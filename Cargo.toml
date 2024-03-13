@@ -1,0 +1,57 @@
+[package]
+name = "ai-agents"
+version = "0.1.2"
+authors = ["Jaemin Kim <geminik23@gmail.com>"]
+edition = "2021"
+description = "a Rust library designed for building and managing generative AI agents, leveraging the capabilities of large language models (LLMs)"
+license = "MIT"
+readme = "README.md"
+# documentation = "https://docs.rs/"
+repository = "https://github.com/geminik23/ai-agents"
+# keywords = []
+
+
+
+[workspace]
+resolver = "2"
+
+members = [
+	"crates/*", 
+	"examples/*", 
+	]
+
+
+[workspace.dependencies]
+log = "0.4"
+dotenv = "0.15"
+env_logger = "0.11"
+async-trait = "0.1"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = { version="2.9", features = ["json"] }
+smol = "2.0"
+
+[patch.crates-io]
+ai-agent-macro = { path = "./crates/ai-agent-macro" }
+sllm-rs = { path = "./crates/sllm-rs" }
+ai-agents = { path = "."}
+
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sllm-rs = "0.1"
+ai-agent-macro = "0.1"
+tera = "1.19"
+
+smol.workspace = true
+
+[dev-dependencies]
+dotenv.workspace = true
+env_logger.workspace = true
+

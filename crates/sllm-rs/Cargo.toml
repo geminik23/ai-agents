@@ -1,0 +1,27 @@
+[package]
+name = "sllm-rs"
+version = "0.1.1"
+authors = ["Jaemin Kim <geminik23@gmail.com>"]
+edition = "2021"
+description = "A simple library designed for integrating and interacting with various GPT-like APIs."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/geminik23/ai-agents"
+keywords = [""]
+
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+
+[dev-dependencies]
+dotenv.workspace = true
+log.workspace = true
+env_logger.workspace = true
+smol.workspace = true
+
+[lib]
+name = "sllm"
