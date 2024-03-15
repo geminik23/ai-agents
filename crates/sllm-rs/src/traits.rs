@@ -7,5 +7,5 @@ pub trait LLMBackend: std::fmt::Debug + Send + Sync {
 }
 
 pub trait MessageBuilder {
-    fn build(&self) -> String;
+    fn build(&mut self) -> String;
 }

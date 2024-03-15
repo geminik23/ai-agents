@@ -16,6 +16,9 @@ This repository is a Rust library designed for building and managing generative 
 
 ## Examples
 
+The examples provided are simulations of limited situations.
+
 - **Find Treasure**
 
+- **Ecommerce Chat Assistant**
 

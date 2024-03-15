@@ -57,7 +57,7 @@ impl PromptMessageGroup {
 }
 
 impl MessageBuilder for PromptMessageGroup {
-    fn build(&self) -> String {
+    fn build(&mut self) -> String {
         let messages = self
             .messages
             .iter()
@@ -79,26 +79,67 @@ impl MessageBuilder for PromptMessageGroup {
     }
 }
 
-pub struct PromptMessageBuilder {
-    groups: Vec<PromptMessageGroup>,
+// one time
+pub struct PromptMessageBuilder<T>
+where
+    T: IntoIterator,
+    T::Item: MessageBuilder,
+{
+    groups: Option<T>,
 }
 
-impl PromptMessageBuilder {
-    // Constructor for a new PromptMessageBuilder with groups.
-    pub fn new(groups: Vec<PromptMessageGroup>) -> Self {
-        PromptMessageBuilder { groups }
+impl<T> PromptMessageBuilder<T>
+where
+    T: IntoIterator,
+    T::Item: MessageBuilder,
+{
+    // Constructor for a new PromptMessageBuilder with an iterable of items that implement MessageBuilder.
+    pub fn new(groups: T) -> Self {
+        PromptMessageBuilder {
+            groups: Some(groups),
+        }
     }
 }
 
-impl MessageBuilder for PromptMessageBuilder {
-    fn build(&self) -> String {
-        self.groups
-            .iter()
-            .map(|group| group.build())
+impl<T> MessageBuilder for PromptMessageBuilder<T>
+where
+    T: IntoIterator,
+    T::Item: MessageBuilder,
+{
+    fn build(&mut self) -> String {
+        let groups = self
+            .groups
+            .take()
+            .expect("Groups should not be taken more than once");
+
+        groups
+            .into_iter()
+            .map(|mut group| group.build())
             .collect::<Vec<String>>()
             .join("\n\n")
     }
 }
+
+// pub struct PromptMessageBuilder {
+//     groups: Vec<PromptMessageGroup>,
+// }
+//
+// impl PromptMessageBuilder {
+//     // Constructor for a new PromptMessageBuilder with groups.
+//     pub fn new(groups: Vec<PromptMessageGroup>) -> Self {
+//         PromptMessageBuilder { groups }
+//     }
+// }
+//
+// impl MessageBuilder for PromptMessageBuilder {
+//     fn build(&self) -> String {
+//         self.groups
+//             .iter()
+//             .map(|group| group.build())
+//             .collect::<Vec<String>>()
+//             .join("\n\n")
+//     }
+// }
 
 // pub struct PromptMessageBuilder<'a> {
 //     groups: Vec<&'a PromptMessageGroup>,
@@ -165,8 +206,7 @@ mod tests {
         let mut group2 = PromptMessageGroup::new("Group2");
         group2.insert("Key2", "Value2");
 
-        let builder = PromptMessageBuilder::new(vec![group1, group2]);
-        let output = builder.build();
+        let output = PromptMessageBuilder::new(vec![group1, group2]).build();
 
         let expected_output = "[Group1]\nKey1: Value1\n\n[Group2]\nKey2: Value2";
         assert_eq!(output, expected_output);

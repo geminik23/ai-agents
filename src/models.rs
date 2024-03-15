@@ -1,5 +1,6 @@
 use super::sync::Mutex;
 pub use std::sync::Arc;
+use std::{collections::HashMap, hash::Hash};
 
 use serde::Deserialize;
 use sllm::{message::PromptMessageGroup, Model};
@@ -23,7 +24,7 @@ pub enum Error {
 #[derive(Debug, Clone)]
 pub enum ModuleParam {
     Str(String),
-    MessageBuilders(Vec<PromptMessageGroup>),
+    MessageBuilders(Vec<PromptMessageGroup>), // FIXME need to change the name of field.
     None,
 }
 
@@ -32,6 +33,34 @@ impl ModuleParam {
         match self {
             Self::None => true,
             _ => false,
+        }
+    }
+
+    pub fn into_message_group(self) -> Option<Vec<PromptMessageGroup>> {
+        match self {
+            Self::MessageBuilders(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    pub fn into_string(self) -> Option<String> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn as_message_group(&self) -> Option<&Vec<PromptMessageGroup>> {
+        match self {
+            Self::MessageBuilders(group) => Some(group),
+            _ => None,
+        }
+    }
+
+    pub fn as_string(&self) -> Option<&String> {
+        match self {
+            Self::Str(s) => Some(s),
+            _ => None,
         }
     }
 }
@@ -59,6 +88,49 @@ impl From<String> for ModuleParam {
         ModuleParam::Str(val)
     }
 }
+
+//
+// PromptManager
+
+#[derive(Debug)]
+pub struct PromptManager<T: Hash + Eq> {
+    prompts: HashMap<String, PromptMessageGroup>,
+    patterns: HashMap<T, String>,
+}
+
+impl<T: Hash + Eq> PromptManager<T> {
+    pub fn new() -> Self {
+        Self {
+            prompts: HashMap::new(),
+            patterns: HashMap::new(),
+        }
+    }
+
+    fn parse_pattern<'a>(pattern: &'a str) -> impl Iterator<Item = &'a str> {
+        pattern.split_whitespace()
+    }
+
+    pub fn insert_prompt(&mut self, alias: &str, prompt: PromptMessageGroup) {
+        self.prompts.insert(alias.into(), prompt);
+    }
+
+    pub fn register_pattern(&mut self, key: T, pattern: &str) {
+        self.patterns.insert(key, pattern.into());
+    }
+
+    pub fn get(&self, key: T) -> Vec<PromptMessageGroup> {
+        self.patterns
+            .get(&key)
+            .into_iter()
+            .flat_map(|pattern| Self::parse_pattern(pattern))
+            .filter_map(|alias| self.prompts.get(alias))
+            .cloned()
+            .collect()
+    }
+}
+
+//
+// TRAITS
 
 #[async_trait::async_trait]
 pub trait AgentTrait: std::fmt::Debug + Send + Sync {

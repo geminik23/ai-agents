@@ -35,9 +35,18 @@ impl Model {
         })
     }
 
-    pub async fn generate_response(&self, builder: &PromptMessageBuilder) -> Result<String, Error> {
+    pub async fn generate_response<T>(&self, context_message_group: T) -> Result<String, Error>
+    where
+        T: IntoIterator + Send,
+        T::Item: MessageBuilder + Send,
+    {
         self.backend
-            .generate_response(self.temperature, builder.build().as_str())
+            .generate_response(
+                self.temperature,
+                PromptMessageBuilder::new(context_message_group)
+                    .build()
+                    .as_str(),
+            )
             .await
     }
 

@@ -1,8 +1,5 @@
 use crate::models::{AgentModuleTrait, Error, ModuleParam};
-use sllm::{
-    message::{PromptMessageBuilder, PromptMessageGroup},
-    Model,
-};
+use sllm::{message::PromptMessageGroup, Model};
 
 #[derive(Debug)]
 pub struct RequestModule {
@@ -40,7 +37,7 @@ impl AgentModuleTrait for RequestModule {
 
         // generate the response
         model
-            .generate_response(&PromptMessageBuilder::new(groups))
+            .generate_response(groups)
             .await
             .map(|result| result.into())
             .map_err(|e| e.into())

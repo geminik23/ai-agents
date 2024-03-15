@@ -1,4 +1,7 @@
-use sllm::{message::PromptMessageGroup, Model};
+use sllm::{
+    message::{PromptMessageBuilder, PromptMessageGroup},
+    Model,
+};
 
 use crate::{
     models::{Error, ModuleCascade, ModuleParam},
@@ -32,6 +35,10 @@ impl DialogueAgent {
             agent,
             ..Default::default()
         }
+    }
+
+    pub fn clear_dialogue(&mut self) {
+        self.dialogues.clear();
     }
 
     pub fn add_instruction(&mut self, instruction: &str) {
@@ -74,7 +81,7 @@ impl DialogueAgent {
 impl AgentTrait for DialogueAgent {
     fn construct_param(&mut self) -> ModuleParam {
         // FIXME changed to ref later.
-        let mut group = PromptMessageGroup::new("");
+        let mut group = PromptMessageGroup::new("Dialogue");
         self.dialogues.iter().for_each(|entry| {
             group.insert(&entry.name, &entry.message);
         });
@@ -89,6 +96,22 @@ impl AgentTrait for DialogueAgent {
 
     async fn execute(&mut self, model: &Model) -> Result<(), Error> {
         let args = self.construct_param();
+
+        match &args {
+            ModuleParam::Str(s) => {
+                log::info!("Context Message: {}", s);
+            }
+            ModuleParam::MessageBuilders(msgs) => {
+                log::info!(
+                    "Context Message: \n{}",
+                    PromptMessageBuilder::new(msgs.clone()).build()
+                );
+            }
+            ModuleParam::None => {
+                log::info!("Context Message: None");
+            }
+        }
+
         let result = self.agent.execute(model, args).await?;
         self.output = result;
         Ok(())
