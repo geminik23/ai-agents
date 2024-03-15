@@ -97,20 +97,20 @@ impl AgentTrait for DialogueAgent {
     async fn execute(&mut self, model: &Model) -> Result<(), Error> {
         let args = self.construct_param();
 
-        match &args {
-            ModuleParam::Str(s) => {
-                log::info!("Context Message: {}", s);
-            }
-            ModuleParam::MessageBuilders(msgs) => {
-                log::info!(
-                    "Context Message: \n{}",
-                    PromptMessageBuilder::new(msgs.clone()).build()
-                );
-            }
-            ModuleParam::None => {
-                log::info!("Context Message: None");
-            }
-        }
+        // match &args {
+        //     ModuleParam::Str(s) => {
+        //         log::debug!("Context Message: {}", s);
+        //     }
+        //     ModuleParam::MessageBuilders(msgs) => {
+        //         log::debug!(
+        //             "Context Message: \n{}",
+        //             PromptMessageBuilder::new(msgs.clone()).build()
+        //         );
+        //     }
+        //     ModuleParam::None => {
+        //         log::debug!("Context Message: None");
+        //     }
+        // }
 
         let result = self.agent.execute(model, args).await?;
         self.output = result;
