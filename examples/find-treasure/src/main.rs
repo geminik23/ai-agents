@@ -1,6 +1,6 @@
 mod utils;
 
-use ai_agents::{models::Error, sllm::Model};
+use ai_agents::{Backend, Error, Model};
 use find_treasure::{FindTreasure, FindTreasureParam};
 
 struct Simulator {
@@ -9,12 +9,11 @@ struct Simulator {
 
 impl Simulator {
     fn new(api_key: &str) -> Self {
-        let mut llmodel = Model::new(ai_agents::sllm::Backend::ChatGPT {
+        let llmodel = Model::new(Backend::ChatGPT {
             api_key: api_key.to_string(),
             model: "gpt-3.5-turbo".into(),
         })
         .unwrap();
-        llmodel.set_temperature(0.1);
 
         let agent = FindTreasure::new(llmodel, FindTreasureParam::new(4, 6, 3));
 

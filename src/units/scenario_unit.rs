@@ -3,32 +3,21 @@ use std::collections::HashMap;
 use tera::{Context, Tera};
 
 use serde::Serialize;
-use sllm::Model;
 
-use crate::{
-    models::{Error, ModuleCascade, ModuleParam},
-    modules::RequestModule,
-    prelude::*,
-};
+use crate::{prelude::*, Error, ModuleParam, UnitProcess};
 
 #[derive(Debug, Default)]
-pub struct ScenarioAgent {
+pub struct ScenarioUnit {
+    name: String,
     scenario_template: String,
     response_template: String,
     context: HashMap<String, serde_json::Value>,
-
-    output: ModuleParam,
-    agent: ModuleCascade,
 }
 
-impl ScenarioAgent {
-    pub fn new() -> Self {
-        let mut agent = ModuleCascade::new();
-        agent.add_module(RequestModule::new());
-
+impl ScenarioUnit {
+    pub fn new(name: &str) -> Self {
         Self {
-            output: ModuleParam::default(),
-            agent,
+            name: name.into(),
             ..Default::default()
         }
     }
@@ -45,11 +34,8 @@ impl ScenarioAgent {
         self.context
             .insert(key.into(), serde_json::to_value(value).unwrap());
     }
-}
 
-#[async_trait::async_trait]
-impl AgentTrait for ScenarioAgent {
-    fn construct_param(&mut self) -> ModuleParam {
+    fn construct_param(&self) -> PromptMessageGroup {
         let mut tera = Tera::default();
         tera.add_raw_template("req", &format!("{}\n\n{{{{ output_template }}}}\n\nYou are a json generator. Generate in json template above.", self.scenario_template))
             .unwrap();
@@ -60,29 +46,51 @@ impl AgentTrait for ScenarioAgent {
 
         context.insert("output_template", &self.response_template);
 
-        tera.render("req", &context).unwrap().into()
+        let mut group = PromptMessageGroup::new("");
+        group.insert("", tera.render("req", &context).unwrap().as_str());
+        group
+    }
+}
+
+#[async_trait::async_trait]
+impl UnitProcess for ScenarioUnit {
+    fn get_name(&self) -> &str {
+        self.name.as_str()
     }
 
-    async fn execute(&mut self, model: &Model) -> Result<(), Error> {
-        let args = self.construct_param();
-        let result = self.agent.execute(model, args).await?;
-        self.output = result;
-        Ok(())
-    }
+    async fn process(&self, input: ModuleParam) -> Result<ModuleParam, Error> {
+        // input +
+        log::debug!("[{}] intput - {:?}", self.name, input);
 
-    fn get_result(&self) -> &ModuleParam {
-        &self.output
+        // ignore the input
+        let mut groups = match input {
+            ModuleParam::Str(req) => {
+                let mut group = PromptMessageGroup::new("");
+                group.insert("", req.as_str());
+                vec![group]
+            }
+            ModuleParam::MessageBuilders(builder) => builder,
+            ModuleParam::None => {
+                vec![]
+                // return Err(Error::InputRequiredError);
+            }
+        };
+
+        groups.push(self.construct_param());
+
+        Ok(ModuleParam::MessageBuilders(groups))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
+    use sllm::message::PromptMessageBuilder;
 
-    use crate::agents::scenario::ScenarioAgent;
-
-    use crate::models::ModuleParam;
     use crate::{prelude::*, sync::block_on};
+    use crate::{ModuleParam, UnitProcess};
+
+    use super::ScenarioUnit;
 
     const REQUEST_FIND_TREASURE_STR: &'static str = r#"This is the one episode in RPG game.
 
@@ -91,7 +99,7 @@ The goal is to find the treasure in the town.
 The way of finding treasure is to talk to NPCs in town in specific order and goes to some place.
 Generate background of town include facilities and NPCs with background, and the orders player talk to who to finish the game.
 
-There are {{ num_npcs }} NPCs and {{ num_facilities }} facilities in Town, And only {{ num_clues }} NPCs to visit have clue among them. 
+There are {{ num_npcs }} NPCs and {{ num_facilities }} facilities in Town, And only {{ num_clues }} NPCs to visit have clue among them.
 Treasure location is in facility. Do not duplicate treasure location and the locations of characters who have clue."#;
 
     #[allow(dead_code)]
@@ -120,27 +128,19 @@ Treasure location is in facility. Do not duplicate treasure location and the loc
     #[ignore]
     #[test]
     fn test_find_treasure() {
-        let model = crate::tests::get_model();
-        env_logger::init();
+        let mut unit = ScenarioUnit::new("ScenarioUnit");
+        unit.set_scenario_template(REQUEST_FIND_TREASURE_STR);
+        unit.insert_context("num_npcs", 5);
+        unit.insert_context("num_facilities", 8);
+        unit.insert_context("num_clues", 3);
+        unit.update_response_template::<ScenarioResponse>();
 
-        let mut agent = ScenarioAgent::new();
-        agent.set_scenario_template(REQUEST_FIND_TREASURE_STR);
-        agent.insert_context("num_npcs", 5);
-        agent.insert_context("num_facilities", 8);
-        agent.insert_context("num_clues", 3);
-        agent.update_response_template::<ScenarioResponse>();
-
-        match agent.construct_param() {
-            ModuleParam::Str(arg) => {
-                println!("::Prompt::\n{}", arg);
-            }
-            _ => {}
-        }
-        block_on(async move {
-            if let Ok(_) = agent.execute(&model).await {
-                let result = agent.get_typed_result::<ScenarioResponse>().unwrap();
-                println!("{:?}", result);
-            }
-        });
+        let Ok(ModuleParam::MessageBuilders(groups)) =
+            block_on(async move { unit.process(ModuleParam::None).await })
+        else {
+            assert!(false);
+            return;
+        };
+        println!("{}", PromptMessageBuilder::new(groups).build().as_str());
     }
 }

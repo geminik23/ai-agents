@@ -1,9 +1,9 @@
-use ai_agents::{
-    agents::dialogue::DialogueAgent,
-    models::{AgentTrait, Error, PromptManager},
-    sllm::{message::PromptMessageGroup, Model},
-};
+use ai_agents::units::ModelUnit;
+use ai_agents::{prelude::*, sync::RwLock, Model};
+use ai_agents::{units::DialogueUnit, Backend, PromptManager};
+use ai_agents::{Error, ModuleParam, PipelineNet};
 use serde::Serialize;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct CustomerInfo {
@@ -48,19 +48,26 @@ pub enum PromptType {
 }
 
 pub struct EcommerceChatAssistant {
-    model: Model,
-    agent: DialogueAgent,
+    pipeline_net: PipelineNet,
 
+    dialogue: Arc<RwLock<DialogueUnit>>,
     prompt: PromptManager<PromptType>,
 
     order_info: Option<OrderInfo>,
-
     received_customer_info: Option<CustomerInfo>,
 }
 
 impl EcommerceChatAssistant {
     pub fn new(model: Model, company: &str) -> Self {
-        let mut agent = DialogueAgent::new();
+        let unit = Arc::new(RwLock::new(DialogueUnit::new("dialogue")));
+        let model_unit = Arc::new(RwLock::new(ModelUnit::new("chatgpt", model)));
+
+        // Construct pipeline network.
+        let mut net = PipelineNet::new();
+        net.add_node("in", unit.clone());
+        net.add_node("out", model_unit);
+        net.add_edge("in", "out");
+        net.set_group_input("dialogue", "in");
 
         // Prompt setting
         let mut prompt = PromptManager::new();
@@ -82,22 +89,19 @@ impl EcommerceChatAssistant {
         prompt.register_pattern(PromptType::WithCommand, "b c r");
         prompt.register_pattern(PromptType::WithOrderInfo, "b r");
 
-        // default background
-        agent.set_background(prompt.get(PromptType::WithCommand));
-
         Self {
-            model,
-            agent,
+            dialogue: unit,
             order_info: None,
             prompt,
+            pipeline_net: net,
             received_customer_info: None,
         }
     }
 
     // conditionally
 
-    pub fn reset(&mut self) {
-        self.agent.clear_dialogue();
+    pub async fn reset(&mut self) {
+        self.dialogue.write().await.clear_dialogue();
         self.order_info = None;
         self.received_customer_info = None;
     }
@@ -106,9 +110,8 @@ impl EcommerceChatAssistant {
         self.order_info = Some(order_info);
     }
 
-    fn set_background(&mut self) {
+    fn get_background(&mut self) -> Vec<PromptMessageGroup> {
         // set background
-
         let mut prompt = self.prompt.get(if self.received_customer_info.is_some() {
             PromptType::WithOrderInfo
         } else {
@@ -123,8 +126,7 @@ impl EcommerceChatAssistant {
             });
             prompt.push(group);
         });
-
-        self.agent.set_background(prompt);
+        prompt
     }
 
     fn parse_command(&mut self, res: &str) -> Option<CustomerInfo> {
@@ -160,15 +162,22 @@ impl EcommerceChatAssistant {
     ) -> Result<Option<String>, Error> {
         match message {
             Some(msg) => {
-                self.set_background();
-
                 // add customer's message
-                self.agent.add_dialogue("Customer", msg.as_str());
+                {
+                    let mut unit = self.dialogue.write().await;
+                    unit.add_dialogue("Customer", msg.as_str());
+                    unit.set_responder_name("Assistant");
+                }
 
+                let initial_input = ModuleParam::MessageBuilders(self.get_background());
+                let results = self
+                    .pipeline_net
+                    .process_group("dialogue", initial_input)
+                    .await?;
+
+                let mut response = results.get("out").unwrap().as_string().cloned();
                 // receive the response.
-                self.agent.set_responder_name("Assistant");
-                self.agent.execute(&self.model).await?;
-                let mut response = self.agent.get_result().as_string().cloned();
+                // let mut response = self.agent.get_result().as_string().clone();
 
                 // Hijack the response of agent
                 match &response {
@@ -178,7 +187,8 @@ impl EcommerceChatAssistant {
                             self.received_customer_info = self.parse_command(res);
                             response = None;
                         } else {
-                            self.agent.update_last_reponse();
+                            // Update the last response.
+                            self.dialogue.write().await.add_dialogue("Assistant", res)
                         }
                     }
                     None => {
@@ -189,12 +199,22 @@ impl EcommerceChatAssistant {
                 Ok(response)
             }
             None => {
-                self.set_background();
+                let initial_input = ModuleParam::MessageBuilders(self.get_background());
+                {
+                    let mut unit = self.dialogue.write().await;
+                    unit.set_responder_name("Assistant");
+                }
 
-                self.agent.set_responder_name("Assistant");
-                self.agent.execute(&self.model).await?;
-                let response = self.agent.get_result().as_string().cloned();
-                self.agent.update_last_reponse();
+                let results = self
+                    .pipeline_net
+                    .process_group("dialogue", initial_input)
+                    .await?;
+
+                let response = results.get("out").unwrap().as_string().cloned();
+                // let response = self.agent.get_result().as_string().cloned();
+                if let Some(res) = &response {
+                    self.dialogue.write().await.add_dialogue("Assistant", res);
+                }
                 Ok(response)
             }
         }

@@ -1,12 +1,18 @@
 # ai-agents
 
-This repository is a Rust library designed for building and managing generative AI agents, leveraging the capabilities of large language models (LLMs), such as ChatGPT. The aim of this project is to provide a robust and scalable framework that is adaptable to a wide range of scenarios. (`ai-agents` is at **a very early stage** of development.)
+This repository is a Rust library designed for building and managing generative AI agents, leveraging the capabilities of large language models (LLMs), such as ChatGPT. The aim of this project is to provide a robust and scalable framework that is adaptable to a wide range of scenarios.
 
-## Key Features
+`ai-agents` is at **a very early stage** of development.
 
-- **Modular Architecture**: Enhances the creation of complex AI behaviors by chaining together smaller, interoperable components. This is reusability and flexibility across different projects.
-- **Agent and Module Traits**: a flexible interface for building custom agents and modules, allowing for the execution of sophisticated AI tasks with ease.
+
+## Features
+
+- **Structured Data Flow**: Leverage `PipelineNet` for organized and efficient data flow between processing units, enabling complex data transformation and decision-making capabilities.
+- **Flexible Architectures**: Utilize dynamic flow control within `PipelineNet` to adapt AI agent behaviors.
+- **Extendibility**: Easily extend core functionalities with custom unit implementations.
+- **Contextual Grouping**: Organize units into coherent groups for focused execution, simplifying task management and enhancing processing clarity.
 - **Asynchronous Support**
+
 
 ## Crates
 
@@ -36,3 +42,9 @@ OPEN_API_KEY=your_api_key_here
   ```
   cargo run -p ecommerce-assistant
   ```
+
+
+
+
+
+

@@ -1,8 +1,5 @@
 mod utils;
-use ai_agents::{
-    models::Error,
-    sllm::{Backend, Model},
-};
+use ai_agents::{Backend, Error, Model};
 use ecommerce_assistant::{EcommerceChatAssistant, OrderInfo};
 
 fn get_order_info() -> OrderInfo {
@@ -28,12 +25,12 @@ fn get_order_info() -> OrderInfo {
 
 async fn run() -> Result<(), Error> {
     let api_key = std::env::var("OPEN_API_KEY").expect("Failed to find OPEN_API_KEY");
-    let model = Model::new(Backend::ChatGPT {
+    let config = Backend::ChatGPT {
         api_key,
         model: "gpt-3.5-turbo".to_string(),
-    })
-    .unwrap();
+    };
 
+    let model = Model::new(config).unwrap();
     let mut agent = EcommerceChatAssistant::new(model, "ECommer");
 
     println!("");

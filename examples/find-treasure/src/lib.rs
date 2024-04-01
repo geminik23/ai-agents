@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use ai_agents::{
-    agents::{dialogue::DialogueAgent, scenario::ScenarioAgent},
-    models::{Error, ModuleParam},
     prelude::*,
-    sllm::{message::PromptMessageGroup, Model},
+    sync::RwLock,
+    units::{DialogueUnit, ModelUnit, ScenarioUnit},
+    Error, Model, ModuleParam, PipelineNet,
 };
 use serde::Deserialize;
 
@@ -134,11 +134,13 @@ impl GameState {
     }
 }
 
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct FindTreasure {
-    model: Model,
-    scenario_agent: ScenarioAgent,
-    dialog_agent: DialogueAgent,
+    scenario_unit: Arc<RwLock<ScenarioUnit>>,
+    dialogue_unit: Arc<RwLock<DialogueUnit>>,
+
+    pipeline_net: PipelineNet,
+
     param: FindTreasureParam,
 
     scenario: Option<Scenario>,
@@ -157,17 +159,32 @@ const RULES: [&'static str; 3] = [
 
 impl FindTreasure {
     pub fn new(model: Model, param: FindTreasureParam) -> Self {
-        let mut scenario_agent = ScenarioAgent::new();
-        scenario_agent.set_scenario_template(REQUEST_FIND_TREASURE_STR);
-        scenario_agent.update_response_template::<Scenario>();
+        let mut scenario_unit = ScenarioUnit::new("scenario");
+        scenario_unit.set_scenario_template(REQUEST_FIND_TREASURE_STR);
+        scenario_unit.update_response_template::<Scenario>();
+        let scenario_unit = Arc::new(RwLock::new(scenario_unit));
 
-        let mut dialog_agent = DialogueAgent::new();
-        dialog_agent.add_dialogue("", "Player meets NPC.");
+        let mut dialogue_unit = DialogueUnit::new("dialogue");
+        dialogue_unit.add_dialogue("", "Player meets NPC.");
+        let dialogue_unit = Arc::new(RwLock::new(dialogue_unit));
+
+        let model_unit = Arc::new(RwLock::new(ModelUnit::new("chatgpt", model)));
+
+        let mut pipeline_net = PipelineNet::new();
+        pipeline_net.add_node("scene_in", scenario_unit.clone());
+        pipeline_net.add_node("dialogue_in", dialogue_unit.clone());
+        pipeline_net.add_node("out", model_unit);
+
+        pipeline_net.add_edge("scene_in", "out");
+        pipeline_net.add_edge("dialogue_in", "out");
+
+        pipeline_net.set_group_input("scenario", "scene_in");
+        pipeline_net.set_group_input("dialogue", "dialogue_in");
 
         Self {
-            model,
-            scenario_agent,
-            dialog_agent,
+            scenario_unit,
+            dialogue_unit,
+            pipeline_net,
             param,
             scenario: None,
             game_state: None,
@@ -259,18 +276,26 @@ impl FindTreasure {
     // generate the Scenario
     pub async fn generate_scenario(&mut self) -> Result<(), Error> {
         // update into the scenario_agent
-        self.scenario_agent
-            .insert_context("num_npcs", self.param.num_npcs);
-        self.scenario_agent
-            .insert_context("num_facilities", self.param.num_facilities);
-        self.scenario_agent
-            .insert_context("num_clues", self.param.num_clues);
+        {
+            let mut unit = self.scenario_unit.write().await;
+            unit.insert_context("num_npcs", self.param.num_npcs);
+            unit.insert_context("num_facilities", self.param.num_facilities);
+            unit.insert_context("num_clues", self.param.num_clues);
+        }
+
+        let responses = self
+            .pipeline_net
+            .process_group("scenario", ModuleParam::None)
+            .await?;
+
+        let scenario: Scenario =
+            serde_json::from_str(responses.get("out").unwrap().as_string().unwrap())?;
 
         // generate response
         // dbg!("{:?}", self.scenario_agent.construct_param());
-        self.scenario_agent.execute(&self.model).await?;
+        // self.scenario_agent.execute(&self.model).await?;
         // dbg!("{:?}", self.scenario_agent.get_result());
-        let scenario = self.scenario_agent.get_typed_result::<Scenario>()?;
+        // let scenario = self.scenario_agent.get_typed_result::<Scenario>()?;
 
         // set the game state and background
         self.game_state = Some(GameState::new(&scenario));
@@ -291,33 +316,26 @@ impl FindTreasure {
 
         let background = self.construct_background_message(&scenario);
 
-        if let Some(game_state) = &self.game_state {
-            if !game_state.has_npc(npc_name) {
-                return Err(Error::NotFound(format!("NPC {}", npc_name)));
-            }
-            let state = self.construct_game_state(&scenario, game_state.visited_count, npc_name);
-            self.dialog_agent.set_background(vec![background, state]);
+        {
+            let mut unit = self.dialogue_unit.write().await;
+            unit.set_responder_name(npc_name);
         }
 
-        self.dialog_agent.set_responder_name(npc_name);
-
-        // match self.dialog_agent.construct_param() {
-        //     ModuleParam::MessageBuilders(msg) => {
-        //         println!("");
-        //         print!("{}", PromptMessageBuilder::new(msg).build());
-        //     }
-        //     _ => {}
-        // }
-
-        // Generate the response
-        self.dialog_agent.execute(&self.model).await?;
-
-        let dialogue = match self.dialog_agent.get_result() {
-            ModuleParam::Str(s) => s.clone(),
-            _ => {
-                return Err(Error::WrongOutputType);
-            }
+        let Some(game_state) = &self.game_state else {
+            return Err(Error::NotFound("Game State is None".into()));
         };
+
+        if !game_state.has_npc(npc_name) {
+            return Err(Error::NotFound(format!("NPC {}", npc_name)));
+        }
+        let state = self.construct_game_state(&scenario, game_state.visited_count, npc_name);
+        let param = ModuleParam::MessageBuilders(vec![background, state]);
+        let mut responses = self.pipeline_net.process_group("dialogue", param).await?;
+        let dialogue = responses
+            .remove("out")
+            .unwrap()
+            .into_string()
+            .ok_or(Error::WrongOutputType)?;
 
         // udpate the visit
         if let Some(game_state) = &mut self.game_state {

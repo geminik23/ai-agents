@@ -1,42 +1,46 @@
-use crate::models::{AgentModuleTrait, Error, ModuleParam};
-use sllm::{message::PromptMessageGroup, Model};
+use sllm::message::PromptMessageGroup;
 
-#[derive(Debug)]
-pub struct RequestModule {
+use crate::{Error, Model, ModuleParam, UnitProcess};
+
+#[derive(Debug, Clone)]
+pub struct ModelUnit {
     name: String,
+    model: Model,
 }
 
-impl RequestModule {
-    pub fn new() -> Self {
+impl ModelUnit {
+    pub fn new(name: &str, model: Model) -> Self {
         Self {
-            name: "RequestModule".into(),
+            name: name.into(),
+            model,
         }
     }
 }
 
 #[async_trait::async_trait]
-impl AgentModuleTrait for RequestModule {
-    fn get_name(&self) -> String {
-        self.name.clone()
+impl UnitProcess for ModelUnit {
+    fn get_name(&self) -> &str {
+        self.name.as_str()
     }
 
-    async fn execute(&mut self, model: &Model, input: ModuleParam) -> Result<ModuleParam, Error> {
+    async fn process(&self, input: ModuleParam) -> Result<ModuleParam, Error> {
         log::debug!("[{}] intput - {:?}", self.name, input);
         // ignore the input
         let groups = match input {
             ModuleParam::Str(req) => {
                 let mut group = PromptMessageGroup::new("");
-                group.insert("Request", req.as_str());
+                group.insert("", req.as_str());
                 vec![group]
             }
             ModuleParam::MessageBuilders(builder) => builder,
             ModuleParam::None => {
-                return Err(Error::InputRequiredError);
+                vec![]
+                // return Err(Error::InputRequiredError);
             }
         };
 
         // generate the response
-        model
+        self.model
             .generate_response(groups)
             .await
             .map(|result| result.into())

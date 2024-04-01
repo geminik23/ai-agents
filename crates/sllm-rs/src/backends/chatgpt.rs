@@ -102,7 +102,7 @@ mod tests {
     fn calling_gpt() {
         dotenv::dotenv().ok();
 
-        futures_lite::future::block_on(async {
+        smol::block_on(async {
             let gpt = ChatGpt::new(std::env::var("OPEN_API_KEY").unwrap(), "gpt-4".into());
             let result = gpt.generate_response(0.1, "Say Hello.").await;
 

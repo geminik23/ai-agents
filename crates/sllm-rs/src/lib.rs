@@ -31,7 +31,7 @@ impl Model {
         let backend = create_llm_model(config)?;
         Ok(Self {
             backend,
-            temperature: 0.1,
+            temperature: 0.9,
         })
     }
 
