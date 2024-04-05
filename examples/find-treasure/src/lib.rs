@@ -16,8 +16,11 @@ Generate background of town include facilities and NPCs with background, and the
 
 The way of finding treasure is to talk to NPCs in town in specific order and goes to some place.
 
-There are {{ num_npcs }} NPCs and {{ num_facilities }} facilities in Town, And only {{ num_clues }} NPCs who have clue. 
-Treasure location is in facility. Do not duplicate treasure location with locations of characters who have clue."#;
+There are {{ num_npcs }} NPCs and {{ num_facilities }} facilities in Town, And only {{ num_clues }} NPCs have clues. 
+
+Treasure location is facility. 
+Do not duplicate treasure location with locations of characters who have clue. 
+The number of clues should be equal with visit order."#;
 
 #[derive(Debug, Deserialize)]
 pub struct EntityDescription {

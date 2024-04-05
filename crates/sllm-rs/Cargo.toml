@@ -1,6 +1,6 @@
 [package]
 name = "sllm-rs"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 edition = "2021"
 description = "A simple library designed for integrating and interacting with various GPT-like APIs."
@@ -15,7 +15,8 @@ async-trait.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-ureq.workspace = true
+# ureq = { version="2.9", features = ["json"] }
+ehttp = {version = "0.5", features=["native-async"]}
 
 [dev-dependencies]
 dotenv.workspace = true

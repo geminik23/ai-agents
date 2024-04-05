@@ -1,7 +1,15 @@
+use std::string::FromUtf8Error;
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error(transparent)]
     IOError(#[from] std::io::Error),
     #[error(transparent)]
-    RequestError(#[from] ureq::Error),
+    Utf8Error(#[from] FromUtf8Error),
+
+    #[error("Request error {0}")]
+    RequestError(String),
+    #[error(transparent)]
+    JSONParsingError(#[from] serde_json::Error), // #[error(transparent)]
+                                                 // RequestError(#[from] ureq::Error),
 }

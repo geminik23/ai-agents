@@ -1,6 +1,6 @@
 [package]
 name = "ai-agents"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 edition = "2021"
 description = "a Rust library designed for building and managing generative AI agents, leveraging the capabilities of large language models (LLMs)"
@@ -29,7 +29,7 @@ async-trait = "0.1"
 thiserror = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ureq = { version="2.9", features = ["json"] }
+# ureq = { version="2.9", features = ["json"] }
 smol = "2.0"
 
 [patch.crates-io]

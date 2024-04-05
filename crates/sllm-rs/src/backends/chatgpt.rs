@@ -80,14 +80,28 @@ impl LLMBackend for ChatGpt {
             temperature,
         };
 
-        let result: OpenAIChatResponse = ureq::post(CHATGPT_URL)
-            .set("authorization", &format!("Bearer {}", self.api_key))
-            .set("content-type", "application/json")
-            .send_json(chat_completion)?
-            .into_json()?;
+        let body = serde_json::to_string(&chat_completion).unwrap();
+
+        let mut request = ehttp::Request::post(CHATGPT_URL, body.into_bytes());
+        request
+            .headers
+            .insert("Authorization", &format!("Bearer {}", self.api_key));
+        request.headers.insert("Content-Type", "application/json");
+        let response = ehttp::fetch_async(request)
+            .await
+            .map_err(|e| Error::RequestError(e))?;
+        let result = String::from_utf8(response.bytes)?;
+        let result = serde_json::from_str::<OpenAIChatResponse>(&result)?;
+        return Ok(result.choices[0].message.content.clone());
+
+        // let result: OpenAIChatResponse = ureq::post(CHATGPT_URL)
+        //     .set("authorization", &format!("Bearer {}", self.api_key))
+        //     .set("content-type", "application/json")
+        //     .send_json(chat_completion)?
+        //     .into_json()?;
 
         // dbg!(result);
-        Ok(result.choices[0].message.content.clone())
+        // Ok(result.choices[0].message.content.clone())
     }
 }
 
@@ -103,11 +117,15 @@ mod tests {
         dotenv::dotenv().ok();
 
         smol::block_on(async {
-            let gpt = ChatGpt::new(std::env::var("OPEN_API_KEY").unwrap(), "gpt-4".into());
-            let result = gpt.generate_response(0.1, "Say Hello.").await;
+            let gpt = ChatGpt::new(
+                std::env::var("OPEN_API_KEY").unwrap(),
+                "gpt-3.5-turbo".into(),
+            );
+            let result = gpt.generate_response(0.1, "Just Say only 'Hello'").await;
+            // println!("{:?}", result);
 
             assert!(result.is_ok());
-            assert_eq!(result.unwrap(), "Hello.");
+            assert_eq!(result.unwrap(), "Hello");
         });
     }
 }
