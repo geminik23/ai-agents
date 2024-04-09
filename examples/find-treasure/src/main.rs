@@ -1,10 +1,10 @@
 mod utils;
 
 use ai_agents::{Backend, Error, Model};
-use find_treasure::{FindTreasure, FindTreasureParam};
+use find_treasure::{FindTreasureAgent, FindTreasureParam, GameState, Scenario};
 
 struct Simulator {
-    agent: FindTreasure,
+    agent: FindTreasureAgent,
 }
 
 impl Simulator {
@@ -15,40 +15,38 @@ impl Simulator {
         })
         .unwrap();
 
-        let agent = FindTreasure::new(llmodel, FindTreasureParam::new(4, 6, 3));
+        let agent = FindTreasureAgent::new(llmodel, FindTreasureParam::new(4, 6, 3));
 
         Self { agent }
     }
 
-    async fn generate_scenario(&mut self) -> Result<(), Error> {
+    async fn generate_scenario(&mut self) -> Result<(GameState, Scenario), Error> {
         // Generate the scenario
         loop {
             println!("");
             utils::printout_progress("Generating scenario...");
 
             // Generate new scenario
-            self.agent.generate_scenario().await?;
-
-            // get information of game.
-            let scenario = self.agent.scenario();
-
-            let Some(scenario) = scenario else {
-                return Ok(());
-            };
+            let (game_state, scenario) = self.agent.generate_scenario().await?;
 
             // PRINT GENERATED BACKGROUND
             println!("::Generated scenario::\n{:?}", scenario);
 
             println!("");
+
             if utils::get_yes_or_no("Play this scenario? (y/n) ") {
-                break;
+                return Ok((game_state, scenario));
             }
         }
-        Ok(())
     }
 
-    async fn explore_location(&mut self, location: &str) -> Result<(), Error> {
-        let npcs = self.agent.list_npcs_in_facility(location);
+    async fn explore_location(
+        &mut self,
+        location: &str,
+        scenario: &Scenario,
+        game_state: &mut GameState,
+    ) -> Result<(), Error> {
+        let npcs = game_state.list_npcs_in_facility(location);
         println!("");
         println!("Select the action.");
         npcs.iter().enumerate().for_each(|(i, v)| {
@@ -64,7 +62,17 @@ impl Simulator {
             println!("");
             utils::printout_progress("Generating dialogue...");
             let npc_name = npcs[selection - 1].as_str();
-            match self.agent.talk_to(npc_name).await {
+
+            let background_prompt = scenario.construct_background_message();
+            let game_state_prompt =
+                game_state.construct_game_state(&scenario, game_state.visited_count(), npc_name);
+            game_state.visit(&npc_name);
+
+            match self
+                .agent
+                .talk_to(background_prompt, game_state_prompt, &npc_name)
+                .await
+            {
                 Ok(txt) => {
                     println!("{} : {}", npc_name, txt);
                     println!("");
@@ -75,16 +83,16 @@ impl Simulator {
                 }
             }
         } else {
-            self.agent.go_out();
+            game_state.go_out();
             return Ok(());
         }
         Ok(())
     }
 
-    fn choose_new_location(&mut self) {
+    fn choose_new_location(&mut self, game_state: &mut GameState) {
         println!("");
         println!("Where will you visit?");
-        let selections = self.agent.list_of_facilities();
+        let selections = game_state.list_of_facilities();
         selections.iter().enumerate().for_each(|(i, v)| {
             println!("{}. {}", i + 1, v);
         });
@@ -93,17 +101,12 @@ impl Simulator {
             return;
         };
         if selection > 0 && selection <= selections.len() {
-            self.agent
-                .move_to_facility(selections.get(selection - 1).unwrap().as_str());
+            game_state.move_to_facility(selections.get(selection - 1).unwrap().as_str());
         }
     }
 
     pub async fn play_game(&mut self) -> Result<(), Error> {
-        self.generate_scenario().await?;
-
-        let Some(scenario) = self.agent.scenario() else {
-            return Ok(());
-        };
+        let (mut game_state, scenario) = self.generate_scenario().await?;
 
         // All description is pre-generated via ChatGPT.
         println!("");
@@ -117,11 +120,12 @@ impl Simulator {
         let treasure_location = scenario.treasure_place.clone();
 
         // Main game loop
-        while !self.agent.has_found_treasure() {
-            if let Some(location) = self.agent.current_location() {
-                self.explore_location(location.as_str()).await?;
+        while !game_state.has_found_treasure() {
+            if let Some(location) = game_state.current_location() {
+                self.explore_location(location.as_str(), &scenario, &mut game_state)
+                    .await?;
             } else {
-                self.choose_new_location();
+                self.choose_new_location(&mut game_state);
             }
         }
         utils::printout_progress(&format!("After a long journey filled with challenges and revelations, you finally uncover the hidden treasure beneath the {}.", treasure_location));
