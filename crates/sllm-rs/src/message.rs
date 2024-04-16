@@ -1,8 +1,34 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{fmt, sync::Arc};
 
+use serde::Serialize;
 use tera::{Context, Tera};
 
 pub use crate::traits::MessageBuilder;
+
+#[derive(Clone)]
+pub struct TemplatedMessage {
+    template: String,
+    context: Context,
+}
+
+impl TemplatedMessage {
+    pub fn new(template: &str) -> Self {
+        Self {
+            template: template.to_string(),
+            context: Context::new(),
+        }
+    }
+
+    pub fn insert<T: Serialize + ?Sized, S: Into<String>>(&mut self, key: S, val: &T) {
+        self.context.insert(key, val);
+    }
+
+    pub fn remove(&mut self, index: &str) -> bool {
+        self.context.remove(index).is_some()
+    }
+
+    // TODO get
+}
 
 #[derive(Clone)]
 pub enum PromptMessage {
@@ -10,11 +36,14 @@ pub enum PromptMessage {
         title: String,
         messages: Vec<(String, Arc<dyn Fn() -> String + Send + Sync>)>,
     },
-    Templated {
-        template: String,
-        context: HashMap<String, String>,
-    },
+    Templated(TemplatedMessage),
     Simple(String),
+}
+
+impl From<TemplatedMessage> for PromptMessage {
+    fn from(value: TemplatedMessage) -> Self {
+        PromptMessage::Templated(value)
+    }
 }
 
 impl From<String> for PromptMessage {
@@ -49,10 +78,10 @@ impl std::fmt::Debug for PromptMessage {
                     ) // can't display closures, so only the keys.
                     .finish()
             }
-            PromptMessage::Templated { template, context } => f
+            PromptMessage::Templated(templated_msg) => f
                 .debug_struct("Templated")
-                .field("template", &template)
-                .field("context", &context)
+                .field("template", &templated_msg.template)
+                .field("context", &templated_msg.context)
                 .finish(),
             PromptMessage::Simple(message) => f.debug_tuple("Simple").field(message).finish(),
         }
@@ -67,11 +96,8 @@ impl PromptMessage {
         }
     }
 
-    pub fn new_templated(template: &str, context: HashMap<String, String>) -> Self {
-        PromptMessage::Templated {
-            template: template.into(),
-            context,
-        }
+    pub fn new_templated(templated_msg: TemplatedMessage) -> Self {
+        PromptMessage::Templated(templated_msg)
     }
 
     pub fn new_simple(message: String) -> Self {
@@ -120,14 +146,11 @@ impl MessageBuilder for PromptMessage {
                     format!("[{}]\n{}", title, rendered_messages)
                 }
             }
-            PromptMessage::Templated { template, context } => {
+            PromptMessage::Templated(templated_msg) => {
                 let mut tera = Tera::default();
-                tera.add_raw_template("template", template).unwrap();
-                let mut tera_context = Context::new();
-                for (key, value) in context {
-                    tera_context.insert(key, value);
-                }
-                tera.render("template", &tera_context).unwrap()
+                tera.add_raw_template("template", &templated_msg.template)
+                    .unwrap();
+                tera.render("template", &templated_msg.context).unwrap()
             }
             PromptMessage::Simple(message) => message.clone(),
         }
@@ -192,9 +215,9 @@ mod tests {
 
     #[test]
     fn test_templated_build() {
-        let mut context = HashMap::new();
-        context.insert("name".to_string(), "World".to_string());
-        let mut group = PromptMessage::new_templated("Hello, {{ name }}!", context);
+        let mut msg = TemplatedMessage::new("Hello, {{ name }}!");
+        msg.insert("name", "World");
+        let mut group = PromptMessage::new_templated(msg);
         let output = group.build();
         let expected_output = "Hello, World!";
         assert_eq!(output, expected_output);

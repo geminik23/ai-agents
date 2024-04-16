@@ -23,7 +23,7 @@ pub trait ToKeywordString {
 pub mod prelude {
     pub use super::ToKeywordString;
     pub use ai_agent_macro::*;
-    pub use sllm::message::{MessageBuilder, PromptMessage};
+    pub use sllm::message::{MessageBuilder, PromptMessage, TemplatedMessage};
 }
 
 #[derive(Debug, Clone)]

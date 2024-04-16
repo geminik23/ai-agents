@@ -312,7 +312,7 @@ Do not duplicate treasure location with locations of characters who have clue.
 The number of NPCs who have clues should be equal with the number of visit order."#;
 // #[derive(Debug)]
 pub struct FindTreasureAgent {
-    scenario_unit: Arc<RwLock<JsonGeneratorUnit>>,
+    // scenario_unit: Arc<RwLock<JsonGeneratorUnit>>,
     dialogue_unit: Arc<RwLock<DialogueUnit>>,
 
     pipeline_net: PipelineNet,
@@ -323,7 +323,6 @@ pub struct FindTreasureAgent {
 impl FindTreasureAgent {
     pub fn new(model: Model, param: FindTreasureParam) -> Self {
         let mut scenario_unit = JsonGeneratorUnit::new("scenario");
-        scenario_unit.set_scenario_template(REQUEST_FIND_TREASURE_STR);
         scenario_unit.update_response_template::<Scenario>();
         let scenario_unit = Arc::new(RwLock::new(scenario_unit));
 
@@ -345,7 +344,7 @@ impl FindTreasureAgent {
         pipeline_net.set_group_input("dialogue", "dialogue_in");
 
         Self {
-            scenario_unit,
+            // scenario_unit,
             dialogue_unit,
             pipeline_net,
             param,
@@ -359,12 +358,10 @@ impl FindTreasureAgent {
     // generate the Scenario
     pub async fn generate_scenario(&mut self) -> Result<(GameState, Scenario), Error> {
         // update into the scenario_agent
-        {
-            let mut unit = self.scenario_unit.write().await;
-            unit.insert_context("num_npcs", self.param.num_npcs);
-            unit.insert_context("num_facilities", self.param.num_facilities);
-            unit.insert_context("num_clues", self.param.num_clues);
-        }
+        let mut in_param = TemplatedMessage::new(REQUEST_FIND_TREASURE_STR);
+        in_param.insert("num_npcs", &self.param.num_npcs);
+        in_param.insert("num_facilities", &self.param.num_facilities);
+        in_param.insert("num_clues", &self.param.num_clues);
 
         let responses = self
             .pipeline_net

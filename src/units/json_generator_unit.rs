@@ -1,17 +1,11 @@
-use std::collections::HashMap;
-
-use tera::{Context, Tera};
-
-use serde::Serialize;
+use sllm::message::TemplatedMessage;
 
 use crate::{prelude::*, Error, ModuleParam, UnitProcess};
 
 #[derive(Debug, Default)]
 pub struct JsonGeneratorUnit {
     name: String,
-    scenario_template: String,
     response_template: String,
-    context: HashMap<String, serde_json::Value>,
 }
 
 impl JsonGeneratorUnit {
@@ -26,29 +20,10 @@ impl JsonGeneratorUnit {
         self.response_template = T::to_keyword_string();
     }
 
-    pub fn set_scenario_template(&mut self, scenario: &str) {
-        self.scenario_template = scenario.to_string();
-    }
-
-    pub fn insert_context<T: Serialize>(&mut self, key: &str, value: T) {
-        self.context
-            .insert(key.into(), serde_json::to_value(value).unwrap());
-    }
-
     fn construct_param(&self) -> PromptMessage {
-        let mut tera = Tera::default();
-        tera.add_raw_template("req", &format!("{}\n\n{{{{ output_template }}}}\n\nYou are a json generator. Generate in json template above.", self.scenario_template))
-            .unwrap();
-        let mut context = Context::new();
-        self.context.iter().for_each(|(k, v)| {
-            context.insert(k, v);
-        });
-
-        context.insert("output_template", &self.response_template);
-
-        let mut group = PromptMessage::new_key_value("");
-        group.add_message("", tera.render("req", &context).unwrap().as_str());
-        group
+        let mut templated = TemplatedMessage::new("{{{{ output_template }}}}\n\nYou are a json generator. Generate in json template above.");
+        templated.insert("output_template", &self.response_template);
+        templated.into()
     }
 }
 
@@ -83,7 +58,7 @@ impl UnitProcess for JsonGeneratorUnit {
 #[cfg(test)]
 mod tests {
     use serde::Deserialize;
-    use sllm::message::PromptMessageBuilder;
+    use sllm::message::{PromptMessageBuilder, TemplatedMessage};
 
     use crate::{prelude::*, sync::block_on};
     use crate::{ModuleParam, UnitProcess};
@@ -133,11 +108,12 @@ Treasure location is in facility. Do not duplicate treasure location and the loc
     #[test]
     fn test_find_treasure() {
         let mut unit = JsonGeneratorUnit::new("ScenarioUnit");
-        unit.set_scenario_template(REQUEST_FIND_TREASURE_STR);
-        unit.insert_context("num_npcs", 5);
-        unit.insert_context("num_facilities", 8);
-        unit.insert_context("num_clues", 3);
         unit.update_response_template::<ScenarioResponse>();
+
+        let mut templated = TemplatedMessage::new(REQUEST_FIND_TREASURE_STR);
+        templated.insert("num_npcs", &5);
+        templated.insert("num_facilities", &8);
+        templated.insert("num_clues", &3);
 
         let Ok(ModuleParam::MessageBuilders(groups)) =
             block_on(async move { unit.process(ModuleParam::None).await })
