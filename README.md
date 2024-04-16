@@ -34,17 +34,6 @@ OPEN_API_KEY=your_api_key_here
 ```
 
 - **Find Treasure**: A game simulation where the player's goal is to find treasure in a dynamically generated scenario by interacting with NPCs.
-  ```
-  cargo run -p find-treasure
-  ```
 
 - **Ecommerce Chat Assistant**: A limited simulation agent that, based on customer inputs (such as name and order ID), explains the current state of an order.
-  ```
-  cargo run -p ecommerce-assistant
-  ```
-
-
-
-
-
 

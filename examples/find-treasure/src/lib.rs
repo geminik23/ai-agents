@@ -41,6 +41,7 @@ impl ToString for CharacterDescription {
 
 #[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "inbevy", derive(bevy::ecs::system::Resource))]
 pub struct Scenario {
     pub town: EntityDescription,
     pub facilities: Vec<EntityDescription>,
@@ -108,6 +109,7 @@ const RULES: [&'static str; 3] = [
 ];
 
 #[derive(Debug)]
+#[cfg_attr(feature = "inbevy", derive(bevy::ecs::system::Resource))]
 pub struct GameState {
     description: String,
     treasure_place: String,
