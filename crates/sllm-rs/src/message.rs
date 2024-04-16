@@ -5,7 +5,7 @@ use tera::{Context, Tera};
 pub use crate::traits::MessageBuilder;
 
 #[derive(Clone)]
-pub enum PromptMessageGroup {
+pub enum PromptMessage {
     KeyValue {
         title: String,
         messages: Vec<(String, Arc<dyn Fn() -> String + Send + Sync>)>,
@@ -17,15 +17,15 @@ pub enum PromptMessageGroup {
     Simple(String),
 }
 
-impl From<String> for PromptMessageGroup {
+impl From<String> for PromptMessage {
     fn from(value: String) -> Self {
-        PromptMessageGroup::Simple(value)
+        PromptMessage::Simple(value)
     }
 }
 
-impl From<&str> for PromptMessageGroup {
+impl From<&str> for PromptMessage {
     fn from(value: &str) -> Self {
-        PromptMessageGroup::Simple(value.to_string())
+        PromptMessage::Simple(value.to_string())
     }
 }
 // #[derive(Clone)]
@@ -34,10 +34,10 @@ impl From<&str> for PromptMessageGroup {
 //     messages: Vec<(String, Arc<dyn Fn() -> String + Send + Sync>)>,
 // }
 
-impl std::fmt::Debug for PromptMessageGroup {
+impl std::fmt::Debug for PromptMessage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            PromptMessageGroup::KeyValue { title, messages } => {
+            PromptMessage::KeyValue { title, messages } => {
                 f.debug_struct("KeyValue")
                     .field("title", &title)
                     .field(
@@ -49,39 +49,39 @@ impl std::fmt::Debug for PromptMessageGroup {
                     ) // can't display closures, so only the keys.
                     .finish()
             }
-            PromptMessageGroup::Templated { template, context } => f
+            PromptMessage::Templated { template, context } => f
                 .debug_struct("Templated")
                 .field("template", &template)
                 .field("context", &context)
                 .finish(),
-            PromptMessageGroup::Simple(message) => f.debug_tuple("Simple").field(message).finish(),
+            PromptMessage::Simple(message) => f.debug_tuple("Simple").field(message).finish(),
         }
     }
 }
 
-impl PromptMessageGroup {
+impl PromptMessage {
     pub fn new_key_value(title: &str) -> Self {
-        PromptMessageGroup::KeyValue {
+        PromptMessage::KeyValue {
             title: title.into(),
             messages: Vec::new(),
         }
     }
 
     pub fn new_templated(template: &str, context: HashMap<String, String>) -> Self {
-        PromptMessageGroup::Templated {
+        PromptMessage::Templated {
             template: template.into(),
             context,
         }
     }
 
     pub fn new_simple(message: String) -> Self {
-        PromptMessageGroup::Simple(message)
+        PromptMessage::Simple(message)
     }
 
     // A method to add a static message
     pub fn add_message(&mut self, key: &str, value: &str) {
         match self {
-            PromptMessageGroup::KeyValue { messages, .. } => {
+            PromptMessage::KeyValue { messages, .. } => {
                 let v = value.to_string();
                 let value_arc = Arc::new(move || v.clone());
                 messages.push((key.into(), value_arc));
@@ -96,7 +96,7 @@ impl PromptMessageGroup {
         F: Fn() -> String + 'static + Send + Sync,
     {
         match self {
-            PromptMessageGroup::KeyValue { messages, .. } => {
+            PromptMessage::KeyValue { messages, .. } => {
                 messages.push((key.into(), Arc::new(value)));
             }
             _ => panic!("add_message_dyn is only valid for KeyValue variants"),
@@ -104,10 +104,10 @@ impl PromptMessageGroup {
     }
 }
 
-impl MessageBuilder for PromptMessageGroup {
+impl MessageBuilder for PromptMessage {
     fn build(&mut self) -> String {
         match self {
-            PromptMessageGroup::KeyValue { title, messages } => {
+            PromptMessage::KeyValue { title, messages } => {
                 let rendered_messages = messages
                     .iter()
                     .map(|(key, value_fn)| format!("{}: {}", key, value_fn()))
@@ -120,7 +120,7 @@ impl MessageBuilder for PromptMessageGroup {
                     format!("[{}]\n{}", title, rendered_messages)
                 }
             }
-            PromptMessageGroup::Templated { template, context } => {
+            PromptMessage::Templated { template, context } => {
                 let mut tera = Tera::default();
                 tera.add_raw_template("template", template).unwrap();
                 let mut tera_context = Context::new();
@@ -129,7 +129,7 @@ impl MessageBuilder for PromptMessageGroup {
                 }
                 tera.render("template", &tera_context).unwrap()
             }
-            PromptMessageGroup::Simple(message) => message.clone(),
+            PromptMessage::Simple(message) => message.clone(),
         }
     }
 }
@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_key_value_insert_and_build() {
-        let mut group = PromptMessageGroup::new_key_value("Test Group");
+        let mut group = PromptMessage::new_key_value("Test Group");
         group.add_message_dyn("Key1", || "Value1".to_string());
         group.add_message("Key2", "Value2");
 
@@ -194,7 +194,7 @@ mod tests {
     fn test_templated_build() {
         let mut context = HashMap::new();
         context.insert("name".to_string(), "World".to_string());
-        let mut group = PromptMessageGroup::new_templated("Hello, {{ name }}!", context);
+        let mut group = PromptMessage::new_templated("Hello, {{ name }}!", context);
         let output = group.build();
         let expected_output = "Hello, World!";
         assert_eq!(output, expected_output);
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_simple_build() {
-        let mut group = PromptMessageGroup::new_simple("Just a simple message.".to_string());
+        let mut group = PromptMessage::new_simple("Just a simple message.".to_string());
         let output = group.build();
         let expected_output = "Just a simple message.";
         assert_eq!(output, expected_output);
