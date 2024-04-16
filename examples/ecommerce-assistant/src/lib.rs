@@ -72,15 +72,14 @@ impl EcommerceChatAssistant {
         // Prompt setting
         let mut prompt = PromptManager::new();
 
-        let mut ctx_background = PromptMessageGroup::new("Background");
-        ctx_background.insert("", &format!("You are an online assistant for the e-commerce company, {}. Your role is to provide support in a friendly and natural manner.", company));
-        ctx_background.insert("", " To accurately determine the status of an order, it is essential to obtain the customer's name and order number.");
+        let mut ctx_background = PromptMessageGroup::new_key_value("Background");
+        ctx_background.add_message("", &format!("You are an online assistant for the e-commerce company, {}. Your role is to provide support in a friendly and natural manner.", company));
+        ctx_background.add_message("", " To accurately determine the status of an order, it is essential to obtain the customer's name and order number.");
 
-        let mut ctx_command = PromptMessageGroup::new("Command");
-        ctx_command.insert("", COMMAND_DESCRIPTION);
+        let mut ctx_command = PromptMessageGroup::new_key_value("Command");
+        ctx_command.add_message("", COMMAND_DESCRIPTION);
 
-        let mut ctx_rule = PromptMessageGroup::new("");
-        ctx_rule.insert("", "If there is order information available that corresponds to the provided customer's name and order ID, the assistant must ignore the 'Command' and give answer based on the order status.");
+        let mut ctx_rule = PromptMessageGroup::new_simple("If there is order information available that corresponds to the provided customer's name and order ID, the assistant must ignore the 'Command' and give answer based on the order status.".into());
 
         prompt.insert_prompt("b", ctx_background);
         prompt.insert_prompt("c", ctx_command);
@@ -119,8 +118,8 @@ impl EcommerceChatAssistant {
         });
 
         self.order_info.as_ref().map(|v| {
-            let mut group = PromptMessageGroup::new("Order List");
-            group.insert("", &{
+            let mut group = PromptMessageGroup::new_key_value("Order List");
+            group.add_message("", &{
                 let this = &v;
                 serde_json::to_string(this).unwrap()
             });

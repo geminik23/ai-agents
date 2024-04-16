@@ -1,80 +1,135 @@
-use std::sync::Arc;
+use std::{collections::HashMap, fmt, sync::Arc};
+
+use tera::{Context, Tera};
 
 pub use crate::traits::MessageBuilder;
 
 #[derive(Clone)]
-pub struct PromptMessageGroup {
-    title: String,
-    messages: Vec<(String, Arc<dyn Fn() -> String + Send + Sync>)>,
+pub enum PromptMessageGroup {
+    KeyValue {
+        title: String,
+        messages: Vec<(String, Arc<dyn Fn() -> String + Send + Sync>)>,
+    },
+    Templated {
+        template: String,
+        context: HashMap<String, String>,
+    },
+    Simple(String),
 }
 
+impl From<String> for PromptMessageGroup {
+    fn from(value: String) -> Self {
+        PromptMessageGroup::Simple(value)
+    }
+}
+
+impl From<&str> for PromptMessageGroup {
+    fn from(value: &str) -> Self {
+        PromptMessageGroup::Simple(value.to_string())
+    }
+}
+// #[derive(Clone)]
+// pub struct PromptMessageGroup {
+//     title: String,
+//     messages: Vec<(String, Arc<dyn Fn() -> String + Send + Sync>)>,
+// }
+
 impl std::fmt::Debug for PromptMessageGroup {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PromptMessageGroup")
-            .field("title", &self.title)
-            // Optionally, you can show the number of messages or their titles
-            // but not the closures themselves as they do not implement Debug
-            .field(
-                "messages",
-                &self
-                    .messages
-                    .iter()
-                    .map(|(title, _)| title)
-                    .collect::<Vec<_>>(),
-            )
-            .finish()
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PromptMessageGroup::KeyValue { title, messages } => {
+                f.debug_struct("KeyValue")
+                    .field("title", &title)
+                    .field(
+                        "messages",
+                        &messages
+                            .iter()
+                            .map(|(key, _)| key.clone())
+                            .collect::<Vec<String>>(),
+                    ) // can't display closures, so only the keys.
+                    .finish()
+            }
+            PromptMessageGroup::Templated { template, context } => f
+                .debug_struct("Templated")
+                .field("template", &template)
+                .field("context", &context)
+                .finish(),
+            PromptMessageGroup::Simple(message) => f.debug_tuple("Simple").field(message).finish(),
+        }
     }
 }
 
 impl PromptMessageGroup {
-    // Constructor for a new PromptMessageGroup with a title.
-    pub fn new(title: &str) -> Self {
-        PromptMessageGroup {
-            title: title.to_string(),
+    pub fn new_key_value(title: &str) -> Self {
+        PromptMessageGroup::KeyValue {
+            title: title.into(),
             messages: Vec::new(),
         }
     }
 
-    // Inserts a static message into the group.
-    pub fn insert(&mut self, key: &str, value: &str) {
-        let v = value.to_string();
-        self.messages
-            .push((key.to_string(), Arc::new(move || v.clone())));
+    pub fn new_templated(template: &str, context: HashMap<String, String>) -> Self {
+        PromptMessageGroup::Templated {
+            template: template.into(),
+            context,
+        }
     }
 
-    // Inserts a dynamic message into the group.
-    pub fn insert_dyn<F>(&mut self, key: &str, value: F)
+    pub fn new_simple(message: String) -> Self {
+        PromptMessageGroup::Simple(message)
+    }
+
+    // A method to add a static message
+    pub fn add_message(&mut self, key: &str, value: &str) {
+        match self {
+            PromptMessageGroup::KeyValue { messages, .. } => {
+                let v = value.to_string();
+                let value_arc = Arc::new(move || v.clone());
+                messages.push((key.into(), value_arc));
+            }
+            _ => panic!("add_message is only valid for KeyValue variants"),
+        }
+    }
+
+    // A method to add a dynamic message
+    pub fn add_message_dyn<F>(&mut self, key: &str, value: F)
     where
         F: Fn() -> String + 'static + Send + Sync,
     {
-        self.messages.push((key.to_string(), Arc::new(value)));
-    }
-
-    // Removes a message by key.
-    pub fn remove_key(&mut self, key: &str) {
-        self.messages.retain(|(k, _)| k != key);
+        match self {
+            PromptMessageGroup::KeyValue { messages, .. } => {
+                messages.push((key.into(), Arc::new(value)));
+            }
+            _ => panic!("add_message_dyn is only valid for KeyValue variants"),
+        }
     }
 }
 
 impl MessageBuilder for PromptMessageGroup {
     fn build(&mut self) -> String {
-        let messages = self
-            .messages
-            .iter()
-            .map(|(key, value_fn)| {
-                if key.is_empty() {
-                    format!("{}", value_fn())
-                } else {
-                    format!("{}: {}", key, value_fn())
-                }
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
+        match self {
+            PromptMessageGroup::KeyValue { title, messages } => {
+                let rendered_messages = messages
+                    .iter()
+                    .map(|(key, value_fn)| format!("{}: {}", key, value_fn()))
+                    .collect::<Vec<String>>()
+                    .join("\n");
 
-        if self.title.is_empty() {
-            messages
-        } else {
-            format!("[{}]\n{}", self.title, messages)
+                if title.is_empty() {
+                    rendered_messages
+                } else {
+                    format!("[{}]\n{}", title, rendered_messages)
+                }
+            }
+            PromptMessageGroup::Templated { template, context } => {
+                let mut tera = Tera::default();
+                tera.add_raw_template("template", template).unwrap();
+                let mut tera_context = Context::new();
+                for (key, value) in context {
+                    tera_context.insert(key, value);
+                }
+                tera.render("template", &tera_context).unwrap()
+            }
+            PromptMessageGroup::Simple(message) => message.clone(),
         }
     }
 }
@@ -120,95 +175,36 @@ where
     }
 }
 
-// pub struct PromptMessageBuilder {
-//     groups: Vec<PromptMessageGroup>,
-// }
-//
-// impl PromptMessageBuilder {
-//     // Constructor for a new PromptMessageBuilder with groups.
-//     pub fn new(groups: Vec<PromptMessageGroup>) -> Self {
-//         PromptMessageBuilder { groups }
-//     }
-// }
-//
-// impl MessageBuilder for PromptMessageBuilder {
-//     fn build(&self) -> String {
-//         self.groups
-//             .iter()
-//             .map(|group| group.build())
-//             .collect::<Vec<String>>()
-//             .join("\n\n")
-//     }
-// }
-
-// pub struct PromptMessageBuilder<'a> {
-//     groups: Vec<&'a PromptMessageGroup>,
-// }
-//
-// impl<'a> PromptMessageBuilder<'a> {
-//     // Constructor for a new PromptMessageBuilder with groups.
-//     pub fn new(groups: Vec<&'a PromptMessageGroup>) -> Self {
-//         PromptMessageBuilder { groups }
-//     }
-// }
-//
-// impl<'a> MessageBuilder for PromptMessageBuilder<'a> {
-//     fn build(&self) -> String {
-//         self.groups
-//             .iter()
-//             .map(|group| group.build())
-//             .collect::<Vec<String>>()
-//             .join("\n\n")
-//     }
-// }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_insert_static_message() {
-        let mut group = PromptMessageGroup::new("Test Group");
-        group.insert("Key1", "Value1");
-        group.insert("Key2", "Value2");
+    fn test_key_value_insert_and_build() {
+        let mut group = PromptMessageGroup::new_key_value("Test Group");
+        group.add_message_dyn("Key1", || "Value1".to_string());
+        group.add_message("Key2", "Value2");
 
-        // Assuming a method to retrieve a message for testing purposes
-        // This part is purely illustrative; actual implementation may vary
-        assert_eq!(group.messages[0].0, "Key1");
-        assert_eq!((group.messages[0].1)(), "Value1");
-        assert_eq!(group.messages[1].0, "Key2");
-        assert_eq!((group.messages[1].1)(), "Value2");
+        let output = group.build();
+        let expected_output = "[Test Group]\nKey1: Value1\nKey2: Value2";
+        assert_eq!(output, expected_output);
     }
 
     #[test]
-    fn test_insert_dynamic_message() {
-        let dynamic_value = || "Dynamic Value".to_string();
-        let mut group = PromptMessageGroup::new("Group");
-        group.insert_dyn("Key", dynamic_value);
-
-        assert_eq!(group.messages[0].0, "Key");
-        assert_eq!((group.messages[0].1)(), "Dynamic Value");
+    fn test_templated_build() {
+        let mut context = HashMap::new();
+        context.insert("name".to_string(), "World".to_string());
+        let mut group = PromptMessageGroup::new_templated("Hello, {{ name }}!", context);
+        let output = group.build();
+        let expected_output = "Hello, World!";
+        assert_eq!(output, expected_output);
     }
 
     #[test]
-    fn test_remove_key() {
-        let mut group = PromptMessageGroup::new("Group");
-        group.insert("Key", "Value");
-        assert_eq!(group.messages.len(), 1);
-        group.remove_key("Key");
-        assert!(group.messages.is_empty());
-    }
-
-    #[test]
-    fn test_build_output() {
-        let mut group1 = PromptMessageGroup::new("Group1");
-        group1.insert("Key1", "Value1");
-        let mut group2 = PromptMessageGroup::new("Group2");
-        group2.insert("Key2", "Value2");
-
-        let output = PromptMessageBuilder::new(vec![group1, group2]).build();
-
-        let expected_output = "[Group1]\nKey1: Value1\n\n[Group2]\nKey2: Value2";
+    fn test_simple_build() {
+        let mut group = PromptMessageGroup::new_simple("Just a simple message.".to_string());
+        let output = group.build();
+        let expected_output = "Just a simple message.";
         assert_eq!(output, expected_output);
     }
 }

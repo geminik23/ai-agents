@@ -67,12 +67,12 @@ impl DialogueUnit {
     }
 
     fn construct_param(&self) -> PromptMessageGroup {
-        let mut group = PromptMessageGroup::new("Dialogue");
+        let mut group = PromptMessageGroup::new_key_value("Dialogue");
         self.dialogues.iter().for_each(|entry| {
-            group.insert(&entry.name, &entry.message);
+            group.add_message(&entry.name, &entry.message);
         });
         if let Some(responder_name) = &self.responder_name {
-            group.insert(responder_name, "");
+            group.add_message(responder_name, "");
         }
         group
     }
@@ -91,8 +91,8 @@ impl UnitProcess for DialogueUnit {
         // ignore the input
         let mut groups = match input {
             ModuleParam::Str(req) => {
-                let mut group = PromptMessageGroup::new("");
-                group.insert("", req.as_str());
+                let mut group = PromptMessageGroup::new_key_value("");
+                group.add_message("", req.as_str());
                 vec![group]
             }
             ModuleParam::MessageBuilders(builder) => builder,

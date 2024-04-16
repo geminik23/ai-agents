@@ -46,8 +46,8 @@ impl JsonGeneratorUnit {
 
         context.insert("output_template", &self.response_template);
 
-        let mut group = PromptMessageGroup::new("");
-        group.insert("", tera.render("req", &context).unwrap().as_str());
+        let mut group = PromptMessageGroup::new_key_value("");
+        group.add_message("", tera.render("req", &context).unwrap().as_str());
         group
     }
 }
@@ -65,9 +65,7 @@ impl UnitProcess for JsonGeneratorUnit {
         // ignore the input
         let mut groups = match input {
             ModuleParam::Str(req) => {
-                let mut group = PromptMessageGroup::new("");
-                group.insert("", req.as_str());
-                vec![group]
+                vec![req.into()]
             }
             ModuleParam::MessageBuilders(builder) => builder,
             ModuleParam::None => {

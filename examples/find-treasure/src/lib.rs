@@ -63,9 +63,9 @@ impl ToString for Scenario {
 
 impl Scenario {
     pub fn construct_background_message(&self) -> PromptMessageGroup {
-        let mut group = PromptMessageGroup::new("Background");
-        group.insert("Town", self.town.to_string().as_str());
-        group.insert(
+        let mut group = PromptMessageGroup::new_key_value("Background");
+        group.add_message("Town", self.town.to_string().as_str());
+        group.add_message(
             "Facilities",
             self.facilities
                 .iter()
@@ -74,7 +74,7 @@ impl Scenario {
                 .join(";")
                 .as_str(),
         );
-        group.insert(
+        group.add_message(
             "Characters",
             self.characters
                 .iter()
@@ -83,10 +83,10 @@ impl Scenario {
                 .join(";")
                 .as_str(),
         );
-        group.insert("Treasure Place", &self.treasure_place);
-        group.insert("Goal", "Find the treasure.");
-        group.insert("Play method", "Get the clue by visiting NPCs in order.");
-        group.insert("Visit order", &self.visit_order.join(","));
+        group.add_message("Treasure Place", &self.treasure_place);
+        group.add_message("Goal", "Find the treasure.");
+        group.add_message("Play method", "Get the clue by visiting NPCs in order.");
+        group.add_message("Visit order", &self.visit_order.join(","));
         group
     }
 }
@@ -200,11 +200,11 @@ impl GameState {
         completed_order_count: usize,
         cur_npc: &str,
     ) -> PromptMessageGroup {
-        let mut game_state = PromptMessageGroup::new("Game State");
-        game_state.insert("Goal", "Find the treasure location.");
-        game_state.insert("Player", "Treasure Hunter.");
-        game_state.insert("Visit Order", scene_response.visit_order.join(",").as_str());
-        game_state.insert(
+        let mut game_state = PromptMessageGroup::new_key_value("Game State");
+        game_state.add_message("Goal", "Find the treasure location.");
+        game_state.add_message("Player", "Treasure Hunter.");
+        game_state.add_message("Visit Order", scene_response.visit_order.join(",").as_str());
+        game_state.add_message(
             "Visited",
             scene_response
                 .visit_order
@@ -219,9 +219,9 @@ impl GameState {
 
         if let Some(next) = scene_response.visit_order.get(completed_order_count) {
             let is_last_npc = completed_order_count >= scene_response.visit_order.len() - 1;
-            game_state.insert("Next", next.as_str());
-            game_state.insert("", "");
-            game_state.insert(
+            game_state.add_message("Next", next.as_str());
+            game_state.add_message("", "");
+            game_state.add_message(
                 "",
                 RULES[if next == cur_npc {
                     if is_last_npc {

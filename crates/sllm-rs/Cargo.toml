@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 # ureq = { version="2.9", features = ["json"] }
 ehttp = {version = "0.5", features=["native-async"]}
+tera = "1.19"
 
 [dev-dependencies]
 dotenv.workspace = true

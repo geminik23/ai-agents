@@ -28,9 +28,7 @@ impl UnitProcess for ModelUnit {
         // ignore the input
         let groups = match input {
             ModuleParam::Str(req) => {
-                let mut group = PromptMessageGroup::new("");
-                group.insert("", req.as_str());
-                vec![group]
+                vec![PromptMessageGroup::new_simple(req)]
             }
             ModuleParam::MessageBuilders(builder) => builder,
             ModuleParam::None => {
