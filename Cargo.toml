@@ -47,7 +47,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 sllm-rs = "0.1"
 ai-agent-macro = "0.1"
-tera = "1.19"
 
 smol.workspace = true
 

@@ -35,7 +35,7 @@ impl JsonGeneratorUnit {
             .insert(key.into(), serde_json::to_value(value).unwrap());
     }
 
-    fn construct_param(&self) -> PromptMessageGroup {
+    fn construct_param(&self) -> PromptMessage {
         let mut tera = Tera::default();
         tera.add_raw_template("req", &format!("{}\n\n{{{{ output_template }}}}\n\nYou are a json generator. Generate in json template above.", self.scenario_template))
             .unwrap();
@@ -46,7 +46,7 @@ impl JsonGeneratorUnit {
 
         context.insert("output_template", &self.response_template);
 
-        let mut group = PromptMessageGroup::new_key_value("");
+        let mut group = PromptMessage::new_key_value("");
         group.add_message("", tera.render("req", &context).unwrap().as_str());
         group
     }

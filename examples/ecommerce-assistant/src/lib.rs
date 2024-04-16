@@ -72,14 +72,14 @@ impl EcommerceChatAssistant {
         // Prompt setting
         let mut prompt = PromptManager::new();
 
-        let mut ctx_background = PromptMessageGroup::new_key_value("Background");
+        let mut ctx_background = PromptMessage::new_key_value("Background");
         ctx_background.add_message("", &format!("You are an online assistant for the e-commerce company, {}. Your role is to provide support in a friendly and natural manner.", company));
         ctx_background.add_message("", " To accurately determine the status of an order, it is essential to obtain the customer's name and order number.");
 
-        let mut ctx_command = PromptMessageGroup::new_key_value("Command");
+        let mut ctx_command = PromptMessage::new_key_value("Command");
         ctx_command.add_message("", COMMAND_DESCRIPTION);
 
-        let mut ctx_rule = PromptMessageGroup::new_simple("If there is order information available that corresponds to the provided customer's name and order ID, the assistant must ignore the 'Command' and give answer based on the order status.".into());
+        let mut ctx_rule = PromptMessage::new_simple("If there is order information available that corresponds to the provided customer's name and order ID, the assistant must ignore the 'Command' and give answer based on the order status.".into());
 
         prompt.insert_prompt("b", ctx_background);
         prompt.insert_prompt("c", ctx_command);
@@ -109,7 +109,7 @@ impl EcommerceChatAssistant {
         self.order_info = Some(order_info);
     }
 
-    fn get_background(&mut self) -> Vec<PromptMessageGroup> {
+    fn get_background(&mut self) -> Vec<PromptMessage> {
         // set background
         let mut prompt = self.prompt.get(if self.received_customer_info.is_some() {
             PromptType::WithOrderInfo
@@ -118,7 +118,7 @@ impl EcommerceChatAssistant {
         });
 
         self.order_info.as_ref().map(|v| {
-            let mut group = PromptMessageGroup::new_key_value("Order List");
+            let mut group = PromptMessage::new_key_value("Order List");
             group.add_message("", &{
                 let this = &v;
                 serde_json::to_string(this).unwrap()

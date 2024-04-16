@@ -1,12 +1,12 @@
 use std::{collections::HashMap, hash::Hash};
 
-use sllm::message::PromptMessageGroup;
+use sllm::message::PromptMessage;
 
 //
 // PromptManager
 #[derive(Debug)]
 pub struct PromptManager<T: Hash + Eq> {
-    prompts: HashMap<String, PromptMessageGroup>,
+    prompts: HashMap<String, PromptMessage>,
     patterns: HashMap<T, String>,
 }
 
@@ -22,7 +22,7 @@ impl<T: Hash + Eq> PromptManager<T> {
         pattern.split_whitespace()
     }
 
-    pub fn insert_prompt(&mut self, alias: &str, prompt: PromptMessageGroup) {
+    pub fn insert_prompt(&mut self, alias: &str, prompt: PromptMessage) {
         self.prompts.insert(alias.into(), prompt);
     }
 
@@ -30,7 +30,7 @@ impl<T: Hash + Eq> PromptManager<T> {
         self.patterns.insert(key, pattern.into());
     }
 
-    pub fn get(&self, key: T) -> Vec<PromptMessageGroup> {
+    pub fn get(&self, key: T) -> Vec<PromptMessage> {
         self.patterns
             .get(&key)
             .into_iter()

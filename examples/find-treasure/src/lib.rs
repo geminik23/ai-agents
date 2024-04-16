@@ -62,8 +62,8 @@ impl ToString for Scenario {
 }
 
 impl Scenario {
-    pub fn construct_background_message(&self) -> PromptMessageGroup {
-        let mut group = PromptMessageGroup::new_key_value("Background");
+    pub fn construct_background_message(&self) -> PromptMessage {
+        let mut group = PromptMessage::new_key_value("Background");
         group.add_message("Town", self.town.to_string().as_str());
         group.add_message(
             "Facilities",
@@ -199,8 +199,8 @@ impl GameState {
         scene_response: &Scenario,
         completed_order_count: usize,
         cur_npc: &str,
-    ) -> PromptMessageGroup {
-        let mut game_state = PromptMessageGroup::new_key_value("Game State");
+    ) -> PromptMessage {
+        let mut game_state = PromptMessage::new_key_value("Game State");
         game_state.add_message("Goal", "Find the treasure location.");
         game_state.add_message("Player", "Treasure Hunter.");
         game_state.add_message("Visit Order", scene_response.visit_order.join(",").as_str());
@@ -384,8 +384,8 @@ impl FindTreasureAgent {
     //  ACTIONS
     pub async fn talk_to(
         &mut self,
-        scenario_prompt: PromptMessageGroup,
-        game_state_prompt: PromptMessageGroup,
+        scenario_prompt: PromptMessage,
+        game_state_prompt: PromptMessage,
         npc_name: &str,
     ) -> Result<String, Error> {
         // let Some(scenario) = &self.scenario else {

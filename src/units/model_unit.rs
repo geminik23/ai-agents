@@ -1,4 +1,4 @@
-use sllm::message::PromptMessageGroup;
+use sllm::message::PromptMessage;
 
 use crate::{Error, Model, ModuleParam, UnitProcess};
 
@@ -28,7 +28,7 @@ impl UnitProcess for ModelUnit {
         // ignore the input
         let groups = match input {
             ModuleParam::Str(req) => {
-                vec![PromptMessageGroup::new_simple(req)]
+                vec![PromptMessage::new_simple(req)]
             }
             ModuleParam::MessageBuilders(builder) => builder,
             ModuleParam::None => {

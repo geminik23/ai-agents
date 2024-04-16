@@ -1,6 +1,6 @@
 use std::slice::Iter;
 
-use sllm::message::PromptMessageGroup;
+use sllm::message::PromptMessage;
 
 use crate::{Error, ModuleParam, UnitProcess};
 
@@ -66,8 +66,8 @@ impl DialogueUnit {
         };
     }
 
-    fn construct_param(&self) -> PromptMessageGroup {
-        let mut group = PromptMessageGroup::new_key_value("Dialogue");
+    fn construct_param(&self) -> PromptMessage {
+        let mut group = PromptMessage::new_key_value("Dialogue");
         self.dialogues.iter().for_each(|entry| {
             group.add_message(&entry.name, &entry.message);
         });
@@ -91,7 +91,7 @@ impl UnitProcess for DialogueUnit {
         // ignore the input
         let mut groups = match input {
             ModuleParam::Str(req) => {
-                let mut group = PromptMessageGroup::new_key_value("");
+                let mut group = PromptMessage::new_key_value("");
                 group.add_message("", req.as_str());
                 vec![group]
             }

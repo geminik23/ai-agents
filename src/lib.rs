@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sllm::message::{MessageBuilder, PromptMessageGroup};
+use sllm::message::{MessageBuilder, PromptMessage};
 
 pub mod sync;
 pub mod units;
@@ -23,13 +23,13 @@ pub trait ToKeywordString {
 pub mod prelude {
     pub use super::ToKeywordString;
     pub use ai_agent_macro::*;
-    pub use sllm::message::{MessageBuilder, PromptMessageGroup};
+    pub use sllm::message::{MessageBuilder, PromptMessage};
 }
 
 #[derive(Debug, Clone)]
 pub enum ModuleParam {
     Str(String),
-    MessageBuilders(Vec<PromptMessageGroup>),
+    MessageBuilders(Vec<PromptMessage>),
     None,
 }
 
@@ -41,7 +41,7 @@ impl ModuleParam {
         }
     }
 
-    pub fn into_message_group(self) -> Option<Vec<PromptMessageGroup>> {
+    pub fn into_message_group(self) -> Option<Vec<PromptMessage>> {
         match self {
             Self::MessageBuilders(group) => Some(group),
             _ => None,
@@ -55,7 +55,7 @@ impl ModuleParam {
         }
     }
 
-    pub fn as_message_group(&self) -> Option<&Vec<PromptMessageGroup>> {
+    pub fn as_message_group(&self) -> Option<&Vec<PromptMessage>> {
         match self {
             Self::MessageBuilders(group) => Some(group),
             _ => None,
@@ -82,8 +82,8 @@ impl From<&str> for ModuleParam {
     }
 }
 
-impl From<Vec<PromptMessageGroup>> for ModuleParam {
-    fn from(val: Vec<PromptMessageGroup>) -> Self {
+impl From<Vec<PromptMessage>> for ModuleParam {
+    fn from(val: Vec<PromptMessage>) -> Self {
         ModuleParam::MessageBuilders(val)
     }
 }
