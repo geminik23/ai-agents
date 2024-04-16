@@ -1,6 +1,6 @@
 use ai_agents::units::ModelUnit;
 use ai_agents::{prelude::*, sync::RwLock, Model};
-use ai_agents::{units::DialogueUnit, Backend, PromptManager};
+use ai_agents::{units::DialogueUnit, PromptManager};
 use ai_agents::{Error, ModuleParam, PipelineNet};
 use serde::Serialize;
 use std::sync::Arc;

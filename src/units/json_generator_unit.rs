@@ -7,14 +7,14 @@ use serde::Serialize;
 use crate::{prelude::*, Error, ModuleParam, UnitProcess};
 
 #[derive(Debug, Default)]
-pub struct ScenarioUnit {
+pub struct JsonGeneratorUnit {
     name: String,
     scenario_template: String,
     response_template: String,
     context: HashMap<String, serde_json::Value>,
 }
 
-impl ScenarioUnit {
+impl JsonGeneratorUnit {
     pub fn new(name: &str) -> Self {
         Self {
             name: name.into(),
@@ -53,7 +53,7 @@ impl ScenarioUnit {
 }
 
 #[async_trait::async_trait]
-impl UnitProcess for ScenarioUnit {
+impl UnitProcess for JsonGeneratorUnit {
     fn get_name(&self) -> &str {
         self.name.as_str()
     }
@@ -90,7 +90,7 @@ mod tests {
     use crate::{prelude::*, sync::block_on};
     use crate::{ModuleParam, UnitProcess};
 
-    use super::ScenarioUnit;
+    use super::JsonGeneratorUnit;
 
     const REQUEST_FIND_TREASURE_STR: &'static str = r#"This is the one episode in RPG game.
 
@@ -109,6 +109,12 @@ Treasure location is in facility. Do not duplicate treasure location and the loc
         description: String,
     }
 
+    impl ToKeywordString for EntityDescription {
+        fn to_keyword_string() -> String {
+            "{name, description}".into()
+        }
+    }
+
     #[allow(dead_code)]
     #[derive(Debug, Deserialize)]
     struct ScenarioResponse {
@@ -121,14 +127,14 @@ Treasure location is in facility. Do not duplicate treasure location and the loc
 
     impl ToKeywordString for ScenarioResponse {
         fn to_keyword_string() -> String {
-            "{town{name, descriptoin}, facilities[{name, description}], characters[{name, description}], visit_order, treasure_place}".into()
+            "{town{name, description}, facilities[{name, description}], characters[{name, description}], visit_order, treasure_place}".into()
         }
     }
 
     #[ignore]
     #[test]
     fn test_find_treasure() {
-        let mut unit = ScenarioUnit::new("ScenarioUnit");
+        let mut unit = JsonGeneratorUnit::new("ScenarioUnit");
         unit.set_scenario_template(REQUEST_FIND_TREASURE_STR);
         unit.insert_context("num_npcs", 5);
         unit.insert_context("num_facilities", 8);
