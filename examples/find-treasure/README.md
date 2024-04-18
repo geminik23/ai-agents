@@ -27,7 +27,7 @@ To play "Find Treasure," use one of the following commands depending on your pre
 
 ## Preview
 
-![play-gif]()
+![play-inbevy-gif](./imgs/playing_bevy.gif)
 
 
 ## Game Features
