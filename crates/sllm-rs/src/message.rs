@@ -136,7 +136,13 @@ impl MessageBuilder for PromptMessage {
             PromptMessage::KeyValue { title, messages } => {
                 let rendered_messages = messages
                     .iter()
-                    .map(|(key, value_fn)| format!("{}: {}", key, value_fn()))
+                    .map(|(key, value_fn)| {
+                        if key.is_empty() {
+                            format!("{}", value_fn())
+                        } else {
+                            format!("{}: {}", key, value_fn())
+                        }
+                    })
                     .collect::<Vec<String>>()
                     .join("\n");
 

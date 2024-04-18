@@ -21,7 +21,9 @@ impl JsonGeneratorUnit {
     }
 
     fn construct_param(&self) -> PromptMessage {
-        let mut templated = TemplatedMessage::new("{{{{ output_template }}}}\n\nYou are a json generator. Generate in json template above.");
+        let mut templated = TemplatedMessage::new(
+            "{{ output_template }}\n\nYou are a json generator. Generate in json template above.",
+        );
         templated.insert("output_template", &self.response_template);
         templated.into()
     }
@@ -115,9 +117,10 @@ Treasure location is in facility. Do not duplicate treasure location and the loc
         templated.insert("num_facilities", &8);
         templated.insert("num_clues", &3);
 
-        let Ok(ModuleParam::MessageBuilders(groups)) =
-            block_on(async move { unit.process(ModuleParam::None).await })
-        else {
+        let Ok(ModuleParam::MessageBuilders(groups)) = block_on(async move {
+            unit.process(ModuleParam::MessageBuilders(vec![templated.into()]))
+                .await
+        }) else {
             assert!(false);
             return;
         };

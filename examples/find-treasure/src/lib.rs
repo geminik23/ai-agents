@@ -297,21 +297,33 @@ impl GameState {
     }
 }
 
-const REQUEST_FIND_TREASURE_STR: &'static str = r#"This is the one episode in RPG game.
+const REQUEST_FIND_TREASURE_STR: &'static str = r#"This episode in an RPG involves finding a treasure hidden in a town with {{ num_npcs }} NPCs and {{ num_facilities }} facilities. 
 
-The goal is to find the treasure in the town.
+Only {{ num_clues }} NPCs have clues about the treasure's location, which is in a facility not associated with the NPCs holding clues. 
 
-Generate background of town include facilities and NPCs with background, and the orders player talk to who to finish the game.
+Players must talk to the clue-holding NPCs in a specific order based on their names to find the treasure. 
 
-The way of finding treasure is to talk to NPCs in town in specific order and goes to some place.
+Describe the town, facilities, and clue-holding NPCs, ensuring the visit order (NPC name) is clear. Make sure the number of NPCs, facilities, and visit order specified above are explicitly stated.
+"#;
 
-There are {{ num_npcs }} NPCs and {{ num_facilities }} facilities in Town, And only {{ num_clues }} NPCs have clue. 
-
-Treasure location is facility. 
-
-Do not duplicate treasure location with locations of characters who have clue. 
-
-The number of NPCs who have clues should be equal with the number of visit order."#;
+// OLD
+// This is the one episode in RPG game.
+//
+// The goal is to find the treasure in the town.
+//
+// Generate background of town include facilities and NPCs with background, and the orders player talk to who to finish the game.
+//
+// The way of finding treasure is to talk to NPCs in town in specific order and goes to some place.
+//
+// There are {{ num_npcs }} NPCs and {{ num_facilities }} facilities in Town, And only {{ num_clues }} NPCs have clue.
+//
+// Treasure location is facility.
+//
+// Do not duplicate treasure location with locations of characters who have clue.
+//
+// The number of NPCs who have clues should be equal with the number of visit order.
+//
+//
 // #[derive(Debug)]
 pub struct FindTreasureAgent {
     // scenario_unit: Arc<RwLock<JsonGeneratorUnit>>,
@@ -365,9 +377,14 @@ impl FindTreasureAgent {
         in_param.insert("num_facilities", &self.param.num_facilities);
         in_param.insert("num_clues", &self.param.num_clues);
 
+        // printout
+        // let mut msg = PromptMessage::new_templated(in_param.clone());
+        // println!("{}", msg.build());
+
+        let in_param = ModuleParam::MessageBuilders(vec![in_param.into()]);
         let responses = self
             .pipeline_net
-            .process_group("scenario", ModuleParam::None)
+            .process_group("scenario", in_param)
             .await?;
 
         let scenario: Scenario =
@@ -395,6 +412,8 @@ impl FindTreasureAgent {
             let mut unit = self.dialogue_unit.write().await;
             unit.set_responder_name(npc_name);
         }
+
+        // println!("{}", game_state_prompt.build());
 
         // let state = self.construct_game_state(&scenario, game_state.visited_count, npc_name);
         let param = ModuleParam::MessageBuilders(vec![scenario_prompt, game_state_prompt]);
