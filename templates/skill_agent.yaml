@@ -1,0 +1,52 @@
+# Skill-based Agent Template
+# Demonstrates skills and multi-LLM configuration
+
+name: "{{ agent_name | default('SkillAssistant') }}"
+version: "1.0.0"
+description: "An assistant with skill-based routing"
+
+system_prompt: |
+  You are a helpful assistant with specialized skills.
+  When a user's request matches one of your skills, use it to provide the best response.
+  Otherwise, respond naturally and helpfully.
+
+llm:
+  provider: "{{ llm_provider | default('openai') }}"
+  model: "{{ llm_model | default('gpt-4.1-nano') }}"
+
+skills:
+  - id: greeting
+    description: "Greet users warmly"
+    trigger: "When user says hello, hi, or greets"
+    steps:
+      - prompt: |
+          The user greeted you: "{{ user_input }}"
+          Respond with a warm, friendly greeting.
+
+  - id: calculator_help
+    description: "Help with math calculations"
+    trigger: "When user asks for calculation or math help"
+    steps:
+      - tool: calculator
+        args:
+          operation: "2 + 2"
+      - prompt: |
+          User asked: {{ user_input }}
+          Calculator result: {{ steps[0].result }}
+          Explain the result helpfully.
+
+tools:
+  - calculator
+  - echo
+
+memory:
+  type: in-memory
+  max_messages: 100
+
+max_iterations: 10
+
+metadata:
+  template: skill_agent
+  features:
+    - skills
+    - multi-llm

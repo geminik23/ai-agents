@@ -1,0 +1,19 @@
+skill: weather_clothes
+description: "Weather-based clothing recommendation"
+trigger: "When user asks about clothing, outfit preparation, or weather-appropriate attire"
+
+steps:
+  - tool: echo
+    args:
+      message: '{"temperature": 18, "condition": "sunny", "location": "Seoul"}'
+
+  - prompt: |
+      User question: {{ user_input }}
+
+      Current weather information:
+      - Location: {{ steps[0].result.location }}
+      - Temperature: {{ steps[0].result.temperature }}°C
+      - Condition: {{ steps[0].result.condition }}
+
+      Based on the weather information above, please recommend appropriate clothing.
+      Respond in a friendly and natural manner.

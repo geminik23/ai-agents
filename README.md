@@ -37,3 +37,10 @@ OPEN_API_KEY=your_api_key_here
 
 - **Ecommerce Chat Assistant**: A limited simulation agent that, based on customer inputs (such as name and order ID), explains the current state of an order.
 
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license (LICENSE-MIT)
