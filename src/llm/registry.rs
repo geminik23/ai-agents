@@ -3,10 +3,21 @@ use std::sync::Arc;
 
 use crate::llm::{LLMError, LLMProvider};
 
+#[derive(Clone)]
 pub struct LLMRegistry {
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     default_alias: String,
     router_alias: Option<String>,
+}
+
+impl std::fmt::Debug for LLMRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LLMRegistry")
+            .field("providers", &self.providers.keys().collect::<Vec<_>>())
+            .field("default_alias", &self.default_alias)
+            .field("router_alias", &self.router_alias)
+            .finish()
+    }
 }
 
 impl LLMRegistry {

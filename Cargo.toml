@@ -1,6 +1,6 @@
 [package]
 name = "ai-agents"
-version = "1.0.0-pre.1"
+version = "1.0.0-pre.2"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 edition = "2024"
 description = "A Rust framework for building AI agents from YAML specifications with trait-based extensibility"

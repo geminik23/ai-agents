@@ -7,9 +7,12 @@ use crate::error::{AgentError, Result};
 use crate::llm::providers::{ProviderType, UnifiedLLMProvider};
 use crate::llm::{LLMProvider, LLMRegistry};
 use crate::memory::{InMemoryStore, Memory};
+use crate::process::ProcessProcessor;
+use crate::recovery::RecoveryManager;
 use crate::skill::{SkillDefinition, SkillLoader};
 use crate::spec::AgentSpec;
 use crate::template::TemplateLoader;
+use crate::tool_security::ToolSecurityEngine;
 use crate::tools::ToolRegistry;
 
 pub struct AgentBuilder {
@@ -24,6 +27,10 @@ pub struct AgentBuilder {
     tools_prompt: Option<String>,
     auto_tools_prompt: bool,
     max_iterations: Option<u32>,
+    max_context_tokens: Option<u32>,
+    recovery_manager: Option<RecoveryManager>,
+    tool_security: Option<ToolSecurityEngine>,
+    process_processor: Option<ProcessProcessor>,
 }
 
 impl AgentBuilder {
@@ -40,12 +47,17 @@ impl AgentBuilder {
             tools_prompt: None,
             auto_tools_prompt: true,
             max_iterations: None,
+            max_context_tokens: None,
+            recovery_manager: None,
+            tool_security: None,
+            process_processor: None,
         }
     }
 
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
+        let max_context_tokens = Some(spec.max_context_tokens);
 
         Self {
             spec: Some(spec),
@@ -59,6 +71,10 @@ impl AgentBuilder {
             tools_prompt: None,
             auto_tools_prompt: true,
             max_iterations,
+            max_context_tokens,
+            recovery_manager: None,
+            tool_security: None,
+            process_processor: None,
         }
     }
 
@@ -69,7 +85,7 @@ impl AgentBuilder {
     }
 
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| AgentError::IoError(e))?;
+        let content = std::fs::read_to_string(path.as_ref()).map_err(AgentError::IoError)?;
         Self::from_yaml(&content)
     }
 
@@ -121,6 +137,22 @@ impl AgentBuilder {
             self.llm = Some(Arc::new(provider));
         }
 
+        Ok(self)
+    }
+
+    pub fn auto_configure_features(mut self) -> Result<Self> {
+        if let Some(ref spec) = self.spec {
+            self.recovery_manager = Some(RecoveryManager::new(spec.error_recovery.clone()));
+            self.tool_security = Some(ToolSecurityEngine::new(spec.tool_security.clone()));
+
+            if spec.has_process() {
+                let mut processor = ProcessProcessor::new(spec.process.clone());
+                if let Some(ref registry) = self.llm_registry {
+                    processor = processor.with_llm_registry(Arc::new(registry.clone()));
+                }
+                self.process_processor = Some(processor);
+            }
+        }
         Ok(self)
     }
 
@@ -187,6 +219,26 @@ impl AgentBuilder {
 
     pub fn max_iterations(mut self, max: u32) -> Self {
         self.max_iterations = Some(max);
+        self
+    }
+
+    pub fn max_context_tokens(mut self, tokens: u32) -> Self {
+        self.max_context_tokens = Some(tokens);
+        self
+    }
+
+    pub fn recovery_manager(mut self, manager: RecoveryManager) -> Self {
+        self.recovery_manager = Some(manager);
+        self
+    }
+
+    pub fn tool_security(mut self, engine: ToolSecurityEngine) -> Self {
+        self.tool_security = Some(engine);
+        self
+    }
+
+    pub fn process_processor(mut self, processor: ProcessProcessor) -> Self {
+        self.process_processor = Some(processor);
         self
     }
 
@@ -258,15 +310,43 @@ impl AgentBuilder {
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
 
-        Ok(RuntimeAgent::new(
+        let mut agent = RuntimeAgent::new(
             info,
-            llm_registry_arc,
+            llm_registry_arc.clone(),
             memory,
             tools_arc,
             self.skills,
             system_prompt,
             max_iterations,
-        ))
+        );
+
+        if let Some(tokens) = self.max_context_tokens {
+            agent = agent.with_max_context_tokens(tokens);
+        }
+
+        if let Some(manager) = self.recovery_manager {
+            agent = agent.with_recovery_manager(manager);
+        } else if let Some(ref spec) = self.spec {
+            agent = agent.with_recovery_manager(RecoveryManager::new(spec.error_recovery.clone()));
+        }
+
+        if let Some(engine) = self.tool_security {
+            agent = agent.with_tool_security(engine);
+        } else if let Some(ref spec) = self.spec {
+            agent = agent.with_tool_security(ToolSecurityEngine::new(spec.tool_security.clone()));
+        }
+
+        if let Some(processor) = self.process_processor {
+            agent = agent.with_process_processor(processor);
+        } else if let Some(ref spec) = self.spec {
+            if spec.has_process() {
+                let processor =
+                    ProcessProcessor::new(spec.process.clone()).with_llm_registry(llm_registry_arc);
+                agent = agent.with_process_processor(processor);
+            }
+        }
+
+        Ok(agent)
     }
 }
 
@@ -299,6 +379,32 @@ llm:
         let builder = AgentBuilder::from_yaml(yaml).unwrap();
         assert!(builder.spec.is_some());
         assert_eq!(builder.spec.as_ref().unwrap().name, "TestAgent");
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_tool_security() {
+        let yaml = r#"
+name: SecureAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+max_context_tokens: 8192
+error_recovery:
+  default:
+    max_retries: 5
+tool_security:
+  enabled: true
+  tools:
+    http:
+      rate_limit: 10
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+        assert_eq!(spec.max_context_tokens, 8192);
+        assert_eq!(spec.error_recovery.default.max_retries, 5);
+        assert!(spec.tool_security.enabled);
     }
 
     #[test]
@@ -340,10 +446,12 @@ skills:
     fn test_builder_chain() {
         let builder = AgentBuilder::new()
             .system_prompt("Test prompt")
-            .max_iterations(5);
+            .max_iterations(5)
+            .max_context_tokens(4096);
 
         assert_eq!(builder.system_prompt, Some("Test prompt".to_string()));
         assert_eq!(builder.max_iterations, Some(5));
+        assert_eq!(builder.max_context_tokens, Some(4096));
     }
 
     #[test]

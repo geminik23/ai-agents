@@ -19,6 +19,11 @@ fn create_tool_agent_spec() -> AgentSpec {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Initialize tracing for logging (use RUST_LOG=ai_agents=debug for verbose output)
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "ai_agents=info".to_string()))
+        .init();
+
     println!(":::::Tool Agent Demo (gpt-4.1-nano):::::");
     println!();
     println!("Available commands:");

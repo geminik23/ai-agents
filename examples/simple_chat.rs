@@ -1,11 +1,15 @@
 use ai_agents::{
-    create_memory_from_config, Agent, AgentBuilder, ProviderType, TemplateLoader,
-    UnifiedLLMProvider,
+    Agent, AgentBuilder, ProviderType, TemplateLoader, UnifiedLLMProvider,
+    create_memory_from_config,
 };
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "ai_agents=info".to_string()))
+        .init();
+
     println!("=== Simple Chat Agent ===\n");
 
     let mut loader = TemplateLoader::new();

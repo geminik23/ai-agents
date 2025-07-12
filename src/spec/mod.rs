@@ -11,9 +11,11 @@ pub use tool::ToolConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::process::ProcessConfig;
+use crate::recovery::ErrorRecoveryConfig;
 use crate::skill::SkillRef;
+use crate::tool_security::ToolSecurityConfig;
 
-/// Complete specification for an AI agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub name: String,
@@ -43,6 +45,18 @@ pub struct AgentSpec {
 
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
+
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u32,
+
+    #[serde(default)]
+    pub error_recovery: ErrorRecoveryConfig,
+
+    #[serde(default)]
+    pub tool_security: ToolSecurityConfig,
+
+    #[serde(default)]
+    pub process: ProcessConfig,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -99,6 +113,10 @@ fn default_max_iterations() -> u32 {
     10
 }
 
+fn default_max_context_tokens() -> u32 {
+    4096
+}
+
 impl Default for AgentSpec {
     fn default() -> Self {
         Self {
@@ -112,6 +130,10 @@ impl Default for AgentSpec {
             memory: MemoryConfig::default(),
             tools: vec![],
             max_iterations: default_max_iterations(),
+            max_context_tokens: default_max_context_tokens(),
+            error_recovery: ErrorRecoveryConfig::default(),
+            tool_security: ToolSecurityConfig::default(),
+            process: ProcessConfig::default(),
             metadata: None,
         }
     }
@@ -119,7 +141,6 @@ impl Default for AgentSpec {
 
 impl AgentSpec {
     pub fn validate(&self) -> crate::error::Result<()> {
-        // TODO: Improve validation later
         if self.name.is_empty() {
             return Err(crate::error::AgentError::InvalidSpec(
                 "Agent name cannot be empty".to_string(),
@@ -148,6 +169,14 @@ impl AgentSpec {
     pub fn has_skills(&self) -> bool {
         !self.skills.is_empty()
     }
+
+    pub fn has_process(&self) -> bool {
+        !self.process.input.is_empty() || !self.process.output.is_empty()
+    }
+
+    pub fn has_tool_security(&self) -> bool {
+        self.tool_security.enabled
+    }
 }
 
 #[cfg(test)]
@@ -171,31 +200,40 @@ llm:
     }
 
     #[test]
-    fn test_agent_spec_full() {
+    fn test_agent_spec_with_tool_security() {
         let yaml = r#"
-name: FullAgent
+name: SecureAgent
 version: 2.0.0
-description: "A full-featured agent"
 system_prompt: "You are an advanced AI."
 llm:
   provider: openai
   model: gpt-4
-  temperature: 0.8
-memory:
-  type: in-memory
-  max_messages: 50
-tools:
-  - name: calculator
-  - name: echo
-max_iterations: 20
+max_context_tokens: 8192
+error_recovery:
+  default:
+    max_retries: 5
+tool_security:
+  enabled: true
+  default_timeout_ms: 10000
+  tools:
+    http:
+      rate_limit: 10
+      blocked_domains:
+        - evil.com
+process:
+  input:
+    - type: normalize
+      config:
+        trim: true
 "#;
         let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(spec.name, "FullAgent");
-        assert_eq!(spec.version, "2.0.0");
-        assert_eq!(spec.description, Some("A full-featured agent".to_string()));
-        assert_eq!(spec.max_iterations, 20);
-        assert_eq!(spec.tools.len(), 2);
-        assert!(spec.validate().is_ok());
+        assert_eq!(spec.name, "SecureAgent");
+        assert_eq!(spec.max_context_tokens, 8192);
+        assert_eq!(spec.error_recovery.default.max_retries, 5);
+        assert!(spec.tool_security.enabled);
+        assert!(spec.has_tool_security());
+        assert!(!spec.process.input.is_empty());
+        assert!(spec.has_process());
     }
 
     #[test]
@@ -245,63 +283,30 @@ skills:
 
     #[test]
     fn test_agent_spec_validation_empty_name() {
-        let mut spec = AgentSpec {
-            name: "".to_string(),
-            version: "1.0.0".to_string(),
-            description: None,
-            system_prompt: "test".to_string(),
-            llm: LLMConfigOrSelector::default(),
-            llms: HashMap::new(),
-            skills: vec![],
-            memory: MemoryConfig::default(),
-            tools: vec![],
-            max_iterations: 10,
-            metadata: None,
-        };
-
+        let mut spec = AgentSpec::default();
+        spec.name = "".to_string();
         assert!(spec.validate().is_err());
+
         spec.name = "Valid".to_string();
         assert!(spec.validate().is_ok());
     }
 
     #[test]
     fn test_agent_spec_validation_empty_prompt() {
-        let mut spec = AgentSpec {
-            name: "Test".to_string(),
-            version: "1.0.0".to_string(),
-            description: None,
-            system_prompt: "".to_string(),
-            llm: LLMConfigOrSelector::default(),
-            llms: HashMap::new(),
-            skills: vec![],
-            memory: MemoryConfig::default(),
-            tools: vec![],
-            max_iterations: 10,
-            metadata: None,
-        };
-
+        let mut spec = AgentSpec::default();
+        spec.system_prompt = "".to_string();
         assert!(spec.validate().is_err());
+
         spec.system_prompt = "Valid prompt".to_string();
         assert!(spec.validate().is_ok());
     }
 
     #[test]
     fn test_agent_spec_validation_zero_iterations() {
-        let mut spec = AgentSpec {
-            name: "Test".to_string(),
-            version: "1.0.0".to_string(),
-            description: None,
-            system_prompt: "test".to_string(),
-            llm: LLMConfigOrSelector::default(),
-            llms: HashMap::new(),
-            skills: vec![],
-            memory: MemoryConfig::default(),
-            tools: vec![],
-            max_iterations: 0,
-            metadata: None,
-        };
-
+        let mut spec = AgentSpec::default();
+        spec.max_iterations = 0;
         assert!(spec.validate().is_err());
+
         spec.max_iterations = 5;
         assert!(spec.validate().is_ok());
     }

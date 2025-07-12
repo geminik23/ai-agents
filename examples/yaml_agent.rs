@@ -3,6 +3,10 @@ use std::io::{self, BufRead, Write};
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "ai_agents=info".to_string()))
+        .init();
+
     println!("=== YAML Agent Demo ===\n");
     println!("Loading agent from templates/skill_agent.yaml...\n");
 
