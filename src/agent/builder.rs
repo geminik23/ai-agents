@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use crate::llm::providers::{ProviderType, UnifiedLLMProvider};
 use crate::llm::{LLMProvider, LLMRegistry};
 use crate::memory::{InMemoryStore, Memory};
 use crate::process::ProcessProcessor;
-use crate::recovery::RecoveryManager;
+use crate::recovery::{MessageFilter, RecoveryManager};
 use crate::skill::{SkillDefinition, SkillLoader};
 use crate::spec::AgentSpec;
 use crate::template::TemplateLoader;
@@ -31,6 +32,7 @@ pub struct AgentBuilder {
     recovery_manager: Option<RecoveryManager>,
     tool_security: Option<ToolSecurityEngine>,
     process_processor: Option<ProcessProcessor>,
+    message_filters: HashMap<String, Arc<dyn MessageFilter>>,
 }
 
 impl AgentBuilder {
@@ -51,6 +53,7 @@ impl AgentBuilder {
             recovery_manager: None,
             tool_security: None,
             process_processor: None,
+            message_filters: HashMap::new(),
         }
     }
 
@@ -75,6 +78,7 @@ impl AgentBuilder {
             recovery_manager: None,
             tool_security: None,
             process_processor: None,
+            message_filters: HashMap::new(),
         }
     }
 
@@ -242,6 +246,15 @@ impl AgentBuilder {
         self
     }
 
+    pub fn message_filter(
+        mut self,
+        name: impl Into<String>,
+        filter: Arc<dyn MessageFilter>,
+    ) -> Self {
+        self.message_filters.insert(name.into(), filter);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
@@ -344,6 +357,10 @@ impl AgentBuilder {
                     ProcessProcessor::new(spec.process.clone()).with_llm_registry(llm_registry_arc);
                 agent = agent.with_process_processor(processor);
             }
+        }
+
+        for (name, filter) in self.message_filters {
+            agent.register_message_filter(name, filter);
         }
 
         Ok(agent)

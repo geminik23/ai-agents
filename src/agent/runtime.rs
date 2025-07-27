@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -8,7 +9,10 @@ use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, LLMRegistry};
 use crate::memory::Memory;
 use crate::process::{ProcessData, ProcessProcessor};
-use crate::recovery::{IntoClassifiedError, RecoveryManager};
+use crate::recovery::{
+    ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
+    MessageFilter, RecoveryManager, SkipPatternFilter,
+};
 use crate::skill::{SkillDefinition, SkillExecutor, SkillRouter};
 use crate::tool_security::{SecurityCheckResult, ToolSecurityEngine};
 use crate::tools::ToolRegistry;
@@ -28,6 +32,7 @@ pub struct RuntimeAgent {
     recovery_manager: RecoveryManager,
     tool_security: ToolSecurityEngine,
     process_processor: Option<ProcessProcessor>,
+    message_filters: RwLock<HashMap<String, Arc<dyn MessageFilter>>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -77,6 +82,7 @@ impl RuntimeAgent {
             recovery_manager: RecoveryManager::default(),
             tool_security: ToolSecurityEngine::default(),
             process_processor: None,
+            message_filters: RwLock::new(HashMap::new()),
         }
     }
 
@@ -100,36 +106,172 @@ impl RuntimeAgent {
         self
     }
 
+    pub fn register_message_filter(&self, name: impl Into<String>, filter: Arc<dyn MessageFilter>) {
+        self.message_filters.write().insert(name.into(), filter);
+    }
+
     fn estimate_tokens(&self, text: &str) -> u32 {
         (text.len() as f32 / 4.0).ceil() as u32
     }
 
-    fn truncate_context(&self, messages: &mut Vec<ChatMessage>) {
-        let mut total_tokens: u32 = 0;
-
-        if let Some(first) = messages.first() {
-            total_tokens += self.estimate_tokens(&first.content);
-        }
-
-        let mut message_tokens: Vec<u32> = messages
+    fn estimate_total_tokens(&self, messages: &[ChatMessage]) -> u32 {
+        messages
             .iter()
             .map(|m| self.estimate_tokens(&m.content))
-            .collect();
+            .sum()
+    }
 
-        while total_tokens + message_tokens.iter().skip(1).sum::<u32>() > self.max_context_tokens
-            && messages.len() > 2
-        {
-            messages.remove(1);
-            message_tokens.remove(1);
-            debug!("Truncated oldest message to fit context window");
+    fn truncate_context(&self, messages: &mut Vec<ChatMessage>, keep_recent: usize) {
+        if messages.len() <= keep_recent + 1 {
+            return;
         }
+        let system_msg = messages.remove(0);
+        let to_remove = messages.len().saturating_sub(keep_recent);
+        messages.drain(..to_remove);
+        messages.insert(0, system_msg);
+        info!(
+            "Truncated {} old messages, kept {} recent",
+            to_remove, keep_recent
+        );
+    }
+
+    fn get_filter(&self, config: Option<&FilterConfig>) -> Arc<dyn MessageFilter> {
+        match config {
+            None | Some(FilterConfig::KeepRecent) => Arc::new(KeepRecentFilter),
+            Some(FilterConfig::ByRole { keep_roles }) => Arc::new(ByRoleFilter {
+                keep_roles: keep_roles.clone(),
+            }),
+            Some(FilterConfig::SkipPattern { skip_if_contains }) => Arc::new(SkipPatternFilter {
+                skip_if_contains: skip_if_contains.clone(),
+            }),
+            Some(FilterConfig::Custom { name }) => self
+                .message_filters
+                .read()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(KeepRecentFilter)),
+        }
+    }
+
+    async fn summarize_context(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        summarizer_llm: Option<&str>,
+        _max_summary_tokens: u32,
+        custom_prompt: Option<&str>,
+        keep_recent: usize,
+        filter_config: Option<&FilterConfig>,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+
+        let system_msg = messages.remove(0);
+        let filter = self.get_filter(filter_config);
+        let (to_summarize, to_keep) = filter.filter(messages, keep_recent);
+
+        if to_summarize.is_empty() {
+            messages.insert(0, system_msg);
+            debug!("No messages to summarize");
+            return Ok(());
+        }
+
+        let llm = if let Some(alias) = summarizer_llm {
+            self.llm_registry.get(alias).map_err(|e| {
+                AgentError::Config(format!("Summarizer LLM '{}' not found: {}", alias, e))
+            })?
+        } else {
+            self.llm_registry
+                .default()
+                .map_err(|e| AgentError::Config(format!("Default LLM not available: {}", e)))?
+        };
+
+        let default_prompt =
+            "Summarize the following conversation concisely, preserving key information.";
+        let prompt = custom_prompt.unwrap_or(default_prompt);
+
+        let conversation = to_summarize
+            .iter()
+            .map(|m| format!("{:?}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+
+        let request = format!("{}\n\nConversation:\n\n{}", prompt, conversation);
+
+        debug!(
+            "Summarizing {} messages using filter '{}'",
+            to_summarize.len(),
+            filter.name()
+        );
+
+        let response = llm
+            .complete(&[ChatMessage::user(&request)], None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Summarization failed: {}", e)))?;
+
+        let summary = response.content.trim();
+
+        messages.clear();
+        messages.push(system_msg);
+        messages.push(ChatMessage::system(&format!(
+            "[Summary of earlier conversation]: {}",
+            summary
+        )));
+        messages.extend(to_keep);
+
+        info!(
+            "Summarized {} messages, kept {}, summary ~{} tokens",
+            to_summarize.len(),
+            messages.len() - 2,
+            self.estimate_tokens(summary)
+        );
+
+        Ok(())
     }
 
     async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
         let mut messages = vec![ChatMessage::system(&self.system_prompt)];
         let history = self.memory.get_messages(None).await?;
         messages.extend(history);
-        self.truncate_context(&mut messages);
+
+        let total_tokens = self.estimate_total_tokens(&messages);
+
+        if total_tokens > self.max_context_tokens {
+            debug!(
+                "Context overflow: {} > {} tokens",
+                total_tokens, self.max_context_tokens
+            );
+
+            match &self.recovery_manager.config().llm.on_context_overflow {
+                ContextOverflowAction::Error => {
+                    return Err(AgentError::LLM(format!(
+                        "Context overflow: {} tokens > {} limit",
+                        total_tokens, self.max_context_tokens
+                    )));
+                }
+                ContextOverflowAction::Truncate { keep_recent } => {
+                    self.truncate_context(&mut messages, *keep_recent);
+                }
+                ContextOverflowAction::Summarize {
+                    summarizer_llm,
+                    max_summary_tokens,
+                    custom_prompt,
+                    keep_recent,
+                    filter,
+                } => {
+                    self.summarize_context(
+                        &mut messages,
+                        summarizer_llm.as_deref(),
+                        *max_summary_tokens,
+                        custom_prompt.as_deref(),
+                        *keep_recent,
+                        filter.as_ref(),
+                    )
+                    .await?;
+                }
+            }
+        }
+
         Ok(messages)
     }
 
@@ -179,7 +321,7 @@ impl RuntimeAgent {
             match security_result {
                 SecurityCheckResult::Allow => {}
                 SecurityCheckResult::Block { reason } => {
-                    warn!(reason = %reason, "Tool blocked by security");
+                    warn!(reason = %reason, "Tool blocked");
                     return Err(AgentError::Tool(format!("Blocked: {}", reason)));
                 }
                 SecurityCheckResult::RequireConfirmation { message } => {
@@ -284,7 +426,7 @@ impl RuntimeAgent {
                 .metadata
                 .rejection_reason
                 .unwrap_or_else(|| "Input rejected".to_string());
-            warn!(reason = %reason, "Input rejected by process");
+            warn!(reason = %reason, "Input rejected");
             return Ok(AgentResponse::new(reason));
         }
 
@@ -333,7 +475,7 @@ impl RuntimeAgent {
             debug!(
                 iteration = iterations,
                 max = self.max_iterations,
-                "LLM call iteration"
+                "LLM call"
             );
 
             let messages = self.build_messages().await?;
@@ -423,6 +565,10 @@ impl RuntimeAgent {
 
     pub fn max_context_tokens(&self) -> u32 {
         self.max_context_tokens
+    }
+
+    pub fn llm_registry(&self) -> &Arc<LLMRegistry> {
+        &self.llm_registry
     }
 }
 

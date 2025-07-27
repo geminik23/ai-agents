@@ -1,5 +1,3 @@
-//! Error recovery configuration types
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -136,8 +134,27 @@ pub enum ContextOverflowAction {
         keep_recent: usize,
     },
     Summarize {
+        #[serde(default)]
         summarizer_llm: Option<String>,
+        #[serde(default = "default_max_summary_tokens")]
+        max_summary_tokens: u32,
+        #[serde(default)]
+        custom_prompt: Option<String>,
+        #[serde(default = "default_keep_recent")]
+        keep_recent: usize,
+        #[serde(default)]
+        filter: Option<FilterConfig>,
     },
+}
+
+/// Filter configuration for message selection during summarization
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum FilterConfig {
+    KeepRecent,
+    ByRole { keep_roles: Vec<String> },
+    SkipPattern { skip_if_contains: Vec<String> },
+    Custom { name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -224,7 +241,11 @@ fn default_rate_limit_wait() -> u64 {
 }
 
 fn default_keep_recent() -> usize {
-    20
+    10
+}
+
+fn default_max_summary_tokens() -> u32 {
+    200
 }
 
 #[cfg(test)]
@@ -264,5 +285,55 @@ llm:
             config.llm.on_failure,
             LLMFailureAction::FallbackLlm { .. }
         ));
+    }
+
+    #[test]
+    fn test_summarize_config_parsing() {
+        let yaml = r#"
+llm:
+  on_context_overflow:
+    action: summarize
+    summarizer_llm: fast
+    max_summary_tokens: 300
+    keep_recent: 5
+    filter:
+      type: by_role
+      keep_roles:
+        - user
+        - assistant
+"#;
+        let config: ErrorRecoveryConfig = serde_yaml::from_str(yaml).unwrap();
+        match &config.llm.on_context_overflow {
+            ContextOverflowAction::Summarize {
+                summarizer_llm,
+                max_summary_tokens,
+                keep_recent,
+                filter,
+                ..
+            } => {
+                assert_eq!(summarizer_llm.as_deref(), Some("fast"));
+                assert_eq!(*max_summary_tokens, 300);
+                assert_eq!(*keep_recent, 5);
+                assert!(matches!(filter, Some(FilterConfig::ByRole { .. })));
+            }
+            _ => panic!("Expected Summarize action"),
+        }
+    }
+
+    #[test]
+    fn test_filter_config_parsing() {
+        let yaml = r#"
+type: skip_pattern
+skip_if_contains:
+  - "[DEBUG]"
+  - "[TOOL]"
+"#;
+        let filter: FilterConfig = serde_yaml::from_str(yaml).unwrap();
+        match filter {
+            FilterConfig::SkipPattern { skip_if_contains } => {
+                assert_eq!(skip_if_contains.len(), 2);
+            }
+            _ => panic!("Expected SkipPattern"),
+        }
     }
 }

@@ -22,7 +22,10 @@ pub use llm::providers::{ProviderType, UnifiedLLMProvider};
 pub use llm::{ChatMessage, LLMProvider, LLMRegistry, LLMResponse, Role};
 
 pub use process::{ProcessConfig, ProcessData, ProcessProcessor};
-pub use recovery::{ErrorRecoveryConfig, RecoveryManager};
+pub use recovery::{
+    ByRoleFilter, ErrorRecoveryConfig, FilterConfig, KeepRecentFilter, MessageFilter,
+    RecoveryManager, SkipPatternFilter,
+};
 pub use tool_security::{
     SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
 };
