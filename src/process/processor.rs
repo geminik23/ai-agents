@@ -105,7 +105,23 @@ impl ProcessProcessor {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ProcessData>> + Send + 'a>> {
         Box::pin(async move {
             let start = Instant::now();
-            let stage_name = self.get_stage_name(stage);
+            let stage_name = stage
+                .id()
+                .map(String::from)
+                .unwrap_or_else(|| self.get_stage_type_name(stage));
+
+            // Check condition before executing stage
+            if let Some(condition) = stage.condition() {
+                if !self.evaluate_condition_expr(condition, &data) {
+                    if self.config.settings.debug.log_stages {
+                        tracing::debug!(
+                            "[Process] Stage skipped (condition not met): {}",
+                            stage_name
+                        );
+                    }
+                    return Ok(data);
+                }
+            }
 
             if self.config.settings.debug.log_stages {
                 tracing::debug!("[Process] Executing stage: {}", stage_name);
@@ -166,19 +182,17 @@ impl ProcessProcessor {
         })
     }
 
-    fn get_stage_name(&self, stage: &ProcessStage) -> String {
+    fn get_stage_type_name(&self, stage: &ProcessStage) -> String {
         match stage {
-            ProcessStage::Normalize(s) => s.id.clone().unwrap_or_else(|| "normalize".to_string()),
-            ProcessStage::Detect(s) => s.id.clone().unwrap_or_else(|| "detect".to_string()),
-            ProcessStage::Extract(s) => s.id.clone().unwrap_or_else(|| "extract".to_string()),
-            ProcessStage::Sanitize(s) => s.id.clone().unwrap_or_else(|| "sanitize".to_string()),
-            ProcessStage::Transform(s) => s.id.clone().unwrap_or_else(|| "transform".to_string()),
-            ProcessStage::Validate(s) => s.id.clone().unwrap_or_else(|| "validate".to_string()),
-            ProcessStage::Format(s) => s.id.clone().unwrap_or_else(|| "format".to_string()),
-            ProcessStage::Enrich(s) => s.id.clone().unwrap_or_else(|| "enrich".to_string()),
-            ProcessStage::Conditional(s) => {
-                s.id.clone().unwrap_or_else(|| "conditional".to_string())
-            }
+            ProcessStage::Normalize(_) => "normalize".to_string(),
+            ProcessStage::Detect(_) => "detect".to_string(),
+            ProcessStage::Extract(_) => "extract".to_string(),
+            ProcessStage::Sanitize(_) => "sanitize".to_string(),
+            ProcessStage::Transform(_) => "transform".to_string(),
+            ProcessStage::Validate(_) => "validate".to_string(),
+            ProcessStage::Format(_) => "format".to_string(),
+            ProcessStage::Enrich(_) => "enrich".to_string(),
+            ProcessStage::Conditional(_) => "conditional".to_string(),
         }
     }
 
@@ -387,11 +401,6 @@ impl ProcessProcessor {
         config: &TransformConfig,
         mut data: ProcessData,
     ) -> Result<ProcessData> {
-        // Check condition if specified
-        if config.condition.is_some() {
-            // For now, skip condition evaluation - would need context access
-        }
-
         let prompt = match &config.prompt {
             Some(p) => p.clone(),
             None => return Ok(data),
@@ -701,23 +710,72 @@ impl ProcessProcessor {
     fn evaluate_condition(&self, condition: &Option<ConditionExpr>, data: &ProcessData) -> bool {
         match condition {
             None => true,
-            Some(ConditionExpr::Exists { exists }) => {
-                // Check if any relevant context exists
-                *exists == !data.context.is_empty()
-            }
-            Some(ConditionExpr::Simple(map)) => {
-                // Check all conditions in the map
-                for (key, expected) in map {
-                    let actual = data.context.get(key);
-                    match (actual, expected) {
-                        (Some(a), e) if a == e => continue,
-                        (None, serde_json::Value::Null) => continue,
-                        _ => return false,
+            Some(expr) => self.evaluate_condition_expr(expr, data),
+        }
+    }
+
+    fn evaluate_condition_expr(&self, condition: &ConditionExpr, data: &ProcessData) -> bool {
+        match condition {
+            ConditionExpr::All { all } => all.iter().all(|c| self.evaluate_condition_expr(c, data)),
+            ConditionExpr::Any { any } => any.iter().any(|c| self.evaluate_condition_expr(c, data)),
+            ConditionExpr::Simple(map) => self.evaluate_simple_condition(map, data),
+        }
+    }
+
+    fn evaluate_simple_condition(
+        &self,
+        map: &std::collections::HashMap<String, serde_json::Value>,
+        data: &ProcessData,
+    ) -> bool {
+        for (path, expected) in map {
+            let actual = self.get_nested_value(&data.context, path);
+
+            // Handle { exists: true/false }
+            if let Some(obj) = expected.as_object() {
+                if let Some(exists_val) = obj.get("exists") {
+                    let should_exist = exists_val.as_bool().unwrap_or(true);
+                    let does_exist =
+                        actual.is_some() && !matches!(actual, Some(serde_json::Value::Null));
+                    if does_exist != should_exist {
+                        return false;
                     }
+                    continue;
                 }
-                true
+            }
+
+            // Direct value comparison
+            match (actual, expected) {
+                (Some(a), e) if a == e => continue,
+                (None, serde_json::Value::Null) => continue,
+                _ => return false,
             }
         }
+        true
+    }
+
+    fn get_nested_value<'a>(
+        &self,
+        context: &'a std::collections::HashMap<String, serde_json::Value>,
+        path: &str,
+    ) -> Option<&'a serde_json::Value> {
+        let parts: Vec<&str> = path.split('.').collect();
+        if parts.is_empty() {
+            return None;
+        }
+
+        let mut current: Option<&serde_json::Value> = context.get(parts[0]);
+
+        for part in &parts[1..] {
+            current = current.and_then(|v| {
+                if let serde_json::Value::Object(obj) = v {
+                    obj.get(*part)
+                } else {
+                    None
+                }
+            });
+        }
+
+        current
     }
 
     fn get_llm(&self, alias: Option<&str>) -> Result<Arc<dyn crate::llm::LLMProvider>> {
@@ -881,13 +939,157 @@ mod tests {
     }
 
     #[test]
-    fn test_evaluate_condition_exists() {
+    fn test_evaluate_condition_simple_exists_true() {
         let processor = ProcessProcessor::default();
-        let data = ProcessData::new("test").with_context("key", serde_json::json!("value"));
+        let mut data = ProcessData::new("test");
+        data.context.insert(
+            "session".to_string(),
+            serde_json::json!({ "user_name": "Alice" }),
+        );
 
-        assert!(processor.evaluate_condition(&Some(ConditionExpr::Exists { exists: true }), &data));
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "session.user_name".to_string(),
+            serde_json::json!({ "exists": true }),
+        );
+        let condition = ConditionExpr::Simple(map);
+
+        assert!(processor.evaluate_condition_expr(&condition, &data));
+    }
+
+    #[test]
+    fn test_evaluate_condition_simple_exists_false() {
+        let processor = ProcessProcessor::default();
+        let data = ProcessData::new("test");
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "session.user_name".to_string(),
+            serde_json::json!({ "exists": false }),
+        );
+        let condition = ConditionExpr::Simple(map);
+
+        assert!(processor.evaluate_condition_expr(&condition, &data));
+    }
+
+    #[test]
+    fn test_evaluate_condition_all() {
+        let processor = ProcessProcessor::default();
+        let mut data = ProcessData::new("test");
+        data.context.insert(
+            "session".to_string(),
+            serde_json::json!({ "user_name": "Alice", "language": "en" }),
+        );
+
+        let mut map1 = std::collections::HashMap::new();
+        map1.insert(
+            "session.user_name".to_string(),
+            serde_json::json!({ "exists": true }),
+        );
+        let mut map2 = std::collections::HashMap::new();
+        map2.insert(
+            "session.language".to_string(),
+            serde_json::json!({ "exists": true }),
+        );
+
+        let condition = ConditionExpr::All {
+            all: vec![ConditionExpr::Simple(map1), ConditionExpr::Simple(map2)],
+        };
+
+        assert!(processor.evaluate_condition_expr(&condition, &data));
+    }
+
+    #[test]
+    fn test_evaluate_condition_any() {
+        let processor = ProcessProcessor::default();
+        let mut data = ProcessData::new("test");
+        data.context.insert(
+            "session".to_string(),
+            serde_json::json!({ "tier": "premium" }),
+        );
+
+        let mut map1 = std::collections::HashMap::new();
+        map1.insert("session.tier".to_string(), serde_json::json!("premium"));
+        let mut map2 = std::collections::HashMap::new();
+        map2.insert("session.tier".to_string(), serde_json::json!("enterprise"));
+
+        let condition = ConditionExpr::Any {
+            any: vec![ConditionExpr::Simple(map1), ConditionExpr::Simple(map2)],
+        };
+
+        assert!(processor.evaluate_condition_expr(&condition, &data));
+    }
+
+    #[test]
+    fn test_evaluate_condition_value_match() {
+        let processor = ProcessProcessor::default();
+        let mut data = ProcessData::new("test");
+        data.context.insert(
+            "input".to_string(),
+            serde_json::json!({ "sentiment": "negative" }),
+        );
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("input.sentiment".to_string(), serde_json::json!("negative"));
+        let condition = ConditionExpr::Simple(map);
+
+        assert!(processor.evaluate_condition_expr(&condition, &data));
+    }
+
+    #[test]
+    fn test_get_nested_value() {
+        let processor = ProcessProcessor::default();
+        let mut context = std::collections::HashMap::new();
+        context.insert(
+            "session".to_string(),
+            serde_json::json!({ "user": { "name": "Alice" } }),
+        );
+
+        let result = processor.get_nested_value(&context, "session.user.name");
+        assert_eq!(result, Some(&serde_json::json!("Alice")));
+
+        let result = processor.get_nested_value(&context, "session.nonexistent");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stage_skipped_when_condition_false() {
+        let config = ProcessConfig {
+            input: vec![ProcessStage::Extract(ExtractStage {
+                id: Some("skip_me".to_string()),
+                condition: Some(ConditionExpr::Simple({
+                    let mut map = std::collections::HashMap::new();
+                    map.insert(
+                        "session.user".to_string(),
+                        serde_json::json!({ "exists": false }),
+                    );
+                    map
+                })),
+                config: ExtractConfig::default(),
+            })],
+            settings: ProcessSettings {
+                debug: ProcessDebugConfig {
+                    log_stages: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config);
+
+        let mut data = ProcessData::new("test");
+        data.context.insert(
+            "session".to_string(),
+            serde_json::json!({ "user": "Alice" }),
+        );
+
+        let result = processor.process_input("test").await.unwrap();
         assert!(
-            !processor.evaluate_condition(&Some(ConditionExpr::Exists { exists: false }), &data)
+            !result
+                .metadata
+                .stages_executed
+                .contains(&"skip_me".to_string())
         );
     }
 }

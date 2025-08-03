@@ -27,10 +27,42 @@ pub enum ProcessStage {
     Conditional(ConditionalStage),
 }
 
+impl ProcessStage {
+    pub fn condition(&self) -> Option<&ConditionExpr> {
+        match self {
+            ProcessStage::Normalize(s) => s.condition.as_ref(),
+            ProcessStage::Detect(s) => s.condition.as_ref(),
+            ProcessStage::Extract(s) => s.condition.as_ref(),
+            ProcessStage::Sanitize(s) => s.condition.as_ref(),
+            ProcessStage::Transform(s) => s.condition.as_ref(),
+            ProcessStage::Validate(s) => s.condition.as_ref(),
+            ProcessStage::Format(s) => s.condition.as_ref(),
+            ProcessStage::Enrich(s) => s.condition.as_ref(),
+            ProcessStage::Conditional(_) => None,
+        }
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        match self {
+            ProcessStage::Normalize(s) => s.id.as_deref(),
+            ProcessStage::Detect(s) => s.id.as_deref(),
+            ProcessStage::Extract(s) => s.id.as_deref(),
+            ProcessStage::Sanitize(s) => s.id.as_deref(),
+            ProcessStage::Transform(s) => s.id.as_deref(),
+            ProcessStage::Validate(s) => s.id.as_deref(),
+            ProcessStage::Format(s) => s.id.as_deref(),
+            ProcessStage::Enrich(s) => s.id.as_deref(),
+            ProcessStage::Conditional(s) => s.id.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NormalizeStage {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<ConditionExpr>,
     #[serde(default)]
     pub config: NormalizeConfig,
 }
@@ -72,6 +104,8 @@ pub struct DetectStage {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
+    pub condition: Option<ConditionExpr>,
+    #[serde(default)]
     pub config: DetectConfig,
 }
 
@@ -108,6 +142,8 @@ pub struct IntentDefinition {
 pub struct ExtractStage {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<ConditionExpr>,
     #[serde(default)]
     pub config: ExtractConfig,
 }
@@ -152,6 +188,8 @@ pub enum FieldType {
 pub struct SanitizeStage {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<ConditionExpr>,
     #[serde(default)]
     pub config: SanitizeConfig,
 }
@@ -242,6 +280,8 @@ pub struct TransformStage {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
+    pub condition: Option<ConditionExpr>,
+    #[serde(default)]
     pub config: TransformConfig,
 }
 
@@ -249,8 +289,6 @@ pub struct TransformStage {
 pub struct TransformConfig {
     #[serde(default)]
     pub llm: Option<String>,
-    #[serde(default)]
-    pub condition: Option<ConditionExpr>,
     #[serde(default)]
     pub prompt: Option<String>,
     #[serde(default)]
@@ -261,6 +299,8 @@ pub struct TransformConfig {
 pub struct ValidateStage {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<ConditionExpr>,
     #[serde(default)]
     pub config: ValidateConfig,
 }
@@ -340,6 +380,8 @@ pub struct FormatStage {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
+    pub condition: Option<ConditionExpr>,
+    #[serde(default)]
     pub config: FormatConfig,
 }
 
@@ -379,6 +421,8 @@ pub enum OutputFormat {
 pub struct EnrichStage {
     #[serde(default)]
     pub id: Option<String>,
+    #[serde(default)]
+    pub condition: Option<ConditionExpr>,
     #[serde(default)]
     pub config: EnrichConfig,
 }
@@ -451,8 +495,9 @@ pub struct ConditionalConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConditionExpr {
+    All { all: Vec<ConditionExpr> },
+    Any { any: Vec<ConditionExpr> },
     Simple(HashMap<String, serde_json::Value>),
-    Exists { exists: bool },
 }
 
 impl Default for ConditionExpr {
@@ -642,5 +687,79 @@ description: "Priority level"
         let schema: FieldSchema = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(schema.field_type, FieldType::Enum);
         assert_eq!(schema.values.len(), 3);
+    }
+
+    #[test]
+    fn test_condition_parsing_simple() {
+        let yaml = r#"
+type: extract
+condition:
+  context.session.user_name:
+    exists: false
+config:
+  schema:
+    user_name:
+      type: string
+"#;
+        let stage: ExtractStage = serde_yaml::from_str(yaml).unwrap();
+        assert!(stage.condition.is_some());
+    }
+
+    #[test]
+    fn test_condition_parsing_all() {
+        let yaml = r#"
+type: enrich
+condition:
+  all:
+    - context.input.extracted.user_name:
+        exists: true
+    - context.session.user_profile:
+        exists: false
+config: {}
+"#;
+        let stage: EnrichStage = serde_yaml::from_str(yaml).unwrap();
+        assert!(stage.condition.is_some());
+        match stage.condition.unwrap() {
+            ConditionExpr::All { all } => assert_eq!(all.len(), 2),
+            _ => panic!("Expected All condition"),
+        }
+    }
+
+    #[test]
+    fn test_condition_parsing_any() {
+        let yaml = r#"
+type: detect
+condition:
+  any:
+    - context.session.language:
+        exists: false
+    - context.session.force_detect: true
+config:
+  detect:
+    - language
+"#;
+        let stage: DetectStage = serde_yaml::from_str(yaml).unwrap();
+        assert!(stage.condition.is_some());
+        match stage.condition.unwrap() {
+            ConditionExpr::Any { any } => assert_eq!(any.len(), 2),
+            _ => panic!("Expected Any condition"),
+        }
+    }
+
+    #[test]
+    fn test_process_stage_condition_accessor() {
+        let stage = ProcessStage::Extract(ExtractStage {
+            id: Some("test".to_string()),
+            condition: Some(ConditionExpr::Simple(HashMap::new())),
+            config: ExtractConfig::default(),
+        });
+        assert!(stage.condition().is_some());
+        assert_eq!(stage.id(), Some("test"));
+    }
+
+    #[test]
+    fn test_process_stage_no_condition() {
+        let stage = ProcessStage::Normalize(NormalizeStage::default());
+        assert!(stage.condition().is_none());
     }
 }
