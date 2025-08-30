@@ -37,7 +37,12 @@ evalexpr = "11"
 
 regex = "1"
 
+rand = "0.8"
+
 parking_lot = "0.12"
+
+# Optional dependencies
+reqwest = { version = "0.12", features = ["json"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -45,6 +50,8 @@ tempfile = "3"
 
 [features]
 default = []
+http-context = ["reqwest"]
+http-tool = ["reqwest"]
 
 # [profile.release]
 # lto = true

@@ -65,6 +65,12 @@ impl AgentResponse {
         self.tool_calls = Some(calls);
         self
     }
+
+    pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        let metadata = self.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(key.into(), value);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

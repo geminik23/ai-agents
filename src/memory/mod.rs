@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::llm::ChatMessage;
+use crate::persistence::MemorySnapshot;
 use crate::spec::MemoryConfig;
 
 #[async_trait]
@@ -19,6 +20,10 @@ pub trait Memory: Send + Sync {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+    async fn snapshot(&self) -> Result<MemorySnapshot> {
+        Ok(MemorySnapshot::new(self.get_messages(None).await?))
+    }
+    async fn restore(&self, snapshot: MemorySnapshot) -> Result<()>;
 }
 
 pub fn create_memory(memory_type: &str, max_messages: usize) -> Result<Arc<dyn Memory>> {

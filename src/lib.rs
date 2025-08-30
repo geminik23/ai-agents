@@ -1,11 +1,14 @@
 pub mod agent;
+pub mod context;
 pub mod error;
 pub mod llm;
 pub mod memory;
+pub mod persistence;
 pub mod process;
 pub mod recovery;
 pub mod skill;
 pub mod spec;
+pub mod state;
 pub mod template;
 pub mod tool_security;
 pub mod tools;
@@ -28,4 +31,13 @@ pub use recovery::{
 };
 pub use tool_security::{
     SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+};
+
+pub use context::{
+    BuiltinSource, ContextManager, ContextProvider, ContextSource, RefreshPolicy, TemplateRenderer,
+};
+pub use persistence::{AgentSnapshot, AgentStorage, FileStorage, MemorySnapshot};
+pub use state::{
+    LLMTransitionEvaluator, PromptMode, StateConfig, StateDefinition, StateMachine,
+    StateMachineSnapshot, StateTransitionEvent, Transition, TransitionContext, TransitionEvaluator,
 };

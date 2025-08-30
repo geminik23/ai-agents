@@ -80,6 +80,72 @@ Do not include any explanation."#,
     pub fn get_skill(&self, id: &str) -> Option<&SkillDefinition> {
         self.skills.iter().find(|s| s.id == id)
     }
+
+    /// Select a skill from a filtered subset of available skills
+    pub async fn select_skill_filtered(
+        &self,
+        user_input: &str,
+        allowed_skill_ids: &[&str],
+    ) -> Result<Option<String>> {
+        if allowed_skill_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let filtered_skills: Vec<&SkillDefinition> = self
+            .skills
+            .iter()
+            .filter(|s| allowed_skill_ids.contains(&s.id.as_str()))
+            .collect();
+
+        if filtered_skills.is_empty() {
+            return Ok(None);
+        }
+
+        let skills_desc = filtered_skills
+            .iter()
+            .map(|s| format!("- {}: {} (trigger: {})", s.id, s.description, s.trigger))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            r#"Analyze the user input and select an appropriate skill.
+
+Available skills:
+{}
+
+User input: "{}"
+
+Return ONLY the skill id if one matches. Return "none" if no skill matches.
+Do not include any explanation."#,
+            skills_desc, user_input
+        );
+
+        let response = self
+            .llm
+            .complete(&[ChatMessage::user(&prompt)], None)
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+        let selected = response.content.trim().to_lowercase();
+
+        if selected == "none" {
+            return Ok(None);
+        }
+
+        if filtered_skills
+            .iter()
+            .any(|s| s.id.to_lowercase() == selected)
+        {
+            let original_id = filtered_skills
+                .iter()
+                .find(|s| s.id.to_lowercase() == selected)
+                .map(|s| s.id.clone())
+                .unwrap();
+            Ok(Some(original_id))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[cfg(test)]

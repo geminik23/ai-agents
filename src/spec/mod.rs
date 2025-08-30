@@ -11,9 +11,11 @@ pub use tool::ToolConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::context::ContextSource;
 use crate::process::ProcessConfig;
 use crate::recovery::ErrorRecoveryConfig;
 use crate::skill::SkillRef;
+use crate::state::StateConfig;
 use crate::tool_security::ToolSecurityConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +59,12 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub process: ProcessConfig,
+
+    #[serde(default)]
+    pub context: HashMap<String, ContextSource>,
+
+    #[serde(default)]
+    pub states: Option<StateConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -134,6 +142,8 @@ impl Default for AgentSpec {
             error_recovery: ErrorRecoveryConfig::default(),
             tool_security: ToolSecurityConfig::default(),
             process: ProcessConfig::default(),
+            context: HashMap::new(),
+            states: None,
             metadata: None,
         }
     }
@@ -159,6 +169,10 @@ impl AgentSpec {
             ));
         }
 
+        if let Some(ref states) = self.states {
+            states.validate()?;
+        }
+
         Ok(())
     }
 
@@ -176,6 +190,14 @@ impl AgentSpec {
 
     pub fn has_tool_security(&self) -> bool {
         self.tool_security.enabled
+    }
+
+    pub fn has_states(&self) -> bool {
+        self.states.is_some()
+    }
+
+    pub fn has_context(&self) -> bool {
+        !self.context.is_empty()
     }
 }
 
@@ -197,6 +219,52 @@ llm:
         assert_eq!(spec.version, "1.0.0");
         assert_eq!(spec.max_iterations, 10);
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_spec_with_states() {
+        let yaml = r#"
+name: StatefulAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Welcome!"
+      transitions:
+        - to: support
+          when: "user needs help"
+    support:
+      prompt: "How can I help?"
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_states());
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_spec_with_context() {
+        let yaml = r#"
+name: ContextAgent
+system_prompt: "Hello, {{ context.user.name }}!"
+llm:
+  provider: openai
+  model: gpt-4
+context:
+  user:
+    type: runtime
+    required: true
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_context());
+        assert_eq!(spec.context.len(), 2);
     }
 
     #[test]

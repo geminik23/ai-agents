@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use super::{AgentInfo, runtime::RuntimeAgent};
+use crate::context::ContextManager;
 use crate::error::{AgentError, Result};
 use crate::llm::providers::{ProviderType, UnifiedLLMProvider};
 use crate::llm::{LLMProvider, LLMRegistry};
@@ -12,6 +13,7 @@ use crate::process::ProcessProcessor;
 use crate::recovery::{MessageFilter, RecoveryManager};
 use crate::skill::{SkillDefinition, SkillLoader};
 use crate::spec::AgentSpec;
+use crate::state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
 use crate::template::TemplateLoader;
 use crate::tool_security::ToolSecurityEngine;
 use crate::tools::ToolRegistry;
@@ -33,6 +35,9 @@ pub struct AgentBuilder {
     tool_security: Option<ToolSecurityEngine>,
     process_processor: Option<ProcessProcessor>,
     message_filters: HashMap<String, Arc<dyn MessageFilter>>,
+    context_manager: Option<Arc<ContextManager>>,
+    state_machine: Option<Arc<StateMachine>>,
+    transition_evaluator: Option<Arc<dyn TransitionEvaluator>>,
 }
 
 impl AgentBuilder {
@@ -54,6 +59,9 @@ impl AgentBuilder {
             tool_security: None,
             process_processor: None,
             message_filters: HashMap::new(),
+            context_manager: None,
+            state_machine: None,
+            transition_evaluator: None,
         }
     }
 
@@ -79,6 +87,9 @@ impl AgentBuilder {
             tool_security: None,
             process_processor: None,
             message_filters: HashMap::new(),
+            context_manager: None,
+            state_machine: None,
+            transition_evaluator: None,
         }
     }
 
@@ -255,6 +266,21 @@ impl AgentBuilder {
         self
     }
 
+    pub fn context_manager(mut self, manager: Arc<ContextManager>) -> Self {
+        self.context_manager = Some(manager);
+        self
+    }
+
+    pub fn state_machine(mut self, machine: Arc<StateMachine>) -> Self {
+        self.state_machine = Some(machine);
+        self
+    }
+
+    pub fn transition_evaluator(mut self, evaluator: Arc<dyn TransitionEvaluator>) -> Self {
+        self.transition_evaluator = Some(evaluator);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
@@ -353,14 +379,54 @@ impl AgentBuilder {
             agent = agent.with_process_processor(processor);
         } else if let Some(ref spec) = self.spec {
             if spec.has_process() {
-                let processor =
-                    ProcessProcessor::new(spec.process.clone()).with_llm_registry(llm_registry_arc);
+                let processor = ProcessProcessor::new(spec.process.clone())
+                    .with_llm_registry(llm_registry_arc.clone());
                 agent = agent.with_process_processor(processor);
             }
         }
 
         for (name, filter) in self.message_filters {
             agent.register_message_filter(name, filter);
+        }
+
+        // Configure state machine from spec or builder
+        if let Some(state_machine) = self.state_machine {
+            let evaluator = self.transition_evaluator.unwrap_or_else(|| {
+                let eval_llm = llm_registry_arc
+                    .get("evaluator")
+                    .or_else(|_| llm_registry_arc.router())
+                    .or_else(|_| llm_registry_arc.default())
+                    .expect("At least one LLM required for transition evaluator");
+                Arc::new(LLMTransitionEvaluator::new(eval_llm))
+            });
+            agent = agent.with_state_machine(state_machine, evaluator);
+        } else if let Some(ref spec) = self.spec {
+            if let Some(ref state_config) = spec.states {
+                let state_machine = StateMachine::new(state_config.clone())?;
+                let evaluator = self.transition_evaluator.unwrap_or_else(|| {
+                    let eval_llm = llm_registry_arc
+                        .get("evaluator")
+                        .or_else(|_| llm_registry_arc.router())
+                        .or_else(|_| llm_registry_arc.default())
+                        .expect("At least one LLM required for transition evaluator");
+                    Arc::new(LLMTransitionEvaluator::new(eval_llm))
+                });
+                agent = agent.with_state_machine(Arc::new(state_machine), evaluator);
+            }
+        }
+
+        // Configure context manager from spec or builder
+        if let Some(context_manager) = self.context_manager {
+            agent = agent.with_context_manager(context_manager);
+        } else if let Some(ref spec) = self.spec {
+            if !spec.context.is_empty() {
+                let context_manager = ContextManager::new(
+                    spec.context.clone(),
+                    spec.name.clone(),
+                    spec.version.clone(),
+                );
+                agent = agent.with_context_manager(Arc::new(context_manager));
+            }
         }
 
         Ok(agent)
@@ -488,5 +554,134 @@ skills:
         let builder = AgentBuilder::new().skill(skill.clone()).skills(vec![skill]);
 
         assert_eq!(builder.skills.len(), 2);
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_states() {
+        let yaml = r#"
+name: StatefulAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Welcome!"
+      transitions:
+        - to: support
+          when: "user needs help"
+    support:
+      prompt: "How can I help?"
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+        assert!(spec.has_states());
+        assert!(spec.states.is_some());
+        let states = spec.states.as_ref().unwrap();
+        assert_eq!(states.initial, "greeting");
+        assert_eq!(states.states.len(), 2);
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_context() {
+        let yaml = r#"
+name: ContextAgent
+system_prompt: "Hello, {{ context.user.name }}!"
+llm:
+  provider: openai
+  model: gpt-4
+context:
+  user:
+    type: runtime
+    required: true
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+        assert!(spec.has_context());
+        assert_eq!(spec.context.len(), 2);
+        assert!(spec.context.contains_key("user"));
+        assert!(spec.context.contains_key("time"));
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_full_v04_features() {
+        let yaml = r#"
+name: FullFeaturedAgent
+version: "0.4.0"
+system_prompt: |
+  You are a helpful assistant.
+  User: {{ context.user.name }}
+  Language: {{ context.user.language }}
+llm:
+  provider: openai
+  model: gpt-4
+context:
+  user:
+    type: runtime
+    required: true
+    default:
+      name: "Guest"
+      language: "en"
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Welcome to our service!"
+      prompt_mode: append
+      transitions:
+        - to: support
+          when: "user needs help"
+          auto: true
+          priority: 10
+    support:
+      prompt: "I'm here to help you."
+      max_turns: 5
+      timeout_to: escalation
+      transitions:
+        - to: closing
+          when: "issue resolved"
+          auto: true
+    escalation:
+      prompt: "Let me connect you with a human agent."
+    closing:
+      prompt: "Thank you for using our service!"
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+
+        // Check context
+        assert!(spec.has_context());
+        assert_eq!(spec.context.len(), 2);
+
+        // Check states
+        assert!(spec.has_states());
+        let states = spec.states.as_ref().unwrap();
+        assert_eq!(states.initial, "greeting");
+        assert_eq!(states.states.len(), 4);
+
+        // Check greeting state details
+        let greeting = states.states.get("greeting").unwrap();
+        assert!(greeting.prompt.is_some());
+        assert_eq!(greeting.transitions.len(), 1);
+        assert_eq!(greeting.transitions[0].to, "support");
+        assert!(greeting.transitions[0].auto);
+
+        // Check support state has timeout
+        let support = states.states.get("support").unwrap();
+        assert_eq!(support.max_turns, Some(5));
+        assert_eq!(support.timeout_to, Some("escalation".to_string()));
     }
 }

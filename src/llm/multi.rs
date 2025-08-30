@@ -70,7 +70,7 @@ impl MultiLLMRouter {
     async fn execute_with_fallback<F, Fut, T>(
         &self,
         primary_fn: F,
-        fallback_provider: Arc<dyn LLMProvider>,
+        _fallback_provider: Arc<dyn LLMProvider>,
         operation: &str,
     ) -> Result<T, LLMError>
     where

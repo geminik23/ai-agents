@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use super::Memory;
 use crate::error::Result;
 use crate::llm::ChatMessage;
+use crate::persistence::MemorySnapshot;
 
 pub struct InMemoryStore {
     messages: Arc<RwLock<Vec<ChatMessage>>>,
@@ -40,7 +41,6 @@ impl Memory for InMemoryStore {
         let mut messages = self.messages.write();
         messages.push(message);
 
-        // FIFO eviction when over limit
         while messages.len() > self.max_messages {
             messages.remove(0);
         }
@@ -66,6 +66,15 @@ impl Memory for InMemoryStore {
 
     fn len(&self) -> usize {
         self.messages.read().len()
+    }
+
+    async fn restore(&self, snapshot: MemorySnapshot) -> Result<()> {
+        let mut messages = self.messages.write();
+        *messages = snapshot.messages;
+        while messages.len() > self.max_messages {
+            messages.remove(0);
+        }
+        Ok(())
     }
 }
 
@@ -155,5 +164,23 @@ mod tests {
         let messages = store2.get_messages(None).await.unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "from store1");
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_restore() {
+        let store = InMemoryStore::new(10);
+        store.add_message(make_message("msg1")).await.unwrap();
+        store.add_message(make_message("msg2")).await.unwrap();
+
+        let snapshot = store.snapshot().await.unwrap();
+        assert_eq!(snapshot.messages.len(), 2);
+
+        store.clear().await.unwrap();
+        assert!(store.is_empty());
+
+        store.restore(snapshot).await.unwrap();
+        let messages = store.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content, "msg1");
     }
 }
