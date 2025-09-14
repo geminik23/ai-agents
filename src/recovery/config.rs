@@ -151,7 +151,7 @@ pub enum ContextOverflowAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FilterConfig {
-    KeepRecent,
+    KeepRecent(#[serde(default = "default_keep_recent")] usize),
     ByRole { keep_roles: Vec<String> },
     SkipPattern { skip_if_contains: Vec<String> },
     Custom { name: String },

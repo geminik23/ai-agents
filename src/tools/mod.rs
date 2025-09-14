@@ -7,9 +7,11 @@ use std::sync::Arc;
 use thiserror::Error;
 
 pub mod builtin;
+mod condition;
 mod registry;
 
 pub use builtin::{CalculatorTool, EchoTool};
+pub use condition::{ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord};
 pub use registry::ToolRegistry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,6 +69,9 @@ pub enum ToolError {
 
     #[error("Duplicate tool: {0}")]
     Duplicate(String),
+
+    #[error("Condition not met: {0}")]
+    ConditionNotMet(String),
 
     #[error("{0}")]
     Other(String),

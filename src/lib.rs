@@ -38,6 +38,9 @@ pub use context::{
 };
 pub use persistence::{AgentSnapshot, AgentStorage, FileStorage, MemorySnapshot};
 pub use state::{
-    LLMTransitionEvaluator, PromptMode, StateConfig, StateDefinition, StateMachine,
-    StateMachineSnapshot, StateTransitionEvent, Transition, TransitionContext, TransitionEvaluator,
+    CompareOp, ContextExtractor, ContextMatcher, GuardConditions, GuardOnlyEvaluator,
+    LLMTransitionEvaluator, PromptMode, StateAction, StateConfig, StateDefinition, StateMachine,
+    StateMachineSnapshot, StateMatcher, StateTransitionEvent, TimeMatcher, ToolCondition, ToolRef,
+    Transition, TransitionContext, TransitionEvaluator, TransitionGuard,
 };
+pub use tools::{ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord};

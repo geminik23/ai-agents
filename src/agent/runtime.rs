@@ -8,7 +8,7 @@ use tracing::{debug, error, info, instrument, warn};
 use super::{Agent, AgentInfo, AgentResponse, ToolCall};
 use crate::context::{ContextManager, ContextProvider, TemplateRenderer};
 use crate::error::{AgentError, Result};
-use crate::llm::{ChatMessage, LLMRegistry};
+use crate::llm::{ChatMessage, LLMProvider, LLMRegistry};
 use crate::memory::Memory;
 use crate::persistence::{AgentSnapshot, AgentStorage};
 use crate::process::{ProcessData, ProcessProcessor};
@@ -18,11 +18,11 @@ use crate::recovery::{
 };
 use crate::skill::{SkillDefinition, SkillExecutor, SkillRouter};
 use crate::state::{
-    PromptMode, StateMachine, StateMachineSnapshot, StateTransitionEvent, TransitionContext,
-    TransitionEvaluator,
+    PromptMode, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
+    TransitionContext, TransitionEvaluator,
 };
 use crate::tool_security::{SecurityCheckResult, ToolSecurityEngine};
-use crate::tools::ToolRegistry;
+use crate::tools::{ConditionEvaluator, EvaluationContext, LLMGetter, ToolCallRecord, ToolRegistry};
 
 pub struct RuntimeAgent {
     info: AgentInfo,
@@ -44,6 +44,7 @@ pub struct RuntimeAgent {
     transition_evaluator: Option<Arc<dyn TransitionEvaluator>>,
     context_manager: Arc<ContextManager>,
     template_renderer: TemplateRenderer,
+    tool_call_history: RwLock<Vec<ToolCallRecord>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -56,6 +57,16 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("max_context_tokens", &self.max_context_tokens)
             .field("has_state_machine", &self.state_machine.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+struct RegistryLLMGetter {
+    registry: Arc<LLMRegistry>,
+}
+
+impl LLMGetter for RegistryLLMGetter {
+    fn get_llm(&self, alias: &str) -> Option<Arc<dyn LLMProvider>> {
+        self.registry.get(alias).ok()
     }
 }
 
@@ -102,6 +113,7 @@ impl RuntimeAgent {
             transition_evaluator: None,
             context_manager: Arc::new(context_manager),
             template_renderer: TemplateRenderer::new(),
+            tool_call_history: RwLock::new(Vec::new()),
         }
     }
 
@@ -196,6 +208,7 @@ impl RuntimeAgent {
                     current_state: String::new(),
                     previous_state: None,
                     turn_count: 0,
+                    no_transition_count: 0,
                     history: vec![],
                 }),
             ))
@@ -248,28 +261,22 @@ impl RuntimeAgent {
         let to_remove = messages.len().saturating_sub(keep_recent);
         messages.drain(..to_remove);
         messages.insert(0, system_msg);
-        info!(
-            removed = to_remove,
-            kept = keep_recent,
-            "Truncated messages"
-        );
     }
 
-    fn get_filter(&self, config: Option<&FilterConfig>) -> Arc<dyn MessageFilter> {
+    fn get_filter(&self, config: &FilterConfig) -> Arc<dyn MessageFilter> {
         match config {
-            None | Some(FilterConfig::KeepRecent) => Arc::new(KeepRecentFilter),
-            Some(FilterConfig::ByRole { keep_roles }) => Arc::new(ByRoleFilter {
-                keep_roles: keep_roles.clone(),
-            }),
-            Some(FilterConfig::SkipPattern { skip_if_contains }) => Arc::new(SkipPatternFilter {
-                skip_if_contains: skip_if_contains.clone(),
-            }),
-            Some(FilterConfig::Custom { name }) => self
-                .message_filters
-                .read()
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| Arc::new(KeepRecentFilter)),
+            FilterConfig::KeepRecent(n) => Arc::new(KeepRecentFilter::new(*n)),
+            FilterConfig::ByRole { keep_roles } => Arc::new(ByRoleFilter::new(keep_roles.clone())),
+            FilterConfig::SkipPattern { skip_if_contains } => {
+                Arc::new(SkipPatternFilter::new(skip_if_contains.clone()))
+            }
+            FilterConfig::Custom { name } => {
+                let filters = self.message_filters.read();
+                filters
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(KeepRecentFilter::new(10)))
+            }
         }
     }
 
@@ -277,70 +284,73 @@ impl RuntimeAgent {
         &self,
         messages: &mut Vec<ChatMessage>,
         summarizer_llm: Option<&str>,
-        _max_summary_tokens: u32,
+        max_summary_tokens: u32,
         custom_prompt: Option<&str>,
         keep_recent: usize,
-        filter_config: Option<&FilterConfig>,
+        filter: Option<&FilterConfig>,
     ) -> Result<()> {
-        if messages.is_empty() {
-            return Ok(());
-        }
-
         let system_msg = messages.remove(0);
-        let filter = self.get_filter(filter_config);
-        let (to_summarize, to_keep) = filter.filter(messages, keep_recent);
 
-        if to_summarize.is_empty() {
+        let to_summarize_count = messages.len().saturating_sub(keep_recent);
+        if to_summarize_count == 0 {
             messages.insert(0, system_msg);
             return Ok(());
         }
 
-        let llm = if let Some(alias) = summarizer_llm {
-            self.llm_registry.get(alias).map_err(|e| {
-                AgentError::Config(format!("Summarizer LLM '{}' not found: {}", alias, e))
-            })?
-        } else {
-            self.llm_registry
-                .default()
-                .map_err(|e| AgentError::Config(format!("Default LLM not available: {}", e)))?
-        };
+        let recent_msgs: Vec<ChatMessage> = messages.drain(to_summarize_count..).collect();
+        let mut to_summarize = std::mem::take(messages);
 
-        let default_prompt =
-            "Summarize the following conversation concisely, preserving key information.";
-        let prompt = custom_prompt.unwrap_or(default_prompt);
+        if let Some(filter_config) = filter {
+            let filter = self.get_filter(filter_config);
+            to_summarize = filter.filter(to_summarize);
+        }
 
-        let conversation = to_summarize
+        if to_summarize.is_empty() {
+            *messages = recent_msgs;
+            messages.insert(0, system_msg);
+            return Ok(());
+        }
+
+        let conversation_text = to_summarize
             .iter()
             .map(|m| format!("{:?}: {}", m.role, m.content))
             .collect::<Vec<_>>()
-            .join("\n\n");
+            .join("\n");
 
-        let request = format!("{}\n\nConversation:\n\n{}", prompt, conversation);
-
-        debug!(
-            count = to_summarize.len(),
-            filter = %filter.name(),
-            "Summarizing messages"
+        let default_prompt = format!(
+            "Summarize the following conversation in under {} tokens, preserving key information:\n\n{}",
+            max_summary_tokens, conversation_text
         );
 
-        let response = llm
-            .complete(&[ChatMessage::user(&request)], None)
-            .await
-            .map_err(|e| AgentError::LLM(format!("Summarization failed: {}", e)))?;
+        let summary_prompt = custom_prompt
+            .map(|p| format!("{}\n\n{}", p, conversation_text))
+            .unwrap_or(default_prompt);
 
-        let summary = response.content.trim();
+        let summarizer = if let Some(alias) = summarizer_llm {
+            self.llm_registry
+                .get(alias)
+                .map_err(|e| AgentError::Config(e.to_string()))?
+        } else {
+            self.llm_registry
+                .router()
+                .or_else(|_| self.llm_registry.default())
+                .map_err(|e| AgentError::Config(e.to_string()))?
+        };
 
-        messages.clear();
-        messages.push(system_msg);
-        messages.push(ChatMessage::system(&format!(
-            "[Summary of earlier conversation]: {}",
-            summary
-        )));
-        messages.extend(to_keep);
+        let summary_msgs = vec![ChatMessage::user(&summary_prompt)];
+        let response = summarizer.complete(&summary_msgs, None).await?;
 
-        info!(
-            summarized = to_summarize.len(),
-            kept = messages.len() - 2,
+        let summary_message = ChatMessage::system(&format!(
+            "[Previous conversation summary]\n{}",
+            response.content
+        ));
+
+        *messages = vec![system_msg, summary_message];
+        messages.extend(recent_msgs);
+
+        debug!(
+            summarized_count = to_summarize_count,
+            kept_recent = keep_recent,
             "Context summarized"
         );
 
@@ -349,11 +359,97 @@ impl RuntimeAgent {
 
     fn render_system_prompt(&self) -> Result<String> {
         let context = self.context_manager.get_all();
-        self.template_renderer
-            .render(&self.base_system_prompt, &context)
+        self.template_renderer.render(&self.base_system_prompt, &context)
     }
 
-    fn get_effective_system_prompt(&self) -> Result<String> {
+    async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
+        let tool_refs = self.get_current_tool_refs();
+
+        if tool_refs.is_empty() {
+            return Ok(self.tools.list_ids());
+        }
+
+        let eval_ctx = self.build_evaluation_context().await?;
+        let llm_getter = RegistryLLMGetter {
+            registry: self.llm_registry.clone(),
+        };
+        let evaluator = ConditionEvaluator::new(llm_getter);
+
+        let mut available = Vec::new();
+        for tool_ref in &tool_refs {
+            let tool_id = tool_ref.id();
+
+            if self.tools.get(tool_id).is_none() {
+                continue;
+            }
+
+            if let Some(condition) = tool_ref.condition() {
+                match evaluator.evaluate(condition, &eval_ctx).await {
+                    Ok(true) => {
+                        available.push(tool_id.to_string());
+                    }
+                    Ok(false) => {
+                        debug!(tool = tool_id, "Tool condition not met, skipping");
+                    }
+                    Err(e) => {
+                        warn!(tool = tool_id, error = %e, "Error evaluating tool condition");
+                    }
+                }
+            } else {
+                available.push(tool_id.to_string());
+            }
+        }
+
+        Ok(available)
+    }
+
+    fn get_current_tool_refs(&self) -> Vec<ToolRef> {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if !state_def.tools.is_empty() {
+                    let parent_def = sm.get_parent_definition();
+                    return state_def
+                        .get_effective_tools(parent_def.as_ref())
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    async fn build_evaluation_context(&self) -> Result<EvaluationContext> {
+        let context = self.context_manager.get_all();
+        let messages = self.memory.get_messages(Some(10)).await?;
+        let tool_history = self.tool_call_history.read().clone();
+
+        let (state_name, turn_count, previous_state) = if let Some(ref sm) = self.state_machine {
+            (
+                Some(sm.current()),
+                sm.turn_count(),
+                sm.previous(),
+            )
+        } else {
+            (None, 0, None)
+        };
+
+        Ok(EvaluationContext::default()
+            .with_context(context)
+            .with_state(state_name, turn_count, previous_state)
+            .with_called_tools(tool_history)
+            .with_messages(messages))
+    }
+
+    fn record_tool_call(&self, tool_id: &str, result: Value) {
+        self.tool_call_history.write().push(ToolCallRecord {
+            tool_id: tool_id.to_string(),
+            result,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    async fn get_effective_system_prompt(&self) -> Result<String> {
         let rendered_base = self.render_system_prompt()?;
 
         if let Some(ref sm) = self.state_machine {
@@ -401,10 +497,11 @@ impl RuntimeAgent {
                     }
                 };
 
-                let tools_prompt = if state_def.tools.is_empty() {
+                let available_tool_ids = self.get_available_tool_ids().await?;
+                let tools_prompt = if available_tool_ids.is_empty() {
                     self.tools.generate_tools_prompt()
                 } else {
-                    self.tools.generate_filtered_prompt(&state_def.tools)
+                    self.tools.generate_filtered_prompt(&available_tool_ids)
                 };
 
                 if !tools_prompt.is_empty() {
@@ -422,7 +519,7 @@ impl RuntimeAgent {
         }
     }
 
-    fn get_state_llm(&self) -> Result<Arc<dyn crate::llm::LLMProvider>> {
+    fn get_state_llm(&self) -> Result<Arc<dyn LLMProvider>> {
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
                 if let Some(ref llm_alias) = state_def.llm {
@@ -441,11 +538,13 @@ impl RuntimeAgent {
     fn get_available_skills(&self) -> Vec<&SkillDefinition> {
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
-                if !state_def.skills.is_empty() {
+                let parent_def = sm.get_parent_definition();
+                let effective_skills = state_def.get_effective_skills(parent_def.as_ref());
+                if !effective_skills.is_empty() {
                     return self
                         .skills
                         .iter()
-                        .filter(|s| state_def.skills.contains(&s.id))
+                        .filter(|s| effective_skills.contains(&&s.id))
                         .collect();
                 }
             }
@@ -454,7 +553,7 @@ impl RuntimeAgent {
     }
 
     async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
-        let system_prompt = self.get_effective_system_prompt()?;
+        let system_prompt = self.get_effective_system_prompt().await?;
         let mut messages = vec![ChatMessage::system(&system_prompt)];
         let history = self.memory.get_messages(None).await?;
         messages.extend(history);
@@ -537,6 +636,15 @@ impl RuntimeAgent {
     async fn execute_tool_smart(&self, tool_call: &ToolCall) -> Result<String> {
         info!(args = %tool_call.arguments, "Executing tool");
 
+        let available_tool_ids = self.get_available_tool_ids().await?;
+        if !available_tool_ids.is_empty() && !available_tool_ids.contains(&tool_call.name) {
+            warn!(tool = %tool_call.name, "Tool not available in current context");
+            return Err(AgentError::Tool(format!(
+                "Tool '{}' is not available in current context",
+                tool_call.name
+            )));
+        }
+
         if self.tool_security.config().enabled {
             let security_result = self
                 .tool_security
@@ -587,8 +695,15 @@ impl RuntimeAgent {
         };
 
         match &result {
-            Ok(output) => info!(output_len = output.len(), "Tool execution successful"),
-            Err(e) => error!(error = %e, "Tool execution failed"),
+            Ok(output) => {
+                info!(output_len = output.len(), "Tool execution successful");
+                let result_value: Value = serde_json::from_str(output).unwrap_or(Value::String(output.clone()));
+                self.record_tool_call(&tool_call.name, result_value);
+            }
+            Err(e) => {
+                error!(error = %e, "Tool execution failed");
+                self.record_tool_call(&tool_call.name, serde_json::json!({"error": e.to_string()}));
+            }
         }
 
         result
@@ -653,36 +768,49 @@ impl RuntimeAgent {
         }
     }
 
-    async fn evaluate_transitions(&self, user_message: &str, response: &str) -> Result<()> {
+    async fn evaluate_transitions(&self, user_message: &str, response: &str) -> Result<bool> {
         let (transitions, evaluator, current_state) =
             match (&self.state_machine, &self.transition_evaluator) {
                 (Some(sm), Some(eval)) => {
                     let auto_transitions = sm.auto_transitions();
                     if auto_transitions.is_empty() {
-                        return Ok(());
+                        return Ok(false);
                     }
                     (auto_transitions, eval, sm.current())
                 }
-                _ => return Ok(()),
+                _ => return Ok(false),
             };
 
-        let context = TransitionContext {
-            user_message: user_message.to_string(),
-            assistant_response: response.to_string(),
-            current_state,
-        };
+        let context_map = self.context_manager.get_all();
+        let context = TransitionContext::new(user_message, response, &current_state)
+            .with_context(context_map);
 
         if let Some(index) = evaluator.select_transition(&transitions, &context).await? {
             let target = transitions[index].to.clone();
-            let reason = transitions[index].when.clone();
+            let reason = if transitions[index].when.is_empty() {
+                "guard condition met".to_string()
+            } else {
+                transitions[index].when.clone()
+            };
 
             if let Some(ref sm) = self.state_machine {
                 sm.transition_to(&target, &reason)?;
+                sm.reset_no_transition();
                 info!(from = %context.current_state, to = %target, "State transition");
+            }
+            return Ok(true);
+        }
+
+        if let Some(ref sm) = self.state_machine {
+            sm.increment_no_transition();
+            if let Some(fallback) = sm.check_fallback() {
+                sm.transition_to(&fallback, "fallback after no transitions")?;
+                info!(to = %fallback, "Fallback transition");
+                return Ok(true);
             }
         }
 
-        Ok(())
+        Ok(false)
     }
 
     #[instrument(skip(self, input), fields(agent = %self.info.name))]
@@ -838,11 +966,10 @@ impl RuntimeAgent {
     pub async fn reset(&self) -> Result<()> {
         self.memory.clear().await?;
         *self.iteration_count.write() = 0;
-        self.tool_security.reset_session();
+        self.tool_call_history.write().clear();
         if let Some(ref sm) = self.state_machine {
             sm.reset();
         }
-        info!("Agent session reset");
         Ok(())
     }
 
@@ -861,14 +988,15 @@ impl RuntimeAgent {
     pub fn context_manager(&self) -> &Arc<ContextManager> {
         &self.context_manager
     }
+
+    pub fn tool_call_history(&self) -> Vec<ToolCallRecord> {
+        self.tool_call_history.read().clone()
+    }
 }
 
 #[async_trait]
 impl Agent for RuntimeAgent {
     async fn chat(&self, input: &str) -> Result<AgentResponse> {
-        if input.trim().is_empty() {
-            return Err(AgentError::Other("Input cannot be empty".into()));
-        }
         self.run_loop(input).await
     }
 
@@ -879,11 +1007,10 @@ impl Agent for RuntimeAgent {
     async fn reset(&self) -> Result<()> {
         self.memory.clear().await?;
         *self.iteration_count.write() = 0;
-        self.tool_security.reset_session();
+        self.tool_call_history.write().clear();
         if let Some(ref sm) = self.state_machine {
             sm.reset();
         }
-        info!("Agent session reset");
         Ok(())
     }
 }
