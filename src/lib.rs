@@ -19,7 +19,12 @@ pub use memory::{InMemoryStore, Memory, create_memory, create_memory_from_config
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};
 pub use spec::{AgentSpec, LLMConfig, LLMSelector, MemoryConfig, ToolConfig};
 pub use template::TemplateLoader;
-pub use tools::{Tool, ToolRegistry, ToolResult, create_builtin_registry};
+#[cfg(feature = "http-tool")]
+pub use tools::HttpTool;
+pub use tools::{
+    CalculatorTool, DateTimeTool, EchoTool, JsonTool, RandomTool, Tool, ToolRegistry, ToolResult,
+    create_builtin_registry,
+};
 
 pub use llm::providers::{ProviderType, UnifiedLLMProvider};
 pub use llm::{ChatMessage, LLMProvider, LLMRegistry, LLMResponse, Role};
@@ -43,4 +48,6 @@ pub use state::{
     StateMachineSnapshot, StateMatcher, StateTransitionEvent, TimeMatcher, ToolCondition, ToolRef,
     Transition, TransitionContext, TransitionEvaluator, TransitionGuard,
 };
-pub use tools::{ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord};
+pub use tools::{
+    ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
+};

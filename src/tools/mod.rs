@@ -10,8 +10,12 @@ pub mod builtin;
 mod condition;
 mod registry;
 
-pub use builtin::{CalculatorTool, EchoTool};
-pub use condition::{ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord};
+#[cfg(feature = "http-tool")]
+pub use builtin::HttpTool;
+pub use builtin::{CalculatorTool, DateTimeTool, EchoTool, JsonTool, RandomTool};
+pub use condition::{
+    ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
+};
 pub use registry::ToolRegistry;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +114,19 @@ pub fn create_builtin_registry() -> ToolRegistry {
         .register(Arc::new(EchoTool::new()))
         .expect("failed to register echo");
     registry
+        .register(Arc::new(DateTimeTool::new()))
+        .expect("failed to register datetime");
+    registry
+        .register(Arc::new(JsonTool::new()))
+        .expect("failed to register json");
+    registry
+        .register(Arc::new(RandomTool::new()))
+        .expect("failed to register random");
+    #[cfg(feature = "http-tool")]
+    registry
+        .register(Arc::new(HttpTool::new()))
+        .expect("failed to register http");
+    registry
 }
 
 #[cfg(test)]
@@ -135,5 +152,8 @@ mod tests {
         let registry = create_builtin_registry();
         assert!(registry.get("calculator").is_some());
         assert!(registry.get("echo").is_some());
+        assert!(registry.get("datetime").is_some());
+        assert!(registry.get("json").is_some());
+        assert!(registry.get("random").is_some());
     }
 }
