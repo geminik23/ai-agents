@@ -1,11 +1,15 @@
 use async_trait::async_trait;
+use futures::stream::{self, Stream, StreamExt};
 use parking_lot::RwLock;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
 
-use super::{Agent, AgentInfo, AgentResponse, ToolCall};
+use super::{
+    Agent, AgentInfo, AgentResponse, ParallelToolsConfig, StreamChunk, StreamingConfig, ToolCall,
+};
 use crate::context::{ContextManager, ContextProvider, TemplateRenderer};
 use crate::error::{AgentError, Result};
 use crate::llm::{ChatMessage, LLMProvider, LLMRegistry};
@@ -22,7 +26,9 @@ use crate::state::{
     TransitionContext, TransitionEvaluator,
 };
 use crate::tool_security::{SecurityCheckResult, ToolSecurityEngine};
-use crate::tools::{ConditionEvaluator, EvaluationContext, LLMGetter, ToolCallRecord, ToolRegistry};
+use crate::tools::{
+    ConditionEvaluator, EvaluationContext, LLMGetter, ToolCallRecord, ToolRegistry,
+};
 
 pub struct RuntimeAgent {
     info: AgentInfo,
@@ -45,6 +51,8 @@ pub struct RuntimeAgent {
     context_manager: Arc<ContextManager>,
     template_renderer: TemplateRenderer,
     tool_call_history: RwLock<Vec<ToolCallRecord>>,
+    parallel_tools: ParallelToolsConfig,
+    streaming: StreamingConfig,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -56,6 +64,8 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("skills_count", &self.skills.len())
             .field("max_context_tokens", &self.max_context_tokens)
             .field("has_state_machine", &self.state_machine.is_some())
+            .field("parallel_tools", &self.parallel_tools)
+            .field("streaming", &self.streaming)
             .finish_non_exhaustive()
     }
 }
@@ -114,7 +124,19 @@ impl RuntimeAgent {
             context_manager: Arc::new(context_manager),
             template_renderer: TemplateRenderer::new(),
             tool_call_history: RwLock::new(Vec::new()),
+            parallel_tools: ParallelToolsConfig::default(),
+            streaming: StreamingConfig::default(),
         }
+    }
+
+    pub fn with_parallel_tools(mut self, config: ParallelToolsConfig) -> Self {
+        self.parallel_tools = config;
+        self
+    }
+
+    pub fn with_streaming(mut self, config: StreamingConfig) -> Self {
+        self.streaming = config;
+        self
     }
 
     pub fn with_max_context_tokens(mut self, tokens: u32) -> Self {
@@ -359,7 +381,8 @@ impl RuntimeAgent {
 
     fn render_system_prompt(&self) -> Result<String> {
         let context = self.context_manager.get_all();
-        self.template_renderer.render(&self.base_system_prompt, &context)
+        self.template_renderer
+            .render(&self.base_system_prompt, &context)
     }
 
     async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
@@ -425,11 +448,7 @@ impl RuntimeAgent {
         let tool_history = self.tool_call_history.read().clone();
 
         let (state_name, turn_count, previous_state) = if let Some(ref sm) = self.state_machine {
-            (
-                Some(sm.current()),
-                sm.turn_count(),
-                sm.previous(),
-            )
+            (Some(sm.current()), sm.turn_count(), sm.previous())
         } else {
             (None, 0, None)
         };
@@ -697,7 +716,8 @@ impl RuntimeAgent {
         match &result {
             Ok(output) => {
                 info!(output_len = output.len(), "Tool execution successful");
-                let result_value: Value = serde_json::from_str(output).unwrap_or(Value::String(output.clone()));
+                let result_value: Value =
+                    serde_json::from_str(output).unwrap_or(Value::String(output.clone()));
                 self.record_tool_call(&tool_call.name, result_value);
             }
             Err(e) => {
@@ -900,8 +920,10 @@ impl RuntimeAgent {
             let content = response.content.trim();
 
             if let Some(tool_calls) = self.parse_tool_calls(content) {
-                for tool_call in &tool_calls {
-                    match self.execute_tool_smart(tool_call).await {
+                let results = self.execute_tools_parallel(&tool_calls).await;
+
+                for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
+                    match result {
                         Ok(output) => {
                             self.memory
                                 .add_message(ChatMessage::function(&tool_call.name, &output))
@@ -991,6 +1013,186 @@ impl RuntimeAgent {
 
     pub fn tool_call_history(&self) -> Vec<ToolCallRecord> {
         self.tool_call_history.read().clone()
+    }
+
+    pub fn parallel_tools_config(&self) -> &ParallelToolsConfig {
+        &self.parallel_tools
+    }
+
+    pub fn streaming_config(&self) -> &StreamingConfig {
+        &self.streaming
+    }
+
+    /// Execute multiple tools in parallel
+    async fn execute_tools_parallel(
+        &self,
+        tool_calls: &[ToolCall],
+    ) -> Vec<(String, Result<String>)> {
+        if !self.parallel_tools.enabled || tool_calls.len() <= 1 {
+            let mut results = Vec::new();
+            for tc in tool_calls {
+                let result = self.execute_tool_smart(tc).await;
+                results.push((tc.id.clone(), result));
+            }
+            return results;
+        }
+
+        let chunks: Vec<_> = tool_calls
+            .chunks(self.parallel_tools.max_parallel)
+            .collect();
+
+        let mut all_results = Vec::new();
+
+        for chunk in chunks {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|tc| {
+                    let tc = tc.clone();
+                    async move {
+                        let result = self.execute_tool_smart(&tc).await;
+                        (tc.id.clone(), result)
+                    }
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+            all_results.extend(results);
+        }
+
+        all_results
+    }
+
+    /// Stream a chat response with real-time updates
+    pub async fn chat_stream(
+        &self,
+        input: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + '_>>> {
+        info!(input_len = input.len(), "Starting streaming chat");
+
+        self.check_turn_timeout().await?;
+        self.context_manager.refresh_per_turn().await?;
+
+        let input_data = self.process_input(input).await?;
+
+        if input_data.metadata.rejected {
+            let reason = input_data
+                .metadata
+                .rejection_reason
+                .unwrap_or_else(|| "Input rejected".to_string());
+            warn!(reason = %reason, "Input rejected");
+            return Ok(Box::pin(stream::once(
+                async move { StreamChunk::error(reason) },
+            )));
+        }
+
+        let processed_input = input_data.content.clone();
+        let input_context = input_data.context.clone();
+
+        if let Some(skill_response) = self.try_skill_route(&processed_input).await? {
+            self.memory
+                .add_message(ChatMessage::user(&processed_input))
+                .await?;
+
+            let output_data = self.process_output(&skill_response, &input_context).await?;
+            let final_response = output_data.content;
+
+            self.memory
+                .add_message(ChatMessage::assistant(&final_response))
+                .await?;
+
+            self.increment_turn();
+            self.evaluate_transitions(&processed_input, &final_response)
+                .await?;
+
+            return Ok(Box::pin(stream::iter(vec![
+                StreamChunk::content(final_response),
+                StreamChunk::Done {},
+            ])));
+        }
+
+        self.memory
+            .add_message(ChatMessage::user(&processed_input))
+            .await?;
+
+        let llm = self.get_state_llm()?;
+        let messages = self.build_messages().await?;
+
+        let llm_stream = llm
+            .complete_stream(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+        let streaming_config = self.streaming.clone();
+        let include_tool_events = streaming_config.include_tool_events;
+
+        let stream = async_stream::stream! {
+            let mut accumulated_content = String::new();
+            let mut stream = llm_stream;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        accumulated_content.push_str(&chunk.delta);
+                        yield StreamChunk::content(chunk.delta);
+                    }
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                }
+            }
+
+            let content = accumulated_content.trim().to_string();
+
+            if let Some(tool_calls) = self.parse_tool_calls(&content) {
+                for tool_call in &tool_calls {
+                    if include_tool_events {
+                        yield StreamChunk::tool_start(&tool_call.id, &tool_call.name);
+                    }
+
+                    match self.execute_tool_smart(tool_call).await {
+                        Ok(output) => {
+                            if include_tool_events {
+                                yield StreamChunk::tool_result(
+                                    &tool_call.id,
+                                    &tool_call.name,
+                                    &output,
+                                    true,
+                                );
+                            }
+                            let _ = self.memory
+                                .add_message(ChatMessage::function(&tool_call.name, &output))
+                                .await;
+                        }
+                        Err(e) => {
+                            if include_tool_events {
+                                yield StreamChunk::tool_result(
+                                    &tool_call.id,
+                                    &tool_call.name,
+                                    &e.to_string(),
+                                    false,
+                                );
+                            }
+                            let _ = self.memory
+                                .add_message(ChatMessage::function(&tool_call.name, &format!("Error: {}", e)))
+                                .await;
+                        }
+                    }
+
+                    if include_tool_events {
+                        yield StreamChunk::tool_end(&tool_call.id);
+                    }
+                }
+            } else {
+                let _ = self.memory
+                    .add_message(ChatMessage::assistant(&content))
+                    .await;
+            }
+
+            yield StreamChunk::Done {};
+        };
+
+        Ok(Box::pin(stream))
     }
 }
 

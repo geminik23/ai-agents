@@ -13,7 +13,10 @@ pub mod template;
 pub mod tool_security;
 pub mod tools;
 
-pub use agent::{Agent, AgentBuilder, AgentInfo, AgentResponse, RuntimeAgent};
+pub use agent::{
+    Agent, AgentBuilder, AgentInfo, AgentResponse, ParallelToolsConfig, RuntimeAgent, StreamChunk,
+    StreamingConfig,
+};
 pub use error::{AgentError, Result};
 pub use memory::{InMemoryStore, Memory, create_memory, create_memory_from_config};
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};

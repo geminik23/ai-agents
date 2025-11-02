@@ -4,9 +4,11 @@ use std::collections::HashMap;
 
 mod builder;
 mod runtime;
+mod streaming;
 
 pub use builder::AgentBuilder;
 pub use runtime::RuntimeAgent;
+pub use streaming::{StreamChunk, StreamingConfig};
 
 use crate::error::Result;
 
@@ -80,6 +82,34 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Configuration for parallel tool execution
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelToolsConfig {
+    /// Enable parallel tool execution
+    #[serde(default = "default_parallel_enabled")]
+    pub enabled: bool,
+    /// Maximum number of tools to execute in parallel
+    #[serde(default = "default_max_parallel")]
+    pub max_parallel: usize,
+}
+
+fn default_parallel_enabled() -> bool {
+    true
+}
+
+fn default_max_parallel() -> usize {
+    5
+}
+
+impl Default for ParallelToolsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_parallel: 5,
+        }
+    }
+}
+
 #[async_trait]
 pub trait Agent: Send + Sync {
     async fn chat(&self, input: &str) -> Result<AgentResponse>;
@@ -125,5 +155,29 @@ mod tests {
         let response = AgentResponse::new("Hello!");
         assert_eq!(response.content, "Hello!");
         assert!(response.tool_calls.is_none());
+    }
+
+    #[test]
+    fn test_parallel_tools_config_defaults() {
+        let config = ParallelToolsConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.max_parallel, 5);
+    }
+
+    #[test]
+    fn test_parallel_tools_config_deserialize() {
+        let yaml = r#"
+enabled: true
+max_parallel: 10
+"#;
+        let config: ParallelToolsConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.max_parallel, 10);
+    }
+
+    #[test]
+    fn test_streaming_config_defaults() {
+        let config = StreamingConfig::default();
+        assert!(config.enabled);
     }
 }

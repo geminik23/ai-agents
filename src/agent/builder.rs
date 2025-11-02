@@ -429,6 +429,12 @@ impl AgentBuilder {
             }
         }
 
+        // Configure parallel tools and streaming from spec
+        if let Some(ref spec) = self.spec {
+            agent = agent.with_parallel_tools(spec.parallel_tools.clone());
+            agent = agent.with_streaming(spec.streaming.clone());
+        }
+
         Ok(agent)
     }
 }

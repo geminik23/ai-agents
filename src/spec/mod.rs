@@ -11,6 +11,7 @@ pub use tool::ToolConfig;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use crate::agent::{ParallelToolsConfig, StreamingConfig};
 use crate::context::ContextSource;
 use crate::process::ProcessConfig;
 use crate::recovery::ErrorRecoveryConfig;
@@ -65,6 +66,12 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub states: Option<StateConfig>,
+
+    #[serde(default)]
+    pub parallel_tools: ParallelToolsConfig,
+
+    #[serde(default)]
+    pub streaming: StreamingConfig,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -144,6 +151,8 @@ impl Default for AgentSpec {
             process: ProcessConfig::default(),
             context: HashMap::new(),
             states: None,
+            parallel_tools: ParallelToolsConfig::default(),
+            streaming: StreamingConfig::default(),
             metadata: None,
         }
     }
@@ -198,6 +207,14 @@ impl AgentSpec {
 
     pub fn has_context(&self) -> bool {
         !self.context.is_empty()
+    }
+
+    pub fn has_parallel_tools(&self) -> bool {
+        self.parallel_tools.enabled
+    }
+
+    pub fn has_streaming(&self) -> bool {
+        self.streaming.enabled
     }
 }
 
@@ -377,5 +394,48 @@ skills:
 
         spec.max_iterations = 5;
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_spec_with_parallel_tools() {
+        let yaml = r#"
+name: ParallelAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+parallel_tools:
+  enabled: true
+  max_parallel: 10
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_parallel_tools());
+        assert_eq!(spec.parallel_tools.max_parallel, 10);
+    }
+
+    #[test]
+    fn test_agent_spec_with_streaming() {
+        let yaml = r#"
+name: StreamingAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+streaming:
+  enabled: true
+  buffer_size: 64
+  include_tool_events: true
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_streaming());
+        assert_eq!(spec.streaming.buffer_size, 64);
+    }
+
+    #[test]
+    fn test_agent_spec_defaults() {
+        let spec = AgentSpec::default();
+        assert!(spec.parallel_tools.enabled);
+        assert_eq!(spec.parallel_tools.max_parallel, 5);
+        assert!(spec.streaming.enabled);
     }
 }
