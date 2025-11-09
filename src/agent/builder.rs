@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::{AgentInfo, runtime::RuntimeAgent};
 use crate::context::ContextManager;
 use crate::error::{AgentError, Result};
+use crate::hooks::AgentHooks;
 use crate::llm::providers::{ProviderType, UnifiedLLMProvider};
 use crate::llm::{LLMProvider, LLMRegistry};
 use crate::memory::{InMemoryStore, Memory};
@@ -38,6 +39,7 @@ pub struct AgentBuilder {
     context_manager: Option<Arc<ContextManager>>,
     state_machine: Option<Arc<StateMachine>>,
     transition_evaluator: Option<Arc<dyn TransitionEvaluator>>,
+    hooks: Option<Arc<dyn AgentHooks>>,
 }
 
 impl AgentBuilder {
@@ -62,6 +64,7 @@ impl AgentBuilder {
             context_manager: None,
             state_machine: None,
             transition_evaluator: None,
+            hooks: None,
         }
     }
 
@@ -90,6 +93,7 @@ impl AgentBuilder {
             context_manager: None,
             state_machine: None,
             transition_evaluator: None,
+            hooks: None,
         }
     }
 
@@ -281,6 +285,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
+        self.hooks = Some(hooks);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
@@ -433,6 +442,11 @@ impl AgentBuilder {
         if let Some(ref spec) = self.spec {
             agent = agent.with_parallel_tools(spec.parallel_tools.clone());
             agent = agent.with_streaming(spec.streaming.clone());
+        }
+
+        // Configure hooks
+        if let Some(hooks) = self.hooks {
+            agent = agent.with_hooks(hooks);
         }
 
         Ok(agent)

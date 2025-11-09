@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
 use super::{
@@ -12,6 +13,7 @@ use super::{
 };
 use crate::context::{ContextManager, ContextProvider, TemplateRenderer};
 use crate::error::{AgentError, Result};
+use crate::hooks::{AgentHooks, NoopHooks};
 use crate::llm::{ChatMessage, LLMProvider, LLMRegistry};
 use crate::memory::Memory;
 use crate::persistence::{AgentSnapshot, AgentStorage};
@@ -27,7 +29,7 @@ use crate::state::{
 };
 use crate::tool_security::{SecurityCheckResult, ToolSecurityEngine};
 use crate::tools::{
-    ConditionEvaluator, EvaluationContext, LLMGetter, ToolCallRecord, ToolRegistry,
+    ConditionEvaluator, EvaluationContext, LLMGetter, ToolCallRecord, ToolRegistry, ToolResult,
 };
 
 pub struct RuntimeAgent {
@@ -53,6 +55,7 @@ pub struct RuntimeAgent {
     tool_call_history: RwLock<Vec<ToolCallRecord>>,
     parallel_tools: ParallelToolsConfig,
     streaming: StreamingConfig,
+    hooks: Arc<dyn AgentHooks>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -66,6 +69,7 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("has_state_machine", &self.state_machine.is_some())
             .field("parallel_tools", &self.parallel_tools)
             .field("streaming", &self.streaming)
+            .field("has_hooks", &true)
             .finish_non_exhaustive()
     }
 }
@@ -126,7 +130,13 @@ impl RuntimeAgent {
             tool_call_history: RwLock::new(Vec::new()),
             parallel_tools: ParallelToolsConfig::default(),
             streaming: StreamingConfig::default(),
+            hooks: Arc::new(NoopHooks),
         }
+    }
+
+    pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
+        self.hooks = hooks;
+        self
     }
 
     pub fn with_parallel_tools(mut self, config: ParallelToolsConfig) -> Self {
@@ -655,6 +665,11 @@ impl RuntimeAgent {
     async fn execute_tool_smart(&self, tool_call: &ToolCall) -> Result<String> {
         info!(args = %tool_call.arguments, "Executing tool");
 
+        self.hooks
+            .on_tool_start(&tool_call.name, &tool_call.arguments)
+            .await;
+        let tool_start = Instant::now();
+
         let available_tool_ids = self.get_available_tool_ids().await?;
         if !available_tool_ids.is_empty() && !available_tool_ids.contains(&tool_call.name) {
             warn!(tool = %tool_call.name, "Tool not available in current context");
@@ -713,16 +728,37 @@ impl RuntimeAgent {
             self.execute_tool(tool_call).await
         };
 
+        let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
+
         match &result {
             Ok(output) => {
                 info!(output_len = output.len(), "Tool execution successful");
                 let result_value: Value =
                     serde_json::from_str(output).unwrap_or(Value::String(output.clone()));
                 self.record_tool_call(&tool_call.name, result_value);
+
+                let tool_result = ToolResult {
+                    success: true,
+                    output: output.clone(),
+                    metadata: None,
+                };
+                self.hooks
+                    .on_tool_complete(&tool_call.name, &tool_result, tool_duration_ms)
+                    .await;
             }
             Err(e) => {
                 error!(error = %e, "Tool execution failed");
                 self.record_tool_call(&tool_call.name, serde_json::json!({"error": e.to_string()}));
+
+                let tool_result = ToolResult {
+                    success: false,
+                    output: e.to_string(),
+                    metadata: None,
+                };
+                self.hooks
+                    .on_tool_complete(&tool_call.name, &tool_result, tool_duration_ms)
+                    .await;
+                self.hooks.on_error(e).await;
             }
         }
 
@@ -816,6 +852,9 @@ impl RuntimeAgent {
             if let Some(ref sm) = self.state_machine {
                 sm.transition_to(&target, &reason)?;
                 sm.reset_no_transition();
+                self.hooks
+                    .on_state_transition(Some(&context.current_state), &target, &reason)
+                    .await;
                 info!(from = %context.current_state, to = %target, "State transition");
             }
             return Ok(true);
@@ -824,7 +863,15 @@ impl RuntimeAgent {
         if let Some(ref sm) = self.state_machine {
             sm.increment_no_transition();
             if let Some(fallback) = sm.check_fallback() {
+                let from_state = current_state.clone();
                 sm.transition_to(&fallback, "fallback after no transitions")?;
+                self.hooks
+                    .on_state_transition(
+                        Some(&from_state),
+                        &fallback,
+                        "fallback after no transitions",
+                    )
+                    .await;
                 info!(to = %fallback, "Fallback transition");
                 return Ok(true);
             }
@@ -836,6 +883,8 @@ impl RuntimeAgent {
     #[instrument(skip(self, input), fields(agent = %self.info.name))]
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
         info!(input_len = input.len(), "Starting chat");
+
+        self.hooks.on_message_received(input).await;
 
         self.check_turn_timeout().await?;
         self.context_manager.refresh_per_turn().await?;
@@ -871,7 +920,9 @@ impl RuntimeAgent {
             self.evaluate_transitions(processed_input, &final_response)
                 .await?;
 
-            return Ok(AgentResponse::new(final_response));
+            let response = AgentResponse::new(final_response);
+            self.hooks.on_response(&response).await;
+            return Ok(response);
         }
 
         self.memory
@@ -885,11 +936,11 @@ impl RuntimeAgent {
 
         loop {
             if iterations >= self.max_iterations {
+                let err =
+                    AgentError::Other(format!("Max iterations ({}) exceeded", self.max_iterations));
+                self.hooks.on_error(&err).await;
                 error!(iterations = iterations, "Max iterations exceeded");
-                return Err(AgentError::Other(format!(
-                    "Max iterations ({}) exceeded",
-                    self.max_iterations
-                )));
+                return Err(err);
             }
             iterations += 1;
             *self.iteration_count.write() = iterations;
@@ -901,6 +952,9 @@ impl RuntimeAgent {
             );
 
             let messages = self.build_messages().await?;
+
+            self.hooks.on_llm_start(&messages).await;
+            let llm_start = Instant::now();
 
             let response = if self.recovery_manager.config().default.max_retries > 0 {
                 self.recovery_manager
@@ -916,6 +970,9 @@ impl RuntimeAgent {
                     .await
                     .map_err(|e| AgentError::LLM(e.to_string()))?
             };
+
+            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
 
             let content = response.content.trim();
 
@@ -971,6 +1028,8 @@ impl RuntimeAgent {
                 response = response.with_metadata("current_state", serde_json::json!(state));
             }
 
+            self.hooks.on_response(&response).await;
+
             let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
             info!(tool_calls = tool_call_count, "Chat completed");
             return Ok(response);
@@ -1021,6 +1080,10 @@ impl RuntimeAgent {
 
     pub fn streaming_config(&self) -> &StreamingConfig {
         &self.streaming
+    }
+
+    pub fn hooks(&self) -> &Arc<dyn AgentHooks> {
+        &self.hooks
     }
 
     /// Execute multiple tools in parallel

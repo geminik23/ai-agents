@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod context;
 pub mod error;
+pub mod hooks;
 pub mod llm;
 pub mod memory;
 pub mod persistence;
@@ -54,3 +55,5 @@ pub use state::{
 pub use tools::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
 };
+
+pub use hooks::{AgentHooks, CompositeHooks, HookTimer, LoggingHooks, NoopHooks};
