@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use crate::agent::{ParallelToolsConfig, StreamingConfig};
 use crate::context::ContextSource;
+use crate::hitl::HITLConfig;
 use crate::process::ProcessConfig;
 use crate::recovery::ErrorRecoveryConfig;
 use crate::skill::SkillRef;
@@ -72,6 +73,9 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub streaming: StreamingConfig,
+
+    #[serde(default)]
+    pub hitl: Option<HITLConfig>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -153,6 +157,7 @@ impl Default for AgentSpec {
             states: None,
             parallel_tools: ParallelToolsConfig::default(),
             streaming: StreamingConfig::default(),
+            hitl: None,
             metadata: None,
         }
     }
@@ -215,6 +220,10 @@ impl AgentSpec {
 
     pub fn has_streaming(&self) -> bool {
         self.streaming.enabled
+    }
+
+    pub fn has_hitl(&self) -> bool {
+        self.hitl.is_some()
     }
 }
 
@@ -437,5 +446,41 @@ streaming:
         assert!(spec.parallel_tools.enabled);
         assert_eq!(spec.parallel_tools.max_parallel, 5);
         assert!(spec.streaming.enabled);
+        assert!(!spec.has_hitl());
+    }
+
+    #[test]
+    fn test_agent_spec_with_hitl() {
+        let yaml = r#"
+name: HITLAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+hitl:
+  default_timeout_seconds: 600
+  on_timeout: reject
+  tools:
+    send_payment:
+      require_approval: true
+      approval_context:
+        - amount
+        - recipient
+      approval_message: "Approve payment?"
+  conditions:
+    - name: high_value
+      when: "amount > 1000"
+      require_approval: true
+  states:
+    escalation:
+      on_enter: require_approval
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_hitl());
+        let hitl = spec.hitl.as_ref().unwrap();
+        assert_eq!(hitl.default_timeout_seconds, 600);
+        assert_eq!(hitl.tools.len(), 1);
+        assert_eq!(hitl.conditions.len(), 1);
+        assert_eq!(hitl.states.len(), 1);
     }
 }

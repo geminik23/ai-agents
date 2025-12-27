@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::{AgentInfo, runtime::RuntimeAgent};
 use crate::context::ContextManager;
 use crate::error::{AgentError, Result};
+use crate::hitl::{ApprovalHandler, HITLEngine, RejectAllHandler};
 use crate::hooks::AgentHooks;
 use crate::llm::providers::{ProviderType, UnifiedLLMProvider};
 use crate::llm::{LLMProvider, LLMRegistry};
@@ -40,6 +41,8 @@ pub struct AgentBuilder {
     state_machine: Option<Arc<StateMachine>>,
     transition_evaluator: Option<Arc<dyn TransitionEvaluator>>,
     hooks: Option<Arc<dyn AgentHooks>>,
+    hitl_engine: Option<HITLEngine>,
+    approval_handler: Option<Arc<dyn ApprovalHandler>>,
 }
 
 impl AgentBuilder {
@@ -65,6 +68,8 @@ impl AgentBuilder {
             state_machine: None,
             transition_evaluator: None,
             hooks: None,
+            hitl_engine: None,
+            approval_handler: None,
         }
     }
 
@@ -94,6 +99,8 @@ impl AgentBuilder {
             state_machine: None,
             transition_evaluator: None,
             hooks: None,
+            hitl_engine: None,
+            approval_handler: None,
         }
     }
 
@@ -290,6 +297,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn approval_handler(mut self, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.approval_handler = Some(handler);
+        self
+    }
+
+    pub fn hitl_engine(mut self, engine: HITLEngine) -> Self {
+        self.hitl_engine = Some(engine);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
@@ -447,6 +464,22 @@ impl AgentBuilder {
         // Configure hooks
         if let Some(hooks) = self.hooks {
             agent = agent.with_hooks(hooks);
+        }
+
+        // Configure HITL from spec or builder
+        if let Some(hitl_engine) = self.hitl_engine {
+            let handler = self
+                .approval_handler
+                .unwrap_or_else(|| Arc::new(RejectAllHandler::new()));
+            agent = agent.with_hitl(hitl_engine, handler);
+        } else if let Some(ref spec) = self.spec {
+            if let Some(ref hitl_config) = spec.hitl {
+                let hitl_engine = HITLEngine::new(hitl_config.clone());
+                let handler = self
+                    .approval_handler
+                    .unwrap_or_else(|| Arc::new(RejectAllHandler::new()));
+                agent = agent.with_hitl(hitl_engine, handler);
+            }
         }
 
         Ok(agent)
@@ -703,5 +736,49 @@ states:
         let support = states.states.get("support").unwrap();
         assert_eq!(support.max_turns, Some(5));
         assert_eq!(support.timeout_to, Some("escalation".to_string()));
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_hitl() {
+        let yaml = r#"
+name: HITLAgent
+system_prompt: "You are a secure assistant."
+llm:
+  provider: openai
+  model: gpt-4
+hitl:
+  default_timeout_seconds: 600
+  on_timeout: reject
+  tools:
+    send_payment:
+      require_approval: true
+      approval_context:
+        - amount
+        - recipient
+      approval_message: "Approve payment?"
+    delete_record:
+      require_approval: true
+  conditions:
+    - name: high_value
+      when: "amount > 1000"
+      require_approval: true
+      approval_message: "High value transaction"
+  states:
+    escalation:
+      on_enter: require_approval
+      approval_message: "Escalate to human?"
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+
+        assert!(spec.has_hitl());
+        let hitl = spec.hitl.as_ref().unwrap();
+        assert_eq!(hitl.default_timeout_seconds, 600);
+        assert_eq!(hitl.tools.len(), 2);
+        assert!(hitl.tools.get("send_payment").unwrap().require_approval);
+        assert_eq!(hitl.conditions.len(), 1);
+        assert_eq!(hitl.conditions[0].name, "high_value");
+        assert_eq!(hitl.states.len(), 1);
     }
 }

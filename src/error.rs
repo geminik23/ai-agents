@@ -45,6 +45,12 @@ pub enum AgentError {
     #[error("JSON error: {0}")]
     JsonError(#[from] serde_json::Error),
 
+    #[error("HITL timeout")]
+    HITLTimeout,
+
+    #[error("HITL rejected: {0}")]
+    HITLRejected(String),
+
     #[error("{0}")]
     Other(String),
 }

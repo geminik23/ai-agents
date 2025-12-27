@@ -6,6 +6,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::agent::AgentResponse;
 use crate::error::AgentError;
+use crate::hitl::{ApprovalRequest, ApprovalResult};
 use crate::llm::{ChatMessage, LLMResponse};
 use crate::tools::ToolResult;
 
@@ -26,6 +27,10 @@ pub trait AgentHooks: Send + Sync {
     async fn on_error(&self, _error: &AgentError) {}
 
     async fn on_response(&self, _response: &AgentResponse) {}
+
+    async fn on_approval_requested(&self, _request: &ApprovalRequest) {}
+
+    async fn on_approval_result(&self, _request_id: &str, _result: &ApprovalResult) {}
 }
 
 pub struct NoopHooks;
@@ -120,6 +125,36 @@ impl AgentHooks for LoggingHooks {
         };
         debug!("{} Response: {}", self.prefix, preview);
     }
+
+    async fn on_approval_requested(&self, request: &ApprovalRequest) {
+        info!(
+            "{} Approval requested [{}]: {}",
+            self.prefix, request.id, request.message
+        );
+    }
+
+    async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
+        match result {
+            ApprovalResult::Approved => {
+                info!("{} Approval [{}]: approved", self.prefix, request_id);
+            }
+            ApprovalResult::Rejected { reason } => {
+                warn!(
+                    "{} Approval [{}]: rejected ({:?})",
+                    self.prefix, request_id, reason
+                );
+            }
+            ApprovalResult::Modified { .. } => {
+                info!(
+                    "{} Approval [{}]: approved with modifications",
+                    self.prefix, request_id
+                );
+            }
+            ApprovalResult::Timeout => {
+                warn!("{} Approval [{}]: timeout", self.prefix, request_id);
+            }
+        }
+    }
 }
 
 pub struct CompositeHooks {
@@ -194,6 +229,18 @@ impl AgentHooks for CompositeHooks {
     async fn on_response(&self, response: &AgentResponse) {
         for hook in &self.hooks {
             hook.on_response(response).await;
+        }
+    }
+
+    async fn on_approval_requested(&self, request: &ApprovalRequest) {
+        for hook in &self.hooks {
+            hook.on_approval_requested(request).await;
+        }
+    }
+
+    async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
+        for hook in &self.hooks {
+            hook.on_approval_result(request_id, result).await;
         }
     }
 }
@@ -280,6 +327,24 @@ mod tests {
             self.events
                 .lock()
                 .push(format!("response:{}", response.content.len()));
+        }
+
+        async fn on_approval_requested(&self, request: &ApprovalRequest) {
+            self.events
+                .lock()
+                .push(format!("approval_requested:{}", request.id));
+        }
+
+        async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
+            let status = match result {
+                ApprovalResult::Approved => "approved",
+                ApprovalResult::Rejected { .. } => "rejected",
+                ApprovalResult::Modified { .. } => "modified",
+                ApprovalResult::Timeout => "timeout",
+            };
+            self.events
+                .lock()
+                .push(format!("approval_result:{}:{}", request_id, status));
         }
     }
 

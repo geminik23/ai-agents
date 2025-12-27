@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod context;
 pub mod error;
+pub mod hitl;
 pub mod hooks;
 pub mod llm;
 pub mod memory;
@@ -57,3 +58,12 @@ pub use tools::{
 };
 
 pub use hooks::{AgentHooks, CompositeHooks, HookTimer, LoggingHooks, NoopHooks};
+
+pub use hitl::{
+    ApprovalCondition, ApprovalHandler, ApprovalMessage, ApprovalRequest, ApprovalResult,
+    ApprovalTrigger, AutoApproveHandler, HITLCheckResult, HITLConfig, HITLEngine,
+    LlmGenerateConfig, LocalizedHandler, MessageLanguageConfig, MessageLanguageStrategy,
+    MessageResolver, RejectAllHandler, StateApprovalConfig, StateApprovalTrigger, TimeoutAction,
+    ToolApprovalConfig, create_handler, create_localized_handler, resolve_best_language,
+    resolve_tool_message,
+};

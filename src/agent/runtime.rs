@@ -13,6 +13,9 @@ use super::{
 };
 use crate::context::{ContextManager, ContextProvider, TemplateRenderer};
 use crate::error::{AgentError, Result};
+use crate::hitl::{
+    ApprovalHandler, ApprovalResult, HITLCheckResult, HITLEngine, RejectAllHandler, TimeoutAction,
+};
 use crate::hooks::{AgentHooks, NoopHooks};
 use crate::llm::{ChatMessage, LLMProvider, LLMRegistry};
 use crate::memory::Memory;
@@ -56,6 +59,8 @@ pub struct RuntimeAgent {
     parallel_tools: ParallelToolsConfig,
     streaming: StreamingConfig,
     hooks: Arc<dyn AgentHooks>,
+    hitl_engine: Option<HITLEngine>,
+    approval_handler: Arc<dyn ApprovalHandler>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -70,6 +75,7 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("parallel_tools", &self.parallel_tools)
             .field("streaming", &self.streaming)
             .field("has_hooks", &true)
+            .field("has_hitl", &self.hitl_engine.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -131,6 +137,8 @@ impl RuntimeAgent {
             parallel_tools: ParallelToolsConfig::default(),
             streaming: StreamingConfig::default(),
             hooks: Arc::new(NoopHooks),
+            hitl_engine: None,
+            approval_handler: Arc::new(RejectAllHandler::new()),
         }
     }
 
@@ -146,6 +154,12 @@ impl RuntimeAgent {
 
     pub fn with_streaming(mut self, config: StreamingConfig) -> Self {
         self.streaming = config;
+        self
+    }
+
+    pub fn with_hitl(mut self, engine: HITLEngine, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.hitl_engine = Some(engine);
+        self.approval_handler = handler;
         self
     }
 
@@ -679,6 +693,34 @@ impl RuntimeAgent {
             )));
         }
 
+        // Check HITL approval for tool
+        if let Some(ref hitl_engine) = self.hitl_engine {
+            let check_result = hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
+            if check_result.is_required() {
+                let approved = self.request_hitl_approval(check_result).await?;
+                if !approved {
+                    warn!(tool = %tool_call.name, "Tool execution rejected by HITL");
+                    return Err(AgentError::HITLRejected(format!(
+                        "Tool '{}' was rejected by human approver. Do not retry.",
+                        tool_call.name
+                    )));
+                }
+            }
+
+            // Check conditions (e.g., amount > 1000)
+            let condition_check = hitl_engine.check_conditions(&tool_call.arguments);
+            if condition_check.is_required() {
+                let approved = self.request_hitl_approval(condition_check).await?;
+                if !approved {
+                    warn!(tool = %tool_call.name, "Tool execution rejected by HITL condition");
+                    return Err(AgentError::HITLRejected(format!(
+                        "Tool '{}' was rejected due to policy condition. Do not retry.",
+                        tool_call.name
+                    )));
+                }
+            }
+        }
+
         if self.tool_security.config().enabled {
             let security_result = self
                 .tool_security
@@ -850,6 +892,15 @@ impl RuntimeAgent {
             };
 
             if let Some(ref sm) = self.state_machine {
+                // Check HITL approval for state transition
+                let approved = self
+                    .check_state_hitl(Some(&context.current_state), &target)
+                    .await?;
+                if !approved {
+                    info!(to = %target, "State transition rejected by HITL");
+                    return Ok(false);
+                }
+
                 sm.transition_to(&target, &reason)?;
                 sm.reset_no_transition();
                 self.hooks
@@ -864,6 +915,14 @@ impl RuntimeAgent {
             sm.increment_no_transition();
             if let Some(fallback) = sm.check_fallback() {
                 let from_state = current_state.clone();
+
+                // Check HITL approval for fallback transition
+                let approved = self.check_state_hitl(Some(&from_state), &fallback).await?;
+                if !approved {
+                    info!(to = %fallback, "Fallback transition rejected by HITL");
+                    return Ok(false);
+                }
+
                 sm.transition_to(&fallback, "fallback after no transitions")?;
                 self.hooks
                     .on_state_transition(
@@ -987,6 +1046,21 @@ impl RuntimeAgent {
                                 .await?;
                         }
                         Err(e) => {
+                            // Check if this is a HITL rejection - if so, break the loop
+                            if matches!(e, AgentError::HITLRejected(_)) {
+                                self.memory
+                                    .add_message(ChatMessage::assistant(&format!(
+                                        "The operation was rejected by the approver: {}",
+                                        e
+                                    )))
+                                    .await?;
+                                // Return the rejection message to user, don't continue loop
+                                return Ok(AgentResponse {
+                                    content: format!("Operation cancelled: {}", e),
+                                    metadata: None,
+                                    tool_calls: Some(all_tool_calls),
+                                });
+                            }
                             self.memory
                                 .add_message(ChatMessage::function(
                                     &tool_call.name,
@@ -1084,6 +1158,72 @@ impl RuntimeAgent {
 
     pub fn hooks(&self) -> &Arc<dyn AgentHooks> {
         &self.hooks
+    }
+
+    pub fn hitl_engine(&self) -> Option<&HITLEngine> {
+        self.hitl_engine.as_ref()
+    }
+
+    pub fn approval_handler(&self) -> &Arc<dyn ApprovalHandler> {
+        &self.approval_handler
+    }
+
+    async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<bool> {
+        let Some(request) = check_result.into_request() else {
+            return Ok(true);
+        };
+
+        self.hooks.on_approval_requested(&request).await;
+
+        let request_id = request.id.clone();
+        let timeout = request.timeout;
+
+        let result = if let Some(duration) = timeout {
+            match tokio::time::timeout(duration, self.approval_handler.request_approval(request))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => ApprovalResult::timeout(),
+            }
+        } else {
+            self.approval_handler.request_approval(request).await
+        };
+
+        self.hooks.on_approval_result(&request_id, &result).await;
+
+        match result {
+            ApprovalResult::Approved => Ok(true),
+            ApprovalResult::Modified { .. } => Ok(true),
+            ApprovalResult::Rejected { reason } => {
+                if let Some(r) = reason {
+                    info!(reason = %r, "HITL rejected");
+                }
+                Ok(false)
+            }
+            ApprovalResult::Timeout => {
+                if let Some(ref engine) = self.hitl_engine {
+                    match engine.config().on_timeout {
+                        TimeoutAction::Approve => Ok(true),
+                        TimeoutAction::Reject => Ok(false),
+                        TimeoutAction::Error => {
+                            Err(AgentError::Other("HITL approval timeout".to_string()))
+                        }
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    pub async fn check_state_hitl(&self, from: Option<&str>, to: &str) -> Result<bool> {
+        if let Some(ref hitl_engine) = self.hitl_engine {
+            let check_result = hitl_engine.check_state_transition(from, to);
+            if check_result.is_required() {
+                return self.request_hitl_approval(check_result).await;
+            }
+        }
+        Ok(true)
     }
 
     /// Execute multiple tools in parallel
