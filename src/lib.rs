@@ -27,8 +27,8 @@ pub use template::TemplateLoader;
 #[cfg(feature = "http-tool")]
 pub use tools::HttpTool;
 pub use tools::{
-    CalculatorTool, DateTimeTool, EchoTool, JsonTool, RandomTool, Tool, ToolRegistry, ToolResult,
-    create_builtin_registry,
+    CalculatorTool, DateTimeTool, EchoTool, FileTool, JsonTool, MathTool, RandomTool, TemplateTool,
+    TextTool, Tool, ToolRegistry, ToolResult, create_builtin_registry,
 };
 
 pub use llm::providers::{ProviderType, UnifiedLLMProvider};

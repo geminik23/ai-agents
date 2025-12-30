@@ -12,7 +12,10 @@ mod registry;
 
 #[cfg(feature = "http-tool")]
 pub use builtin::HttpTool;
-pub use builtin::{CalculatorTool, DateTimeTool, EchoTool, JsonTool, RandomTool};
+pub use builtin::{
+    CalculatorTool, DateTimeTool, EchoTool, FileTool, JsonTool, MathTool, RandomTool, TemplateTool,
+    TextTool,
+};
 pub use condition::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
 };
@@ -122,6 +125,18 @@ pub fn create_builtin_registry() -> ToolRegistry {
     registry
         .register(Arc::new(RandomTool::new()))
         .expect("failed to register random");
+    registry
+        .register(Arc::new(FileTool::new()))
+        .expect("failed to register file");
+    registry
+        .register(Arc::new(TextTool::new()))
+        .expect("failed to register text");
+    registry
+        .register(Arc::new(TemplateTool::new()))
+        .expect("failed to register template");
+    registry
+        .register(Arc::new(MathTool::new()))
+        .expect("failed to register math");
     #[cfg(feature = "http-tool")]
     registry
         .register(Arc::new(HttpTool::new()))
@@ -155,5 +170,9 @@ mod tests {
         assert!(registry.get("datetime").is_some());
         assert!(registry.get("json").is_some());
         assert!(registry.get("random").is_some());
+        assert!(registry.get("file").is_some());
+        assert!(registry.get("text").is_some());
+        assert!(registry.get("template").is_some());
+        assert!(registry.get("math").is_some());
     }
 }
