@@ -2,10 +2,12 @@
 
 mod llm;
 mod memory;
+mod storage;
 mod tool;
 
 pub use llm::{LLMConfig, LLMSelector};
 pub use memory::MemoryConfig;
+pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
 pub use tool::ToolConfig;
 
 use serde::{Deserialize, Serialize};
@@ -27,7 +29,7 @@ pub struct AgentSpec {
     #[serde(default = "default_version")]
     pub version: String,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
     pub system_prompt: String,
@@ -43,6 +45,9 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub memory: MemoryConfig,
+
+    #[serde(default)]
+    pub storage: StorageConfig,
 
     #[serde(default)]
     pub tools: Vec<ToolConfig>,
@@ -147,6 +152,7 @@ impl Default for AgentSpec {
             llms: HashMap::new(),
             skills: vec![],
             memory: MemoryConfig::default(),
+            storage: StorageConfig::default(),
             tools: vec![],
             max_iterations: default_max_iterations(),
             max_context_tokens: default_max_context_tokens(),
@@ -224,6 +230,10 @@ impl AgentSpec {
 
     pub fn has_hitl(&self) -> bool {
         self.hitl.is_some()
+    }
+
+    pub fn has_storage(&self) -> bool {
+        !self.storage.is_none()
     }
 }
 
@@ -482,5 +492,69 @@ hitl:
         assert_eq!(hitl.tools.len(), 1);
         assert_eq!(hitl.conditions.len(), 1);
         assert_eq!(hitl.states.len(), 1);
+    }
+
+    #[test]
+    fn test_agent_spec_with_storage_file() {
+        let yaml = r#"
+name: PersistentAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+storage:
+  type: file
+  path: "./data/sessions"
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_storage());
+        assert!(spec.storage.is_file());
+        assert_eq!(spec.storage.get_path(), Some("./data/sessions"));
+    }
+
+    #[test]
+    fn test_agent_spec_with_storage_sqlite() {
+        let yaml = r#"
+name: PersistentAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+storage:
+  type: sqlite
+  path: "./data/sessions.db"
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_storage());
+        assert!(spec.storage.is_sqlite());
+    }
+
+    #[test]
+    fn test_agent_spec_with_storage_redis() {
+        let yaml = r#"
+name: PersistentAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+storage:
+  type: redis
+  url: "redis://localhost:6379"
+  prefix: "myagent:"
+  ttl_seconds: 86400
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_storage());
+        assert!(spec.storage.is_redis());
+        assert_eq!(spec.storage.get_url(), Some("redis://localhost:6379"));
+        assert_eq!(spec.storage.get_prefix(), "myagent:");
+        assert_eq!(spec.storage.get_ttl(), Some(86400));
+    }
+
+    #[test]
+    fn test_agent_spec_no_storage_by_default() {
+        let spec = AgentSpec::default();
+        assert!(!spec.has_storage());
+        assert!(spec.storage.is_none());
     }
 }

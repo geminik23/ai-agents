@@ -76,6 +76,13 @@ impl Memory for InMemoryStore {
         }
         Ok(())
     }
+
+    async fn evict_oldest(&self, count: usize) -> Result<Vec<ChatMessage>> {
+        let mut messages = self.messages.write();
+        let evict_count = count.min(messages.len());
+        let evicted: Vec<ChatMessage> = messages.drain(..evict_count).collect();
+        Ok(evicted)
+    }
 }
 
 #[cfg(test)]
@@ -182,5 +189,25 @@ mod tests {
         let messages = store.get_messages(None).await.unwrap();
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "msg1");
+    }
+
+    #[tokio::test]
+    async fn test_evict_oldest() {
+        let store = InMemoryStore::new(10);
+        for i in 0..5 {
+            store
+                .add_message(make_message(&format!("msg{}", i)))
+                .await
+                .unwrap();
+        }
+
+        let evicted = store.evict_oldest(2).await.unwrap();
+        assert_eq!(evicted.len(), 2);
+        assert_eq!(evicted[0].content, "msg0");
+        assert_eq!(evicted[1].content, "msg1");
+
+        let remaining = store.get_messages(None).await.unwrap();
+        assert_eq!(remaining.len(), 3);
+        assert_eq!(remaining[0].content, "msg2");
     }
 }

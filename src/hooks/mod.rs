@@ -8,6 +8,7 @@ use crate::agent::AgentResponse;
 use crate::error::AgentError;
 use crate::hitl::{ApprovalRequest, ApprovalResult};
 use crate::llm::{ChatMessage, LLMResponse};
+use crate::memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use crate::tools::ToolResult;
 
 #[async_trait]
@@ -31,6 +32,12 @@ pub trait AgentHooks: Send + Sync {
     async fn on_approval_requested(&self, _request: &ApprovalRequest) {}
 
     async fn on_approval_result(&self, _request_id: &str, _result: &ApprovalResult) {}
+
+    async fn on_memory_compress(&self, _event: &MemoryCompressEvent) {}
+
+    async fn on_memory_evict(&self, _event: &MemoryEvictEvent) {}
+
+    async fn on_memory_budget_warning(&self, _event: &MemoryBudgetEvent) {}
 }
 
 pub struct NoopHooks;
@@ -155,6 +162,31 @@ impl AgentHooks for LoggingHooks {
             }
         }
     }
+
+    async fn on_memory_compress(&self, event: &MemoryCompressEvent) {
+        info!(
+            "{} Memory compressed: {} messages, ratio: {:.2}",
+            self.prefix, event.messages_compressed, event.compression_ratio
+        );
+    }
+
+    async fn on_memory_evict(&self, event: &MemoryEvictEvent) {
+        warn!(
+            "{} Memory evicted: {} messages, reason: {:?}",
+            self.prefix, event.messages_evicted, event.reason
+        );
+    }
+
+    async fn on_memory_budget_warning(&self, event: &MemoryBudgetEvent) {
+        warn!(
+            "{} Memory budget warning: {} at {:.1}% ({}/{} tokens)",
+            self.prefix,
+            event.component,
+            event.usage_percent,
+            event.used_tokens,
+            event.budget_tokens
+        );
+    }
 }
 
 pub struct CompositeHooks {
@@ -241,6 +273,24 @@ impl AgentHooks for CompositeHooks {
     async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
         for hook in &self.hooks {
             hook.on_approval_result(request_id, result).await;
+        }
+    }
+
+    async fn on_memory_compress(&self, event: &MemoryCompressEvent) {
+        for hook in &self.hooks {
+            hook.on_memory_compress(event).await;
+        }
+    }
+
+    async fn on_memory_evict(&self, event: &MemoryEvictEvent) {
+        for hook in &self.hooks {
+            hook.on_memory_evict(event).await;
+        }
+    }
+
+    async fn on_memory_budget_warning(&self, event: &MemoryBudgetEvent) {
+        for hook in &self.hooks {
+            hook.on_memory_budget_warning(event).await;
         }
     }
 }

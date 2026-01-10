@@ -10,11 +10,14 @@ use crate::hitl::{ApprovalHandler, HITLEngine, RejectAllHandler};
 use crate::hooks::AgentHooks;
 use crate::llm::providers::{ProviderType, UnifiedLLMProvider};
 use crate::llm::{LLMProvider, LLMRegistry};
-use crate::memory::{InMemoryStore, Memory};
+use crate::memory::{
+    CompactingMemory, InMemoryStore, LLMSummarizer, Memory, NoopSummarizer, Summarizer,
+};
+use crate::persistence::AgentStorage;
 use crate::process::ProcessProcessor;
 use crate::recovery::{MessageFilter, RecoveryManager};
 use crate::skill::{SkillDefinition, SkillLoader};
-use crate::spec::AgentSpec;
+use crate::spec::{AgentSpec, StorageConfig};
 use crate::state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
 use crate::template::TemplateLoader;
 use crate::tool_security::ToolSecurityEngine;
@@ -43,6 +46,8 @@ pub struct AgentBuilder {
     hooks: Option<Arc<dyn AgentHooks>>,
     hitl_engine: Option<HITLEngine>,
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
+    storage_config: Option<StorageConfig>,
+    storage: Option<Arc<dyn AgentStorage>>,
 }
 
 impl AgentBuilder {
@@ -70,6 +75,8 @@ impl AgentBuilder {
             hooks: None,
             hitl_engine: None,
             approval_handler: None,
+            storage_config: None,
+            storage: None,
         }
     }
 
@@ -101,6 +108,8 @@ impl AgentBuilder {
             hooks: None,
             hitl_engine: None,
             approval_handler: None,
+            storage_config: None,
+            storage: None,
         }
     }
 
@@ -307,19 +316,20 @@ impl AgentBuilder {
         self
     }
 
+    pub fn storage_config(mut self, config: StorageConfig) -> Self {
+        self.storage_config = Some(config);
+        self
+    }
+
+    pub fn storage(mut self, storage: Arc<dyn AgentStorage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
             .ok_or_else(|| AgentError::Config("System prompt is required".into()))?;
-
-        let memory = self.memory.unwrap_or_else(|| {
-            let max_messages = self
-                .spec
-                .as_ref()
-                .map(|s| s.memory.max_messages)
-                .unwrap_or(100);
-            Arc::new(InMemoryStore::new(max_messages))
-        });
 
         let tools = self.tools.unwrap_or_else(ToolRegistry::new);
 
@@ -371,6 +381,31 @@ impl AgentBuilder {
                 "At least one LLM provider is required".into(),
             ));
         }
+
+        // Create memory after LLM registry is ready (needed for CompactingMemory summarizer)
+        let memory = self.memory.unwrap_or_else(|| {
+            if let Some(ref spec) = self.spec {
+                if spec.memory.is_compacting() {
+                    let summarizer_llm = spec
+                        .memory
+                        .summarizer_llm
+                        .as_ref()
+                        .and_then(|alias| llm_registry.get(alias).ok())
+                        .or_else(|| llm_registry.router().ok())
+                        .or_else(|| llm_registry.default().ok());
+
+                    let summarizer: Arc<dyn Summarizer> = match summarizer_llm {
+                        Some(llm) => Arc::new(LLMSummarizer::new(llm)),
+                        None => Arc::new(NoopSummarizer),
+                    };
+                    let config = spec.memory.to_compacting_config();
+                    return Arc::new(CompactingMemory::new(summarizer, config));
+                }
+                Arc::new(InMemoryStore::new(spec.memory.max_messages))
+            } else {
+                Arc::new(InMemoryStore::new(100))
+            }
+        });
 
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
@@ -459,6 +494,24 @@ impl AgentBuilder {
         if let Some(ref spec) = self.spec {
             agent = agent.with_parallel_tools(spec.parallel_tools.clone());
             agent = agent.with_streaming(spec.streaming.clone());
+
+            // Configure memory token budget if specified
+            if let Some(ref budget) = spec.memory.token_budget {
+                agent = agent.with_memory_token_budget(budget.clone());
+            }
+
+            // Configure storage from spec if not explicitly set
+            if self.storage_config.is_none() && spec.has_storage() {
+                agent = agent.with_storage_config(spec.storage.clone());
+            }
+        }
+
+        // Configure storage from builder
+        if let Some(storage_config) = self.storage_config {
+            agent = agent.with_storage_config(storage_config);
+        }
+        if let Some(storage) = self.storage {
+            agent = agent.with_storage(storage);
         }
 
         // Configure hooks
@@ -780,5 +833,194 @@ hitl:
         assert_eq!(hitl.conditions.len(), 1);
         assert_eq!(hitl.conditions[0].name, "high_value");
         assert_eq!(hitl.states.len(), 1);
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_compacting_memory() {
+        let yaml = r#"
+name: CompactingAgent
+system_prompt: "You are a helpful assistant."
+memory:
+  type: compacting
+  max_messages: 100
+  max_recent_messages: 20
+  compress_threshold: 15
+  summarize_batch_size: 5
+  summarizer_llm: router
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+
+        assert!(spec.memory.is_compacting());
+        assert_eq!(spec.memory.max_recent_messages, Some(20));
+        assert_eq!(spec.memory.compress_threshold, Some(15));
+        assert_eq!(spec.memory.summarize_batch_size, Some(5));
+        assert_eq!(spec.memory.summarizer_llm, Some("router".to_string()));
+
+        let compacting_config = spec.memory.to_compacting_config();
+        assert_eq!(compacting_config.max_recent_messages, 20);
+        assert_eq!(compacting_config.compress_threshold, 15);
+        assert_eq!(compacting_config.summarize_batch_size, 5);
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_token_budget() {
+        let yaml = r#"
+name: BudgetAgent
+system_prompt: "You are a helpful assistant."
+memory:
+  type: compacting
+  max_messages: 100
+  token_budget:
+    total: 8192
+    allocation:
+      summary: 2048
+      recent_messages: 4096
+      facts: 1024
+    overflow_strategy: summarize_more
+    warn_at_percent: 75
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        assert!(builder.spec.is_some());
+        let spec = builder.spec.as_ref().unwrap();
+
+        assert!(spec.memory.token_budget.is_some());
+        let budget = spec.memory.token_budget.as_ref().unwrap();
+        assert_eq!(budget.total, 8192);
+        assert_eq!(budget.allocation.summary, 2048);
+        assert_eq!(budget.allocation.recent_messages, 4096);
+        assert_eq!(budget.allocation.facts, 1024);
+        assert_eq!(budget.warn_at_percent, 75);
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_overflow_strategies() {
+        use crate::memory::OverflowStrategy;
+
+        let yaml = r#"
+name: TruncateAgent
+system_prompt: "You are helpful."
+memory:
+  type: compacting
+  token_budget:
+    total: 4096
+    overflow_strategy: truncate_oldest
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let budget = builder
+            .spec
+            .as_ref()
+            .unwrap()
+            .memory
+            .token_budget
+            .as_ref()
+            .unwrap();
+        assert_eq!(budget.overflow_strategy, OverflowStrategy::TruncateOldest);
+
+        let yaml = r#"
+name: ErrorAgent
+system_prompt: "You are helpful."
+memory:
+  type: compacting
+  token_budget:
+    total: 4096
+    overflow_strategy: error
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let budget = builder
+            .spec
+            .as_ref()
+            .unwrap()
+            .memory
+            .token_budget
+            .as_ref()
+            .unwrap();
+        assert_eq!(budget.overflow_strategy, OverflowStrategy::Error);
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_storage_file() {
+        let yaml = r#"
+name: PersistentAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+storage:
+  type: file
+  path: "./data/sessions"
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let spec = builder.spec.as_ref().unwrap();
+        assert!(spec.has_storage());
+        assert!(spec.storage.is_file());
+        assert_eq!(spec.storage.get_path(), Some("./data/sessions"));
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_storage_sqlite() {
+        let yaml = r#"
+name: PersistentAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+storage:
+  type: sqlite
+  path: "./data/sessions.db"
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let spec = builder.spec.as_ref().unwrap();
+        assert!(spec.has_storage());
+        assert!(spec.storage.is_sqlite());
+    }
+
+    #[test]
+    fn test_builder_from_yaml_with_storage_redis() {
+        let yaml = r#"
+name: PersistentAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+storage:
+  type: redis
+  url: "redis://localhost:6379"
+  prefix: "myagent:"
+  ttl_seconds: 86400
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let spec = builder.spec.as_ref().unwrap();
+        assert!(spec.has_storage());
+        assert!(spec.storage.is_redis());
+        assert_eq!(spec.storage.get_prefix(), "myagent:");
+        assert_eq!(spec.storage.get_ttl(), Some(86400));
+    }
+
+    #[test]
+    fn test_builder_no_storage_by_default() {
+        let yaml = r#"
+name: SimpleAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let spec = builder.spec.as_ref().unwrap();
+        assert!(!spec.has_storage());
     }
 }

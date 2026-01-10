@@ -51,6 +51,12 @@ pub enum AgentError {
     #[error("HITL rejected: {0}")]
     HITLRejected(String),
 
+    #[error("Persistence error: {0}")]
+    Persistence(String),
+
+    #[error("Memory budget exceeded: used {used} tokens, budget {budget} tokens")]
+    MemoryBudgetExceeded { used: u32, budget: u32 },
+
     #[error("{0}")]
     Other(String),
 }

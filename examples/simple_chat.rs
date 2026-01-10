@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
 
-    let memory = create_memory_from_config(&spec.memory)?;
+    let memory = create_memory_from_config(&spec.memory);
     let agent = AgentBuilder::from_spec(spec)
         .llm(Arc::new(llm))
         .memory(memory)

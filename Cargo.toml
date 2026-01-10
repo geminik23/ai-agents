@@ -1,6 +1,6 @@
 [package]
 name = "ai-agents"
-version = "1.0.0-pre.8"
+version = "1.0.0-rc.1"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
 edition = "2024"
 description = "A Rust framework for building AI agents from YAML specifications with trait-based extensibility"
@@ -44,6 +44,8 @@ parking_lot = "0.12"
 
 # Optional dependencies
 reqwest = { version = "0.12", features = ["json"], optional = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"], optional = true }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -53,6 +55,9 @@ tempfile = "3"
 default = []
 http-context = ["reqwest"]
 http-tool = ["reqwest"]
+sqlite = ["sqlx"]
+redis-storage = ["redis"]
+full-storage = ["sqlite", "redis-storage"]
 
 # [profile.release]
 # lto = true

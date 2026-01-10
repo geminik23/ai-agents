@@ -20,9 +20,19 @@ pub use agent::{
     StreamingConfig,
 };
 pub use error::{AgentError, Result};
-pub use memory::{InMemoryStore, Memory, create_memory, create_memory_from_config};
+pub use memory::{
+    CompactingMemory, CompactingMemoryConfig, CompressResult, CompressionEvent,
+    ConversationContext, EvictionReason, FactExtractedEvent, InMemoryStore, LLMSummarizer, Memory,
+    MemoryBudgetEvent, MemoryBudgetState, MemoryCompressEvent, MemoryEvictEvent, MemoryTokenBudget,
+    NoopSummarizer, OverflowStrategy, Summarizer, TokenAllocation, create_memory,
+    create_memory_from_config, create_memory_from_config_with_llm, estimate_message_tokens,
+    estimate_tokens,
+};
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};
-pub use spec::{AgentSpec, LLMConfig, LLMSelector, MemoryConfig, ToolConfig};
+pub use spec::{
+    AgentSpec, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig, RedisStorageConfig,
+    SqliteStorageConfig, StorageConfig, ToolConfig,
+};
 pub use template::TemplateLoader;
 #[cfg(feature = "http-tool")]
 pub use tools::HttpTool;
@@ -46,7 +56,15 @@ pub use tool_security::{
 pub use context::{
     BuiltinSource, ContextManager, ContextProvider, ContextSource, RefreshPolicy, TemplateRenderer,
 };
-pub use persistence::{AgentSnapshot, AgentStorage, FileStorage, MemorySnapshot};
+#[cfg(feature = "sqlite")]
+pub use persistence::SqliteStorage;
+pub use persistence::{
+    AgentSnapshot, AgentStorage, FileStorage, MemorySnapshot, SessionInfo, SessionMetadata,
+    SessionOrderBy, SessionQuery, create_storage,
+};
+#[cfg(feature = "redis-storage")]
+pub use persistence::{RedisSessionMeta, RedisStorage};
+
 pub use state::{
     CompareOp, ContextExtractor, ContextMatcher, GuardConditions, GuardOnlyEvaluator,
     LLMTransitionEvaluator, PromptMode, StateAction, StateConfig, StateDefinition, StateMachine,

@@ -18,14 +18,18 @@ use crate::hitl::{
 };
 use crate::hooks::{AgentHooks, NoopHooks};
 use crate::llm::{ChatMessage, LLMProvider, LLMRegistry};
-use crate::memory::Memory;
-use crate::persistence::{AgentSnapshot, AgentStorage};
+use crate::memory::{
+    CompressResult, EvictionReason, Memory, MemoryBudgetEvent, MemoryCompressEvent,
+    MemoryEvictEvent, MemoryTokenBudget, OverflowStrategy,
+};
+use crate::persistence::{AgentSnapshot, AgentStorage, create_storage};
 use crate::process::{ProcessData, ProcessProcessor};
 use crate::recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
     MessageFilter, RecoveryManager, SkipPatternFilter,
 };
 use crate::skill::{SkillDefinition, SkillExecutor, SkillRouter};
+use crate::spec::StorageConfig;
 use crate::state::{
     PromptMode, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
     TransitionContext, TransitionEvaluator,
@@ -47,6 +51,7 @@ pub struct RuntimeAgent {
     max_iterations: u32,
     iteration_count: RwLock<u32>,
     max_context_tokens: u32,
+    memory_token_budget: Option<MemoryTokenBudget>,
     recovery_manager: RecoveryManager,
     tool_security: ToolSecurityEngine,
     process_processor: Option<ProcessProcessor>,
@@ -61,6 +66,8 @@ pub struct RuntimeAgent {
     hooks: Arc<dyn AgentHooks>,
     hitl_engine: Option<HITLEngine>,
     approval_handler: Arc<dyn ApprovalHandler>,
+    storage_config: StorageConfig,
+    storage: RwLock<Option<Arc<dyn AgentStorage>>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -76,6 +83,7 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("streaming", &self.streaming)
             .field("has_hooks", &true)
             .field("has_hitl", &self.hitl_engine.is_some())
+            .field("storage_type", &self.storage_config.storage_type())
             .finish_non_exhaustive()
     }
 }
@@ -125,6 +133,7 @@ impl RuntimeAgent {
             max_iterations,
             iteration_count: RwLock::new(0),
             max_context_tokens: 4096,
+            memory_token_budget: None,
             recovery_manager: RecoveryManager::default(),
             tool_security: ToolSecurityEngine::default(),
             process_processor: None,
@@ -139,7 +148,39 @@ impl RuntimeAgent {
             hooks: Arc::new(NoopHooks),
             hitl_engine: None,
             approval_handler: Arc::new(RejectAllHandler::new()),
+            storage_config: StorageConfig::default(),
+            storage: RwLock::new(None),
         }
+    }
+
+    pub fn with_storage_config(mut self, config: StorageConfig) -> Self {
+        self.storage_config = config;
+        self
+    }
+
+    pub fn with_storage(self, storage: Arc<dyn AgentStorage>) -> Self {
+        *self.storage.write() = Some(storage);
+        self
+    }
+
+    pub async fn init_storage(&self) -> Result<()> {
+        if self.storage_config.is_none() {
+            return Ok(());
+        }
+        if self.storage.read().is_some() {
+            return Ok(());
+        }
+        let storage = create_storage(&self.storage_config).await?;
+        *self.storage.write() = storage;
+        Ok(())
+    }
+
+    pub fn storage(&self) -> Option<Arc<dyn AgentStorage>> {
+        self.storage.read().clone()
+    }
+
+    pub fn storage_config(&self) -> &StorageConfig {
+        &self.storage_config
     }
 
     pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
@@ -165,6 +206,11 @@ impl RuntimeAgent {
 
     pub fn with_max_context_tokens(mut self, tokens: u32) -> Self {
         self.max_context_tokens = tokens;
+        self
+    }
+
+    pub fn with_memory_token_budget(mut self, budget: MemoryTokenBudget) -> Self {
+        self.memory_token_budget = Some(budget);
         self
     }
 
@@ -285,6 +331,46 @@ impl RuntimeAgent {
             Ok(true)
         } else {
             Ok(false)
+        }
+    }
+
+    pub async fn save_session(&self, session_id: &str) -> Result<()> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => self.save_to(s.as_ref(), session_id).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    pub async fn load_session(&self, session_id: &str) -> Result<bool> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => self.load_from(s.as_ref(), session_id).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => s.delete(session_id).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<String>> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => s.list_sessions().await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
         }
     }
 
@@ -598,6 +684,9 @@ impl RuntimeAgent {
     async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
         let system_prompt = self.get_effective_system_prompt().await?;
         let mut messages = vec![ChatMessage::system(&system_prompt)];
+
+        // Token budget controls what's stored in memory (via handle_memory_overflow)
+        // max_context_tokens + ContextOverflowAction handles LLM context limits
         let history = self.memory.get_messages(None).await?;
         messages.extend(history);
 
@@ -939,6 +1028,111 @@ impl RuntimeAgent {
         Ok(false)
     }
 
+    async fn check_memory_compression(&self) -> Result<()> {
+        if self.memory.needs_compression() {
+            let result = self.memory.compress(None).await?;
+            if let CompressResult::Compressed {
+                messages_summarized,
+                new_summary_length,
+                tokens_saved,
+            } = result
+            {
+                let event = MemoryCompressEvent::new(
+                    messages_summarized,
+                    tokens_saved,
+                    new_summary_length as u32,
+                );
+                self.hooks.on_memory_compress(&event).await;
+                debug!(
+                    messages = messages_summarized,
+                    tokens_saved = tokens_saved,
+                    "Memory compressed"
+                );
+            }
+        }
+
+        // Handle overflow AFTER compression, then check warning threshold
+        self.handle_memory_overflow().await?;
+        self.check_memory_budget().await;
+
+        Ok(())
+    }
+
+    async fn check_memory_budget(&self) {
+        if let Some(ref budget) = self.memory_token_budget {
+            let context = match self.memory.get_context().await {
+                Ok(ctx) => ctx,
+                Err(_) => return,
+            };
+
+            let used_tokens = context.estimated_tokens();
+
+            if budget.is_over_warn_threshold(used_tokens) {
+                let event = MemoryBudgetEvent::new("memory", used_tokens, budget.total);
+                self.hooks.on_memory_budget_warning(&event).await;
+                debug!(
+                    used = used_tokens,
+                    total = budget.total,
+                    percent = event.usage_percent,
+                    "Memory budget warning"
+                );
+            }
+        }
+    }
+
+    async fn handle_memory_overflow(&self) -> Result<()> {
+        let Some(ref budget) = self.memory_token_budget else {
+            return Ok(());
+        };
+
+        let context = self.memory.get_context().await?;
+        let used_tokens = context.estimated_tokens();
+
+        if used_tokens <= budget.total {
+            return Ok(());
+        }
+
+        match budget.overflow_strategy {
+            OverflowStrategy::TruncateOldest => {
+                let tokens_to_free = used_tokens - budget.total;
+                let messages_to_evict = self.calculate_eviction_count(tokens_to_free);
+                if messages_to_evict > 0 {
+                    self.evict_messages(messages_to_evict, EvictionReason::TokenBudgetExceeded)
+                        .await?;
+                }
+            }
+            OverflowStrategy::SummarizeMore => {
+                self.memory.compress(None).await?;
+            }
+            OverflowStrategy::Error => {
+                return Err(AgentError::MemoryBudgetExceeded {
+                    used: used_tokens,
+                    budget: budget.total,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn calculate_eviction_count(&self, tokens_to_free: u32) -> usize {
+        // Estimate ~50 tokens per message on average
+        ((tokens_to_free as f64 / 50.0).ceil() as usize).max(1)
+    }
+
+    async fn evict_messages(&self, count: usize, reason: EvictionReason) -> Result<()> {
+        let evicted = self.memory.evict_oldest(count).await?;
+        if !evicted.is_empty() {
+            let event = MemoryEvictEvent {
+                reason,
+                messages_evicted: evicted.len(),
+                importance_scores: vec![],
+            };
+            self.hooks.on_memory_evict(&event).await;
+            debug!(count = evicted.len(), "Messages evicted from memory");
+        }
+        Ok(())
+    }
+
     #[instrument(skip(self, input), fields(agent = %self.info.name))]
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
         info!(input_len = input.len(), "Starting chat");
@@ -974,6 +1168,8 @@ impl RuntimeAgent {
             self.memory
                 .add_message(ChatMessage::assistant(&final_response))
                 .await?;
+
+            self.check_memory_compression().await?;
 
             self.increment_turn();
             self.evaluate_transitions(processed_input, &final_response)
@@ -1088,6 +1284,8 @@ impl RuntimeAgent {
             self.memory
                 .add_message(ChatMessage::assistant(&final_content))
                 .await?;
+
+            self.check_memory_compression().await?;
 
             self.increment_turn();
             self.evaluate_transitions(processed_input, &final_content)
