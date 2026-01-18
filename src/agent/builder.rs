@@ -333,13 +333,9 @@ impl AgentBuilder {
 
         let tools = self.tools.unwrap_or_else(ToolRegistry::new);
 
-        let system_prompt = if let Some(custom_tools_prompt) = self.tools_prompt {
-            format!("{}\n\n{}", base_prompt, custom_tools_prompt)
-        } else if self.auto_tools_prompt && !tools.is_empty() {
-            format!("{}\n\n{}", base_prompt, tools.generate_tools_prompt())
-        } else {
-            base_prompt
-        };
+        // ERROR NOTE: Don't include tools prompt here
+        // - it will be added AFTER template rendering in get_effective_system_prompt() to avoid Jinja2 parsing JSON braces
+        let system_prompt = base_prompt;
 
         let max_iterations = self.max_iterations.unwrap_or(10);
 

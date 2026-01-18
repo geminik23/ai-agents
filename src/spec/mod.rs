@@ -2,11 +2,16 @@
 
 mod llm;
 mod memory;
+mod provider;
 mod storage;
 mod tool;
 
 pub use llm::{LLMConfig, LLMSelector};
 pub use memory::MemoryConfig;
+pub use provider::{
+    BuiltinProviderConfig, ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig,
+    ToolAliasesConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+};
 pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
 pub use tool::ToolConfig;
 
@@ -81,6 +86,15 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub hitl: Option<HITLConfig>,
+
+    #[serde(default)]
+    pub providers: ProvidersConfig,
+
+    #[serde(default)]
+    pub provider_security: ProviderSecurityConfig,
+
+    #[serde(default)]
+    pub tool_aliases: ToolAliasesConfig,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
@@ -164,6 +178,9 @@ impl Default for AgentSpec {
             parallel_tools: ParallelToolsConfig::default(),
             streaming: StreamingConfig::default(),
             hitl: None,
+            providers: ProvidersConfig::default(),
+            provider_security: ProviderSecurityConfig::default(),
+            tool_aliases: ToolAliasesConfig::default(),
             metadata: None,
         }
     }
@@ -234,6 +251,14 @@ impl AgentSpec {
 
     pub fn has_storage(&self) -> bool {
         !self.storage.is_none()
+    }
+
+    pub fn has_providers(&self) -> bool {
+        self.providers.yaml.is_some()
+    }
+
+    pub fn has_tool_aliases(&self) -> bool {
+        !self.tool_aliases.tools.is_empty()
     }
 }
 
@@ -556,5 +581,55 @@ storage:
         let spec = AgentSpec::default();
         assert!(!spec.has_storage());
         assert!(spec.storage.is_none());
+    }
+
+    #[test]
+    fn test_agent_spec_with_providers() {
+        let yaml = r#"
+name: ProviderAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+providers:
+  builtin:
+    enabled: true
+  yaml:
+    enabled: true
+    tools:
+      - id: custom_search
+        name: Custom Search
+        description: Search custom API
+        implementation:
+          type: http
+          url: https://api.example.com/search
+          method: GET
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_providers());
+        assert!(spec.providers.builtin.enabled);
+        assert!(spec.providers.yaml.is_some());
+    }
+
+    #[test]
+    fn test_agent_spec_with_tool_aliases() {
+        let yaml = r#"
+name: AliasAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+tool_aliases:
+  calculator:
+    names:
+      ko: 계산기
+      ja: 計算機
+    descriptions:
+      ko: 수학 계산을 합니다
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_tool_aliases());
+        let calc_aliases = spec.tool_aliases.tools.get("calculator").unwrap();
+        assert_eq!(calc_aliases.get_name("ko"), Some("계산기"));
     }
 }

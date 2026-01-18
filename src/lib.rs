@@ -30,8 +30,10 @@ pub use memory::{
 };
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};
 pub use spec::{
-    AgentSpec, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig, RedisStorageConfig,
-    SqliteStorageConfig, StorageConfig, ToolConfig,
+    AgentSpec, BuiltinProviderConfig, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
+    ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
+    SqliteStorageConfig, StorageConfig, ToolAliasesConfig, ToolConfig,
+    ToolPolicyConfig as SpecToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
 pub use template::TemplateLoader;
 #[cfg(feature = "http-tool")]
@@ -41,7 +43,7 @@ pub use tools::{
     TextTool, Tool, ToolRegistry, ToolResult, create_builtin_registry,
 };
 
-pub use llm::providers::{ProviderType, UnifiedLLMProvider};
+pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
 pub use llm::{ChatMessage, LLMProvider, LLMRegistry, LLMResponse, Role};
 
 pub use process::{ProcessConfig, ProcessData, ProcessProcessor};
@@ -84,4 +86,10 @@ pub use hitl::{
     MessageResolver, RejectAllHandler, StateApprovalConfig, StateApprovalTrigger, TimeoutAction,
     ToolApprovalConfig, create_handler, create_localized_handler, resolve_best_language,
     resolve_tool_message,
+};
+
+// Tool Provider System (v0.5.1 - Simplified)
+pub use tools::{
+    ProviderHealth, ToolAliases, ToolContext, ToolDescriptor, ToolMetadata, ToolProvider,
+    ToolProviderError, ToolProviderType, TrustLevel,
 };

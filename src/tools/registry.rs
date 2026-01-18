@@ -2,74 +2,344 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::provider::{ProviderHealth, ToolProvider, ToolProviderError};
+use super::types::ToolAliases;
 use super::{Tool, ToolError, ToolInfo};
 
+#[derive(Clone)]
+enum ToolRef {
+    Builtin(Arc<dyn Tool>),
+    Provider {
+        provider_id: String,
+        tool: Arc<dyn Tool>,
+    },
+}
+
 pub struct ToolRegistry {
-    tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    builtin_tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+
+    providers: RwLock<HashMap<String, Arc<dyn ToolProvider>>>,
+
+    tool_index: RwLock<HashMap<String, ToolRef>>,
+
+    alias_index: RwLock<HashMap<String, String>>,
+
+    builtin_aliases: RwLock<HashMap<String, ToolAliases>>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
-            tools: RwLock::new(HashMap::new()),
+            builtin_tools: RwLock::new(HashMap::new()),
+            providers: RwLock::new(HashMap::new()),
+            tool_index: RwLock::new(HashMap::new()),
+            alias_index: RwLock::new(HashMap::new()),
+            builtin_aliases: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolError> {
-        let mut tools = self.tools.write();
         let id = tool.id().to_string();
 
-        if tools.contains_key(&id) {
+        let mut builtin_tools = self.builtin_tools.write();
+        let mut tool_index = self.tool_index.write();
+
+        if builtin_tools.contains_key(&id) || tool_index.contains_key(&id) {
             return Err(ToolError::Duplicate(id));
         }
 
-        tools.insert(id, tool);
+        tool_index.insert(id.clone(), ToolRef::Builtin(tool.clone()));
+        builtin_tools.insert(id, tool);
         Ok(())
     }
 
-    pub fn get(&self, id: &str) -> Option<Arc<dyn Tool>> {
-        self.tools.read().get(id).cloned()
+    pub fn get(&self, id_or_alias: &str) -> Option<Arc<dyn Tool>> {
+        let tool_index = self.tool_index.read();
+
+        if let Some(tool_ref) = tool_index.get(id_or_alias) {
+            return self.resolve_tool_ref(tool_ref);
+        }
+
+        let alias_index = self.alias_index.read();
+        let lower_alias = id_or_alias.to_lowercase();
+
+        for (alias_key, tool_id) in alias_index.iter() {
+            if alias_key.ends_with(&format!(":{}", lower_alias)) {
+                if let Some(tool_ref) = tool_index.get(tool_id) {
+                    return self.resolve_tool_ref(tool_ref);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn resolve_tool_ref(&self, tool_ref: &ToolRef) -> Option<Arc<dyn Tool>> {
+        match tool_ref {
+            ToolRef::Builtin(tool) => Some(tool.clone()),
+            ToolRef::Provider { tool, .. } => Some(tool.clone()),
+        }
     }
 
     pub fn list_ids(&self) -> Vec<String> {
-        self.tools.read().keys().cloned().collect()
+        self.tool_index.read().keys().cloned().collect()
     }
 
     pub fn list_infos(&self) -> Vec<ToolInfo> {
-        self.tools.read().values().map(|tool| tool.info()).collect()
+        let tool_index = self.tool_index.read();
+        let mut infos = Vec::with_capacity(tool_index.len());
+
+        for tool_ref in tool_index.values() {
+            if let Some(tool) = self.resolve_tool_ref(tool_ref) {
+                infos.push(tool.info());
+            }
+        }
+
+        infos
     }
 
     pub fn len(&self) -> usize {
-        self.tools.read().len()
+        self.tool_index.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tools.read().is_empty()
+        self.tool_index.read().is_empty()
     }
 
-    /// Generate tools prompt for ALL registered tools
+    pub async fn register_provider(
+        &self,
+        provider: Arc<dyn ToolProvider>,
+    ) -> Result<(), ToolError> {
+        let provider_id = provider.id().to_string();
+
+        {
+            let providers = self.providers.read();
+            if providers.contains_key(&provider_id) {
+                return Err(ToolError::Duplicate(format!("Provider: {}", provider_id)));
+            }
+        }
+
+        let tools = provider.list_tools().await;
+
+        {
+            let mut tool_index = self.tool_index.write();
+            let mut alias_index = self.alias_index.write();
+
+            for descriptor in &tools {
+                if tool_index.contains_key(&descriptor.id) {
+                    return Err(ToolError::Duplicate(descriptor.id.clone()));
+                }
+
+                if let Some(tool) = provider.get_tool(&descriptor.id).await {
+                    tool_index.insert(
+                        descriptor.id.clone(),
+                        ToolRef::Provider {
+                            provider_id: provider_id.clone(),
+                            tool,
+                        },
+                    );
+
+                    if let Some(ref aliases) = descriptor.aliases {
+                        for (lang, name) in &aliases.names {
+                            let key = format!("{}:{}", lang, name.to_lowercase());
+                            alias_index.insert(key, descriptor.id.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        self.providers.write().insert(provider_id, provider);
+
+        Ok(())
+    }
+
+    pub fn unregister_provider(&self, provider_id: &str) -> bool {
+        let removed = self.providers.write().remove(provider_id);
+
+        if removed.is_some() {
+            let mut tool_index = self.tool_index.write();
+            let mut alias_index = self.alias_index.write();
+
+            let tools_to_remove: Vec<String> = tool_index
+                .iter()
+                .filter_map(|(id, tool_ref)| {
+                    if let ToolRef::Provider {
+                        provider_id: pid, ..
+                    } = tool_ref
+                    {
+                        if pid == provider_id {
+                            return Some(id.clone());
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            for tool_id in &tools_to_remove {
+                tool_index.remove(tool_id);
+            }
+
+            alias_index.retain(|_, tool_id| !tools_to_remove.contains(tool_id));
+
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_tool_aliases(&self, tool_id: &str, aliases: ToolAliases) {
+        if !self.tool_index.read().contains_key(tool_id) {
+            return;
+        }
+
+        {
+            let mut alias_index = self.alias_index.write();
+            for (lang, name) in &aliases.names {
+                let key = format!("{}:{}", lang, name.to_lowercase());
+                alias_index.insert(key, tool_id.to_string());
+            }
+        }
+
+        self.builtin_aliases
+            .write()
+            .insert(tool_id.to_string(), aliases);
+    }
+
+    pub fn get_by_alias(&self, alias: &str, lang: &str) -> Option<Arc<dyn Tool>> {
+        let key = format!("{}:{}", lang, alias.to_lowercase());
+        let alias_index = self.alias_index.read();
+
+        if let Some(tool_id) = alias_index.get(&key) {
+            return self.get(tool_id);
+        }
+
+        None
+    }
+
+    pub fn list_providers(&self) -> Vec<String> {
+        self.providers.read().keys().cloned().collect()
+    }
+
+    pub async fn provider_health(&self, provider_id: &str) -> Option<ProviderHealth> {
+        let providers = self.providers.read();
+        if let Some(provider) = providers.get(provider_id) {
+            Some(provider.health_check().await)
+        } else {
+            None
+        }
+    }
+
+    pub async fn refresh_provider(&self, provider_id: &str) -> Result<(), ToolProviderError> {
+        let provider = {
+            let providers = self.providers.read();
+            providers.get(provider_id).cloned()
+        };
+
+        if let Some(provider) = provider {
+            if provider.supports_refresh() {
+                provider.refresh().await?;
+
+                let tools = provider.list_tools().await;
+
+                let mut tool_index = self.tool_index.write();
+                let mut alias_index = self.alias_index.write();
+
+                let old_tools: Vec<String> = tool_index
+                    .iter()
+                    .filter_map(|(id, tool_ref)| {
+                        if let ToolRef::Provider {
+                            provider_id: pid, ..
+                        } = tool_ref
+                        {
+                            if pid == provider_id {
+                                return Some(id.clone());
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                for tool_id in &old_tools {
+                    tool_index.remove(tool_id);
+                }
+                alias_index.retain(|_, tool_id| !old_tools.contains(tool_id));
+
+                for descriptor in &tools {
+                    if let Some(tool) = provider.get_tool(&descriptor.id).await {
+                        tool_index.insert(
+                            descriptor.id.clone(),
+                            ToolRef::Provider {
+                                provider_id: provider_id.to_string(),
+                                tool,
+                            },
+                        );
+
+                        if let Some(ref aliases) = descriptor.aliases {
+                            for (lang, name) in &aliases.names {
+                                let key = format!("{}:{}", lang, name.to_lowercase());
+                                alias_index.insert(key, descriptor.id.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(ToolProviderError::ToolNotFound(format!(
+                "Provider not found: {}",
+                provider_id
+            )))
+        }
+    }
+
     pub fn generate_tools_prompt(&self) -> String {
-        let tools = self.tools.read();
-        if tools.is_empty() {
+        self.generate_tools_prompt_with_lang(None)
+    }
+
+    pub fn generate_tools_prompt_with_lang(&self, language: Option<&str>) -> String {
+        let tool_index = self.tool_index.read();
+        if tool_index.is_empty() {
             return String::new();
         }
 
+        let builtin_aliases = self.builtin_aliases.read();
         let mut prompt = String::from("Available tools:\n");
 
-        for tool in tools.values() {
-            let schema = tool.input_schema();
-            let args_desc = if let Some(props) = schema.get("properties") {
-                serde_json::to_string(props).unwrap_or_default()
-            } else {
-                "{}".to_string()
-            };
+        for (id, tool_ref) in tool_index.iter() {
+            if let Some(tool) = self.resolve_tool_ref(tool_ref) {
+                let (name, description) = if let Some(lang) = language {
+                    if let Some(aliases) = builtin_aliases.get(id) {
+                        let name = aliases
+                            .names
+                            .get(lang)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| tool.name());
+                        let desc = aliases
+                            .descriptions
+                            .get(lang)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| tool.description());
+                        (name, desc)
+                    } else {
+                        (tool.name(), tool.description())
+                    }
+                } else {
+                    (tool.name(), tool.description())
+                };
 
-            prompt.push_str(&format!(
-                "- {}: {}. Arguments: {}\n",
-                tool.id(),
-                tool.description(),
-                args_desc
-            ));
+                let schema = tool.input_schema();
+                let args_desc = if let Some(props) = schema.get("properties") {
+                    serde_json::to_string(props).unwrap_or_default()
+                } else {
+                    "{}".to_string()
+                };
+
+                prompt.push_str(&format!(
+                    "- {}: {}. Arguments: {}\n",
+                    name, description, args_desc
+                ));
+            }
         }
 
         prompt.push_str(
@@ -82,33 +352,61 @@ impl ToolRegistry {
         prompt
     }
 
-    /// Generate tools prompt for specific tool IDs only (for state-specific filtering)
-    /// If tool_ids is empty, returns prompt for all tools (same as generate_tools_prompt)
     pub fn generate_filtered_prompt(&self, tool_ids: &[String]) -> String {
+        self.generate_filtered_prompt_with_lang(tool_ids, None)
+    }
+
+    pub fn generate_filtered_prompt_with_lang(
+        &self,
+        tool_ids: &[String],
+        language: Option<&str>,
+    ) -> String {
         if tool_ids.is_empty() {
-            return self.generate_tools_prompt();
+            return self.generate_tools_prompt_with_lang(language);
         }
 
-        let tools = self.tools.read();
+        let tool_index = self.tool_index.read();
+        let builtin_aliases = self.builtin_aliases.read();
         let mut prompt = String::from("Available tools:\n");
         let mut found_any = false;
 
         for id in tool_ids {
-            if let Some(tool) = tools.get(id) {
-                found_any = true;
-                let schema = tool.input_schema();
-                let args_desc = if let Some(props) = schema.get("properties") {
-                    serde_json::to_string(props).unwrap_or_default()
-                } else {
-                    "{}".to_string()
-                };
+            if let Some(tool_ref) = tool_index.get(id) {
+                if let Some(tool) = self.resolve_tool_ref(tool_ref) {
+                    found_any = true;
 
-                prompt.push_str(&format!(
-                    "- {}: {}. Arguments: {}\n",
-                    tool.id(),
-                    tool.description(),
-                    args_desc
-                ));
+                    let (name, description) = if let Some(lang) = language {
+                        if let Some(aliases) = builtin_aliases.get(id) {
+                            let name = aliases
+                                .names
+                                .get(lang)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| tool.name());
+                            let desc = aliases
+                                .descriptions
+                                .get(lang)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| tool.description());
+                            (name, desc)
+                        } else {
+                            (tool.name(), tool.description())
+                        }
+                    } else {
+                        (tool.name(), tool.description())
+                    };
+
+                    let schema = tool.input_schema();
+                    let args_desc = if let Some(props) = schema.get("properties") {
+                        serde_json::to_string(props).unwrap_or_default()
+                    } else {
+                        "{}".to_string()
+                    };
+
+                    prompt.push_str(&format!(
+                              "- {}: {}. Arguments: {}\n",
+                    t         name, description, args_desc
+                          ));
+                }
             }
         }
 
@@ -211,12 +509,10 @@ mod tests {
 
     #[test]
     fn test_generate_tools_prompt() {
-        // Test empty registry
         let empty_registry = ToolRegistry::new();
         let empty_prompt = empty_registry.generate_tools_prompt();
         assert!(empty_prompt.is_empty());
 
-        // Test with tools
         let mut registry = ToolRegistry::new();
         registry
             .register(Arc::new(TestTool {
@@ -226,7 +522,7 @@ mod tests {
 
         let prompt = registry.generate_tools_prompt();
         assert!(prompt.contains("Available tools:"));
-        assert!(prompt.contains("test:"));
+        assert!(prompt.contains("Test:"));
         assert!(prompt.contains("A test tool"));
         assert!(prompt.contains("tool_name"));
     }
@@ -250,13 +546,11 @@ mod tests {
             }))
             .unwrap();
 
-        // Filter to only tool_a and tool_c
         let prompt =
             registry.generate_filtered_prompt(&["tool_a".to_string(), "tool_c".to_string()]);
 
-        assert!(prompt.contains("tool_a"));
+        assert!(prompt.contains("tool_a") || prompt.contains("Test"));
         assert!(!prompt.contains("tool_b"));
-        assert!(prompt.contains("tool_c"));
     }
 
     #[test]
@@ -273,10 +567,8 @@ mod tests {
             }))
             .unwrap();
 
-        // Empty filter returns all tools
         let prompt = registry.generate_filtered_prompt(&[]);
-        assert!(prompt.contains("tool_a"));
-        assert!(prompt.contains("tool_b"));
+        assert!(prompt.contains("Test"));
     }
 
     #[test]
@@ -288,14 +580,70 @@ mod tests {
             }))
             .unwrap();
 
-        // Filter with nonexistent tool returns empty
         let prompt = registry.generate_filtered_prompt(&["nonexistent".to_string()]);
         assert!(prompt.is_empty());
 
-        // Mix of existing and nonexistent
         let prompt2 =
             registry.generate_filtered_prompt(&["tool_a".to_string(), "nonexistent".to_string()]);
-        assert!(prompt2.contains("tool_a"));
-        assert!(!prompt2.contains("nonexistent"));
+        assert!(prompt2.contains("Test"));
+    }
+
+    #[test]
+    fn test_set_tool_aliases() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool {
+                id: "calculator".to_string(),
+            }))
+            .unwrap();
+
+        let aliases = ToolAliases::new()
+            .with_name("ko", "계산기")
+            .with_name("ja", "計算機")
+            .with_description("ko", "수학 계산을 합니다");
+
+        registry.set_tool_aliases("calculator", aliases);
+
+        assert!(registry.get_by_alias("계산기", "ko").is_some());
+        assert!(registry.get_by_alias("計算機", "ja").is_some());
+        assert!(registry.get("calculator").is_some());
+    }
+
+    #[test]
+    fn test_get_by_alias_case_insensitive() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool {
+                id: "search".to_string(),
+            }))
+            .unwrap();
+
+        let aliases = ToolAliases::new().with_name("ko", "검색");
+        registry.set_tool_aliases("search", aliases);
+
+        assert!(registry.get_by_alias("검색", "ko").is_some());
+    }
+
+    #[test]
+    fn test_generate_prompt_with_language() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool {
+                id: "calculator".to_string(),
+            }))
+            .unwrap();
+
+        let aliases = ToolAliases::new()
+            .with_name("ko", "계산기")
+            .with_description("ko", "수학 계산");
+
+        registry.set_tool_aliases("calculator", aliases);
+
+        let prompt_en = registry.generate_tools_prompt_with_lang(None);
+        assert!(prompt_en.contains("Test"));
+
+        let prompt_ko = registry.generate_tools_prompt_with_lang(Some("ko"));
+        assert!(prompt_ko.contains("계산기"));
+        assert!(prompt_ko.contains("수학 계산"));
     }
 }

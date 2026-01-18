@@ -8,7 +8,9 @@ use thiserror::Error;
 
 pub mod builtin;
 mod condition;
+mod provider;
 mod registry;
+mod types;
 
 #[cfg(feature = "http-tool")]
 pub use builtin::HttpTool;
@@ -19,7 +21,9 @@ pub use builtin::{
 pub use condition::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
 };
+pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderError};
 pub use registry::ToolRegistry;
+pub use types::{ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResult {
