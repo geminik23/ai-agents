@@ -1,6 +1,6 @@
 use ai_agents::{
-    Agent, AgentBuilder, ProviderType, TemplateLoader, UnifiedLLMProvider,
-    create_memory_from_config,
+    create_memory_from_config, Agent, AgentBuilder, ProviderType, TemplateLoader,
+    UnifiedLLMProvider,
 };
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;

@@ -1,0 +1,19 @@
+[package]
+name = "ai-agents-process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Input/Output processing pipeline for AI Agents framework"
+
+[dependencies]
+ai-agents-core = { workspace = true }
+ai-agents-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+regex = { workspace = true }
+serde_yaml = { workspace = true }

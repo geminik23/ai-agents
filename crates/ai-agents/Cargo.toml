@@ -1,0 +1,37 @@
+[package]
+name = "ai-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "A Rust framework for building AI agents from YAML specifications with trait-based extensibility"
+readme = "../../README.md"
+keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
+categories = ["asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+ai-agents-llm = { workspace = true }
+ai-agents-memory = { workspace = true }
+ai-agents-storage = { workspace = true }
+ai-agents-tools = { workspace = true }
+ai-agents-state = { workspace = true }
+ai-agents-context = { workspace = true }
+ai-agents-process = { workspace = true }
+ai-agents-skills = { workspace = true }
+ai-agents-hitl = { workspace = true }
+ai-agents-hooks = { workspace = true }
+ai-agents-recovery = { workspace = true }
+ai-agents-template = { workspace = true }
+ai-agents-runtime = { workspace = true }
+serde_yaml = { workspace = true }
+
+[features]
+default = []
+sqlite = ["ai-agents-storage/sqlite", "ai-agents-runtime/sqlite"]
+redis-storage = ["ai-agents-storage/redis-storage", "ai-agents-runtime/redis-storage"]
+http-tool = ["ai-agents-tools/http-tool", "ai-agents-runtime/http-tool"]
+http-context = ["ai-agents-context/http-context", "ai-agents-runtime/http-context"]
+full-storage = ["sqlite", "redis-storage"]
+full = ["full-storage", "http-tool", "http-context"]

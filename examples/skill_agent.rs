@@ -1,7 +1,6 @@
-use ai_agents::llm::providers::ProviderType;
 use ai_agents::{
-    Agent, AgentBuilder, LLMRegistry, SkillDefinition, SkillStep, UnifiedLLMProvider,
-    create_builtin_registry,
+    create_builtin_registry, Agent, AgentBuilder, LLMRegistry, ProviderType, SkillDefinition,
+    SkillStep, UnifiedLLMProvider,
 };
 use std::sync::Arc;
 
@@ -40,17 +39,30 @@ Respond with a warm, friendly greeting. Be enthusiastic but not over the top."#
         description: "Perform mathematical calculations".to_string(),
         trigger: "When user asks to calculate something or needs math help".to_string(),
         steps: vec![
+            // First: Extract the math expression from user input using LLM
+            SkillStep::Prompt {
+                prompt: r#"Extract ONLY the mathematical expression from this user message.
+Output ONLY the math expression, nothing else. If no clear expression, output "2 + 2" as default.
+
+User message: "{{ user_input }}"
+
+Mathematical expression:"#
+                    .to_string(),
+                llm: None,
+            },
+            // Second: Call calculator with the extracted expression
             SkillStep::Tool {
                 tool: "calculator".to_string(),
                 args: Some(serde_json::json!({
-                    "operation": "2 + 2"
+                    "expression": "{{ steps[0].result }}"
                 })),
                 output_as: None,
             },
+            // Third: Explain the result to the user
             SkillStep::Prompt {
                 prompt: r#"User asked: {{ user_input }}
 
-Calculator result: {{ steps[0].result }}
+Calculator result: {{ steps[1].result }}
 
 Explain the result to the user in a helpful way."#
                     .to_string(),
@@ -76,7 +88,7 @@ Explain the result to the user in a helpful way."#
     agent.reset().await?;
 
     println!("--- Test 2: Calculation ---");
-    let response = agent.chat("Can you help me calculate something?").await?;
+    let response = agent.chat("Can you help me calculate 15 * 7 + 3?").await?;
     println!("Response: {}\n", response.content);
 
     agent.reset().await?;
