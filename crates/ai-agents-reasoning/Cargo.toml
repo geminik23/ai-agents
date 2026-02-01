@@ -1,0 +1,17 @@
+[package]
+name = "ai-agents-reasoning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Reasoning and reflection capabilities for AI Agents framework"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }

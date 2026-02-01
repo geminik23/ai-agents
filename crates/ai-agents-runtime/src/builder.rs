@@ -13,6 +13,7 @@ use ai_agents_memory::{
     CompactingMemory, InMemoryStore, LLMSummarizer, Memory, NoopSummarizer, Summarizer,
 };
 use ai_agents_process::ProcessProcessor;
+use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use ai_agents_recovery::{MessageFilter, RecoveryManager};
 use ai_agents_skills::{SkillDefinition, SkillLoader};
 use ai_agents_state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
@@ -48,11 +49,15 @@ pub struct AgentBuilder {
     approval_handler: Option<Arc<dyn ApprovalHandler>>,
     storage_config: Option<StorageConfig>,
     storage: Option<Arc<dyn AgentStorage>>,
+    reasoning: Option<ReasoningConfig>,
+    reflection: Option<ReflectionConfig>,
 }
 
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
+            reasoning: None,
+            reflection: None,
             spec: None,
             llm: None,
             llm_registry: None,
@@ -84,6 +89,8 @@ impl AgentBuilder {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
         let max_context_tokens = Some(spec.max_context_tokens);
+        let reasoning = Some(spec.reasoning.clone());
+        let reflection = Some(spec.reflection.clone());
 
         Self {
             spec: Some(spec),
@@ -110,6 +117,8 @@ impl AgentBuilder {
             approval_handler: None,
             storage_config: None,
             storage: None,
+            reasoning,
+            reflection,
         }
     }
 
@@ -337,6 +346,16 @@ impl AgentBuilder {
         self
     }
 
+    pub fn reasoning(mut self, config: ReasoningConfig) -> Self {
+        self.reasoning = Some(config);
+        self
+    }
+
+    pub fn reflection(mut self, config: ReflectionConfig) -> Self {
+        self.reflection = Some(config);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
@@ -542,6 +561,18 @@ impl AgentBuilder {
             }
         }
 
+        if let Some(reasoning) = self.reasoning {
+            agent = agent.with_reasoning(reasoning);
+        } else if let Some(ref spec) = self.spec {
+            agent = agent.with_reasoning(spec.reasoning.clone());
+        }
+
+        if let Some(reflection) = self.reflection {
+            agent = agent.with_reflection(reflection);
+        } else if let Some(ref spec) = self.spec {
+            agent = agent.with_reflection(spec.reflection.clone());
+        }
+
         Ok(agent)
     }
 }
@@ -662,6 +693,8 @@ skills:
                 prompt: "Hello".to_string(),
                 llm: None,
             }],
+            reasoning: None,
+            reflection: None,
         };
 
         let builder = AgentBuilder::new().skill(skill.clone()).skills(vec![skill]);

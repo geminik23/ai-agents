@@ -90,7 +90,7 @@ impl Memory for InMemoryStore {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_agents_core::Role;
+    use ai_agents_core::{Memory as CoreMemory, Role};
 
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {

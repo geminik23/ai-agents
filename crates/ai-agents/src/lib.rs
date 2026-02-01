@@ -281,6 +281,15 @@ pub mod template {
     }
 }
 
+pub mod reasoning {
+    pub use ai_agents_reasoning::{
+        CriterionResult, EvaluationResult, Plan, PlanAction, PlanAvailableActions,
+        PlanReflectionConfig, PlanStatus, PlanStep, PlanningConfig, ReasoningConfig,
+        ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
+        ReflectionMetadata, ReflectionMode, StepFailureAction, StepStatus, StringOrList,
+    };
+}
+
 pub mod tool_security {
     pub use ai_agents_tools::{
         SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
@@ -378,4 +387,12 @@ pub use hitl::{
 pub use tools::{
     ProviderHealth, ToolAliases, ToolContext, ToolDescriptor, ToolMetadata, ToolProvider,
     ToolProviderError, ToolProviderType, TrustLevel,
+};
+
+// Reasoning & Reflection (v0.5.3)
+pub use reasoning::{
+    CriterionResult, EvaluationResult, Plan, PlanAction, PlanAvailableActions,
+    PlanReflectionConfig, PlanStatus, PlanStep, PlanningConfig, ReasoningConfig, ReasoningMetadata,
+    ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig, ReflectionMetadata,
+    ReflectionMode, StepFailureAction, StepStatus, StringOrList,
 };

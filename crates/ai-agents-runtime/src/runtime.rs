@@ -22,6 +22,11 @@ use ai_agents_memory::{
     MemoryEvictEvent, MemoryTokenBudget, OverflowStrategy,
 };
 use ai_agents_process::{ProcessData, ProcessProcessor};
+use ai_agents_reasoning::{
+    CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
+    ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
+    ReflectionMetadata,
+};
 use ai_agents_recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
     MessageFilter, RecoveryManager, RetryConfig, SkipPatternFilter,
@@ -71,6 +76,9 @@ pub struct RuntimeAgent {
     approval_handler: Arc<dyn ApprovalHandler>,
     storage_config: StorageConfig,
     storage: RwLock<Option<Arc<dyn AgentStorage>>>,
+    reasoning_config: ReasoningConfig,
+    reflection_config: ReflectionConfig,
+    current_plan: RwLock<Option<Plan>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -87,6 +95,8 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("has_hooks", &true)
             .field("has_hitl", &self.hitl_engine.is_some())
             .field("storage_type", &self.storage_config.storage_type())
+            .field("reasoning_mode", &self.reasoning_config.mode)
+            .field("reflection_enabled", &self.reflection_config.enabled)
             .finish_non_exhaustive()
     }
 }
@@ -153,6 +163,9 @@ impl RuntimeAgent {
             approval_handler: Arc::new(RejectAllHandler::new()),
             storage_config: StorageConfig::default(),
             storage: RwLock::new(None),
+            reasoning_config: ReasoningConfig::default(),
+            reflection_config: ReflectionConfig::default(),
+            current_plan: RwLock::new(None),
         }
     }
 
@@ -164,6 +177,24 @@ impl RuntimeAgent {
     pub fn with_storage(self, storage: Arc<dyn AgentStorage>) -> Self {
         *self.storage.write() = Some(storage);
         self
+    }
+
+    pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
+        self.reasoning_config = config;
+        self
+    }
+
+    pub fn with_reflection(mut self, config: ReflectionConfig) -> Self {
+        self.reflection_config = config;
+        self
+    }
+
+    pub fn reasoning_config(&self) -> &ReasoningConfig {
+        &self.reasoning_config
+    }
+
+    pub fn reflection_config(&self) -> &ReflectionConfig {
+        &self.reflection_config
     }
 
     pub async fn init_storage(&self) -> Result<()> {
@@ -685,6 +716,42 @@ impl RuntimeAgent {
             .map_err(|e| AgentError::Config(e.to_string()))
     }
 
+    fn get_effective_reasoning_config(&self) -> ReasoningConfig {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if let Some(ref state_reasoning) = state_def.reasoning {
+                    return state_reasoning.clone();
+                }
+            }
+        }
+        self.reasoning_config.clone()
+    }
+
+    fn get_effective_reflection_config(&self) -> ReflectionConfig {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if let Some(ref state_reflection) = state_def.reflection {
+                    return state_reflection.clone();
+                }
+            }
+        }
+        self.reflection_config.clone()
+    }
+
+    fn get_skill_reasoning_config(&self, skill: &SkillDefinition) -> ReasoningConfig {
+        skill
+            .reasoning
+            .clone()
+            .unwrap_or_else(|| self.get_effective_reasoning_config())
+    }
+
+    fn get_skill_reflection_config(&self, skill: &SkillDefinition) -> ReflectionConfig {
+        skill
+            .reflection
+            .clone()
+            .unwrap_or_else(|| self.get_effective_reflection_config())
+    }
+
     fn get_available_skills(&self) -> Vec<&SkillDefinition> {
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
@@ -989,14 +1056,222 @@ impl RuntimeAgent {
                     .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
 
                 if let Some(ref executor) = self.skill_executor {
+                    let skill_reasoning = self.get_skill_reasoning_config(skill);
+                    let skill_reflection = self.get_skill_reflection_config(skill);
+
+                    debug!(
+                        skill_id = %skill_id,
+                        reasoning_mode = ?skill_reasoning.mode,
+                        reflection_enabled = ?skill_reflection.enabled,
+                        "Skill reasoning/reflection config"
+                    );
+
                     let response = executor
                         .execute(skill, input, serde_json::json!({}))
                         .await?;
+
+                    if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
+                        let should_reflect = self
+                            .should_reflect_with_config(input, &response, &skill_reflection)
+                            .await?;
+                        if should_reflect {
+                            let evaluated = self
+                                .evaluate_and_retry_with_config(input, response, &skill_reflection)
+                                .await?;
+                            return Ok(Some(evaluated));
+                        }
+                    }
+
                     return Ok(Some(response));
                 }
             }
         }
         Ok(None)
+    }
+
+    async fn should_reflect_with_config(
+        &self,
+        input: &str,
+        response: &str,
+        config: &ReflectionConfig,
+    ) -> Result<bool> {
+        if !config.requires_evaluation() {
+            return Ok(false);
+        }
+
+        if config.is_enabled() {
+            return Ok(true);
+        }
+
+        let evaluator_llm = config
+            .evaluator_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok());
+
+        let Some(llm) = evaluator_llm else {
+            return Ok(false);
+        };
+
+        let prompt = format!(
+            r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
+
+User query: "{}"
+Response: "{}"
+
+Answer YES or NO only."#,
+            input,
+            &response[..response.len().min(500)]
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let result = llm.complete(&messages, None).await;
+
+        match result {
+            Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn evaluate_and_retry_with_config(
+        &self,
+        input: &str,
+        mut response: String,
+        config: &ReflectionConfig,
+    ) -> Result<String> {
+        let llm = self.get_state_llm()?;
+        let mut attempts = 0u32;
+        let max_retries = config.max_retries;
+
+        loop {
+            let evaluation = self
+                .evaluate_response_with_config(input, &response, config)
+                .await?;
+
+            if evaluation.passed || attempts >= max_retries {
+                info!(
+                    passed = evaluation.passed,
+                    confidence = evaluation.confidence,
+                    attempts = attempts + 1,
+                    "Skill reflection evaluation complete"
+                );
+                return Ok(response);
+            }
+
+            debug!(
+                attempt = attempts + 1,
+                failed_criteria = evaluation.failed_criteria().count(),
+                "Skill response did not meet criteria, retrying"
+            );
+
+            let feedback: Vec<String> = evaluation
+                .failed_criteria()
+                .map(|c| format!("- {}", c.criterion))
+                .collect();
+
+            let retry_prompt = format!(
+                "Your previous response did not meet these criteria:\n{}\n\nPlease provide an improved response to: {}",
+                feedback.join("\n"),
+                input
+            );
+
+            let messages = vec![ChatMessage::user(&retry_prompt)];
+            let retry_response = llm
+                .complete(&messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+            response = retry_response.content.trim().to_string();
+            attempts += 1;
+        }
+    }
+
+    async fn evaluate_response_with_config(
+        &self,
+        input: &str,
+        response: &str,
+        config: &ReflectionConfig,
+    ) -> Result<EvaluationResult> {
+        let evaluator_llm = config
+            .evaluator_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok())
+            .ok_or_else(|| AgentError::Config("No LLM available for evaluation".into()))?;
+
+        let criteria = &config.criteria;
+        let criteria_list = criteria
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}. {}", i + 1, c))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            r#"Evaluate this response against the criteria.
+
+User query: "{}"
+
+Response to evaluate: "{}"
+
+Criteria:
+{}
+
+For each criterion, respond with:
+- criterion number
+- PASS or FAIL
+- brief reason
+
+Then provide overall confidence (0.0 to 1.0) and whether it passes overall.
+
+Format:
+1. PASS/FAIL - reason
+2. PASS/FAIL - reason
+...
+CONFIDENCE: 0.X
+OVERALL: PASS/FAIL"#,
+            input, response, criteria_list
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let eval_response = evaluator_llm
+            .complete(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Evaluation failed: {}", e)))?;
+
+        let content = eval_response.content.to_uppercase();
+        let overall_pass = content.contains("OVERALL: PASS");
+
+        let confidence = content
+            .lines()
+            .find(|l| l.contains("CONFIDENCE:"))
+            .and_then(|l| {
+                l.split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+            })
+            .unwrap_or(if overall_pass { 0.8 } else { 0.4 });
+
+        let mut criteria_results = Vec::new();
+        for (i, criterion) in criteria.iter().enumerate() {
+            let line_marker = format!("{}.", i + 1);
+            let passed = eval_response
+                .content
+                .lines()
+                .find(|l| l.contains(&line_marker))
+                .map(|l| l.to_uppercase().contains("PASS"))
+                .unwrap_or(overall_pass);
+
+            if passed {
+                criteria_results.push(CriterionResult::pass(criterion));
+            } else {
+                criteria_results.push(CriterionResult::fail(criterion, "Did not meet criterion"));
+            }
+        }
+
+        Ok(EvaluationResult::new(overall_pass, confidence).with_criteria(criteria_results))
     }
 
     async fn process_input(&self, input: &str) -> Result<ProcessData> {
@@ -1214,6 +1489,381 @@ impl RuntimeAgent {
     }
 
     #[instrument(skip(self, input), fields(agent = %self.info.name))]
+    async fn determine_reasoning_mode(&self, input: &str) -> Result<ReasoningMode> {
+        let effective_config = self.get_effective_reasoning_config();
+
+        if !matches!(effective_config.mode, ReasoningMode::Auto) {
+            return Ok(effective_config.mode.clone());
+        }
+
+        let judge_llm = effective_config
+            .judge_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok());
+
+        let Some(llm) = judge_llm else {
+            return Ok(ReasoningMode::None);
+        };
+
+        let prompt = format!(
+            r#"Analyze this user request and determine the appropriate reasoning mode.
+
+User request: "{}"
+
+Choose ONE of these modes:
+- none: Simple queries, greetings, direct answers (fastest)
+- cot: Complex analysis, multi-step reasoning, math problems
+- react: Tasks requiring multiple tool calls with observation
+- plan_and_execute: Complex multi-step tasks requiring coordination
+
+Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
+            input
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = llm.complete(&messages, None).await;
+
+        match response {
+            Ok(resp) => {
+                let mode_str = resp.content.trim().to_lowercase();
+                Ok(match mode_str.as_str() {
+                    "cot" => ReasoningMode::CoT,
+                    "react" => ReasoningMode::React,
+                    "plan_and_execute" => ReasoningMode::PlanAndExecute,
+                    _ => ReasoningMode::None,
+                })
+            }
+            Err(_) => Ok(ReasoningMode::None),
+        }
+    }
+
+    async fn should_reflect(&self, input: &str, response: &str) -> Result<bool> {
+        let effective_config = self.get_effective_reflection_config();
+
+        if !effective_config.requires_evaluation() {
+            return Ok(false);
+        }
+
+        if effective_config.is_enabled() {
+            return Ok(true);
+        }
+
+        let evaluator_llm = effective_config
+            .evaluator_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok());
+
+        let Some(llm) = evaluator_llm else {
+            return Ok(false);
+        };
+
+        let prompt = format!(
+            r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
+
+User query: "{}"
+Response: "{}"
+
+Answer YES or NO only."#,
+            input,
+            &response[..response.len().min(500)]
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let result = llm.complete(&messages, None).await;
+
+        match result {
+            Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn build_cot_system_prompt(&self, base_prompt: &str) -> String {
+        format!(
+            "{}\n\n<instruction>\nThink through this step by step before answering:\n1. Understand what is being asked\n2. Break down the problem\n3. Work through each part\n4. Provide your final answer\n\nShow your thinking process, then give your final answer.\n</instruction>",
+            base_prompt
+        )
+    }
+
+    fn build_react_system_prompt(&self, base_prompt: &str) -> String {
+        format!(
+            "{}\n\n<instruction>\nUse the Reason-Act-Observe pattern:\n1. Thought: Think about what to do\n2. Action: Use a tool if needed\n3. Observation: Analyze the result\n4. Repeat until you have the answer\n\nFormat your response showing Thought/Action/Observation steps.\n</instruction>",
+            base_prompt
+        )
+    }
+
+    async fn generate_plan(&self, input: &str) -> Result<Plan> {
+        let planning_config = self.reasoning_config.get_planning();
+
+        let planner_llm = planning_config
+            .and_then(|c| c.planner_llm.as_ref())
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok())
+            .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
+
+        let available_tools: Vec<String> = self.tools.list_ids();
+        let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
+
+        let prompt = format!(
+            r#"Create a step-by-step plan to accomplish this goal.
+
+Goal: "{}"
+
+Available tools: {}
+Available skills: {}
+
+Create a plan with clear steps. For each step, specify:
+- description: What this step accomplishes
+- action_type: "tool", "skill", "think", or "respond"
+- action_target: The tool/skill name (if applicable)
+- dependencies: List of step IDs this depends on (empty if none)
+
+Respond in JSON format:
+{{
+  "steps": [
+    {{"id": "step1", "description": "...", "action_type": "tool", "action_target": "tool_name", "args": {{}}, "dependencies": []}},
+    {{"id": "step2", "description": "...", "action_type": "think", "action_target": "...", "dependencies": ["step1"]}}
+  ]
+}}"#,
+            input,
+            available_tools.join(", "),
+            available_skills.join(", ")
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = planner_llm
+            .complete(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Planning failed: {}", e)))?;
+
+        let mut plan = Plan::new(input);
+
+        if let Some(json_start) = response.content.find('{') {
+            if let Some(json_end) = response.content.rfind('}') {
+                let json_str = &response.content[json_start..=json_end];
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(steps) = parsed.get("steps").and_then(|s| s.as_array()) {
+                        for step_value in steps {
+                            let id = step_value
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("step");
+                            let desc = step_value
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let action_type = step_value
+                                .get("action_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("think");
+                            let action_target = step_value
+                                .get("action_target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let args = step_value
+                                .get("args")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            let deps: Vec<String> = step_value
+                                .get("dependencies")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            let action = match action_type {
+                                "tool" => PlanAction::tool(action_target, args),
+                                "skill" => PlanAction::skill(action_target),
+                                "respond" => PlanAction::respond(action_target),
+                                _ => PlanAction::think(desc),
+                            };
+
+                            let step = PlanStep::new(desc, action)
+                                .with_id(id)
+                                .with_dependencies(deps);
+                            plan.add_step(step);
+                        }
+                    }
+                }
+            }
+        }
+
+        if plan.steps.is_empty() {
+            plan.add_step(PlanStep::new(
+                "Process the request",
+                PlanAction::think(input),
+            ));
+            plan.add_step(PlanStep::new(
+                "Provide response",
+                PlanAction::respond("Answer based on analysis"),
+            ));
+        }
+
+        Ok(plan)
+    }
+
+    async fn execute_plan(&self, plan: &mut Plan) -> Result<String> {
+        let llm = self.get_state_llm()?;
+        let mut results: HashMap<String, serde_json::Value> = HashMap::new();
+        let max_steps = self
+            .reasoning_config
+            .get_planning()
+            .map(|c| c.max_steps)
+            .unwrap_or(10);
+
+        plan.status = PlanStatus::InProgress;
+
+        for step_idx in 0..plan.steps.len().min(max_steps as usize) {
+            let step = &plan.steps[step_idx];
+
+            let deps_satisfied = step.dependencies.iter().all(|dep| {
+                plan.steps
+                    .iter()
+                    .find(|s| &s.id == dep)
+                    .map(|s| s.status.is_completed())
+                    .unwrap_or(false)
+            });
+
+            if !deps_satisfied {
+                continue;
+            }
+
+            plan.steps[step_idx].mark_running();
+
+            let result = match &plan.steps[step_idx].action {
+                PlanAction::Tool { tool, args } => {
+                    let tool_call = ToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: tool.clone(),
+                        arguments: args.clone(),
+                    };
+                    match self.execute_tool_smart(&tool_call).await {
+                        Ok(output) => serde_json::json!({ "output": output }),
+                        Err(e) => {
+                            plan.steps[step_idx].mark_failed(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                PlanAction::Skill { skill } => {
+                    if let Some(skill_def) = self.skills.iter().find(|s| &s.id == skill) {
+                        if let Some(ref executor) = self.skill_executor {
+                            match executor.execute(skill_def, "", serde_json::json!({})).await {
+                                Ok(output) => serde_json::json!({ "output": output }),
+                                Err(e) => {
+                                    plan.steps[step_idx].mark_failed(e.to_string());
+                                    continue;
+                                }
+                            }
+                        } else {
+                            serde_json::json!({ "output": "Skill executor not available" })
+                        }
+                    } else {
+                        plan.steps[step_idx].mark_failed("Skill not found");
+                        continue;
+                    }
+                }
+                PlanAction::Think { prompt } => {
+                    let context: String = results
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let think_prompt = format!("Context:\n{}\n\nTask: {}", context, prompt);
+                    let messages = vec![ChatMessage::user(&think_prompt)];
+
+                    match llm.complete(&messages, None).await {
+                        Ok(resp) => serde_json::json!({ "output": resp.content }),
+                        Err(e) => {
+                            plan.steps[step_idx].mark_failed(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                PlanAction::Respond { template } => {
+                    let context: String = results
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let respond_prompt = format!(
+                        "Based on this context:\n{}\n\nGenerate a response following this template/instruction: {}",
+                        context, template
+                    );
+                    let messages = vec![ChatMessage::user(&respond_prompt)];
+
+                    match llm.complete(&messages, None).await {
+                        Ok(resp) => serde_json::json!({ "output": resp.content }),
+                        Err(e) => {
+                            plan.steps[step_idx].mark_failed(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            results.insert(plan.steps[step_idx].id.clone(), result.clone());
+            plan.steps[step_idx].mark_completed(Some(result));
+        }
+
+        plan.status = PlanStatus::Completed;
+
+        let final_output = results
+            .values()
+            .filter_map(|v| v.get("output").and_then(|o| o.as_str()))
+            .last()
+            .unwrap_or("Plan execution completed.")
+            .to_string();
+
+        Ok(final_output)
+    }
+
+    async fn evaluate_response(&self, input: &str, response: &str) -> Result<EvaluationResult> {
+        let effective_config = self.get_effective_reflection_config();
+        self.evaluate_response_with_config(input, response, &effective_config)
+            .await
+    }
+
+    fn extract_thinking(&self, content: &str) -> (Option<String>, String) {
+        if let Some(start) = content.find("<thinking>") {
+            if let Some(end) = content.find("</thinking>") {
+                let thinking = content[start + 10..end].trim().to_string();
+                let answer = content[end + 11..].trim().to_string();
+                return (Some(thinking), answer);
+            }
+        }
+        (None, content.to_string())
+    }
+
+    fn format_response_with_thinking(&self, thinking: Option<&str>, answer: &str) -> String {
+        match self.reasoning_config.output {
+            ReasoningOutput::Hidden => answer.to_string(),
+            ReasoningOutput::Visible => {
+                if let Some(t) = thinking {
+                    format!("Thinking:\n{}\n\nAnswer:\n{}", t, answer)
+                } else {
+                    answer.to_string()
+                }
+            }
+            ReasoningOutput::Tagged => {
+                if let Some(t) = thinking {
+                    format!("<thinking>{}</thinking>\n{}", t, answer)
+                } else {
+                    answer.to_string()
+                }
+            }
+        }
+    }
+
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
         info!(input_len = input.len(), "Starting chat");
 
@@ -1260,12 +1910,71 @@ impl RuntimeAgent {
             return Ok(response);
         }
 
+        let effective_reasoning = self.get_effective_reasoning_config();
+        let reasoning_mode = self.determine_reasoning_mode(processed_input).await?;
+        let auto_detected = matches!(effective_reasoning.mode, ReasoningMode::Auto);
+
+        info!(
+            reasoning_mode = ?reasoning_mode,
+            auto_detected = auto_detected,
+            reflection_enabled = ?self.reflection_config.enabled,
+            "Reasoning mode determined"
+        );
+
+        if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
+            self.memory
+                .add_message(ChatMessage::user(processed_input))
+                .await?;
+
+            let mut plan = self.generate_plan(processed_input).await?;
+            info!(
+                plan_id = %plan.id,
+                steps = plan.steps.len(),
+                "Plan generated"
+            );
+            *self.current_plan.write() = Some(plan.clone());
+
+            let plan_result = self.execute_plan(&mut plan).await?;
+            info!(
+                plan_status = ?plan.status,
+                completed_steps = plan.completed_steps().count(),
+                "Plan execution completed"
+            );
+            *self.current_plan.write() = Some(plan);
+
+            let output_data = self
+                .process_output(&plan_result, &input_data.context)
+                .await?;
+            let final_content = output_data.content;
+
+            self.memory
+                .add_message(ChatMessage::assistant(&final_content))
+                .await?;
+
+            self.check_memory_compression().await?;
+            self.increment_turn();
+            self.evaluate_transitions(processed_input, &final_content)
+                .await?;
+
+            let reasoning_metadata = ReasoningMetadata::new(ReasoningMode::PlanAndExecute)
+                .with_auto_detected(auto_detected);
+
+            let response = AgentResponse::new(&final_content).with_metadata(
+                "reasoning",
+                serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+            );
+
+            self.hooks.on_response(&response).await;
+            return Ok(response);
+        }
+
         self.memory
             .add_message(ChatMessage::user(processed_input))
             .await?;
 
         let mut iterations = 0u32;
         let mut all_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut thinking_content: Option<String> = None;
 
         let llm = self.get_state_llm()?;
 
@@ -1286,7 +1995,29 @@ impl RuntimeAgent {
                 "LLM call"
             );
 
-            let messages = self.build_messages().await?;
+            let mut messages = self.build_messages().await?;
+
+            if iterations == 1 {
+                match reasoning_mode {
+                    ReasoningMode::CoT => {
+                        if let Some(msg) = messages.first_mut() {
+                            if matches!(msg.role, ai_agents_core::Role::System) {
+                                msg.content = self.build_cot_system_prompt(&msg.content);
+                                debug!("Applied Chain-of-Thought system prompt");
+                            }
+                        }
+                    }
+                    ReasoningMode::React => {
+                        if let Some(msg) = messages.first_mut() {
+                            if matches!(msg.role, ai_agents_core::Role::System) {
+                                msg.content = self.build_react_system_prompt(&msg.content);
+                                debug!("Applied ReAct system prompt");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             self.hooks.on_llm_start(&messages).await;
             let llm_start = Instant::now();
@@ -1350,16 +2081,89 @@ impl RuntimeAgent {
                 continue;
             }
 
-            let output_data = self.process_output(content, &input_data.context).await?;
+            let (extracted_thinking, answer) = self.extract_thinking(content);
+            if extracted_thinking.is_some() {
+                thinking_content = extracted_thinking;
+            }
 
-            let final_content = if output_data.metadata.rejected {
+            let output_data = self.process_output(&answer, &input_data.context).await?;
+
+            let mut final_content = if output_data.metadata.rejected {
                 output_data
                     .metadata
                     .rejection_reason
-                    .unwrap_or_else(|| content.to_string())
+                    .unwrap_or_else(|| answer.to_string())
             } else {
                 output_data.content
             };
+
+            let should_reflect = self.should_reflect(processed_input, &final_content).await?;
+            let mut reflection_metadata: Option<ReflectionMetadata> = None;
+
+            if should_reflect {
+                info!("Starting response reflection evaluation");
+                let mut attempts = 0u32;
+                let max_retries = self.reflection_config.max_retries;
+                let mut history: Vec<ReflectionAttempt> = Vec::new();
+
+                loop {
+                    let evaluation = self
+                        .evaluate_response(processed_input, &final_content)
+                        .await?;
+
+                    if evaluation.passed || attempts >= max_retries {
+                        info!(
+                            passed = evaluation.passed,
+                            confidence = evaluation.confidence,
+                            attempts = attempts + 1,
+                            "Reflection evaluation complete"
+                        );
+                        reflection_metadata = Some(
+                            ReflectionMetadata::new(evaluation)
+                                .with_attempts(attempts + 1)
+                                .with_history(history),
+                        );
+                        break;
+                    }
+
+                    debug!(
+                        attempt = attempts + 1,
+                        failed_criteria = evaluation.failed_criteria().count(),
+                        "Response did not meet criteria, retrying"
+                    );
+
+                    history.push(
+                        ReflectionAttempt::new(&final_content, evaluation.clone())
+                            .with_feedback("Response did not meet quality criteria"),
+                    );
+
+                    let feedback: Vec<String> = evaluation
+                        .failed_criteria()
+                        .map(|c| format!("- {}", c.criterion))
+                        .collect();
+
+                    let retry_prompt = format!(
+                        "Your previous response did not meet these criteria:\n{}\n\nPlease provide an improved response.",
+                        feedback.join("\n")
+                    );
+
+                    self.memory
+                        .add_message(ChatMessage::user(&retry_prompt))
+                        .await?;
+
+                    let retry_messages = self.build_messages().await?;
+                    let retry_response = llm
+                        .complete(&retry_messages, None)
+                        .await
+                        .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+                    final_content = retry_response.content.trim().to_string();
+                    attempts += 1;
+                }
+            }
+
+            final_content =
+                self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
 
             self.memory
                 .add_message(ChatMessage::assistant(&final_content))
@@ -1371,6 +2175,11 @@ impl RuntimeAgent {
             self.evaluate_transitions(processed_input, &final_content)
                 .await?;
 
+            let reasoning_metadata = ReasoningMetadata::new(reasoning_mode.clone())
+                .with_thinking(thinking_content.clone().unwrap_or_default())
+                .with_iterations(iterations)
+                .with_auto_detected(auto_detected);
+
             let mut response = AgentResponse::new(&final_content);
             if !all_tool_calls.is_empty() {
                 response = response.with_tool_calls(all_tool_calls);
@@ -1380,12 +2189,26 @@ impl RuntimeAgent {
                 response = response.with_metadata("current_state", serde_json::json!(state));
             }
 
+            response = response.with_metadata(
+                "reasoning",
+                serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+            );
+
+            if let Some(ref refl_meta) = reflection_metadata {
+                response = response.with_metadata(
+                    "reflection",
+                    serde_json::to_value(refl_meta).unwrap_or_default(),
+                );
+            }
+
             self.hooks.on_response(&response).await;
 
             let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
             info!(
                 tool_calls = tool_call_count,
                 response_len = response.content.len(),
+                reasoning_mode = ?reasoning_mode,
+                reflected = reflection_metadata.is_some(),
                 "Chat completed"
             );
             return Ok(response);

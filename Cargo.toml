@@ -13,6 +13,7 @@ members = [
     "crates/ai-agents-hitl",
     "crates/ai-agents-hooks",
     "crates/ai-agents-recovery",
+    "crates/ai-agents-reasoning",
     "crates/ai-agents-template",
     "crates/ai-agents-runtime",
     "crates/ai-agents",
@@ -20,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-rc.3"
+version = "1.0.0-rc.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/geminik23/ai-agents"
@@ -65,5 +66,6 @@ ai-agents-skills = { path = "crates/ai-agents-skills" }
 ai-agents-hitl = { path = "crates/ai-agents-hitl" }
 ai-agents-hooks = { path = "crates/ai-agents-hooks" }
 ai-agents-recovery = { path = "crates/ai-agents-recovery" }
+ai-agents-reasoning = { path = "crates/ai-agents-reasoning" }
 ai-agents-template = { path = "crates/ai-agents-template" }
 ai-agents-runtime = { path = "crates/ai-agents-runtime" }

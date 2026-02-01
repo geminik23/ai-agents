@@ -22,6 +22,7 @@ use ai_agents_context::ContextSource;
 use ai_agents_core::{AgentError, Result};
 use ai_agents_hitl::HITLConfig;
 use ai_agents_process::ProcessConfig;
+use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use ai_agents_recovery::ErrorRecoveryConfig;
 use ai_agents_skills::SkillRef;
 use ai_agents_state::StateConfig;
@@ -88,6 +89,12 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub hitl: Option<HITLConfig>,
+
+    #[serde(default)]
+    pub reasoning: ReasoningConfig,
+
+    #[serde(default)]
+    pub reflection: ReflectionConfig,
 
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -180,6 +187,8 @@ impl Default for AgentSpec {
             parallel_tools: ParallelToolsConfig::default(),
             streaming: StreamingConfig::default(),
             hitl: None,
+            reasoning: ReasoningConfig::default(),
+            reflection: ReflectionConfig::default(),
             providers: ProvidersConfig::default(),
             provider_security: ProviderSecurityConfig::default(),
             tool_aliases: ToolAliasesConfig::default(),
@@ -261,6 +270,14 @@ impl AgentSpec {
 
     pub fn has_tool_aliases(&self) -> bool {
         !self.tool_aliases.tools.is_empty()
+    }
+
+    pub fn has_reasoning(&self) -> bool {
+        self.reasoning.is_enabled()
+    }
+
+    pub fn has_reflection(&self) -> bool {
+        self.reflection.requires_evaluation()
     }
 }
 
@@ -633,5 +650,179 @@ tool_aliases:
         assert!(spec.has_tool_aliases());
         let calc_aliases = spec.tool_aliases.tools.get("calculator").unwrap();
         assert_eq!(calc_aliases.get_name("ko"), Some("계산기"));
+    }
+
+    #[test]
+    fn test_agent_spec_with_reasoning() {
+        let yaml = r#"
+    name: ReasoningAgent
+    system_prompt: "You are helpful."
+    llm:
+      provider: openai
+      model: gpt-4
+    reasoning:
+      mode: cot
+      judge_llm: router
+      output: tagged
+      max_iterations: 8
+    "#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_reasoning());
+        assert_eq!(spec.reasoning.max_iterations, 8);
+    }
+
+    #[test]
+    fn test_agent_spec_with_reflection() {
+        let yaml = r#"
+    name: ReflectionAgent
+    system_prompt: "You are helpful."
+    llm:
+      provider: openai
+      model: gpt-4
+    reflection:
+      enabled: auto
+      evaluator_llm: router
+      max_retries: 3
+      pass_threshold: 0.8
+      criteria:
+        - "Response addresses the question"
+        - "Response is accurate"
+    "#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_reflection());
+        assert_eq!(spec.reflection.max_retries, 3);
+        assert_eq!(spec.reflection.criteria.len(), 2);
+    }
+
+    #[test]
+    fn test_agent_spec_with_plan_and_execute() {
+        let yaml = r#"
+    name: PlanningAgent
+    system_prompt: "You are helpful."
+    llm:
+      provider: openai
+      model: gpt-4
+    reasoning:
+      mode: plan_and_execute
+      planning:
+        planner_llm: router
+        max_steps: 15
+        available:
+          tools: all
+          skills:
+            - analyze
+            - summarize
+        reflection:
+          enabled: true
+          on_step_failure: replan
+          max_replans: 3
+    "#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_reasoning());
+        let planning = spec.reasoning.planning.as_ref().unwrap();
+        assert_eq!(planning.max_steps, 15);
+        assert!(planning.reflection.enabled);
+    }
+
+    #[test]
+    fn test_agent_spec_reasoning_defaults() {
+        let spec = AgentSpec::default();
+        assert!(!spec.has_reasoning());
+        assert!(!spec.has_reflection());
+    }
+
+    #[test]
+    fn test_agent_spec_state_level_reasoning_override() {
+        let yaml = r#"
+    name: StateReasoningAgent
+    system_prompt: "You are helpful."
+    llm:
+      provider: openai
+      model: gpt-4
+    reasoning:
+      mode: auto
+    states:
+      initial: greeting
+      states:
+        greeting:
+          prompt: "Welcome!"
+          reasoning:
+            mode: none
+        complex_analysis:
+          prompt: "Analyze this"
+          reasoning:
+            mode: cot
+            output: tagged
+          reflection:
+            enabled: true
+            criteria:
+              - "Analysis is thorough"
+    "#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_reasoning());
+        assert!(spec.has_states());
+
+        let states = spec.states.as_ref().unwrap();
+        let greeting = states.states.get("greeting").unwrap();
+        assert!(greeting.reasoning.is_some());
+        let greeting_reasoning = greeting.reasoning.as_ref().unwrap();
+        assert_eq!(
+            greeting_reasoning.mode,
+            ai_agents_reasoning::ReasoningMode::None
+        );
+
+        let analysis = states.states.get("complex_analysis").unwrap();
+        assert!(analysis.reasoning.is_some());
+        assert!(analysis.reflection.is_some());
+        let analysis_reasoning = analysis.reasoning.as_ref().unwrap();
+        assert_eq!(
+            analysis_reasoning.mode,
+            ai_agents_reasoning::ReasoningMode::CoT
+        );
+    }
+
+    #[test]
+    fn test_agent_spec_skill_level_reasoning_override() {
+        use ai_agents_skills::SkillDefinition;
+
+        let skill_yaml = r#"
+id: complex_analysis
+description: "Analyze data"
+trigger: "When user asks for analysis"
+reasoning:
+  mode: cot
+reflection:
+  enabled: true
+  criteria:
+    - "Analysis covers all aspects"
+steps:
+  - prompt: "Analyze the input"
+"#;
+        let skill_def: SkillDefinition = serde_yaml::from_str(skill_yaml).unwrap();
+        assert!(skill_def.reasoning.is_some());
+        assert!(skill_def.reflection.is_some());
+        let reasoning = skill_def.reasoning.as_ref().unwrap();
+        assert_eq!(reasoning.mode, ai_agents_reasoning::ReasoningMode::CoT);
+        let reflection = skill_def.reflection.as_ref().unwrap();
+        assert!(reflection.is_enabled());
+
+        let simple_yaml = r#"
+id: simple_lookup
+description: "Look up simple facts"
+trigger: "When user asks for facts"
+reasoning:
+  mode: none
+reflection:
+  enabled: false
+steps:
+  - prompt: "Look up the fact"
+"#;
+        let simple_def: SkillDefinition = serde_yaml::from_str(simple_yaml).unwrap();
+        assert!(simple_def.reasoning.is_some());
+        let simple_reasoning = simple_def.reasoning.as_ref().unwrap();
+        assert_eq!(
+            simple_reasoning.mode,
+            ai_agents_reasoning::ReasoningMode::None
+        );
     }
 }

@@ -165,6 +165,8 @@ mod tests {
                     prompt: "Recommend clothes".to_string(),
                     llm: None,
                 }],
+                reasoning: None,
+                reflection: None,
             },
             SkillDefinition {
                 id: "calculator".to_string(),
@@ -175,6 +177,8 @@ mod tests {
                     args: None,
                     output_as: None,
                 }],
+                reasoning: None,
+                reflection: None,
             },
         ]
     }

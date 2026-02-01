@@ -9,7 +9,7 @@ Build AI agents from a single YAML spec:
 - Safety by default: tool policies, HITL approvals, error recovery
 - Extensible: custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.3**
+> Status: **1.0.0-rc.4**
 > This project is under active development. APIs and YAML schema may change between minor versions.
 > Use it for experiments and feedback; hold off on production until v1.0.0.
 >

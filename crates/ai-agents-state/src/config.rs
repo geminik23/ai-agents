@@ -1,4 +1,5 @@
 use ai_agents_core::{AgentError, Result};
+use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -68,6 +69,12 @@ pub struct StateDefinition {
 
     #[serde(default)]
     pub extract: Option<ContextExtractor>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reflection: Option<ReflectionConfig>,
 }
 
 fn default_inherit_parent() -> bool {

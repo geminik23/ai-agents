@@ -106,6 +106,8 @@ mod tests {
                 prompt: "Hello".to_string(),
                 llm: None,
             }],
+            reasoning: None,
+            reflection: None,
         };
 
         let skill_ref = SkillRef::Inline(inline_skill.clone());
@@ -131,6 +133,8 @@ mod tests {
             description: "Cached".to_string(),
             trigger: "When cached".to_string(),
             steps: vec![],
+            reasoning: None,
+            reflection: None,
         };
 
         loader

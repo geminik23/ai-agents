@@ -1,6 +1,6 @@
 use ai_agents::{
-    create_builtin_registry, Agent, AgentBuilder, LLMRegistry, ProviderType, SkillDefinition,
-    SkillStep, UnifiedLLMProvider,
+    Agent, AgentBuilder, LLMRegistry, ProviderType, SkillDefinition, SkillStep, UnifiedLLMProvider,
+    create_builtin_registry,
 };
 use std::sync::Arc;
 
@@ -32,12 +32,16 @@ Respond with a warm, friendly greeting. Be enthusiastic but not over the top."#
                 .to_string(),
             llm: None,
         }],
+        reasoning: None,
+        reflection: None,
     };
 
     let calc_skill = SkillDefinition {
         id: "calculator".to_string(),
         description: "Perform mathematical calculations".to_string(),
         trigger: "When user asks to calculate something or needs math help".to_string(),
+        reasoning: None,
+        reflection: None,
         steps: vec![
             // First: Extract the math expression from user input using LLM
             SkillStep::Prompt {
