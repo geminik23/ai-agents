@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use ai_agents_context::ContextSource;
 use ai_agents_core::{AgentError, Result};
+use ai_agents_disambiguation::DisambiguationConfig;
 use ai_agents_hitl::HITLConfig;
 use ai_agents_process::ProcessConfig;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
@@ -95,6 +96,9 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub reflection: ReflectionConfig,
+
+    #[serde(default)]
+    pub disambiguation: DisambiguationConfig,
 
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -189,6 +193,7 @@ impl Default for AgentSpec {
             hitl: None,
             reasoning: ReasoningConfig::default(),
             reflection: ReflectionConfig::default(),
+            disambiguation: DisambiguationConfig::default(),
             providers: ProvidersConfig::default(),
             provider_security: ProviderSecurityConfig::default(),
             tool_aliases: ToolAliasesConfig::default(),
@@ -278,6 +283,10 @@ impl AgentSpec {
 
     pub fn has_reflection(&self) -> bool {
         self.reflection.requires_evaluation()
+    }
+
+    pub fn has_disambiguation(&self) -> bool {
+        self.disambiguation.is_enabled()
     }
 }
 
@@ -824,5 +833,73 @@ steps:
             simple_reasoning.mode,
             ai_agents_reasoning::ReasoningMode::None
         );
+    }
+
+    #[test]
+    fn test_agent_spec_with_disambiguation() {
+        let yaml = r#"
+name: DisambiguatingAgent
+system_prompt: "You are a helpful assistant."
+disambiguation:
+  enabled: true
+  detection:
+    llm: router
+    threshold: 0.8
+    aspects:
+      - missing_target
+      - vague_references
+  clarification:
+    style: auto
+    max_attempts: 3
+    on_max_attempts: proceed_with_best_guess
+  skip_when:
+    - type: social
+    - type: short_input
+      max_chars: 10
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_disambiguation());
+        assert!(spec.disambiguation.is_enabled());
+        assert_eq!(spec.disambiguation.detection.threshold, 0.8);
+        assert_eq!(spec.disambiguation.clarification.max_attempts, 3);
+        assert_eq!(spec.disambiguation.skip_when.len(), 2);
+    }
+
+    #[test]
+    fn test_agent_spec_disambiguation_minimal() {
+        let yaml = r#"
+name: MinimalDisambiguatingAgent
+system_prompt: "You are helpful."
+disambiguation:
+  enabled: true
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.has_disambiguation());
+        assert_eq!(spec.disambiguation.detection.llm, "router");
+        assert_eq!(spec.disambiguation.detection.threshold, 0.7);
+        assert_eq!(spec.disambiguation.clarification.max_attempts, 2);
+    }
+
+    #[test]
+    fn test_agent_spec_no_disambiguation_by_default() {
+        let yaml = r#"
+name: SimpleAgent
+system_prompt: "You are helpful."
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+"#;
+        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(!spec.has_disambiguation());
+        assert!(!spec.disambiguation.is_enabled());
     }
 }

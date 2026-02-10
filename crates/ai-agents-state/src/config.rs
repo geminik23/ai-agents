@@ -1,4 +1,5 @@
 use ai_agents_core::{AgentError, Result};
+use ai_agents_disambiguation::StateDisambiguationOverride;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -75,6 +76,9 @@ pub struct StateDefinition {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<ReflectionConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disambiguation: Option<StateDisambiguationOverride>,
 }
 
 fn default_inherit_parent() -> bool {
@@ -724,5 +728,36 @@ states:
         let effective_tools = child.get_effective_tools(Some(&parent));
         assert_eq!(effective_tools.len(), 1);
         assert_eq!(effective_tools[0].id(), "child_tool");
+    }
+
+    #[test]
+    fn test_state_with_disambiguation_override() {
+        let yaml = r#"
+initial: greeting
+states:
+  greeting:
+    prompt: "Hello"
+    transitions:
+      - to: payment
+        when: "User wants to pay"
+  payment:
+    prompt: "Processing payment"
+    disambiguation:
+      threshold: 0.95
+      require_confirmation: true
+      required_clarity:
+        - recipient
+        - amount
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let payment = config.get_state("payment").unwrap();
+        let disambig = payment.disambiguation.as_ref().unwrap();
+        assert_eq!(disambig.threshold, Some(0.95));
+        assert!(disambig.require_confirmation);
+        assert_eq!(disambig.required_clarity.len(), 2);
+        assert!(disambig.required_clarity.contains(&"recipient".to_string()));
+
+        let greeting = config.get_state("greeting").unwrap();
+        assert!(greeting.disambiguation.is_none());
     }
 }

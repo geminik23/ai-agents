@@ -21,6 +21,7 @@ ai-agents-hitl = { workspace = true }
 ai-agents-hooks = { workspace = true }
 ai-agents-recovery = { workspace = true }
 ai-agents-reasoning = { workspace = true }
+ai-agents-disambiguation = { workspace = true }
 ai-agents-template = { workspace = true }
 
 serde = { workspace = true }

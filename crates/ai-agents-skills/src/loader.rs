@@ -108,6 +108,7 @@ mod tests {
             }],
             reasoning: None,
             reflection: None,
+            disambiguation: None,
         };
 
         let skill_ref = SkillRef::Inline(inline_skill.clone());
@@ -135,6 +136,7 @@ mod tests {
             steps: vec![],
             reasoning: None,
             reflection: None,
+            disambiguation: None,
         };
 
         loader

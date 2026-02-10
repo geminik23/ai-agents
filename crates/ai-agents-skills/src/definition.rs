@@ -1,3 +1,4 @@
+use ai_agents_disambiguation::SkillDisambiguationOverride;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -16,6 +17,9 @@ pub struct SkillDefinition {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reflection: Option<ReflectionConfig>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disambiguation: Option<SkillDisambiguationOverride>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +210,40 @@ steps:
         } else {
             panic!("Expected inline skill");
         }
+    }
+
+    #[test]
+    fn test_skill_definition_with_disambiguation() {
+        let yaml = r#"
+id: transfer_money
+description: "Transfer money between accounts"
+trigger: "When user wants to transfer money"
+disambiguation:
+  enabled: true
+  threshold: 0.9
+  required_clarity:
+    - recipient
+    - amount
+  clarification_templates:
+    missing_recipient: "누구에게 보내시겠습니까?"
+    missing_amount: "얼마를 보내시겠습니까?"
+steps:
+  - prompt: "Processing transfer"
+"#;
+        let def: SkillDefinition = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(def.id, "transfer_money");
+        let disambig = def.disambiguation.as_ref().unwrap();
+        assert_eq!(disambig.enabled, Some(true));
+        assert_eq!(disambig.threshold, Some(0.9));
+        assert_eq!(disambig.required_clarity.len(), 2);
+        assert_eq!(disambig.clarification_templates.len(), 2);
+        assert_eq!(
+            disambig
+                .clarification_templates
+                .get("missing_recipient")
+                .unwrap(),
+            "누구에게 보내시겠습니까?"
+        );
     }
 
     #[test]

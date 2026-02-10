@@ -1053,6 +1053,382 @@ mod tests {
         assert!(result.is_none());
     }
 
+    //
+    // LLM-based stage tests (detect, extract, sanitize, transform, validate)
+    //
+    fn create_mock_registry(response: &str) -> Arc<ai_agents_llm::LLMRegistry> {
+        use ai_agents_llm::mock::MockLLMProvider;
+        let mut mock = MockLLMProvider::new("test");
+        mock.set_response(response);
+        let mut registry = ai_agents_llm::LLMRegistry::new();
+        registry.register("default", std::sync::Arc::new(mock));
+        registry.set_default("default");
+        std::sync::Arc::new(registry)
+    }
+
+    fn create_mock_registry_multi(responses: Vec<&str>) -> Arc<ai_agents_llm::LLMRegistry> {
+        use ai_agents_llm::mock::MockLLMProvider;
+        let mut mock = MockLLMProvider::new("test");
+        mock.set_responses(responses.into_iter().map(String::from).collect(), true);
+        let mut registry = ai_agents_llm::LLMRegistry::new();
+        registry.register("default", std::sync::Arc::new(mock));
+        registry.set_default("default");
+        std::sync::Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn test_detect_stage_language_sentiment() {
+        let registry = create_mock_registry(
+            r#"{"language": "ko", "sentiment": "positive", "intent": "greeting"}"#,
+        );
+        let config = ProcessConfig {
+            input: vec![ProcessStage::Detect(DetectStage {
+                id: Some("detect_test".to_string()),
+                condition: None,
+                config: DetectConfig {
+                    llm: None,
+                    detect: vec![DetectionType::Language, DetectionType::Sentiment],
+                    intents: vec![IntentDefinition {
+                        id: "greeting".to_string(),
+                        description: "User says hello".to_string(),
+                    }],
+                    store_in_context: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert("language".to_string(), "input.language".to_string());
+                        m.insert("sentiment".to_string(), "input.sentiment".to_string());
+                        m
+                    },
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+        let result = processor.process_input("안녕하세요!").await.unwrap();
+
+        assert_eq!(
+            result.context.get("input.language"),
+            Some(&serde_json::json!("ko"))
+        );
+        assert_eq!(
+            result.context.get("input.sentiment"),
+            Some(&serde_json::json!("positive"))
+        );
+        assert!(
+            result
+                .metadata
+                .stages_executed
+                .contains(&"detect_test".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_extract_stage_entities() {
+        let registry = create_mock_registry(r#"{"order_number": "ORD-12345", "urgency": "high"}"#);
+        let config = ProcessConfig {
+            input: vec![ProcessStage::Extract(ExtractStage {
+                id: Some("extract_test".to_string()),
+                condition: None,
+                config: ExtractConfig {
+                    llm: None,
+                    schema: {
+                        let mut m = std::collections::HashMap::new();
+                        m.insert(
+                            "order_number".to_string(),
+                            FieldSchema {
+                                field_type: FieldType::String,
+                                description: Some("Order number".to_string()),
+                                required: true,
+                                values: vec![],
+                            },
+                        );
+                        m.insert(
+                            "urgency".to_string(),
+                            FieldSchema {
+                                field_type: FieldType::Enum,
+                                description: Some("Urgency level".to_string()),
+                                required: false,
+                                values: vec![
+                                    "low".to_string(),
+                                    "medium".to_string(),
+                                    "high".to_string(),
+                                ],
+                            },
+                        );
+                        m
+                    },
+                    store_in_context: Some("extracted".to_string()),
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+        let result = processor
+            .process_input("My order ORD-12345 is urgent!")
+            .await
+            .unwrap();
+
+        let extracted = result.context.get("extracted").unwrap();
+        assert_eq!(extracted["order_number"], "ORD-12345");
+        assert_eq!(extracted["urgency"], "high");
+    }
+
+    #[tokio::test]
+    async fn test_sanitize_stage_pii_masking() {
+        let registry = create_mock_registry("Call me at ****-****-**** or email at ****@****.com");
+        let config = ProcessConfig {
+            input: vec![ProcessStage::Sanitize(SanitizeStage {
+                id: Some("sanitize_test".to_string()),
+                condition: None,
+                config: SanitizeConfig {
+                    llm: None,
+                    pii: Some(PIISanitizeConfig {
+                        action: PIIAction::Mask,
+                        types: vec![PIIType::Phone, PIIType::Email],
+                        mask_char: "*".to_string(),
+                    }),
+                    harmful: None,
+                    remove: vec![],
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+        let result = processor
+            .process_input("Call me at 010-1234-5678 or email at user@example.com")
+            .await
+            .unwrap();
+
+        // LLM returns sanitized text
+        assert!(result.content.contains("****"));
+        assert!(!result.content.contains("010-1234-5678"));
+        assert!(!result.content.contains("user@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_transform_stage_tone_adjustment() {
+        let registry = create_mock_registry(
+            "I understand your frustration. Let me help you resolve this issue right away.",
+        );
+        let config = ProcessConfig {
+            output: vec![ProcessStage::Transform(TransformStage {
+                id: Some("tone_test".to_string()),
+                condition: None,
+                config: TransformConfig {
+                    llm: None,
+                    prompt: Some("Rewrite to be more empathetic.".to_string()),
+                    max_output_tokens: None,
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+
+        let input_context = std::collections::HashMap::new();
+        let result = processor
+            .process_output("Your request is being processed.", &input_context)
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("understand"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_stage_llm_criteria() {
+        let registry = create_mock_registry(
+            r#"{"passes": false, "score": 0.3, "issues": ["Response is too vague"]}"#,
+        );
+        let config = ProcessConfig {
+            output: vec![ProcessStage::Validate(ValidateStage {
+                id: Some("quality_test".to_string()),
+                condition: None,
+                config: ValidateConfig {
+                    rules: vec![],
+                    llm: None,
+                    criteria: vec!["Response is specific and actionable".to_string()],
+                    threshold: 0.7,
+                    on_fail: ValidationFailAction {
+                        action: ValidationFailType::Warn,
+                        ..Default::default()
+                    },
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+
+        let input_context = std::collections::HashMap::new();
+        let result = processor
+            .process_output("It depends.", &input_context)
+            .await
+            .unwrap();
+
+        // Should have a warning because score (0.3) < threshold (0.7)
+        assert!(
+            result.metadata.warnings.iter().any(|w| w.contains("vague")),
+            "Expected warning about vague response, got: {:?}",
+            result.metadata.warnings
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_stage_llm_criteria_reject() {
+        let registry = create_mock_registry(
+            r#"{"passes": false, "score": 0.2, "issues": ["Contains harmful content"]}"#,
+        );
+        let config = ProcessConfig {
+            output: vec![ProcessStage::Validate(ValidateStage {
+                id: Some("reject_test".to_string()),
+                condition: None,
+                config: ValidateConfig {
+                    rules: vec![],
+                    llm: None,
+                    criteria: vec!["Response is safe".to_string()],
+                    threshold: 0.7,
+                    on_fail: ValidationFailAction {
+                        action: ValidationFailType::Reject,
+                        ..Default::default()
+                    },
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+
+        let input_context = std::collections::HashMap::new();
+        let result = processor
+            .process_output("Dangerous content here.", &input_context)
+            .await
+            .unwrap();
+
+        assert!(result.metadata.rejected);
+        assert!(
+            result
+                .metadata
+                .rejection_reason
+                .as_ref()
+                .unwrap()
+                .contains("harmful")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_input_pipeline_chain() {
+        // normalize → detect → extract pipeline
+        let registry = create_mock_registry_multi(vec![
+            // detect response
+            r#"{"language": "en", "sentiment": "neutral"}"#,
+            // extract response
+            r#"{"user_name": "Alice", "topic": "billing"}"#,
+        ]);
+        let config = ProcessConfig {
+            input: vec![
+                ProcessStage::Normalize(NormalizeStage {
+                    id: Some("norm".to_string()),
+                    condition: None,
+                    config: NormalizeConfig {
+                        trim: true,
+                        collapse_whitespace: true,
+                        ..Default::default()
+                    },
+                }),
+                ProcessStage::Detect(DetectStage {
+                    id: Some("detect".to_string()),
+                    condition: None,
+                    config: DetectConfig {
+                        llm: None,
+                        detect: vec![DetectionType::Language, DetectionType::Sentiment],
+                        intents: vec![],
+                        store_in_context: {
+                            let mut m = std::collections::HashMap::new();
+                            m.insert("language".to_string(), "input.language".to_string());
+                            m
+                        },
+                    },
+                }),
+                ProcessStage::Extract(ExtractStage {
+                    id: Some("extract".to_string()),
+                    condition: None,
+                    config: ExtractConfig {
+                        llm: None,
+                        schema: {
+                            let mut m = std::collections::HashMap::new();
+                            m.insert(
+                                "user_name".to_string(),
+                                FieldSchema {
+                                    field_type: FieldType::String,
+                                    description: Some("User name".to_string()),
+                                    ..Default::default()
+                                },
+                            );
+                            m
+                        },
+                        store_in_context: Some("entities".to_string()),
+                    },
+                }),
+            ],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+        let result = processor
+            .process_input("  Hi, I'm   Alice and I have a billing question  ")
+            .await
+            .unwrap();
+
+        // Verify normalize ran
+        assert_eq!(
+            result.content,
+            "Hi, I'm Alice and I have a billing question"
+        );
+
+        // Verify detect stored context
+        assert_eq!(
+            result.context.get("input.language"),
+            Some(&serde_json::json!("en"))
+        );
+
+        // Verify extract stored context
+        let entities = result.context.get("entities").unwrap();
+        assert_eq!(entities["user_name"], "Alice");
+
+        // Verify all stages executed in order
+        assert_eq!(
+            result.metadata.stages_executed,
+            vec!["norm", "detect", "extract"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_conditional_stage_skips_on_false() {
+        let registry = create_mock_registry(r#"{"language": "en"}"#);
+        let config = ProcessConfig {
+            input: vec![ProcessStage::Detect(DetectStage {
+                id: Some("should_skip".to_string()),
+                condition: Some(ConditionExpr::Simple({
+                    let mut map = std::collections::HashMap::new();
+                    map.insert("needs_detection".to_string(), serde_json::json!(true));
+                    map
+                })),
+                config: DetectConfig {
+                    llm: None,
+                    detect: vec![DetectionType::Language],
+                    ..Default::default()
+                },
+            })],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(config).with_llm_registry(registry);
+        let result = processor.process_input("Hello").await.unwrap();
+
+        // Stage should be skipped because "needs_detection" is not in context
+        assert!(
+            !result
+                .metadata
+                .stages_executed
+                .contains(&"should_skip".to_string()),
+            "Stage should have been skipped"
+        );
+    }
+
     #[tokio::test]
     async fn test_stage_skipped_when_condition_false() {
         let config = ProcessConfig {

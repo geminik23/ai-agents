@@ -14,6 +14,7 @@ members = [
     "crates/ai-agents-hooks",
     "crates/ai-agents-recovery",
     "crates/ai-agents-reasoning",
+    "crates/ai-agents-disambiguation",
     "crates/ai-agents-template",
     "crates/ai-agents-runtime",
     "crates/ai-agents",
@@ -67,5 +68,6 @@ ai-agents-hitl = { path = "crates/ai-agents-hitl" }
 ai-agents-hooks = { path = "crates/ai-agents-hooks" }
 ai-agents-recovery = { path = "crates/ai-agents-recovery" }
 ai-agents-reasoning = { path = "crates/ai-agents-reasoning" }
+ai-agents-disambiguation = { path = "crates/ai-agents-disambiguation" }
 ai-agents-template = { path = "crates/ai-agents-template" }
 ai-agents-runtime = { path = "crates/ai-agents-runtime" }

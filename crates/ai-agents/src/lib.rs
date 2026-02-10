@@ -290,6 +290,16 @@ pub mod reasoning {
     };
 }
 
+pub mod disambiguation {
+    pub use ai_agents_disambiguation::{
+        AmbiguityAspect, AmbiguityDetectionResult, AmbiguityDetector, AmbiguityType, CacheConfig,
+        ClarificationConfig, ClarificationGenerator, ClarificationOption, ClarificationParseResult,
+        ClarificationQuestion, ClarificationStyle, ContextConfig, DetectionConfig,
+        DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
+        MaxAttemptsAction, SkillDisambiguationOverride, SkipCondition, StateDisambiguationOverride,
+    };
+}
+
 pub mod tool_security {
     pub use ai_agents_tools::{
         SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
@@ -395,4 +405,13 @@ pub use reasoning::{
     PlanReflectionConfig, PlanStatus, PlanStep, PlanningConfig, ReasoningConfig, ReasoningMetadata,
     ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig, ReflectionMetadata,
     ReflectionMode, StepFailureAction, StepStatus, StringOrList,
+};
+
+// Intent Disambiguation (v0.5.4)
+pub use disambiguation::{
+    AmbiguityAspect, AmbiguityDetectionResult, AmbiguityDetector, AmbiguityType, CacheConfig,
+    ClarificationConfig, ClarificationGenerator, ClarificationOption, ClarificationParseResult,
+    ClarificationQuestion, ClarificationStyle, ContextConfig, DetectionConfig,
+    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
+    MaxAttemptsAction, SkillDisambiguationOverride, SkipCondition, StateDisambiguationOverride,
 };

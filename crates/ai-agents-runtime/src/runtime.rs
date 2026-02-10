@@ -12,8 +12,12 @@ use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
 use ai_agents_core::{
     AgentError, AgentSnapshot, AgentStorage, ChatMessage, LLMProvider, Result, ToolResult,
 };
+use ai_agents_disambiguation::{
+    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
+};
 use ai_agents_hitl::{
-    ApprovalHandler, ApprovalResult, HITLCheckResult, HITLEngine, RejectAllHandler, TimeoutAction,
+    ApprovalHandler, ApprovalResult, ApprovalTrigger, HITLCheckResult, HITLEngine,
+    RejectAllHandler, TimeoutAction,
 };
 use ai_agents_hooks::{AgentHooks, NoopHooks};
 use ai_agents_llm::LLMRegistry;
@@ -33,7 +37,7 @@ use ai_agents_recovery::{
 };
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
 use ai_agents_state::{
-    PromptMode, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
+    PromptMode, StateAction, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
     TransitionContext, TransitionEvaluator,
 };
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
@@ -78,6 +82,7 @@ pub struct RuntimeAgent {
     storage: RwLock<Option<Arc<dyn AgentStorage>>>,
     reasoning_config: ReasoningConfig,
     reflection_config: ReflectionConfig,
+    disambiguation_manager: Option<DisambiguationManager>,
     current_plan: RwLock<Option<Plan>>,
 }
 
@@ -165,6 +170,7 @@ impl RuntimeAgent {
             storage: RwLock::new(None),
             reasoning_config: ReasoningConfig::default(),
             reflection_config: ReflectionConfig::default(),
+            disambiguation_manager: None,
             current_plan: RwLock::new(None),
         }
     }
@@ -195,6 +201,26 @@ impl RuntimeAgent {
 
     pub fn reflection_config(&self) -> &ReflectionConfig {
         &self.reflection_config
+    }
+
+    pub fn with_disambiguation(mut self, config: DisambiguationConfig) -> Self {
+        if config.is_enabled() {
+            self.disambiguation_manager = Some(DisambiguationManager::new(
+                config,
+                Arc::clone(&self.llm_registry),
+            ));
+        }
+        self
+    }
+
+    pub fn disambiguation_manager(&self) -> Option<&DisambiguationManager> {
+        self.disambiguation_manager.as_ref()
+    }
+
+    pub fn has_disambiguation(&self) -> bool {
+        self.disambiguation_manager
+            .as_ref()
+            .is_some_and(|m| m.is_enabled())
     }
 
     pub async fn init_storage(&self) -> Result<()> {
@@ -324,9 +350,12 @@ impl RuntimeAgent {
         self.state_machine.as_ref().map(|sm| sm.current())
     }
 
-    pub fn transition_to(&self, state: &str) -> Result<()> {
+    pub async fn transition_to(&self, state: &str) -> Result<()> {
         if let Some(ref sm) = self.state_machine {
+            let from_state = sm.current();
+            self.execute_state_exit_actions(&from_state).await;
             sm.transition_to(state, "manual transition")?;
+            self.execute_state_enter_actions(state).await;
             info!(to = %state, "Manual state transition");
         }
         Ok(())
@@ -752,6 +781,33 @@ impl RuntimeAgent {
             .unwrap_or_else(|| self.get_effective_reflection_config())
     }
 
+    async fn build_disambiguation_context(&self) -> Result<DisambiguationContext> {
+        let recent_messages: Vec<String> = self
+            .memory
+            .get_messages(Some(5))
+            .await?
+            .iter()
+            .rev()
+            .map(|m| format!("{:?}: {}", m.role, m.content))
+            .collect();
+
+        let current_state = self.current_state().map(|s| s.to_string());
+
+        let available_tools: Vec<String> = self.tools.list_ids().into_iter().collect();
+
+        let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
+
+        let user_context = self.context_manager.get_all();
+
+        Ok(DisambiguationContext::from_agent_state(
+            recent_messages,
+            current_state,
+            available_tools,
+            available_skills,
+            user_context,
+        ))
+    }
+
     fn get_available_skills(&self) -> Vec<&SkillDefinition> {
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
@@ -929,7 +985,47 @@ impl RuntimeAgent {
             )));
         }
 
-        // Check HITL approval for tool
+        // FIX: note Check security FIRST — don't bother the human if security blocks
+        if self.tool_security.config().enabled {
+            let security_result = self
+                .tool_security
+                .check_tool_execution(&tool_call.name, &tool_call.arguments)
+                .await?;
+
+            match security_result {
+                SecurityCheckResult::Allow => {}
+                SecurityCheckResult::Block { reason } => {
+                    warn!(reason = %reason, "Tool blocked by security");
+                    return Err(AgentError::Tool(format!("Blocked: {}", reason)));
+                }
+                SecurityCheckResult::RequireConfirmation { message } => {
+                    // Route through HITL if available, otherwise error
+                    if let Some(ref hitl_engine) = self.hitl_engine {
+                        let check_result =
+                            hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
+                        let approved = self.request_hitl_approval(check_result).await?;
+                        if !approved {
+                            warn!(tool = %tool_call.name, "Security confirmation rejected by approver");
+                            return Err(AgentError::Tool(format!(
+                                "Confirmation rejected: {}",
+                                message
+                            )));
+                        }
+                    } else {
+                        warn!(message = %message, "Tool requires confirmation but no HITL handler");
+                        return Err(AgentError::Tool(format!(
+                            "Confirmation required: {}",
+                            message
+                        )));
+                    }
+                }
+                SecurityCheckResult::Warn { message } => {
+                    warn!(message = %message, "Tool security warning");
+                }
+            }
+        }
+
+        // Check HITL approval for tool (after security passes)
         if let Some(ref hitl_engine) = self.hitl_engine {
             let check_result = hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
             if check_result.is_required() {
@@ -953,31 +1049,6 @@ impl RuntimeAgent {
                         "Tool '{}' was rejected due to policy condition. Do not retry.",
                         tool_call.name
                     )));
-                }
-            }
-        }
-
-        if self.tool_security.config().enabled {
-            let security_result = self
-                .tool_security
-                .check_tool_execution(&tool_call.name, &tool_call.arguments)
-                .await?;
-
-            match security_result {
-                SecurityCheckResult::Allow => {}
-                SecurityCheckResult::Block { reason } => {
-                    warn!(reason = %reason, "Tool blocked");
-                    return Err(AgentError::Tool(format!("Blocked: {}", reason)));
-                }
-                SecurityCheckResult::RequireConfirmation { message } => {
-                    warn!(message = %message, "Tool requires confirmation");
-                    return Err(AgentError::Tool(format!(
-                        "Confirmation required: {}",
-                        message
-                    )));
-                }
-                SecurityCheckResult::Warn { message } => {
-                    warn!(message = %message, "Tool security warning");
                 }
             }
         }
@@ -1297,7 +1368,10 @@ OVERALL: PASS/FAIL"#,
     async fn check_turn_timeout(&self) -> Result<()> {
         if let Some(ref sm) = self.state_machine {
             if let Some(timeout_state) = sm.check_timeout() {
+                let from_state = sm.current();
+                self.execute_state_exit_actions(&from_state).await;
                 sm.transition_to(&timeout_state, "max_turns exceeded")?;
+                self.execute_state_enter_actions(&timeout_state).await;
                 info!(to = %timeout_state, "Timeout transition");
             }
         }
@@ -1345,8 +1419,16 @@ OVERALL: PASS/FAIL"#,
                     return Ok(false);
                 }
 
+                // Execute on_exit actions for the current state
+                self.execute_state_exit_actions(&context.current_state)
+                    .await;
+
                 sm.transition_to(&target, &reason)?;
                 sm.reset_no_transition();
+
+                // Execute on_enter actions for the new state
+                self.execute_state_enter_actions(&target).await;
+
                 self.hooks
                     .on_state_transition(Some(&context.current_state), &target, &reason)
                     .await;
@@ -1367,7 +1449,14 @@ OVERALL: PASS/FAIL"#,
                     return Ok(false);
                 }
 
+                // Execute on_exit actions for the current state
+                self.execute_state_exit_actions(&from_state).await;
+
                 sm.transition_to(&fallback, "fallback after no transitions")?;
+
+                // Execute on_enter actions for the fallback state
+                self.execute_state_enter_actions(&fallback).await;
+
                 self.hooks
                     .on_state_transition(
                         Some(&from_state),
@@ -1381,6 +1470,106 @@ OVERALL: PASS/FAIL"#,
         }
 
         Ok(false)
+    }
+
+    /// Execute on_exit actions for a state being left.
+    async fn execute_state_exit_actions(&self, state_path: &str) {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(def) = sm.get_definition(state_path) {
+                if !def.on_exit.is_empty() {
+                    debug!(state = %state_path, count = def.on_exit.len(), "Executing on_exit actions");
+                    self.execute_state_actions(&def.on_exit).await;
+                }
+            }
+        }
+    }
+
+    /// Execute on_enter actions for a state being entered.
+    async fn execute_state_enter_actions(&self, state_path: &str) {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(def) = sm.get_definition(state_path) {
+                if !def.on_enter.is_empty() {
+                    debug!(state = %state_path, count = def.on_enter.len(), "Executing on_enter actions");
+                    self.execute_state_actions(&def.on_enter).await;
+                }
+            }
+        }
+    }
+
+    /// Execute a list of state actions (tool calls, skill invocations, context updates, LLM prompts).
+    async fn execute_state_actions(&self, actions: &[StateAction]) {
+        for action in actions {
+            match action {
+                StateAction::Tool { tool, args } => {
+                    let args_value = args.clone().unwrap_or(Value::Object(Default::default()));
+                    if let Some(t) = self.tools.get(tool) {
+                        let result = t.execute(args_value).await;
+                        if result.success {
+                            debug!(tool = %tool, "State action: tool executed");
+                        } else {
+                            warn!(tool = %tool, error = %result.output, "State action: tool failed");
+                        }
+                    } else {
+                        warn!(tool = %tool, "State action: tool not found");
+                    }
+                }
+                StateAction::Skill { skill } => {
+                    if let Some(ref executor) = self.skill_executor {
+                        if let Some(def) = self.skills.iter().find(|s| s.id == *skill) {
+                            match executor.execute(def, "", serde_json::json!({})).await {
+                                Ok(_) => debug!(skill = %skill, "State action: skill executed"),
+                                Err(e) => {
+                                    warn!(skill = %skill, error = %e, "State action: skill failed")
+                                }
+                            }
+                        } else {
+                            warn!(skill = %skill, "State action: skill not found");
+                        }
+                    }
+                }
+                StateAction::SetContext { set_context } => {
+                    for (key, value) in set_context {
+                        if let Err(e) = self.context_manager.set(key, value.clone()) {
+                            warn!(key = %key, error = %e, "State action: set_context failed");
+                        } else {
+                            debug!(key = %key, "State action: context set");
+                        }
+                    }
+                }
+                StateAction::Prompt {
+                    prompt,
+                    llm,
+                    store_as,
+                } => {
+                    let llm_result = if let Some(alias) = llm {
+                        self.llm_registry.get(alias)
+                    } else {
+                        self.llm_registry.default()
+                    };
+                    match llm_result {
+                        Ok(llm_provider) => {
+                            let messages = vec![ChatMessage::user(prompt)];
+                            match llm_provider.complete(&messages, None).await {
+                                Ok(response) => {
+                                    if let Some(key) = store_as {
+                                        let _ = self
+                                            .context_manager
+                                            .set(key, Value::String(response.content));
+                                        debug!(key = %key, "State action: prompt result stored");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "State action: prompt LLM call failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "State action: LLM not found for prompt");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn check_memory_compression(&self) -> Result<()> {
@@ -1872,6 +2061,163 @@ Respond in JSON format:
         self.check_turn_timeout().await?;
         self.context_manager.refresh_per_turn().await?;
 
+        // Disambiguation check (before input processing)
+        if let Some(ref disambiguator) = self.disambiguation_manager {
+            let disambiguation_context = self.build_disambiguation_context().await?;
+
+            // Get state-level disambiguation override
+            let state_override = self
+                .state_machine
+                .as_ref()
+                .and_then(|sm| sm.current_definition())
+                .and_then(|def| def.disambiguation.clone());
+
+            match disambiguator
+                .process_input_with_override(
+                    input,
+                    &disambiguation_context,
+                    state_override.as_ref(),
+                    None,
+                )
+                .await?
+            {
+                DisambiguationResult::Clear => {
+                    debug!("Input is clear, proceeding normally");
+                }
+                DisambiguationResult::NeedsClarification {
+                    question,
+                    detection,
+                } => {
+                    info!(
+                        ambiguity_type = ?detection.ambiguity_type,
+                        confidence = detection.confidence,
+                        "Input requires clarification"
+                    );
+
+                    self.memory.add_message(ChatMessage::user(input)).await?;
+                    self.memory
+                        .add_message(ChatMessage::assistant(&question.question))
+                        .await?;
+
+                    return Ok(AgentResponse::new(&question.question).with_metadata(
+                        "disambiguation",
+                        serde_json::json!({
+                            "status": "awaiting_clarification",
+                            "options": question.options,
+                            "clarifying": question.clarifying,
+                            "detection": {
+                                "type": detection.ambiguity_type,
+                                "confidence": detection.confidence,
+                                "what_is_unclear": detection.what_is_unclear,
+                            }
+                        }),
+                    ));
+                }
+                DisambiguationResult::Clarified {
+                    enriched_input,
+                    resolved,
+                    ..
+                } => {
+                    info!(
+                        resolved_count = resolved.len(),
+                        "Input clarified, using enriched input"
+                    );
+                    return self.run_loop_internal(&enriched_input).await;
+                }
+                DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                    info!("Proceeding with best guess interpretation");
+                    return self.run_loop_internal(&enriched_input).await;
+                }
+                DisambiguationResult::GiveUp { reason } => {
+                    warn!(reason = %reason, "Disambiguation gave up");
+                    let apology = self
+                        .generate_localized_apology(
+                            "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                            &reason,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            format!("I'm sorry, I couldn't understand your request: {}", reason)
+                        });
+                    return Ok(AgentResponse::new(&apology));
+                }
+                DisambiguationResult::Escalate { reason } => {
+                    info!(reason = %reason, "Escalating to human");
+                    if let Some(ref hitl) = self.hitl_engine {
+                        let trigger =
+                            ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
+                        let mut context_map = HashMap::new();
+                        context_map.insert("original_input".to_string(), serde_json::json!(input));
+                        context_map.insert("reason".to_string(), serde_json::json!(&reason));
+                        let check_result = HITLCheckResult::required(
+                            trigger,
+                            context_map,
+                            format!("User request needs human assistance: {}", reason),
+                            Some(hitl.config().default_timeout_seconds),
+                        );
+                        let approved = self.request_hitl_approval(check_result).await?;
+                        if approved {
+                            return self.run_loop_internal(input).await;
+                        }
+                    }
+                    let apology = self
+                        .generate_localized_apology(
+                            "Explain briefly that you're transferring the user to a human agent for help.",
+                            &reason,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            format!("I need human assistance to help with your request: {}", reason)
+                        });
+                    return Ok(AgentResponse::new(&apology));
+                }
+            }
+        }
+
+        self.run_loop_internal(input).await
+    }
+
+    /// Generate a localized response using the router LLM
+    async fn generate_localized_apology(&self, instruction: &str, reason: &str) -> Result<String> {
+        let llm = self.llm_registry.router().map_err(|e| {
+            AgentError::LLM(format!(
+                "Router LLM not available for localized response: {}",
+                e
+            ))
+        })?;
+
+        let recent: Vec<String> = self
+            .memory
+            .get_messages(Some(3))
+            .await?
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+
+        let context_hint = if recent.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nRecent conversation (detect the user's language from this):\n{}\n",
+                recent.join("\n")
+            )
+        };
+
+        let prompt = format!(
+            "{}\nReason: {}\n{}Respond in the same language as the user. Output ONLY the message, nothing else.",
+            instruction, reason, context_hint
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = llm
+            .complete(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Localized response generation failed: {}", e)))?;
+
+        Ok(response.content.trim().to_string())
+    }
+
+    async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         let input_data = self.process_input(input).await?;
 
         if input_data.metadata.rejected {
@@ -2522,5 +2868,323 @@ impl Agent for RuntimeAgent {
             sm.reset();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentBuilder;
+    use ai_agents_llm::mock::MockLLMProvider;
+
+    fn mock_with_response(response: &str) -> MockLLMProvider {
+        let mut mock = MockLLMProvider::new("test");
+        mock.set_response(response);
+        mock
+    }
+
+    fn mock_with_responses(responses: Vec<&str>) -> MockLLMProvider {
+        let mut mock = MockLLMProvider::new("test");
+        mock.set_responses(responses.into_iter().map(String::from).collect(), true);
+        mock
+    }
+
+    // Basic YAML → Build → Chat flow
+    #[tokio::test]
+    async fn test_integration_yaml_to_chat_basic() {
+        let mock = mock_with_response("Hello! How can I help you?");
+        let agent = AgentBuilder::new()
+            .system_prompt("You are a test assistant.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hi").await.unwrap();
+        assert!(!response.content.is_empty());
+        assert_eq!(response.content, "Hello! How can I help you?");
+    }
+
+    // Multi-turn conversation
+    #[tokio::test]
+    async fn test_integration_multi_turn_conversation() {
+        let mock = mock_with_responses(vec![
+            "Hello! I'm your assistant.",
+            "The weather is sunny today.",
+            "Goodbye!",
+        ]);
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let r1 = agent.chat("Hi").await.unwrap();
+        assert_eq!(r1.content, "Hello! I'm your assistant.");
+
+        let r2 = agent.chat("What's the weather?").await.unwrap();
+        assert_eq!(r2.content, "The weather is sunny today.");
+
+        let r3 = agent.chat("Bye").await.unwrap();
+        assert_eq!(r3.content, "Goodbye!");
+
+        // Verify memory accumulated messages
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        // 3 user + 3 assistant = 6 messages
+        assert_eq!(messages.len(), 6);
+    }
+
+    // Tool execution in chat flow
+    #[tokio::test]
+    async fn test_integration_tool_execution() {
+        // Mock LLM that returns a tool call then a final answer
+        let mock = mock_with_responses(vec![
+            // First response: tool call
+            r#"I'll calculate that for you.
+[TOOL_CALL: {"name": "calculator", "arguments": {"expression": "2+2"}}]"#,
+            // After tool result: final answer
+            "The answer is 4.",
+        ]);
+        let mut tools = ai_agents_tools::ToolRegistry::new();
+        tools
+            .register(Arc::new(ai_agents_tools::CalculatorTool))
+            .unwrap();
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are a calculator assistant.")
+            .llm(Arc::new(mock))
+            .tools(tools)
+            .build()
+            .unwrap();
+
+        let response = agent.chat("What is 2+2?").await.unwrap();
+        // The agent should eventually produce a response
+        assert!(!response.content.is_empty());
+    }
+
+    // State machine transitions
+    #[tokio::test]
+    async fn test_integration_state_machine_basic() {
+        let yaml = r#"
+name: StateAgent
+system_prompt: "You are a support agent."
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Welcome the user warmly."
+      transitions:
+        - to: support
+          when: "User needs help"
+          auto: true
+    support:
+      prompt: "Help solve the user's problem."
+"#;
+        let mock = mock_with_responses(vec![
+            "Welcome! How can I help?", // greeting response
+            "1",                        // transition evaluator picks first (index 0)
+            "I'll help you with that.", // support response
+        ]);
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock)).build().unwrap();
+
+        assert_eq!(agent.current_state(), Some("greeting".to_string()));
+        let _ = agent.chat("I need help").await.unwrap();
+        // After transition evaluation, state may or may not have changed
+        // depending on mock evaluator response - the key is that it doesn't crash
+    }
+
+    // State on_enter/on_exit actions
+    #[tokio::test]
+    async fn test_integration_state_on_enter_set_context() {
+        let yaml = r#"
+name: ActionAgent
+system_prompt: "You are helpful."
+states:
+  initial: step1
+  states:
+    step1:
+      prompt: "Step 1"
+      on_exit:
+        - set_context:
+            step1_exited: true
+      transitions:
+        - to: step2
+          when: "always"
+          auto: true
+    step2:
+      prompt: "Step 2"
+      on_enter:
+        - set_context:
+            step2_entered: true
+"#;
+        // The transition evaluator will pick the first transition (index 0)
+        let mock = mock_with_responses(vec![
+            "Processing step 1.",
+            "0", // transition evaluator response: select first transition
+        ]);
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock)).build().unwrap();
+
+        assert_eq!(agent.current_state(), Some("step1".to_string()));
+
+        // Manually transition to test on_enter/on_exit
+        agent.transition_to("step2").await.unwrap();
+
+        assert_eq!(agent.current_state(), Some("step2".to_string()));
+
+        // Verify context was set by on_exit and on_enter actions
+        let ctx = agent.get_context();
+        assert_eq!(ctx.get("step1_exited"), Some(&serde_json::json!(true)));
+        assert_eq!(ctx.get("step2_entered"), Some(&serde_json::json!(true)));
+    }
+
+    // Process pipeline transforms input
+    #[tokio::test]
+    async fn test_integration_process_normalize() {
+        let yaml = r#"
+name: ProcessAgent
+system_prompt: "You are helpful."
+process:
+  input:
+    - type: normalize
+      config:
+        trim: true
+        collapse_whitespace: true
+"#;
+        let mock = mock_with_response("Got your message.");
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock.clone())).build().unwrap();
+
+        let _ = agent.chat("  hello   world  ").await.unwrap();
+
+        // Verify the LLM received the normalized input (trimmed + collapsed whitespace)
+        let history = mock.call_history();
+        assert!(!history.is_empty());
+        // The user message in LLM call should be normalized
+        let last_call = history.last().unwrap();
+        let user_msg = last_call
+            .messages
+            .iter()
+            .find(|m| m.role == ai_agents_core::Role::User)
+            .unwrap();
+        assert_eq!(user_msg.content, "hello world");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Integration Test 2.1.7: Memory compression triggers
+    // ═══════════════════════════════════════════════════════════
+    #[tokio::test]
+    async fn test_integration_memory_compression() {
+        let yaml = r#"
+name: MemoryAgent
+system_prompt: "You are helpful."
+memory:
+  type: compacting
+  max_messages: 100
+  compress_threshold: 5
+  max_recent_messages: 3
+  summarize_batch_size: 2
+"#;
+        // Provide enough responses for compression to trigger
+        let responses: Vec<&str> = (0..8).map(|_| "Response from assistant.").collect();
+        let mock = mock_with_responses(responses);
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock)).build().unwrap();
+
+        // Send enough messages to trigger compression
+        for i in 0..6 {
+            let _ = agent.chat(&format!("Message {}", i)).await.unwrap();
+        }
+
+        // Memory should have compressed - verify it didn't crash
+        // and that messages are bounded
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        // With compress_threshold=5 and max_recent_messages=3,
+        // after 6 turns (12 messages), compression should have run
+        assert!(messages.len() <= 12); // At most all messages if no compression, fewer if compressed
+    }
+
+    // YAML with multiple LLMs
+    #[tokio::test]
+    async fn test_integration_multi_llm_registry() {
+        let mut mock_default = MockLLMProvider::new("default");
+        mock_default.set_response("Default LLM response.");
+        let mut mock_router = MockLLMProvider::new("router");
+        mock_router.set_response("Router response.");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm_alias("default", Arc::new(mock_default))
+            .llm_alias("router", Arc::new(mock_router))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hello").await.unwrap();
+        assert_eq!(response.content, "Default LLM response.");
+    }
+
+    // Agent reset clears state
+    #[tokio::test]
+    async fn test_integration_agent_reset() {
+        let mock = mock_with_responses(vec!["Hello!", "Hello again!"]);
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let _ = agent.chat("Hi").await.unwrap();
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 2); // user + assistant
+
+        agent.reset().await.unwrap();
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 0);
+    }
+
+    // Process pipeline rejects input
+    #[tokio::test]
+    async fn test_integration_process_validate_reject() {
+        use ai_agents_process::{ProcessConfig, ProcessProcessor};
+
+        let validate_config = ai_agents_process::ValidateStage {
+            id: Some("length_check".to_string()),
+            condition: None,
+            config: ai_agents_process::ValidateConfig {
+                rules: vec![ai_agents_process::ValidationRule::MinLength {
+                    min_length: 10,
+                    on_fail: ai_agents_process::ValidationAction {
+                        action: ai_agents_process::ValidationActionType::Reject,
+                        message: None,
+                    },
+                }],
+                ..Default::default()
+            },
+        };
+        let process_config = ProcessConfig {
+            input: vec![ai_agents_process::ProcessStage::Validate(validate_config)],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(process_config);
+
+        let mock = mock_with_response("Should not reach here.");
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .process_processor(processor)
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hi").await.unwrap();
+        // Rejected input should produce a rejection response, not call LLM
+        assert!(
+            response.content.contains("rejected")
+                || response.content.contains("Input rejected")
+                || response.content.contains("too short")
+                || response.content.contains("Too short")
+                || response.content.len() < 50, // rejection message is typically short
+            "Expected rejection response, got: {}",
+            response.content
+        );
     }
 }

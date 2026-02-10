@@ -34,6 +34,7 @@ Respond with a warm, friendly greeting. Be enthusiastic but not over the top."#
         }],
         reasoning: None,
         reflection: None,
+        disambiguation: None,
     };
 
     let calc_skill = SkillDefinition {
@@ -42,6 +43,7 @@ Respond with a warm, friendly greeting. Be enthusiastic but not over the top."#
         trigger: "When user asks to calculate something or needs math help".to_string(),
         reasoning: None,
         reflection: None,
+        disambiguation: None,
         steps: vec![
             // First: Extract the math expression from user input using LLM
             SkillStep::Prompt {

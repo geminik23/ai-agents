@@ -15,10 +15,19 @@ anyhow = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 parking_lot = { workspace = true }
+uuid = { workspace = true }
 
 [[example]]
 name = "simple_chat"
 path = "simple_chat.rs"
+
+[[example]]
+name = "memory_agent"
+path = "memory_agent.rs"
+
+[[example]]
+name = "hitl_agent"
+path = "hitl_agent.rs"
 
 [[example]]
 name = "state_machine_agent"
@@ -39,3 +48,19 @@ path = "skill_agent.rs"
 [[example]]
 name = "tool_agent_demo"
 path = "tool_agent_demo.rs"
+
+[[example]]
+name = "multilingual_tools"
+path = "multilingual_tools.rs"
+
+[[example]]
+name = "sqlite_persistence"
+path = "sqlite_persistence.rs"
+
+[[example]]
+name = "reasoning_agent"
+path = "reasoning_agent.rs"
+
+[[example]]
+name = "disambiguation_agent"
+path = "disambiguation_agent.rs"

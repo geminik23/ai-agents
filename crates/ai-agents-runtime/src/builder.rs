@@ -573,6 +573,13 @@ impl AgentBuilder {
             agent = agent.with_reflection(spec.reflection.clone());
         }
 
+        // Configure disambiguation from spec
+        if let Some(ref spec) = self.spec {
+            if spec.disambiguation.is_enabled() {
+                agent = agent.with_disambiguation(spec.disambiguation.clone());
+            }
+        }
+
         Ok(agent)
     }
 }
@@ -695,6 +702,7 @@ skills:
             }],
             reasoning: None,
             reflection: None,
+            disambiguation: None,
         };
 
         let builder = AgentBuilder::new().skill(skill.clone()).skills(vec![skill]);

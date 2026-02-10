@@ -167,6 +167,7 @@ mod tests {
                 }],
                 reasoning: None,
                 reflection: None,
+                disambiguation: None,
             },
             SkillDefinition {
                 id: "calculator".to_string(),
@@ -178,6 +179,7 @@ mod tests {
                     output_as: None,
                 }],
                 reasoning: None,
+                disambiguation: None,
                 reflection: None,
             },
         ]
