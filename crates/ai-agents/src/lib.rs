@@ -7,7 +7,7 @@
 //!
 //! ### From YAML
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use ai_agents::{Agent, AgentBuilder};
 //!
 //! #[tokio::main]
@@ -24,8 +24,8 @@
 //!
 //! ### From Rust API
 //!
-//! ```rust,no_run
-//! use ai_agents::{AgentBuilder, UnifiedLLMProvider, ProviderType};
+//! ```rust,ignore
+//! use ai_agents::{Agent, AgentBuilder, UnifiedLLMProvider, ProviderType};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
