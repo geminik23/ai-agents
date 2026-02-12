@@ -1,0 +1,49 @@
+[package]
+name = "ai-agents-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Runtime agent and builder for AI Agents framework"
+keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
+categories = ["asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+ai-agents-llm = { workspace = true }
+ai-agents-memory = { workspace = true }
+ai-agents-storage = { workspace = true }
+ai-agents-tools = { workspace = true }
+ai-agents-state = { workspace = true }
+ai-agents-context = { workspace = true }
+ai-agents-process = { workspace = true }
+ai-agents-skills = { workspace = true }
+ai-agents-hitl = { workspace = true }
+ai-agents-hooks = { workspace = true }
+ai-agents-recovery = { workspace = true }
+ai-agents-reasoning = { workspace = true }
+ai-agents-disambiguation = { workspace = true }
+ai-agents-template = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+schemars = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+async-stream = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+parking_lot = { workspace = true }
+
+[features]
+default = []
+sqlite = ["ai-agents-storage/sqlite"]
+redis-storage = ["ai-agents-storage/redis-storage"]
+http-tool = ["ai-agents-tools/http-tool"]
+http-context = ["ai-agents-context/http-context"]
+full-storage = ["sqlite", "redis-storage"]
+full = ["full-storage", "http-tool", "http-context"]

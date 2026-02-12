@@ -1,0 +1,31 @@
+[package]
+name = "ai-agents-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dynamic context management for AI Agents framework"
+keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
+categories = ["asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+minijinja = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+reqwest = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
+
+[features]
+default = []
+http-context = ["reqwest"]

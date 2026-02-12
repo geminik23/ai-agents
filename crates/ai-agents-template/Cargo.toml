@@ -1,0 +1,22 @@
+[package]
+name = "ai-agents-template"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Template loading and rendering for AI Agents framework"
+keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
+categories = ["asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+minijinja = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

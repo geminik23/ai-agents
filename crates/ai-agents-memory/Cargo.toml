@@ -1,0 +1,25 @@
+[package]
+name = "ai-agents-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Memory implementations for AI Agents framework"
+keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
+categories = ["asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+ai-agents-llm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+serde_yaml = { workspace = true }
+futures = { workspace = true }

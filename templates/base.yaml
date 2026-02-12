@@ -1,0 +1,43 @@
+# Base Agent Template
+#
+# This is the minimal base template that all other templates can extend.
+# It provides the essential structure for an AI agent specification.
+#
+# Variables:
+#   - agent_name: Name of the agent (required)
+#   - agent_version: Version string (default: "1.0.0")
+#   - agent_description: Description of the agent (optional)
+#   - system_prompt: The system prompt for the agent (required)
+#   - llm_provider: LLM provider to use (default: "openai")
+#   - llm_model: LLM model to use (default: "gpt-4.1-nano")
+#   - temperature: Temperature for generation (default: 0.7)
+#   - max_tokens: Maximum tokens to generate (default: 2000)
+#   - max_iterations: Maximum number of reasoning iterations (default: 10)
+#   - memory_type: Type of memory backend (default: "in-memory")
+#   - max_messages: Maximum messages in memory (default: 100)
+
+name: "{{ agent_name }}"
+version: "{{ agent_version | default('1.0.0') }}"
+description: "{{ agent_description | default('') }}"
+
+system_prompt: "{{ system_prompt | default(' ') }}"
+
+llm:
+  provider: "{{ llm_provider | default('openai') }}"
+  model: "{{ llm_model | default('gpt-4.1-nano') }}"
+  temperature: {{ temperature | default(0.7) }}
+  max_tokens: {{ max_tokens | default(2000) }}
+
+max_iterations: {{ max_iterations | default(10) }}
+
+memory:
+  type: "{{ memory_type | default('in-memory') }}"
+  max_messages: {{ max_messages | default(100) }}
+
+tools: []
+
+skills: []
+
+metadata:
+  template: base
+  created_with: ai-agents-framework

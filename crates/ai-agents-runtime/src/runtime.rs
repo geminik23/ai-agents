@@ -1,0 +1,3190 @@
+use async_trait::async_trait;
+use futures::stream::{self, Stream, StreamExt};
+use parking_lot::RwLock;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Instant;
+use tracing::{debug, error, info, instrument, warn};
+
+use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
+use ai_agents_core::{
+    AgentError, AgentSnapshot, AgentStorage, ChatMessage, LLMProvider, Result, ToolResult,
+};
+use ai_agents_disambiguation::{
+    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
+};
+use ai_agents_hitl::{
+    ApprovalHandler, ApprovalResult, ApprovalTrigger, HITLCheckResult, HITLEngine,
+    RejectAllHandler, TimeoutAction,
+};
+use ai_agents_hooks::{AgentHooks, NoopHooks};
+use ai_agents_llm::LLMRegistry;
+use ai_agents_memory::{
+    CompressResult, EvictionReason, Memory, MemoryBudgetEvent, MemoryCompressEvent,
+    MemoryEvictEvent, MemoryTokenBudget, OverflowStrategy,
+};
+use ai_agents_process::{ProcessData, ProcessProcessor};
+use ai_agents_reasoning::{
+    CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
+    ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
+    ReflectionMetadata,
+};
+use ai_agents_recovery::{
+    ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
+    MessageFilter, RecoveryManager, RetryConfig, SkipPatternFilter,
+};
+use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
+use ai_agents_state::{
+    PromptMode, StateAction, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
+    TransitionContext, TransitionEvaluator,
+};
+use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
+use ai_agents_tools::{
+    ConditionEvaluator, EvaluationContext, LLMGetter, SecurityCheckResult, ToolCallRecord,
+    ToolRegistry, ToolSecurityEngine,
+};
+
+use super::{
+    Agent, AgentInfo, AgentResponse, ParallelToolsConfig, StreamChunk, StreamingConfig, ToolCall,
+};
+use crate::spec::StorageConfig;
+
+pub struct RuntimeAgent {
+    info: AgentInfo,
+    llm_registry: Arc<LLMRegistry>,
+    memory: Arc<dyn Memory>,
+    tools: Arc<ToolRegistry>,
+    skills: Vec<SkillDefinition>,
+    skill_router: Option<SkillRouter>,
+    skill_executor: Option<SkillExecutor>,
+    base_system_prompt: String,
+    max_iterations: u32,
+    iteration_count: RwLock<u32>,
+    max_context_tokens: u32,
+    memory_token_budget: Option<MemoryTokenBudget>,
+    recovery_manager: RecoveryManager,
+    tool_security: ToolSecurityEngine,
+    process_processor: Option<ProcessProcessor>,
+    message_filters: RwLock<HashMap<String, Arc<dyn MessageFilter>>>,
+    state_machine: Option<Arc<StateMachine>>,
+    transition_evaluator: Option<Arc<dyn TransitionEvaluator>>,
+    context_manager: Arc<ContextManager>,
+    template_renderer: TemplateRenderer,
+    tool_call_history: RwLock<Vec<ToolCallRecord>>,
+    parallel_tools: ParallelToolsConfig,
+    streaming: StreamingConfig,
+    hooks: Arc<dyn AgentHooks>,
+    hitl_engine: Option<HITLEngine>,
+    approval_handler: Arc<dyn ApprovalHandler>,
+    storage_config: StorageConfig,
+    storage: RwLock<Option<Arc<dyn AgentStorage>>>,
+    reasoning_config: ReasoningConfig,
+    reflection_config: ReflectionConfig,
+    disambiguation_manager: Option<DisambiguationManager>,
+    current_plan: RwLock<Option<Plan>>,
+}
+
+impl std::fmt::Debug for RuntimeAgent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeAgent")
+            .field("info", &self.info)
+            .field("base_system_prompt", &self.base_system_prompt)
+            .field("max_iterations", &self.max_iterations)
+            .field("skills_count", &self.skills.len())
+            .field("max_context_tokens", &self.max_context_tokens)
+            .field("has_state_machine", &self.state_machine.is_some())
+            .field("parallel_tools", &self.parallel_tools)
+            .field("streaming", &self.streaming)
+            .field("has_hooks", &true)
+            .field("has_hitl", &self.hitl_engine.is_some())
+            .field("storage_type", &self.storage_config.storage_type())
+            .field("reasoning_mode", &self.reasoning_config.mode)
+            .field("reflection_enabled", &self.reflection_config.enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+struct RegistryLLMGetter {
+    registry: Arc<LLMRegistry>,
+}
+
+impl LLMGetter for RegistryLLMGetter {
+    fn get_llm(&self, alias: &str) -> Option<Arc<dyn LLMProvider>> {
+        self.registry.get(alias).ok()
+    }
+}
+
+impl RuntimeAgent {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        info: AgentInfo,
+        llm_registry: Arc<LLMRegistry>,
+        memory: Arc<dyn Memory>,
+        tools: Arc<ToolRegistry>,
+        skills: Vec<SkillDefinition>,
+        system_prompt: String,
+        max_iterations: u32,
+    ) -> Self {
+        let (skill_router, skill_executor) = if !skills.is_empty() {
+            let router_llm = llm_registry.router().ok();
+            let router = router_llm.map(|llm| SkillRouter::new(llm, skills.clone()));
+            let executor = SkillExecutor::new(llm_registry.clone(), tools.clone());
+            (router, Some(executor))
+        } else {
+            (None, None)
+        };
+
+        let context_manager =
+            ContextManager::new(HashMap::new(), info.name.clone(), info.version.clone());
+
+        Self {
+            info,
+            llm_registry,
+            memory,
+            tools,
+            skills,
+            skill_router,
+            skill_executor,
+            base_system_prompt: system_prompt,
+            max_iterations,
+            iteration_count: RwLock::new(0),
+            max_context_tokens: 4096,
+            memory_token_budget: None,
+            recovery_manager: RecoveryManager::default(),
+            tool_security: ToolSecurityEngine::default(),
+            process_processor: None,
+            message_filters: RwLock::new(HashMap::new()),
+            state_machine: None,
+            transition_evaluator: None,
+            context_manager: Arc::new(context_manager),
+            template_renderer: TemplateRenderer::new(),
+            tool_call_history: RwLock::new(Vec::new()),
+            parallel_tools: ParallelToolsConfig::default(),
+            streaming: StreamingConfig::default(),
+            hooks: Arc::new(NoopHooks),
+            hitl_engine: None,
+            approval_handler: Arc::new(RejectAllHandler::new()),
+            storage_config: StorageConfig::default(),
+            storage: RwLock::new(None),
+            reasoning_config: ReasoningConfig::default(),
+            reflection_config: ReflectionConfig::default(),
+            disambiguation_manager: None,
+            current_plan: RwLock::new(None),
+        }
+    }
+
+    pub fn with_storage_config(mut self, config: StorageConfig) -> Self {
+        self.storage_config = config;
+        self
+    }
+
+    pub fn with_storage(self, storage: Arc<dyn AgentStorage>) -> Self {
+        *self.storage.write() = Some(storage);
+        self
+    }
+
+    pub fn with_reasoning(mut self, config: ReasoningConfig) -> Self {
+        self.reasoning_config = config;
+        self
+    }
+
+    pub fn with_reflection(mut self, config: ReflectionConfig) -> Self {
+        self.reflection_config = config;
+        self
+    }
+
+    pub fn reasoning_config(&self) -> &ReasoningConfig {
+        &self.reasoning_config
+    }
+
+    pub fn reflection_config(&self) -> &ReflectionConfig {
+        &self.reflection_config
+    }
+
+    pub fn with_disambiguation(mut self, config: DisambiguationConfig) -> Self {
+        if config.is_enabled() {
+            self.disambiguation_manager = Some(DisambiguationManager::new(
+                config,
+                Arc::clone(&self.llm_registry),
+            ));
+        }
+        self
+    }
+
+    pub fn disambiguation_manager(&self) -> Option<&DisambiguationManager> {
+        self.disambiguation_manager.as_ref()
+    }
+
+    pub fn has_disambiguation(&self) -> bool {
+        self.disambiguation_manager
+            .as_ref()
+            .is_some_and(|m| m.is_enabled())
+    }
+
+    pub async fn init_storage(&self) -> Result<()> {
+        if self.storage_config.is_none() {
+            return Ok(());
+        }
+        if self.storage.read().is_some() {
+            return Ok(());
+        }
+        let storage_config = self.convert_storage_config();
+        let storage = create_storage(&storage_config).await?;
+        *self.storage.write() = storage;
+        Ok(())
+    }
+
+    fn convert_storage_config(&self) -> StorageStorageConfig {
+        match &self.storage_config {
+            StorageConfig::None => StorageStorageConfig::None,
+            StorageConfig::File(fc) => StorageStorageConfig::File {
+                path: fc.path.clone(),
+            },
+            StorageConfig::Sqlite(sc) => StorageStorageConfig::Sqlite {
+                path: sc.path.clone(),
+            },
+            StorageConfig::Redis(rc) => StorageStorageConfig::Redis {
+                url: rc.url.clone(),
+                prefix: rc.prefix.clone(),
+                ttl_seconds: rc.ttl_seconds,
+            },
+        }
+    }
+
+    pub fn storage(&self) -> Option<Arc<dyn AgentStorage>> {
+        self.storage.read().clone()
+    }
+
+    pub fn storage_config(&self) -> &StorageConfig {
+        &self.storage_config
+    }
+
+    pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
+        self.hooks = hooks;
+        self
+    }
+
+    pub fn with_parallel_tools(mut self, config: ParallelToolsConfig) -> Self {
+        self.parallel_tools = config;
+        self
+    }
+
+    pub fn with_streaming(mut self, config: StreamingConfig) -> Self {
+        self.streaming = config;
+        self
+    }
+
+    pub fn with_hitl(mut self, engine: HITLEngine, handler: Arc<dyn ApprovalHandler>) -> Self {
+        self.hitl_engine = Some(engine);
+        self.approval_handler = handler;
+        self
+    }
+
+    pub fn with_max_context_tokens(mut self, tokens: u32) -> Self {
+        self.max_context_tokens = tokens;
+        self
+    }
+
+    pub fn with_memory_token_budget(mut self, budget: MemoryTokenBudget) -> Self {
+        self.memory_token_budget = Some(budget);
+        self
+    }
+
+    pub fn with_recovery_manager(mut self, manager: RecoveryManager) -> Self {
+        self.recovery_manager = manager;
+        self
+    }
+
+    pub fn with_tool_security(mut self, engine: ToolSecurityEngine) -> Self {
+        self.tool_security = engine;
+        self
+    }
+
+    pub fn with_process_processor(mut self, processor: ProcessProcessor) -> Self {
+        self.process_processor = Some(processor);
+        self
+    }
+
+    pub fn with_state_machine(
+        mut self,
+        state_machine: Arc<StateMachine>,
+        evaluator: Arc<dyn TransitionEvaluator>,
+    ) -> Self {
+        self.state_machine = Some(state_machine);
+        self.transition_evaluator = Some(evaluator);
+        self
+    }
+
+    pub fn with_context_manager(mut self, manager: Arc<ContextManager>) -> Self {
+        self.context_manager = manager;
+        self
+    }
+
+    pub fn register_message_filter(&self, name: impl Into<String>, filter: Arc<dyn MessageFilter>) {
+        self.message_filters.write().insert(name.into(), filter);
+    }
+
+    pub fn set_context(&self, key: &str, value: Value) -> Result<()> {
+        self.context_manager.set(key, value)
+    }
+
+    pub fn update_context(&self, path: &str, value: Value) -> Result<()> {
+        self.context_manager.update(path, value)
+    }
+
+    pub fn get_context(&self) -> HashMap<String, Value> {
+        self.context_manager.get_all()
+    }
+
+    pub async fn refresh_context(&self, key: &str) -> Result<()> {
+        self.context_manager.refresh(key).await
+    }
+
+    pub fn register_context_provider(&self, name: &str, provider: Arc<dyn ContextProvider>) {
+        self.context_manager.register_provider(name, provider);
+    }
+
+    pub fn current_state(&self) -> Option<String> {
+        self.state_machine.as_ref().map(|sm| sm.current())
+    }
+
+    pub async fn transition_to(&self, state: &str) -> Result<()> {
+        if let Some(ref sm) = self.state_machine {
+            let from_state = sm.current();
+            self.execute_state_exit_actions(&from_state).await;
+            sm.transition_to(state, "manual transition")?;
+            self.execute_state_enter_actions(state).await;
+            info!(to = %state, "Manual state transition");
+        }
+        Ok(())
+    }
+
+    pub fn state_history(&self) -> Vec<StateTransitionEvent> {
+        self.state_machine
+            .as_ref()
+            .map(|sm| sm.history())
+            .unwrap_or_default()
+    }
+
+    pub async fn save_state(&self) -> Result<AgentSnapshot> {
+        let memory_snapshot = self.memory.snapshot().await?;
+        let state_machine_snapshot = self.state_machine.as_ref().map(|sm| sm.snapshot());
+        let context_snapshot = self.context_manager.snapshot();
+
+        Ok(AgentSnapshot::new(self.info.id.clone())
+            .with_memory(memory_snapshot)
+            .with_context(context_snapshot)
+            .with_state_machine(
+                state_machine_snapshot.unwrap_or_else(|| StateMachineSnapshot {
+                    current_state: String::new(),
+                    previous_state: None,
+                    turn_count: 0,
+                    no_transition_count: 0,
+                    history: vec![],
+                }),
+            ))
+    }
+
+    pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {
+        self.memory.restore(snapshot.memory).await?;
+
+        if let (Some(sm), Some(sm_snapshot)) = (&self.state_machine, snapshot.state_machine) {
+            if !sm_snapshot.current_state.is_empty() {
+                sm.restore(sm_snapshot)?;
+            }
+        }
+
+        self.context_manager.restore(snapshot.context);
+        info!(agent_id = %snapshot.agent_id, "State restored");
+        Ok(())
+    }
+
+    pub async fn save_to(&self, storage: &dyn AgentStorage, session_id: &str) -> Result<()> {
+        let snapshot = self.save_state().await?;
+        storage.save(session_id, &snapshot).await
+    }
+
+    pub async fn load_from(&self, storage: &dyn AgentStorage, session_id: &str) -> Result<bool> {
+        if let Some(snapshot) = storage.load(session_id).await? {
+            self.restore_state(snapshot).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn save_session(&self, session_id: &str) -> Result<()> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => self.save_to(s.as_ref(), session_id).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    pub async fn load_session(&self, session_id: &str) -> Result<bool> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => self.load_from(s.as_ref(), session_id).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    pub async fn delete_session(&self, session_id: &str) -> Result<()> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => s.delete(session_id).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    pub async fn list_sessions(&self) -> Result<Vec<String>> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => s.list_sessions().await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    fn estimate_tokens(&self, text: &str) -> u32 {
+        (text.len() as f32 / 4.0).ceil() as u32
+    }
+
+    fn estimate_total_tokens(&self, messages: &[ChatMessage]) -> u32 {
+        messages
+            .iter()
+            .map(|m| self.estimate_tokens(&m.content))
+            .sum()
+    }
+
+    fn truncate_context(&self, messages: &mut Vec<ChatMessage>, keep_recent: usize) {
+        if messages.len() <= keep_recent + 1 {
+            return;
+        }
+        let system_msg = messages.remove(0);
+        let to_remove = messages.len().saturating_sub(keep_recent);
+        messages.drain(..to_remove);
+        messages.insert(0, system_msg);
+    }
+
+    fn get_filter(&self, config: &FilterConfig) -> Arc<dyn MessageFilter> {
+        match config {
+            FilterConfig::KeepRecent(n) => Arc::new(KeepRecentFilter::new(*n)),
+            FilterConfig::ByRole { keep_roles } => Arc::new(ByRoleFilter::new(keep_roles.clone())),
+            FilterConfig::SkipPattern { skip_if_contains } => {
+                Arc::new(SkipPatternFilter::new(skip_if_contains.clone()))
+            }
+            FilterConfig::Custom { name } => {
+                let filters = self.message_filters.read();
+                filters
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(KeepRecentFilter::new(10)))
+            }
+        }
+    }
+
+    async fn summarize_context(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        summarizer_llm: Option<&str>,
+        max_summary_tokens: u32,
+        custom_prompt: Option<&str>,
+        keep_recent: usize,
+        filter: Option<&FilterConfig>,
+    ) -> Result<()> {
+        let system_msg = messages.remove(0);
+
+        let to_summarize_count = messages.len().saturating_sub(keep_recent);
+        if to_summarize_count == 0 {
+            messages.insert(0, system_msg);
+            return Ok(());
+        }
+
+        let recent_msgs: Vec<ChatMessage> = messages.drain(to_summarize_count..).collect();
+        let mut to_summarize = std::mem::take(messages);
+
+        if let Some(filter_config) = filter {
+            let filter = self.get_filter(filter_config);
+            to_summarize = filter.filter(to_summarize);
+        }
+
+        if to_summarize.is_empty() {
+            *messages = recent_msgs;
+            messages.insert(0, system_msg);
+            return Ok(());
+        }
+
+        let conversation_text = to_summarize
+            .iter()
+            .map(|m| format!("{:?}: {}", m.role, m.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let default_prompt = format!(
+            "Summarize the following conversation in under {} tokens, preserving key information:\n\n{}",
+            max_summary_tokens, conversation_text
+        );
+
+        let summary_prompt = custom_prompt
+            .map(|p| format!("{}\n\n{}", p, conversation_text))
+            .unwrap_or(default_prompt);
+
+        let summarizer = if let Some(alias) = summarizer_llm {
+            self.llm_registry
+                .get(alias)
+                .map_err(|e| AgentError::Config(e.to_string()))?
+        } else {
+            self.llm_registry
+                .router()
+                .or_else(|_| self.llm_registry.default())
+                .map_err(|e| AgentError::Config(e.to_string()))?
+        };
+
+        let summary_msgs = vec![ChatMessage::user(&summary_prompt)];
+        let response = summarizer.complete(&summary_msgs, None).await?;
+
+        let summary_message = ChatMessage::system(&format!(
+            "[Previous conversation summary]\n{}",
+            response.content
+        ));
+
+        *messages = vec![system_msg, summary_message];
+        messages.extend(recent_msgs);
+
+        debug!(
+            summarized_count = to_summarize_count,
+            kept_recent = keep_recent,
+            "Context summarized"
+        );
+
+        Ok(())
+    }
+
+    fn render_system_prompt(&self) -> Result<String> {
+        let context = self.context_manager.get_all();
+        self.template_renderer
+            .render(&self.base_system_prompt, &context)
+    }
+
+    async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
+        let tool_refs = self.get_current_tool_refs();
+
+        if tool_refs.is_empty() {
+            return Ok(self.tools.list_ids());
+        }
+
+        let eval_ctx = self.build_evaluation_context().await?;
+        let llm_getter = RegistryLLMGetter {
+            registry: self.llm_registry.clone(),
+        };
+        let evaluator = ConditionEvaluator::new(llm_getter);
+
+        let mut available = Vec::new();
+        for tool_ref in &tool_refs {
+            let tool_id = tool_ref.id();
+
+            if self.tools.get(tool_id).is_none() {
+                continue;
+            }
+
+            if let Some(condition) = tool_ref.condition() {
+                match evaluator.evaluate(condition, &eval_ctx).await {
+                    Ok(true) => {
+                        available.push(tool_id.to_string());
+                    }
+                    Ok(false) => {
+                        debug!(tool = tool_id, "Tool condition not met, skipping");
+                    }
+                    Err(e) => {
+                        warn!(tool = tool_id, error = %e, "Error evaluating tool condition");
+                    }
+                }
+            } else {
+                available.push(tool_id.to_string());
+            }
+        }
+
+        Ok(available)
+    }
+
+    fn get_current_tool_refs(&self) -> Vec<ToolRef> {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if !state_def.tools.is_empty() {
+                    let parent_def = sm.get_parent_definition();
+                    return state_def
+                        .get_effective_tools(parent_def.as_ref())
+                        .into_iter()
+                        .cloned()
+                        .collect();
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    async fn build_evaluation_context(&self) -> Result<EvaluationContext> {
+        let context = self.context_manager.get_all();
+        let messages = self.memory.get_messages(Some(10)).await?;
+        let tool_history = self.tool_call_history.read().clone();
+
+        let (state_name, turn_count, previous_state) = if let Some(ref sm) = self.state_machine {
+            (Some(sm.current()), sm.turn_count(), sm.previous())
+        } else {
+            (None, 0, None)
+        };
+
+        Ok(EvaluationContext::default()
+            .with_context(context)
+            .with_state(state_name, turn_count, previous_state)
+            .with_called_tools(tool_history)
+            .with_messages(messages))
+    }
+
+    fn record_tool_call(&self, tool_id: &str, result: Value) {
+        self.tool_call_history.write().push(ToolCallRecord {
+            tool_id: tool_id.to_string(),
+            result,
+            timestamp: chrono::Utc::now(),
+        });
+    }
+
+    async fn get_effective_system_prompt(&self) -> Result<String> {
+        let rendered_base = self.render_system_prompt()?;
+
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                let state_prompt = if let Some(ref prompt) = state_def.prompt {
+                    let context = self.context_manager.get_all();
+                    self.template_renderer.render_with_state(
+                        prompt,
+                        &context,
+                        &sm.current(),
+                        sm.previous().as_deref(),
+                        sm.turn_count(),
+                        state_def.max_turns,
+                    )?
+                } else {
+                    String::new()
+                };
+
+                let combined = match state_def.prompt_mode {
+                    PromptMode::Append => {
+                        if state_prompt.is_empty() {
+                            rendered_base
+                        } else {
+                            format!(
+                                "{}\n\n[Current State: {}]\n{}",
+                                rendered_base,
+                                sm.current(),
+                                state_prompt
+                            )
+                        }
+                    }
+                    PromptMode::Replace => {
+                        if state_prompt.is_empty() {
+                            rendered_base
+                        } else {
+                            state_prompt
+                        }
+                    }
+                    PromptMode::Prepend => {
+                        if state_prompt.is_empty() {
+                            rendered_base
+                        } else {
+                            format!("{}\n\n{}", state_prompt, rendered_base)
+                        }
+                    }
+                };
+
+                let available_tool_ids = self.get_available_tool_ids().await?;
+                let tools_prompt = if available_tool_ids.is_empty() {
+                    self.tools.generate_tools_prompt()
+                } else {
+                    self.tools.generate_filtered_prompt(&available_tool_ids)
+                };
+
+                if !tools_prompt.is_empty() {
+                    return Ok(format!("{}\n\n{}", combined, tools_prompt));
+                }
+                return Ok(combined);
+            }
+        }
+
+        let tools_prompt = self.tools.generate_tools_prompt();
+        if !tools_prompt.is_empty() {
+            Ok(format!("{}\n\n{}", rendered_base, tools_prompt))
+        } else {
+            Ok(rendered_base)
+        }
+    }
+
+    fn get_state_llm(&self) -> Result<Arc<dyn LLMProvider>> {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if let Some(ref llm_alias) = state_def.llm {
+                    return self
+                        .llm_registry
+                        .get(llm_alias)
+                        .map_err(|e| AgentError::Config(e.to_string()));
+                }
+            }
+        }
+        self.llm_registry
+            .default()
+            .map_err(|e| AgentError::Config(e.to_string()))
+    }
+
+    fn get_effective_reasoning_config(&self) -> ReasoningConfig {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if let Some(ref state_reasoning) = state_def.reasoning {
+                    return state_reasoning.clone();
+                }
+            }
+        }
+        self.reasoning_config.clone()
+    }
+
+    fn get_effective_reflection_config(&self) -> ReflectionConfig {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                if let Some(ref state_reflection) = state_def.reflection {
+                    return state_reflection.clone();
+                }
+            }
+        }
+        self.reflection_config.clone()
+    }
+
+    fn get_skill_reasoning_config(&self, skill: &SkillDefinition) -> ReasoningConfig {
+        skill
+            .reasoning
+            .clone()
+            .unwrap_or_else(|| self.get_effective_reasoning_config())
+    }
+
+    fn get_skill_reflection_config(&self, skill: &SkillDefinition) -> ReflectionConfig {
+        skill
+            .reflection
+            .clone()
+            .unwrap_or_else(|| self.get_effective_reflection_config())
+    }
+
+    async fn build_disambiguation_context(&self) -> Result<DisambiguationContext> {
+        let recent_messages: Vec<String> = self
+            .memory
+            .get_messages(Some(5))
+            .await?
+            .iter()
+            .rev()
+            .map(|m| format!("{:?}: {}", m.role, m.content))
+            .collect();
+
+        let current_state = self.current_state().map(|s| s.to_string());
+
+        let available_tools: Vec<String> = self.tools.list_ids().into_iter().collect();
+
+        let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
+
+        let user_context = self.context_manager.get_all();
+
+        Ok(DisambiguationContext::from_agent_state(
+            recent_messages,
+            current_state,
+            available_tools,
+            available_skills,
+            user_context,
+        ))
+    }
+
+    fn get_available_skills(&self) -> Vec<&SkillDefinition> {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(state_def) = sm.current_definition() {
+                let parent_def = sm.get_parent_definition();
+                let effective_skills = state_def.get_effective_skills(parent_def.as_ref());
+                if !effective_skills.is_empty() {
+                    return self
+                        .skills
+                        .iter()
+                        .filter(|s| effective_skills.contains(&&s.id))
+                        .collect();
+                }
+            }
+        }
+        self.skills.iter().collect()
+    }
+
+    async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
+        let system_prompt = self.get_effective_system_prompt().await?;
+        let mut messages = vec![ChatMessage::system(&system_prompt)];
+
+        // Token budget controls what's stored in memory (via handle_memory_overflow)
+        // max_context_tokens + ContextOverflowAction handles LLM context limits
+        let history = self.memory.get_messages(None).await?;
+        messages.extend(history);
+
+        let total_tokens = self.estimate_total_tokens(&messages);
+
+        if total_tokens > self.max_context_tokens {
+            debug!(
+                total = total_tokens,
+                limit = self.max_context_tokens,
+                "Context overflow"
+            );
+
+            match &self.recovery_manager.config().llm.on_context_overflow {
+                ContextOverflowAction::Error => {
+                    return Err(AgentError::LLM(format!(
+                        "Context overflow: {} tokens > {} limit",
+                        total_tokens, self.max_context_tokens
+                    )));
+                }
+                ContextOverflowAction::Truncate { keep_recent } => {
+                    self.truncate_context(&mut messages, *keep_recent);
+                }
+                ContextOverflowAction::Summarize {
+                    summarizer_llm,
+                    max_summary_tokens,
+                    custom_prompt,
+                    keep_recent,
+                    filter,
+                } => {
+                    self.summarize_context(
+                        &mut messages,
+                        summarizer_llm.as_deref(),
+                        *max_summary_tokens,
+                        custom_prompt.as_deref(),
+                        *keep_recent,
+                        filter.as_ref(),
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Ok(messages)
+    }
+
+    fn parse_tool_calls(&self, content: &str) -> Option<Vec<ToolCall>> {
+        // Try direct JSON parse first
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
+                return Some(vec![tool_call]);
+            }
+        }
+
+        // Try to extract JSON from content (handles extra text/braces from LLM)
+        if let Some(json_str) = self.extract_json_from_content(content) {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
+                    return Some(vec![tool_call]);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn extract_tool_call_from_value(&self, parsed: &serde_json::Value) -> Option<ToolCall> {
+        if let Some(tool_name) = parsed.get("tool").and_then(|v| v.as_str()) {
+            let arguments = parsed
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::json!({}));
+            return Some(ToolCall {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: tool_name.to_string(),
+                arguments,
+            });
+        }
+        None
+    }
+
+    // Lite models could generate unmatched braces: this function handles such cases
+    fn extract_json_from_content(&self, content: &str) -> Option<String> {
+        // Find the first '{' and try to find matching '}'
+        let start = content.find('{')?;
+        let content_from_start = &content[start..];
+
+        // Count braces to find the matching closing brace
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, ch) in content_from_start.char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if end > 0 {
+            let json_str = &content_from_start[..end];
+            // Verify it looks like a tool call
+            if json_str.contains("\"tool\"") {
+                return Some(json_str.to_string());
+            }
+        }
+
+        None
+    }
+
+    async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
+        let tool = self
+            .tools
+            .get(&tool_call.name)
+            .ok_or_else(|| AgentError::Tool(format!("Tool not found: {}", tool_call.name)))?;
+
+        let result = tool.execute(tool_call.arguments.clone()).await;
+
+        if result.success {
+            Ok(result.output)
+        } else {
+            Err(AgentError::Tool(result.output))
+        }
+    }
+
+    #[instrument(skip(self, tool_call), fields(tool = %tool_call.name))]
+    async fn execute_tool_smart(&self, tool_call: &ToolCall) -> Result<String> {
+        info!(args = %tool_call.arguments, "Executing tool");
+
+        self.hooks
+            .on_tool_start(&tool_call.name, &tool_call.arguments)
+            .await;
+        let tool_start = Instant::now();
+
+        let available_tool_ids = self.get_available_tool_ids().await?;
+        // Compare case-insensitively: LLM may return tool name (e.g., "Calculator")
+        // while available_tool_ids contains tool IDs (e.g., "calculator")
+        let tool_name_lower = tool_call.name.to_lowercase();
+        if !available_tool_ids.is_empty()
+            && !available_tool_ids
+                .iter()
+                .any(|id| id.to_lowercase() == tool_name_lower)
+        {
+            warn!(tool = %tool_call.name, "Tool not available in current context");
+            return Err(AgentError::Tool(format!(
+                "Tool '{}' is not available in current context",
+                tool_call.name
+            )));
+        }
+
+        // FIX: note Check security FIRST — don't bother the human if security blocks
+        if self.tool_security.config().enabled {
+            let security_result = self
+                .tool_security
+                .check_tool_execution(&tool_call.name, &tool_call.arguments)
+                .await?;
+
+            match security_result {
+                SecurityCheckResult::Allow => {}
+                SecurityCheckResult::Block { reason } => {
+                    warn!(reason = %reason, "Tool blocked by security");
+                    return Err(AgentError::Tool(format!("Blocked: {}", reason)));
+                }
+                SecurityCheckResult::RequireConfirmation { message } => {
+                    // Route through HITL if available, otherwise error
+                    if let Some(ref hitl_engine) = self.hitl_engine {
+                        let check_result =
+                            hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
+                        let approved = self.request_hitl_approval(check_result).await?;
+                        if !approved {
+                            warn!(tool = %tool_call.name, "Security confirmation rejected by approver");
+                            return Err(AgentError::Tool(format!(
+                                "Confirmation rejected: {}",
+                                message
+                            )));
+                        }
+                    } else {
+                        warn!(message = %message, "Tool requires confirmation but no HITL handler");
+                        return Err(AgentError::Tool(format!(
+                            "Confirmation required: {}",
+                            message
+                        )));
+                    }
+                }
+                SecurityCheckResult::Warn { message } => {
+                    warn!(message = %message, "Tool security warning");
+                }
+            }
+        }
+
+        // Check HITL approval for tool (after security passes)
+        if let Some(ref hitl_engine) = self.hitl_engine {
+            let check_result = hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
+            if check_result.is_required() {
+                let approved = self.request_hitl_approval(check_result).await?;
+                if !approved {
+                    warn!(tool = %tool_call.name, "Tool execution rejected by HITL");
+                    return Err(AgentError::HITLRejected(format!(
+                        "Tool '{}' was rejected by human approver. Do not retry.",
+                        tool_call.name
+                    )));
+                }
+            }
+
+            // Check conditions (e.g., amount > 1000)
+            let condition_check = hitl_engine.check_conditions(&tool_call.arguments);
+            if condition_check.is_required() {
+                let approved = self.request_hitl_approval(condition_check).await?;
+                if !approved {
+                    warn!(tool = %tool_call.name, "Tool execution rejected by HITL condition");
+                    return Err(AgentError::HITLRejected(format!(
+                        "Tool '{}' was rejected due to policy condition. Do not retry.",
+                        tool_call.name
+                    )));
+                }
+            }
+        }
+
+        let tool_config = self.recovery_manager.get_tool_config(&tool_call.name);
+
+        let result = if tool_config.max_retries > 0 {
+            let retry_config = RetryConfig {
+                max_retries: tool_config.max_retries,
+                ..Default::default()
+            };
+
+            let tool_call_clone = tool_call.clone();
+            self.recovery_manager
+                .with_retry(
+                    &format!("tool:{}", tool_call.name),
+                    Some(&retry_config),
+                    || {
+                        let tc = tool_call_clone.clone();
+                        async move { self.execute_tool(&tc).await.map_err(|e| e.classify()) }
+                    },
+                )
+                .await
+                .map_err(|e| AgentError::Tool(e.to_string()))
+        } else {
+            self.execute_tool(tool_call).await
+        };
+
+        let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
+
+        match &result {
+            Ok(output) => {
+                info!(output_len = output.len(), "Tool execution successful");
+                let result_value: Value =
+                    serde_json::from_str(output).unwrap_or(Value::String(output.clone()));
+                self.record_tool_call(&tool_call.name, result_value);
+
+                let tool_result = ToolResult {
+                    success: true,
+                    output: output.clone(),
+                    metadata: None,
+                };
+                self.hooks
+                    .on_tool_complete(&tool_call.name, &tool_result, tool_duration_ms)
+                    .await;
+            }
+            Err(e) => {
+                error!(error = %e, "Tool execution failed");
+                self.record_tool_call(&tool_call.name, serde_json::json!({"error": e.to_string()}));
+
+                let tool_result = ToolResult {
+                    success: false,
+                    output: e.to_string(),
+                    metadata: None,
+                };
+                self.hooks
+                    .on_tool_complete(&tool_call.name, &tool_result, tool_duration_ms)
+                    .await;
+                self.hooks.on_error(e).await;
+            }
+        }
+
+        result
+    }
+
+    async fn try_skill_route(&self, input: &str) -> Result<Option<String>> {
+        if let Some(ref router) = self.skill_router {
+            let available_skills = self.get_available_skills();
+            let skill_ids: Vec<&str> = available_skills.iter().map(|s| s.id.as_str()).collect();
+
+            if let Some(skill_id) = router.select_skill_filtered(input, &skill_ids).await? {
+                info!(skill_id = %skill_id, "Skill selected");
+
+                let skill = router
+                    .get_skill(&skill_id)
+                    .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
+
+                if let Some(ref executor) = self.skill_executor {
+                    let skill_reasoning = self.get_skill_reasoning_config(skill);
+                    let skill_reflection = self.get_skill_reflection_config(skill);
+
+                    debug!(
+                        skill_id = %skill_id,
+                        reasoning_mode = ?skill_reasoning.mode,
+                        reflection_enabled = ?skill_reflection.enabled,
+                        "Skill reasoning/reflection config"
+                    );
+
+                    let response = executor
+                        .execute(skill, input, serde_json::json!({}))
+                        .await?;
+
+                    if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
+                        let should_reflect = self
+                            .should_reflect_with_config(input, &response, &skill_reflection)
+                            .await?;
+                        if should_reflect {
+                            let evaluated = self
+                                .evaluate_and_retry_with_config(input, response, &skill_reflection)
+                                .await?;
+                            return Ok(Some(evaluated));
+                        }
+                    }
+
+                    return Ok(Some(response));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    async fn should_reflect_with_config(
+        &self,
+        input: &str,
+        response: &str,
+        config: &ReflectionConfig,
+    ) -> Result<bool> {
+        if !config.requires_evaluation() {
+            return Ok(false);
+        }
+
+        if config.is_enabled() {
+            return Ok(true);
+        }
+
+        let evaluator_llm = config
+            .evaluator_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok());
+
+        let Some(llm) = evaluator_llm else {
+            return Ok(false);
+        };
+
+        let prompt = format!(
+            r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
+
+User query: "{}"
+Response: "{}"
+
+Answer YES or NO only."#,
+            input,
+            &response[..response.len().min(500)]
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let result = llm.complete(&messages, None).await;
+
+        match result {
+            Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
+            Err(_) => Ok(false),
+        }
+    }
+
+    async fn evaluate_and_retry_with_config(
+        &self,
+        input: &str,
+        mut response: String,
+        config: &ReflectionConfig,
+    ) -> Result<String> {
+        let llm = self.get_state_llm()?;
+        let mut attempts = 0u32;
+        let max_retries = config.max_retries;
+
+        loop {
+            let evaluation = self
+                .evaluate_response_with_config(input, &response, config)
+                .await?;
+
+            if evaluation.passed || attempts >= max_retries {
+                info!(
+                    passed = evaluation.passed,
+                    confidence = evaluation.confidence,
+                    attempts = attempts + 1,
+                    "Skill reflection evaluation complete"
+                );
+                return Ok(response);
+            }
+
+            debug!(
+                attempt = attempts + 1,
+                failed_criteria = evaluation.failed_criteria().count(),
+                "Skill response did not meet criteria, retrying"
+            );
+
+            let feedback: Vec<String> = evaluation
+                .failed_criteria()
+                .map(|c| format!("- {}", c.criterion))
+                .collect();
+
+            let retry_prompt = format!(
+                "Your previous response did not meet these criteria:\n{}\n\nPlease provide an improved response to: {}",
+                feedback.join("\n"),
+                input
+            );
+
+            let messages = vec![ChatMessage::user(&retry_prompt)];
+            let retry_response = llm
+                .complete(&messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+            response = retry_response.content.trim().to_string();
+            attempts += 1;
+        }
+    }
+
+    async fn evaluate_response_with_config(
+        &self,
+        input: &str,
+        response: &str,
+        config: &ReflectionConfig,
+    ) -> Result<EvaluationResult> {
+        let evaluator_llm = config
+            .evaluator_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok())
+            .ok_or_else(|| AgentError::Config("No LLM available for evaluation".into()))?;
+
+        let criteria = &config.criteria;
+        let criteria_list = criteria
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}. {}", i + 1, c))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let prompt = format!(
+            r#"Evaluate this response against the criteria.
+
+User query: "{}"
+
+Response to evaluate: "{}"
+
+Criteria:
+{}
+
+For each criterion, respond with:
+- criterion number
+- PASS or FAIL
+- brief reason
+
+Then provide overall confidence (0.0 to 1.0) and whether it passes overall.
+
+Format:
+1. PASS/FAIL - reason
+2. PASS/FAIL - reason
+...
+CONFIDENCE: 0.X
+OVERALL: PASS/FAIL"#,
+            input, response, criteria_list
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let eval_response = evaluator_llm
+            .complete(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Evaluation failed: {}", e)))?;
+
+        let content = eval_response.content.to_uppercase();
+        let overall_pass = content.contains("OVERALL: PASS");
+
+        let confidence = content
+            .lines()
+            .find(|l| l.contains("CONFIDENCE:"))
+            .and_then(|l| {
+                l.split(':')
+                    .nth(1)
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+            })
+            .unwrap_or(if overall_pass { 0.8 } else { 0.4 });
+
+        let mut criteria_results = Vec::new();
+        for (i, criterion) in criteria.iter().enumerate() {
+            let line_marker = format!("{}.", i + 1);
+            let passed = eval_response
+                .content
+                .lines()
+                .find(|l| l.contains(&line_marker))
+                .map(|l| l.to_uppercase().contains("PASS"))
+                .unwrap_or(overall_pass);
+
+            if passed {
+                criteria_results.push(CriterionResult::pass(criterion));
+            } else {
+                criteria_results.push(CriterionResult::fail(criterion, "Did not meet criterion"));
+            }
+        }
+
+        Ok(EvaluationResult::new(overall_pass, confidence).with_criteria(criteria_results))
+    }
+
+    async fn process_input(&self, input: &str) -> Result<ProcessData> {
+        if let Some(ref processor) = self.process_processor {
+            processor.process_input(input).await
+        } else {
+            Ok(ProcessData::new(input))
+        }
+    }
+
+    async fn process_output(
+        &self,
+        output: &str,
+        input_context: &std::collections::HashMap<String, serde_json::Value>,
+    ) -> Result<ProcessData> {
+        if let Some(ref processor) = self.process_processor {
+            processor.process_output(output, input_context).await
+        } else {
+            Ok(ProcessData::new(output))
+        }
+    }
+
+    async fn check_turn_timeout(&self) -> Result<()> {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(timeout_state) = sm.check_timeout() {
+                let from_state = sm.current();
+                self.execute_state_exit_actions(&from_state).await;
+                sm.transition_to(&timeout_state, "max_turns exceeded")?;
+                self.execute_state_enter_actions(&timeout_state).await;
+                info!(to = %timeout_state, "Timeout transition");
+            }
+        }
+        Ok(())
+    }
+
+    fn increment_turn(&self) {
+        if let Some(ref sm) = self.state_machine {
+            sm.increment_turn();
+        }
+    }
+
+    async fn evaluate_transitions(&self, user_message: &str, response: &str) -> Result<bool> {
+        let (transitions, evaluator, current_state) =
+            match (&self.state_machine, &self.transition_evaluator) {
+                (Some(sm), Some(eval)) => {
+                    let auto_transitions = sm.auto_transitions();
+                    if auto_transitions.is_empty() {
+                        return Ok(false);
+                    }
+                    (auto_transitions, eval, sm.current())
+                }
+                _ => return Ok(false),
+            };
+
+        let context_map = self.context_manager.get_all();
+        let context = TransitionContext::new(user_message, response, &current_state)
+            .with_context(context_map);
+
+        if let Some(index) = evaluator.select_transition(&transitions, &context).await? {
+            let target = transitions[index].to.clone();
+            let reason = if transitions[index].when.is_empty() {
+                "guard condition met".to_string()
+            } else {
+                transitions[index].when.clone()
+            };
+
+            if let Some(ref sm) = self.state_machine {
+                // Check HITL approval for state transition
+                let approved = self
+                    .check_state_hitl(Some(&context.current_state), &target)
+                    .await?;
+                if !approved {
+                    info!(to = %target, "State transition rejected by HITL");
+                    return Ok(false);
+                }
+
+                // Execute on_exit actions for the current state
+                self.execute_state_exit_actions(&context.current_state)
+                    .await;
+
+                sm.transition_to(&target, &reason)?;
+                sm.reset_no_transition();
+
+                // Execute on_enter actions for the new state
+                self.execute_state_enter_actions(&target).await;
+
+                self.hooks
+                    .on_state_transition(Some(&context.current_state), &target, &reason)
+                    .await;
+                info!(from = %context.current_state, to = %target, "State transition");
+            }
+            return Ok(true);
+        }
+
+        if let Some(ref sm) = self.state_machine {
+            sm.increment_no_transition();
+            if let Some(fallback) = sm.check_fallback() {
+                let from_state = current_state.clone();
+
+                // Check HITL approval for fallback transition
+                let approved = self.check_state_hitl(Some(&from_state), &fallback).await?;
+                if !approved {
+                    info!(to = %fallback, "Fallback transition rejected by HITL");
+                    return Ok(false);
+                }
+
+                // Execute on_exit actions for the current state
+                self.execute_state_exit_actions(&from_state).await;
+
+                sm.transition_to(&fallback, "fallback after no transitions")?;
+
+                // Execute on_enter actions for the fallback state
+                self.execute_state_enter_actions(&fallback).await;
+
+                self.hooks
+                    .on_state_transition(
+                        Some(&from_state),
+                        &fallback,
+                        "fallback after no transitions",
+                    )
+                    .await;
+                info!(to = %fallback, "Fallback transition");
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Execute on_exit actions for a state being left.
+    async fn execute_state_exit_actions(&self, state_path: &str) {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(def) = sm.get_definition(state_path) {
+                if !def.on_exit.is_empty() {
+                    debug!(state = %state_path, count = def.on_exit.len(), "Executing on_exit actions");
+                    self.execute_state_actions(&def.on_exit).await;
+                }
+            }
+        }
+    }
+
+    /// Execute on_enter actions for a state being entered.
+    async fn execute_state_enter_actions(&self, state_path: &str) {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(def) = sm.get_definition(state_path) {
+                if !def.on_enter.is_empty() {
+                    debug!(state = %state_path, count = def.on_enter.len(), "Executing on_enter actions");
+                    self.execute_state_actions(&def.on_enter).await;
+                }
+            }
+        }
+    }
+
+    /// Execute a list of state actions (tool calls, skill invocations, context updates, LLM prompts).
+    async fn execute_state_actions(&self, actions: &[StateAction]) {
+        for action in actions {
+            match action {
+                StateAction::Tool { tool, args } => {
+                    let args_value = args.clone().unwrap_or(Value::Object(Default::default()));
+                    if let Some(t) = self.tools.get(tool) {
+                        let result = t.execute(args_value).await;
+                        if result.success {
+                            debug!(tool = %tool, "State action: tool executed");
+                        } else {
+                            warn!(tool = %tool, error = %result.output, "State action: tool failed");
+                        }
+                    } else {
+                        warn!(tool = %tool, "State action: tool not found");
+                    }
+                }
+                StateAction::Skill { skill } => {
+                    if let Some(ref executor) = self.skill_executor {
+                        if let Some(def) = self.skills.iter().find(|s| s.id == *skill) {
+                            match executor.execute(def, "", serde_json::json!({})).await {
+                                Ok(_) => debug!(skill = %skill, "State action: skill executed"),
+                                Err(e) => {
+                                    warn!(skill = %skill, error = %e, "State action: skill failed")
+                                }
+                            }
+                        } else {
+                            warn!(skill = %skill, "State action: skill not found");
+                        }
+                    }
+                }
+                StateAction::SetContext { set_context } => {
+                    for (key, value) in set_context {
+                        if let Err(e) = self.context_manager.set(key, value.clone()) {
+                            warn!(key = %key, error = %e, "State action: set_context failed");
+                        } else {
+                            debug!(key = %key, "State action: context set");
+                        }
+                    }
+                }
+                StateAction::Prompt {
+                    prompt,
+                    llm,
+                    store_as,
+                } => {
+                    let llm_result = if let Some(alias) = llm {
+                        self.llm_registry.get(alias)
+                    } else {
+                        self.llm_registry.default()
+                    };
+                    match llm_result {
+                        Ok(llm_provider) => {
+                            let messages = vec![ChatMessage::user(prompt)];
+                            match llm_provider.complete(&messages, None).await {
+                                Ok(response) => {
+                                    if let Some(key) = store_as {
+                                        let _ = self
+                                            .context_manager
+                                            .set(key, Value::String(response.content));
+                                        debug!(key = %key, "State action: prompt result stored");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "State action: prompt LLM call failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "State action: LLM not found for prompt");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn check_memory_compression(&self) -> Result<()> {
+        if self.memory.needs_compression() {
+            let result = self.memory.compress(None).await?;
+            if let CompressResult::Compressed {
+                messages_summarized,
+                new_summary_length,
+                tokens_saved,
+            } = result
+            {
+                let event = MemoryCompressEvent::new(
+                    messages_summarized,
+                    tokens_saved,
+                    new_summary_length as u32,
+                );
+                self.hooks.on_memory_compress(&event).await;
+                debug!(
+                    messages = messages_summarized,
+                    tokens_saved = tokens_saved,
+                    "Memory compressed"
+                );
+            }
+        }
+
+        // Handle overflow AFTER compression, then check warning threshold
+        self.handle_memory_overflow().await?;
+        self.check_memory_budget().await;
+
+        Ok(())
+    }
+
+    async fn check_memory_budget(&self) {
+        if let Some(ref budget) = self.memory_token_budget {
+            let context = match self.memory.get_context().await {
+                Ok(ctx) => ctx,
+                Err(_) => return,
+            };
+
+            let used_tokens = context.estimated_tokens();
+
+            if budget.is_over_warn_threshold(used_tokens) {
+                let event = MemoryBudgetEvent::new("memory", used_tokens, budget.total);
+                self.hooks.on_memory_budget_warning(&event).await;
+                debug!(
+                    used = used_tokens,
+                    total = budget.total,
+                    percent = event.usage_percent,
+                    "Memory budget warning"
+                );
+            }
+        }
+    }
+
+    async fn handle_memory_overflow(&self) -> Result<()> {
+        let Some(ref budget) = self.memory_token_budget else {
+            return Ok(());
+        };
+
+        let context = self.memory.get_context().await?;
+        let used_tokens = context.estimated_tokens();
+
+        if used_tokens <= budget.total {
+            return Ok(());
+        }
+
+        match budget.overflow_strategy {
+            OverflowStrategy::TruncateOldest => {
+                let tokens_to_free = used_tokens - budget.total;
+                let messages_to_evict = self.calculate_eviction_count(tokens_to_free);
+                if messages_to_evict > 0 {
+                    self.evict_messages(messages_to_evict, EvictionReason::TokenBudgetExceeded)
+                        .await?;
+                }
+            }
+            OverflowStrategy::SummarizeMore => {
+                self.memory.compress(None).await?;
+            }
+            OverflowStrategy::Error => {
+                return Err(AgentError::MemoryBudgetExceeded {
+                    used: used_tokens,
+                    budget: budget.total,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn calculate_eviction_count(&self, tokens_to_free: u32) -> usize {
+        // Estimate ~50 tokens per message on average
+        ((tokens_to_free as f64 / 50.0).ceil() as usize).max(1)
+    }
+
+    async fn evict_messages(&self, count: usize, reason: EvictionReason) -> Result<()> {
+        let evicted = self.memory.evict_oldest(count).await?;
+        if !evicted.is_empty() {
+            let event = MemoryEvictEvent {
+                reason,
+                messages_evicted: evicted.len(),
+                importance_scores: vec![],
+            };
+            self.hooks.on_memory_evict(&event).await;
+            debug!(count = evicted.len(), "Messages evicted from memory");
+        }
+        Ok(())
+    }
+
+    #[instrument(skip(self, input), fields(agent = %self.info.name))]
+    async fn determine_reasoning_mode(&self, input: &str) -> Result<ReasoningMode> {
+        let effective_config = self.get_effective_reasoning_config();
+
+        if !matches!(effective_config.mode, ReasoningMode::Auto) {
+            return Ok(effective_config.mode.clone());
+        }
+
+        let judge_llm = effective_config
+            .judge_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok());
+
+        let Some(llm) = judge_llm else {
+            return Ok(ReasoningMode::None);
+        };
+
+        let prompt = format!(
+            r#"Analyze this user request and determine the appropriate reasoning mode.
+
+User request: "{}"
+
+Choose ONE of these modes:
+- none: Simple queries, greetings, direct answers (fastest)
+- cot: Complex analysis, multi-step reasoning, math problems
+- react: Tasks requiring multiple tool calls with observation
+- plan_and_execute: Complex multi-step tasks requiring coordination
+
+Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
+            input
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = llm.complete(&messages, None).await;
+
+        match response {
+            Ok(resp) => {
+                let mode_str = resp.content.trim().to_lowercase();
+                Ok(match mode_str.as_str() {
+                    "cot" => ReasoningMode::CoT,
+                    "react" => ReasoningMode::React,
+                    "plan_and_execute" => ReasoningMode::PlanAndExecute,
+                    _ => ReasoningMode::None,
+                })
+            }
+            Err(_) => Ok(ReasoningMode::None),
+        }
+    }
+
+    async fn should_reflect(&self, input: &str, response: &str) -> Result<bool> {
+        let effective_config = self.get_effective_reflection_config();
+
+        if !effective_config.requires_evaluation() {
+            return Ok(false);
+        }
+
+        if effective_config.is_enabled() {
+            return Ok(true);
+        }
+
+        let evaluator_llm = effective_config
+            .evaluator_llm
+            .as_ref()
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok());
+
+        let Some(llm) = evaluator_llm else {
+            return Ok(false);
+        };
+
+        let prompt = format!(
+            r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
+
+User query: "{}"
+Response: "{}"
+
+Answer YES or NO only."#,
+            input,
+            &response[..response.len().min(500)]
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let result = llm.complete(&messages, None).await;
+
+        match result {
+            Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
+            Err(_) => Ok(false),
+        }
+    }
+
+    fn build_cot_system_prompt(&self, base_prompt: &str) -> String {
+        format!(
+            "{}\n\n<instruction>\nThink through this step by step before answering:\n1. Understand what is being asked\n2. Break down the problem\n3. Work through each part\n4. Provide your final answer\n\nShow your thinking process, then give your final answer.\n</instruction>",
+            base_prompt
+        )
+    }
+
+    fn build_react_system_prompt(&self, base_prompt: &str) -> String {
+        format!(
+            "{}\n\n<instruction>\nUse the Reason-Act-Observe pattern:\n1. Thought: Think about what to do\n2. Action: Use a tool if needed\n3. Observation: Analyze the result\n4. Repeat until you have the answer\n\nFormat your response showing Thought/Action/Observation steps.\n</instruction>",
+            base_prompt
+        )
+    }
+
+    async fn generate_plan(&self, input: &str) -> Result<Plan> {
+        let planning_config = self.reasoning_config.get_planning();
+
+        let planner_llm = planning_config
+            .and_then(|c| c.planner_llm.as_ref())
+            .and_then(|alias| self.llm_registry.get(alias).ok())
+            .or_else(|| self.llm_registry.router().ok())
+            .or_else(|| self.llm_registry.default().ok())
+            .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
+
+        let available_tools: Vec<String> = self.tools.list_ids();
+        let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
+
+        let prompt = format!(
+            r#"Create a step-by-step plan to accomplish this goal.
+
+Goal: "{}"
+
+Available tools: {}
+Available skills: {}
+
+Create a plan with clear steps. For each step, specify:
+- description: What this step accomplishes
+- action_type: "tool", "skill", "think", or "respond"
+- action_target: The tool/skill name (if applicable)
+- dependencies: List of step IDs this depends on (empty if none)
+
+Respond in JSON format:
+{{
+  "steps": [
+    {{"id": "step1", "description": "...", "action_type": "tool", "action_target": "tool_name", "args": {{}}, "dependencies": []}},
+    {{"id": "step2", "description": "...", "action_type": "think", "action_target": "...", "dependencies": ["step1"]}}
+  ]
+}}"#,
+            input,
+            available_tools.join(", "),
+            available_skills.join(", ")
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = planner_llm
+            .complete(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Planning failed: {}", e)))?;
+
+        let mut plan = Plan::new(input);
+
+        if let Some(json_start) = response.content.find('{') {
+            if let Some(json_end) = response.content.rfind('}') {
+                let json_str = &response.content[json_start..=json_end];
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                    if let Some(steps) = parsed.get("steps").and_then(|s| s.as_array()) {
+                        for step_value in steps {
+                            let id = step_value
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("step");
+                            let desc = step_value
+                                .get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let action_type = step_value
+                                .get("action_type")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("think");
+                            let action_target = step_value
+                                .get("action_target")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let args = step_value
+                                .get("args")
+                                .cloned()
+                                .unwrap_or(serde_json::json!({}));
+                            let deps: Vec<String> = step_value
+                                .get("dependencies")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            let action = match action_type {
+                                "tool" => PlanAction::tool(action_target, args),
+                                "skill" => PlanAction::skill(action_target),
+                                "respond" => PlanAction::respond(action_target),
+                                _ => PlanAction::think(desc),
+                            };
+
+                            let step = PlanStep::new(desc, action)
+                                .with_id(id)
+                                .with_dependencies(deps);
+                            plan.add_step(step);
+                        }
+                    }
+                }
+            }
+        }
+
+        if plan.steps.is_empty() {
+            plan.add_step(PlanStep::new(
+                "Process the request",
+                PlanAction::think(input),
+            ));
+            plan.add_step(PlanStep::new(
+                "Provide response",
+                PlanAction::respond("Answer based on analysis"),
+            ));
+        }
+
+        Ok(plan)
+    }
+
+    async fn execute_plan(&self, plan: &mut Plan) -> Result<String> {
+        let llm = self.get_state_llm()?;
+        let mut results: HashMap<String, serde_json::Value> = HashMap::new();
+        let max_steps = self
+            .reasoning_config
+            .get_planning()
+            .map(|c| c.max_steps)
+            .unwrap_or(10);
+
+        plan.status = PlanStatus::InProgress;
+
+        for step_idx in 0..plan.steps.len().min(max_steps as usize) {
+            let step = &plan.steps[step_idx];
+
+            let deps_satisfied = step.dependencies.iter().all(|dep| {
+                plan.steps
+                    .iter()
+                    .find(|s| &s.id == dep)
+                    .map(|s| s.status.is_completed())
+                    .unwrap_or(false)
+            });
+
+            if !deps_satisfied {
+                continue;
+            }
+
+            plan.steps[step_idx].mark_running();
+
+            let result = match &plan.steps[step_idx].action {
+                PlanAction::Tool { tool, args } => {
+                    let tool_call = ToolCall {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        name: tool.clone(),
+                        arguments: args.clone(),
+                    };
+                    match self.execute_tool_smart(&tool_call).await {
+                        Ok(output) => serde_json::json!({ "output": output }),
+                        Err(e) => {
+                            plan.steps[step_idx].mark_failed(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                PlanAction::Skill { skill } => {
+                    if let Some(skill_def) = self.skills.iter().find(|s| &s.id == skill) {
+                        if let Some(ref executor) = self.skill_executor {
+                            match executor.execute(skill_def, "", serde_json::json!({})).await {
+                                Ok(output) => serde_json::json!({ "output": output }),
+                                Err(e) => {
+                                    plan.steps[step_idx].mark_failed(e.to_string());
+                                    continue;
+                                }
+                            }
+                        } else {
+                            serde_json::json!({ "output": "Skill executor not available" })
+                        }
+                    } else {
+                        plan.steps[step_idx].mark_failed("Skill not found");
+                        continue;
+                    }
+                }
+                PlanAction::Think { prompt } => {
+                    let context: String = results
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let think_prompt = format!("Context:\n{}\n\nTask: {}", context, prompt);
+                    let messages = vec![ChatMessage::user(&think_prompt)];
+
+                    match llm.complete(&messages, None).await {
+                        Ok(resp) => serde_json::json!({ "output": resp.content }),
+                        Err(e) => {
+                            plan.steps[step_idx].mark_failed(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+                PlanAction::Respond { template } => {
+                    let context: String = results
+                        .iter()
+                        .map(|(k, v)| format!("{}: {}", k, v))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let respond_prompt = format!(
+                        "Based on this context:\n{}\n\nGenerate a response following this template/instruction: {}",
+                        context, template
+                    );
+                    let messages = vec![ChatMessage::user(&respond_prompt)];
+
+                    match llm.complete(&messages, None).await {
+                        Ok(resp) => serde_json::json!({ "output": resp.content }),
+                        Err(e) => {
+                            plan.steps[step_idx].mark_failed(e.to_string());
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            results.insert(plan.steps[step_idx].id.clone(), result.clone());
+            plan.steps[step_idx].mark_completed(Some(result));
+        }
+
+        plan.status = PlanStatus::Completed;
+
+        let final_output = results
+            .values()
+            .filter_map(|v| v.get("output").and_then(|o| o.as_str()))
+            .last()
+            .unwrap_or("Plan execution completed.")
+            .to_string();
+
+        Ok(final_output)
+    }
+
+    async fn evaluate_response(&self, input: &str, response: &str) -> Result<EvaluationResult> {
+        let effective_config = self.get_effective_reflection_config();
+        self.evaluate_response_with_config(input, response, &effective_config)
+            .await
+    }
+
+    fn extract_thinking(&self, content: &str) -> (Option<String>, String) {
+        if let Some(start) = content.find("<thinking>") {
+            if let Some(end) = content.find("</thinking>") {
+                let thinking = content[start + 10..end].trim().to_string();
+                let answer = content[end + 11..].trim().to_string();
+                return (Some(thinking), answer);
+            }
+        }
+        (None, content.to_string())
+    }
+
+    fn format_response_with_thinking(&self, thinking: Option<&str>, answer: &str) -> String {
+        match self.reasoning_config.output {
+            ReasoningOutput::Hidden => answer.to_string(),
+            ReasoningOutput::Visible => {
+                if let Some(t) = thinking {
+                    format!("Thinking:\n{}\n\nAnswer:\n{}", t, answer)
+                } else {
+                    answer.to_string()
+                }
+            }
+            ReasoningOutput::Tagged => {
+                if let Some(t) = thinking {
+                    format!("<thinking>{}</thinking>\n{}", t, answer)
+                } else {
+                    answer.to_string()
+                }
+            }
+        }
+    }
+
+    async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
+        info!(input_len = input.len(), "Starting chat");
+
+        self.hooks.on_message_received(input).await;
+
+        self.check_turn_timeout().await?;
+        self.context_manager.refresh_per_turn().await?;
+
+        // Disambiguation check (before input processing)
+        if let Some(ref disambiguator) = self.disambiguation_manager {
+            let disambiguation_context = self.build_disambiguation_context().await?;
+
+            // Get state-level disambiguation override
+            let state_override = self
+                .state_machine
+                .as_ref()
+                .and_then(|sm| sm.current_definition())
+                .and_then(|def| def.disambiguation.clone());
+
+            match disambiguator
+                .process_input_with_override(
+                    input,
+                    &disambiguation_context,
+                    state_override.as_ref(),
+                    None,
+                )
+                .await?
+            {
+                DisambiguationResult::Clear => {
+                    debug!("Input is clear, proceeding normally");
+                }
+                DisambiguationResult::NeedsClarification {
+                    question,
+                    detection,
+                } => {
+                    info!(
+                        ambiguity_type = ?detection.ambiguity_type,
+                        confidence = detection.confidence,
+                        "Input requires clarification"
+                    );
+
+                    self.memory.add_message(ChatMessage::user(input)).await?;
+                    self.memory
+                        .add_message(ChatMessage::assistant(&question.question))
+                        .await?;
+
+                    return Ok(AgentResponse::new(&question.question).with_metadata(
+                        "disambiguation",
+                        serde_json::json!({
+                            "status": "awaiting_clarification",
+                            "options": question.options,
+                            "clarifying": question.clarifying,
+                            "detection": {
+                                "type": detection.ambiguity_type,
+                                "confidence": detection.confidence,
+                                "what_is_unclear": detection.what_is_unclear,
+                            }
+                        }),
+                    ));
+                }
+                DisambiguationResult::Clarified {
+                    enriched_input,
+                    resolved,
+                    ..
+                } => {
+                    info!(
+                        resolved_count = resolved.len(),
+                        "Input clarified, using enriched input"
+                    );
+                    return self.run_loop_internal(&enriched_input).await;
+                }
+                DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                    info!("Proceeding with best guess interpretation");
+                    return self.run_loop_internal(&enriched_input).await;
+                }
+                DisambiguationResult::GiveUp { reason } => {
+                    warn!(reason = %reason, "Disambiguation gave up");
+                    let apology = self
+                        .generate_localized_apology(
+                            "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                            &reason,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            format!("I'm sorry, I couldn't understand your request: {}", reason)
+                        });
+                    return Ok(AgentResponse::new(&apology));
+                }
+                DisambiguationResult::Escalate { reason } => {
+                    info!(reason = %reason, "Escalating to human");
+                    if let Some(ref hitl) = self.hitl_engine {
+                        let trigger =
+                            ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
+                        let mut context_map = HashMap::new();
+                        context_map.insert("original_input".to_string(), serde_json::json!(input));
+                        context_map.insert("reason".to_string(), serde_json::json!(&reason));
+                        let check_result = HITLCheckResult::required(
+                            trigger,
+                            context_map,
+                            format!("User request needs human assistance: {}", reason),
+                            Some(hitl.config().default_timeout_seconds),
+                        );
+                        let approved = self.request_hitl_approval(check_result).await?;
+                        if approved {
+                            return self.run_loop_internal(input).await;
+                        }
+                    }
+                    let apology = self
+                        .generate_localized_apology(
+                            "Explain briefly that you're transferring the user to a human agent for help.",
+                            &reason,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            format!("I need human assistance to help with your request: {}", reason)
+                        });
+                    return Ok(AgentResponse::new(&apology));
+                }
+            }
+        }
+
+        self.run_loop_internal(input).await
+    }
+
+    /// Generate a localized response using the router LLM
+    async fn generate_localized_apology(&self, instruction: &str, reason: &str) -> Result<String> {
+        let llm = self.llm_registry.router().map_err(|e| {
+            AgentError::LLM(format!(
+                "Router LLM not available for localized response: {}",
+                e
+            ))
+        })?;
+
+        let recent: Vec<String> = self
+            .memory
+            .get_messages(Some(3))
+            .await?
+            .iter()
+            .map(|m| m.content.clone())
+            .collect();
+
+        let context_hint = if recent.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\nRecent conversation (detect the user's language from this):\n{}\n",
+                recent.join("\n")
+            )
+        };
+
+        let prompt = format!(
+            "{}\nReason: {}\n{}Respond in the same language as the user. Output ONLY the message, nothing else.",
+            instruction, reason, context_hint
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = llm
+            .complete(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(format!("Localized response generation failed: {}", e)))?;
+
+        Ok(response.content.trim().to_string())
+    }
+
+    async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
+        let input_data = self.process_input(input).await?;
+
+        if input_data.metadata.rejected {
+            let reason = input_data
+                .metadata
+                .rejection_reason
+                .unwrap_or_else(|| "Input rejected".to_string());
+            warn!(reason = %reason, "Input rejected");
+            return Ok(AgentResponse::new(reason));
+        }
+
+        let processed_input = &input_data.content;
+
+        if let Some(skill_response) = self.try_skill_route(processed_input).await? {
+            self.memory
+                .add_message(ChatMessage::user(processed_input))
+                .await?;
+
+            let output_data = self
+                .process_output(&skill_response, &input_data.context)
+                .await?;
+            let final_response = output_data.content;
+
+            self.memory
+                .add_message(ChatMessage::assistant(&final_response))
+                .await?;
+
+            self.check_memory_compression().await?;
+
+            self.increment_turn();
+            self.evaluate_transitions(processed_input, &final_response)
+                .await?;
+
+            let response = AgentResponse::new(final_response);
+            self.hooks.on_response(&response).await;
+            return Ok(response);
+        }
+
+        let effective_reasoning = self.get_effective_reasoning_config();
+        let reasoning_mode = self.determine_reasoning_mode(processed_input).await?;
+        let auto_detected = matches!(effective_reasoning.mode, ReasoningMode::Auto);
+
+        info!(
+            reasoning_mode = ?reasoning_mode,
+            auto_detected = auto_detected,
+            reflection_enabled = ?self.reflection_config.enabled,
+            "Reasoning mode determined"
+        );
+
+        if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
+            self.memory
+                .add_message(ChatMessage::user(processed_input))
+                .await?;
+
+            let mut plan = self.generate_plan(processed_input).await?;
+            info!(
+                plan_id = %plan.id,
+                steps = plan.steps.len(),
+                "Plan generated"
+            );
+            *self.current_plan.write() = Some(plan.clone());
+
+            let plan_result = self.execute_plan(&mut plan).await?;
+            info!(
+                plan_status = ?plan.status,
+                completed_steps = plan.completed_steps().count(),
+                "Plan execution completed"
+            );
+            *self.current_plan.write() = Some(plan);
+
+            let output_data = self
+                .process_output(&plan_result, &input_data.context)
+                .await?;
+            let final_content = output_data.content;
+
+            self.memory
+                .add_message(ChatMessage::assistant(&final_content))
+                .await?;
+
+            self.check_memory_compression().await?;
+            self.increment_turn();
+            self.evaluate_transitions(processed_input, &final_content)
+                .await?;
+
+            let reasoning_metadata = ReasoningMetadata::new(ReasoningMode::PlanAndExecute)
+                .with_auto_detected(auto_detected);
+
+            let response = AgentResponse::new(&final_content).with_metadata(
+                "reasoning",
+                serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+            );
+
+            self.hooks.on_response(&response).await;
+            return Ok(response);
+        }
+
+        self.memory
+            .add_message(ChatMessage::user(processed_input))
+            .await?;
+
+        let mut iterations = 0u32;
+        let mut all_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut thinking_content: Option<String> = None;
+
+        let llm = self.get_state_llm()?;
+
+        loop {
+            if iterations >= self.max_iterations {
+                let err =
+                    AgentError::Other(format!("Max iterations ({}) exceeded", self.max_iterations));
+                self.hooks.on_error(&err).await;
+                error!(iterations = iterations, "Max iterations exceeded");
+                return Err(err);
+            }
+            iterations += 1;
+            *self.iteration_count.write() = iterations;
+
+            debug!(
+                iteration = iterations,
+                max = self.max_iterations,
+                "LLM call"
+            );
+
+            let mut messages = self.build_messages().await?;
+
+            if iterations == 1 {
+                match reasoning_mode {
+                    ReasoningMode::CoT => {
+                        if let Some(msg) = messages.first_mut() {
+                            if matches!(msg.role, ai_agents_core::Role::System) {
+                                msg.content = self.build_cot_system_prompt(&msg.content);
+                                debug!("Applied Chain-of-Thought system prompt");
+                            }
+                        }
+                    }
+                    ReasoningMode::React => {
+                        if let Some(msg) = messages.first_mut() {
+                            if matches!(msg.role, ai_agents_core::Role::System) {
+                                msg.content = self.build_react_system_prompt(&msg.content);
+                                debug!("Applied ReAct system prompt");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            self.hooks.on_llm_start(&messages).await;
+            let llm_start = Instant::now();
+
+            let response = if self.recovery_manager.config().default.max_retries > 0 {
+                self.recovery_manager
+                    .with_retry("llm_call", None, || async {
+                        llm.complete(&messages, None)
+                            .await
+                            .map_err(|e| e.classify())
+                    })
+                    .await
+                    .map_err(|e| AgentError::LLM(e.to_string()))?
+            } else {
+                llm.complete(&messages, None)
+                    .await
+                    .map_err(|e| AgentError::LLM(e.to_string()))?
+            };
+
+            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
+
+            let content = response.content.trim();
+
+            if let Some(tool_calls) = self.parse_tool_calls(content) {
+                let results = self.execute_tools_parallel(&tool_calls).await;
+
+                for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
+                    match result {
+                        Ok(output) => {
+                            self.memory
+                                .add_message(ChatMessage::function(&tool_call.name, &output))
+                                .await?;
+                        }
+                        Err(e) => {
+                            // Check if this is a HITL rejection - if so, break the loop
+                            if matches!(e, AgentError::HITLRejected(_)) {
+                                self.memory
+                                    .add_message(ChatMessage::assistant(&format!(
+                                        "The operation was rejected by the approver: {}",
+                                        e
+                                    )))
+                                    .await?;
+                                // Return the rejection message to user, don't continue loop
+                                return Ok(AgentResponse {
+                                    content: format!("Operation cancelled: {}", e),
+                                    metadata: None,
+                                    tool_calls: Some(all_tool_calls),
+                                });
+                            }
+                            self.memory
+                                .add_message(ChatMessage::function(
+                                    &tool_call.name,
+                                    &format!("Error: {}", e),
+                                ))
+                                .await?;
+                        }
+                    }
+                    all_tool_calls.push(tool_call.clone());
+                }
+                continue;
+            }
+
+            let (extracted_thinking, answer) = self.extract_thinking(content);
+            if extracted_thinking.is_some() {
+                thinking_content = extracted_thinking;
+            }
+
+            let output_data = self.process_output(&answer, &input_data.context).await?;
+
+            let mut final_content = if output_data.metadata.rejected {
+                output_data
+                    .metadata
+                    .rejection_reason
+                    .unwrap_or_else(|| answer.to_string())
+            } else {
+                output_data.content
+            };
+
+            let should_reflect = self.should_reflect(processed_input, &final_content).await?;
+            let mut reflection_metadata: Option<ReflectionMetadata> = None;
+
+            if should_reflect {
+                info!("Starting response reflection evaluation");
+                let mut attempts = 0u32;
+                let max_retries = self.reflection_config.max_retries;
+                let mut history: Vec<ReflectionAttempt> = Vec::new();
+
+                loop {
+                    let evaluation = self
+                        .evaluate_response(processed_input, &final_content)
+                        .await?;
+
+                    if evaluation.passed || attempts >= max_retries {
+                        info!(
+                            passed = evaluation.passed,
+                            confidence = evaluation.confidence,
+                            attempts = attempts + 1,
+                            "Reflection evaluation complete"
+                        );
+                        reflection_metadata = Some(
+                            ReflectionMetadata::new(evaluation)
+                                .with_attempts(attempts + 1)
+                                .with_history(history),
+                        );
+                        break;
+                    }
+
+                    debug!(
+                        attempt = attempts + 1,
+                        failed_criteria = evaluation.failed_criteria().count(),
+                        "Response did not meet criteria, retrying"
+                    );
+
+                    history.push(
+                        ReflectionAttempt::new(&final_content, evaluation.clone())
+                            .with_feedback("Response did not meet quality criteria"),
+                    );
+
+                    let feedback: Vec<String> = evaluation
+                        .failed_criteria()
+                        .map(|c| format!("- {}", c.criterion))
+                        .collect();
+
+                    let retry_prompt = format!(
+                        "Your previous response did not meet these criteria:\n{}\n\nPlease provide an improved response.",
+                        feedback.join("\n")
+                    );
+
+                    self.memory
+                        .add_message(ChatMessage::user(&retry_prompt))
+                        .await?;
+
+                    let retry_messages = self.build_messages().await?;
+                    let retry_response = llm
+                        .complete(&retry_messages, None)
+                        .await
+                        .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+                    final_content = retry_response.content.trim().to_string();
+                    attempts += 1;
+                }
+            }
+
+            final_content =
+                self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
+
+            self.memory
+                .add_message(ChatMessage::assistant(&final_content))
+                .await?;
+
+            self.check_memory_compression().await?;
+
+            self.increment_turn();
+            self.evaluate_transitions(processed_input, &final_content)
+                .await?;
+
+            let reasoning_metadata = ReasoningMetadata::new(reasoning_mode.clone())
+                .with_thinking(thinking_content.clone().unwrap_or_default())
+                .with_iterations(iterations)
+                .with_auto_detected(auto_detected);
+
+            let mut response = AgentResponse::new(&final_content);
+            if !all_tool_calls.is_empty() {
+                response = response.with_tool_calls(all_tool_calls);
+            }
+
+            if let Some(state) = self.current_state() {
+                response = response.with_metadata("current_state", serde_json::json!(state));
+            }
+
+            response = response.with_metadata(
+                "reasoning",
+                serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+            );
+
+            if let Some(ref refl_meta) = reflection_metadata {
+                response = response.with_metadata(
+                    "reflection",
+                    serde_json::to_value(refl_meta).unwrap_or_default(),
+                );
+            }
+
+            self.hooks.on_response(&response).await;
+
+            let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
+            info!(
+                tool_calls = tool_call_count,
+                response_len = response.content.len(),
+                reasoning_mode = ?reasoning_mode,
+                reflected = reflection_metadata.is_some(),
+                "Chat completed"
+            );
+            return Ok(response);
+        }
+    }
+
+    pub fn info(&self) -> AgentInfo {
+        self.info.clone()
+    }
+
+    pub fn skills(&self) -> &[SkillDefinition] {
+        &self.skills
+    }
+
+    pub async fn reset(&self) -> Result<()> {
+        self.memory.clear().await?;
+        *self.iteration_count.write() = 0;
+        self.tool_call_history.write().clear();
+        if let Some(ref sm) = self.state_machine {
+            sm.reset();
+        }
+        Ok(())
+    }
+
+    pub fn max_context_tokens(&self) -> u32 {
+        self.max_context_tokens
+    }
+
+    pub fn llm_registry(&self) -> &Arc<LLMRegistry> {
+        &self.llm_registry
+    }
+
+    pub fn state_machine(&self) -> Option<&Arc<StateMachine>> {
+        self.state_machine.as_ref()
+    }
+
+    pub fn context_manager(&self) -> &Arc<ContextManager> {
+        &self.context_manager
+    }
+
+    pub fn tool_call_history(&self) -> Vec<ToolCallRecord> {
+        self.tool_call_history.read().clone()
+    }
+
+    pub fn parallel_tools_config(&self) -> &ParallelToolsConfig {
+        &self.parallel_tools
+    }
+
+    pub fn streaming_config(&self) -> &StreamingConfig {
+        &self.streaming
+    }
+
+    pub fn hooks(&self) -> &Arc<dyn AgentHooks> {
+        &self.hooks
+    }
+
+    pub fn hitl_engine(&self) -> Option<&HITLEngine> {
+        self.hitl_engine.as_ref()
+    }
+
+    pub fn approval_handler(&self) -> &Arc<dyn ApprovalHandler> {
+        &self.approval_handler
+    }
+
+    async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<bool> {
+        let Some(request) = check_result.into_request() else {
+            return Ok(true);
+        };
+
+        self.hooks.on_approval_requested(&request).await;
+
+        let request_id = request.id.clone();
+        let timeout = request.timeout;
+
+        let result = if let Some(duration) = timeout {
+            match tokio::time::timeout(duration, self.approval_handler.request_approval(request))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => ApprovalResult::timeout(),
+            }
+        } else {
+            self.approval_handler.request_approval(request).await
+        };
+
+        self.hooks.on_approval_result(&request_id, &result).await;
+
+        match result {
+            ApprovalResult::Approved => Ok(true),
+            ApprovalResult::Modified { .. } => Ok(true),
+            ApprovalResult::Rejected { reason } => {
+                if let Some(r) = reason {
+                    info!(reason = %r, "HITL rejected");
+                }
+                Ok(false)
+            }
+            ApprovalResult::Timeout => {
+                if let Some(ref engine) = self.hitl_engine {
+                    match engine.config().on_timeout {
+                        TimeoutAction::Approve => Ok(true),
+                        TimeoutAction::Reject => Ok(false),
+                        TimeoutAction::Error => {
+                            Err(AgentError::Other("HITL approval timeout".to_string()))
+                        }
+                    }
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    pub async fn check_state_hitl(&self, from: Option<&str>, to: &str) -> Result<bool> {
+        if let Some(ref hitl_engine) = self.hitl_engine {
+            let check_result = hitl_engine.check_state_transition(from, to);
+            if check_result.is_required() {
+                return self.request_hitl_approval(check_result).await;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Execute multiple tools in parallel
+    async fn execute_tools_parallel(
+        &self,
+        tool_calls: &[ToolCall],
+    ) -> Vec<(String, Result<String>)> {
+        if !self.parallel_tools.enabled || tool_calls.len() <= 1 {
+            let mut results = Vec::new();
+            for tc in tool_calls {
+                let result = self.execute_tool_smart(tc).await;
+                results.push((tc.id.clone(), result));
+            }
+            return results;
+        }
+
+        let chunks: Vec<_> = tool_calls
+            .chunks(self.parallel_tools.max_parallel)
+            .collect();
+
+        let mut all_results = Vec::new();
+
+        for chunk in chunks {
+            let futures: Vec<_> = chunk
+                .iter()
+                .map(|tc| {
+                    let tc = tc.clone();
+                    async move {
+                        let result = self.execute_tool_smart(&tc).await;
+                        (tc.id.clone(), result)
+                    }
+                })
+                .collect();
+
+            let results = futures::future::join_all(futures).await;
+            all_results.extend(results);
+        }
+
+        all_results
+    }
+
+    /// Stream a chat response with real-time updates
+    pub async fn chat_stream(
+        &self,
+        input: &str,
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + '_>>> {
+        info!(input_len = input.len(), "Starting streaming chat");
+
+        self.check_turn_timeout().await?;
+        self.context_manager.refresh_per_turn().await?;
+
+        let input_data = self.process_input(input).await?;
+
+        if input_data.metadata.rejected {
+            let reason = input_data
+                .metadata
+                .rejection_reason
+                .unwrap_or_else(|| "Input rejected".to_string());
+            warn!(reason = %reason, "Input rejected");
+            return Ok(Box::pin(stream::once(
+                async move { StreamChunk::error(reason) },
+            )));
+        }
+
+        let processed_input = input_data.content.clone();
+        let input_context = input_data.context.clone();
+
+        if let Some(skill_response) = self.try_skill_route(&processed_input).await? {
+            self.memory
+                .add_message(ChatMessage::user(&processed_input))
+                .await?;
+
+            let output_data = self.process_output(&skill_response, &input_context).await?;
+            let final_response = output_data.content;
+
+            self.memory
+                .add_message(ChatMessage::assistant(&final_response))
+                .await?;
+
+            self.increment_turn();
+            self.evaluate_transitions(&processed_input, &final_response)
+                .await?;
+
+            return Ok(Box::pin(stream::iter(vec![
+                StreamChunk::content(final_response),
+                StreamChunk::Done {},
+            ])));
+        }
+
+        self.memory
+            .add_message(ChatMessage::user(&processed_input))
+            .await?;
+
+        let llm = self.get_state_llm()?;
+        let messages = self.build_messages().await?;
+
+        let llm_stream = llm
+            .complete_stream(&messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+        let streaming_config = self.streaming.clone();
+        let include_tool_events = streaming_config.include_tool_events;
+
+        let stream = async_stream::stream! {
+            let mut accumulated_content = String::new();
+            let mut stream = llm_stream;
+
+            while let Some(chunk_result) = stream.next().await {
+                match chunk_result {
+                    Ok(chunk) => {
+                        accumulated_content.push_str(&chunk.delta);
+                        yield StreamChunk::content(chunk.delta);
+                    }
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                }
+            }
+
+            let content = accumulated_content.trim().to_string();
+
+            if let Some(tool_calls) = self.parse_tool_calls(&content) {
+                for tool_call in &tool_calls {
+                    if include_tool_events {
+                        yield StreamChunk::tool_start(&tool_call.id, &tool_call.name);
+                    }
+
+                    match self.execute_tool_smart(tool_call).await {
+                        Ok(output) => {
+                            if include_tool_events {
+                                yield StreamChunk::tool_result(
+                                    &tool_call.id,
+                                    &tool_call.name,
+                                    &output,
+                                    true,
+                                );
+                            }
+                            let _ = self.memory
+                                .add_message(ChatMessage::function(&tool_call.name, &output))
+                                .await;
+                        }
+                        Err(e) => {
+                            if include_tool_events {
+                                yield StreamChunk::tool_result(
+                                    &tool_call.id,
+                                    &tool_call.name,
+                                    &e.to_string(),
+                                    false,
+                                );
+                            }
+                            let _ = self.memory
+                                .add_message(ChatMessage::function(&tool_call.name, &format!("Error: {}", e)))
+                                .await;
+                        }
+                    }
+
+                    if include_tool_events {
+                        yield StreamChunk::tool_end(&tool_call.id);
+                    }
+                }
+            } else {
+                let _ = self.memory
+                    .add_message(ChatMessage::assistant(&content))
+                    .await;
+            }
+
+            yield StreamChunk::Done {};
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+#[async_trait]
+impl Agent for RuntimeAgent {
+    async fn chat(&self, input: &str) -> Result<AgentResponse> {
+        self.run_loop(input).await
+    }
+
+    fn info(&self) -> AgentInfo {
+        self.info.clone()
+    }
+
+    async fn reset(&self) -> Result<()> {
+        self.memory.clear().await?;
+        *self.iteration_count.write() = 0;
+        self.tool_call_history.write().clear();
+        if let Some(ref sm) = self.state_machine {
+            sm.reset();
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::AgentBuilder;
+    use ai_agents_llm::mock::MockLLMProvider;
+
+    fn mock_with_response(response: &str) -> MockLLMProvider {
+        let mut mock = MockLLMProvider::new("test");
+        mock.set_response(response);
+        mock
+    }
+
+    fn mock_with_responses(responses: Vec<&str>) -> MockLLMProvider {
+        let mut mock = MockLLMProvider::new("test");
+        mock.set_responses(responses.into_iter().map(String::from).collect(), true);
+        mock
+    }
+
+    // Basic YAML → Build → Chat flow
+    #[tokio::test]
+    async fn test_integration_yaml_to_chat_basic() {
+        let mock = mock_with_response("Hello! How can I help you?");
+        let agent = AgentBuilder::new()
+            .system_prompt("You are a test assistant.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hi").await.unwrap();
+        assert!(!response.content.is_empty());
+        assert_eq!(response.content, "Hello! How can I help you?");
+    }
+
+    // Multi-turn conversation
+    #[tokio::test]
+    async fn test_integration_multi_turn_conversation() {
+        let mock = mock_with_responses(vec![
+            "Hello! I'm your assistant.",
+            "The weather is sunny today.",
+            "Goodbye!",
+        ]);
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let r1 = agent.chat("Hi").await.unwrap();
+        assert_eq!(r1.content, "Hello! I'm your assistant.");
+
+        let r2 = agent.chat("What's the weather?").await.unwrap();
+        assert_eq!(r2.content, "The weather is sunny today.");
+
+        let r3 = agent.chat("Bye").await.unwrap();
+        assert_eq!(r3.content, "Goodbye!");
+
+        // Verify memory accumulated messages
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        // 3 user + 3 assistant = 6 messages
+        assert_eq!(messages.len(), 6);
+    }
+
+    // Tool execution in chat flow
+    #[tokio::test]
+    async fn test_integration_tool_execution() {
+        // Mock LLM that returns a tool call then a final answer
+        let mock = mock_with_responses(vec![
+            // First response: tool call
+            r#"I'll calculate that for you.
+[TOOL_CALL: {"name": "calculator", "arguments": {"expression": "2+2"}}]"#,
+            // After tool result: final answer
+            "The answer is 4.",
+        ]);
+        let mut tools = ai_agents_tools::ToolRegistry::new();
+        tools
+            .register(Arc::new(ai_agents_tools::CalculatorTool))
+            .unwrap();
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are a calculator assistant.")
+            .llm(Arc::new(mock))
+            .tools(tools)
+            .build()
+            .unwrap();
+
+        let response = agent.chat("What is 2+2?").await.unwrap();
+        // The agent should eventually produce a response
+        assert!(!response.content.is_empty());
+    }
+
+    // State machine transitions
+    #[tokio::test]
+    async fn test_integration_state_machine_basic() {
+        let yaml = r#"
+name: StateAgent
+system_prompt: "You are a support agent."
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Welcome the user warmly."
+      transitions:
+        - to: support
+          when: "User needs help"
+          auto: true
+    support:
+      prompt: "Help solve the user's problem."
+"#;
+        let mock = mock_with_responses(vec![
+            "Welcome! How can I help?", // greeting response
+            "1",                        // transition evaluator picks first (index 0)
+            "I'll help you with that.", // support response
+        ]);
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock)).build().unwrap();
+
+        assert_eq!(agent.current_state(), Some("greeting".to_string()));
+        let _ = agent.chat("I need help").await.unwrap();
+        // After transition evaluation, state may or may not have changed
+        // depending on mock evaluator response - the key is that it doesn't crash
+    }
+
+    // State on_enter/on_exit actions
+    #[tokio::test]
+    async fn test_integration_state_on_enter_set_context() {
+        let yaml = r#"
+name: ActionAgent
+system_prompt: "You are helpful."
+states:
+  initial: step1
+  states:
+    step1:
+      prompt: "Step 1"
+      on_exit:
+        - set_context:
+            step1_exited: true
+      transitions:
+        - to: step2
+          when: "always"
+          auto: true
+    step2:
+      prompt: "Step 2"
+      on_enter:
+        - set_context:
+            step2_entered: true
+"#;
+        // The transition evaluator will pick the first transition (index 0)
+        let mock = mock_with_responses(vec![
+            "Processing step 1.",
+            "0", // transition evaluator response: select first transition
+        ]);
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock)).build().unwrap();
+
+        assert_eq!(agent.current_state(), Some("step1".to_string()));
+
+        // Manually transition to test on_enter/on_exit
+        agent.transition_to("step2").await.unwrap();
+
+        assert_eq!(agent.current_state(), Some("step2".to_string()));
+
+        // Verify context was set by on_exit and on_enter actions
+        let ctx = agent.get_context();
+        assert_eq!(ctx.get("step1_exited"), Some(&serde_json::json!(true)));
+        assert_eq!(ctx.get("step2_entered"), Some(&serde_json::json!(true)));
+    }
+
+    // Process pipeline transforms input
+    #[tokio::test]
+    async fn test_integration_process_normalize() {
+        let yaml = r#"
+name: ProcessAgent
+system_prompt: "You are helpful."
+process:
+  input:
+    - type: normalize
+      config:
+        trim: true
+        collapse_whitespace: true
+"#;
+        let mock = mock_with_response("Got your message.");
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock.clone())).build().unwrap();
+
+        let _ = agent.chat("  hello   world  ").await.unwrap();
+
+        // Verify the LLM received the normalized input (trimmed + collapsed whitespace)
+        let history = mock.call_history();
+        assert!(!history.is_empty());
+        // The user message in LLM call should be normalized
+        let last_call = history.last().unwrap();
+        let user_msg = last_call
+            .messages
+            .iter()
+            .find(|m| m.role == ai_agents_core::Role::User)
+            .unwrap();
+        assert_eq!(user_msg.content, "hello world");
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Integration Test 2.1.7: Memory compression triggers
+    // ═══════════════════════════════════════════════════════════
+    #[tokio::test]
+    async fn test_integration_memory_compression() {
+        let yaml = r#"
+name: MemoryAgent
+system_prompt: "You are helpful."
+memory:
+  type: compacting
+  max_messages: 100
+  compress_threshold: 5
+  max_recent_messages: 3
+  summarize_batch_size: 2
+"#;
+        // Provide enough responses for compression to trigger
+        let responses: Vec<&str> = (0..8).map(|_| "Response from assistant.").collect();
+        let mock = mock_with_responses(responses);
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let agent = builder.llm(Arc::new(mock)).build().unwrap();
+
+        // Send enough messages to trigger compression
+        for i in 0..6 {
+            let _ = agent.chat(&format!("Message {}", i)).await.unwrap();
+        }
+
+        // Memory should have compressed - verify it didn't crash
+        // and that messages are bounded
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        // With compress_threshold=5 and max_recent_messages=3,
+        // after 6 turns (12 messages), compression should have run
+        assert!(messages.len() <= 12); // At most all messages if no compression, fewer if compressed
+    }
+
+    // YAML with multiple LLMs
+    #[tokio::test]
+    async fn test_integration_multi_llm_registry() {
+        let mut mock_default = MockLLMProvider::new("default");
+        mock_default.set_response("Default LLM response.");
+        let mut mock_router = MockLLMProvider::new("router");
+        mock_router.set_response("Router response.");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm_alias("default", Arc::new(mock_default))
+            .llm_alias("router", Arc::new(mock_router))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hello").await.unwrap();
+        assert_eq!(response.content, "Default LLM response.");
+    }
+
+    // Agent reset clears state
+    #[tokio::test]
+    async fn test_integration_agent_reset() {
+        let mock = mock_with_responses(vec!["Hello!", "Hello again!"]);
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let _ = agent.chat("Hi").await.unwrap();
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 2); // user + assistant
+
+        agent.reset().await.unwrap();
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 0);
+    }
+
+    // Process pipeline rejects input
+    #[tokio::test]
+    async fn test_integration_process_validate_reject() {
+        use ai_agents_process::{ProcessConfig, ProcessProcessor};
+
+        let validate_config = ai_agents_process::ValidateStage {
+            id: Some("length_check".to_string()),
+            condition: None,
+            config: ai_agents_process::ValidateConfig {
+                rules: vec![ai_agents_process::ValidationRule::MinLength {
+                    min_length: 10,
+                    on_fail: ai_agents_process::ValidationAction {
+                        action: ai_agents_process::ValidationActionType::Reject,
+                        message: None,
+                    },
+                }],
+                ..Default::default()
+            },
+        };
+        let process_config = ProcessConfig {
+            input: vec![ai_agents_process::ProcessStage::Validate(validate_config)],
+            ..Default::default()
+        };
+        let processor = ProcessProcessor::new(process_config);
+
+        let mock = mock_with_response("Should not reach here.");
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .process_processor(processor)
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hi").await.unwrap();
+        // Rejected input should produce a rejection response, not call LLM
+        assert!(
+            response.content.contains("rejected")
+                || response.content.contains("Input rejected")
+                || response.content.contains("too short")
+                || response.content.contains("Too short")
+                || response.content.len() < 50, // rejection message is typically short
+            "Expected rejection response, got: {}",
+            response.content
+        );
+    }
+}

@@ -1,6 +1,8 @@
 target
 debug
 **/.env
+**/temp
+**/.cargo
 
 **/Cargo.lock
 

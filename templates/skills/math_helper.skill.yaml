@@ -1,0 +1,16 @@
+skill: math_helper
+description: "Skill to help with mathematical calculations"
+trigger: "When user requests help with calculations, math problems, or arithmetic operations"
+
+steps:
+  - tool: calculator
+    args:
+      operation: "{{ user_input }}"
+
+  - prompt: |
+      User question: {{ user_input }}
+
+      Calculation result: {{ steps[0].result }}
+
+      Please explain the calculation result above in a friendly manner.
+      If necessary, briefly explain the calculation process as well.
