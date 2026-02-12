@@ -1,4 +1,79 @@
-//! AI Agents Framework
+//! # AI Agents Framework
+//!
+//! **One YAML = Any Agent.** A Rust framework for building AI agents from a single YAML
+//! specification. No code required for common use cases.
+//!
+//! # Quick Start
+//!
+//! ### From YAML
+//!
+//! ```rust,no_run
+//! use ai_agents::{Agent, AgentBuilder};
+//!
+//! #[tokio::main]
+//! async fn main() -> ai_agents::Result<()> {
+//!     let agent = AgentBuilder::from_yaml_file("agent.yaml")?
+//!         .auto_configure_llms()?
+//!         .build()?;
+//!
+//!     let response = agent.chat("Hello!").await?;
+//!     println!("{}", response.content);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ### From Rust API
+//!
+//! ```rust,no_run
+//! use ai_agents::{AgentBuilder, UnifiedLLMProvider, ProviderType};
+//! use std::sync::Arc;
+//!
+//! #[tokio::main]
+//! async fn main() -> ai_agents::Result<()> {
+//!     let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
+//!
+//!     let agent = AgentBuilder::new()
+//!         .system_prompt("You are a helpful assistant.")
+//!         .llm(Arc::new(llm))
+//!         .build()?;
+//!
+//!     let response = agent.chat("Hello!").await?;
+//!     println!("{}", response.content);
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Modules
+//!
+//! | Module | Description |
+//! |--------|-------------|
+//! | [`agent`] | Agent builder, runtime, streaming, and response types |
+//! | [`llm`] | LLM providers and registry |
+//! | [`memory`] | Conversation memory with compression and token budgeting |
+//! | [`tools`] | Built-in tools and extensible tool registry |
+//! | [`state`] | Hierarchical state machine with LLM-evaluated transitions |
+//! | [`context`] | Dynamic context injection from multiple sources |
+//! | [`skill`] | Reusable workflows with LLM-based intent routing |
+//! | [`hitl`] | Human-in-the-loop approval system |
+//! | [`reasoning`] | Chain-of-thought, ReAct, plan-and-execute modes |
+//! | [`disambiguation`] | Intent ambiguity detection and clarification |
+//! | [`persistence`] | SQLite, Redis, and file storage backends |
+//! | [`process`] | Input/output processing pipeline |
+//! | [`recovery`] | Error recovery with retry and fallback strategies |
+//! | [`hooks`] | Lifecycle event hooks for logging, metrics, monitoring |
+//! | [`spec`] | YAML agent specification types |
+//! | [`template`] | Template loading with Jinja2 rendering and inheritance |
+//!
+//! # Feature Flags
+//!
+//! | Flag | Description |
+//! |------|-------------|
+//! | `sqlite` | SQLite storage backend |
+//! | `redis-storage` | Redis storage backend |
+//! | `http-tool` | HTTP request built-in tool |
+//! | `http-context` | HTTP context source for dynamic context injection |
+//! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
+//! | `full` | All optional features enabled |
 
 pub mod agent {
     pub use ai_agents_runtime::{

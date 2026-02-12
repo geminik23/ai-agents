@@ -8,23 +8,31 @@ use thiserror::Error;
 use crate::message::ChatMessage;
 use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse};
 
-/// Core LLM provider trait
+/// Core LLM provider trait.
+///
+/// Implement this to integrate a custom LLM backend. Most users can use
+/// `UnifiedLLMProvider` which supports OpenAI, Anthropic, and other providers
+/// out of the box.
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// Send messages and get a complete response.
     async fn complete(
         &self,
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<LLMResponse, LLMError>;
 
+    /// Send messages and get a streaming response.
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>;
 
+    /// Provider identifier (e.g. `"openai"`, `"anthropic"`).
     fn provider_name(&self) -> &str;
 
+    /// Check if this provider supports a given feature.
     fn supports(&self, feature: LLMFeature) -> bool;
 }
 

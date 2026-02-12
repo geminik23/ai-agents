@@ -3,14 +3,22 @@ use std::sync::Arc;
 
 use super::types::{ApprovalRequest, ApprovalResult};
 
+/// Handler for human-in-the-loop approval requests.
+///
+/// Built-in handlers: `RejectAllHandler`, `AutoApproveHandler`, `CallbackHandler`,
+/// `LocalizedHandler`. For simple cases, use `create_handler()` or
+/// `create_localized_handler()` helpers instead of implementing this directly.
 #[async_trait]
 pub trait ApprovalHandler: Send + Sync {
+    /// Process an approval request and return the decision.
     async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult;
 
+    /// Language preference for approval messages. Returns `None` by default.
     fn preferred_language(&self) -> Option<String> {
         None
     }
 
+    /// Languages this handler can display. Returns `None` by default.
     fn supported_languages(&self) -> Option<Vec<String>> {
         None
     }

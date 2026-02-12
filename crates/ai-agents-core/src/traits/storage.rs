@@ -49,11 +49,18 @@ impl AgentSnapshot {
     }
 }
 
-/// Core storage trait for persisting agent state
+/// Core storage trait for persisting agent state.
+///
+/// Built-in backends: `FileStorage`, `SqliteStorage`, and `RedisStorage`.
+/// Implement this for custom persistence (e.g., PostgreSQL, DynamoDB).
 #[async_trait]
 pub trait AgentStorage: Send + Sync {
+    /// Persist an agent snapshot for the given session ID.
     async fn save(&self, session_id: &str, snapshot: &AgentSnapshot) -> Result<()>;
+    /// Load a snapshot. Returns `None` if the session does not exist.
     async fn load(&self, session_id: &str) -> Result<Option<AgentSnapshot>>;
+    /// Remove a session's persisted data.
     async fn delete(&self, session_id: &str) -> Result<()>;
+    /// List all stored session IDs.
     async fn list_sessions(&self) -> Result<Vec<String>>;
 }

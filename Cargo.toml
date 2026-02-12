@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-rc.4"
+version = "1.0.0-rc.5"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/geminik23/ai-agents"
@@ -55,19 +55,19 @@ reqwest = { version = "0.12", features = ["json"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
-ai-agents-core = { path = "crates/ai-agents-core" }
-ai-agents-llm = { path = "crates/ai-agents-llm" }
-ai-agents-memory = { path = "crates/ai-agents-memory" }
-ai-agents-storage = { path = "crates/ai-agents-storage" }
-ai-agents-tools = { path = "crates/ai-agents-tools" }
-ai-agents-state = { path = "crates/ai-agents-state" }
-ai-agents-context = { path = "crates/ai-agents-context" }
-ai-agents-process = { path = "crates/ai-agents-process" }
-ai-agents-skills = { path = "crates/ai-agents-skills" }
-ai-agents-hitl = { path = "crates/ai-agents-hitl" }
-ai-agents-hooks = { path = "crates/ai-agents-hooks" }
-ai-agents-recovery = { path = "crates/ai-agents-recovery" }
-ai-agents-reasoning = { path = "crates/ai-agents-reasoning" }
-ai-agents-disambiguation = { path = "crates/ai-agents-disambiguation" }
-ai-agents-template = { path = "crates/ai-agents-template" }
-ai-agents-runtime = { path = "crates/ai-agents-runtime" }
+ai-agents-core = { path = "crates/ai-agents-core", version = "1.0.0-rc.5" }
+ai-agents-llm = { path = "crates/ai-agents-llm", version = "1.0.0-rc.5" }
+ai-agents-memory = { path = "crates/ai-agents-memory", version = "1.0.0-rc.5" }
+ai-agents-storage = { path = "crates/ai-agents-storage", version = "1.0.0-rc.5" }
+ai-agents-tools = { path = "crates/ai-agents-tools", version = "1.0.0-rc.5" }
+ai-agents-state = { path = "crates/ai-agents-state", version = "1.0.0-rc.5" }
+ai-agents-context = { path = "crates/ai-agents-context", version = "1.0.0-rc.5" }
+ai-agents-process = { path = "crates/ai-agents-process", version = "1.0.0-rc.5" }
+ai-agents-skills = { path = "crates/ai-agents-skills", version = "1.0.0-rc.5" }
+ai-agents-hitl = { path = "crates/ai-agents-hitl", version = "1.0.0-rc.5" }
+ai-agents-hooks = { path = "crates/ai-agents-hooks", version = "1.0.0-rc.5" }
+ai-agents-recovery = { path = "crates/ai-agents-recovery", version = "1.0.0-rc.5" }
+ai-agents-reasoning = { path = "crates/ai-agents-reasoning", version = "1.0.0-rc.5" }
+ai-agents-disambiguation = { path = "crates/ai-agents-disambiguation", version = "1.0.0-rc.5" }
+ai-agents-template = { path = "crates/ai-agents-template", version = "1.0.0-rc.5" }
+ai-agents-runtime = { path = "crates/ai-agents-runtime", version = "1.0.0-rc.5" }

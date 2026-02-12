@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Reasoning and reflection capabilities for AI Agents framework"
+keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
+categories = ["asynchronous"]
 
 [dependencies]
 serde = { workspace = true }

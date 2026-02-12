@@ -6,14 +6,22 @@ use async_trait::async_trait;
 
 use ai_agents_core::{ChatMessage, LLMProvider, Result, Role};
 
+/// Summarizes conversation messages for memory compression.
+///
+/// Built-in implementations: `LLMSummarizer` (uses an LLM to generate summaries)
+/// and `NoopSummarizer` (concatenates messages, for testing).
+/// Most users use `LLMSummarizer`, auto-configured from the YAML `summarizer_llm` field.
 #[async_trait]
 pub trait Summarizer: Send + Sync {
+    /// Produce a summary from a batch of messages.
     async fn summarize(&self, messages: &[ChatMessage]) -> Result<String>;
 
+    /// Maximum messages per summarization call. Returns 20 by default.
     fn max_batch_size(&self) -> usize {
         20
     }
 
+    /// Combine multiple summaries into one. Joins with `\n\n` by default.
     async fn merge_summaries(&self, summaries: &[String]) -> Result<String> {
         Ok(summaries.join("\n\n"))
     }

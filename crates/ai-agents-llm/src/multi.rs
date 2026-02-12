@@ -2,12 +2,11 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use ai_agents_core::{
-    ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
-    LLMProvider, LLMResponse, Role, TaskContext, ToolSelection,
+    ChatMessage, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
+    LLMResponse, TaskContext, ToolSelection,
 };
 
 use super::capability::DefaultLLMCapability;
-use super::mock::MockLLMProvider;
 
 #[derive(Clone)]
 pub struct MultiLLMRouter {
@@ -181,6 +180,8 @@ impl LLMCapability for MultiLLMRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mock::MockLLMProvider;
+    use ai_agents_core::{FinishReason, Role};
     use std::collections::HashMap;
 
     #[tokio::test]

@@ -168,6 +168,8 @@ impl UnifiedLLMProvider {
         }
     }
 
+    // LEGACY: kept for potential use by future provider implementations
+    #[allow(dead_code)]
     fn map_finish_reason(&self, reason: &str) -> FinishReason {
         match reason {
             "stop" | "end_turn" => FinishReason::Stop,
