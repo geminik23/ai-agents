@@ -2120,6 +2120,7 @@ Respond in JSON format:
                 } => {
                     info!(
                         resolved_count = resolved.len(),
+                        enriched = %enriched_input,
                         "Input clarified, using enriched input"
                     );
                     return self.run_loop_internal(&enriched_input).await;

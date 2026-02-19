@@ -92,8 +92,11 @@ impl DisambiguationManager {
             return Ok(DisambiguationResult::Clear);
         }
 
-        // Check if we're handling a clarification response
-        if let Some(pending) = self.pending_clarification.read().await.clone() {
+        // Check if we're handling a clarification response.
+        // ISSUE: Solved
+        // Clone and drop the read guard before entering the async block to avoid deadlocking with the write lock inside handle_clarification_response.
+        let pending = self.pending_clarification.read().await.clone();
+        if let Some(pending) = pending {
             debug!(
                 attempts = pending.attempts,
                 "Processing clarification response"
