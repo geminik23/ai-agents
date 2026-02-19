@@ -1,6 +1,6 @@
 mod common;
 
-pub use common::repl::{PromptStyle, Repl, ReplConfig, ReplMode};
+pub use common::repl::{CommandResult, PromptStyle, Repl, ReplConfig, ReplMode};
 
 pub fn init_tracing() {
     init_tracing_with_default("ai_agents=info");

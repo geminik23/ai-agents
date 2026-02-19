@@ -45,9 +45,9 @@ path = "skill_agent.rs"
 name = "tool_agent_demo"
 path = "tool_agent_demo.rs"
 
-# [[example]]
-# name = "memory_agent"
-# path = "memory_agent.rs"
+[[example]]
+name = "memory_agent"
+path = "memory_agent.rs"
 
 # [[example]]
 # name = "hitl_agent"

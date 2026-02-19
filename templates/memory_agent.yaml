@@ -1,0 +1,46 @@
+# Memory Agent Template
+#
+# Demonstrates CompactingMemory with auto-summarization and token budgeting.
+# Uses a router LLM for message compression and a default LLM for chat.
+
+name: MemoryDemo
+version: "1.0.0"
+description: "Memory agent with compacting memory and auto-summarization"
+
+system_prompt: |
+  You are a helpful assistant with excellent memory.
+  You remember previous conversations and can recall details.
+  When asked about past topics, reference what was discussed.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_messages: 100
+  max_recent_messages: 10
+  compress_threshold: 8
+  summarize_batch_size: 4
+  summarizer_llm: router
+  token_budget:
+    total: 4096
+    allocation:
+      summary: 1024
+      recent_messages: 2048
+      facts: 512
+    overflow_strategy: truncate_oldest
+    warn_at_percent: 70
+
+max_iterations: 10
+
+tools: []
+skills: []

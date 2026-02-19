@@ -1,6 +1,15 @@
 use ai_agents::{Agent, AgentResponse, RuntimeAgent, StreamChunk};
 use futures::StreamExt;
 use std::io::{self, Write};
+use std::sync::Arc;
+
+/// Return value from a custom command handler.
+pub enum CommandResult {
+    /// The command was handled; skip further processing for this input.
+    Handled,
+    /// The input was not a recognised custom command; fall through to built-ins.
+    NotHandled,
+}
 
 /// The interactive REPL wrapper around a `RuntimeAgent`.
 pub struct Repl {
@@ -26,6 +35,12 @@ pub struct ReplConfig {
     pub builtin_commands: bool,
     /// Additional hints or instructions to show at startup.
     pub hints: Vec<String>,
+    /// Optional callback invoked before built-in command handling.
+    /// If the callback returns `CommandResult::Handled`, built-in handling is skipped.
+    pub on_command:
+        Option<Arc<dyn Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync>>,
+    /// Optional callback invoked when the REPL is about to exit.
+    pub on_quit: Option<Arc<dyn Fn(&RuntimeAgent) + Send + Sync>>,
 }
 
 /// Controls how the input prompt is rendered.
@@ -63,8 +78,15 @@ impl Repl {
                 show_timing: false,
                 builtin_commands: true,
                 hints: vec![],
+                on_command: None,
+                on_quit: None,
             },
         }
+    }
+
+    /// Access the underlying agent (e.g. from an `on_command` callback).
+    pub fn agent(&self) -> &RuntimeAgent {
+        &self.agent
     }
 
     pub fn welcome(mut self, msg: impl Into<String>) -> Self {
@@ -106,6 +128,28 @@ impl Repl {
 
     pub fn no_builtin_commands(mut self) -> Self {
         self.config.builtin_commands = false;
+        self
+    }
+
+    /// Register a custom command handler invoked before the built-in commands.
+    ///
+    /// The callback receives the raw input line and a reference to the agent.
+    /// Return `CommandResult::Handled` to consume the input, or
+    /// `CommandResult::NotHandled` to fall through to built-in handling.
+    pub fn on_command(
+        mut self,
+        handler: impl Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync + 'static,
+    ) -> Self {
+        self.config.on_command = Some(Arc::new(handler));
+        self
+    }
+
+    /// Register a callback that runs when the REPL is about to exit.
+    pub fn on_quit(
+        mut self,
+        handler: impl Fn(&RuntimeAgent) + Send + Sync + 'static,
+    ) -> Self {
+        self.config.on_quit = Some(Arc::new(handler));
         self
     }
 
@@ -160,8 +204,18 @@ impl Repl {
                 continue;
             }
 
+            // Try custom command handler first
+            if let Some(ref handler) = self.config.on_command {
+                if let CommandResult::Handled = handler(input, &self.agent) {
+                    continue;
+                }
+            }
+
             match self.handle_command(input).await {
                 Some(CommandAction::Quit) => {
+                    if let Some(ref handler) = self.config.on_quit {
+                        handler(&self.agent);
+                    }
                     println!("Goodbye!");
                     break;
                 }
