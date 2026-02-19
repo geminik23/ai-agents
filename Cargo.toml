@@ -19,6 +19,7 @@ members = [
     "crates/ai-agents-runtime",
     "crates/ai-agents",
     "examples",
+    "demo/acl-cancel",
 ]
 
 [workspace.package]

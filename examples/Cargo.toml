@@ -5,6 +5,10 @@ publish = false
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+[lib]
+name = "example_support"
+path = "src/lib.rs"
+
 [dependencies]
 ai-agents = { path = "../crates/ai-agents", features = ["full"] }
 tokio = { workspace = true }

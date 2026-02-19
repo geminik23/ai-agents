@@ -20,8 +20,8 @@ skills:
     trigger: "When user says hello, hi, or greets"
     steps:
       - prompt: |
-          The user greeted you: "{{ user_input }}"
-          Respond with a warm, friendly greeting.
+          {% raw %}The user greeted you: "{{ user_input }}"
+          Respond with a warm, friendly greeting.{% endraw %}
 
   - id: calculator_help
     description: "Help with math calculations"
@@ -31,13 +31,13 @@ skills:
         args:
           operation: "2 + 2"
       - prompt: |
-          User asked: {{ user_input }}
+          {% raw %}User asked: {{ user_input }}
           Calculator result: {{ steps[0].result }}
-          Explain the result helpfully.
+          Explain the result helpfully.{% endraw %}
 
 tools:
-  - calculator
-  - echo
+  - name: calculator
+  - name: echo
 
 memory:
   type: in-memory

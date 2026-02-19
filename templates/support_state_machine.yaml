@@ -1,0 +1,158 @@
+# Customer Support State Machine Template
+# Multi-branch support agent with greeting, technical, order, product, and escalation states
+
+name: "{{ agent_name | default('CustomerSupportAgent') }}"
+version: "{{ agent_version | default('1.0.0') }}"
+description: "A multi-branch customer support agent with state machine routing"
+
+system_prompt: |
+  You are a friendly and professional customer support agent.
+  You help customers with technical issues, order inquiries, product questions, and more.
+  Always be empathetic, clear, and solution-oriented.
+  If the customer seems frustrated, acknowledge their feelings and escalate if needed.
+
+llm:
+  provider: "{{ llm_provider | default('openai') }}"
+  model: "{{ llm_model | default('gpt-4.1-nano') }}"
+
+states:
+  initial: greeting
+  fallback: confused
+  max_no_transition: 3
+  global_transitions:
+    - to: escalation
+      when: "User is very frustrated, angry, or explicitly asks for a manager/supervisor"
+      auto: true
+      priority: 100
+  states:
+    greeting:
+      prompt: |
+        Welcome the customer warmly.
+        Ask how you can help them today.
+        Listen carefully to understand what category their issue falls into.
+      transitions:
+        - to: technical_support
+          when: "User mentions technical issues like login problems, errors, bugs, account access, or system issues"
+          auto: true
+        - to: order_support
+          when: "User asks about orders, shipping, delivery, tracking, returns, or refunds"
+          auto: true
+        - to: product_inquiry
+          when: "User asks about products, recommendations, features, pricing, or specifications"
+          auto: true
+
+    technical_support:
+      prompt: |
+        You are now helping with a technical issue.
+        Ask clarifying questions to understand the exact problem.
+        Suggest troubleshooting steps one at a time.
+        Common issues: login problems, password reset, app crashes, connectivity.
+      initial: gathering_info
+      states:
+        gathering_info:
+          prompt: |
+            Gather details about the technical issue.
+            Ask what they were trying to do, what happened, and any error messages they saw.
+          max_turns: 5
+          transitions:
+            - to: proposing_solution
+              when: "Enough information has been gathered to propose a solution"
+              auto: true
+            - to: ^escalation
+              when: "The issue is too complex or the user is frustrated"
+              auto: true
+        proposing_solution:
+          prompt: |
+            Based on the information gathered, propose a solution or troubleshooting steps.
+            Be clear and step-by-step.
+          transitions:
+            - to: ^closing
+              when: "The user confirms the issue is resolved or thanks the agent"
+              auto: true
+            - to: gathering_info
+              when: "The solution didn't work, need to gather more information"
+              auto: true
+            - to: ^escalation
+              when: "Multiple solutions have failed or user requests escalation"
+              auto: true
+
+    order_support:
+      prompt: |
+        You are now helping with an order-related inquiry.
+        Help with order status, shipping, returns, refunds, and delivery issues.
+        Ask for order number or relevant details to assist.
+      transitions:
+        - to: closing
+          when: "The order inquiry is resolved or the user is satisfied"
+          auto: true
+        - to: escalation
+          when: "The issue requires special handling or the user is unhappy"
+          auto: true
+
+    product_inquiry:
+      prompt: |
+        You are now helping with a product inquiry.
+        Provide helpful information about products, features, pricing, and recommendations.
+        Ask about the customer's needs and preferences to give personalized suggestions.
+      transitions:
+        - to: closing
+          when: "The user has the information they need or is satisfied"
+          auto: true
+        - to: order_support
+          when: "The user wants to check on an existing order"
+          auto: true
+
+    escalation:
+      prompt: |
+        The conversation has been escalated.
+        Acknowledge the customer's frustration empathetically.
+        Assure them that their concern is important and will be handled with priority.
+        Summarize the issue clearly for the next level of support.
+      transitions:
+        - to: closing
+          when: "The user feels heard and the escalation is acknowledged"
+          auto: true
+
+    confused:
+      prompt: |
+        You're not sure what the customer needs.
+        Politely ask them to clarify their request.
+        Offer categories they can choose from: technical support, order inquiries, or product questions.
+      transitions:
+        - to: technical_support
+          when: "User mentions technical issues like login problems, errors, bugs, account access, or system issues"
+          auto: true
+        - to: order_support
+          when: "User asks about orders, shipping, delivery, tracking, returns, or refunds"
+          auto: true
+        - to: product_inquiry
+          when: "User asks about products, recommendations, features, pricing, or specifications"
+          auto: true
+
+    closing:
+      prompt: |
+        The issue appears to be resolved.
+        Thank the customer for their patience.
+        Ask if there's anything else you can help with.
+        Wish them a great day.
+      transitions:
+        - to: greeting
+          when: "The user has another question or issue"
+          auto: true
+
+memory:
+  type: in-memory
+  max_messages: 100
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  template: support_state_machine
+  features:
+    - state-machine
+    - hierarchical-states
+    - global-transitions
+    - fallback-state
