@@ -164,6 +164,7 @@ async fn main() -> Result<()> {
 
     let agent = AgentBuilder::from_template("memory_agent")?
         .auto_configure_llms()?
+        .auto_configure_features()?
         .hooks(hooks.clone())
         .build()?;
 

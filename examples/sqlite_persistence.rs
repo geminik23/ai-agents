@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
 
     let agent = AgentBuilder::from_template("sqlite_persistence")?
         .auto_configure_llms()?
+        .auto_configure_features()?
         .build()?;
 
     let storage_cmd = storage.clone();

@@ -190,6 +190,9 @@ pub struct Transition {
     pub when: String,
     #[serde(default)]
     pub guard: Option<TransitionGuard>,
+    /// Intent label for deterministic routing after disambiguation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
     #[serde(default)]
     pub auto: bool,
     #[serde(default)]
@@ -490,6 +493,7 @@ states:
                     to: "nonexistent".into(),
                     when: "always".into(),
                     guard: None,
+                    intent: None,
                     auto: true,
                     priority: 0,
                 }],

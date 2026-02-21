@@ -84,6 +84,8 @@ pub struct RuntimeAgent {
     reflection_config: ReflectionConfig,
     disambiguation_manager: Option<DisambiguationManager>,
     current_plan: RwLock<Option<Plan>>,
+    /// Tool IDs declared in the top-level `tools:` spec.
+    declared_tool_ids: Vec<String>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -102,6 +104,7 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("storage_type", &self.storage_config.storage_type())
             .field("reasoning_mode", &self.reasoning_config.mode)
             .field("reflection_enabled", &self.reflection_config.enabled)
+            .field("declared_tool_ids", &self.declared_tool_ids)
             .finish_non_exhaustive()
     }
 }
@@ -172,7 +175,13 @@ impl RuntimeAgent {
             reflection_config: ReflectionConfig::default(),
             disambiguation_manager: None,
             current_plan: RwLock::new(None),
+            declared_tool_ids: Vec::new(),
         }
+    }
+
+    pub fn with_declared_tool_ids(mut self, ids: Vec<String>) -> Self {
+        self.declared_tool_ids = ids;
+        self
     }
 
     pub fn with_storage_config(mut self, config: StorageConfig) -> Self {
@@ -580,6 +589,16 @@ impl RuntimeAgent {
         let tool_refs = self.get_current_tool_refs();
 
         if tool_refs.is_empty() {
+            // No state-level tools: fallback to agent-level declared tools
+            if !self.declared_tool_ids.is_empty() {
+                return Ok(self
+                    .declared_tool_ids
+                    .iter()
+                    .filter(|id| self.tools.get(id).is_some())
+                    .cloned()
+                    .collect());
+            }
+            // No declared tools either: all registered tools available
             return Ok(self.tools.list_ids());
         }
 
@@ -721,7 +740,11 @@ impl RuntimeAgent {
             }
         }
 
-        let tools_prompt = self.tools.generate_tools_prompt();
+        let tools_prompt = if !self.declared_tool_ids.is_empty() {
+            self.tools.generate_filtered_prompt(&self.declared_tool_ids)
+        } else {
+            self.tools.generate_tools_prompt()
+        };
         if !tools_prompt.is_empty() {
             Ok(format!("{}\n\n{}", rendered_base, tools_prompt))
         } else {
@@ -793,7 +816,10 @@ impl RuntimeAgent {
 
         let current_state = self.current_state().map(|s| s.to_string());
 
-        let available_tools: Vec<String> = self.tools.list_ids().into_iter().collect();
+        let available_tools: Vec<String> = self
+            .get_available_tool_ids()
+            .await
+            .unwrap_or_else(|_| self.tools.list_ids());
 
         let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
 
@@ -1794,7 +1820,10 @@ Answer YES or NO only."#,
             .or_else(|| self.llm_registry.default().ok())
             .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
 
-        let available_tools: Vec<String> = self.tools.list_ids();
+        let available_tools: Vec<String> = self
+            .get_available_tool_ids()
+            .await
+            .unwrap_or_else(|_| self.tools.list_ids());
         let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
 
         let prompt = format!(
@@ -2061,6 +2090,10 @@ Respond in JSON format:
         self.check_turn_timeout().await?;
         self.context_manager.refresh_per_turn().await?;
 
+        // Clear stale disambiguation context from previous turns.
+        // This prevents resolved_intent from leaking across turns and causing incorrect deterministic routing on subsequent inputs.
+        self.clear_disambiguation_context();
+
         // Disambiguation check (before input processing)
         if let Some(ref disambiguator) = self.disambiguation_manager {
             let disambiguation_context = self.build_disambiguation_context().await?;
@@ -2121,8 +2154,26 @@ Respond in JSON format:
                     info!(
                         resolved_count = resolved.len(),
                         enriched = %enriched_input,
-                        "Input clarified, using enriched input"
+                        "Input clarified, injecting resolved intent into context"
                     );
+
+                    // Routing uses `resolved` (structured, deterministic)
+                    // This is what makes post-disambiguation routing DETERMINISTIC
+                    for (key, value) in &resolved {
+                        let context_key = format!("disambiguation.{}", key);
+                        let _ = self.context_manager.set(&context_key, value.clone());
+                    }
+
+                    if let Some(intent) = resolved.get("intent") {
+                        let _ = self.context_manager.set("resolved_intent", intent.clone());
+                    }
+
+                    let _ = self
+                        .context_manager
+                        .set("disambiguation.resolved", serde_json::Value::Bool(true));
+
+                    // The enriched input provides context for the LLM to generate a relevant response.
+                    // It does NOT drive routing decisions.
                     return self.run_loop_internal(&enriched_input).await;
                 }
                 DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
@@ -2216,6 +2267,22 @@ Respond in JSON format:
             .map_err(|e| AgentError::LLM(format!("Localized response generation failed: {}", e)))?;
 
         Ok(response.content.trim().to_string())
+    }
+
+    /// Clear disambiguation-related keys from the context manager.
+    ///
+    /// Called at the start of each turn to prevent stale `resolved_intent` from leaking across turns.
+    fn clear_disambiguation_context(&self) {
+        let _ = self
+            .context_manager
+            .set("resolved_intent", serde_json::Value::Null);
+
+        let all = self.context_manager.get_all();
+        for key in all.keys() {
+            if key.starts_with("disambiguation.") {
+                let _ = self.context_manager.set(key, serde_json::Value::Null);
+            }
+        }
     }
 
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {

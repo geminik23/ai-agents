@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_agents_context::ContextManager;
-use ai_agents_core::{AgentError, AgentStorage, LLMProvider, Result};
+use ai_agents_core::{AgentError, AgentStorage, LLMProvider, Result, Tool};
 use ai_agents_hitl::{ApprovalHandler, HITLEngine, RejectAllHandler};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_llm::LLMRegistry;
@@ -18,7 +18,7 @@ use ai_agents_recovery::{MessageFilter, RecoveryManager};
 use ai_agents_skills::{SkillDefinition, SkillLoader};
 use ai_agents_state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
 use ai_agents_template::{TemplateInheritance, TemplateLoader, TemplateRenderer};
-use ai_agents_tools::{ToolRegistry, ToolSecurityEngine};
+use ai_agents_tools::{ToolRegistry, ToolSecurityEngine, create_builtin_registry};
 
 use super::AgentInfo;
 use super::runtime::RuntimeAgent;
@@ -207,6 +207,11 @@ impl AgentBuilder {
                 }
                 self.process_processor = Some(processor);
             }
+
+            // Auto-register builtin tools if the user hasn't provided a custom registry.
+            if self.tools.is_none() {
+                self.tools = Some(create_builtin_registry());
+            }
         }
         Ok(self)
     }
@@ -236,8 +241,37 @@ impl AgentBuilder {
         self
     }
 
+    /// Replace the entire tool registry.
+    ///
+    /// If `auto_configure_features()` was called before this, the auto-registered builtins will be overwritten.
     pub fn tools(mut self, tools: ToolRegistry) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// Register a single tool into the existing registry.
+    ///
+    /// If no registry exists yet, creates an empty one first.
+    /// Use this to add custom tools on top of auto-configured builtins.
+    pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        let registry = self.tools.get_or_insert_with(ToolRegistry::new);
+        let _ = registry.register(tool);
+        self
+    }
+
+    /// Merge tools from another registry into the existing one.
+    ///
+    /// Skips tools whose ID already exists (no overwrite).
+    /// If no registry exists yet, creates an empty one first.
+    pub fn extend_tools(mut self, additional: ToolRegistry) -> Self {
+        let registry = self.tools.get_or_insert_with(ToolRegistry::new);
+        for id in additional.list_ids() {
+            if registry.get(&id).is_none() {
+                if let Some(tool) = additional.get(&id) {
+                    let _ = registry.register(tool);
+                }
+            }
+        }
         self
     }
 
@@ -436,6 +470,13 @@ impl AgentBuilder {
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
 
+        // Extract declared tool IDs from spec (agent-level tool scope)
+        let declared_tool_ids: Vec<String> = self
+            .spec
+            .as_ref()
+            .map(|s| s.tools.iter().map(|t| t.name.clone()).collect())
+            .unwrap_or_default();
+
         let mut agent = RuntimeAgent::new(
             info,
             llm_registry_arc.clone(),
@@ -444,7 +485,8 @@ impl AgentBuilder {
             self.skills,
             system_prompt,
             max_iterations,
-        );
+        )
+        .with_declared_tool_ids(declared_tool_ids);
 
         if let Some(tokens) = self.max_context_tokens {
             agent = agent.with_max_context_tokens(tokens);

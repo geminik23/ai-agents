@@ -1,6 +1,5 @@
 use ai_agents::{
-    AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result, Tool, ToolRegistry,
-    ToolResult,
+    AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result, Tool, ToolResult,
 };
 use async_trait::async_trait;
 use example_support::{Repl, init_tracing};
@@ -163,14 +162,11 @@ impl Tool for DeleteRecordTool {
 async fn main() -> Result<()> {
     init_tracing();
 
-    let mut tools = ToolRegistry::new();
-    tools.register(Arc::new(SendPaymentTool)).unwrap();
-    tools.register(Arc::new(DeleteRecordTool)).unwrap();
-
     let agent = AgentBuilder::from_template("hitl_agent")?
         .auto_configure_llms()?
         .auto_configure_features()?
-        .tools(tools)
+        .tool(Arc::new(SendPaymentTool))
+        .tool(Arc::new(DeleteRecordTool))
         .approval_handler(Arc::new(CliApprovalHandler))
         .build()?;
 

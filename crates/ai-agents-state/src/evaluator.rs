@@ -285,6 +285,7 @@ impl TransitionEvaluator for LLMTransitionEvaluator {
             return Ok(None);
         }
 
+        // Guard-based transitions (existing, no LLM)
         for (i, transition) in transitions.iter().enumerate() {
             if let Some(ref guard) = transition.guard {
                 if self.evaluate_guard(guard, context) {
@@ -293,6 +294,31 @@ impl TransitionEvaluator for LLMTransitionEvaluator {
             }
         }
 
+        // !!NOTE: Resolved-intent short-circuit
+        //
+        // If disambiguation has resolved an intent, try to match it against transitions that declare an `intent` field.
+        // This is DETERMINISTIC - no LLM call.
+        if let Some(resolved) = context.context.get("resolved_intent") {
+            if let Some(resolved_str) = resolved.as_str() {
+                // Skip null values (used to clear stale context)
+                if !resolved_str.is_empty() {
+                    for (i, transition) in transitions.iter().enumerate() {
+                        if let Some(ref intent) = transition.intent {
+                            if intent == resolved_str {
+                                tracing::debug!(
+                                    resolved_intent = resolved_str,
+                                    target = %transition.to,
+                                    "Deterministic routing via resolved_intent"
+                                );
+                                return Ok(Some(i));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Phase 1: LLM-based evaluation (existing) ──
         let llm_transitions: Vec<(usize, &Transition)> = transitions
             .iter()
             .enumerate()
@@ -393,6 +419,7 @@ mod tests {
             to: "next".into(),
             when: "user says goodbye".into(),
             guard: None,
+            intent: None,
             auto: true,
             priority: 0,
         }];
@@ -415,6 +442,7 @@ mod tests {
                 to: "support".into(),
                 when: "user needs help".into(),
                 guard: None,
+                intent: None,
                 auto: true,
                 priority: 10,
             },
@@ -422,6 +450,7 @@ mod tests {
                 to: "sales".into(),
                 when: "user wants to buy".into(),
                 guard: None,
+                intent: None,
                 auto: true,
                 priority: 5,
             },
@@ -571,6 +600,7 @@ mod tests {
                 to: "llm_based".into(),
                 when: "user wants to proceed".into(),
                 guard: None,
+                intent: None,
                 auto: true,
                 priority: 10,
             },
@@ -578,6 +608,7 @@ mod tests {
                 to: "guard_based".into(),
                 when: String::new(),
                 guard: Some(TransitionGuard::Expression("{{ context.ready }}".into())),
+                intent: None,
                 auto: true,
                 priority: 5,
             },
@@ -601,6 +632,7 @@ mod tests {
                 to: "no_guard".into(),
                 when: "some condition".into(),
                 guard: None,
+                intent: None,
                 auto: true,
                 priority: 10,
             },
@@ -608,6 +640,7 @@ mod tests {
                 to: "with_guard".into(),
                 when: String::new(),
                 guard: Some(TransitionGuard::Expression("{{ context.ready }}".into())),
+                intent: None,
                 auto: true,
                 priority: 5,
             },
@@ -687,5 +720,171 @@ mod tests {
 
         let guard = TransitionGuard::Conditions(GuardConditions::Context(matchers));
         assert!(evaluator.evaluate_guard(&guard, &ctx));
+    }
+
+    /// a transition's `intent` field, routing is deterministic - no LLM call.
+    #[tokio::test]
+    async fn test_intent_based_routing_deterministic() {
+        // The mock has NO responses queued — if the LLM were called it would panic/fail.
+        let mock = MockLLMProvider::new("intent_test");
+        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
+
+        let transitions = vec![
+            Transition {
+                to: "cancel_order".into(),
+                when: "User wants to cancel an order".into(),
+                guard: None,
+                intent: Some("cancel_order".into()),
+                auto: true,
+                priority: 10,
+            },
+            Transition {
+                to: "cancel_reservation".into(),
+                when: "User wants to cancel a reservation".into(),
+                guard: None,
+                intent: Some("cancel_reservation".into()),
+                auto: true,
+                priority: 10,
+            },
+            Transition {
+                to: "cancel_subscription".into(),
+                when: "User wants to cancel a subscription".into(),
+                guard: None,
+                intent: Some("cancel_subscription".into()),
+                auto: true,
+                priority: 10,
+            },
+        ];
+
+        // Simulate disambiguation having resolved intent to "cancel_reservation"
+        let mut context_map = HashMap::new();
+        context_map.insert(
+            "resolved_intent".to_string(),
+            Value::String("cancel_reservation".into()),
+        );
+
+        let ctx =
+            TransitionContext::new("あれキャンセルして", "", "greeting").with_context(context_map);
+
+        let result = evaluator
+            .select_transition(&transitions, &ctx)
+            .await
+            .unwrap();
+        // Should pick index 1 (cancel_reservation) deterministically
+        assert_eq!(result, Some(1));
+    }
+
+    /// the evaluator falls back to LLM-based `when` evaluation.
+    #[tokio::test]
+    async fn test_intent_routing_falls_back_to_llm_when_no_resolved_intent() {
+        let mut mock = MockLLMProvider::new("intent_fallback_test");
+        // LLM returns "1" → first LLM transition (cancel_order)
+        mock.add_response(LLMResponse::new("1", FinishReason::Stop));
+        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
+
+        let transitions = vec![
+            Transition {
+                to: "cancel_order".into(),
+                when: "User wants to cancel an order".into(),
+                guard: None,
+                intent: Some("cancel_order".into()),
+                auto: true,
+                priority: 10,
+            },
+            Transition {
+                to: "cancel_reservation".into(),
+                when: "User wants to cancel a reservation".into(),
+                guard: None,
+                intent: Some("cancel_reservation".into()),
+                auto: true,
+                priority: 10,
+            },
+        ];
+
+        // No resolved_intent in context -> LLM evaluation fires
+        let ctx = TransitionContext::new("Cancel order ORD-1042", "", "greeting")
+            .with_context(HashMap::new());
+
+        let result = evaluator
+            .select_transition(&transitions, &ctx)
+            .await
+            .unwrap();
+        // LLM said "1" → index 0 (first LLM transition)
+        assert_eq!(result, Some(0));
+    }
+
+    /// transition's `intent` field, it falls through to LLM evaluation.
+    #[tokio::test]
+    async fn test_no_routing_when_resolved_intent_doesnt_match() {
+        let mut mock = MockLLMProvider::new("intent_nomatch_test");
+        // LLM returns "0" (none of the above)
+        mock.add_response(LLMResponse::new("0", FinishReason::Stop));
+        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
+
+        let transitions = vec![
+            Transition {
+                to: "cancel_order".into(),
+                when: "User wants to cancel an order".into(),
+                guard: None,
+                intent: Some("cancel_order".into()),
+                auto: true,
+                priority: 10,
+            },
+            Transition {
+                to: "cancel_reservation".into(),
+                when: "User wants to cancel a reservation".into(),
+                guard: None,
+                intent: Some("cancel_reservation".into()),
+                auto: true,
+                priority: 10,
+            },
+        ];
+
+        // resolved_intent is "something_else" which matches no transition
+        let mut context_map = HashMap::new();
+        context_map.insert(
+            "resolved_intent".to_string(),
+            Value::String("something_else".into()),
+        );
+
+        let ctx = TransitionContext::new("do something", "", "greeting").with_context(context_map);
+
+        let result = evaluator
+            .select_transition(&transitions, &ctx)
+            .await
+            .unwrap();
+        // LLM said "0" → None
+        assert_eq!(result, None);
+    }
+
+    /// should be ignored - not treated as a valid intent.
+    #[tokio::test]
+    async fn test_null_resolved_intent_is_ignored() {
+        let mut mock = MockLLMProvider::new("intent_null_test");
+        mock.add_response(LLMResponse::new("1", FinishReason::Stop));
+        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
+
+        let transitions = vec![Transition {
+            to: "cancel_order".into(),
+            when: "User wants to cancel an order".into(),
+            guard: None,
+            intent: Some("cancel_order".into()),
+            auto: true,
+            priority: 10,
+        }];
+
+        // resolved_intent is Null (simulating clear_disambiguation_context)
+        let mut context_map = HashMap::new();
+        context_map.insert("resolved_intent".to_string(), Value::Null);
+
+        let ctx =
+            TransitionContext::new("Cancel my order", "", "greeting").with_context(context_map);
+
+        let result = evaluator
+            .select_transition(&transitions, &ctx)
+            .await
+            .unwrap();
+        // Null resolved_intent should be ignored; LLM said "1" -> index 0
+        assert_eq!(result, Some(0));
     }
 }
