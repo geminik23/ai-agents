@@ -5,15 +5,13 @@ trigger: "When user asks about clothing, outfit preparation, or weather-appropri
 steps:
   - tool: echo
     args:
-      message: '{"temperature": 18, "condition": "sunny", "location": "Seoul"}'
+      message: "temperature=18, condition=sunny, location=Seoul"
 
   - prompt: |
       User question: {{ user_input }}
 
-      Current weather information:
-      - Location: {{ steps[0].result.location }}
-      - Temperature: {{ steps[0].result.temperature }}°C
-      - Condition: {{ steps[0].result.condition }}
+      Current weather information (from tool):
+      {{ steps[0].result }}
 
       Based on the weather information above, please recommend appropriate clothing.
       Respond in a friendly and natural manner.

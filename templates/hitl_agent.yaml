@@ -1,0 +1,72 @@
+name: HITLDemoAgent
+version: "1.0.0"
+description: "Agent with human-in-the-loop approval for sensitive operations"
+
+system_prompt: |
+  You are a helpful assistant that can send payments and delete records.
+  When the user asks you to send money or delete something, use the
+  appropriate tool immediately. Do NOT ask for confirmation yourself —
+  the HITL system handles approval automatically.
+  Always respond in the user's language.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+hitl:
+  default_timeout_seconds: 300
+  on_timeout: reject
+  message_language:
+    strategy: auto
+    fallback:
+      - approver
+      - user
+      - explicit
+    explicit: en
+  tools:
+    send_payment:
+      require_approval: true
+      approval_context:
+        - amount
+        - currency
+        - recipient
+      approval_message:
+        en: "Approve payment of {{ amount }} {{ currency }} to {{ recipient }}?"
+        ko: "{{ recipient }}에게 {{ amount }} {{ currency }} 결제를 승인하시겠습니까?"
+        ja: "{{ recipient }}への{{ amount }} {{ currency }}の支払いを承認しますか？"
+        description: "Payment approval request"
+      timeout_seconds: 600
+    delete_record:
+      require_approval: true
+      approval_context:
+        - record_id
+        - record_type
+      approval_message:
+        en: "Approve deletion of {{ record_type }} {{ record_id }}?"
+        ko: "{{ record_type }} {{ record_id }} 삭제를 승인하시겠습니까?"
+        ja: "{{ record_type }} {{ record_id }}の削除を承認しますか？"
+        description: "Record deletion approval"
+  conditions:
+    - name: high_value_transaction
+      when: "Transaction amount exceeds $1000"
+      require_approval: true
+      approval_message:
+        en: "High value transaction detected"
+        ko: "고액 거래가 감지되었습니다"
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []

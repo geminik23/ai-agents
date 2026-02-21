@@ -3,14 +3,25 @@ description: "Skill to help with mathematical calculations"
 trigger: "When user requests help with calculations, math problems, or arithmetic operations"
 
 steps:
+  # Step 1: Extract the math expression from natural language input
+  - prompt: |
+      Extract ONLY the mathematical expression from this user message.
+      Output ONLY the math expression using +, -, *, /, ^, and parentheses. Nothing else.
+
+      User message: "{{ user_input }}"
+
+      Mathematical expression:
+
+  # Step 2: Evaluate the extracted expression
   - tool: calculator
     args:
-      operation: "{{ user_input }}"
+      expression: "{{ steps[0].result }}"
 
+  # Step 3: Explain the result
   - prompt: |
       User question: {{ user_input }}
 
-      Calculation result: {{ steps[0].result }}
+      Calculation result: {{ steps[1].result }}
 
       Please explain the calculation result above in a friendly manner.
       If necessary, briefly explain the calculation process as well.

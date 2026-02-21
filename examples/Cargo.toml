@@ -30,14 +30,6 @@ name = "state_machine_agent"
 path = "state_machine_agent.rs"
 
 [[example]]
-name = "streaming_chat"
-path = "streaming_chat.rs"
-
-[[example]]
-name = "yaml_agent"
-path = "yaml_agent.rs"
-
-[[example]]
 name = "skill_agent"
 path = "skill_agent.rs"
 
@@ -49,22 +41,19 @@ path = "tool_agent_demo.rs"
 name = "memory_agent"
 path = "memory_agent.rs"
 
-# [[example]]
-# name = "hitl_agent"
-# path = "hitl_agent.rs"
+[[example]]
+name = "hitl_agent"
+path = "hitl_agent.rs"
 
-# [[example]]
-# name = "multilingual_tools"
-# path = "multilingual_tools.rs"
+[[example]]
+name = "sqlite_persistence"
+path = "sqlite_persistence.rs"
 
-# [[example]]
-# name = "sqlite_persistence"
-# path = "sqlite_persistence.rs"
+[[example]]
+name = "reasoning_agent"
+path = "reasoning_agent.rs"
 
-# [[example]]
-# name = "reasoning_agent"
-# path = "reasoning_agent.rs"
+[[example]]
+name = "disambiguation_agent"
+path = "disambiguation_agent.rs"
 
-# [[example]]
-# name = "disambiguation_agent"
-# path = "disambiguation_agent.rs"

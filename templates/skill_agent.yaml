@@ -1,6 +1,3 @@
-# Skill-based Agent Template
-# Demonstrates skills and multi-LLM configuration
-
 name: "{{ agent_name | default('SkillAssistant') }}"
 version: "1.0.0"
 description: "An assistant with skill-based routing"
@@ -15,6 +12,13 @@ llm:
   model: "{{ llm_model | default('gpt-4.1-nano') }}"
 
 skills:
+  # 1. External skill by name — resolves to templates/skills/math_helper.skill.yaml
+  - math_helper
+
+  # 2. External skill by file path
+  - file: templates/skills/weather_clothes.skill.yaml
+
+  # 3. Inline skill definition
   - id: greeting
     description: "Greet users warmly"
     trigger: "When user says hello, hi, or greets"
@@ -22,18 +26,6 @@ skills:
       - prompt: |
           {% raw %}The user greeted you: "{{ user_input }}"
           Respond with a warm, friendly greeting.{% endraw %}
-
-  - id: calculator_help
-    description: "Help with math calculations"
-    trigger: "When user asks for calculation or math help"
-    steps:
-      - tool: calculator
-        args:
-          operation: "2 + 2"
-      - prompt: |
-          {% raw %}User asked: {{ user_input }}
-          Calculator result: {{ steps[0].result }}
-          Explain the result helpfully.{% endraw %}
 
 tools:
   - name: calculator
@@ -49,4 +41,5 @@ metadata:
   template: skill_agent
   features:
     - skills
-    - multi-llm
+    - external-skills
+    - inline-skills
