@@ -10,7 +10,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default -- tool policies, HITL approvals, error recovery
 - Extensible -- custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.5** | 17 crates | 681 tests
+> Status: **1.0.0-rc.5**
 >
 > Under active development. APIs and YAML schema may change between minor versions.
 > Documentation and more examples are coming.
@@ -27,6 +27,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 ### State Machine
 - Hierarchical states -- nested sub-states with prompt inheritance
 - Auto transitions -- LLM-evaluated conditions with guard-based short-circuiting
+- Intent-based routing -- deterministic `intent:` transitions after disambiguation (no LLM call)
 - Entry/exit actions -- execute tools, skills, prompts, or set context on state change
 - Turn timeout -- automatic state transition after max turns
 
@@ -39,6 +40,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ### Tools
 - Built-in tools -- datetime, JSON, random, HTTP, file, text, template, math, calculator(for dev)
+- Tool scoping -- 3-level filtering: `state.tools` -> `spec.tools` -> registry (all)
 - Conditional availability -- context, state, time, semantic (LLM-based), and composite conditions
 - Multi-language aliases -- tool names and descriptions in any language
 - Parallel execution -- concurrent tool calls with configurable concurrency
@@ -68,6 +70,12 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 | Workspace Refactoring | 17 modular crates for parallel compilation | ✅ Done |
 | Reasoning & Reflection | Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation | ✅ Done |
 | Intent Disambiguation | LLM-based ambiguity detection and clarification | ✅ Done |
+| MCP Integration | Model Context Protocol tool ecosystem | Planned |
+| Hot Reload | Live YAML configuration updates without restart | Planned |
+| Dynamic Agent Spawning | Runtime agent creation, registry, inter-agent messaging | Planned |
+| Multi-Agent Orchestration | Supervisor, pipeline, crew patterns | Planned |
+| A2A Protocol | Agent-to-Agent communication and delegation | Planned |
+| Agent Composition | Multi-agent patterns (supervisor, pipeline, debate) | Planned |
 | Evaluation Framework | Dataset runner, metrics, LLM judge | Planned |
 | Observability & Tracing | Per-call latency, token usage, cost tracking | Planned |
 | Conversation Scripts | Declarative guided flows with LLM extraction | Planned |
@@ -75,17 +83,12 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 | Reasoning Depth Control | Auto shallow/standard/deep with resource limits | Planned |
 | Conversation Style Modifiers | Dynamic tone, formality, verbosity adaptation | Planned |
 | Session Management | Cross-session user memory, key facts extraction | Planned |
-| Multi-Agent Orchestration | Supervisor, pipeline, crew patterns | Planned |
 | VectorDB Tool | Embedding-based retrieval for RAG | Planned |
 | Background Tasks & Scheduling | Cron-based, event-driven, interval tasks | Planned |
 | Knowledge Base / RAG | Document ingestion, chunking, retrieval pipeline | Planned |
-| Hot Reload | Live YAML configuration updates without restart | Planned |
 | Code Interpreter | Sandboxed Python/JS execution with templates | Planned |
-| MCP Integration | Model Context Protocol tool ecosystem | Planned |
 | Semantic Caching | Embedding-based response caching | Planned |
 | Budget Control | Token/cost limits, LLM switching, cost prediction | Planned |
-| A2A Protocol | Agent-to-Agent communication and delegation | Planned |
-| Agent Composition | Multi-agent patterns (supervisor, pipeline, debate) | Planned |
 
 ## Install
 
@@ -114,6 +117,7 @@ use ai_agents::{Agent, AgentBuilder};
 async fn main() -> ai_agents::Result<()> {
     let agent = AgentBuilder::from_yaml_file("agent.yaml")?
         .auto_configure_llms()?
+        .auto_configure_features()?
         .build()?;
 
     let response = agent.chat("Hello!").await?;
