@@ -63,12 +63,17 @@ impl ToolRegistry {
             return self.resolve_tool_ref(tool_ref);
         }
 
-        // Try case-insensitive match on tool IDs
-        // (LLM may return tool name like "Calculator" but ID is "calculator")
+        // Try case-insensitive match on tool IDs and display names
+        // (LLM may return display name like "HTTP Client" but ID is "http")
         let lower_input = id_or_alias.to_lowercase();
         for (id, tool_ref) in tool_index.iter() {
             if id.to_lowercase() == lower_input {
                 return self.resolve_tool_ref(tool_ref);
+            }
+            if let Some(tool) = self.resolve_tool_ref(tool_ref) {
+                if tool.name().to_lowercase() == lower_input {
+                    return Some(tool);
+                }
             }
         }
 

@@ -996,19 +996,28 @@ impl RuntimeAgent {
         let tool_start = Instant::now();
 
         let available_tool_ids = self.get_available_tool_ids().await?;
-        // Compare case-insensitively: LLM may return tool name (e.g., "Calculator")
-        // while available_tool_ids contains tool IDs (e.g., "calculator")
+        // Resolve the tool call name to its canonical ID via the registry.
+        // The LLM may use the display name (e.g., "HTTP Client") but
+        // available_tool_ids contains IDs (e.g., "http"). Registry.get()
+        // now matches by ID, display name, and alias.
+        let resolved_id = self
+            .tools
+            .get(&tool_call.name)
+            .map(|t| t.id().to_lowercase());
         let tool_name_lower = tool_call.name.to_lowercase();
-        if !available_tool_ids.is_empty()
-            && !available_tool_ids
-                .iter()
-                .any(|id| id.to_lowercase() == tool_name_lower)
-        {
-            warn!(tool = %tool_call.name, "Tool not available in current context");
-            return Err(AgentError::Tool(format!(
-                "Tool '{}' is not available in current context",
-                tool_call.name
-            )));
+        if !available_tool_ids.is_empty() {
+            let is_available = available_tool_ids.iter().any(|id| {
+                let id_lower = id.to_lowercase();
+                id_lower == tool_name_lower
+                    || resolved_id.as_deref() == Some(&id_lower)
+            });
+            if !is_available {
+                warn!(tool = %tool_call.name, "Tool not available in current context");
+                return Err(AgentError::Tool(format!(
+                    "Tool '{}' is not available in current context",
+                    tool_call.name
+                )));
+            }
         }
 
         // FIX: note Check security FIRST — don't bother the human if security blocks
@@ -1527,11 +1536,18 @@ OVERALL: PASS/FAIL"#,
         for action in actions {
             match action {
                 StateAction::Tool { tool, args } => {
-                    let args_value = args.clone().unwrap_or(Value::Object(Default::default()));
+                    let raw_args = args.clone().unwrap_or(Value::Object(Default::default()));
+                    // Render template variables in tool args (e.g., {{ context.order_id }})
+                    let args_value = self.render_action_args(&raw_args);
                     if let Some(t) = self.tools.get(tool) {
                         let result = t.execute(args_value).await;
                         if result.success {
                             debug!(tool = %tool, "State action: tool executed");
+                            // Store tool result in memory so the LLM can reference it
+                            let _ = self
+                                .memory
+                                .add_message(ChatMessage::function(tool, &result.output))
+                                .await;
                         } else {
                             warn!(tool = %tool, error = %result.output, "State action: tool failed");
                         }
@@ -1574,7 +1590,19 @@ OVERALL: PASS/FAIL"#,
                     };
                     match llm_result {
                         Ok(llm_provider) => {
-                            let messages = vec![ChatMessage::user(prompt)];
+                            // Render template variables and include conversation context
+                            let context = self.context_manager.get_all();
+                            let rendered_prompt = self
+                                .template_renderer
+                                .render(prompt, &context)
+                                .unwrap_or_else(|_| prompt.clone());
+                            let recent = self
+                                .memory
+                                .get_messages(Some(5))
+                                .await
+                                .unwrap_or_default();
+                            let mut messages: Vec<ChatMessage> = recent;
+                            messages.push(ChatMessage::user(&rendered_prompt));
                             match llm_provider.complete(&messages, None).await {
                                 Ok(response) => {
                                     if let Some(key) = store_as {
@@ -2271,6 +2299,35 @@ Respond in JSON format:
 
     /// Clear disambiguation-related keys from the context manager.
     ///
+    /// Render template variables in state action args using the context manager.
+    fn render_action_args(&self, args: &Value) -> Value {
+        let context = self.context_manager.get_all();
+        match args {
+            Value::Object(map) => {
+                let mut rendered = serde_json::Map::new();
+                for (k, v) in map {
+                    match v {
+                        Value::String(s) if s.contains("{{") => {
+                            match self.template_renderer.render(s, &context) {
+                                Ok(rendered_str) => {
+                                    rendered.insert(k.clone(), Value::String(rendered_str));
+                                }
+                                Err(_) => {
+                                    rendered.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        _ => {
+                            rendered.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                Value::Object(rendered)
+            }
+            _ => args.clone(),
+        }
+    }
+
     /// Called at the start of each turn to prevent stale `resolved_intent` from leaking across turns.
     fn clear_disambiguation_context(&self) {
         let _ = self
@@ -2457,6 +2514,21 @@ Respond in JSON format:
             let content = response.content.trim();
 
             if let Some(tool_calls) = self.parse_tool_calls(content) {
+                // Check if a transition should fire before executing the LLM's tool call.
+                // If a transition fires, on_enter actions handle the tool call correctly
+                // (with proper URLs from YAML), so skip the LLM's tool call.
+                let transition_fired = self
+                    .evaluate_transitions(processed_input, content)
+                    .await?;
+                if transition_fired {
+                    self.memory
+                        .add_message(ChatMessage::assistant(
+                            "(Transitioned to new state — tool call handled by workflow)",
+                        ))
+                        .await?;
+                    continue;
+                }
+
                 let results = self.execute_tools_parallel(&tool_calls).await;
 
                 for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {

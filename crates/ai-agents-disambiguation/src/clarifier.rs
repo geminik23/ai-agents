@@ -228,19 +228,23 @@ We asked for clarification: "{}"
             r#"
 User responded: "{}"
 
-Parse the user's response and provide:
-1. Whether they made a clear choice
-2. The enriched/clarified version of their original request
+Parse the user's response and determine which option they selected.
+If they replied with a number, letter, or short phrase, match it to the corresponding option above.
 
 Respond in JSON format:
 {{
   "understood": true/false,
   "selected_option": "option_id if applicable, null otherwise",
-  "enriched_input": "The original request with clarifications incorporated",
-  "resolved": {{}} // Key-value pairs of what was clarified
+  "enriched_input": "The original request rewritten to be unambiguous",
+  "resolved": {{
+    "intent": "a short snake_case label derived from the selected option"
+  }}
 }}
 
-IMPORTANT: Output ONLY valid JSON, no other text."#,
+IMPORTANT:
+- "understood" should be true if the user clearly selected one of the available options.
+- "intent" in "resolved" MUST be a short snake_case label derived from the selected option's meaning.
+- Output ONLY valid JSON, no other text."#,
             user_response
         ));
 

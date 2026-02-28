@@ -1,4 +1,6 @@
-use ai_agents::{AgentBuilder, AgentSpec, ProviderType, Result, UnifiedLLMProvider};
+use ai_agents::{
+    AgentBuilder, AgentSpec, ProviderType, Result, UnifiedLLMProvider, create_builtin_registry,
+};
 use example_support::{Repl, init_tracing};
 use std::sync::Arc;
 
@@ -22,6 +24,7 @@ async fn main() -> Result<()> {
     let agent = AgentBuilder::from_spec(create_tool_agent_spec())
         .llm(Arc::new(llm))
         .auto_configure_features()?
+        .tools(create_builtin_registry())
         .build()?;
 
     Repl::new(agent)
