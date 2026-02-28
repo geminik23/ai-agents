@@ -265,7 +265,10 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
         };
 
         let prompt = format!(
-            r#"Is this message a social/greeting message (hello, thanks, bye, etc.) that doesn't require any action?
+            r#"Is this message ONLY a social/greeting message (hello, thanks, bye, etc.) that doesn't require any action?
+
+IMPORTANT: Short affirmative/negative responses like "yes", "no", "ok", "응", "네", "はい", "y", "n" are NOT social messages — they are answers to a previous question.
+
 Message: "{}"
 Answer only "yes" or "no"."#,
             input

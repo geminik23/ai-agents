@@ -1008,8 +1008,7 @@ impl RuntimeAgent {
         if !available_tool_ids.is_empty() {
             let is_available = available_tool_ids.iter().any(|id| {
                 let id_lower = id.to_lowercase();
-                id_lower == tool_name_lower
-                    || resolved_id.as_deref() == Some(&id_lower)
+                id_lower == tool_name_lower || resolved_id.as_deref() == Some(&id_lower)
             });
             if !is_available {
                 warn!(tool = %tool_call.name, "Tool not available in current context");
@@ -1543,11 +1542,11 @@ OVERALL: PASS/FAIL"#,
                         let result = t.execute(args_value).await;
                         if result.success {
                             debug!(tool = %tool, "State action: tool executed");
-                            // Store tool result in memory so the LLM can reference it
+                            // Store tool result in context so YAML prompts can reference it
+                            let context_key = format!("last_tool_result");
                             let _ = self
-                                .memory
-                                .add_message(ChatMessage::function(tool, &result.output))
-                                .await;
+                                .context_manager
+                                .set(&context_key, serde_json::Value::String(result.output));
                         } else {
                             warn!(tool = %tool, error = %result.output, "State action: tool failed");
                         }
@@ -1596,11 +1595,8 @@ OVERALL: PASS/FAIL"#,
                                 .template_renderer
                                 .render(prompt, &context)
                                 .unwrap_or_else(|_| prompt.clone());
-                            let recent = self
-                                .memory
-                                .get_messages(Some(5))
-                                .await
-                                .unwrap_or_default();
+                            let recent =
+                                self.memory.get_messages(Some(5)).await.unwrap_or_default();
                             let mut messages: Vec<ChatMessage> = recent;
                             messages.push(ChatMessage::user(&rendered_prompt));
                             match llm_provider.complete(&messages, None).await {
@@ -2517,9 +2513,7 @@ Respond in JSON format:
                 // Check if a transition should fire before executing the LLM's tool call.
                 // If a transition fires, on_enter actions handle the tool call correctly
                 // (with proper URLs from YAML), so skip the LLM's tool call.
-                let transition_fired = self
-                    .evaluate_transitions(processed_input, content)
-                    .await?;
+                let transition_fired = self.evaluate_transitions(processed_input, content).await?;
                 if transition_fired {
                     self.memory
                         .add_message(ChatMessage::assistant(
@@ -2658,8 +2652,27 @@ Respond in JSON format:
             self.check_memory_compression().await?;
 
             self.increment_turn();
-            self.evaluate_transitions(processed_input, &final_content)
+            let transitioned = self
+                .evaluate_transitions(processed_input, &final_content)
                 .await?;
+
+            // FIX: find better solution later
+            // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
+            // The current final_content was generated in the OLD state context and is stale. Re-generate the response in the new state context so the LLM can reference the on_enter tool results (now in memory).
+            if transitioned {
+                let new_llm = self.get_state_llm()?;
+                let new_messages = self.build_messages().await?;
+                let new_response = new_llm
+                    .complete(&new_messages, None)
+                    .await
+                    .map_err(|e| AgentError::LLM(e.to_string()))?;
+                final_content = new_response.content.trim().to_string();
+
+                // FIX: check later
+                self.memory
+                    .add_message(ChatMessage::assistant(&final_content))
+                    .await?;
+            }
 
             let reasoning_metadata = ReasoningMetadata::new(reasoning_mode.clone())
                 .with_thinking(thinking_content.clone().unwrap_or_default())
