@@ -41,8 +41,12 @@ pub struct StateDefinition {
     #[serde(default)]
     pub skills: Vec<String>,
 
-    #[serde(default)]
-    pub tools: Vec<ToolRef>,
+    /// Tool availability for this state.
+    /// - `None` (omitted in YAML): inherit from parent or agent-level tools
+    /// - `Some([])` (`tools: []` in YAML): explicitly no tools available
+    /// - `Some([...])`: only these tools available
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolRef>>,
 
     #[serde(default)]
     pub transitions: Vec<Transition>,
@@ -412,15 +416,18 @@ impl StateDefinition {
     pub fn get_effective_tools<'a>(
         &'a self,
         parent: Option<&'a StateDefinition>,
-    ) -> Vec<&'a ToolRef> {
-        if !self.inherit_parent || parent.is_none() {
-            return self.tools.iter().collect();
+    ) -> Option<Vec<&'a ToolRef>> {
+        match &self.tools {
+            // Explicitly set (including empty): use as-is, no inheritance
+            Some(tools) => Some(tools.iter().collect()),
+            // Not set: inherit from parent if available
+            None => {
+                if !self.inherit_parent {
+                    return None;
+                }
+                parent.and_then(|p| p.tools.as_ref()).map(|t| t.iter().collect())
+            }
         }
-
-        let parent = parent.unwrap();
-        let mut tools: Vec<&'a ToolRef> = parent.tools.iter().collect();
-        tools.extend(self.tools.iter());
-        tools
     }
 
     pub fn get_effective_skills<'a>(
@@ -697,20 +704,20 @@ states:
     #[test]
     fn test_inherit_parent() {
         let parent = StateDefinition {
-            tools: vec![ToolRef::Simple("parent_tool".into())],
+            tools: Some(vec![ToolRef::Simple("parent_tool".into())]),
             skills: vec!["parent_skill".into()],
             ..Default::default()
         };
 
         let child = StateDefinition {
-            tools: vec![ToolRef::Simple("child_tool".into())],
+            tools: Some(vec![ToolRef::Simple("child_tool".into())]),
             skills: vec!["child_skill".into()],
             inherit_parent: true,
             ..Default::default()
         };
 
-        let effective_tools = child.get_effective_tools(Some(&parent));
-        assert_eq!(effective_tools.len(), 2);
+        let effective_tools = child.get_effective_tools(Some(&parent)).unwrap();
+        assert_eq!(effective_tools.len(), 1); // explicit tools override, no merge
 
         let effective_skills = child.get_effective_skills(Some(&parent));
         assert_eq!(effective_skills.len(), 2);
@@ -719,19 +726,54 @@ states:
     #[test]
     fn test_no_inherit_parent() {
         let parent = StateDefinition {
-            tools: vec![ToolRef::Simple("parent_tool".into())],
+            tools: Some(vec![ToolRef::Simple("parent_tool".into())]),
             ..Default::default()
         };
 
         let child = StateDefinition {
-            tools: vec![ToolRef::Simple("child_tool".into())],
+            tools: Some(vec![ToolRef::Simple("child_tool".into())]),
             inherit_parent: false,
             ..Default::default()
         };
 
-        let effective_tools = child.get_effective_tools(Some(&parent));
+        let effective_tools = child.get_effective_tools(Some(&parent)).unwrap();
         assert_eq!(effective_tools.len(), 1);
         assert_eq!(effective_tools[0].id(), "child_tool");
+    }
+
+    #[test]
+    fn test_tools_none_inherits() {
+        let parent = StateDefinition {
+            tools: Some(vec![ToolRef::Simple("parent_tool".into())]),
+            ..Default::default()
+        };
+
+        let child = StateDefinition {
+            tools: None, // not specified → inherit
+            inherit_parent: true,
+            ..Default::default()
+        };
+
+        let effective_tools = child.get_effective_tools(Some(&parent)).unwrap();
+        assert_eq!(effective_tools.len(), 1);
+        assert_eq!(effective_tools[0].id(), "parent_tool");
+    }
+
+    #[test]
+    fn test_tools_empty_means_no_tools() {
+        let parent = StateDefinition {
+            tools: Some(vec![ToolRef::Simple("parent_tool".into())]),
+            ..Default::default()
+        };
+
+        let child = StateDefinition {
+            tools: Some(vec![]), // explicitly empty → no tools
+            inherit_parent: true,
+            ..Default::default()
+        };
+
+        let effective_tools = child.get_effective_tools(Some(&parent)).unwrap();
+        assert!(effective_tools.is_empty());
     }
 
     #[test]

@@ -160,6 +160,24 @@ impl ClarificationQuestion {
     pub fn has_options(&self) -> bool {
         self.options.as_ref().is_some_and(|o| !o.is_empty())
     }
+
+    /// Format the question with options appended as a user-facing string.
+    /// e.g. "What would you like to cancel?\n  A) Order\n  B) Reservation\n  C) Subscription"
+    pub fn formatted(&self) -> String {
+        let mut text = self.question.clone();
+        if let Some(ref options) = self.options {
+            if !options.is_empty() {
+                text.push('\n');
+                for (i, opt) in options.iter().enumerate() {
+                    let letter = (b'A' + i as u8) as char;
+                    text.push_str(&format!("  {}) {}\n", letter, opt.label));
+                }
+                // Remove trailing newline
+                text.truncate(text.trim_end().len());
+            }
+        }
+        text
+    }
 }
 
 /// Disambiguation processing result
@@ -222,6 +240,9 @@ pub struct DisambiguationContext {
     pub current_state: Option<String>,
     pub available_tools: Vec<String>,
     pub available_skills: Vec<String>,
+    /// Canonical intent labels from the state machine (e.g., ["cancel_order", "cancel_reservation"]).
+    /// Used to constrain clarification options to declared workflows.
+    pub available_intents: Vec<String>,
     pub user_context: HashMap<String, serde_json::Value>,
     pub clarification_attempts: u32,
     pub previous_questions: Vec<String>,

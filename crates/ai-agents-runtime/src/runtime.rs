@@ -586,70 +586,76 @@ impl RuntimeAgent {
     }
 
     async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
-        let tool_refs = self.get_current_tool_refs();
+        match self.get_current_tool_refs() {
+            // State explicitly sets tools (including empty = no tools)
+            Some(tool_refs) => {
+                if tool_refs.is_empty() {
+                    // Explicitly empty: no tools available in this state
+                    return Ok(Vec::new());
+                }
 
-        if tool_refs.is_empty() {
-            // No state-level tools: fallback to agent-level declared tools
-            if !self.declared_tool_ids.is_empty() {
-                return Ok(self
-                    .declared_tool_ids
-                    .iter()
-                    .filter(|id| self.tools.get(id).is_some())
-                    .cloned()
-                    .collect());
-            }
-            // No declared tools either: all registered tools available
-            return Ok(self.tools.list_ids());
-        }
+                let eval_ctx = self.build_evaluation_context().await?;
+                let llm_getter = RegistryLLMGetter {
+                    registry: self.llm_registry.clone(),
+                };
+                let evaluator = ConditionEvaluator::new(llm_getter);
 
-        let eval_ctx = self.build_evaluation_context().await?;
-        let llm_getter = RegistryLLMGetter {
-            registry: self.llm_registry.clone(),
-        };
-        let evaluator = ConditionEvaluator::new(llm_getter);
+                let mut available = Vec::new();
+                for tool_ref in &tool_refs {
+                    let tool_id = tool_ref.id();
 
-        let mut available = Vec::new();
-        for tool_ref in &tool_refs {
-            let tool_id = tool_ref.id();
+                    if self.tools.get(tool_id).is_none() {
+                        continue;
+                    }
 
-            if self.tools.get(tool_id).is_none() {
-                continue;
-            }
-
-            if let Some(condition) = tool_ref.condition() {
-                match evaluator.evaluate(condition, &eval_ctx).await {
-                    Ok(true) => {
+                    if let Some(condition) = tool_ref.condition() {
+                        match evaluator.evaluate(condition, &eval_ctx).await {
+                            Ok(true) => {
+                                available.push(tool_id.to_string());
+                            }
+                            Ok(false) => {
+                                debug!(tool = tool_id, "Tool condition not met, skipping");
+                            }
+                            Err(e) => {
+                                warn!(tool = tool_id, error = %e, "Error evaluating tool condition");
+                            }
+                        }
+                    } else {
                         available.push(tool_id.to_string());
                     }
-                    Ok(false) => {
-                        debug!(tool = tool_id, "Tool condition not met, skipping");
-                    }
-                    Err(e) => {
-                        warn!(tool = tool_id, error = %e, "Error evaluating tool condition");
-                    }
                 }
-            } else {
-                available.push(tool_id.to_string());
+
+                Ok(available)
+            }
+            // State doesn't specify tools: fallback to agent-level
+            None => {
+                if !self.declared_tool_ids.is_empty() {
+                    return Ok(self
+                        .declared_tool_ids
+                        .iter()
+                        .filter(|id| self.tools.get(id).is_some())
+                        .cloned()
+                        .collect());
+                }
+                // No declared tools either: all registered tools available
+                Ok(self.tools.list_ids())
             }
         }
-
-        Ok(available)
     }
 
-    fn get_current_tool_refs(&self) -> Vec<ToolRef> {
+    /// Returns `Some(tools)` if the current state explicitly declares tools
+    /// (including `Some([])` for "no tools"), or `None` if the state doesn't
+    /// specify tools (meaning: fall back to agent-level declared_tool_ids).
+    fn get_current_tool_refs(&self) -> Option<Vec<ToolRef>> {
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
-                if !state_def.tools.is_empty() {
-                    let parent_def = sm.get_parent_definition();
-                    return state_def
-                        .get_effective_tools(parent_def.as_ref())
-                        .into_iter()
-                        .cloned()
-                        .collect();
+                let parent_def = sm.get_parent_definition();
+                if let Some(effective) = state_def.get_effective_tools(parent_def.as_ref()) {
+                    return Some(effective.into_iter().cloned().collect());
                 }
             }
         }
-        Vec::new()
+        None
     }
 
     async fn build_evaluation_context(&self) -> Result<EvaluationContext> {
@@ -727,14 +733,14 @@ impl RuntimeAgent {
                 };
 
                 let available_tool_ids = self.get_available_tool_ids().await?;
-                let tools_prompt = if available_tool_ids.is_empty() {
-                    self.tools.generate_tools_prompt()
-                } else {
-                    self.tools.generate_filtered_prompt(&available_tool_ids)
-                };
-
-                if !tools_prompt.is_empty() {
-                    return Ok(format!("{}\n\n{}", combined, tools_prompt));
+                // Only add tools prompt if tools are available.
+                // When tools: [] is set (explicitly empty), show NO tools to the LLM.
+                if !available_tool_ids.is_empty() {
+                    let tools_prompt =
+                        self.tools.generate_filtered_prompt(&available_tool_ids);
+                    if !tools_prompt.is_empty() {
+                        return Ok(format!("{}\n\n{}", combined, tools_prompt));
+                    }
                 }
                 return Ok(combined);
             }
@@ -825,11 +831,26 @@ impl RuntimeAgent {
 
         let user_context = self.context_manager.get_all();
 
+        // Extract canonical intent labels from current state's transitions
+        let available_intents: Vec<String> = if let Some(ref sm) = self.state_machine {
+            sm.current_definition()
+                .map(|def| {
+                    def.transitions
+                        .iter()
+                        .filter_map(|t| t.intent.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         Ok(DisambiguationContext::from_agent_state(
             recent_messages,
             current_state,
             available_tools,
             available_skills,
+            available_intents,
             user_context,
         ))
     }
@@ -1539,7 +1560,11 @@ OVERALL: PASS/FAIL"#,
                     // Render template variables in tool args (e.g., {{ context.order_id }})
                     let args_value = self.render_action_args(&raw_args);
                     if let Some(t) = self.tools.get(tool) {
+                        self.hooks.on_tool_start(tool, &args_value).await;
+                        let start = Instant::now();
                         let result = t.execute(args_value).await;
+                        let duration_ms = start.elapsed().as_millis() as u64;
+                        self.hooks.on_tool_complete(tool, &result, duration_ms).await;
                         if result.success {
                             debug!(tool = %tool, "State action: tool executed");
                             // Store tool result in context so YAML prompts can reference it
@@ -2656,19 +2681,27 @@ Respond in JSON format:
                 .evaluate_transitions(processed_input, &final_content)
                 .await?;
 
-            // FIX: find better solution later
             // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
-            // The current final_content was generated in the OLD state context and is stale. Re-generate the response in the new state context so the LLM can reference the on_enter tool results (now in memory).
+            // The current final_content was generated in the OLD state context and is stale.
+            // Re-generate in the new state context so the LLM can reference on_enter results.
             if transitioned {
                 let new_llm = self.get_state_llm()?;
                 let new_messages = self.build_messages().await?;
+                // Log the system prompt to verify template rendering
+                if let Some(system_msg) = new_messages.first() {
+                    if system_msg.role == ai_agents_core::Role::System {
+                        debug!(
+                            prompt_preview = &system_msg.content[system_msg.content.len().saturating_sub(200)..],
+                            "Post-transition system prompt (last 200 chars)"
+                        );
+                    }
+                }
                 let new_response = new_llm
                     .complete(&new_messages, None)
                     .await
                     .map_err(|e| AgentError::LLM(e.to_string()))?;
                 final_content = new_response.content.trim().to_string();
 
-                // FIX: check later
                 self.memory
                     .add_message(ChatMessage::assistant(&final_content))
                     .await?;

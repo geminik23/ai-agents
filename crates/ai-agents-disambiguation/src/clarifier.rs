@@ -152,6 +152,16 @@ impl ClarificationGenerator {
             ""
         };
 
+        // If the state machine declares canonical intents, constrain options to them
+        let intent_constraint = if !context.available_intents.is_empty() {
+            format!(
+                "IMPORTANT: The options MUST correspond to these available workflows: {}. Do NOT invent other categories.",
+                context.available_intents.join(", ")
+            )
+        } else {
+            String::new()
+        };
+
         let mut prompt = format!(
             r#"The user said: "{}"
 
@@ -161,13 +171,15 @@ What is unclear: {}
 {}
 {}
 {}
+{}
 "#,
             input,
             detection.reasoning,
             detection.what_is_unclear.join(", "),
             language_hint,
             style_instruction,
-            other_option
+            other_option,
+            intent_constraint
         );
 
         if !context.recent_messages.is_empty() {
@@ -189,14 +201,18 @@ What is unclear: {}
             r#"
 Respond in JSON format:
 {
-  "question": "The clarifying question to ask",
+  "question": "The full clarifying question to show the user, including any options naturally embedded in the text",
   "options": [
     {"id": "1", "label": "First option"},
     {"id": "2", "label": "Second option"}
-  ] // Only include if style requires options, otherwise null
+  ]
 }
 
-IMPORTANT: Output ONLY valid JSON, no other text."#,
+IMPORTANT:
+- The "question" field MUST be self-contained: if there are options, include them naturally in the question text itself (e.g., "What would you like to cancel?\nA) Order\nB) Reservation\nC) Subscription\nD) Other").
+- The "options" array is a structured copy of the same options for programmatic use.
+- If the style does not require options, set "options" to null and write a plain question.
+- Output ONLY valid JSON, no other text."#,
         );
 
         prompt

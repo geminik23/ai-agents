@@ -367,6 +367,7 @@ impl DisambiguationContext {
         current_state: Option<String>,
         available_tools: Vec<String>,
         available_skills: Vec<String>,
+        available_intents: Vec<String>,
         user_context: HashMap<String, serde_json::Value>,
     ) -> Self {
         Self {
@@ -374,6 +375,7 @@ impl DisambiguationContext {
             current_state,
             available_tools,
             available_skills,
+            available_intents,
             user_context,
             clarification_attempts: 0,
             previous_questions: Vec::new(),
@@ -392,6 +394,7 @@ mod tests {
             Some("greeting".to_string()),
             vec!["search".to_string()],
             vec!["greet".to_string()],
+            vec!["cancel_order".to_string()],
             HashMap::new(),
         );
 
@@ -430,3 +433,4 @@ mod tests {
         assert_eq!(config.detection.threshold, 0.7);
     }
 }
+//
