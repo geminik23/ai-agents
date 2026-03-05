@@ -1,5 +1,5 @@
 use ai_agents::{AgentBuilder, ProviderType, Result, UnifiedLLMProvider};
-use example_support::{Repl, init_tracing};
+use example_common::{Repl, init_tracing};
 use std::sync::Arc;
 
 #[tokio::main]

@@ -1,0 +1,59 @@
+name: DisambiguationAgent
+version: "1.0.0"
+description: "Agent with LLM-based intent disambiguation"
+
+system_prompt: |
+  You are a helpful assistant with intent disambiguation capabilities.
+
+  When a user's request is unclear or ambiguous, you will ask clarifying questions
+  before proceeding. This helps ensure you understand exactly what the user wants.
+
+  You can handle requests in any language - Korean, Japanese, Chinese, English, etc.
+  The disambiguation system uses LLM-based detection, not regex patterns.
+
+  Be helpful, clear, and patient when asking for clarification.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+disambiguation:
+  enabled: true
+  detection:
+    llm: router
+    threshold: 0.7
+    aspects:
+      - missing_target
+      - missing_action
+      - missing_parameters
+      - multiple_intents
+      - vague_references
+      - implicit_context
+  clarification:
+    style: auto
+    max_attempts: 2
+    on_max_attempts: proceed_with_best_guess
+  skip_when:
+    - type: social
+    - type: short_input
+      max_chars: 5
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools:
+  - name: calculator
+  - name: datetime
+  - name: math
+skills: []

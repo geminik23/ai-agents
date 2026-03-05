@@ -1,7 +1,7 @@
 use ai_agents::{
     AgentBuilder, AgentSpec, ProviderType, Result, UnifiedLLMProvider, create_builtin_registry,
 };
-use example_support::{Repl, init_tracing};
+use example_common::{Repl, init_tracing};
 use std::sync::Arc;
 
 fn create_tool_agent_spec() -> AgentSpec {

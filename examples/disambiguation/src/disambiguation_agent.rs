@@ -2,7 +2,7 @@ use ai_agents::{
     AgentBuilder, AgentHooks, AgentResponse, ClarificationStyle, MaxAttemptsAction, Result,
 };
 use async_trait::async_trait;
-use example_support::{Repl, init_tracing};
+use example_common::{Repl, init_tracing};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
     println!("=== Disambiguation Agent Demo ===\n");
     let (style, fallback) = select_options();
 
-    let agent = AgentBuilder::from_template("disambiguation_agent")?
+    let agent = AgentBuilder::from_yaml_file("agents/disambiguation_agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
         .hooks(Arc::new(DisambiguationHooks))

@@ -1,6 +1,6 @@
 use ai_agents::{AgentBuilder, AgentHooks, AgentResponse, ReasoningMode, ReflectionMode, Result};
 use async_trait::async_trait;
-use example_support::{Repl, init_tracing};
+use example_common::{Repl, init_tracing};
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -141,7 +141,7 @@ async fn main() -> Result<()> {
     println!("=== Reasoning Agent Demo ===\n");
     let (reasoning_mode, reflection_mode) = select_modes();
 
-    let agent = AgentBuilder::from_template("reasoning_agent")?
+    let agent = AgentBuilder::from_yaml_file("agents/reasoning_agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
         .hooks(Arc::new(ReasoningHooks))

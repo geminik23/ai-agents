@@ -2,7 +2,7 @@ use ai_agents::{
     AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result, Tool, ToolResult,
 };
 use async_trait::async_trait;
-use example_support::{Repl, init_tracing};
+use example_common::{Repl, init_tracing};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -162,7 +162,7 @@ impl Tool for DeleteRecordTool {
 async fn main() -> Result<()> {
     init_tracing();
 
-    let agent = AgentBuilder::from_template("hitl_agent")?
+    let agent = AgentBuilder::from_yaml_file("agents/hitl_agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
         .tool(Arc::new(SendPaymentTool))

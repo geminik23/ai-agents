@@ -12,7 +12,7 @@ use ai_agents::{
     MemoryEvictEvent, Result, RuntimeAgent,
 };
 use async_trait::async_trait;
-use example_support::{CommandResult, Repl, init_tracing};
+use example_common::{CommandResult, Repl, init_tracing};
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
 
     let hooks = Arc::new(MemoryMonitorHooks::new());
 
-    let agent = AgentBuilder::from_template("memory_agent")?
+    let agent = AgentBuilder::from_yaml_file("agents/memory_agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
         .hooks(hooks.clone())

@@ -18,7 +18,6 @@ members = [
     "crates/ai-agents-template",
     "crates/ai-agents-runtime",
     "crates/ai-agents",
-    "examples",
 ]
 
 [workspace.package]

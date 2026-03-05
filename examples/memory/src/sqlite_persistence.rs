@@ -1,5 +1,5 @@
 use ai_agents::{AgentBuilder, AgentStorage, Result, SessionQuery, SqliteStorage, StorageConfig};
-use example_support::{CommandResult, Repl, init_tracing};
+use example_common::{CommandResult, Repl, init_tracing};
 use std::sync::Arc;
 
 /// Run an async block from inside the sync `on_command` callback.
@@ -128,7 +128,7 @@ async fn main() -> Result<()> {
 
     let storage = Arc::new(SqliteStorage::new("./agent_sessions.db").await?);
 
-    let agent = AgentBuilder::from_template("sqlite_persistence")?
+    let agent = AgentBuilder::from_yaml_file("agents/sqlite_persistence.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
         .build()?;

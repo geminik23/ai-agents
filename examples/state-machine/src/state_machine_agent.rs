@@ -1,11 +1,11 @@
 use ai_agents::{AgentBuilder, Result};
-use example_support::{Repl, init_tracing};
+use example_common::{Repl, init_tracing};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let agent = AgentBuilder::from_template("support_state_machine")?
+    let agent = AgentBuilder::from_yaml_file("agents/support_state_machine.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
         .build()?;

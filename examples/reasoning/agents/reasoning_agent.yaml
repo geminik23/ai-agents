@@ -1,0 +1,54 @@
+name: ReasoningAgent
+version: "1.0.0"
+description: "Agent with reasoning and reflection capabilities"
+
+system_prompt: |
+  You are an intelligent assistant with reasoning capabilities.
+
+  When reasoning is enabled, you think through problems step by step.
+  When reflection is enabled, you evaluate your own responses for quality.
+
+  For complex multi-step tasks, you can create and execute plans.
+  For analytical questions, you use chain-of-thought reasoning.
+
+  Always be helpful, accurate, and clear in your responses.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+reasoning:
+  mode: auto
+  judge_llm: router
+  output: tagged
+  max_iterations: 5
+
+reflection:
+  enabled: auto
+  evaluator_llm: router
+  max_retries: 2
+  pass_threshold: 0.7
+  criteria:
+    - "Response directly addresses the user's question"
+    - "Response is complete and accurate"
+    - "Response is helpful and clear"
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools:
+  - name: calculator
+  - name: datetime
+  - name: math
+skills: []

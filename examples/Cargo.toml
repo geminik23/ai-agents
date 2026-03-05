@@ -1,59 +1,30 @@
-[package]
-name = "examples"
-version = "0.0.0"
-publish = false
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "basic",
+    "skills",
+    "state-machine",
+    "memory",
+    "hitl",
+    "reasoning",
+    "disambiguation",
+]
+
+[workspace.package]
 edition = "2024"
+publish = false
 license = "MIT OR Apache-2.0"
 
-[lib]
-name = "example_support"
-path = "src/lib.rs"
-
-[dependencies]
+[workspace.dependencies]
 ai-agents = { path = "../crates/ai-agents", features = ["full"] }
-tokio = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-futures = { workspace = true }
-anyhow = { workspace = true }
-serde_json = { workspace = true }
-async-trait = { workspace = true }
-parking_lot = { workspace = true }
-uuid = { workspace = true }
-
-[[example]]
-name = "simple_chat"
-path = "simple_chat.rs"
-
-[[example]]
-name = "state_machine_agent"
-path = "state_machine_agent.rs"
-
-[[example]]
-name = "skill_agent"
-path = "skill_agent.rs"
-
-[[example]]
-name = "tool_agent_demo"
-path = "tool_agent_demo.rs"
-
-[[example]]
-name = "memory_agent"
-path = "memory_agent.rs"
-
-[[example]]
-name = "hitl_agent"
-path = "hitl_agent.rs"
-
-[[example]]
-name = "sqlite_persistence"
-path = "sqlite_persistence.rs"
-
-[[example]]
-name = "reasoning_agent"
-path = "reasoning_agent.rs"
-
-[[example]]
-name = "disambiguation_agent"
-path = "disambiguation_agent.rs"
-
+example-common = { path = "common" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+anyhow = "1"
+serde_json = "1"
+async-trait = "0.1"
+parking_lot = "0.12"
+uuid = { version = "1", features = ["v4"] }

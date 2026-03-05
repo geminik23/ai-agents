@@ -1,0 +1,16 @@
+[package]
+name = "example-disambiguation"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-agents = { workspace = true }
+example-common = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[[bin]]
+name = "disambiguation-agent"
+path = "src/disambiguation_agent.rs"
