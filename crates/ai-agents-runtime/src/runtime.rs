@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use futures::stream::{self, Stream, StreamExt};
+use futures::stream::{Stream, StreamExt};
 use parking_lot::RwLock;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -50,6 +50,16 @@ use super::{
     Agent, AgentInfo, AgentResponse, ParallelToolsConfig, StreamChunk, StreamingConfig, ToolCall,
 };
 use crate::spec::StorageConfig;
+
+/// Outcome of processing tool calls within the agent loop.
+enum ToolCallOutcome {
+    /// Tools executed successfully, continue the LLM loop for the next iteration.
+    Continue,
+    /// A state transition fired during tool call handling, continue the loop.
+    TransitionFired,
+    /// HITL rejected a tool call, return this response immediately.
+    Rejected(AgentResponse),
+}
 
 pub struct RuntimeAgent {
     info: AgentInfo,
@@ -736,8 +746,7 @@ impl RuntimeAgent {
                 // Only add tools prompt if tools are available.
                 // When tools: [] is set (explicitly empty), show NO tools to the LLM.
                 if !available_tool_ids.is_empty() {
-                    let tools_prompt =
-                        self.tools.generate_filtered_prompt(&available_tool_ids);
+                    let tools_prompt = self.tools.generate_filtered_prompt(&available_tool_ids);
                     if !tools_prompt.is_empty() {
                         return Ok(format!("{}\n\n{}", combined, tools_prompt));
                     }
@@ -1564,7 +1573,9 @@ OVERALL: PASS/FAIL"#,
                         let start = Instant::now();
                         let result = t.execute(args_value).await;
                         let duration_ms = start.elapsed().as_millis() as u64;
-                        self.hooks.on_tool_complete(tool, &result, duration_ms).await;
+                        self.hooks
+                            .on_tool_complete(tool, &result, duration_ms)
+                            .await;
                         if result.success {
                             debug!(tool = %tool, "State action: tool executed");
                             // Store tool result in context so YAML prompts can reference it
@@ -2363,6 +2374,329 @@ Respond in JSON format:
         }
     }
 
+    /// Handle skill routing result: output processing, memory, transitions.
+    /// Returns a fully formed AgentResponse for skill-routed requests.
+    async fn handle_skill_response(
+        &self,
+        processed_input: &str,
+        skill_response: String,
+        input_context: &HashMap<String, Value>,
+    ) -> Result<AgentResponse> {
+        let output_data = self.process_output(&skill_response, input_context).await?;
+        let final_response = output_data.content;
+
+        self.memory
+            .add_message(ChatMessage::assistant(&final_response))
+            .await?;
+
+        self.check_memory_compression().await?;
+
+        self.increment_turn();
+        self.evaluate_transitions(processed_input, &final_response)
+            .await?;
+
+        let response = AgentResponse::new(final_response);
+        self.hooks.on_response(&response).await;
+        Ok(response)
+    }
+
+    /// Run the Plan-and-Execute flow: generate plan, execute steps, finalize.
+    async fn handle_plan_and_execute(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        auto_detected: bool,
+    ) -> Result<AgentResponse> {
+        let mut plan = self.generate_plan(processed_input).await?;
+        info!(
+            plan_id = %plan.id,
+            steps = plan.steps.len(),
+            "Plan generated"
+        );
+        *self.current_plan.write() = Some(plan.clone());
+
+        let plan_result = self.execute_plan(&mut plan).await?;
+        info!(
+            plan_status = ?plan.status,
+            completed_steps = plan.completed_steps().count(),
+            "Plan execution completed"
+        );
+        *self.current_plan.write() = Some(plan);
+
+        let output_data = self.process_output(&plan_result, input_context).await?;
+        let final_content = output_data.content;
+
+        self.memory
+            .add_message(ChatMessage::assistant(&final_content))
+            .await?;
+
+        self.check_memory_compression().await?;
+        self.increment_turn();
+        self.evaluate_transitions(processed_input, &final_content)
+            .await?;
+
+        let reasoning_metadata =
+            ReasoningMetadata::new(ReasoningMode::PlanAndExecute).with_auto_detected(auto_detected);
+
+        let response = AgentResponse::new(&final_content).with_metadata(
+            "reasoning",
+            serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+        );
+
+        self.hooks.on_response(&response).await;
+        Ok(response)
+    }
+
+    /// Inject CoT/ReAct reasoning prompt into the system message (first iteration only).
+    fn inject_reasoning_prompt(
+        &self,
+        messages: &mut [ChatMessage],
+        reasoning_mode: &ReasoningMode,
+        is_first_iteration: bool,
+    ) {
+        if !is_first_iteration {
+            return;
+        }
+        match reasoning_mode {
+            ReasoningMode::CoT => {
+                if let Some(msg) = messages.first_mut() {
+                    if matches!(msg.role, ai_agents_core::Role::System) {
+                        msg.content = self.build_cot_system_prompt(&msg.content);
+                        debug!("Applied Chain-of-Thought system prompt");
+                    }
+                }
+            }
+            ReasoningMode::React => {
+                if let Some(msg) = messages.first_mut() {
+                    if matches!(msg.role, ai_agents_core::Role::System) {
+                        msg.content = self.build_react_system_prompt(&msg.content);
+                        debug!("Applied ReAct system prompt");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle tool calls: check transitions, execute tools in parallel, handle HITL rejection.
+    async fn handle_tool_calls(
+        &self,
+        processed_input: &str,
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        all_tool_calls: &mut Vec<ToolCall>,
+    ) -> Result<ToolCallOutcome> {
+        // Check if a transition should fire before executing the LLM's tool call.
+        // If a transition fires, on_enter actions handle the tool call correctly
+        // (with proper URLs from YAML), so skip the LLM's tool call.
+        let transition_fired = self.evaluate_transitions(processed_input, content).await?;
+        if transition_fired {
+            self.memory
+                .add_message(ChatMessage::assistant(
+                    "(Transitioned to new state — tool call handled by workflow)",
+                ))
+                .await?;
+            return Ok(ToolCallOutcome::TransitionFired);
+        }
+
+        let results = self.execute_tools_parallel(&tool_calls).await;
+
+        for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
+            match result {
+                Ok(output) => {
+                    self.memory
+                        .add_message(ChatMessage::function(&tool_call.name, &output))
+                        .await?;
+                }
+                Err(e) => {
+                    // Check if this is a HITL rejection - if so, break the loop
+                    if matches!(e, AgentError::HITLRejected(_)) {
+                        self.memory
+                            .add_message(ChatMessage::assistant(&format!(
+                                "The operation was rejected by the approver: {}",
+                                e
+                            )))
+                            .await?;
+                        // Return the rejection message to user, don't continue loop
+                        return Ok(ToolCallOutcome::Rejected(AgentResponse {
+                            content: format!("Operation cancelled: {}", e),
+                            metadata: None,
+                            tool_calls: Some(all_tool_calls.clone()),
+                        }));
+                    }
+                    self.memory
+                        .add_message(ChatMessage::function(
+                            &tool_call.name,
+                            &format!("Error: {}", e),
+                        ))
+                        .await?;
+                }
+            }
+            all_tool_calls.push(tool_call.clone());
+        }
+        Ok(ToolCallOutcome::Continue)
+    }
+
+    /// Run the reflection loop on a response, returning (improved_content, reflection_metadata).
+    async fn run_reflection(
+        &self,
+        llm: &dyn LLMProvider,
+        processed_input: &str,
+        mut content: String,
+    ) -> Result<(String, Option<ReflectionMetadata>)> {
+        let should_reflect = self.should_reflect(processed_input, &content).await?;
+        if !should_reflect {
+            return Ok((content, None));
+        }
+
+        info!("Starting response reflection evaluation");
+        let mut attempts = 0u32;
+        let max_retries = self.reflection_config.max_retries;
+        let mut history: Vec<ReflectionAttempt> = Vec::new();
+
+        loop {
+            let evaluation = self.evaluate_response(processed_input, &content).await?;
+
+            if evaluation.passed || attempts >= max_retries {
+                info!(
+                    passed = evaluation.passed,
+                    confidence = evaluation.confidence,
+                    attempts = attempts + 1,
+                    "Reflection evaluation complete"
+                );
+                let reflection_metadata = Some(
+                    ReflectionMetadata::new(evaluation)
+                        .with_attempts(attempts + 1)
+                        .with_history(history),
+                );
+                return Ok((content, reflection_metadata));
+            }
+
+            debug!(
+                attempt = attempts + 1,
+                failed_criteria = evaluation.failed_criteria().count(),
+                "Response did not meet criteria, retrying"
+            );
+
+            history.push(
+                ReflectionAttempt::new(&content, evaluation.clone())
+                    .with_feedback("Response did not meet quality criteria"),
+            );
+
+            let feedback: Vec<String> = evaluation
+                .failed_criteria()
+                .map(|c| format!("- {}", c.criterion))
+                .collect();
+
+            let retry_prompt = format!(
+                "Your previous response did not meet these criteria:\n{}\n\nPlease provide an improved response.",
+                feedback.join("\n")
+            );
+
+            self.memory
+                .add_message(ChatMessage::user(&retry_prompt))
+                .await?;
+
+            let retry_messages = self.build_messages().await?;
+            let retry_response = llm
+                .complete(&retry_messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(e.to_string()))?;
+
+            content = retry_response.content.trim().to_string();
+            attempts += 1;
+        }
+    }
+
+    /// Add assistant message, memory compression, transitions, and post-transition re-generation.
+    /// Returns (final_content, transitioned).
+    async fn post_loop_processing(
+        &self,
+        processed_input: &str,
+        content: String,
+    ) -> Result<(String, bool)> {
+        self.memory
+            .add_message(ChatMessage::assistant(&content))
+            .await?;
+
+        self.check_memory_compression().await?;
+
+        self.increment_turn();
+        let transitioned = self.evaluate_transitions(processed_input, &content).await?;
+
+        if !transitioned {
+            return Ok((content, false));
+        }
+
+        // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
+        // The current content was generated in the OLD state context and is stale.
+        // Re-generate in the new state context so the LLM can reference on_enter results.
+        let new_llm = self.get_state_llm()?;
+        let new_messages = self.build_messages().await?;
+        // Log the system prompt to verify template rendering
+        if let Some(system_msg) = new_messages.first() {
+            if system_msg.role == ai_agents_core::Role::System {
+                debug!(
+                    prompt_preview =
+                        &system_msg.content[system_msg.content.len().saturating_sub(200)..],
+                    "Post-transition system prompt (last 200 chars)"
+                );
+            }
+        }
+        let new_response = new_llm
+            .complete(&new_messages, None)
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
+        let final_content = new_response.content.trim().to_string();
+
+        self.memory
+            .add_message(ChatMessage::assistant(&final_content))
+            .await?;
+
+        Ok((final_content, true))
+    }
+
+    /// Build the final AgentResponse with all metadata.
+    fn build_agent_response(
+        &self,
+        content: String,
+        all_tool_calls: Vec<ToolCall>,
+        reasoning_mode: ReasoningMode,
+        auto_detected: bool,
+        iterations: u32,
+        thinking: Option<String>,
+        reflection_metadata: Option<ReflectionMetadata>,
+    ) -> AgentResponse {
+        let reasoning_metadata = ReasoningMetadata::new(reasoning_mode.clone())
+            .with_thinking(thinking.clone().unwrap_or_default())
+            .with_iterations(iterations)
+            .with_auto_detected(auto_detected);
+
+        let mut response = AgentResponse::new(&content);
+        if !all_tool_calls.is_empty() {
+            response = response.with_tool_calls(all_tool_calls);
+        }
+
+        if let Some(state) = self.current_state() {
+            response = response.with_metadata("current_state", serde_json::json!(state));
+        }
+
+        response = response.with_metadata(
+            "reasoning",
+            serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+        );
+
+        if let Some(ref refl_meta) = reflection_metadata {
+            response = response.with_metadata(
+                "reflection",
+                serde_json::to_value(refl_meta).unwrap_or_default(),
+            );
+        }
+
+        response
+    }
+
+    /// run_loop_internal: blocking (non-streaming) agent pipeline
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         let input_data = self.process_input(input).await?;
 
@@ -2381,25 +2715,9 @@ Respond in JSON format:
             self.memory
                 .add_message(ChatMessage::user(processed_input))
                 .await?;
-
-            let output_data = self
-                .process_output(&skill_response, &input_data.context)
-                .await?;
-            let final_response = output_data.content;
-
-            self.memory
-                .add_message(ChatMessage::assistant(&final_response))
-                .await?;
-
-            self.check_memory_compression().await?;
-
-            self.increment_turn();
-            self.evaluate_transitions(processed_input, &final_response)
-                .await?;
-
-            let response = AgentResponse::new(final_response);
-            self.hooks.on_response(&response).await;
-            return Ok(response);
+            return self
+                .handle_skill_response(processed_input, skill_response, &input_data.context)
+                .await;
         }
 
         let effective_reasoning = self.get_effective_reasoning_config();
@@ -2417,47 +2735,9 @@ Respond in JSON format:
             self.memory
                 .add_message(ChatMessage::user(processed_input))
                 .await?;
-
-            let mut plan = self.generate_plan(processed_input).await?;
-            info!(
-                plan_id = %plan.id,
-                steps = plan.steps.len(),
-                "Plan generated"
-            );
-            *self.current_plan.write() = Some(plan.clone());
-
-            let plan_result = self.execute_plan(&mut plan).await?;
-            info!(
-                plan_status = ?plan.status,
-                completed_steps = plan.completed_steps().count(),
-                "Plan execution completed"
-            );
-            *self.current_plan.write() = Some(plan);
-
-            let output_data = self
-                .process_output(&plan_result, &input_data.context)
-                .await?;
-            let final_content = output_data.content;
-
-            self.memory
-                .add_message(ChatMessage::assistant(&final_content))
-                .await?;
-
-            self.check_memory_compression().await?;
-            self.increment_turn();
-            self.evaluate_transitions(processed_input, &final_content)
-                .await?;
-
-            let reasoning_metadata = ReasoningMetadata::new(ReasoningMode::PlanAndExecute)
-                .with_auto_detected(auto_detected);
-
-            let response = AgentResponse::new(&final_content).with_metadata(
-                "reasoning",
-                serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
-            );
-
-            self.hooks.on_response(&response).await;
-            return Ok(response);
+            return self
+                .handle_plan_and_execute(processed_input, &input_data.context, auto_detected)
+                .await;
         }
 
         self.memory
@@ -2488,28 +2768,7 @@ Respond in JSON format:
             );
 
             let mut messages = self.build_messages().await?;
-
-            if iterations == 1 {
-                match reasoning_mode {
-                    ReasoningMode::CoT => {
-                        if let Some(msg) = messages.first_mut() {
-                            if matches!(msg.role, ai_agents_core::Role::System) {
-                                msg.content = self.build_cot_system_prompt(&msg.content);
-                                debug!("Applied Chain-of-Thought system prompt");
-                            }
-                        }
-                    }
-                    ReasoningMode::React => {
-                        if let Some(msg) = messages.first_mut() {
-                            if matches!(msg.role, ai_agents_core::Role::System) {
-                                msg.content = self.build_react_system_prompt(&msg.content);
-                                debug!("Applied ReAct system prompt");
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
 
             self.hooks.on_llm_start(&messages).await;
             let llm_start = Instant::now();
@@ -2535,55 +2794,13 @@ Respond in JSON format:
             let content = response.content.trim();
 
             if let Some(tool_calls) = self.parse_tool_calls(content) {
-                // Check if a transition should fire before executing the LLM's tool call.
-                // If a transition fires, on_enter actions handle the tool call correctly
-                // (with proper URLs from YAML), so skip the LLM's tool call.
-                let transition_fired = self.evaluate_transitions(processed_input, content).await?;
-                if transition_fired {
-                    self.memory
-                        .add_message(ChatMessage::assistant(
-                            "(Transitioned to new state — tool call handled by workflow)",
-                        ))
-                        .await?;
-                    continue;
+                match self
+                    .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
+                    .await?
+                {
+                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
+                    ToolCallOutcome::Rejected(resp) => return Ok(resp),
                 }
-
-                let results = self.execute_tools_parallel(&tool_calls).await;
-
-                for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
-                    match result {
-                        Ok(output) => {
-                            self.memory
-                                .add_message(ChatMessage::function(&tool_call.name, &output))
-                                .await?;
-                        }
-                        Err(e) => {
-                            // Check if this is a HITL rejection - if so, break the loop
-                            if matches!(e, AgentError::HITLRejected(_)) {
-                                self.memory
-                                    .add_message(ChatMessage::assistant(&format!(
-                                        "The operation was rejected by the approver: {}",
-                                        e
-                                    )))
-                                    .await?;
-                                // Return the rejection message to user, don't continue loop
-                                return Ok(AgentResponse {
-                                    content: format!("Operation cancelled: {}", e),
-                                    metadata: None,
-                                    tool_calls: Some(all_tool_calls),
-                                });
-                            }
-                            self.memory
-                                .add_message(ChatMessage::function(
-                                    &tool_call.name,
-                                    &format!("Error: {}", e),
-                                ))
-                                .await?;
-                        }
-                    }
-                    all_tool_calls.push(tool_call.clone());
-                }
-                continue;
             }
 
             let (extracted_thinking, answer) = self.extract_thinking(content);
@@ -2602,136 +2819,35 @@ Respond in JSON format:
                 output_data.content
             };
 
-            let should_reflect = self.should_reflect(processed_input, &final_content).await?;
-            let mut reflection_metadata: Option<ReflectionMetadata> = None;
-
-            if should_reflect {
-                info!("Starting response reflection evaluation");
-                let mut attempts = 0u32;
-                let max_retries = self.reflection_config.max_retries;
-                let mut history: Vec<ReflectionAttempt> = Vec::new();
-
-                loop {
-                    let evaluation = self
-                        .evaluate_response(processed_input, &final_content)
-                        .await?;
-
-                    if evaluation.passed || attempts >= max_retries {
-                        info!(
-                            passed = evaluation.passed,
-                            confidence = evaluation.confidence,
-                            attempts = attempts + 1,
-                            "Reflection evaluation complete"
-                        );
-                        reflection_metadata = Some(
-                            ReflectionMetadata::new(evaluation)
-                                .with_attempts(attempts + 1)
-                                .with_history(history),
-                        );
-                        break;
-                    }
-
-                    debug!(
-                        attempt = attempts + 1,
-                        failed_criteria = evaluation.failed_criteria().count(),
-                        "Response did not meet criteria, retrying"
-                    );
-
-                    history.push(
-                        ReflectionAttempt::new(&final_content, evaluation.clone())
-                            .with_feedback("Response did not meet quality criteria"),
-                    );
-
-                    let feedback: Vec<String> = evaluation
-                        .failed_criteria()
-                        .map(|c| format!("- {}", c.criterion))
-                        .collect();
-
-                    let retry_prompt = format!(
-                        "Your previous response did not meet these criteria:\n{}\n\nPlease provide an improved response.",
-                        feedback.join("\n")
-                    );
-
-                    self.memory
-                        .add_message(ChatMessage::user(&retry_prompt))
-                        .await?;
-
-                    let retry_messages = self.build_messages().await?;
-                    let retry_response = llm
-                        .complete(&retry_messages, None)
-                        .await
-                        .map_err(|e| AgentError::LLM(e.to_string()))?;
-
-                    final_content = retry_response.content.trim().to_string();
-                    attempts += 1;
-                }
-            }
+            // Run reflection (blocking LLM calls for retries)
+            let reflection_metadata;
+            (final_content, reflection_metadata) = self
+                .run_reflection(&*llm, processed_input, final_content)
+                .await?;
 
             final_content =
                 self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
 
-            self.memory
-                .add_message(ChatMessage::assistant(&final_content))
-                .await?;
-
-            self.check_memory_compression().await?;
-
-            self.increment_turn();
-            let transitioned = self
-                .evaluate_transitions(processed_input, &final_content)
-                .await?;
-
-            // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
-            // The current final_content was generated in the OLD state context and is stale.
-            // Re-generate in the new state context so the LLM can reference on_enter results.
-            if transitioned {
-                let new_llm = self.get_state_llm()?;
-                let new_messages = self.build_messages().await?;
-                // Log the system prompt to verify template rendering
-                if let Some(system_msg) = new_messages.first() {
-                    if system_msg.role == ai_agents_core::Role::System {
-                        debug!(
-                            prompt_preview = &system_msg.content[system_msg.content.len().saturating_sub(200)..],
-                            "Post-transition system prompt (last 200 chars)"
-                        );
-                    }
-                }
-                let new_response = new_llm
-                    .complete(&new_messages, None)
-                    .await
-                    .map_err(|e| AgentError::LLM(e.to_string()))?;
-                final_content = new_response.content.trim().to_string();
-
-                self.memory
-                    .add_message(ChatMessage::assistant(&final_content))
+            // Post-loop: memory, transitions, post-transition re-generation
+            let (_transitioned, final_content) = {
+                let (content, transitioned) = self
+                    .post_loop_processing(processed_input, final_content)
                     .await?;
-            }
+                (transitioned, content)
+            };
 
-            let reasoning_metadata = ReasoningMetadata::new(reasoning_mode.clone())
-                .with_thinking(thinking_content.clone().unwrap_or_default())
-                .with_iterations(iterations)
-                .with_auto_detected(auto_detected);
+            let reflected = reflection_metadata.is_some();
+            let reasoning_mode_debug = format!("{:?}", reasoning_mode);
 
-            let mut response = AgentResponse::new(&final_content);
-            if !all_tool_calls.is_empty() {
-                response = response.with_tool_calls(all_tool_calls);
-            }
-
-            if let Some(state) = self.current_state() {
-                response = response.with_metadata("current_state", serde_json::json!(state));
-            }
-
-            response = response.with_metadata(
-                "reasoning",
-                serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
+            let response = self.build_agent_response(
+                final_content,
+                all_tool_calls,
+                reasoning_mode,
+                auto_detected,
+                iterations,
+                thinking_content,
+                reflection_metadata,
             );
-
-            if let Some(ref refl_meta) = reflection_metadata {
-                response = response.with_metadata(
-                    "reflection",
-                    serde_json::to_value(refl_meta).unwrap_or_default(),
-                );
-            }
 
             self.hooks.on_response(&response).await;
 
@@ -2739,12 +2855,527 @@ Respond in JSON format:
             info!(
                 tool_calls = tool_call_count,
                 response_len = response.content.len(),
-                reasoning_mode = ?reasoning_mode,
-                reflected = reflection_metadata.is_some(),
+                reasoning_mode = %reasoning_mode_debug,
+                reflected = reflected,
                 "Chat completed"
             );
             return Ok(response);
         }
+    }
+
+    /// Streaming agent pipeline
+    /// Uses all the same shared helpers as run_loop_internal.
+    /// The ONLY difference: LLM calls use complete_stream() + yield deltas.
+    fn run_loop_internal_stream<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
+        let include_tool_events = self.streaming.include_tool_events;
+        let include_state_events = self.streaming.include_state_events;
+
+        Box::pin(async_stream::stream! {
+            let input_data = match self.process_input(input).await {
+                Ok(data) => data,
+                Err(e) => {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
+            };
+
+            if input_data.metadata.rejected {
+                let reason = input_data
+                    .metadata
+                    .rejection_reason
+                    .unwrap_or_else(|| "Input rejected".to_string());
+                warn!(reason = %reason, "Input rejected (stream)");
+                yield StreamChunk::error(reason);
+                return;
+            }
+
+            let processed_input = &input_data.content;
+
+            // Skill routing
+            match self.try_skill_route(processed_input).await {
+                Ok(Some(skill_response)) => {
+                    let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    match self.handle_skill_response(processed_input, skill_response, &input_data.context).await {
+                        Ok(resp) => {
+                            yield StreamChunk::content(&resp.content);
+                            yield StreamChunk::Done {};
+                            return;
+                        }
+                        Err(e) => {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => {} // no skill matched, continue
+                Err(e) => {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
+            }
+
+            // Reasoning mode determination
+            let effective_reasoning = self.get_effective_reasoning_config();
+            let reasoning_mode = match self.determine_reasoning_mode(processed_input).await {
+                Ok(mode) => mode,
+                Err(e) => {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
+            };
+            let auto_detected = matches!(effective_reasoning.mode, ReasoningMode::Auto);
+
+            info!(
+                reasoning_mode = ?reasoning_mode,
+                auto_detected = auto_detected,
+                "Reasoning mode determined (stream)"
+            );
+
+            // Plan-and-Execute: yield final result as single chunk (not token-by-token)
+            if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
+                let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                match self.handle_plan_and_execute(processed_input, &input_data.context, auto_detected).await {
+                    Ok(resp) => {
+                        yield StreamChunk::content(&resp.content);
+                        yield StreamChunk::Done {};
+                        return;
+                    }
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                }
+            }
+
+            let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+
+            let llm = match self.get_state_llm() {
+                Ok(llm) => llm,
+                Err(e) => {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
+            };
+
+            let mut iterations = 0u32;
+            let mut all_tool_calls: Vec<ToolCall> = Vec::new();
+            let mut thinking_content: Option<String> = None;
+
+            loop {
+                if iterations >= self.max_iterations {
+                    let err_msg = format!("Max iterations ({}) exceeded", self.max_iterations);
+                    let err = AgentError::Other(err_msg.clone());
+                    self.hooks.on_error(&err).await;
+                    error!(iterations = iterations, "Max iterations exceeded (stream)");
+                    yield StreamChunk::error(err_msg);
+                    return;
+                }
+                iterations += 1;
+                *self.iteration_count.write() = iterations;
+
+                debug!(
+                    iteration = iterations,
+                    max = self.max_iterations,
+                    "LLM call (stream)"
+                );
+
+                let mut messages = match self.build_messages().await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+                self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
+
+                self.hooks.on_llm_start(&messages).await;
+                let llm_start = Instant::now();
+
+                // Check if reflection is active — if so, suppress streaming for this LLM call
+                // because we may need to retry and the user would see a stale first attempt.
+                let reflection_active = match self.should_reflect(processed_input, "").await {
+                    Ok(v) => v,
+                    Err(_) => false,
+                };
+
+                let content = if reflection_active {
+                    // Use blocking call so reflection can retry without partial output
+                    let response = match llm.complete(&messages, None).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
+                    };
+                    let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+                    self.hooks.on_llm_complete(&response, llm_duration_ms).await;
+                    response.content.trim().to_string()
+                } else {
+                    // Streaming LLM call
+                    let llm_stream = match llm.complete_stream(&messages, None).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
+                    };
+                    let mut accumulated = String::new();
+                    let mut stream_inner = llm_stream;
+                    while let Some(chunk_result) = stream_inner.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                accumulated.push_str(&chunk.delta);
+                                yield StreamChunk::content(chunk.delta);
+                            }
+                            Err(e) => {
+                                yield StreamChunk::error(e.to_string());
+                                return;
+                            }
+                        }
+                    }
+                    let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+                    // Construct LLMResponse for hooks
+                    let llm_response = ai_agents_core::LLMResponse::new(
+                        accumulated.trim(),
+                        ai_agents_core::FinishReason::Stop,
+                    );
+                    self.hooks.on_llm_complete(&llm_response, llm_duration_ms).await;
+                    accumulated.trim().to_string()
+                };
+
+                // Tool call handling
+                if let Some(tool_calls) = self.parse_tool_calls(&content) {
+                    // Emit tool events for streaming
+                    // First check transitions (same as blocking path)
+                    let transition_fired = match self.evaluate_transitions(processed_input, &content).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
+                    };
+                    if transition_fired {
+                        let _ = self.memory.add_message(ChatMessage::assistant(
+                            "(Transitioned to new state — tool call handled by workflow)",
+                        )).await;
+
+                        if include_state_events {
+                            if let Some(state) = self.current_state() {
+                                yield StreamChunk::state_transition(None, state);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Execute tools with streaming events
+                    let results = self.execute_tools_parallel(&tool_calls).await;
+
+                    for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
+                        if include_tool_events {
+                            yield StreamChunk::tool_start(&tool_call.id, &tool_call.name);
+                        }
+
+                        match result {
+                            Ok(output) => {
+                                if include_tool_events {
+                                    yield StreamChunk::tool_result(
+                                        &tool_call.id,
+                                        &tool_call.name,
+                                        &output,
+                                        true,
+                                    );
+                                }
+                                let _ = self.memory
+                                    .add_message(ChatMessage::function(&tool_call.name, &output))
+                                    .await;
+                            }
+                            Err(e) => {
+                                if matches!(e, AgentError::HITLRejected(_)) {
+                                    let _ = self.memory.add_message(ChatMessage::assistant(
+                                        &format!("The operation was rejected by the approver: {}", e),
+                                    )).await;
+                                    yield StreamChunk::error(format!("Operation cancelled: {}", e));
+                                    yield StreamChunk::Done {};
+                                    return;
+                                }
+                                if include_tool_events {
+                                    yield StreamChunk::tool_result(
+                                        &tool_call.id,
+                                        &tool_call.name,
+                                        &e.to_string(),
+                                        false,
+                                    );
+                                }
+                                let _ = self.memory
+                                    .add_message(ChatMessage::function(
+                                        &tool_call.name,
+                                        &format!("Error: {}", e),
+                                    ))
+                                    .await;
+                            }
+                        }
+                        all_tool_calls.push(tool_call.clone());
+
+                        if include_tool_events {
+                            yield StreamChunk::tool_end(&tool_call.id);
+                        }
+                    }
+                    continue;
+                }
+
+                // Extract thinking, process output
+                let (extracted_thinking, answer) = self.extract_thinking(&content);
+                if extracted_thinking.is_some() {
+                    thinking_content = extracted_thinking;
+                }
+
+                let output_data = match self.process_output(&answer, &input_data.context).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+
+                let final_content = if output_data.metadata.rejected {
+                    output_data
+                        .metadata
+                        .rejection_reason
+                        .unwrap_or_else(|| answer.to_string())
+                } else {
+                    output_data.content
+                };
+
+                // Reflection (uses blocking LLM calls for retries)
+                let (final_content, _reflection_metadata) = match self
+                    .run_reflection(&*llm, processed_input, final_content)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+
+                let final_content = self.format_response_with_thinking(
+                    thinking_content.as_deref(),
+                    &final_content,
+                );
+
+                // If reflection was active (we used blocking call), yield the final content now
+                if reflection_active {
+                    yield StreamChunk::content(&final_content);
+                }
+
+                // Post-loop: memory, transitions, post-transition re-generation
+                let (final_content, transitioned) = match self
+                    .post_loop_processing(processed_input, final_content)
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+
+                if transitioned {
+                    if include_state_events {
+                        if let Some(state) = self.current_state() {
+                            yield StreamChunk::state_transition(None, state);
+                        }
+                    }
+                    // The post-transition re-generated content should be yielded
+                    yield StreamChunk::content(&final_content);
+                }
+
+                yield StreamChunk::Done {};
+                return;
+            }
+        })
+    }
+
+    /// Streaming entry point with disambiguation
+    /// Mirrors run_loop but yields StreamChunks instead of AgentResponse.
+    fn run_loop_stream<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            self.hooks.on_message_received(input).await;
+
+            if let Err(e) = self.check_turn_timeout().await {
+                yield StreamChunk::error(e.to_string());
+                return;
+            }
+            if let Err(e) = self.context_manager.refresh_per_turn().await {
+                yield StreamChunk::error(e.to_string());
+                return;
+            }
+
+            // Clear stale disambiguation context from previous turns.
+            self.clear_disambiguation_context();
+
+            // Disambiguation check (before input processing)
+            if let Some(ref disambiguator) = self.disambiguation_manager {
+                let disambiguation_context = match self.build_disambiguation_context().await {
+                    Ok(ctx) => ctx,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+
+                let state_override = self
+                    .state_machine
+                    .as_ref()
+                    .and_then(|sm| sm.current_definition())
+                    .and_then(|def| def.disambiguation.clone());
+
+                let result = match disambiguator
+                    .process_input_with_override(
+                        input,
+                        &disambiguation_context,
+                        state_override.as_ref(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+
+                match result {
+                    DisambiguationResult::Clear => {
+                        debug!("Input is clear, proceeding normally (stream)");
+                    }
+                    DisambiguationResult::NeedsClarification {
+                        question,
+                        detection,
+                    } => {
+                        info!(
+                            ambiguity_type = ?detection.ambiguity_type,
+                            confidence = detection.confidence,
+                            "Input requires clarification (stream)"
+                        );
+                        let _ = self.memory.add_message(ChatMessage::user(input)).await;
+                        let _ = self
+                            .memory
+                            .add_message(ChatMessage::assistant(&question.question))
+                            .await;
+                        yield StreamChunk::content(&question.question);
+                        yield StreamChunk::Done {};
+                        return;
+                    }
+                    DisambiguationResult::Clarified {
+                        enriched_input,
+                        resolved,
+                        ..
+                    } => {
+                        info!(
+                            resolved_count = resolved.len(),
+                            enriched = %enriched_input,
+                            "Input clarified (stream)"
+                        );
+                        for (key, value) in &resolved {
+                            let context_key = format!("disambiguation.{}", key);
+                            let _ = self.context_manager.set(&context_key, value.clone());
+                        }
+                        if let Some(intent) = resolved.get("intent") {
+                            let _ = self.context_manager.set("resolved_intent", intent.clone());
+                        }
+                        let _ = self
+                            .context_manager
+                            .set("disambiguation.resolved", serde_json::Value::Bool(true));
+
+                        // Forward to internal stream with enriched input
+                        let mut inner = self.run_loop_internal_stream(&enriched_input);
+                        while let Some(chunk) = inner.next().await {
+                            yield chunk;
+                        }
+                        return;
+                    }
+                    DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                        info!("Proceeding with best guess (stream)");
+                        let mut inner = self.run_loop_internal_stream(&enriched_input);
+                        while let Some(chunk) = inner.next().await {
+                            yield chunk;
+                        }
+                        return;
+                    }
+                    DisambiguationResult::GiveUp { reason } => {
+                        warn!(reason = %reason, "Disambiguation gave up (stream)");
+                        let apology = self
+                            .generate_localized_apology(
+                                "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                                &reason,
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                format!("I'm sorry, I couldn't understand your request: {}", reason)
+                            });
+                        yield StreamChunk::content(&apology);
+                        yield StreamChunk::Done {};
+                        return;
+                    }
+                    DisambiguationResult::Escalate { reason } => {
+                        info!(reason = %reason, "Escalating to human (stream)");
+                        if let Some(ref hitl) = self.hitl_engine {
+                            let trigger =
+                                ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
+                            let mut context_map = HashMap::new();
+                            context_map.insert("original_input".to_string(), serde_json::json!(input));
+                            context_map.insert("reason".to_string(), serde_json::json!(&reason));
+                            let check_result = HITLCheckResult::required(
+                                trigger,
+                                context_map,
+                                format!("User request needs human assistance: {}", reason),
+                                Some(hitl.config().default_timeout_seconds),
+                            );
+                            match self.request_hitl_approval(check_result).await {
+                                Ok(true) => {
+                                    let mut inner = self.run_loop_internal_stream(input);
+                                    while let Some(chunk) = inner.next().await {
+                                        yield chunk;
+                                    }
+                                    return;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    yield StreamChunk::error(e.to_string());
+                                    return;
+                                }
+                            }
+                        }
+                        let apology = self
+                            .generate_localized_apology(
+                                "Explain briefly that you're transferring the user to a human agent for help.",
+                                &reason,
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                format!("I need human assistance to help with your request: {}", reason)
+                            });
+                        yield StreamChunk::content(&apology);
+                        yield StreamChunk::Done {};
+                        return;
+                    }
+                }
+            }
+
+            // No disambiguation or Clear result — proceed with internal stream
+            let mut inner = self.run_loop_internal_stream(input);
+            while let Some(chunk) = inner.next().await {
+                yield chunk;
+            }
+        })
     }
 
     pub fn info(&self) -> AgentInfo {
@@ -2903,136 +3534,12 @@ Respond in JSON format:
     }
 
     /// Stream a chat response with real-time updates
-    pub async fn chat_stream(
-        &self,
-        input: &str,
-    ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + '_>>> {
+    pub async fn chat_stream<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>> {
         info!(input_len = input.len(), "Starting streaming chat");
-
-        self.check_turn_timeout().await?;
-        self.context_manager.refresh_per_turn().await?;
-
-        let input_data = self.process_input(input).await?;
-
-        if input_data.metadata.rejected {
-            let reason = input_data
-                .metadata
-                .rejection_reason
-                .unwrap_or_else(|| "Input rejected".to_string());
-            warn!(reason = %reason, "Input rejected");
-            return Ok(Box::pin(stream::once(
-                async move { StreamChunk::error(reason) },
-            )));
-        }
-
-        let processed_input = input_data.content.clone();
-        let input_context = input_data.context.clone();
-
-        if let Some(skill_response) = self.try_skill_route(&processed_input).await? {
-            self.memory
-                .add_message(ChatMessage::user(&processed_input))
-                .await?;
-
-            let output_data = self.process_output(&skill_response, &input_context).await?;
-            let final_response = output_data.content;
-
-            self.memory
-                .add_message(ChatMessage::assistant(&final_response))
-                .await?;
-
-            self.increment_turn();
-            self.evaluate_transitions(&processed_input, &final_response)
-                .await?;
-
-            return Ok(Box::pin(stream::iter(vec![
-                StreamChunk::content(final_response),
-                StreamChunk::Done {},
-            ])));
-        }
-
-        self.memory
-            .add_message(ChatMessage::user(&processed_input))
-            .await?;
-
-        let llm = self.get_state_llm()?;
-        let messages = self.build_messages().await?;
-
-        let llm_stream = llm
-            .complete_stream(&messages, None)
-            .await
-            .map_err(|e| AgentError::LLM(e.to_string()))?;
-
-        let streaming_config = self.streaming.clone();
-        let include_tool_events = streaming_config.include_tool_events;
-
-        let stream = async_stream::stream! {
-            let mut accumulated_content = String::new();
-            let mut stream = llm_stream;
-
-            while let Some(chunk_result) = stream.next().await {
-                match chunk_result {
-                    Ok(chunk) => {
-                        accumulated_content.push_str(&chunk.delta);
-                        yield StreamChunk::content(chunk.delta);
-                    }
-                    Err(e) => {
-                        yield StreamChunk::error(e.to_string());
-                        return;
-                    }
-                }
-            }
-
-            let content = accumulated_content.trim().to_string();
-
-            if let Some(tool_calls) = self.parse_tool_calls(&content) {
-                for tool_call in &tool_calls {
-                    if include_tool_events {
-                        yield StreamChunk::tool_start(&tool_call.id, &tool_call.name);
-                    }
-
-                    match self.execute_tool_smart(tool_call).await {
-                        Ok(output) => {
-                            if include_tool_events {
-                                yield StreamChunk::tool_result(
-                                    &tool_call.id,
-                                    &tool_call.name,
-                                    &output,
-                                    true,
-                                );
-                            }
-                            let _ = self.memory
-                                .add_message(ChatMessage::function(&tool_call.name, &output))
-                                .await;
-                        }
-                        Err(e) => {
-                            if include_tool_events {
-                                yield StreamChunk::tool_result(
-                                    &tool_call.id,
-                                    &tool_call.name,
-                                    &e.to_string(),
-                                    false,
-                                );
-                            }
-                            let _ = self.memory
-                                .add_message(ChatMessage::function(&tool_call.name, &format!("Error: {}", e)))
-                                .await;
-                        }
-                    }
-
-                    if include_tool_events {
-                        yield StreamChunk::tool_end(&tool_call.id);
-                    }
-                }
-            } else {
-                let _ = self.memory
-                    .add_message(ChatMessage::assistant(&content))
-                    .await;
-            }
-
-            yield StreamChunk::Done {};
-        };
-
-        Ok(Box::pin(stream))
+        Ok(self.run_loop_stream(input))
     }
 }
 
