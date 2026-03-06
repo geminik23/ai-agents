@@ -164,21 +164,6 @@ cargo run --bin simple-chat
 cargo run --bin tool-agent
 ```
 
-### `rust/skills/`
-
-Rust wrapper around a YAML-defined skill agent.
-
-| Binary | Description |
-|--------|-------------|
-| `skill-agent` | Inline skills, external skills, and LLM-based skill matching |
-
-Run from:
-
-```sh
-cd examples/rust/skills
-cargo run --bin skill-agent
-```
-
 ### `rust/state-machine/`
 
 Rust wrapper around a YAML-defined state machine example.

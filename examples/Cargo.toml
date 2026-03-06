@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "rust/basic-api",
-    "rust/skills",
     "rust/state-machine",
     "rust/storage",
     "rust/custom-hitl",
