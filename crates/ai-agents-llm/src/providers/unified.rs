@@ -4,6 +4,7 @@ use ai_agents_core::{
 };
 use async_trait::async_trait;
 use futures::stream::StreamExt;
+use llm::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
@@ -205,6 +206,25 @@ impl UnifiedLLMProvider {
             if let Some(top_p) = cfg.top_p {
                 builder = builder.top_p(top_p);
             }
+            if let Some(reasoning_effort) =
+                cfg.extra.get("reasoning_effort").and_then(|v| v.as_str())
+            {
+                let effort = match reasoning_effort.to_lowercase().as_str() {
+                    "low" => Some(ReasoningEffort::Low),
+                    "medium" => Some(ReasoningEffort::Medium),
+                    "high" => Some(ReasoningEffort::High),
+                    _ => {
+                        return Err(LLMError::Config(format!(
+                            "Invalid reasoning_effort '{}'. Expected one of: low, medium, high",
+                            reasoning_effort
+                        )));
+                    }
+                };
+
+                if let Some(effort) = effort {
+                    builder = builder.reasoning_effort(effort);
+                }
+            }
         }
 
         builder
@@ -390,6 +410,7 @@ impl Default for ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn test_builder() {
@@ -415,5 +436,67 @@ mod tests {
                 .to_string()
                 .contains("Provider type not set")
         );
+    }
+
+    #[test]
+    fn test_build_llm_accepts_reasoning_effort_low() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("gpt-5.1-mini")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("low".to_string()),
+        );
+
+        let config = LLMConfig {
+            temperature: Some(0.7),
+            max_tokens: Some(2000),
+            top_p: Some(0.9),
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop_sequences: None,
+            extra,
+        };
+
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_llm_rejects_invalid_reasoning_effort() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("gpt-5.1-mini")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let mut extra = HashMap::new();
+        extra.insert(
+            "reasoning_effort".to_string(),
+            serde_json::Value::String("invalid".to_string()),
+        );
+
+        let config = LLMConfig {
+            temperature: Some(0.7),
+            max_tokens: Some(2000),
+            top_p: Some(0.9),
+            top_k: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop_sequences: None,
+            extra,
+        };
+
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("Invalid reasoning_effort"));
     }
 }
