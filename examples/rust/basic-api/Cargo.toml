@@ -19,3 +19,11 @@ path = "src/simple_chat.rs"
 [[bin]]
 name = "tool-agent"
 path = "src/tool_agent.rs"
+
+[[bin]]
+name = "yaml-loader"
+path = "src/yaml_loader.rs"
+
+[[bin]]
+name = "streaming-chat"
+path = "src/streaming_chat.rs"

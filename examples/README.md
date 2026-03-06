@@ -149,12 +149,14 @@ Rust examples are for embedding and extension scenarios.
 
 ### `rust/basic-api/`
 
-Minimal code-first examples.
+Beginner Rust entrypoints that show embedding and code-first usage after the YAML basics.
 
 | Binary | Description |
 |--------|-------------|
-| `simple-chat` | Minimal agent built entirely from the Rust API with a single LLM |
-| `tool-agent` | Agent with built-in tools via `AgentSpec` |
+| `simple-chat` | Smallest Rust-first agent using `AgentBuilder::new()` and a single LLM |
+| `tool-agent` | Rust-built agent that demonstrates built-in tools and interactive tool-call visibility |
+| `yaml-loader` | Minimal Rust example that loads and runs a YAML-defined agent |
+| `streaming-chat` | Minimal Rust example that enables streaming mode from the builder and streams output in the REPL |
 
 Run from:
 
@@ -162,6 +164,8 @@ Run from:
 cd examples/rust/basic-api
 cargo run --bin simple-chat
 cargo run --bin tool-agent
+cargo run --bin yaml-loader
+cargo run --bin streaming-chat
 ```
 
 ### `rust/state-machine/`
