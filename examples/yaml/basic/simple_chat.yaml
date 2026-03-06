@@ -1,0 +1,28 @@
+name: SimpleChatAgent
+version: "1.0.0"
+description: "Minimal YAML-first chat agent for ai-agents-cli"
+
+system_prompt: |
+  You are a friendly, curious, and helpful AI assistant.
+  Keep your answers clear, natural, and conversational.
+
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Simple Chat YAML Demo ==="
+    hints:
+      - "Try: Hello!"
+      - "Try: What can you help me with?"
+      - "Try: Explain Rust ownership simply."

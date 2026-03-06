@@ -6,7 +6,7 @@ mod provider;
 mod storage;
 mod tool;
 
-pub use llm::{LLMConfig, LLMSelector};
+pub use llm::{CliMetadata, CliPromptStyle, LLMConfig, LLMSelector};
 pub use memory::MemoryConfig;
 pub use provider::{
     BuiltinProviderConfig, ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig,

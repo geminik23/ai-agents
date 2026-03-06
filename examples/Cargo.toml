@@ -1,14 +1,13 @@
 [workspace]
 resolver = "2"
 members = [
-    "common",
-    "basic",
-    "skills",
-    "state-machine",
-    "memory",
-    "hitl",
-    "reasoning",
-    "disambiguation",
+    "rust/basic-api",
+    "rust/skills",
+    "rust/state-machine",
+    "rust/storage",
+    "rust/custom-hitl",
+    "rust/reasoning",
+    "rust/disambiguation",
 ]
 
 [workspace.package]
@@ -18,7 +17,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 ai-agents = { path = "../crates/ai-agents", features = ["full"] }
-example-common = { path = "common" }
+ai-agents-cli = { path = "../crates/ai-agents-cli" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

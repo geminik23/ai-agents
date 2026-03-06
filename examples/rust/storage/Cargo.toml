@@ -1,0 +1,22 @@
+[package]
+name = "example-memory"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-agents = { workspace = true }
+ai-agents-cli = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+uuid = { workspace = true }
+
+[[bin]]
+name = "memory-agent"
+path = "src/memory_agent.rs"
+
+[[bin]]
+name = "sqlite-persistence"
+path = "src/sqlite_persistence.rs"

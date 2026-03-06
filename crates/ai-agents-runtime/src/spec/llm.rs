@@ -3,6 +3,40 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CliMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub welcome: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hints: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_tools: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_state: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_timing: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub streaming: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_style: Option<CliPromptStyle>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_builtin_commands: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliPromptStyle {
+    Simple,
+    WithState,
+}
+
 /// Configuration for LLM provider
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMConfig {
@@ -83,6 +117,31 @@ impl LLMSelector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_cli_metadata_deserialize() {
+        let yaml = r#"
+welcome: "=== Demo ==="
+hints:
+  - "Try: hello"
+  - "Try: help"
+show_tools: true
+show_state: false
+show_timing: true
+streaming: true
+prompt_style: with_state
+disable_builtin_commands: false
+"#;
+        let metadata: CliMetadata = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(metadata.welcome.as_deref(), Some("=== Demo ==="));
+        assert_eq!(metadata.hints.len(), 2);
+        assert_eq!(metadata.show_tools, Some(true));
+        assert_eq!(metadata.show_state, Some(false));
+        assert_eq!(metadata.show_timing, Some(true));
+        assert_eq!(metadata.streaming, Some(true));
+        assert_eq!(metadata.prompt_style, Some(CliPromptStyle::WithState));
+        assert_eq!(metadata.disable_builtin_commands, Some(false));
+    }
 
     #[test]
     fn test_llm_config_default() {

@@ -1,0 +1,34 @@
+name: SimpleToolsAgent
+version: "1.0.0"
+description: "Basic YAML-first example showing built-in tool usage"
+
+system_prompt: |
+  You are a helpful assistant with access to a few built-in tools.
+  Use tools when they are clearly useful.
+  Keep responses short, clear, and practical.
+
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+
+tools:
+  - name: calculator
+  - name: datetime
+  - name: echo
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Simple Tools YAML Demo ==="
+    hints:
+      - "Try: What is 24 * 17?"
+      - "Try: What time is it?"
+      - "Try: Echo Hello tools"
+    show_tools: true

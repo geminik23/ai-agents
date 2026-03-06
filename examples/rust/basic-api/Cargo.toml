@@ -1,0 +1,21 @@
+[package]
+name = "example-basic"
+version = "0.0.0"
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+ai-agents = { workspace = true }
+ai-agents-cli = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "simple-chat"
+path = "src/simple_chat.rs"
+
+[[bin]]
+name = "tool-agent"
+path = "src/tool_agent.rs"
