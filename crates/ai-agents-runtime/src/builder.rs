@@ -21,6 +21,7 @@ use ai_agents_template::{TemplateInheritance, TemplateLoader, TemplateRenderer};
 use ai_agents_tools::{ToolRegistry, ToolSecurityEngine, create_builtin_registry};
 
 use super::AgentInfo;
+use super::StreamingConfig;
 use super::runtime::RuntimeAgent;
 use crate::spec::{AgentSpec, StorageConfig};
 
@@ -51,6 +52,7 @@ pub struct AgentBuilder {
     storage: Option<Arc<dyn AgentStorage>>,
     reasoning: Option<ReasoningConfig>,
     reflection: Option<ReflectionConfig>,
+    streaming: Option<StreamingConfig>,
 }
 
 impl AgentBuilder {
@@ -82,6 +84,7 @@ impl AgentBuilder {
             approval_handler: None,
             storage_config: None,
             storage: None,
+            streaming: None,
         }
     }
 
@@ -390,6 +393,13 @@ impl AgentBuilder {
         self
     }
 
+    pub fn streaming(mut self, enabled: bool) -> Self {
+        let mut config = self.streaming.unwrap_or_default();
+        config.enabled = enabled;
+        self.streaming = Some(config);
+        self
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt
@@ -561,7 +571,11 @@ impl AgentBuilder {
         // Configure parallel tools and streaming from spec
         if let Some(ref spec) = self.spec {
             agent = agent.with_parallel_tools(spec.parallel_tools.clone());
-            agent = agent.with_streaming(spec.streaming.clone());
+            let streaming_config = self
+                .streaming
+                .clone()
+                .unwrap_or_else(|| spec.streaming.clone());
+            agent = agent.with_streaming(streaming_config);
 
             // Configure memory token budget if specified
             if let Some(ref budget) = spec.memory.token_budget {
