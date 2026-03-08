@@ -5,7 +5,7 @@ pub mod run;
 
 pub use cli::{Cli, Command, RunArgs, ValidateArgs};
 pub use metadata::{CliOverrides, ResolvedCliMetadata};
-pub use repl::{CliRepl, CliReplConfig, PromptStyle, ReplMode};
+pub use repl::{CliRepl, CliReplConfig, CommandResult, PromptStyle, ReplMode};
 pub use run::{
     RunOptions, build_agent, load_spec, resolve_cli_config, run, run_agent, validate_agent,
 };

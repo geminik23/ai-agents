@@ -11,7 +11,7 @@ use ai_agents::{
     Agent, AgentBuilder, AgentHooks, AgentResponse, MemoryBudgetEvent, MemoryCompressEvent,
     MemoryEvictEvent, Result, RuntimeAgent,
 };
-use ai_agents_cli::{CliRepl, init_tracing};
+use ai_agents_cli::{CliRepl, CommandResult, init_tracing};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -83,11 +83,11 @@ impl AgentHooks for MemoryMonitorHooks {
     }
 }
 
-fn handle_command(input: &str, agent: &RuntimeAgent, hooks: &MemoryMonitorHooks) -> bool {
+fn handle_command(input: &str, agent: &RuntimeAgent, hooks: &MemoryMonitorHooks) -> CommandResult {
     match input.to_lowercase().as_str() {
         "/stats" => {
             hooks.print_stats();
-            true
+            CommandResult::Handled
         }
         "/history" | "/hist" => {
             let snapshot = tokio::task::block_in_place(|| {
@@ -123,7 +123,7 @@ fn handle_command(input: &str, agent: &RuntimeAgent, hooks: &MemoryMonitorHooks)
                     eprintln!("Error getting history: {}\n", e);
                 }
             }
-            true
+            CommandResult::Handled
         }
         "/fill" => {
             println!("Adding test messages...");
@@ -146,9 +146,9 @@ fn handle_command(input: &str, agent: &RuntimeAgent, hooks: &MemoryMonitorHooks)
             });
             println!("Done! Memory should have compressed.\n");
             hooks.print_stats();
-            true
+            CommandResult::Handled
         }
-        _ => false,
+        _ => CommandResult::NotHandled,
     }
 }
 
@@ -164,19 +164,18 @@ async fn main() -> Result<()> {
         .hooks(hooks.clone())
         .build()?;
 
-    println!("=== Memory Agent Demo ===");
-    println!();
-    println!("CompactingMemory with auto-summarization.");
-    println!("Memory type: compacting | Compress threshold: 8 messages | Token budget: 4096");
-    println!("/stats   - Show memory statistics");
-    println!("/history - Show conversation history (messages + summary)");
-    println!("/fill    - Add test messages to trigger compression");
-    println!("Try having a long conversation to see compression in action!");
-    println!();
-
+    let hooks_cmd = hooks.clone();
     let hooks_quit = hooks.clone();
 
     CliRepl::new(agent)
+        .welcome("=== Memory Agent Demo ===")
+        .hint("CompactingMemory with auto-summarization.")
+        .hint("Memory type: compacting | Compress threshold: 8 messages | Token budget: 4096")
+        .hint("/stats   - Show memory statistics")
+        .hint("/history - Show conversation history (messages + summary)")
+        .hint("/fill    - Add test messages to trigger compression")
+        .hint("Try having a long conversation to see compression in action!")
+        .on_command(move |input, agent| handle_command(input, agent, &hooks_cmd))
         .run()
         .await?;
 

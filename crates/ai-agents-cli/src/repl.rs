@@ -14,6 +14,15 @@ pub enum PromptStyle {
     WithState,
 }
 
+/// Return type for custom command handlers registered via [`CliRepl::on_command`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandResult {
+    Handled,
+    NotHandled,
+}
+
+type CommandHandler = Box<dyn Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync>;
+
 #[derive(Debug, Clone)]
 pub struct CliReplConfig {
     pub welcome: Option<String>,
@@ -46,10 +55,28 @@ enum CommandAction {
     Quit,
 }
 
-#[derive(Debug)]
 pub struct CliRepl {
     agent: RuntimeAgent,
     config: CliReplConfig,
+    command_handler: Option<CommandHandler>,
+}
+
+// Manual Debug impl because CommandHandler (a boxed closure) doesn't implement Debug.
+impl std::fmt::Debug for CliRepl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CliRepl")
+            .field("agent", &"RuntimeAgent { .. }")
+            .field("config", &self.config)
+            .field(
+                "command_handler",
+                &if self.command_handler.is_some() {
+                    "Some(<fn>)"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
 }
 
 impl CliRepl {
@@ -57,6 +84,7 @@ impl CliRepl {
         Self {
             agent,
             config: CliReplConfig::default(),
+            command_handler: None,
         }
     }
 
@@ -106,6 +134,15 @@ impl CliRepl {
         self
     }
 
+    /// Register a custom command handler, called before built-in commands.
+    pub fn on_command<F>(mut self, handler: F) -> Self
+    where
+        F: Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync + 'static,
+    {
+        self.command_handler = Some(Box::new(handler));
+        self
+    }
+
     pub async fn run(self) -> ai_agents::Result<()> {
         if let Some(ref welcome) = self.config.welcome {
             println!("{}", welcome);
@@ -127,9 +164,9 @@ impl CliRepl {
 
         println!();
         if self.config.builtin_commands {
-            println!("Type 'help' for commands, 'quit' to exit.");
+            println!("Type '/help' for commands, '/quit' to exit.");
         } else {
-            println!("Type 'quit' to exit.");
+            println!("Type '/quit' to exit.");
         }
         println!();
 
@@ -157,6 +194,14 @@ impl CliRepl {
                 continue;
             }
 
+            // 1. Try the user-supplied custom command handler first
+            if let Some(ref handler) = self.command_handler {
+                if handler(input, &self.agent) == CommandResult::Handled {
+                    continue;
+                }
+            }
+
+            // 2. Try built-in commands
             match self.handle_command(input).await {
                 Some(CommandAction::Quit) => {
                     println!("Goodbye!");
@@ -166,6 +211,7 @@ impl CliRepl {
                 None => {}
             }
 
+            // 3. Normal chat / streaming
             let start = std::time::Instant::now();
 
             match self.config.mode {
@@ -185,18 +231,18 @@ impl CliRepl {
     async fn handle_command(&self, input: &str) -> Option<CommandAction> {
         if !self.config.builtin_commands {
             return match input.to_lowercase().as_str() {
-                "quit" | "exit" => Some(CommandAction::Quit),
+                "/quit" | "/exit" => Some(CommandAction::Quit),
                 _ => None,
             };
         }
 
         match input.to_lowercase().as_str() {
-            "quit" | "exit" => Some(CommandAction::Quit),
-            "help" | "?" => {
+            "/quit" | "/exit" => Some(CommandAction::Quit),
+            "/help" | "?" => {
                 self.print_help();
                 Some(CommandAction::Continue)
             }
-            "reset" => {
+            "/reset" => {
                 if let Err(e) = self.agent.reset().await {
                     eprintln!("[Error] Reset failed: {}", e);
                 } else {
@@ -207,14 +253,14 @@ impl CliRepl {
                 }
                 Some(CommandAction::Continue)
             }
-            "state" => {
+            "/state" => {
                 match self.agent.current_state() {
                     Some(state) => println!("Current state: {}", state),
                     None => println!("No state machine active."),
                 }
                 Some(CommandAction::Continue)
             }
-            "history" => {
+            "/history" => {
                 let history = self.agent.state_history();
                 if history.is_empty() {
                     println!("No state transitions yet.");
@@ -226,7 +272,7 @@ impl CliRepl {
                 }
                 Some(CommandAction::Continue)
             }
-            "info" => {
+            "/info" => {
                 let info = self.agent.info();
                 println!("Agent: {} v{}", info.name, info.version);
                 if let Some(ref desc) = info.description {
@@ -244,12 +290,12 @@ impl CliRepl {
 
     fn print_help(&self) {
         println!("Commands:");
-        println!("  help, ?     Show this help message");
-        println!("  quit, exit  Exit the REPL");
-        println!("  reset       Clear memory and reset state");
-        println!("  state       Show current state");
-        println!("  history     Show state transition history");
-        println!("  info        Show agent information");
+        println!("  /help, ?     Show this help message");
+        println!("  /quit, /exit Exit the REPL");
+        println!("  /reset       Clear memory and reset state");
+        println!("  /state       Show current state");
+        println!("  /history     Show state transition history");
+        println!("  /info        Show agent information");
         println!();
     }
 

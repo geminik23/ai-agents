@@ -885,9 +885,16 @@ impl RuntimeAgent {
         let system_prompt = self.get_effective_system_prompt().await?;
         let mut messages = vec![ChatMessage::system(&system_prompt)];
 
+        // Use get_context() instead of get_messages() so that the conversation
+        // summary produced by CompactingMemory is included in the prompt.
         // Token budget controls what's stored in memory (via handle_memory_overflow)
         // max_context_tokens + ContextOverflowAction handles LLM context limits
-        let history = self.memory.get_messages(None).await?;
+        let context = self.memory.get_context().await?;
+        let history = if let Some(ref budget) = self.memory_token_budget {
+            context.to_llm_messages_with_budget(budget.total)
+        } else {
+            context.to_llm_messages()
+        };
         messages.extend(history);
 
         let total_tokens = self.estimate_total_tokens(&messages);

@@ -103,17 +103,32 @@ cargo run -p ai-agents-cli -- run examples/yaml/state-machine/support_state_mach
 
 ### `yaml/memory/`
 
-Memory-focused declarative examples.
+Progressive memory examples — from simplest to production-grade.
 
 | File | Description |
 |------|-------------|
-| `memory_agent.yaml` | Compacting memory with summarization and token budgeting |
+| `memory_basic.yaml` | Simplest memory — in-memory storage with a message limit |
+| `memory_compacting.yaml` | Compacting memory with automatic LLM-based summarization |
+| `memory_budget.yaml` | Token budgeting — per-component allocation controlling prompt size |
+| `memory_agent.yaml` | Full production config combining compacting, budgeting, and hooks |
 
-Example:
+Learning path:
+
+1. **`memory_basic.yaml`** — Memory exists, keeps messages, has a limit
+2. **`memory_compacting.yaml`** — Old messages get summarized automatically
+3. **`memory_budget.yaml`** — Token budget controls how much memory enters the prompt
+4. **`memory_agent.yaml`** — Full production configuration
+
+Examples:
 
 ```sh
+cargo run -p ai-agents-cli -- run examples/yaml/memory/memory_basic.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/memory/memory_compacting.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/memory/memory_budget.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/memory/memory_agent.yaml
 ```
+
+For session persistence (save/restore across restarts), see `rust/storage/` below.
 
 ### `yaml/reasoning/`
 
@@ -189,13 +204,21 @@ Programmatic memory and persistence examples.
 
 | Binary | Description |
 |--------|-------------|
-| `memory-agent` | Compacting memory with hooks and custom commands |
-| `sqlite-persistence` | Save/load/search agent sessions with SQLite storage |
+| `save-restore-session` | Minimal session persistence — `/save` and `/load` only |
+| `memory-agent` | Compacting memory with hooks monitoring compression and budget warnings |
+| `sqlite-persistence` | Full session CRUD — save, load, list, search, delete, info |
+
+Learning path:
+
+1. **`save-restore-session`** — Simplest persistence (save a session, quit, restart, load it back)
+2. **`memory-agent`** — Monitor memory events with hooks (compression, eviction, budget warnings)
+3. **`sqlite-persistence`** — Full session management with SQLite
 
 Run from:
 
 ```sh
 cd examples/rust/storage
+cargo run --bin save-restore-session
 cargo run --bin memory-agent
 cargo run --bin sqlite-persistence
 ```

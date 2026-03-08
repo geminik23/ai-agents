@@ -122,6 +122,7 @@ impl AgentBuilder {
             storage: None,
             reasoning,
             reflection,
+            streaming: None,
         }
     }
 

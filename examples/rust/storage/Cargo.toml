@@ -20,3 +20,7 @@ path = "src/memory_agent.rs"
 [[bin]]
 name = "sqlite-persistence"
 path = "src/sqlite_persistence.rs"
+
+[[bin]]
+name = "save-restore-session"
+path = "src/save_restore_session.rs"

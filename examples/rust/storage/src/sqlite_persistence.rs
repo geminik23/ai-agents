@@ -1,5 +1,5 @@
 use ai_agents::{AgentBuilder, AgentStorage, Result, SessionQuery, SqliteStorage, StorageConfig};
-use ai_agents_cli::{CliRepl as Repl, init_tracing};
+use ai_agents_cli::{CliRepl as Repl, CommandResult, init_tracing};
 use std::sync::Arc;
 
 /// Run an async block from inside the sync `on_command` callback.

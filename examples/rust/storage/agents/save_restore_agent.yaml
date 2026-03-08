@@ -1,0 +1,42 @@
+name: SaveRestoreAgent
+version: "1.0.0"
+description: "Minimal agent for demonstrating session save and restore"
+
+system_prompt: "You are a helpful assistant."
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-nano
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_messages: 50
+  max_recent_messages: 10
+  compress_threshold: 8
+  summarize_batch_size: 4
+  summarizer_llm: router
+
+storage:
+  type: sqlite
+  path: "./save_restore_sessions.db"
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Save & Restore Session Demo ==="
+    hints:
+      - "/save <id>  - Save the current session"
+      - "/load <id>  - Restore a previously saved session"
+      - "Try: chat, /save mysession, quit, restart, /load mysession"

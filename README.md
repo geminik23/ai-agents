@@ -99,7 +99,9 @@ ai-agents = "1.0.0-rc.5"
 
 ## Quick Start
 
-### From YAML
+### From CLI (no Rust code needed)
+
+Create `agent.yaml`:
 
 ```yaml
 # agent.yaml
@@ -108,7 +110,25 @@ system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
   model: gpt-4.1-nano
+  
+# Provider-specific extra params are also allowed.
+# Example for OpenAI reasoning-capable models:
+# llms:
+#   default:
+#     provider: openai
+#     model: gpt-5.1-mini
+#     reasoning_effort: low
+# llm:
+#   default: default
 ```
+
+Run it:
+
+```sh
+cargo run -p ai-agents-cli -- run agent.yaml
+```
+
+### From YAML + Rust
 
 ```rust
 use ai_agents::{Agent, AgentBuilder};
@@ -148,6 +168,70 @@ async fn main() -> ai_agents::Result<()> {
 ```
 
 See the [examples/](examples/) directory for more.
+
+## CLI
+
+The `ai-agents-cli` crate is the framework's command-line runner.
+
+### Install
+
+```sh
+# From the framework repo
+cargo install --path crates/ai-agents-cli
+
+# Or run directly without installing
+cargo run -p ai-agents-cli -- <command>
+```
+
+### Run an agent
+
+```sh
+ai-agents-cli run agent.yaml
+```
+
+With options:
+
+```sh
+ai-agents-cli run agent.yaml --stream           # stream tokens in real time
+ai-agents-cli run agent.yaml --show-tools        # display tool calls
+ai-agents-cli run agent.yaml --show-state        # show state machine transitions
+ai-agents-cli run agent.yaml --show-timing       # show response time
+ai-agents-cli run agent.yaml --stream --show-tools --show-state  # combine flags
+```
+
+### Validate a YAML file
+
+Check an agent definition without starting the REPL:
+
+```sh
+ai-agents-cli validate agent.yaml
+```
+
+### REPL commands
+
+Once inside the interactive session:
+
+| Command | Description |
+|---------|-------------|
+| `/help`, `?` | Show available commands |
+| `/reset` | Clear memory and reset state |
+| `/state` | Show current state machine state |
+| `/history` | Show state transition history |
+| `/info` | Show agent name, version, skills |
+| `/quit`, `/exit` | Exit the REPL |
+
+### YAML CLI metadata
+
+YAML files can include optional `metadata.cli` for a better interactive experience:
+
+```yaml
+metadata:
+  cli:
+    welcome: "=== My Agent ==="
+    hints:
+      - "Try asking about the weather"
+      - "Type 'help' for commands"
+```
 
 ## License
 

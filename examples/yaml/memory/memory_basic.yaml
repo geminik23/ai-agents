@@ -1,0 +1,32 @@
+name: BasicMemoryAgent
+version: "1.0.0"
+description: "Simplest memory example — in-memory storage with a message limit"
+
+system_prompt: "You are a helpful assistant."
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+
+llm:
+  default: default
+
+# "in-memory" keeps messages in RAM (lost on restart)
+# max_messages caps how many messages are retained
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Basic Memory Demo ==="
+    hints:
+      - "Tell the agent your name, then later ask: What is my name?"
+      - "This agent uses simple in-memory storage with a 50-message limit."
+      - "Messages are lost when the agent restarts."

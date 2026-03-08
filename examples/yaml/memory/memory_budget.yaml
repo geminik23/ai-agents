@@ -1,6 +1,6 @@
-name: MemoryDemo
+name: BudgetMemoryAgent
 version: "1.0.0"
-description: "Memory agent with compacting memory and auto-summarization"
+description: "Compacting memory with token budgeting for prompt size control"
 
 system_prompt: "You are a helpful assistant."
 
@@ -18,11 +18,10 @@ llm:
 
 memory:
   type: compacting
-  max_messages: 100                    # hard cap on stored messages
-  max_recent_messages: 10              # always keep this many unsummarized
-  compress_threshold: 8               # trigger compression after this many messages
-  summarize_batch_size: 4             # how many old messages to summarize at once
-  summarizer_llm: router              # use the fast/cheap LLM for summaries
+  max_recent_messages: 8
+  compress_threshold: 8
+  summarize_batch_size: 4
+  summarizer_llm: router
   token_budget:
     total: 4096                        # max tokens memory can contribute to the prompt
     allocation:
@@ -39,8 +38,9 @@ skills: []
 
 metadata:
   cli:
-    welcome: "=== Memory Agent Demo ==="
+    welcome: "=== Token Budget Memory Demo ==="
     hints:
-      - "Try a longer conversation and ask the agent to recall earlier details."
-      - "Ask: What did we talk about before?"
-      - "Ask several unrelated questions to exercise memory compaction."
+      - "Token budget controls how much memory enters the LLM prompt."
+      - "summary gets 1024 tokens, recent_messages gets 2048, facts gets 512."
+      - "Total budget: 4096 tokens. Overflow strategy: truncate_oldest."
+      - "Warning fires at 70% usage. Have a long conversation to see it in action."

@@ -1,0 +1,42 @@
+name: CompactingMemoryAgent
+version: "1.0.0"
+description: "Compacting memory with automatic LLM-based summarization"
+
+system_prompt: "You are a helpful assistant."
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# compress_threshold: after this many messages, compression kicks in
+# summarize_batch_size: how many old messages to summarize at once
+# summarizer_llm: which LLM generates summaries (use a fast/cheap one)
+# max_recent_messages: how many recent messages to always keep unsummarized
+memory:
+  type: compacting
+  max_recent_messages: 6
+  compress_threshold: 8
+  summarize_batch_size: 4
+  summarizer_llm: router
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Compacting Memory Demo ==="
+    hints:
+      - "Have a long conversation (8+ messages) to trigger summarization."
+      - "Ask: What did we discuss earlier?"
+      - "The router LLM compresses old messages into a rolling summary."
+      - "Recent messages (last 6) are always kept in full."

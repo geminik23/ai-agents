@@ -2,10 +2,7 @@ name: MemoryDemo
 version: "1.0.0"
 description: "Memory agent with compacting memory and auto-summarization"
 
-system_prompt: |
-  You are a helpful assistant with excellent memory.
-  You remember previous conversations and can recall details.
-  When asked about past topics, reference what was discussed.
+system_prompt: "You are a helpful assistant."
 
 llms:
   default:
