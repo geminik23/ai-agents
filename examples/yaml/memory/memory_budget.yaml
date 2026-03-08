@@ -41,6 +41,8 @@ metadata:
     welcome: "=== Token Budget Memory Demo ==="
     hints:
       - "Token budget controls how much memory enters the LLM prompt."
-      - "summary gets 1024 tokens, recent_messages gets 2048, facts gets 512."
+      - "summary: 1024 tokens | recent_messages: 2048 | facts: 512 (reserved)"
       - "Total budget: 4096 tokens. Overflow strategy: truncate_oldest."
-      - "Warning fires at 70% usage. Have a long conversation to see it in action."
+      - "Warning fires at 70% usage per component."
+      - "Type /memory to see current token usage vs budget."
+      - "Have a long conversation (8+ messages) to trigger compression and budget events."

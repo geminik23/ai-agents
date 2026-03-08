@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::token_budget::TokenAllocation;
 use ai_agents_core::{ChatMessage, Role};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -46,6 +47,60 @@ impl ConversationContext {
         }
 
         result.extend(self.messages.clone());
+        result
+    }
+
+    /// Build LLM messages with per-component token budgets.
+    pub fn to_llm_messages_with_allocation(
+        &self,
+        allocation: &TokenAllocation,
+    ) -> Vec<ChatMessage> {
+        let mut result = Vec::new();
+
+        // Summary - capped to allocation.summary tokens
+        if let Some(ref summary) = self.summary {
+            let summary_content = format!("[Previous conversation summary]\n{}", summary);
+            let summary_tokens = estimate_tokens(&summary_content);
+
+            let final_content = if summary_tokens > allocation.summary {
+                let ratio = summary_content.len() as f64 / summary_tokens as f64;
+                let target_chars = (allocation.summary as f64 * ratio) as usize;
+                let truncated = &summary_content[..target_chars.min(summary_content.len())];
+                format!("{}...", truncated)
+            } else {
+                summary_content
+            };
+
+            result.push(ChatMessage {
+                role: Role::System,
+                content: final_content,
+                name: None,
+                timestamp: None,
+            });
+        }
+
+        // Recent messages - capped to allocation.recent_messages tokens
+        let mut used_message_tokens = 0u32;
+        let mut messages_to_add: Vec<&ChatMessage> = Vec::new();
+
+        for msg in self.messages.iter().rev() {
+            let tokens = estimate_message_tokens(msg);
+            if used_message_tokens + tokens <= allocation.recent_messages {
+                used_message_tokens += tokens;
+                messages_to_add.push(msg);
+            } else {
+                break;
+            }
+        }
+
+        messages_to_add.reverse();
+        for msg in messages_to_add {
+            result.push(msg.clone());
+        }
+
+        // TODO:
+        // Facts - reserved for 'Session Management' feature, not injected yet.
+
         result
     }
 
@@ -242,6 +297,84 @@ mod tests {
 
         let limited = ctx.to_llm_messages_with_budget(50);
         assert!(limited.len() < 10);
+    }
+
+    #[test]
+    fn test_to_llm_messages_with_allocation_caps_summary() {
+        let long_summary = "x".repeat(10000); // ~2500 tokens
+        let messages = vec![make_message(Role::User, "Hello")];
+        let ctx = ConversationContext::with_messages(messages).with_summary(long_summary, 50);
+
+        let allocation = TokenAllocation {
+            summary: 100,
+            recent_messages: 2048,
+            facts: 512,
+        };
+
+        let result = ctx.to_llm_messages_with_allocation(&allocation);
+        // Summary should be truncated
+        let summary_msg = &result[0];
+        let summary_tokens = estimate_tokens(&summary_msg.content);
+        assert!(
+            summary_tokens <= 120,
+            "Summary should be roughly capped: got {}",
+            summary_tokens
+        );
+        // Recent message should still be present
+        assert!(result.len() >= 2);
+    }
+
+    #[test]
+    fn test_to_llm_messages_with_allocation_caps_recent() {
+        let messages: Vec<ChatMessage> = (0..50)
+            .map(|i| {
+                make_message(
+                    Role::User,
+                    &format!(
+                        "Message number {} with some extra text to increase tokens",
+                        i
+                    ),
+                )
+            })
+            .collect();
+        let ctx = ConversationContext::with_messages(messages);
+
+        let allocation = TokenAllocation {
+            summary: 1024,
+            recent_messages: 200,
+            facts: 512,
+        };
+
+        let result = ctx.to_llm_messages_with_allocation(&allocation);
+        assert!(
+            result.len() < 50,
+            "Should have fewer messages due to cap: got {}",
+            result.len()
+        );
+        // Messages should be the most recent
+        let last = &result[result.len() - 1];
+        assert!(
+            last.content.contains("49"),
+            "Last message should be the most recent"
+        );
+    }
+
+    #[test]
+    fn test_to_llm_messages_with_allocation_no_summary() {
+        let messages = vec![
+            make_message(Role::User, "Hello"),
+            make_message(Role::Assistant, "Hi!"),
+        ];
+        let ctx = ConversationContext::with_messages(messages);
+
+        let allocation = TokenAllocation {
+            summary: 1024,
+            recent_messages: 2048,
+            facts: 512,
+        };
+
+        let result = ctx.to_llm_messages_with_allocation(&allocation);
+        assert_eq!(result.len(), 2);
     }
 
     #[test]

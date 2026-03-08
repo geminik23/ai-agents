@@ -1,3 +1,4 @@
+use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
 use ai_agents::{Agent, AgentResponse, RuntimeAgent, StreamChunk};
 use futures::StreamExt;
 use std::io::{self, Write};
@@ -284,19 +285,119 @@ impl CliRepl {
                 }
                 Some(CommandAction::Continue)
             }
+            "/memory" | "/mem" => {
+                self.print_memory_status().await;
+                Some(CommandAction::Continue)
+            }
             _ => None,
         }
     }
 
     fn print_help(&self) {
         println!("Commands:");
-        println!("  /help, ?     Show this help message");
-        println!("  /quit, /exit Exit the REPL");
-        println!("  /reset       Clear memory and reset state");
-        println!("  /state       Show current state");
-        println!("  /history     Show state transition history");
-        println!("  /info        Show agent information");
+        println!("  /help, ?      Show this help message");
+        println!("  /quit, /exit  Exit the REPL");
+        println!("  /reset        Clear memory and reset state");
+        println!("  /state        Show current state");
+        println!("  /history      Show state transition history");
+        println!("  /info         Show agent information");
+        println!("  /memory, /mem Show memory status and token budget");
         println!();
+    }
+
+    async fn print_memory_status(&self) {
+        let snapshot = match self.agent.save_state().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[Error] Failed to read memory: {}\n", e);
+                return;
+            }
+        };
+
+        let msg_count = snapshot.memory.messages.len();
+        let has_summary = snapshot.memory.summary.is_some();
+
+        println!("\n--- Memory Status ---");
+
+        // Message counts
+        if has_summary {
+            println!("  Messages: {} recent + summary", msg_count);
+        } else {
+            println!("  Messages: {}", msg_count);
+        }
+
+        // Summary info
+        if let Some(ref summary) = snapshot.memory.summary {
+            let tokens = estimate_tokens(summary);
+            let preview = if summary.len() > 80 {
+                format!("{}...", &summary[..80])
+            } else {
+                summary.clone()
+            };
+            println!("  Summary:  {} tokens", tokens);
+            println!("            \"{}\"", preview);
+        } else {
+            println!("  Summary:  none");
+        }
+
+        // Token budget display
+        if let Some(budget) = self.agent.memory_token_budget() {
+            let recent_tokens: u32 = snapshot
+                .memory
+                .messages
+                .iter()
+                .map(|m| estimate_message_tokens(m))
+                .sum();
+            let summary_tokens = snapshot
+                .memory
+                .summary
+                .as_ref()
+                .map(|s| estimate_tokens(s))
+                .unwrap_or(0);
+            let used = recent_tokens + summary_tokens;
+            let pct = if budget.total > 0 {
+                used as f64 / budget.total as f64 * 100.0
+            } else {
+                0.0
+            };
+
+            println!();
+            println!("  Token Budget:");
+            println!(
+                "    Total:           {:>5} / {:>5} ({:.1}%)",
+                used, budget.total, pct
+            );
+
+            let s_pct = if budget.allocation.summary > 0 {
+                summary_tokens as f64 / budget.allocation.summary as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    Summary:         {:>5} / {:>5} ({:.1}%)",
+                summary_tokens, budget.allocation.summary, s_pct
+            );
+
+            let r_pct = if budget.allocation.recent_messages > 0 {
+                recent_tokens as f64 / budget.allocation.recent_messages as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    Recent messages: {:>5} / {:>5} ({:.1}%)",
+                recent_tokens, budget.allocation.recent_messages, r_pct
+            );
+
+            println!(
+                "    Facts:           {:>5} / {:>5} ( 0.0%)",
+                0, budget.allocation.facts
+            );
+
+            println!("    Overflow:        {:?}", budget.overflow_strategy);
+            println!("    Warning at:      {}%", budget.warn_at_percent);
+        }
+
+        println!("---------------------\n");
     }
 
     async fn handle_chat(&self, input: &str) {

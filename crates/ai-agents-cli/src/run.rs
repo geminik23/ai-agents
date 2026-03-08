@@ -1,8 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ai_agents::{
-    AgentBuilder, RuntimeAgent,
+    AgentBuilder, LoggingHooks, RuntimeAgent,
     spec::{AgentSpec, CliPromptStyle},
 };
 use anyhow::{Context, Result};
@@ -102,14 +103,23 @@ pub fn load_spec(path: &Path) -> Result<AgentSpec> {
 }
 
 pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
-    AgentBuilder::from_yaml_file(path)
+    let spec = load_spec(path)?;
+
+    let mut builder = AgentBuilder::from_yaml_file(path)
         .with_context(|| format!("failed to load YAML from {}", path.display()))?
         .auto_configure_llms()
         .context("failed to auto-configure LLMs from environment")?
         .auto_configure_features()
-        .context("failed to auto-configure agent features")?
-        .build()
-        .context("failed to build runtime agent")
+        .context("failed to auto-configure agent features")?;
+
+    // Attach LoggingHooks when the agent uses memory features that produce
+    // hook events (compacting memory, token budgeting). Without this, budget
+    // warnings and compression events are silently discarded by NoopHooks.
+    if spec.memory.is_compacting() || spec.memory.token_budget.is_some() {
+        builder = builder.hooks(Arc::new(LoggingHooks::with_prefix("[Memory]")));
+    }
+
+    builder.build().context("failed to build runtime agent")
 }
 
 pub fn resolve_cli_config(spec: &AgentSpec, metadata: &ResolvedCliMetadata) -> CliReplConfig {

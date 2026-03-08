@@ -891,7 +891,9 @@ impl RuntimeAgent {
         // max_context_tokens + ContextOverflowAction handles LLM context limits
         let context = self.memory.get_context().await?;
         let history = if let Some(ref budget) = self.memory_token_budget {
-            context.to_llm_messages_with_budget(budget.total)
+            // Use per-component allocation so summary and recent messages
+            // are each capped to their declared token budgets.
+            context.to_llm_messages_with_allocation(&budget.allocation)
         } else {
             context.to_llm_messages()
         };
@@ -1696,23 +1698,55 @@ OVERALL: PASS/FAIL"#,
     }
 
     async fn check_memory_budget(&self) {
-        if let Some(ref budget) = self.memory_token_budget {
-            let context = match self.memory.get_context().await {
-                Ok(ctx) => ctx,
-                Err(_) => return,
-            };
+        let Some(ref budget) = self.memory_token_budget else {
+            return;
+        };
 
-            let used_tokens = context.estimated_tokens();
+        let context = match self.memory.get_context().await {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
 
-            if budget.is_over_warn_threshold(used_tokens) {
-                let event = MemoryBudgetEvent::new("memory", used_tokens, budget.total);
+        // Overall budget warning
+        let used_tokens = context.estimated_tokens();
+        if budget.is_over_warn_threshold(used_tokens) {
+            let event = MemoryBudgetEvent::new("memory", used_tokens, budget.total);
+            self.hooks.on_memory_budget_warning(&event).await;
+            debug!(
+                used = used_tokens,
+                total = budget.total,
+                percent = event.usage_percent,
+                "Memory budget warning"
+            );
+        }
+
+        // Per-component warning: summary
+        if let Some(ref summary) = context.summary {
+            let summary_tokens = ai_agents_memory::estimate_tokens(summary);
+            let summary_budget = budget.allocation.summary;
+            if summary_budget > 0 {
+                let warn_threshold =
+                    (summary_budget as f64 * budget.warn_at_percent as f64 / 100.0) as u32;
+                if summary_tokens >= warn_threshold {
+                    let event = MemoryBudgetEvent::new("summary", summary_tokens, summary_budget);
+                    self.hooks.on_memory_budget_warning(&event).await;
+                }
+            }
+        }
+
+        // Per-component warning: recent_messages
+        let recent_tokens: u32 = context
+            .messages
+            .iter()
+            .map(ai_agents_memory::estimate_message_tokens)
+            .sum();
+        let recent_budget = budget.allocation.recent_messages;
+        if recent_budget > 0 {
+            let warn_threshold =
+                (recent_budget as f64 * budget.warn_at_percent as f64 / 100.0) as u32;
+            if recent_tokens >= warn_threshold {
+                let event = MemoryBudgetEvent::new("recent_messages", recent_tokens, recent_budget);
                 self.hooks.on_memory_budget_warning(&event).await;
-                debug!(
-                    used = used_tokens,
-                    total = budget.total,
-                    percent = event.usage_percent,
-                    "Memory budget warning"
-                );
             }
         }
     }
@@ -3421,6 +3455,10 @@ Respond in JSON format:
 
     pub fn tool_call_history(&self) -> Vec<ToolCallRecord> {
         self.tool_call_history.read().clone()
+    }
+
+    pub fn memory_token_budget(&self) -> Option<&MemoryTokenBudget> {
+        self.memory_token_budget.as_ref()
     }
 
     pub fn parallel_tools_config(&self) -> &ParallelToolsConfig {
