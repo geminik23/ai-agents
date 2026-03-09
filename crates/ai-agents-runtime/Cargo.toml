@@ -43,7 +43,6 @@ parking_lot = { workspace = true }
 default = []
 sqlite = ["ai-agents-storage/sqlite"]
 redis-storage = ["ai-agents-storage/redis-storage"]
-http-tool = ["ai-agents-tools/http-tool"]
 http-context = ["ai-agents-context/http-context"]
 full-storage = ["sqlite", "redis-storage"]
-full = ["full-storage", "http-tool", "http-context"]
+full = ["full-storage", "http-context"]

@@ -70,7 +70,6 @@
 //! |------|-------------|
 //! | `sqlite` | SQLite storage backend |
 //! | `redis-storage` | Redis storage backend |
-//! | `http-tool` | HTTP request built-in tool |
 //! | `http-context` | HTTP context source for dynamic context injection |
 //! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
 //! | `full` | All optional features enabled |
@@ -383,7 +382,6 @@ pub mod tool_security {
 
 pub mod tools {
     pub use ai_agents_core::{Tool, ToolInfo, ToolResult};
-    #[cfg(feature = "http-tool")]
     pub use ai_agents_tools::HttpTool;
     pub use ai_agents_tools::{
         CalculatorTool, ConditionEvaluator, DateTimeTool, EchoTool, EvaluationContext, FileTool,
@@ -416,7 +414,6 @@ pub use spec::{
     ToolPolicyConfig as SpecToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
 pub use template::TemplateLoader;
-#[cfg(feature = "http-tool")]
 pub use tools::HttpTool;
 pub use tools::{
     CalculatorTool, DateTimeTool, EchoTool, FileTool, JsonTool, MathTool, RandomTool, TemplateTool,

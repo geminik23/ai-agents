@@ -15,7 +15,6 @@ pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderErr
 pub use registry::ToolRegistry;
 pub use types::{ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel};
 
-#[cfg(feature = "http-tool")]
 pub use builtin::HttpTool;
 pub use builtin::{
     CalculatorTool, DateTimeTool, EchoTool, FileTool, JsonTool, MathTool, RandomTool, TemplateTool,
@@ -78,7 +77,6 @@ pub fn create_builtin_registry() -> ToolRegistry {
     registry
         .register(Arc::new(MathTool::new()))
         .expect("failed to register math");
-    #[cfg(feature = "http-tool")]
     registry
         .register(Arc::new(HttpTool::new()))
         .expect("failed to register http");

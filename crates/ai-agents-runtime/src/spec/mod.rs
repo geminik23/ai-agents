@@ -58,8 +58,8 @@ pub struct AgentSpec {
     #[serde(default)]
     pub storage: StorageConfig,
 
-    #[serde(default)]
-    pub tools: Vec<ToolConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<ToolConfig>>,
 
     #[serde(default = "default_max_iterations")]
     pub max_iterations: u32,
@@ -180,7 +180,7 @@ impl Default for AgentSpec {
             skills: vec![],
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
-            tools: vec![],
+            tools: None,
             max_iterations: default_max_iterations(),
             max_context_tokens: default_max_context_tokens(),
             error_recovery: ErrorRecoveryConfig::default(),

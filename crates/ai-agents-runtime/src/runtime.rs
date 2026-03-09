@@ -95,7 +95,7 @@ pub struct RuntimeAgent {
     disambiguation_manager: Option<DisambiguationManager>,
     current_plan: RwLock<Option<Plan>>,
     /// Tool IDs declared in the top-level `tools:` spec.
-    declared_tool_ids: Vec<String>,
+    declared_tool_ids: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -185,11 +185,11 @@ impl RuntimeAgent {
             reflection_config: ReflectionConfig::default(),
             disambiguation_manager: None,
             current_plan: RwLock::new(None),
-            declared_tool_ids: Vec::new(),
+            declared_tool_ids: None,
         }
     }
 
-    pub fn with_declared_tool_ids(mut self, ids: Vec<String>) -> Self {
+    pub fn with_declared_tool_ids(mut self, ids: Option<Vec<String>>) -> Self {
         self.declared_tool_ids = ids;
         self
     }
@@ -639,16 +639,18 @@ impl RuntimeAgent {
             }
             // State doesn't specify tools: fallback to agent-level
             None => {
-                if !self.declared_tool_ids.is_empty() {
-                    return Ok(self
-                        .declared_tool_ids
+                match &self.declared_tool_ids {
+                    // tools: [...] — specific tools listed
+                    Some(ids) if !ids.is_empty() => Ok(ids
                         .iter()
                         .filter(|id| self.tools.get(id).is_some())
                         .cloned()
-                        .collect());
+                        .collect()),
+                    // tools: [] — explicitly no tools
+                    Some(_) => Ok(Vec::new()),
+                    // tools: not specified — all registered tools available
+                    None => Ok(self.tools.list_ids()),
                 }
-                // No declared tools either: all registered tools available
-                Ok(self.tools.list_ids())
             }
         }
     }
@@ -755,10 +757,16 @@ impl RuntimeAgent {
             }
         }
 
-        let tools_prompt = if !self.declared_tool_ids.is_empty() {
-            self.tools.generate_filtered_prompt(&self.declared_tool_ids)
-        } else {
-            self.tools.generate_tools_prompt()
+        let tools_prompt = match &self.declared_tool_ids {
+            Some(ids) if !ids.is_empty() => self.tools.generate_filtered_prompt(ids),
+            Some(_) => {
+                // tools: [] — explicitly no tools, empty prompt
+                String::new()
+            }
+            None => {
+                // tools: not specified — all registered tools
+                self.tools.generate_tools_prompt()
+            }
         };
         if !tools_prompt.is_empty() {
             Ok(format!("{}\n\n{}", rendered_base, tools_prompt))

@@ -33,7 +33,6 @@ serde_yaml = { workspace = true }
 default = []
 sqlite = ["ai-agents-storage/sqlite", "ai-agents-runtime/sqlite"]
 redis-storage = ["ai-agents-storage/redis-storage", "ai-agents-runtime/redis-storage"]
-http-tool = ["ai-agents-tools/http-tool", "ai-agents-runtime/http-tool"]
 http-context = ["ai-agents-context/http-context", "ai-agents-runtime/http-context"]
 full-storage = ["sqlite", "redis-storage"]
-full = ["full-storage", "http-tool", "http-context"]
+full = ["full-storage", "http-context"]

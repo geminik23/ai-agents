@@ -482,11 +482,14 @@ impl AgentBuilder {
         let llm_registry_arc = Arc::new(llm_registry);
 
         // Extract declared tool IDs from spec (agent-level tool scope)
-        let declared_tool_ids: Vec<String> = self
-            .spec
-            .as_ref()
-            .map(|s| s.tools.iter().map(|t| t.name.clone()).collect())
-            .unwrap_or_default();
+        // - None  = `tools:` not specified in YAML -> all registered tools available : WILL CHANGE as no tools (Future task)
+        // - Some([]) = `tools: []` in YAML -> explicitly no tools
+        // - Some([...]) = specific tools listed
+        let declared_tool_ids: Option<Vec<String>> = self.spec.as_ref().and_then(|s| {
+            s.tools
+                .as_ref()
+                .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
+        });
 
         let mut agent = RuntimeAgent::new(
             info,
