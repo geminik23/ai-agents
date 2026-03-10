@@ -1,0 +1,33 @@
+name: BasicToolsAgent
+version: "1.0.0"
+description: "Introduces built-in tools: calculator for math, datetime for time operations"
+
+# NOTE: Do NOT list tool names or descriptions here.
+# The framework auto-injects all tool names, descriptions, and argument schemas into the prompt at runtime via generate_tools_prompt().
+system_prompt: |
+  You are a helpful assistant.
+  Always use tools for computation and time queries — never guess or do mental math.
+  Keep responses concise and show the tool result clearly.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+tools:
+  - name: calculator
+  - name: datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Basic Tools Demo ==="
+    hints:
+      - "Try: What is 2^10?"
+      - "Try: What is (100 - 37) * 4 / 3?"
+      - "Try: What time is it?"
+      - "Try: What day will it be 45 days from now?"
+      - "Try: How many days between 2025-01-01 and 2025-12-31?"
+    show_tools: true

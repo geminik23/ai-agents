@@ -748,7 +748,10 @@ impl RuntimeAgent {
                 // Only add tools prompt if tools are available.
                 // When tools: [] is set (explicitly empty), show NO tools to the LLM.
                 if !available_tool_ids.is_empty() {
-                    let tools_prompt = self.tools.generate_filtered_prompt(&available_tool_ids);
+                    let tools_prompt = self.tools.generate_filtered_prompt_with_parallel(
+                        &available_tool_ids,
+                        self.parallel_tools.enabled,
+                    );
                     if !tools_prompt.is_empty() {
                         return Ok(format!("{}\n\n{}", combined, tools_prompt));
                     }
@@ -758,14 +761,17 @@ impl RuntimeAgent {
         }
 
         let tools_prompt = match &self.declared_tool_ids {
-            Some(ids) if !ids.is_empty() => self.tools.generate_filtered_prompt(ids),
+            Some(ids) if !ids.is_empty() => self
+                .tools
+                .generate_filtered_prompt_with_parallel(ids, self.parallel_tools.enabled),
             Some(_) => {
                 // tools: [] — explicitly no tools, empty prompt
                 String::new()
             }
             None => {
                 // tools: not specified — all registered tools
-                self.tools.generate_tools_prompt()
+                self.tools
+                    .generate_tools_prompt_with_parallel(self.parallel_tools.enabled)
             }
         };
         if !tools_prompt.is_empty() {
@@ -952,6 +958,17 @@ impl RuntimeAgent {
     fn parse_tool_calls(&self, content: &str) -> Option<Vec<ToolCall>> {
         // Try direct JSON parse first
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+            // Handle JSON array of tool calls (parallel tool calling)
+            if let Some(arr) = parsed.as_array() {
+                let calls: Vec<ToolCall> = arr
+                    .iter()
+                    .filter_map(|v| self.extract_tool_call_from_value(v))
+                    .collect();
+                if !calls.is_empty() {
+                    return Some(calls);
+                }
+            }
+            // Handle single JSON object
             if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
                 return Some(vec![tool_call]);
             }
@@ -960,6 +977,17 @@ impl RuntimeAgent {
         // Try to extract JSON from content (handles extra text/braces from LLM)
         if let Some(json_str) = self.extract_json_from_content(content) {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                // Handle JSON array of tool calls (parallel tool calling)
+                if let Some(arr) = parsed.as_array() {
+                    let calls: Vec<ToolCall> = arr
+                        .iter()
+                        .filter_map(|v| self.extract_tool_call_from_value(v))
+                        .collect();
+                    if !calls.is_empty() {
+                        return Some(calls);
+                    }
+                }
+                // Handle single JSON object
                 if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
                     return Some(vec![tool_call]);
                 }
@@ -986,7 +1014,47 @@ impl RuntimeAgent {
 
     // Lite models could generate unmatched braces: this function handles such cases
     fn extract_json_from_content(&self, content: &str) -> Option<String> {
-        // Find the first '{' and try to find matching '}'
+        // Try array first (for parallel tool calls), then single object
+        if let Some(result) = self.extract_json_array_from_content(content) {
+            return Some(result);
+        }
+        self.extract_json_object_from_content(content)
+    }
+
+    /// Extract a JSON array `[...]` containing tool calls from mixed content.
+    fn extract_json_array_from_content(&self, content: &str) -> Option<String> {
+        let start = content.find('[')?;
+        let content_from_start = &content[start..];
+
+        let mut depth = 0;
+        let mut end = 0;
+        for (i, ch) in content_from_start.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if end > 0 {
+            let json_str = &content_from_start[..end];
+            // Verify it looks like an array of tool calls
+            if json_str.contains("\"tool\"") {
+                return Some(json_str.to_string());
+            }
+        }
+
+        None
+    }
+
+    /// Extract a JSON object `{...}` containing a tool call from mixed content.
+    fn extract_json_object_from_content(&self, content: &str) -> Option<String> {
         let start = content.find('{')?;
         let content_from_start = &content[start..];
 

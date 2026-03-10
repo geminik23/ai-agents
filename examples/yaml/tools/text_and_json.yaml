@@ -1,0 +1,34 @@
+name: TextAndJsonAgent
+version: "1.0.0"
+description: "Text processing and JSON manipulation tools"
+
+# NOTE: Do NOT list tool names or descriptions here.
+# The framework auto-injects all tool names, descriptions, and argument schemas into the prompt at runtime via generate_tools_prompt().
+system_prompt: |
+  You are a data processing assistant.
+  Use tools for all text manipulation and data extraction — do not estimate string lengths or guess at JSON values.
+  The text tool handles all languages and emoji correctly.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+tools:
+  - name: text
+  - name: json
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Text & JSON Tools Demo ==="
+    hints:
+      - "Try: How many characters in 'Hello World!'?"
+      - "Try: Reverse the string 'racecar'"
+      - "Try: Split 'apple,banana,cherry' by comma"
+      - "Try: Convert 'hello world' to uppercase"
+      - 'Try: Get the name from this JSON: {"user": {"name": "Alice", "age": 30}}'
+      - "Try: Merge these two objects: {\"a\": 1} and {\"b\": 2}"
+    show_tools: true

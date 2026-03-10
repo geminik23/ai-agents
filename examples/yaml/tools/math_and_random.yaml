@@ -1,0 +1,37 @@
+name: MathAndRandomAgent
+version: "1.0.0"
+description: "Statistical math operations and random value generation"
+
+# NOTE: Do NOT list tool names or descriptions here.
+# The framework auto-injects all tool names, descriptions, and argument schemas
+# into the prompt at runtime via generate_tools_prompt().
+system_prompt: |
+  You are a math and statistics assistant.
+  Use tools for all numerical analysis — do not estimate or approximate.
+  Note: for evaluating expressions like "2 + 3 * 4" you would need the calculator tool, which is not available here.
+  Your math tool works on arrays of numbers for statistical analysis.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+tools:
+  - name: math
+  - name: random
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Math & Random Tools Demo ==="
+    hints:
+      - "Try: What is the average of 10, 20, 30, 40, 50?"
+      - "Try: Find the median and standard deviation of 3, 7, 2, 9, 4, 6, 8"
+      - "Try: Generate a UUID"
+      - "Try: Pick 3 random items from: red, blue, green, yellow, purple"
+      - "Try: Generate a random 8-character hex string"
+      - "Try: Roll a dice (random integer 1 to 6)"
+      - "Try: What is the square root of 144?"
+    show_tools: true

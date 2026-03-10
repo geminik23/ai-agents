@@ -310,10 +310,18 @@ impl ToolRegistry {
     }
 
     pub fn generate_tools_prompt(&self) -> String {
-        self.generate_tools_prompt_with_lang(None)
+        self.generate_tools_prompt_with_lang(None, false)
     }
 
-    pub fn generate_tools_prompt_with_lang(&self, language: Option<&str>) -> String {
+    pub fn generate_tools_prompt_with_parallel(&self, parallel: bool) -> String {
+        self.generate_tools_prompt_with_lang(None, parallel)
+    }
+
+    pub fn generate_tools_prompt_with_lang(
+        &self,
+        language: Option<&str>,
+        parallel: bool,
+    ) -> String {
         let tool_index = self.tool_index.read();
         if tool_index.is_empty() {
             return String::new();
@@ -358,27 +366,31 @@ impl ToolRegistry {
             }
         }
 
-        prompt.push_str(
-            "\nWhen you need to use a tool, respond ONLY with valid JSON in this exact format:\n",
-        );
-        prompt.push_str("{\"tool\": \"tool_name\", \"arguments\": {...}}\n");
-        prompt.push_str("\nWhen you receive a tool result, summarize it naturally for the user.\n");
-        prompt.push_str("If no tool is needed, respond normally.");
+        Self::append_tool_format_instructions(&mut prompt, parallel);
 
         prompt
     }
 
     pub fn generate_filtered_prompt(&self, tool_ids: &[String]) -> String {
-        self.generate_filtered_prompt_with_lang(tool_ids, None)
+        self.generate_filtered_prompt_with_lang(tool_ids, None, false)
+    }
+
+    pub fn generate_filtered_prompt_with_parallel(
+        &self,
+        tool_ids: &[String],
+        parallel: bool,
+    ) -> String {
+        self.generate_filtered_prompt_with_lang(tool_ids, None, parallel)
     }
 
     pub fn generate_filtered_prompt_with_lang(
         &self,
         tool_ids: &[String],
         language: Option<&str>,
+        parallel: bool,
     ) -> String {
         if tool_ids.is_empty() {
-            return self.generate_tools_prompt_with_lang(language);
+            return self.generate_tools_prompt_with_lang(language, parallel);
         }
 
         let tool_index = self.tool_index.read();
@@ -430,14 +442,29 @@ impl ToolRegistry {
             return String::new();
         }
 
+        Self::append_tool_format_instructions(&mut prompt, parallel);
+
+        prompt
+    }
+
+    /// Append tool call format instructions to a prompt.
+    /// When `parallel` is true, also instructs the LLM to use a JSON array
+    /// for multiple simultaneous tool calls.
+    fn append_tool_format_instructions(prompt: &mut String, parallel: bool) {
         prompt.push_str(
             "\nWhen you need to use a tool, respond ONLY with valid JSON in this exact format:\n",
         );
         prompt.push_str("{\"tool\": \"tool_name\", \"arguments\": {...}}\n");
+        if parallel {
+            prompt.push_str(
+                "\nWhen you need to call multiple tools at once, respond with a JSON array:\n",
+            );
+            prompt.push_str(
+                "[{\"tool\": \"tool_name1\", \"arguments\": {...}}, {\"tool\": \"tool_name2\", \"arguments\": {...}}]\n",
+            );
+        }
         prompt.push_str("\nWhen you receive a tool result, summarize it naturally for the user.\n");
         prompt.push_str("If no tool is needed, respond normally.");
-
-        prompt
     }
 }
 
@@ -655,11 +682,67 @@ mod tests {
 
         registry.set_tool_aliases("calculator", aliases);
 
-        let prompt_en = registry.generate_tools_prompt_with_lang(None);
+        let prompt_en = registry.generate_tools_prompt_with_lang(None, false);
         assert!(prompt_en.contains("Test"));
 
-        let prompt_ko = registry.generate_tools_prompt_with_lang(Some("ko"));
+        let prompt_ko = registry.generate_tools_prompt_with_lang(Some("ko"), false);
         assert!(prompt_ko.contains("계산기"));
         assert!(prompt_ko.contains("수학 계산"));
+    }
+
+    #[test]
+    fn test_generate_tools_prompt_parallel() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool {
+                id: "tool_a".to_string(),
+            }))
+            .unwrap();
+        registry
+            .register(Arc::new(TestTool {
+                id: "tool_b".to_string(),
+            }))
+            .unwrap();
+
+        // Without parallel: no array instruction
+        let prompt_seq = registry.generate_tools_prompt();
+        assert!(prompt_seq.contains("\"tool\": \"tool_name\""));
+        assert!(!prompt_seq.contains("JSON array"));
+        assert!(!prompt_seq.contains("tool_name1"));
+
+        // With parallel: array instruction present
+        let prompt_par = registry.generate_tools_prompt_with_parallel(true);
+        assert!(prompt_par.contains("\"tool\": \"tool_name\""));
+        assert!(prompt_par.contains("JSON array"));
+        assert!(prompt_par.contains("tool_name1"));
+        assert!(prompt_par.contains("tool_name2"));
+    }
+
+    #[test]
+    fn test_generate_filtered_prompt_parallel() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool {
+                id: "tool_a".to_string(),
+            }))
+            .unwrap();
+        registry
+            .register(Arc::new(TestTool {
+                id: "tool_b".to_string(),
+            }))
+            .unwrap();
+
+        // Filtered without parallel
+        let prompt_seq =
+            registry.generate_filtered_prompt(&["tool_a".to_string(), "tool_b".to_string()]);
+        assert!(!prompt_seq.contains("JSON array"));
+
+        // Filtered with parallel
+        let prompt_par = registry.generate_filtered_prompt_with_parallel(
+            &["tool_a".to_string(), "tool_b".to_string()],
+            true,
+        );
+        assert!(prompt_par.contains("JSON array"));
+        assert!(prompt_par.contains("tool_name1"));
     }
 }

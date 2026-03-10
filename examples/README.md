@@ -101,6 +101,36 @@ Example:
 cargo run -p ai-agents-cli -- run examples/yaml/state-machine/support_state_machine.yaml
 ```
 
+### `yaml/tools/`
+
+Progressive tool usage examples — from basic tool calls to multi-tool composition.
+
+| File | Description |
+|------|-------------|
+| `basic_tools.yaml` | Calculator and DateTime — LLM auto-selects the right tool |
+| `text_and_json.yaml` | Unicode-aware text processing and structured JSON operations |
+| `file_and_template.yaml` | File I/O and Jinja2 template rendering |
+| `math_and_random.yaml` | Statistical math and random value generation |
+| `multi_tool_agent.yaml` | All built-in tools with parallel execution |
+| `http_tool.yaml` | External HTTP calls (makes real network requests) |
+
+Learning path: start with `basic_tools`, read through `multi_tool_agent` for full tool coverage, then `http_tool` for network I/O.
+
+Note: the `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
+The framework auto-injects tool information (names, descriptions, argument schemas) into the prompt at runtime.
+The system prompt focuses on behavioral guidance only.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/tools/basic_tools.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/text_and_json.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/file_and_template.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/math_and_random.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/multi_tool_agent.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/http_tool.yaml
+```
+
 ### `yaml/memory/`
 
 Progressive memory examples — from simplest to production-grade.

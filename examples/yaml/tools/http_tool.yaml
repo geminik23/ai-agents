@@ -1,0 +1,36 @@
+name: HttpToolAgent
+version: "1.0.0"
+description: "HTTP client tool for fetching external data"
+
+# NOTE: Do NOT list tool names or descriptions here.
+# The framework auto-injects all tool names, descriptions, and argument schemas
+# into the prompt at runtime via generate_tools_prompt().
+system_prompt: |
+  You are an assistant that can fetch data from the web.
+  Summarize HTTP responses for the user — extract the key information they asked about.
+  Note the HTTP status code if it indicates an error.
+  Only make requests to URLs the user provides or obviously safe public APIs.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+tools:
+  - name: http
+  - name: json
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: |
+      === HTTP Tool Demo ===
+      This agent makes real HTTP requests over the network.
+    hints:
+      - "Try: Fetch https://httpbin.org/get"
+      - "Try: What headers does https://httpbin.org/headers return?"
+      - "Try: POST to https://httpbin.org/post with body 'hello world'"
+      - "Try: What is the response from https://httpbin.org/uuid?"
+    show_tools: true

@@ -1,0 +1,34 @@
+name: FileAndTemplateAgent
+version: "1.0.0"
+description: "File operations and Jinja2 template rendering"
+
+# NOTE: Do NOT list tool names or descriptions here.
+# The framework auto-injects all tool names, descriptions, and argument schemas into the prompt at runtime via generate_tools_prompt().
+system_prompt: |
+  You are a file and template assistant.
+  When creating files from templates, render the template first, then write the result.
+  Always confirm with the user before deleting files.
+  Keep file paths safe — prefer /tmp/ for write operations.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+tools:
+  - name: file
+  - name: template
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== File & Template Tools Demo ==="
+    hints:
+      - "Try: List the files in the current directory"
+      - "Try: Read the file README.md"
+      - "Try: Write 'Hello from AI' to /tmp/greeting.txt"
+      - "Try: Render a template 'Hello {{ name }}!' with name = World"
+      - "Try: Create a file /tmp/report.txt with a template listing items: apple, banana, cherry"
+    show_tools: true

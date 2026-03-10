@@ -1,3 +1,7 @@
+# Basic tools introduction. For more tool examples, see examples/yaml/tools/
+# which covers all 10 built-in tools, conditional availability, scoping,
+# multi-language aliases, and security policies.
+
 name: SimpleToolsAgent
 version: "1.0.0"
 description: "Basic YAML-first example showing built-in tool usage"
