@@ -1,0 +1,103 @@
+name: ContextWithStateAgent
+version: "1.0.0"
+description: "Context + state machine — personalized multi-step support flow"
+
+# Context values persist across state transitions.
+# State prompts can use {{ context.* }} just like system_prompt.
+# Each state tailors its behavior based on the user's tier.
+context:
+  user:
+    type: runtime
+    schema:
+      name: string
+      tier: string           # "free", "pro", or "vip"
+    default:
+      name: "Guest"
+      tier: "free"
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+
+system_prompt: |
+  You are a support assistant.
+  Customer: {{ context.user.name }} ({{ context.user.tier }} tier)
+  Today: {{ context.time.date }}
+
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: |
+        Welcome {{ context.user.name }}!
+        {% if context.user.tier == "vip" %}
+        Thank you for being a VIP member. How can I provide premium assistance today?
+        {% elif context.user.tier == "pro" %}
+        Welcome back, Pro member. How can I help you today?
+        {% else %}
+        How can I help you today?
+        {% endif %}
+      transitions:
+        - to: helping
+          when: "User describes their issue or asks a question"
+          auto: true
+
+    helping:
+      prompt: |
+        Help {{ context.user.name }} with their question.
+        {% if context.user.tier == "vip" %}
+        Provide detailed, thorough answers with extra context and proactive suggestions.
+        Anticipate follow-up questions.
+        {% elif context.user.tier == "pro" %}
+        Provide professional, complete answers. Reference advanced features when relevant.
+        {% else %}
+        Provide clear, concise answers.
+        {% endif %}
+        Be solution-oriented and empathetic.
+      transitions:
+        - to: closing
+          when: "The user's question is answered and they seem satisfied"
+          auto: true
+        - to: greeting
+          when: "User has a completely different question or topic"
+          auto: true
+
+    closing:
+      prompt: |
+        Thank {{ context.user.name }} for reaching out.
+        {% if context.user.tier == "free" %}
+        Mention that upgrading to Pro gives faster response times and access to advanced features.
+        {% elif context.user.tier == "pro" %}
+        Let them know VIP tier offers priority support and dedicated assistance.
+        {% else %}
+        Thank them for being a valued VIP member.
+        {% endif %}
+        Wish them a great {{ context.time.day_of_week }}.
+      transitions:
+        - to: greeting
+          when: "User has another question"
+          auto: true
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Context + State Machine Demo ==="
+    hints:
+      - "Try: Hi, I need help with my subscription."
+      - "Try: Thanks, that's all I needed."
+      - "Notice: the agent uses your name and tier in every state."
+      - "The greeting, help style, and closing all adapt to your context."
+      - "Context values persist across state transitions."
+    show_state: true

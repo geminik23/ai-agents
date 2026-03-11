@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -96,6 +97,8 @@ pub struct RuntimeAgent {
     current_plan: RwLock<Option<Plan>>,
     /// Tool IDs declared in the top-level `tools:` spec.
     declared_tool_ids: Option<Vec<String>>,
+    /// Whether the context manager has been initialized (defaults loaded, env resolved, etc.)
+    context_initialized: AtomicBool,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -186,6 +189,7 @@ impl RuntimeAgent {
             disambiguation_manager: None,
             current_plan: RwLock::new(None),
             declared_tool_ids: None,
+            context_initialized: AtomicBool::new(false),
         }
     }
 
@@ -2264,6 +2268,14 @@ Respond in JSON format:
 
         self.hooks.on_message_received(input).await;
 
+        // One-shot context initialization: load runtime defaults, resolve env vars,
+        // populate builtin sources (session, agent), etc.  This must happen before
+        // the first template render so that {{ context.* }} variables are available.
+        if !self.context_initialized.swap(true, Ordering::SeqCst) {
+            self.context_manager.initialize().await?;
+            debug!("Context manager initialized (defaults, env, builtins)");
+        }
+
         self.check_turn_timeout().await?;
         self.context_manager.refresh_per_turn().await?;
 
@@ -3324,6 +3336,15 @@ Respond in JSON format:
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
         Box::pin(async_stream::stream! {
             self.hooks.on_message_received(input).await;
+
+            // One-shot context initialization (mirrors run_loop)
+            if !self.context_initialized.swap(true, Ordering::SeqCst) {
+                if let Err(e) = self.context_manager.initialize().await {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
+                debug!("Context manager initialized (defaults, env, builtins)");
+            }
 
             if let Err(e) = self.check_turn_timeout().await {
                 yield StreamChunk::error(e.to_string());

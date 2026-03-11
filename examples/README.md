@@ -31,17 +31,6 @@ cd examples/rust/basic-api
 cargo run --bin simple-chat
 ```
 
-## Recommended Learning Path
-
-Start with these YAML examples:
-
-- `examples/yaml/basic/simple_chat.yaml`
-- `examples/yaml/basic/simple_chat_stream.yaml`
-- `examples/yaml/basic/simple_tools.yaml`
-- `examples/yaml/skills/skill_agent.yaml`
-- `examples/yaml/state-machine/support_state_machine.yaml`
-
-Then move to Rust examples when you want embedding or customization.
 
 ## YAML Examples
 
@@ -114,8 +103,6 @@ Progressive tool usage examples — from basic tool calls to multi-tool composit
 | `multi_tool_agent.yaml` | All built-in tools with parallel execution |
 | `http_tool.yaml` | External HTTP calls (makes real network requests) |
 
-Learning path: start with `basic_tools`, read through `multi_tool_agent` for full tool coverage, then `http_tool` for network I/O.
-
 Note: the `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
 The framework auto-injects tool information (names, descriptions, argument schemas) into the prompt at runtime.
 The system prompt focuses on behavioral guidance only.
@@ -131,6 +118,33 @@ cargo run -p ai-agents-cli -- run examples/yaml/tools/multi_tool_agent.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/http_tool.yaml
 ```
 
+### `yaml/context/`
+
+Dynamic context injection examples — from runtime values to environment variables and state integration.
+
+| File | Description |
+|------|-------------|
+| `runtime_context.yaml` | Inject user data at runtime — system prompt adapts via `{{ context.user.* }}` |
+| `builtin_context.yaml` | Built-in sources (datetime, session, agent info) with auto-refresh |
+| `env_context.yaml` | Environment variable injection — config and secrets without hardcoding |
+| `template_context.yaml` | Jinja2 conditionals, defaults, and filters for tier-based behavior |
+| `context_with_state.yaml` | Context + state machine — personalized multi-step support flow |
+
+Note: The CLI does not currently support injecting runtime context values at startup.
+All `runtime` context sources in these examples include `default:` blocks so they work out of the box.
+In a Rust host, use `agent.set_context("user", json!({...}))` to override defaults.
+For a full Rust context injection example, see `rust/context/` below.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/context/runtime_context.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/context/builtin_context.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/context/env_context.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/context/template_context.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/context/context_with_state.yaml
+```
+
 ### `yaml/memory/`
 
 Progressive memory examples — from simplest to production-grade.
@@ -141,13 +155,6 @@ Progressive memory examples — from simplest to production-grade.
 | `memory_compacting.yaml` | Compacting memory with automatic LLM-based summarization |
 | `memory_budget.yaml` | Token budgeting — per-component allocation controlling prompt size |
 | `memory_agent.yaml` | Full production config combining compacting, budgeting, and hooks |
-
-Learning path:
-
-1. **`memory_basic.yaml`** — Memory exists, keeps messages, has a limit
-2. **`memory_compacting.yaml`** — Old messages get summarized automatically
-3. **`memory_budget.yaml`** — Token budget controls how much memory enters the prompt
-4. **`memory_agent.yaml`** — Full production configuration
 
 Examples:
 
@@ -238,12 +245,6 @@ Programmatic memory and persistence examples.
 | `memory-agent` | Compacting memory with hooks monitoring compression and budget warnings |
 | `sqlite-persistence` | Full session CRUD — save, load, list, search, delete, info |
 
-Learning path:
-
-1. **`save-restore-session`** — Simplest persistence (save a session, quit, restart, load it back)
-2. **`memory-agent`** — Monitor memory events with hooks (compression, eviction, budget warnings)
-3. **`sqlite-persistence`** — Full session management with SQLite
-
 Run from:
 
 ```sh
@@ -251,6 +252,21 @@ cd examples/rust/storage
 cargo run --bin save-restore-session
 cargo run --bin memory-agent
 cargo run --bin sqlite-persistence
+```
+
+### `rust/context/`
+
+Rust-side context injection — `set_context()` and custom `ContextProvider` implementation.
+
+| Binary | Description |
+|--------|-------------|
+| `context-injection` | Overrides YAML defaults with runtime user data and registers a callback provider for live usage stats |
+
+Run from:
+
+```sh
+cd examples/rust/context
+cargo run --bin context-injection
 ```
 
 ### `rust/custom-hitl/`

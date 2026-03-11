@@ -1,0 +1,54 @@
+name: RuntimeContextAgent
+version: "1.0.0"
+description: "Injects user data at runtime — system prompt adapts to the user"
+
+# Context values are available in system_prompt as {{ context.KEY.FIELD }}
+# type: runtime means "the Rust host (or CLI) provides this data"
+# schema: declares the expected shape (documentation + validation)
+# default: provides fallback values (essential for CLI usage)
+context:
+  user:
+    type: runtime
+    required: false
+    schema:
+      name: string
+      language: string
+      role: string
+    default:
+      name: "Guest"
+      language: "English"
+      role: "user"
+
+# Template variables are rendered before the prompt reaches the LLM.
+# The LLM never sees raw {{ }} syntax - it receives the resolved text.
+system_prompt: |
+  You are a helpful assistant.
+  The user's name is {{ context.user.name }}.
+  Their preferred language is {{ context.user.language }}.
+  Their role is {{ context.user.role }}.
+
+  Always address the user by name.
+  Respond in the user's preferred language when possible.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Context Demo ==="
+    hints:
+      - "Try: What's my name?"
+      - "Try: Say hello to me in my preferred language."
+      - "Try: What role do I have?"
+      - "The agent knows you as 'Guest' (from context defaults)."
+      - "In a Rust host, call agent.set_context(\"user\", json!({...})) to override."

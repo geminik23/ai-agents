@@ -1,0 +1,80 @@
+name: RustContextAgent
+version: "1.0.0"
+description: "Demonstrates context injection from a Rust host"
+
+# This agent is designed to be run from the Rust example in src/context_injection.rs.
+# The Rust host overrides runtime defaults and registers a callback provider.
+# Running this YAML directly via CLI will use the default values below.
+
+context:
+  # Runtime context - Rust host overrides these defaults via set_context()
+  # In real production, values come from auth middleware, database lookups, etc...
+  user:
+    type: runtime
+    required: false
+    schema:
+      name: string
+      email: string
+      tier: string
+    default:
+      name: "Guest"
+      email: "unknown"
+      tier: "free"
+
+  # Callback context - Rust host provides this via register_context_provider()
+  # The framework calls the registered ContextProvider on every turn.
+  # No default: only works when the Rust host registers a provider.
+  # When running via CLI without a provider, this key will be absent,
+  # and the {% if %} block in the system prompt handles that gracefully.
+  usage_stats:
+    type: callback
+    name: get_usage_stats
+    refresh: per_turn
+
+  # Builtin context — always available, no Rust code needed
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+
+system_prompt: |
+  You are a helpful assistant.
+
+  User: {{ context.user.name }} ({{ context.user.email }})
+  Tier: {{ context.user.tier }}
+
+  {% if context.usage_stats %}
+  Usage this session: {{ context.usage_stats.message_count }} messages, {{ context.usage_stats.total_tokens }} tokens used.
+  {% endif %}
+
+  Current time: {{ context.time.datetime }}
+
+  {% if context.user.tier == "vip" %}
+  This user is a VIP - provide premium, detailed responses.
+  {% elif context.user.tier == "pro" %}
+  This user is on the Pro plan - be thorough but efficient.
+  {% else %}
+  This user is on the Free plan - be helpful and concise.
+  {% endif %}
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Rust Context Agent ==="
+    hints:
+      - "This agent is designed to be run from the Rust example."
+      - "Run: cd examples/rust/context && cargo run --bin context-injection"
+      - "Via CLI, you'll see default context values (Guest, free tier)."
+      - "Via Rust, context is overridden with real user data + live usage stats."

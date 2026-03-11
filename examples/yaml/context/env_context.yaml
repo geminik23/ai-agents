@@ -1,0 +1,56 @@
+name: EnvContextAgent
+version: "1.0.0"
+description: "Environment variable injection — secrets and config without hardcoding"
+
+# type: env reads a named environment variable at startup.
+# The value is available as {{ context.KEY }} in templates.
+# Missing env vars result in empty/undefined values (no crash).
+# This pattern keeps secrets and deployment config out of YAML files.
+context:
+  app_env:
+    type: env
+    name: APP_ENV                    # reads $APP_ENV
+  greeting_style:
+    type: env
+    name: GREETING_STYLE             # reads $GREETING_STYLE
+
+system_prompt: |
+  You are a helpful assistant.
+
+  {% if context.app_env == "production" %}
+  You are running in PRODUCTION mode. Be formal, precise, and concise.
+  Do not reveal internal details or debugging information.
+  {% elif context.app_env == "development" %}
+  You are running in DEVELOPMENT mode. Be casual and verbose.
+  Include extra detail that would help a developer debug issues.
+  {% else %}
+  Standard mode. Be helpful and clear.
+  {% endif %}
+
+  {% if context.greeting_style %}
+  Greeting style preference: {{ context.greeting_style }}.
+  Adapt your tone to match this style.
+  {% endif %}
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Env Context Demo ==="
+    hints:
+      - "Without env vars set, the agent uses 'Standard mode'."
+      - "Set APP_ENV=production before running to see formal mode."
+      - "Set GREETING_STYLE=enthusiastic to change the tone."
+      - "Example: APP_ENV=development cargo run -p ai-agents-cli -- run examples/yaml/context/env_context.yaml"
+      - "Env vars keep secrets out of YAML — use this pattern for API keys and config."

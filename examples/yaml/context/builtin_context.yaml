@@ -1,0 +1,58 @@
+name: BuiltinContextAgent
+version: "1.0.0"
+description: "Uses built-in context sources — datetime, session, and agent info"
+
+# Built-in sources are provided automatically by the framework.
+# No host code or external data needed — they just work.
+context:
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn        # Updates every turn - time stays current
+  session:
+    type: builtin
+    source: session          # Session ID + start time, set once at session start
+  agent_info:
+    type: builtin
+    source: agent            # Agent name + version from this YAML file
+
+# Built-in context fields:
+#   time    -> date, time, hour, minute, day_of_week, year, month, day, utc, local, timestamp
+#   session -> id, started_at
+#   agent   -> name, version
+system_prompt: |
+  You are a helpful assistant.
+  Current date: {{ context.time.date }}
+  Current time: {{ context.time.time }}
+  Day of week: {{ context.time.day_of_week }}
+  Session ID: {{ context.session.id }}
+  You are: {{ context.agent_info.name }} v{{ context.agent_info.version }}
+
+  Adjust your greeting based on the time of day:
+  - Morning (before 12:00): "Good morning!"
+  - Afternoon (12:00-18:00): "Good afternoon!"
+  - Evening (after 18:00): "Good evening!"
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Built-in Context Demo ==="
+    hints:
+      - "Try: What time is it?"
+      - "Try: What day is it today?"
+      - "Try: What's my session ID?"
+      - "Try: What's your name and version?"
+      - "The time updates every turn (refresh: per_turn)."
+      - "Session ID stays the same for the entire session."

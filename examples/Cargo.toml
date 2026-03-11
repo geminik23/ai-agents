@@ -7,6 +7,7 @@ members = [
     "rust/custom-hitl",
     "rust/reasoning",
     "rust/disambiguation",
+    "rust/context",
 ]
 
 [workspace.package]

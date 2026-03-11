@@ -1,0 +1,72 @@
+name: TemplateContextAgent
+version: "1.0.0"
+description: "Jinja2 templates in prompts — behavior changes based on user tier"
+
+# Templates use full Jinja2 syntax (via MiniJinja):
+#   {{ variable }}              - render a value
+#   {{ var | default('x') }}    - fallback if missing
+#   {% if %} / {% elif %} / {% else %} / {% endif %} - conditionals
+#   {% for item in list %}      - loops
+# Templates are rendered BEFORE the LLM sees the prompt.
+# The LLM never sees raw {{ }} syntax - it receives fully resolved text.
+context:
+  user:
+    type: runtime
+    schema:
+      name: string
+      tier: string        # "free", "pro", or "vip"
+      company: string
+    default:
+      name: "Guest"
+      tier: "free"
+      company: ""
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+
+# Full Jinja2 syntax: conditionals, defaults, filters
+system_prompt: |
+  You are a support assistant for Acme Corp.
+  Customer: {{ context.user.name | default('Valued Customer') }}
+  {% if context.user.company %}Company: {{ context.user.company }}{% endif %}
+
+  {% if context.user.tier == "vip" %}
+  VIP CUSTOMER - Provide premium, detailed support.
+  Offer proactive suggestions and go above and beyond expectations.
+  Always address the customer by name.
+  Anticipate follow-up questions and answer them preemptively.
+  {% elif context.user.tier == "pro" %}
+  Pro-tier customer. Provide thorough, professional answers.
+  You may reference advanced features and technical details.
+  {% else %}
+  Free-tier customer. Be helpful and concise.
+  When relevant, briefly mention that upgrading to Pro or VIP unlocks additional benefits.
+  {% endif %}
+
+  Current date: {{ context.time.date }}
+  Day: {{ context.time.day_of_week }}
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Template Context Demo ==="
+    hints:
+      - "Try: Help me with my account."
+      - "Try: What tier am I on?"
+      - "The agent treats you as a 'free' tier user by default."
+      - "Notice: the agent may mention upgrade benefits for free-tier users."
+      - "In a Rust host, set tier to 'vip' to see premium behavior."
+      - "Templates use Jinja2: {% if %}, {{ var | default() }}, {% for %}, etc."
