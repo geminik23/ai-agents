@@ -1,0 +1,102 @@
+name: OutputSanitizeAgent
+version: "1.0.0"
+description: "Output post-processing — PII masking, quality validation, and formatting"
+
+# The output process pipeline runs AFTER the LLM generates its response,
+# BEFORE the user sees it (in blocking mode).
+#
+# Flow: user input -> LLM -> sanitize (router LLM) -> validate -> format -> user sees response
+#
+# Known limitations:
+#   1. Sanitization is LLM-based - the router model may miss PII or pass it through unchanged.
+#      For guaranteed masking, use regex/rule-based post-processing outside the framework.
+#   2. In streaming mode (--stream), tokens are printed as they arrive BEFORE process_output
+#      runs, so the user sees unmasked content. Output processing only works in blocking mode.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+system_prompt: |
+  You are a helpful customer support assistant.
+  Help users with their questions.
+  When the user shares personal information, acknowledge it but don't repeat it back unnecessarily.
+
+process:
+  # Input: minimal cleanup
+  input:
+    - type: normalize
+      config:
+        trim: true
+        collapse_whitespace: true
+
+  # Output: sanitize, validate, and format the LLM's response
+  output:
+    # Stage 1: Ask the router LLM to mask PII in the response.
+    # Effectiveness depends on the router model — small models may miss some PII.
+    - type: sanitize
+      id: mask_pii
+      config:
+        llm: router
+        pii:
+          action: mask
+          types:
+            - email
+            - phone
+            - credit_card
+          mask_char: "*"
+
+    # Stage 2: Check response quality. Warns but does not block.
+    - type: validate
+      id: quality_check
+      config:
+        llm: router
+        criteria:
+          - "The response is helpful and addresses the user's concern"
+          - "The response does not contain offensive or inappropriate content"
+        threshold: 0.6
+        on_fail:
+          action: warn
+
+    # Stage 3: Append a consistent footer.
+    - type: format
+      id: add_footer
+      config:
+        template: |
+          {{ response }}
+
+          ---
+          Need more help?
+
+  settings:
+    on_stage_error:
+      default: continue
+    debug:
+      log_stages: true
+      include_timing: true
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Output Sanitization Demo ==="
+    hints:
+      - "Try: My email is alice@example.com, can you confirm my account?"
+      - "Try: Repeat back my info: phone 010-1234-5678, card 4111-1111-1111-1111"
+      - "PII masking is LLM-based — the router model may not catch everything."
+      - "Do NOT use --stream with this example; output processing only runs in blocking mode."
+      - "Every response has a footer added by the format stage."

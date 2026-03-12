@@ -118,6 +118,29 @@ cargo run -p ai-agents-cli -- run examples/yaml/tools/multi_tool_agent.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/http_tool.yaml
 ```
 
+### `yaml/process/`
+
+Declarative input/output processing pipeline - preprocessing before the LLM, post-processing after.
+
+| File | Description |
+|------|-------------|
+| `input_normalize.yaml` | Simplest pipeline - whitespace cleanup and length validation (no LLM cost) |
+| `detect_language.yaml` | LLM-based language and sentiment detection stored in context |
+| `extract_and_validate.yaml` | Structured entity extraction with typed schema and validation rules |
+| `output_sanitize.yaml` | Output PII masking, quality validation, and response formatting |
+
+Note: Input stages run before the LLM; output stages run after. LLM-based stages use the router (fast/cheap) model.
+Output processing only works in blocking mode - with `--stream`, tokens are printed before output stages run.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/process/input_normalize.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/process/detect_language.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/process/extract_and_validate.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/process/output_sanitize.yaml
+```
+
 ### `yaml/context/`
 
 Dynamic context injection examples — from runtime values to environment variables and state integration.

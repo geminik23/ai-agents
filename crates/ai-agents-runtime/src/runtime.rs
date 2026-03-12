@@ -2829,6 +2829,12 @@ Respond in JSON format:
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         let input_data = self.process_input(input).await?;
 
+        // Inject process context (detect/extract results) into agent context
+        // so system prompt templates can use {{ context.detected_language }} etc.
+        for (key, value) in &input_data.context {
+            let _ = self.context_manager.set(key, value.clone());
+        }
+
         if input_data.metadata.rejected {
             let reason = input_data
                 .metadata
@@ -3010,6 +3016,11 @@ Respond in JSON format:
                     return;
                 }
             };
+
+            // Inject process context (detect/extract results) into agent context
+            for (key, value) in &input_data.context {
+                let _ = self.context_manager.set(key, value.clone());
+            }
 
             if input_data.metadata.rejected {
                 let reason = input_data

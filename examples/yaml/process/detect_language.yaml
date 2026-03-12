@@ -1,0 +1,93 @@
+name: DetectLanguageAgent
+version: "1.0.0"
+description: "LLM-based language and sentiment detection in the process pipeline"
+
+# The detect stage uses a fast/cheap LLM (router) to analyze the input BEFORE the main LLM sees it.
+# Detected values are injected into agent context via store_in_context,
+# so the system prompt can reference them with {{ context.* }} templates.
+#
+# Flow: user input -> normalize -> detect (router LLM) -> main LLM → response
+#
+# The router LLM classifies language, sentiment, and intent.
+# Results are available to the system prompt, downstream stages, and state transitions.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+system_prompt: |
+  You are a multilingual assistant.
+
+  The process pipeline has already analyzed the user's input:
+  - Detected language: {{ context.detected_language }}
+  - Detected sentiment: {{ context.detected_sentiment }}
+  - Detected intent: {{ context.detected_intent }}
+
+  Always respond in the detected language.
+  If sentiment is negative, be extra empathetic and helpful.
+  If sentiment is positive, match their energy.
+
+process:
+  input:
+    - type: normalize
+      id: clean_input
+      config:
+        trim: true
+        collapse_whitespace: true
+
+    # The detect stage calls the router LLM to classify the input.
+    # Results are injected into agent context — the system prompt
+    # references them via {{ context.detected_language }} etc.
+    - type: detect
+      id: detect_language_sentiment
+      config:
+        llm: router
+        detect:
+          - language
+          - sentiment
+        intents:
+          - id: greeting
+            description: "User is saying hello or greeting"
+          - id: question
+            description: "User is asking a question"
+          - id: complaint
+            description: "User is complaining or expressing dissatisfaction"
+          - id: farewell
+            description: "User is saying goodbye"
+        store_in_context:
+          language: detected_language
+          sentiment: detected_sentiment
+          intent: detected_intent
+
+  settings:
+    debug:
+      log_stages: true
+      include_timing: true
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Language & Sentiment Detection Demo ==="
+    hints:
+      - "Try: Hello! (English, positive sentiment)"
+      - "Try: 안녕하세요! (Korean greeting)"
+      - "Try: I'm really frustrated with this service! (negative sentiment)"
+      - "Try: ありがとうございます (Japanese, positive)"
+      - "Try: This is broken and nobody is helping me. (complaint intent)"
+      - "The router LLM detects language/sentiment BEFORE the main LLM responds."
+      - "The system prompt shows detected values via {{ context.* }} templates."

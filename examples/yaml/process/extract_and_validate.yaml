@@ -1,0 +1,107 @@
+name: ExtractAndValidateAgent
+version: "1.0.0"
+description: "Structured entity extraction from unstructured input, with validation"
+
+# The extract stage asks the router LLM to pull structured data from free text.
+# The validate stage enforces constraints (rule-based and LLM-based).
+#
+# Flow: user input -> normalize -> extract (router LLM) -> validate -> main LLM
+#
+# After extraction, the main LLM knows not just what the user said,
+# but also the structured entities (email, order number, urgency) found in the message.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+
+# Uses {% if %} guards because extracted fields are null when not found in the message.
+system_prompt: |
+  You are a customer support assistant.
+  If key information is missing (like an order number), ask for it politely.
+  {% if context.extracted %}
+  Extracted: {% if context.extracted.email %}email={{ context.extracted.email }} {% endif %}
+  {%- if context.extracted.order_number %}order={{ context.extracted.order_number }} {% endif %}
+  {%- if context.extracted.urgency %}urgency={{ context.extracted.urgency }} {% endif %}
+  {%- if context.extracted.issue_type %}type={{ context.extracted.issue_type }}{% endif %}
+  {% endif %}
+
+process:
+  input:
+    - type: normalize
+      id: clean_input
+      config:
+        trim: true
+        collapse_whitespace: true
+
+    # Extract structured entities from the user's free-text message.
+    # The router LLM reads the input and returns JSON with the defined fields.
+    # Fields not found in the input become null.
+    - type: extract
+      id: extract_entities
+      config:
+        llm: router
+        schema:
+          email:
+            type: string
+            description: "User's email address in any format"
+          order_number:
+            type: string
+            description: "Order or reference number (e.g., ORD-123, #456)"
+          urgency:
+            type: enum
+            values: [low, medium, high, critical]
+            description: "How urgent the user's request seems"
+          issue_type:
+            type: string
+            description: "Category of issue: billing, shipping, product, account, other"
+        store_in_context: extracted
+
+    # Validate: rule-based length check + LLM-based content quality check.
+    - type: validate
+      id: validate_input
+      config:
+        rules:
+          - min_length: 5
+            on_fail:
+              action: reject
+          - max_length: 2000
+            on_fail:
+              action: truncate
+        llm: router
+        criteria:
+          - "The message appears to be a genuine customer support request"
+        threshold: 0.5
+        on_fail:
+          action: warn
+
+  settings:
+    debug:
+      log_stages: true
+      include_timing: true
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Entity Extraction & Validation Demo ==="
+    hints:
+      - "Try: My email is alice@example.com and my order ORD-789 hasn't arrived."
+      - "Try: 주문번호 #12345가 아직 안 왔어요. (Korean - extraction works in any language)"
+      - "Try: URGENT! Order ABC-001 is completely wrong, need help NOW!"
+      - "Try: Hi (short message — passes min_length but limited extraction)"
+      - "The agent knows your email, order number, and urgency before responding."

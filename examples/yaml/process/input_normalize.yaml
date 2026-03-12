@@ -1,0 +1,67 @@
+name: InputNormalizeAgent
+version: "1.0.0"
+description: "Simplest process pipeline — input normalization and validation without LLM"
+
+# The process pipeline runs BEFORE the LLM sees your message.
+# normalize: cleans up whitespace and formatting
+# validate: enforces length constraints
+# No LLM is used for these stages - they are pure rule-based preprocessing.
+#
+# Flow: user input -> normalize -> validate -> LLM -> response
+
+system_prompt: |
+  You are an echo assistant.
+  Always repeat the user's message back exactly as you received it, wrapped in quotes.
+  Then respond normally below that.
+  Example:
+    User: hello world
+    You: hello world
+    (your response here)
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+process:
+  input:
+    # Stage 1: Clean up the raw input
+    - type: normalize
+      id: clean_whitespace
+      config:
+        trim: true
+        collapse_whitespace: true
+
+    # Stage 2: length constraints
+    - type: validate
+      id: check_length
+      config:
+        rules:
+          - min_length: 2
+            on_fail:
+              action: reject
+          - max_length: 500
+            on_fail:
+              action: truncate
+
+  settings:
+    debug:
+      log_stages: true
+      include_timing: true
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Input Normalization Demo ==="
+    hints:
+      - "Try typing with   lots   of   spaces — they get collapsed."
+      - "Try: '  hello  ' (leading/trailing whitespace is trimmed)"
+      - "Try a single character like 'x' — it gets rejected (min_length: 2)"
+      - "The LLM only sees the cleaned, validated input."
+      - "No LLM is used for normalization — it's free preprocessing."
