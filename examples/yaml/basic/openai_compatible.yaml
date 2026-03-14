@@ -1,0 +1,43 @@
+name: OpenAICompatibleChat
+version: "1.0"
+description: "Chat agent connecting to an OpenAI-compatible server"
+
+# Connect to any OpenAI-compatible server.
+#
+# - provider: openai-compatible -> uses the OpenAI HTTP protocol with a custom base_url
+# - base_url -> required; points to your server's /v1 endpoint
+# - api_key_env -> optional; env var name holding the API key (omit for keyless servers)
+#
+# Example with authentication:
+#   llm:
+#     provider: openai-compatible
+#     model: qwen3:8b
+#     base_url: http://localhost:11434/v1
+#     api_key_env: SERVER_API_KEY
+#
+# Flow: user input -> LLM (via openai-compatible) -> response
+
+system_prompt: |
+  You are a helpful assistant.
+  Keep responses concise and informative.
+
+llm:
+  provider: openai-compatible
+  model: qwen3:8b
+  base_url: http://localhost:11434/v1
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== OpenAI-Compatible Chat ==="
+    hints:
+      - "Connects to an OpenAI-compatible server."
+      - "Change base_url and model in this YAML to point to your server."

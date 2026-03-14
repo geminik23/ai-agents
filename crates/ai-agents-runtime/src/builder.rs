@@ -179,8 +179,39 @@ impl AgentBuilder {
                 let provider_type = ProviderType::from_str(&config.provider)
                     .map_err(|e| AgentError::Config(e.to_string()))?;
 
-                let provider = UnifiedLLMProvider::from_env(provider_type, &config.model)
-                    .map_err(|e| AgentError::LLM(e.to_string()))?;
+                let core_config = ai_agents_core::LLMConfig {
+                    temperature: Some(config.temperature),
+                    max_tokens: Some(config.max_tokens),
+                    top_p: config.top_p,
+                    top_k: None,
+                    frequency_penalty: None,
+                    presence_penalty: None,
+                    stop_sequences: None,
+                    extra: config.extra.clone(),
+                };
+                // base_url: first-class field, fallback to extra for backward compat
+                let base_url = config.base_url.clone().or_else(|| {
+                    config
+                        .extra
+                        .get("base_url")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+
+                // api_key: resolve from api_key_env if specified
+                let api_key = config
+                    .api_key_env
+                    .as_ref()
+                    .and_then(|env_var| std::env::var(env_var).ok());
+
+                let provider = UnifiedLLMProvider::from_spec_config(
+                    provider_type,
+                    &config.model,
+                    api_key,
+                    base_url,
+                    core_config,
+                )
+                .map_err(|e| AgentError::LLM(e.to_string()))?;
 
                 registry.register(alias, Arc::new(provider));
             }
@@ -198,8 +229,39 @@ impl AgentBuilder {
             let provider_type = ProviderType::from_str(&config.provider)
                 .map_err(|e| AgentError::Config(e.to_string()))?;
 
-            let provider = UnifiedLLMProvider::from_env(provider_type, &config.model)
-                .map_err(|e| AgentError::LLM(e.to_string()))?;
+            let core_config = ai_agents_core::LLMConfig {
+                temperature: Some(config.temperature),
+                max_tokens: Some(config.max_tokens),
+                top_p: config.top_p,
+                top_k: None,
+                frequency_penalty: None,
+                presence_penalty: None,
+                stop_sequences: None,
+                extra: config.extra.clone(),
+            };
+            // base_url: first-class field, fallback to extra for backward compat
+            let base_url = config.base_url.clone().or_else(|| {
+                config
+                    .extra
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            });
+
+            // api_key: resolve from api_key_env if specified
+            let api_key = config
+                .api_key_env
+                .as_ref()
+                .and_then(|env_var| std::env::var(env_var).ok());
+
+            let provider = UnifiedLLMProvider::from_spec_config(
+                provider_type,
+                &config.model,
+                api_key,
+                base_url,
+                core_config,
+            )
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
 
             self.llm = Some(Arc::new(provider));
         }

@@ -331,6 +331,35 @@ cd examples/rust/reasoning
 cargo run --bin reasoning-agent
 ```
 
+### `rust/custom-llm/`
+
+Custom LLM provider examples - from implementing `LLMProvider` from scratch to multi-provider routing.
+
+
+| Binary | Description |
+|--------|-------------|
+| `custom-provider` | Implement `LLMProvider` from scratch with an offline echo/rule-based provider - no API key needed |
+| `openai-compatible` | HTTP adapter for any OpenAI-compatible server (LM Studio, Ollama, vLLM, LocalAI, TGI) |
+| `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
+
+
+Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` — no custom Rust code needed.
+
+Run from:
+
+```sh
+cd examples/rust/custom-llm
+
+# No API key needed - runs entirely offline
+cargo run --bin custom-provider
+
+# Requires a running OpenAI-compatible server
+LOCAL_LLM_BASE_URL=http://localhost:1234/v1 cargo run --bin openai-compatible
+
+# OPENAI_API_KEY
+cargo run --bin multi-provider
+```
+
 ### `rust/disambiguation/`
 
 Advanced disambiguation demo with Rust-side startup options and metadata display.

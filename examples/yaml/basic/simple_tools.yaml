@@ -1,10 +1,15 @@
-# Basic tools introduction. For more tool examples, see examples/yaml/tools/
-# which covers all 10 built-in tools, conditional availability, scoping,
-# multi-language aliases, and security policies.
-
 name: SimpleToolsAgent
 version: "1.0.0"
 description: "Basic YAML-first example showing built-in tool usage"
+
+# Basic tools introduction. For more tool examples, see examples/yaml/tools/
+#
+# - calculator, datetime, echo - three built-in tools registered below
+# - system_prompt does NOT list tool names or descriptions;
+#   the framework auto-injects tool info at runtime
+#
+# Flow: user input -> LLM selects tool -> tool execution -> LLM summarizes -> response
+#                  -> no tool needed -> normal LLM chat -> response
 
 system_prompt: |
   You are a helpful assistant with access to a few built-in tools.

@@ -53,6 +53,16 @@ pub struct LLMConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
+    /// Base URL for the LLM provider API.
+    /// Required for `openai-compatible`; optional override for other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+
+    /// Environment variable name containing the API key.
+    /// Overrides the provider's default env var (e.g. OPENAI_API_KEY).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+
     /// Additional provider-specific configuration
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -74,6 +84,8 @@ impl Default for LLMConfig {
             temperature: default_temperature(),
             max_tokens: default_max_tokens(),
             top_p: None,
+            base_url: None,
+            api_key_env: None,
             extra: HashMap::new(),
         }
     }
@@ -150,6 +162,46 @@ disable_builtin_commands: false
         assert_eq!(config.model, "gpt-4");
         assert_eq!(config.temperature, 0.7);
         assert_eq!(config.max_tokens, 2000);
+        assert_eq!(config.base_url, None);
+        assert_eq!(config.api_key_env, None);
+    }
+
+    #[test]
+    fn test_llm_config_with_base_url() {
+        let yaml = r#"
+provider: openai-compatible
+model: llama3.2
+base_url: http://localhost:1234/v1
+"#;
+        let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.provider, "openai-compatible");
+        assert_eq!(
+            config.base_url,
+            Some("http://localhost:1234/v1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_llm_config_with_api_key_env() {
+        let yaml = r#"
+provider: openai-compatible
+model: my-model
+base_url: http://my-server:8080/v1
+api_key_env: MY_SERVER_KEY
+"#;
+        let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.api_key_env, Some("MY_SERVER_KEY".to_string()));
+    }
+
+    #[test]
+    fn test_llm_config_base_url_does_not_leak_to_extra() {
+        let yaml = r#"
+provider: openai-compatible
+model: my-model
+base_url: http://localhost:1234/v1
+"#;
+        let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.extra.contains_key("base_url"));
     }
 
     #[test]

@@ -2,6 +2,13 @@ name: SimpleChatStreamAgent
 version: "1.0.0"
 description: "Minimal YAML-first streaming chat agent for ai-agents-cli"
 
+# Streaming mode - tokens are printed in real time as the LLM generates them.
+#
+# - streaming.enabled: true -> enables token-by-token output
+# - metadata.cli.streaming: true -> tells the CLI to use streaming mode
+#
+# Flow: user input -> LLM -> streamed tokens -> response
+
 system_prompt: |
   You are a friendly, helpful, and concise AI assistant.
   Keep your answers natural and easy to follow.

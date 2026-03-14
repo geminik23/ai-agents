@@ -2,6 +2,10 @@ name: SimpleChatAgent
 version: "1.0.0"
 description: "Minimal YAML-first chat agent for ai-agents-cli"
 
+# Simplest possible agent - just a system prompt and an LLM.
+#
+# Flow: user input -> LLM -> response
+
 system_prompt: |
   You are a friendly, curious, and helpful AI assistant.
   Keep your answers clear, natural, and conversational.

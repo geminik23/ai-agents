@@ -19,7 +19,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ### Agent Core
 - YAML-defined agents -- system prompt, tools, skills, states, memory, and behavior in one file
-- Multi-LLM support -- multiple providers with aliases (default, router, evaluator); auto-fallback on failure
+- Multi-LLM support -- multiple providers built-in; multiple providers with aliases (default, router, evaluator); auto-fallback on failure
 - Skill system -- reusable "tool + prompt" workflows with LLM-based intent routing
 - Input/output process -- declarative pipeline: normalize, detect, extract, sanitize, validate, transform, format
 - Streaming -- real-time token streaming with tool call and state transition events
@@ -57,7 +57,26 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ### Extensibility
 - Agent hooks -- lifecycle events for logging, metrics, monitoring (message, LLM, tool, state, memory, HITL)
-- Custom providers -- implement `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer` traits
+- Custom providers -- built-in `openai-compatible` for any OpenAI-compatible server; implement `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer` traits for full control
+
+### Supported LLM Providers
+
+| Provider | YAML `provider:` | Env Var |
+|----------|-------------------|---------|
+| OpenAI | `openai` | `OPENAI_API_KEY` |
+| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` |
+| Google Gemini | `google` | `GOOGLE_API_KEY` |
+| Ollama | `ollama` | *(none — local)* |
+| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` |
+| Groq | `groq` | `GROQ_API_KEY` |
+| Mistral | `mistral` | `MISTRAL_API_KEY` |
+| Cohere | `cohere` | `COHERE_API_KEY` |
+| xAI (Grok) | `xai` | `XAI_API_KEY` |
+| Phind | `phind` | `PHIND_API_KEY` |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
+| Any OpenAI-compatible | `openai-compatible` | *(optional, via `api_key_env`)* |
+
+`openai-compatible` requires `base_url` and `model`. Use `api_key_env` to specify which environment variable holds the API key.
 
 ## Roadmap
 
@@ -110,6 +129,12 @@ system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
   model: gpt-4.1-nano
+
+# For any OpenAI-compatible server:
+# llm:
+#   provider: openai-compatible
+#   model: qwen3:8b
+#   base_url: http://localhost:11434/v1
   
 # Provider-specific extra params are also allowed.
 # Example for OpenAI reasoning-capable models:
