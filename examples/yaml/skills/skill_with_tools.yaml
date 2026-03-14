@@ -1,0 +1,106 @@
+name: ToolSkillAgent
+version: "1.0.0"
+description: "Skills that chain multiple tool calls and LLM prompts in a single pipeline"
+
+# Multi-step skill pipeline - chains tool calls and LLM prompts in sequence.
+#
+# Steps execute in order. Each step can reference results from previous steps via {{ steps[N].result }} and {{ steps[N].args }} Jinja2 templates.
+# {{ user_input }} is always the user's original message.
+#
+# Flow: user input -> skill router (LLM) -> skill steps (tool/prompt chain) -> response
+#                  -> no match -> normal LLM chat -> response
+system_prompt: |
+  You are a helpful daily briefing assistant.
+  When the user asks for a briefing or daily update, your skill handles it automatically.
+  For other questions, respond naturally.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+skills:
+  # A first skill
+  #
+  # The daily_briefing skill pipeline:
+  #   Step 0 (tool):   datetime - get the current time
+  #   Step 1 (tool):   random - generate an "energy score" (simulates external data)
+  #   Step 2 (prompt): LLM combines all tool results into a cohesive briefing
+  # Each step builds on the results of previous steps.
+  - id: daily_briefing
+    description: "Give the user a personalized daily briefing"
+    trigger: "When user asks for a daily briefing, morning update, or what's happening today"
+    steps:
+      # Step 0: Get the current date and time
+      - tool: datetime
+        args:
+          operation: "now"
+
+      # Step 1: Generate a random "energy score" (1-10) to simulate personalization
+      - tool: random
+        args:
+          operation: "integer"
+          min: 1
+          max: 10
+
+      # Step 2: The LLM weaves all tool results into a cohesive briefing.
+      # {{ steps[0].result }} and {{ steps[1].result }} reference
+      # the outputs from the two tool calls above.
+      - prompt: |
+          The user said: "{{ user_input }}"
+
+          Current date/time (from datetime tool): {{ steps[0].result }}
+          Random energy score 1-10 (from random tool): {{ steps[1].result }}
+
+          Create a short, cheerful daily briefing that includes:
+          1. A greeting with today's date
+          2. A fun comment based on the energy score (high = energetic day ahead, low = take it easy)
+          3. One motivational thought for the day
+
+          Keep it concise — 4-5 sentences maximum.
+
+  # A second skill - the router picks the right one based on trigger matching.
+  - id: quick_math
+    description: "Do a quick calculation"
+    trigger: "When user asks for a calculation, math problem, or to compute something"
+    steps:
+      # Step 0: Extract the math expression from natural language
+      - prompt: |
+          Extract ONLY the mathematical expression from the user's message.
+          Output nothing but the expression using +, -, *, /, ^, and parentheses.
+
+          User message: "{{ user_input }}"
+
+      # Step 1: Evaluate with the calculator tool.
+      # {{ steps[0].result }} is the extracted expression from the prompt above.
+      - tool: calculator
+        args:
+          expression: "{{ steps[0].result }}"
+
+      # Step 2: Present the result
+      - prompt: |
+          The user asked: "{{ user_input }}"
+          The calculation result is: {{ steps[1].result }}
+
+          Present the answer clearly in one sentence.
+
+# All tools referenced by any skill must be listed here.
+tools:
+  - name: datetime
+  - name: random
+  - name: calculator
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: "=== Skill With Tools Demo ==="
+    hints:
+      - "Try: Give me my daily briefing"
+      - "Try: What's happening today?"
+      - "Try: What is 42 * 17 + 3? (triggers the quick_math skill)"
+      - "Try: What's your favorite color? (no skill match — normal chat)"
+    show_tools: true

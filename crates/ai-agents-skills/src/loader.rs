@@ -7,6 +7,7 @@ use crate::definition::{SkillDefinition, SkillRef};
 
 pub struct SkillLoader {
     search_paths: Vec<PathBuf>,
+    base_dir: Option<PathBuf>,
     cache: HashMap<String, SkillDefinition>,
 }
 
@@ -14,8 +15,18 @@ impl SkillLoader {
     pub fn new() -> Self {
         Self {
             search_paths: vec![PathBuf::from("templates/skills")],
+            base_dir: None,
             cache: HashMap::new(),
         }
+    }
+
+    pub fn with_base_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.base_dir = Some(dir.into());
+        self
+    }
+
+    pub fn set_base_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.base_dir = Some(dir.into());
     }
 
     pub fn add_search_path(&mut self, path: impl Into<PathBuf>) {
@@ -62,12 +73,27 @@ impl SkillLoader {
     }
 
     pub fn load_from_path(&mut self, path: &Path) -> Result<SkillDefinition> {
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            AgentError::Skill(format!("Failed to read skill file {:?}: {}", path, e))
+        let resolved = if path.is_relative() {
+            if let Some(ref base) = self.base_dir {
+                let candidate = base.join(path);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    path.to_path_buf()
+                }
+            } else {
+                path.to_path_buf()
+            }
+        } else {
+            path.to_path_buf()
+        };
+
+        let content = std::fs::read_to_string(&resolved).map_err(|e| {
+            AgentError::Skill(format!("Failed to read skill file {:?}: {}", resolved, e))
         })?;
 
         let skill: SkillDefinition = serde_yaml::from_str(&content).map_err(|e| {
-            AgentError::Skill(format!("Failed to parse skill file {:?}: {}", path, e))
+            AgentError::Skill(format!("Failed to parse skill file {:?}: {}", resolved, e))
         })?;
 
         self.cache.insert(skill.id.clone(), skill.clone());
@@ -93,6 +119,27 @@ impl Default for SkillLoader {
 mod tests {
     use super::*;
     use crate::definition::SkillStep;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_skill_yaml(dir: &Path, relative_path: &str) -> PathBuf {
+        let full = dir.join(relative_path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(
+            &full,
+            r#"
+id: test_file_skill
+description: "loaded from file"
+trigger: "test"
+steps:
+  - prompt: "hello"
+"#,
+        )
+        .unwrap();
+        full
+    }
 
     #[test]
     fn test_loader_inline() {
@@ -147,5 +194,63 @@ mod tests {
 
         loader.clear_cache();
         assert!(loader.get_cached("cached_skill").is_none());
+    }
+
+    #[test]
+    fn test_load_from_path_with_base_dir() {
+        let tmp = TempDir::new().unwrap();
+        write_skill_yaml(tmp.path(), "skills/helper.skill.yaml");
+
+        let mut loader = SkillLoader::new().with_base_dir(tmp.path());
+        let skill = loader
+            .load_from_path(Path::new("skills/helper.skill.yaml"))
+            .unwrap();
+        assert_eq!(skill.id, "test_file_skill");
+    }
+
+    #[test]
+    fn test_load_from_path_absolute_ignores_base_dir() {
+        let tmp = TempDir::new().unwrap();
+        let abs = write_skill_yaml(tmp.path(), "skills/helper.skill.yaml");
+
+        // base_dir points somewhere else — should not matter for absolute paths
+        let other = TempDir::new().unwrap();
+        let mut loader = SkillLoader::new().with_base_dir(other.path());
+        let skill = loader.load_from_path(&abs).unwrap();
+        assert_eq!(skill.id, "test_file_skill");
+    }
+
+    #[test]
+    fn test_load_from_path_no_base_dir_uses_cwd() {
+        // Without base_dir, a relative path that doesn't exist under CWD should fail
+        let mut loader = SkillLoader::new();
+        let result = loader.load_from_path(Path::new("nonexistent/skill.yaml"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_base_dir() {
+        let tmp = TempDir::new().unwrap();
+        write_skill_yaml(tmp.path(), "my_skill.skill.yaml");
+
+        let mut loader = SkillLoader::new();
+        loader.set_base_dir(tmp.path());
+        let skill = loader
+            .load_from_path(Path::new("my_skill.skill.yaml"))
+            .unwrap();
+        assert_eq!(skill.id, "test_file_skill");
+    }
+
+    #[test]
+    fn test_load_ref_file_with_base_dir() {
+        let tmp = TempDir::new().unwrap();
+        write_skill_yaml(tmp.path(), "skills/math.skill.yaml");
+
+        let mut loader = SkillLoader::new().with_base_dir(tmp.path());
+        let skill_ref = SkillRef::File {
+            file: PathBuf::from("skills/math.skill.yaml"),
+        };
+        let skill = loader.load_ref(&skill_ref).unwrap();
+        assert_eq!(skill.id, "test_file_skill");
     }
 }

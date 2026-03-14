@@ -2,11 +2,15 @@ skill: weather_clothes
 description: "Weather-based clothing recommendation"
 trigger: "When user asks about clothing, outfit preparation, or weather-appropriate attire"
 
+
+# The weather_clothes skill has 2 steps:
 steps:
+  # Step 1: Get current weather data (simulated via echo tool)
   - tool: echo
     args:
       message: "temperature=18, condition=sunny, location=Seoul"
 
+  # Step 2: Recommend clothing based on weather
   - prompt: |
       User question: {{ user_input }}
 

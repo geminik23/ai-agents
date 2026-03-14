@@ -2,6 +2,8 @@ skill: math_helper
 description: "Skill to help with mathematical calculations"
 trigger: "When user requests help with calculations, math problems, or arithmetic operations"
 
+
+# The math_helper skill has 3 steps:
 steps:
   # Step 1: Extract the math expression from natural language input
   - prompt: |

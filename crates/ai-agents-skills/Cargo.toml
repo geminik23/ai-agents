@@ -22,3 +22,6 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 minijinja = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

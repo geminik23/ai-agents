@@ -2,31 +2,40 @@ name: "{{ agent_name | default('SkillAssistant') }}"
 version: "1.0.0"
 description: "An assistant with skill-based routing"
 
+# Combined skill usage - external file skills and inline skills together.
+#
+# Three skills: two loaded from external files, one defined inline.
+# All tools used by any skill must be listed in the agent's tools: section.
+#
+# Flow: user input -> skill router (LLM) -> matched skill steps -> response
+#                  -> no match -> normal LLM chat -> response
 system_prompt: |
   You are a helpful assistant with specialized skills.
   When a user's request matches one of your skills, use it to provide the best response.
   Otherwise, respond naturally and helpfully.
 
 llm:
-  provider: "{{ llm_provider | default('openai') }}"
-  model: "{{ llm_model | default('gpt-4.1-nano') }}"
+  provider: "openai"
+  model: "gpt-4.1-mini"
 
 skills:
-  # 1. External skill by file path
+  # External skill: prompt -> calculator -> prompt
   - file: skills/math_helper.skill.yaml
 
-  # 2. External skill by file path
+  # External skill: echo (simulated weather) -> prompt
   - file: skills/weather_clothes.skill.yaml
 
-  # 3. Inline skill definition
+  # Inline skill: single prompt step
   - id: greeting
     description: "Greet users warmly"
     trigger: "When user says hello, hi, or greets"
     steps:
       - prompt: |
-          {% raw %}The user greeted you: "{{ user_input }}"
-          Respond with a warm, friendly greeting.{% endraw %}
+          The user greeted you: "{{ user_input }}"
+          Respond with a warm, friendly greeting.
 
+# calculator: used by math_helper skill
+# echo: used by weather_clothes skill
 tools:
   - name: calculator
   - name: echo

@@ -1,0 +1,54 @@
+name: InlineSkillAgent
+version: "1.0.0"
+description: "Single inline skill with LLM-based trigger routing"
+
+# Simplest skill usage - one inline skill with LLM-based trigger routing.
+#
+# A "skill" is a named behavior with a trigger condition and a step pipeline.
+# The skill router (LLM) compares the user's input against each skill's trigger.
+# If a trigger matches, that skill's steps execute instead of normal chat.
+#
+# Flow: user input -> skill router (LLM) -> skill steps -> response
+#                  -> no match -> normal LLM chat -> response
+#
+# {{ user_input }} is a Jinja2 variable containing the user's original message.
+
+system_prompt: |
+  You are a friendly, helpful assistant.
+  When no skill matches the user's request, respond naturally.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+# Skills defined directly inside the agent YAML.
+# The router LLM reads each skill's trigger description and decides whether the user's input matches.
+skills:
+  - id: explain_simply
+    description: "Explain concepts in simple terms"
+    trigger: "When user asks to explain something simply, in plain language, or like they're a beginner"
+    steps:
+      - prompt: |
+          The user asked: "{{ user_input }}"
+
+          Explain this concept in the simplest possible terms that a 10-year-old would understand.
+          Use a real-world analogy if it helps.
+          Keep it to 3-4 sentences maximum.
+
+# No tools needed - skills can be prompt-only.
+tools: []
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: "=== Inline Skill Demo ==="
+    hints:
+      - "Try: Explain ai agent simply"
+      - "Try: What is a blockchain in plain language?"
+      - "Try: Explain recursion like I'm a beginner"
+      - "Try: What's the weather like? (no skill match - normal chat)"

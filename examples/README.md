@@ -62,17 +62,26 @@ cargo run -p ai-agents-cli -- run examples/yaml/basic/simple_tools.yaml
 
 ### `yaml/skills/`
 
-Skill system examples.
+skill examples - from a single inline skill to multi-step tool pipelines.
 
 | File | Description |
 |------|-------------|
-| `skill_agent.yaml` | YAML skill agent with inline and external skills |
-| `skills/math_helper.skill.yaml` | External math skill |
-| `skills/weather_clothes.skill.yaml` | External weather/clothing skill |
+| `skill_inline_only.yaml` | Single inline skill with LLM-based trigger routing |
+| `skill_external_only.yaml` | Loads a skill from a separate file for cross-agent reusability |
+| `skill_with_tools.yaml` | Skills that chain multiple tool calls and LLM prompts in a single pipeline |
+| `skill_agent.yaml` | Combined: inline skills, external skill files, and tool-using skills together |
+| `skills/math_helper.skill.yaml` | External math skill (used by `skill_external_only` and `skill_agent`) |
+| `skills/weather_clothes.skill.yaml` | External weather/clothing skill (used by `skill_agent`) |
 
-Example:
+The skill router (LLM) compares user input against each skill's `trigger` description and selects the best match.
+Skills that reference tools (e.g., `calculator`) must list those tools in the agent's `tools:` section.
+
+Examples:
 
 ```sh
+cargo run -p ai-agents-cli -- run examples/yaml/skills/skill_inline_only.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/skills/skill_external_only.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/skills/skill_with_tools.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/skills/skill_agent.yaml
 ```
 

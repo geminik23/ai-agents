@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -33,6 +33,7 @@ pub struct AgentBuilder {
     tools: Option<ToolRegistry>,
     skills: Vec<SkillDefinition>,
     skill_loader: Option<SkillLoader>,
+    yaml_dir: Option<PathBuf>,
     system_prompt: Option<String>,
     tools_prompt: Option<String>,
     auto_tools_prompt: bool,
@@ -67,6 +68,7 @@ impl AgentBuilder {
             tools: None,
             skills: Vec::new(),
             skill_loader: None,
+            yaml_dir: None,
             system_prompt: None,
             tools_prompt: None,
             auto_tools_prompt: true,
@@ -103,6 +105,7 @@ impl AgentBuilder {
             tools: None,
             skills: Vec::new(),
             skill_loader: None,
+            yaml_dir: None,
             system_prompt: Some(system_prompt),
             tools_prompt: None,
             auto_tools_prompt: true,
@@ -133,8 +136,13 @@ impl AgentBuilder {
     }
 
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref()).map_err(AgentError::IoError)?;
-        Self::from_yaml(&content)
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(AgentError::IoError)?;
+        let mut builder = Self::from_yaml(&content)?;
+        if let Some(parent) = path.parent() {
+            builder.yaml_dir = Some(parent.to_path_buf());
+        }
+        Ok(builder)
     }
 
     pub fn from_template(template_name: &str) -> Result<Self> {
@@ -424,6 +432,9 @@ impl AgentBuilder {
         if let Some(ref spec) = self.spec {
             if !spec.skills.is_empty() {
                 let mut loader = self.skill_loader.take().unwrap_or_else(SkillLoader::new);
+                if let Some(ref dir) = self.yaml_dir {
+                    loader.set_base_dir(dir);
+                }
                 let loaded_skills = loader.load_refs(&spec.skills)?;
                 self.skills.extend(loaded_skills);
             }

@@ -1,0 +1,46 @@
+name: ExternalSkillAgent
+version: "1.0.0"
+description: "Loads a skill from a separate file for cross-agent reusability"
+
+# External skill file - skills defined in separate .yaml files for reusability.
+#
+# The file: syntax loads a skill definition from a relative path.
+# Multiple agents can reference the same skill file - write once, reuse everywhere.
+# External skills work exactly like inline skills: same trigger routing, same steps.
+#
+# Flow: user input -> skill router (LLM) -> math_helper skill steps -> response
+#                  -> no match -> normal LLM chat -> response
+system_prompt: |
+  You are a helpful assistant with a math skill.
+  When the user asks a math question, your math skill will handle it automatically.
+  For non-math questions, respond naturally.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+# Load a skill from an external file.
+# Check the skill yaml file.
+skills:
+  - file: skills/math_helper.skill.yaml
+
+# The math_helper skill uses the calculator tool internally, so it must be listed here.
+tools:
+  - name: calculator
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: "=== External Skill Demo ==="
+    hints:
+      - "Try: What is 15 * 7 + 3?"
+      - "Try: Calculate 20% of 350"
+      - "Try: What is the square root of 144?"
+      - "Try: Tell me a joke (no skill match - normal chat)"
+      - "The math_helper skill lives in skills/math_helper.skill.yaml"
+    show_tools: true
