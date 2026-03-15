@@ -6,7 +6,6 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Command-line interface for running YAML-defined AI agents"
-publish = false
 
 [[bin]]
 name = "ai-agents-cli"

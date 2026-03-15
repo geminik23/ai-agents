@@ -10,7 +10,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default -- tool policies, HITL approvals, error recovery
 - Extensible -- custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.5**
+> Status: **1.0.0-rc.6**
 >
 > Under active development. APIs and YAML schema may change between minor versions.
 > Documentation and more examples are coming.
@@ -114,7 +114,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.5"
+ai-agents = "1.0.0-rc.6"
 ```
 
 ## Quick Start
