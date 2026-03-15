@@ -1132,8 +1132,9 @@ impl RuntimeAgent {
             if !is_available {
                 warn!(tool = %tool_call.name, "Tool not available in current context");
                 return Err(AgentError::Tool(format!(
-                    "Tool '{}' is not available in current context",
-                    tool_call.name
+                    "Tool '{}' is not available. Available tools: {}",
+                    tool_call.name,
+                    available_tool_ids.join(", ")
                 )));
             }
         }
@@ -2760,24 +2761,71 @@ Respond in JSON format:
         // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
         // The current content was generated in the OLD state context and is stale.
         // Re-generate in the new state context so the LLM can reference on_enter results.
+        // If the LLM responds with a tool call, execute it in a mini-loop so the
+        // result is not returned as raw JSON text.
         let new_llm = self.get_state_llm()?;
-        let new_messages = self.build_messages().await?;
-        // Log the system prompt to verify template rendering
-        if let Some(system_msg) = new_messages.first() {
-            if system_msg.role == ai_agents_core::Role::System {
-                debug!(
-                    prompt_preview =
-                        &system_msg.content[system_msg.content.len().saturating_sub(200)..],
-                    "Post-transition system prompt (last 200 chars)"
-                );
-            }
-        }
-        let new_response = new_llm
-            .complete(&new_messages, None)
-            .await
-            .map_err(|e| AgentError::LLM(e.to_string()))?;
-        let final_content = new_response.content.trim().to_string();
+        let mut final_content;
 
+        for post_iter in 0..self.max_iterations {
+            let new_messages = self.build_messages().await?;
+            if post_iter == 0 {
+                if let Some(system_msg) = new_messages.first() {
+                    if system_msg.role == ai_agents_core::Role::System {
+                        debug!(
+                            prompt_preview =
+                                &system_msg.content[system_msg.content.len().saturating_sub(200)..],
+                            "Post-transition system prompt (last 200 chars)"
+                        );
+                    }
+                }
+            }
+
+            let new_response = new_llm
+                .complete(&new_messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(e.to_string()))?;
+            final_content = new_response.content.trim().to_string();
+
+            // Check if the post-transition response contains tool calls.
+            // If so, execute them and loop so the LLM can summarize the result.
+            if let Some(tool_calls) = self.parse_tool_calls(&final_content) {
+                debug!(
+                    post_iter = post_iter,
+                    tools = tool_calls.len(),
+                    "Post-transition tool call detected, executing"
+                );
+
+                let results = self.execute_tools_parallel(&tool_calls).await;
+                for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
+                    match result {
+                        Ok(output) => {
+                            self.memory
+                                .add_message(ChatMessage::function(&tool_call.name, &output))
+                                .await?;
+                        }
+                        Err(e) => {
+                            self.memory
+                                .add_message(ChatMessage::function(
+                                    &tool_call.name,
+                                    &format!("Error: {}", e),
+                                ))
+                                .await?;
+                        }
+                    }
+                }
+                // Loop to let the LLM see the tool result and produce a text response.
+                continue;
+            }
+
+            // No tool call — this is the final text response.
+            self.memory
+                .add_message(ChatMessage::assistant(&final_content))
+                .await?;
+            return Ok((final_content, true));
+        }
+
+        // Exhausted post-transition iterations (unlikely). Return last content.
+        final_content = "Post-transition processing completed.".to_string();
         self.memory
             .add_message(ChatMessage::assistant(&final_content))
             .await?;

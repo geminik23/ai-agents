@@ -197,10 +197,14 @@ pub struct Transition {
     /// Intent label for deterministic routing after disambiguation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub intent: Option<String>,
-    #[serde(default)]
+    #[serde(default = "default_auto")]
     pub auto: bool,
     #[serde(default)]
     pub priority: u8,
+}
+
+fn default_auto() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -425,7 +429,9 @@ impl StateDefinition {
                 if !self.inherit_parent {
                     return None;
                 }
-                parent.and_then(|p| p.tools.as_ref()).map(|t| t.iter().collect())
+                parent
+                    .and_then(|p| p.tools.as_ref())
+                    .map(|t| t.iter().collect())
             }
         }
     }

@@ -110,7 +110,10 @@ pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
         .auto_configure_llms()
         .context("failed to auto-configure LLMs from environment")?
         .auto_configure_features()
-        .context("failed to auto-configure agent features")?;
+        .context("failed to auto-configure agent features")?
+        .auto_configure_mcp()
+        .await
+        .context("failed to auto-configure MCP tools")?;
 
     // Attach LoggingHooks when the agent uses memory features that produce
     // hook events (compacting memory, token budgeting). Without this, budget

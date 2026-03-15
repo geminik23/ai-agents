@@ -143,6 +143,38 @@ env:
     }
 
     #[test]
+    fn test_tool_entry_mcp_with_views() {
+        let yaml = r#"
+name: github
+type: mcp
+transport: stdio
+command: npx
+args: ["-y", "@modelcontextprotocol/server-github"]
+env:
+  GITHUB_TOKEN: "test"
+views:
+  github_issues:
+    functions: [create_issue, list_issues]
+  github_code:
+    functions: [search_code]
+    description: "Code search"
+"#;
+        let entry: ToolEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name(), "github");
+        assert!(entry.is_mcp());
+        let config = entry.to_mcp_config().unwrap();
+        assert_eq!(config.views.len(), 2);
+        assert_eq!(
+            config.views["github_issues"].functions,
+            vec!["create_issue", "list_issues"]
+        );
+        assert_eq!(
+            config.views["github_code"].description.as_deref(),
+            Some("Code search")
+        );
+    }
+
+    #[test]
     fn test_tool_entry_name_method() {
         let simple = ToolEntry::Simple("calculator".to_string());
         assert_eq!(simple.name(), "calculator");

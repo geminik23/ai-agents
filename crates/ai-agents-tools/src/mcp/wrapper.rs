@@ -16,15 +16,15 @@ use rmcp::{RoleClient, ServiceExt};
 
 use ai_agents_core::{Tool, ToolResult};
 
-/// A discovered function from the MCP server.
+/// A discovered function from an MCP server (name, description, schema).
 #[derive(Debug, Clone)]
-struct DiscoveredFunction {
+pub(crate) struct DiscoveredFunction {
     /// Original function name as reported by the MCP server.
-    name: String,
+    pub(crate) name: String,
     /// Human-readable description of the function.
-    description: String,
+    pub(crate) description: String,
     /// JSON Schema for the function's parameters.
-    input_schema: Value,
+    pub(crate) input_schema: Value,
 }
 
 /// Configuration for the MCP wrapper tool, deserialized from YAML.
@@ -53,6 +53,10 @@ pub struct MCPWrapperConfig {
     /// If not set, auto-generated from discovered functions.
     #[serde(default)]
     pub description: Option<String>,
+
+    /// Named views: subsets of this server's functions registered as separate tools.
+    #[serde(default)]
+    pub views: HashMap<String, MCPViewConfig>,
 }
 
 fn default_startup_timeout() -> u64 {
@@ -91,6 +95,16 @@ pub struct MCPWrapperSecurity {
     /// Functions that require HITL approval before execution.
     #[serde(default)]
     pub hitl_functions: Vec<String>,
+}
+
+/// Configuration for a single MCP view (a named function subset).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MCPViewConfig {
+    /// Whitelist of function names to include in this view.
+    pub functions: Vec<String>,
+    /// Optional custom description for this view tool.
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// An MCP server exposed as a single builtin Tool.
@@ -202,7 +216,7 @@ impl MCPWrapperTool {
     }
 
     /// Build the dynamic input schema from discovered functions.
-    fn build_schema(server_name: &str, functions: &[DiscoveredFunction]) -> Value {
+    pub(crate) fn build_schema(server_name: &str, functions: &[DiscoveredFunction]) -> Value {
         let function_names: Vec<Value> = functions
             .iter()
             .map(|f| Value::String(f.name.clone()))
@@ -239,7 +253,7 @@ impl MCPWrapperTool {
             "properties": {
                 "function": {
                     "type": "string",
-                    "description": format!("The {} function to call", server_name),
+                    "description": format!("The function to call inside the '{}' tool. Pass this as arguments.function, NOT as the tool name.", server_name),
                     "enum": function_names
                 },
                 "params": {
@@ -252,7 +266,7 @@ impl MCPWrapperTool {
     }
 
     /// Build a rich description listing all available functions.
-    fn build_description(
+    pub(crate) fn build_description(
         server_name: &str,
         custom: Option<&str>,
         functions: &[DiscoveredFunction],
@@ -263,7 +277,12 @@ impl MCPWrapperTool {
         };
 
         if !functions.is_empty() {
-            desc.push_str(" Available functions: ");
+            // Clarify the dispatch pattern: the tool name is server_name,
+            // function names go inside arguments.function.
+            desc.push_str(&format!(
+                " Use tool '{}' with arguments.function set to one of: ",
+                server_name
+            ));
             let names: Vec<&str> = functions.iter().map(|f| f.name.as_str()).collect();
             desc.push_str(&names.join(", "));
             desc.push('.');
@@ -285,7 +304,7 @@ impl MCPWrapperTool {
     }
 
     /// Execute a function call on the MCP server.
-    async fn call_function(&self, function: &str, params: Value) -> ToolResult {
+    pub(crate) async fn call_function(&self, function: &str, params: Value) -> ToolResult {
         // Validate that the function exists
         if !self.functions.iter().any(|f| f.name == function) {
             let available: Vec<&str> = self.functions.iter().map(|f| f.name.as_str()).collect();
@@ -334,6 +353,15 @@ impl MCPWrapperTool {
             }
             Err(e) => ToolResult::error(format!("MCP function '{}' failed: {}", function, e)),
         }
+    }
+
+    /// Return the subset of discovered functions matching the given names.
+    pub(crate) fn get_functions_filtered(&self, names: &[String]) -> Vec<DiscoveredFunction> {
+        self.functions
+            .iter()
+            .filter(|f| names.iter().any(|n| n == &f.name))
+            .cloned()
+            .collect()
     }
 
     /// Connect to an MCP server via stdio transport.
@@ -594,6 +622,7 @@ headers:
         let desc = MCPWrapperTool::build_description("github", None, &functions);
 
         assert!(desc.contains("github operations via MCP"));
+        assert!(desc.contains("Use tool 'github'"));
         assert!(desc.contains("create_issue"));
         assert!(desc.contains("list_repos"));
         assert!(desc.contains("Create a new issue"));
@@ -614,6 +643,7 @@ headers:
                 hitl_functions: vec!["create_issue".to_string()],
             },
             description: None,
+            views: HashMap::new(),
         };
         let tool = MCPWrapperTool::new(config);
 
@@ -633,6 +663,7 @@ headers:
             startup_timeout_ms: 30000,
             security: MCPWrapperSecurity::default(),
             description: None,
+            views: HashMap::new(),
         };
         let tool = MCPWrapperTool::new(config);
         assert_eq!(tool.description(), "github operations via MCP");
@@ -650,8 +681,145 @@ headers:
             startup_timeout_ms: 30000,
             security: MCPWrapperSecurity::default(),
             description: Some("GitHub integration for DevOps".to_string()),
+            views: HashMap::new(),
         };
         let tool = MCPWrapperTool::new(config);
         assert_eq!(tool.description(), "GitHub integration for DevOps");
+    }
+
+    #[test]
+    fn test_view_config_deserialize() {
+        let yaml = r#"
+functions: [create_issue, list_issues]
+description: "Issue management"
+"#;
+        let config: MCPViewConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.functions, vec!["create_issue", "list_issues"]);
+        assert_eq!(config.description.as_deref(), Some("Issue management"));
+    }
+
+    #[test]
+    fn test_view_config_no_description() {
+        let yaml = r#"
+functions: [search_code, get_pull_request]
+"#;
+        let config: MCPViewConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.functions, vec!["search_code", "get_pull_request"]);
+        assert!(config.description.is_none());
+    }
+
+    #[test]
+    fn test_mcp_config_with_views() {
+        let yaml = r#"
+name: github
+type: mcp
+transport: stdio
+command: npx
+args: ["-y", "@modelcontextprotocol/server-github"]
+views:
+  github_issues:
+    functions: [create_issue, list_issues]
+  github_code:
+    functions: [search_code]
+    description: "Code search"
+"#;
+        let config: MCPWrapperConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.views.len(), 2);
+        assert_eq!(
+            config.views["github_issues"].functions,
+            vec!["create_issue", "list_issues"]
+        );
+        assert_eq!(
+            config.views["github_code"].description.as_deref(),
+            Some("Code search")
+        );
+    }
+
+    #[test]
+    fn test_mcp_config_without_views() {
+        let yaml = r#"
+name: github
+type: mcp
+transport: stdio
+command: npx
+args: ["-y", "@modelcontextprotocol/server-github"]
+"#;
+        let config: MCPWrapperConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.views.is_empty());
+    }
+
+    #[test]
+    fn test_tool_entry_mcp_with_views() {
+        let yaml = r#"
+name: github
+type: mcp
+transport: stdio
+command: npx
+args: ["-y", "@modelcontextprotocol/server-github"]
+env:
+  GITHUB_TOKEN: "test"
+views:
+  github_issues:
+    functions: [create_issue, list_issues]
+  github_code:
+    functions: [search_code]
+    description: "Code search"
+"#;
+        let config: MCPWrapperConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.views.len(), 2);
+        assert_eq!(
+            config.views["github_issues"].functions,
+            vec!["create_issue", "list_issues"]
+        );
+    }
+
+    #[test]
+    fn test_view_schema_filtered() {
+        let functions = vec![
+            DiscoveredFunction {
+                name: "create_issue".to_string(),
+                description: "Create a new issue".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string"},
+                        "title": {"type": "string"}
+                    }
+                }),
+            },
+            DiscoveredFunction {
+                name: "list_issues".to_string(),
+                description: "List issues".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string"}
+                    }
+                }),
+            },
+        ];
+
+        let schema = MCPWrapperTool::build_schema("github_issues", &functions);
+        let func_enum = schema["properties"]["function"]["enum"].as_array().unwrap();
+        assert_eq!(func_enum.len(), 2);
+        assert!(func_enum.contains(&json!("create_issue")));
+        assert!(func_enum.contains(&json!("list_issues")));
+    }
+
+    #[test]
+    fn test_view_description_custom() {
+        let functions = vec![DiscoveredFunction {
+            name: "create_issue".to_string(),
+            description: "Create a new issue".to_string(),
+            input_schema: json!({}),
+        }];
+
+        let desc = MCPWrapperTool::build_description(
+            "github_issues",
+            Some("Issue management"),
+            &functions,
+        );
+        assert!(desc.starts_with("Issue management"));
+        assert!(desc.contains("create_issue"));
     }
 }

@@ -396,7 +396,8 @@ pub mod tools {
 /// MCP (Model Context Protocol) integration types.
 pub mod mcp {
     pub use ai_agents_tools::mcp::{
-        MCPWrapperConfig, MCPWrapperSecurity, MCPWrapperTool, MCPWrapperTransport,
+        MCPViewConfig, MCPViewTool, MCPWrapperConfig, MCPWrapperSecurity, MCPWrapperTool,
+        MCPWrapperTransport,
     };
 }
 

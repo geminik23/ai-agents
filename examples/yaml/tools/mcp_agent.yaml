@@ -1,0 +1,121 @@
+name: FileAssistant
+version: "1.0.0"
+description: "Uses an MCP server as a single tool with runtime-discovered functions"
+
+# MCP tool with views - one MCP server, multiple scoped projections.
+#
+# The framework connects to the server, discovers available functions at startup, and exposes them through the `filesystem` tool with a `function` field.
+# Views create named subsets of those functions for state-level scoping.
+#
+# Flow: user input -> state routing -> scoped tool set -> function dispatch -> MCP server -> response
+#                  -> non-filesystem request -> datetime/http or normal chat -> response
+#
+# Prerequisites:
+#   - Install npm so `npx` can spawn the MCP server
+#   - The server is given read/write access to the directory specified in `args`
+#
+# NOTE: Do NOT list MCP function names in the system prompt.
+# The framework auto-injects the tool name, description, and argument schema at runtime.
+system_prompt: |
+  You are a file management assistant with access to the local filesystem via an MCP tool server.
+  Help users browse directories, read files, create files, and perform other file operations efficiently.
+  Use the available tools when the user asks for file-related actions.
+  For general questions, respond naturally or use the built-in tools when helpful.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+tools:
+  # Built-in tools available for general-purpose questions.
+  - datetime
+  - http
+
+  # MCP server declared as a single tool entry.
+  # The discovered server functions are available through `tool: filesystem`.
+  #
+  # Views define named subsets of the server's functions.
+  # Each view becomes an independent tool in the registry, sharing the parent's
+  # MCP connection. States reference views by name for least-privilege scoping.
+  # The parent tool (`filesystem`) is always registered with ALL functions.
+  - name: filesystem
+    type: mcp
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "./"]
+    startup_timeout_ms: 15000
+    security:
+      blocked_functions: []
+    views:
+      fs_read:
+        functions: [read_file, read_multiple_files, list_directory, directory_tree, search_files, get_file_info]
+        description: "Read-only filesystem operations (browse, read, search)"
+      fs_write:
+        functions: [write_file, create_directory, move_file, delete_file]
+        description: "Filesystem write operations (create, move, delete)"
+
+states:
+  initial: ready
+  states:
+    ready:
+      prompt: "How can I help you with your files?"
+      tools: [datetime]
+      transitions:
+        - to: browsing
+          when: "user wants to browse, read, or search files"
+        - to: editing
+          when: "user wants to create, write, move, or delete files"
+        - to: full_access
+          when: "user needs full filesystem access or wants to do multiple types of operations"
+        - to: general
+          when: "user asks a general question"
+
+    # Only read-only MCP functions are visible to the LLM in this state.
+    # The LLM cannot accidentally pick write operations here.
+    browsing:
+      prompt: "I can help you browse and read files."
+      tools: [fs_read, datetime]
+      transitions:
+        - to: editing
+          when: "user wants to create, write, move, or delete files"
+        - to: ready
+          when: "user is done or changes topic"
+
+    # Only write MCP functions are visible here. HITL approval still applies
+    # because the parent's hitl_functions config passes through to all views.
+    editing:
+      prompt: "I can help you create, modify, or delete files."
+      tools: [fs_write, datetime]
+      transitions:
+        - to: browsing
+          when: "user wants to browse or read files"
+        - to: ready
+          when: "user is done or changes topic"
+
+    # The parent tool (`filesystem`) exposes ALL discovered functions.
+    # Use this when the user needs both read and write in the same state.
+    full_access:
+      prompt: "You have full filesystem access. What would you like to do?"
+      tools: [filesystem, datetime]
+      transitions:
+        - to: ready
+          when: "user is done or changes topic"
+
+    general:
+      prompt: "I'll help with your question."
+      # Only the built-in tools are available in this state.
+      tools: [datetime, http]
+      transitions:
+        - to: ready
+          when: "user is done or changes topic"
+
+metadata:
+  cli:
+    welcome: "=== MCP Filesystem Tool Demo (with Views) ==="
+    hints:
+      - "Try: List the files in the current directory"
+      - "Try: Read the contents of Cargo.toml"
+      - "Try: Search for all .yaml files"
+      - "Try: Create a new file called hello.txt"
+      - "Try: I need full filesystem access"
+      - "Try: What time is it?"

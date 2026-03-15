@@ -111,6 +111,7 @@ Progressive tool usage examples — from basic tool calls to multi-tool composit
 | `math_and_random.yaml` | Statistical math and random value generation |
 | `multi_tool_agent.yaml` | All built-in tools with parallel execution |
 | `http_tool.yaml` | External HTTP calls (makes real network requests) |
+| `mcp_agent.yaml` | MCP-backed filesystem tool with views - one MCP server scoped into `fs_read` and `fs_write` view tools for per-state least-privilege access |
 
 Note: the `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
 The framework auto-injects tool information (names, descriptions, argument schemas) into the prompt at runtime.
@@ -125,6 +126,7 @@ cargo run -p ai-agents-cli -- run examples/yaml/tools/file_and_template.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/math_and_random.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/multi_tool_agent.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/http_tool.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/mcp_agent.yaml
 ```
 
 ### `yaml/process/`

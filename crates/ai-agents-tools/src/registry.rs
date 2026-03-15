@@ -455,6 +455,7 @@ impl ToolRegistry {
             "\nWhen you need to use a tool, respond ONLY with valid JSON in this exact format:\n",
         );
         prompt.push_str("{\"tool\": \"tool_name\", \"arguments\": {...}}\n");
+        prompt.push_str("The \"tool\" value MUST be one of the exact tool names listed above. Do not invent tool names.\n");
         if parallel {
             prompt.push_str(
                 "\nWhen you need to call multiple tools at once, respond with a JSON array:\n",

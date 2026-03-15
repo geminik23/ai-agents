@@ -18,6 +18,7 @@ use ai_agents_recovery::{MessageFilter, RecoveryManager};
 use ai_agents_skills::{SkillDefinition, SkillLoader};
 use ai_agents_state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
 use ai_agents_template::{TemplateInheritance, TemplateLoader, TemplateRenderer};
+use ai_agents_tools::mcp::view::MCPViewTool;
 use ai_agents_tools::mcp::wrapper::MCPWrapperTool;
 use ai_agents_tools::{ToolRegistry, ToolSecurityEngine, create_builtin_registry};
 
@@ -294,12 +295,12 @@ impl AgentBuilder {
     /// Initialize MCP wrapper tools from `tools:` entries with `type: mcp`.
     ///
     /// Each MCP entry becomes an `MCPWrapperTool` registered as a normal builtin
-    /// tool in the `ToolRegistry`.
+    /// tool in the `ToolRegistry`. Views defined in the entry's `views:` field are registered as separate `MCPViewTool` instances sharing the parent's MCP connection.
     ///
     /// Call this after `auto_configure_features()` so the tool registry exists.
     pub async fn auto_configure_mcp(mut self) -> Result<Self> {
         if let Some(ref spec) = self.spec {
-            // Phase 1: Collect MCP configs from tools: entries with type: mcp
+            // Collect MCP configs from tools: entries with type: mcp
             let mcp_configs: Vec<_> = spec
                 .tools
                 .as_ref()
@@ -312,12 +313,12 @@ impl AgentBuilder {
                 .unwrap_or_default();
 
             if !mcp_configs.is_empty() {
-                // New approach: MCPWrapperTool per MCP entry in tools:
                 let registry = self.tools.get_or_insert_with(create_builtin_registry);
 
                 for config in mcp_configs {
                     let tool_name = config.name.clone();
                     let timeout_ms = config.startup_timeout_ms;
+                    let views_config = config.views.clone();
 
                     let wrapper = MCPWrapperTool::new(config);
 
@@ -334,12 +335,46 @@ impl AgentBuilder {
                                 functions = initialized_tool.function_count(),
                                 "MCP wrapper tool registered"
                             );
-                            registry.register(Arc::new(initialized_tool)).map_err(|e| {
+
+                            let parent = Arc::new(initialized_tool);
+
+                            // Register the parent tool
+                            registry.register(parent.clone()).map_err(|e| {
                                 AgentError::Config(format!(
                                     "Failed to register MCP tool '{}': {}",
                                     tool_name, e
                                 ))
                             })?;
+
+                            // Register views as separate tools sharing the parent connection
+                            for (view_name, view_config) in &views_config {
+                                let view_tool = MCPViewTool::new(
+                                    view_name.clone(),
+                                    parent.clone(),
+                                    view_config.functions.clone(),
+                                    view_config.description.clone(),
+                                )
+                                .map_err(|e| {
+                                    AgentError::Config(format!(
+                                        "Failed to create MCP view '{}': {}",
+                                        view_name, e
+                                    ))
+                                })?;
+
+                                tracing::info!(
+                                    view = %view_name,
+                                    parent = %tool_name,
+                                    functions = view_config.functions.len(),
+                                    "MCP view tool registered"
+                                );
+
+                                registry.register(Arc::new(view_tool)).map_err(|e| {
+                                    AgentError::Config(format!(
+                                        "Failed to register MCP view '{}': {}",
+                                        view_name, e
+                                    ))
+                                })?;
+                            }
                         }
                         Ok(Err(e)) => {
                             return Err(AgentError::Config(format!(
@@ -629,9 +664,20 @@ impl AgentBuilder {
         // - Some([]) = `tools: []` in YAML -> explicitly no tools
         // - Some([...]) = specific tools listed
         let declared_tool_ids: Option<Vec<String>> = self.spec.as_ref().and_then(|s| {
-            s.tools
-                .as_ref()
-                .map(|tools| tools.iter().map(|t| t.name().to_string()).collect())
+            s.tools.as_ref().map(|tools| {
+                let mut ids: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+
+                // Include view names from MCP entries so they pass availability checks
+                for entry in tools {
+                    if let Some(mcp_config) = entry.to_mcp_config() {
+                        for view_name in mcp_config.views.keys() {
+                            ids.push(view_name.clone());
+                        }
+                    }
+                }
+
+                ids
+            })
         });
 
         let mut agent = RuntimeAgent::new(
