@@ -1,5 +1,35 @@
 # Changelog
 
+
+## 1.0.0-rc.6
+
+### Added
+- MCP integration via rmcp v1.2 SDK: each MCP server exposed as a single builtin tool with function dispatch (stdio, HTTP, SSE transports)
+- MCP view tools: named function subsets of an MCP server registered as separate tools for per-state scoping, sharing the parent connection
+- MCP per-function HITL via security.hitl_functions, enforced uniformly across parent and view tools
+- OpenAI-compatible and OpenRouter provider types with base_url and api_key_env YAML fields
+- Agent-level tool scoping: tools field controls which tools the LLM sees
+- Parallel tool call support end-to-end: prompt, parser, and executor
+- CLI crate with reusable REPL, tracing init, and YAML-first workflow
+- Reasoning effort passthrough (low, medium, high) for supported providers
+- Custom CLI command callbacks via on_command builder method
+
+### Changed
+- Streaming path now has full feature parity with blocking chat
+- Examples moved to independent workspace grouped by feature area
+- CLI REPL commands now require / prefix
+- HttpTool always available: http-tool feature gate removed
+- LLM config fields (temperature, max_tokens, top_p, base_url) forwarded from YAML to providers
+- System prompts passed via builder.system() instead of user-message conversion
+
+### Fixed
+- Tool scoping: LLM prompt, disambiguation, and planning now respect declared tools
+- Context manager initialization was never called on startup
+- Skill loader relative file path resolution against YAML directory instead of CWD
+- Parallel tool call parser now handles JSON arrays
+- Streaming final chunk sentinel with is_final and finish reason
+- Post-transition tool calls were returned as raw JSON text instead of being executed
+
 ## 1.0.0-rc.5
 
 ### Added
