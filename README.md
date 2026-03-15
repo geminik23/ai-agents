@@ -202,6 +202,9 @@ The `ai-agents-cli` crate is the framework's command-line runner.
 ### Install
 
 ```sh
+# Install the published CLI from crates.io
+cargo install ai-agents-cli --version 1.0.0-rc.6
+
 # From the framework repo
 cargo install --path crates/ai-agents-cli
 
