@@ -243,8 +243,9 @@ pub mod spec {
     pub use ai_agents_runtime::spec::{
         AgentSpec, BuiltinProviderConfig, CliMetadata, CliPromptStyle, FileStorageConfig,
         LLMConfig, LLMSelector, MemoryConfig, ProviderPolicyConfig, ProviderSecurityConfig,
-        ProvidersConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig, ToolAliasesConfig,
-        ToolConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+        ProvidersConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig,
+        StructuredToolEntry, ToolAliasesConfig, ToolConfig, ToolEntry, ToolPolicyConfig,
+        YamlProviderConfig, YamlToolConfig,
     };
 }
 
@@ -389,6 +390,13 @@ pub mod tools {
         TextTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor, ToolMetadata,
         ToolProvider, ToolProviderError, ToolProviderType, ToolRegistry, TrustLevel,
         create_builtin_registry,
+    };
+}
+
+/// MCP (Model Context Protocol) integration types.
+pub mod mcp {
+    pub use ai_agents_tools::mcp::{
+        MCPWrapperConfig, MCPWrapperSecurity, MCPWrapperTool, MCPWrapperTransport,
     };
 }
 

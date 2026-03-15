@@ -40,6 +40,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ### Tools
 - Built-in tools -- datetime, JSON, random, HTTP, file, text, template, math, calculator(for dev)
+- MCP integration -- connect to any MCP server (stdio/HTTP) for instant access to hundreds of tools via rmcp SDK
 - Tool scoping -- 3-level filtering: `state.tools` -> `spec.tools` -> registry (all)
 - Conditional availability -- context, state, time, semantic (LLM-based), and composite conditions
 - Multi-language aliases -- tool names and descriptions in any language
@@ -89,7 +90,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 | Workspace Refactoring | 17 modular crates for parallel compilation | ✅ Done |
 | Reasoning & Reflection | Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation | ✅ Done |
 | Intent Disambiguation | LLM-based ambiguity detection and clarification | ✅ Done |
-| MCP Integration | Model Context Protocol tool ecosystem | Planned |
+| MCP Integration | Model Context Protocol tool ecosystem | ✅ Done |
 | Hot Reload | Live YAML configuration updates without restart | Planned |
 | Dynamic Agent Spawning | Runtime agent creation, registry, inter-agent messaging | Planned |
 | Multi-Agent Orchestration | Supervisor, pipeline, crew patterns | Planned |

@@ -13,7 +13,7 @@ pub use provider::{
     ToolAliasesConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
 pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
-pub use tool::ToolConfig;
+pub use tool::{StructuredToolEntry, ToolConfig, ToolEntry};
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

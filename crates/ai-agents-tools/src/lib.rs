@@ -2,6 +2,7 @@
 
 pub mod builtin;
 mod condition;
+pub mod mcp;
 mod provider;
 mod registry;
 pub mod security;

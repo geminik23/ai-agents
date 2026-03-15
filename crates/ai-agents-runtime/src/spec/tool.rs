@@ -1,79 +1,157 @@
-//! Tool configuration types
+//! Tool configuration types for agent specification.
+//!
+//! `ToolEntry` supports plain strings, structured builtins, and MCP wrapper entries.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Configuration for a tool
+use ai_agents_tools::mcp::wrapper::MCPWrapperConfig;
+
+/// A single entry in the agent-level `tools:` list.
+///
+/// Supports three YAML forms:
+/// 1. Plain string:         `- datetime`
+/// 2. Builtin with config:  `- name: http`
+/// 3. MCP wrapper:          `- name: github\n  type: mcp\n  transport: stdio\n  ...`
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolConfig {
+#[serde(untagged)]
+pub enum ToolEntry {
+    /// Plain string tool reference (e.g., `- datetime`).
+    Simple(String),
+    /// Structured entry — builtin with extra config or MCP wrapper.
+    Structured(StructuredToolEntry),
+}
+
+/// A structured tool entry with a name, optional type, and extra configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StructuredToolEntry {
     pub name: String,
 
+    /// `"mcp"` for MCP wrapper tools, absent/null for builtin tools.
+    #[serde(rename = "type", default)]
+    pub tool_type: Option<String>,
+
+    /// Extra fields — flattened from YAML. For builtins, holds additional config.
+    /// For MCP tools, holds transport/env/security/etc.
     #[serde(flatten)]
-    pub config: Option<Value>,
+    pub extra: Value,
 }
 
-impl ToolConfig {
-    pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            config: None,
+impl ToolEntry {
+    /// Get the tool name regardless of entry form.
+    pub fn name(&self) -> &str {
+        match self {
+            ToolEntry::Simple(name) => name,
+            ToolEntry::Structured(s) => &s.name,
         }
     }
 
-    pub fn with_config(name: impl Into<String>, config: Value) -> Self {
-        Self {
-            name: name.into(),
-            config: Some(config),
+    /// Check if this entry is an MCP wrapper tool.
+    pub fn is_mcp(&self) -> bool {
+        match self {
+            ToolEntry::Simple(_) => false,
+            ToolEntry::Structured(s) => s.tool_type.as_deref() == Some("mcp"),
+        }
+    }
+
+    /// Extract MCP wrapper config from a structured MCP entry.
+    ///
+    /// Re-serializes the structured entry to JSON, then deserializes as
+    /// `MCPWrapperConfig` to pick up all flattened MCP fields.
+    pub fn to_mcp_config(&self) -> Option<MCPWrapperConfig> {
+        if !self.is_mcp() {
+            return None;
+        }
+        match self {
+            ToolEntry::Structured(s) => {
+                let value = serde_json::to_value(s).ok()?;
+                serde_json::from_value(value).ok()
+            }
+            _ => None,
         }
     }
 }
+
+/// Backward compatibility alias — existing code using `ToolConfig` keeps working.
+pub type ToolConfig = ToolEntry;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn test_tool_config_new() {
-        let config = ToolConfig::new("calculator");
-        assert_eq!(config.name, "calculator");
-        assert!(config.config.is_none());
+    fn test_tool_entry_plain_string() {
+        let yaml = "datetime";
+        let entry: ToolEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name(), "datetime");
+        assert!(!entry.is_mcp());
     }
 
     #[test]
-    fn test_tool_config_with_config() {
-        let extra = json!({"param": "value"});
-        let config = ToolConfig::with_config("custom_tool", extra.clone());
-        assert_eq!(config.name, "custom_tool");
-        assert_eq!(config.config, Some(extra));
+    fn test_tool_entry_structured_builtin() {
+        let yaml = "name: http";
+        let entry: ToolEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name(), "http");
+        assert!(!entry.is_mcp());
     }
 
     #[test]
-    fn test_tool_config_deserialize_simple() {
+    fn test_tool_entry_mcp() {
         let yaml = r#"
-name: calculator
+name: github
+type: mcp
+transport: stdio
+command: npx
+args: ["-y", "@modelcontextprotocol/server-github"]
+env:
+  GITHUB_TOKEN: "test"
 "#;
-        let config: ToolConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.name, "calculator");
-        // Note: flatten may capture empty object instead of None
+        let entry: ToolEntry = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entry.name(), "github");
+        assert!(entry.is_mcp());
+        let config = entry.to_mcp_config().unwrap();
+        assert_eq!(config.name, "github");
     }
 
     #[test]
-    fn test_tool_config_deserialize_with_extra() {
+    fn test_tool_entry_mixed_list() {
         let yaml = r#"
-name: web_search
-api_key: "test_key"
-timeout: 30
+- datetime
+- name: http
+- name: github
+  type: mcp
+  transport: stdio
+  command: npx
+  args: ["-y", "@modelcontextprotocol/server-github"]
+  env:
+    GITHUB_TOKEN: "test"
 "#;
-        let config: ToolConfig = serde_yaml::from_str(yaml).unwrap();
-        assert_eq!(config.name, "web_search");
-        assert!(config.config.is_some());
+        let entries: Vec<ToolEntry> = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].name(), "datetime");
+        assert!(!entries[0].is_mcp());
+        assert_eq!(entries[1].name(), "http");
+        assert!(!entries[1].is_mcp());
+        assert_eq!(entries[2].name(), "github");
+        assert!(entries[2].is_mcp());
     }
 
     #[test]
-    fn test_tool_config_serialize() {
-        let config = ToolConfig::new("echo");
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        assert!(yaml.contains("name: echo"));
+    fn test_tool_config_backward_compat() {
+        let config = ToolConfig::Simple("echo".to_string());
+        assert_eq!(config.name(), "echo");
+    }
+
+    #[test]
+    fn test_tool_entry_name_method() {
+        let simple = ToolEntry::Simple("calculator".to_string());
+        assert_eq!(simple.name(), "calculator");
+
+        let structured = ToolEntry::Structured(StructuredToolEntry {
+            name: "custom_tool".to_string(),
+            tool_type: None,
+            extra: serde_json::json!({}),
+        });
+        assert_eq!(structured.name(), "custom_tool");
     }
 }

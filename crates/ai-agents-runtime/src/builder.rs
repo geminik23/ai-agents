@@ -18,6 +18,7 @@ use ai_agents_recovery::{MessageFilter, RecoveryManager};
 use ai_agents_skills::{SkillDefinition, SkillLoader};
 use ai_agents_state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
 use ai_agents_template::{TemplateInheritance, TemplateLoader, TemplateRenderer};
+use ai_agents_tools::mcp::wrapper::MCPWrapperTool;
 use ai_agents_tools::{ToolRegistry, ToolSecurityEngine, create_builtin_registry};
 
 use super::AgentInfo;
@@ -285,6 +286,75 @@ impl AgentBuilder {
             // Auto-register builtin tools if the user hasn't provided a custom registry.
             if self.tools.is_none() {
                 self.tools = Some(create_builtin_registry());
+            }
+        }
+        Ok(self)
+    }
+
+    /// Initialize MCP wrapper tools from `tools:` entries with `type: mcp`.
+    ///
+    /// Each MCP entry becomes an `MCPWrapperTool` registered as a normal builtin
+    /// tool in the `ToolRegistry`.
+    ///
+    /// Call this after `auto_configure_features()` so the tool registry exists.
+    pub async fn auto_configure_mcp(mut self) -> Result<Self> {
+        if let Some(ref spec) = self.spec {
+            // Phase 1: Collect MCP configs from tools: entries with type: mcp
+            let mcp_configs: Vec<_> = spec
+                .tools
+                .as_ref()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(|entry| entry.to_mcp_config())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if !mcp_configs.is_empty() {
+                // New approach: MCPWrapperTool per MCP entry in tools:
+                let registry = self.tools.get_or_insert_with(create_builtin_registry);
+
+                for config in mcp_configs {
+                    let tool_name = config.name.clone();
+                    let timeout_ms = config.startup_timeout_ms;
+
+                    let wrapper = MCPWrapperTool::new(config);
+
+                    // Initialize with timeout
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(timeout_ms),
+                        wrapper.initialized(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(initialized_tool)) => {
+                            tracing::info!(
+                                tool = %tool_name,
+                                functions = initialized_tool.function_count(),
+                                "MCP wrapper tool registered"
+                            );
+                            registry.register(Arc::new(initialized_tool)).map_err(|e| {
+                                AgentError::Config(format!(
+                                    "Failed to register MCP tool '{}': {}",
+                                    tool_name, e
+                                ))
+                            })?;
+                        }
+                        Ok(Err(e)) => {
+                            return Err(AgentError::Config(format!(
+                                "MCP tool '{}' initialization failed: {}",
+                                tool_name, e
+                            )));
+                        }
+                        Err(_) => {
+                            return Err(AgentError::Config(format!(
+                                "MCP tool '{}' timed out after {}ms",
+                                tool_name, timeout_ms
+                            )));
+                        }
+                    }
+                }
             }
         }
         Ok(self)
@@ -561,7 +631,7 @@ impl AgentBuilder {
         let declared_tool_ids: Option<Vec<String>> = self.spec.as_ref().and_then(|s| {
             s.tools
                 .as_ref()
-                .map(|tools| tools.iter().map(|t| t.name.clone()).collect())
+                .map(|tools| tools.iter().map(|t| t.name().to_string()).collect())
         });
 
         let mut agent = RuntimeAgent::new(
