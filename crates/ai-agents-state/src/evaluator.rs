@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use ai_agents_core::{ChatMessage, LLMProvider, Result};
-use ai_agents_llm::mock::MockLLMProvider;
 
 use super::config::{CompareOp, ContextMatcher, GuardConditions, Transition, TransitionGuard};
 
@@ -49,228 +48,223 @@ impl LLMTransitionEvaluator {
     pub fn new(llm: Arc<dyn LLMProvider>) -> Self {
         Self { llm }
     }
+}
 
-    fn evaluate_guard(&self, guard: &TransitionGuard, ctx: &TransitionContext) -> bool {
-        match guard {
-            TransitionGuard::Expression(expr) => self.evaluate_expression(expr, ctx),
-            TransitionGuard::Conditions(conditions) => self.evaluate_conditions(conditions, ctx),
-        }
+// ── Standalone guard evaluation functions ──
+
+pub fn evaluate_guard(guard: &TransitionGuard, ctx: &TransitionContext) -> bool {
+    match guard {
+        TransitionGuard::Expression(expr) => evaluate_expression(expr, ctx),
+        TransitionGuard::Conditions(conditions) => evaluate_conditions(conditions, ctx),
+    }
+}
+
+pub fn evaluate_expression(expr: &str, ctx: &TransitionContext) -> bool {
+    let expr = expr.trim();
+
+    if !expr.contains("{{") {
+        return !expr.is_empty();
     }
 
-    fn evaluate_expression(&self, expr: &str, ctx: &TransitionContext) -> bool {
-        let expr = expr.trim();
+    let inner = expr.trim_start_matches("{{").trim_end_matches("}}").trim();
 
-        if !expr.contains("{{") {
-            return !expr.is_empty();
-        }
+    evaluate_simple_expression(inner, ctx)
+}
 
-        let inner = expr.trim_start_matches("{{").trim_end_matches("}}").trim();
-
-        self.evaluate_simple_expression(inner, ctx)
+fn evaluate_simple_expression(expr: &str, ctx: &TransitionContext) -> bool {
+    if expr.starts_with("context.") {
+        let path = &expr[8..];
+        return get_context_value(path, &ctx.context).is_some();
     }
 
-    fn evaluate_simple_expression(&self, expr: &str, ctx: &TransitionContext) -> bool {
-        if expr.starts_with("context.") {
-            let path = &expr[8..];
-            return self.get_context_value(path, &ctx.context).is_some();
-        }
+    if expr.starts_with("state.") {
+        let field = &expr[6..];
+        return evaluate_state_expression(field, ctx);
+    }
 
-        if expr.starts_with("state.") {
-            let field = &expr[6..];
-            return self.evaluate_state_expression(field, ctx);
-        }
+    if let Some(idx) = expr.find('>') {
+        let (left, right) = expr.split_at(idx);
+        let op = if right.starts_with(">=") { ">=" } else { ">" };
+        let right = right.trim_start_matches(op).trim();
+        let left = left.trim();
 
-        if let Some(idx) = expr.find('>') {
-            let (left, right) = expr.split_at(idx);
-            let op = if right.starts_with(">=") { ">=" } else { ">" };
-            let right = right.trim_start_matches(op).trim();
-            let left = left.trim();
-
-            if let (Some(left_val), Ok(right_val)) =
-                (self.resolve_value(left, ctx), right.parse::<f64>())
-            {
-                if let Some(left_num) = left_val.as_f64() {
-                    return if op == ">=" {
-                        left_num >= right_val
-                    } else {
-                        left_num > right_val
-                    };
-                }
-            }
-        }
-
-        if let Some(idx) = expr.find('<') {
-            let (left, right) = expr.split_at(idx);
-            let op = if right.starts_with("<=") { "<=" } else { "<" };
-            let right = right.trim_start_matches(op).trim();
-            let left = left.trim();
-
-            if let (Some(left_val), Ok(right_val)) =
-                (self.resolve_value(left, ctx), right.parse::<f64>())
-            {
-                if let Some(left_num) = left_val.as_f64() {
-                    return if op == "<=" {
-                        left_num <= right_val
-                    } else {
-                        left_num < right_val
-                    };
-                }
-            }
-        }
-
-        if let Some(idx) = expr.find("==") {
-            let (left, right) = expr.split_at(idx);
-            let right = &right[2..].trim();
-            let left = left.trim();
-
-            if let Some(left_val) = self.resolve_value(left, ctx) {
-                let right_val: Value = if right.starts_with('"') && right.ends_with('"') {
-                    Value::String(right[1..right.len() - 1].to_string())
-                } else if *right == "true" {
-                    Value::Bool(true)
-                } else if *right == "false" {
-                    Value::Bool(false)
-                } else if let Ok(n) = right.parse::<f64>() {
-                    serde_json::json!(n)
+        if let (Some(left_val), Ok(right_val)) = (resolve_value(left, ctx), right.parse::<f64>()) {
+            if let Some(left_num) = left_val.as_f64() {
+                return if op == ">=" {
+                    left_num >= right_val
                 } else {
-                    Value::String(right.to_string())
+                    left_num > right_val
                 };
-
-                return left_val == right_val;
             }
         }
+    }
 
-        if let Some(idx) = expr.find("!=") {
-            let (left, right) = expr.split_at(idx);
-            let right = &right[2..].trim();
-            let left = left.trim();
+    if let Some(idx) = expr.find('<') {
+        let (left, right) = expr.split_at(idx);
+        let op = if right.starts_with("<=") { "<=" } else { "<" };
+        let right = right.trim_start_matches(op).trim();
+        let left = left.trim();
 
-            if let Some(left_val) = self.resolve_value(left, ctx) {
-                let right_val: Value = if right.starts_with('"') && right.ends_with('"') {
-                    Value::String(right[1..right.len() - 1].to_string())
-                } else if *right == "true" {
-                    Value::Bool(true)
-                } else if *right == "false" {
-                    Value::Bool(false)
-                } else if let Ok(n) = right.parse::<f64>() {
-                    serde_json::json!(n)
+        if let (Some(left_val), Ok(right_val)) = (resolve_value(left, ctx), right.parse::<f64>()) {
+            if let Some(left_num) = left_val.as_f64() {
+                return if op == "<=" {
+                    left_num <= right_val
                 } else {
-                    Value::String(right.to_string())
+                    left_num < right_val
                 };
-
-                return left_val != right_val;
-            }
-        }
-
-        false
-    }
-
-    fn resolve_value(&self, expr: &str, ctx: &TransitionContext) -> Option<Value> {
-        let expr = expr.trim();
-        if expr.starts_with("context.") {
-            let path = &expr[8..];
-            return self.get_context_value(path, &ctx.context);
-        }
-        if expr.starts_with("state.") {
-            let field = &expr[6..];
-            return self.get_state_value(field, ctx);
-        }
-        None
-    }
-
-    fn evaluate_state_expression(&self, field: &str, _ctx: &TransitionContext) -> bool {
-        match field {
-            "turn_count" => true,
-            _ => false,
-        }
-    }
-
-    fn get_state_value(&self, field: &str, _ctx: &TransitionContext) -> Option<Value> {
-        match field {
-            "current" => Some(Value::String(_ctx.current_state.clone())),
-            _ => None,
-        }
-    }
-
-    fn evaluate_conditions(&self, conditions: &GuardConditions, ctx: &TransitionContext) -> bool {
-        match conditions {
-            GuardConditions::All(exprs) => exprs.iter().all(|e| self.evaluate_expression(e, ctx)),
-            GuardConditions::Any(exprs) => exprs.iter().any(|e| self.evaluate_expression(e, ctx)),
-            GuardConditions::Context(matchers) => {
-                self.evaluate_context_matchers(matchers, &ctx.context)
             }
         }
     }
 
-    fn evaluate_context_matchers(
-        &self,
-        matchers: &HashMap<String, ContextMatcher>,
-        context: &HashMap<String, Value>,
-    ) -> bool {
-        for (path, matcher) in matchers {
-            let value = self.get_context_value(path, context);
-            if !self.match_value(value.as_ref(), matcher) {
+    if let Some(idx) = expr.find("==") {
+        let (left, right) = expr.split_at(idx);
+        let right = &right[2..].trim();
+        let left = left.trim();
+
+        if let Some(left_val) = resolve_value(left, ctx) {
+            let right_val: Value = if right.starts_with('"') && right.ends_with('"') {
+                Value::String(right[1..right.len() - 1].to_string())
+            } else if *right == "true" {
+                Value::Bool(true)
+            } else if *right == "false" {
+                Value::Bool(false)
+            } else if let Ok(n) = right.parse::<f64>() {
+                serde_json::json!(n)
+            } else {
+                Value::String(right.to_string())
+            };
+
+            return left_val == right_val;
+        }
+    }
+
+    if let Some(idx) = expr.find("!=") {
+        let (left, right) = expr.split_at(idx);
+        let right = &right[2..].trim();
+        let left = left.trim();
+
+        if let Some(left_val) = resolve_value(left, ctx) {
+            let right_val: Value = if right.starts_with('"') && right.ends_with('"') {
+                Value::String(right[1..right.len() - 1].to_string())
+            } else if *right == "true" {
+                Value::Bool(true)
+            } else if *right == "false" {
+                Value::Bool(false)
+            } else if let Ok(n) = right.parse::<f64>() {
+                serde_json::json!(n)
+            } else {
+                Value::String(right.to_string())
+            };
+
+            return left_val != right_val;
+        }
+    }
+
+    false
+}
+
+fn resolve_value(expr: &str, ctx: &TransitionContext) -> Option<Value> {
+    let expr = expr.trim();
+    if expr.starts_with("context.") {
+        let path = &expr[8..];
+        return get_context_value(path, &ctx.context);
+    }
+    if expr.starts_with("state.") {
+        let field = &expr[6..];
+        return get_state_value(field, ctx);
+    }
+    None
+}
+
+fn evaluate_state_expression(field: &str, _ctx: &TransitionContext) -> bool {
+    match field {
+        "turn_count" => true,
+        _ => false,
+    }
+}
+
+fn get_state_value(field: &str, ctx: &TransitionContext) -> Option<Value> {
+    match field {
+        "current" => Some(Value::String(ctx.current_state.clone())),
+        _ => None,
+    }
+}
+
+pub fn evaluate_conditions(conditions: &GuardConditions, ctx: &TransitionContext) -> bool {
+    match conditions {
+        GuardConditions::All(exprs) => exprs.iter().all(|e| evaluate_expression(e, ctx)),
+        GuardConditions::Any(exprs) => exprs.iter().any(|e| evaluate_expression(e, ctx)),
+        GuardConditions::Context(matchers) => evaluate_context_matchers(matchers, &ctx.context),
+    }
+}
+
+fn evaluate_context_matchers(
+    matchers: &HashMap<String, ContextMatcher>,
+    context: &HashMap<String, Value>,
+) -> bool {
+    for (path, matcher) in matchers {
+        let value = get_context_value(path, context);
+        if !match_value(value.as_ref(), matcher) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn get_context_value(path: &str, context: &HashMap<String, Value>) -> Option<Value> {
+    let parts: Vec<&str> = path.split('.').collect();
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut current: Option<&Value> = context.get(parts[0]);
+
+    for part in &parts[1..] {
+        match current {
+            Some(Value::Object(map)) => {
+                current = map.get(*part);
+            }
+            _ => return None,
+        }
+    }
+
+    current.cloned()
+}
+
+fn match_value(value: Option<&Value>, matcher: &ContextMatcher) -> bool {
+    match matcher {
+        ContextMatcher::Exact(expected) => value.map(|v| v == expected).unwrap_or(false),
+        ContextMatcher::Exists { exists } => {
+            let has_value = value.is_some() && value != Some(&Value::Null);
+            *exists == has_value
+        }
+        ContextMatcher::Compare(op) => {
+            let Some(val) = value else {
                 return false;
-            }
-        }
-        true
-    }
-
-    fn get_context_value(&self, path: &str, context: &HashMap<String, Value>) -> Option<Value> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.is_empty() {
-            return None;
-        }
-
-        let mut current: Option<&Value> = context.get(parts[0]);
-
-        for part in &parts[1..] {
-            match current {
-                Some(Value::Object(map)) => {
-                    current = map.get(*part);
-                }
-                _ => return None,
-            }
-        }
-
-        current.cloned()
-    }
-
-    fn match_value(&self, value: Option<&Value>, matcher: &ContextMatcher) -> bool {
-        match matcher {
-            ContextMatcher::Exact(expected) => value.map(|v| v == expected).unwrap_or(false),
-            ContextMatcher::Exists { exists } => {
-                let has_value = value.is_some() && value != Some(&Value::Null);
-                *exists == has_value
-            }
-            ContextMatcher::Compare(op) => {
-                let Some(val) = value else {
-                    return false;
-                };
-                self.compare_value(val, op)
-            }
+            };
+            compare_value(val, op)
         }
     }
+}
 
-    fn compare_value(&self, value: &Value, op: &CompareOp) -> bool {
-        match op {
-            CompareOp::Eq(expected) => value == expected,
-            CompareOp::Neq(expected) => value != expected,
-            CompareOp::Gt(n) => value.as_f64().map(|v| v > *n).unwrap_or(false),
-            CompareOp::Gte(n) => value.as_f64().map(|v| v >= *n).unwrap_or(false),
-            CompareOp::Lt(n) => value.as_f64().map(|v| v < *n).unwrap_or(false),
-            CompareOp::Lte(n) => value.as_f64().map(|v| v <= *n).unwrap_or(false),
-            CompareOp::In(values) => values.contains(value),
-            CompareOp::Contains(s) => value
-                .as_str()
-                .map(|v| v.contains(s))
-                .or_else(|| {
-                    value
-                        .as_array()
-                        .map(|arr| arr.iter().any(|v| v.as_str() == Some(s)))
-                })
-                .unwrap_or(false),
-        }
+fn compare_value(value: &Value, op: &CompareOp) -> bool {
+    match op {
+        CompareOp::Eq(expected) => value == expected,
+        CompareOp::Neq(expected) => value != expected,
+        CompareOp::Gt(n) => value.as_f64().map(|v| v > *n).unwrap_or(false),
+        CompareOp::Gte(n) => value.as_f64().map(|v| v >= *n).unwrap_or(false),
+        CompareOp::Lt(n) => value.as_f64().map(|v| v < *n).unwrap_or(false),
+        CompareOp::Lte(n) => value.as_f64().map(|v| v <= *n).unwrap_or(false),
+        CompareOp::In(values) => values.contains(value),
+        CompareOp::Contains(s) => value
+            .as_str()
+            .map(|v| v.contains(s))
+            .or_else(|| {
+                value
+                    .as_array()
+                    .map(|arr| arr.iter().any(|v| v.as_str() == Some(s)))
+            })
+            .unwrap_or(false),
     }
 }
 
@@ -288,7 +282,7 @@ impl TransitionEvaluator for LLMTransitionEvaluator {
         // Guard-based transitions (existing, no LLM)
         for (i, transition) in transitions.iter().enumerate() {
             if let Some(ref guard) = transition.guard {
-                if self.evaluate_guard(guard, context) {
+                if evaluate_guard(guard, context) {
                     return Ok(Some(i));
                 }
             }
@@ -375,10 +369,7 @@ impl GuardOnlyEvaluator {
     }
 
     pub fn evaluate_guard(&self, guard: &TransitionGuard, ctx: &TransitionContext) -> bool {
-        let evaluator = LLMTransitionEvaluator {
-            llm: Arc::new(MockLLMProvider::new("guard_eval")),
-        };
-        evaluator.evaluate_guard(guard, ctx)
+        evaluate_guard(guard, ctx)
     }
 
     pub fn evaluate_guards(
@@ -388,7 +379,7 @@ impl GuardOnlyEvaluator {
     ) -> Option<usize> {
         for (i, transition) in transitions.iter().enumerate() {
             if let Some(ref guard) = transition.guard {
-                if self.evaluate_guard(guard, ctx) {
+                if evaluate_guard(guard, ctx) {
                     return Some(i);
                 }
             }
@@ -422,6 +413,7 @@ mod tests {
             intent: None,
             auto: true,
             priority: 0,
+            cooldown_turns: None,
         }];
 
         let context = TransitionContext::new("hello", "hi there", "greeting");
@@ -445,6 +437,7 @@ mod tests {
                 intent: None,
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "sales".into(),
@@ -453,6 +446,7 @@ mod tests {
                 intent: None,
                 auto: true,
                 priority: 5,
+                cooldown_turns: None,
             },
         ];
 
@@ -475,36 +469,27 @@ mod tests {
         assert!(result.unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn test_guard_expression_simple() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_guard_expression_simple() {
         let mut context_map = HashMap::new();
         context_map.insert("has_data".to_string(), Value::Bool(true));
 
         let ctx = TransitionContext::new("hi", "hello", "start").with_context(context_map);
 
         let guard = TransitionGuard::Expression("{{ context.has_data }}".into());
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_guard_expression_missing() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_guard_expression_missing() {
         let ctx = TransitionContext::new("hi", "hello", "start").with_context(HashMap::new());
 
         let guard = TransitionGuard::Expression("{{ context.has_data }}".into());
-        assert!(!evaluator.evaluate_guard(&guard, &ctx));
+        assert!(!evaluate_guard(&guard, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_guard_with_nested_context() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_guard_with_nested_context() {
         let mut context_map = HashMap::new();
         context_map.insert(
             "user".to_string(),
@@ -517,14 +502,11 @@ mod tests {
         let ctx = TransitionContext::new("hi", "hello", "start").with_context(context_map);
 
         let guard = TransitionGuard::Expression("{{ context.user.verified }}".into());
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_guard_conditions_all() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_guard_conditions_all() {
         let mut context_map = HashMap::new();
         context_map.insert("has_name".to_string(), Value::Bool(true));
         context_map.insert("has_email".to_string(), Value::Bool(true));
@@ -535,14 +517,11 @@ mod tests {
             "{{ context.has_name }}".into(),
             "{{ context.has_email }}".into(),
         ]));
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_guard_conditions_any() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_guard_conditions_any() {
         let mut context_map = HashMap::new();
         context_map.insert("is_vip".to_string(), Value::Bool(true));
 
@@ -552,14 +531,11 @@ mod tests {
             "{{ context.is_admin }}".into(),
             "{{ context.is_vip }}".into(),
         ]));
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_guard_context_matchers() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_guard_context_matchers() {
         let mut context_map = HashMap::new();
         context_map.insert(
             "user".to_string(),
@@ -582,7 +558,7 @@ mod tests {
         );
 
         let guard = TransitionGuard::Conditions(GuardConditions::Context(matchers));
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
     #[tokio::test]
@@ -603,6 +579,7 @@ mod tests {
                 intent: None,
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "guard_based".into(),
@@ -611,6 +588,7 @@ mod tests {
                 intent: None,
                 auto: true,
                 priority: 5,
+                cooldown_turns: None,
             },
         ];
 
@@ -635,6 +613,7 @@ mod tests {
                 intent: None,
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "with_guard".into(),
@@ -643,6 +622,7 @@ mod tests {
                 intent: None,
                 auto: true,
                 priority: 5,
+                cooldown_turns: None,
             },
         ];
 
@@ -650,11 +630,8 @@ mod tests {
         assert_eq!(result, Some(1));
     }
 
-    #[tokio::test]
-    async fn test_context_matcher_exists() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_context_matcher_exists() {
         let mut context_map = HashMap::new();
         context_map.insert("name".to_string(), Value::String("Alice".into()));
 
@@ -668,14 +645,11 @@ mod tests {
         );
 
         let guard = TransitionGuard::Conditions(GuardConditions::Context(matchers));
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_compare_contains() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_compare_contains() {
         let mut context_map = HashMap::new();
         context_map.insert("message".to_string(), Value::String("hello world".into()));
         context_map.insert("tags".to_string(), serde_json::json!(["urgent", "support"]));
@@ -688,7 +662,7 @@ mod tests {
             ContextMatcher::Compare(CompareOp::Contains("world".into())),
         );
         let guard1 = TransitionGuard::Conditions(GuardConditions::Context(matchers1));
-        assert!(evaluator.evaluate_guard(&guard1, &ctx));
+        assert!(evaluate_guard(&guard1, &ctx));
 
         let mut matchers2 = HashMap::new();
         matchers2.insert(
@@ -696,14 +670,11 @@ mod tests {
             ContextMatcher::Compare(CompareOp::Contains("urgent".into())),
         );
         let guard2 = TransitionGuard::Conditions(GuardConditions::Context(matchers2));
-        assert!(evaluator.evaluate_guard(&guard2, &ctx));
+        assert!(evaluate_guard(&guard2, &ctx));
     }
 
-    #[tokio::test]
-    async fn test_compare_in() {
-        let mock = MockLLMProvider::new("guard_test");
-        let evaluator = LLMTransitionEvaluator::new(Arc::new(mock));
-
+    #[test]
+    fn test_compare_in() {
         let mut context_map = HashMap::new();
         context_map.insert("tier".to_string(), Value::String("premium".into()));
 
@@ -719,7 +690,7 @@ mod tests {
         );
 
         let guard = TransitionGuard::Conditions(GuardConditions::Context(matchers));
-        assert!(evaluator.evaluate_guard(&guard, &ctx));
+        assert!(evaluate_guard(&guard, &ctx));
     }
 
     /// a transition's `intent` field, routing is deterministic - no LLM call.
@@ -737,6 +708,7 @@ mod tests {
                 intent: Some("cancel_order".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "cancel_reservation".into(),
@@ -745,6 +717,7 @@ mod tests {
                 intent: Some("cancel_reservation".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "cancel_subscription".into(),
@@ -753,6 +726,7 @@ mod tests {
                 intent: Some("cancel_subscription".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
         ];
 
@@ -790,6 +764,7 @@ mod tests {
                 intent: Some("cancel_order".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "cancel_reservation".into(),
@@ -798,6 +773,7 @@ mod tests {
                 intent: Some("cancel_reservation".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
         ];
 
@@ -829,6 +805,7 @@ mod tests {
                 intent: Some("cancel_order".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
             Transition {
                 to: "cancel_reservation".into(),
@@ -837,6 +814,7 @@ mod tests {
                 intent: Some("cancel_reservation".into()),
                 auto: true,
                 priority: 10,
+                cooldown_turns: None,
             },
         ];
 
@@ -871,6 +849,7 @@ mod tests {
             intent: Some("cancel_order".into()),
             auto: true,
             priority: 10,
+            cooldown_turns: None,
         }];
 
         // resolved_intent is Null (simulating clear_disambiguation_context)

@@ -11,7 +11,6 @@ categories = ["asynchronous"]
 
 [dependencies]
 ai-agents-core = { workspace = true }
-ai-agents-llm = { workspace = true }
 ai-agents-reasoning = { workspace = true }
 ai-agents-disambiguation = { workspace = true }
 serde = { workspace = true }
@@ -24,3 +23,4 @@ parking_lot = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }
+ai-agents-llm = { workspace = true }

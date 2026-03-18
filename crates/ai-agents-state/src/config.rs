@@ -3,7 +3,7 @@ use ai_agents_disambiguation::StateDisambiguationOverride;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -25,6 +25,10 @@ pub struct StateConfig {
     pub fallback: Option<String>,
     #[serde(default)]
     pub max_no_transition: Option<u32>,
+
+    /// Whether to re-generate a response after state transitions (default: true).
+    #[serde(default = "default_true")]
+    pub regenerate_on_transition: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -69,8 +73,16 @@ pub struct StateDefinition {
     #[serde(default)]
     pub on_enter: Vec<StateAction>,
 
+    /// Actions on re-entering a previously visited state. Falls back to on_enter if empty.
+    #[serde(default)]
+    pub on_reenter: Vec<StateAction>,
+
     #[serde(default)]
     pub on_exit: Vec<StateAction>,
+
+    /// Per-state override: skip re-generation on entering this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regenerate_on_enter: Option<bool>,
 
     #[serde(default)]
     pub extract: Option<ContextExtractor>,
@@ -86,6 +98,10 @@ pub struct StateDefinition {
 }
 
 fn default_inherit_parent() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }
 
@@ -201,6 +217,10 @@ pub struct Transition {
     pub auto: bool,
     #[serde(default)]
     pub priority: u8,
+
+    /// Minimum turns before this transition can fire again after last use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_turns: Option<u32>,
 }
 
 fn default_auto() -> bool {
@@ -268,6 +288,12 @@ impl StateConfig {
             )));
         }
         self.validate_states(&self.states, &[])?;
+
+        // Warn about unreachable states (non-fatal)
+        for warning in self.check_reachability() {
+            tracing::warn!("{}", warning);
+        }
+
         Ok(())
     }
 
@@ -383,6 +409,8 @@ impl StateConfig {
         Some(current)
     }
 
+    /// Resolve a transition target to a full dotted state path.
+    /// Order: `^prefix` (parent-level) → top-level → sibling → child → fallback literal.
     pub fn resolve_full_path(&self, current_path: &str, target: &str) -> String {
         if target.starts_with('^') {
             return target[1..].to_string();
@@ -409,6 +437,80 @@ impl StateConfig {
         }
 
         target.to_string()
+    }
+
+    /// Check for unreachable states. Returns warning messages.
+    pub fn check_reachability(&self) -> Vec<String> {
+        let mut reachable: HashSet<String> = HashSet::new();
+        reachable.insert(self.initial.clone());
+
+        if let Some(ref fb) = self.fallback {
+            reachable.insert(fb.clone());
+        }
+        for gt in &self.global_transitions {
+            reachable.insert(self.normalize_target(&gt.to));
+        }
+
+        let mut queue: Vec<String> = reachable.iter().cloned().collect();
+        while let Some(state_path) = queue.pop() {
+            if let Some(def) = self.get_state(&state_path) {
+                for t in &def.transitions {
+                    let target = self.resolve_full_path(&state_path, &t.to);
+                    if reachable.insert(target.clone()) {
+                        queue.push(target);
+                    }
+                }
+                if let Some(ref timeout) = def.timeout_to {
+                    let target = self.resolve_full_path(&state_path, timeout);
+                    if reachable.insert(target.clone()) {
+                        queue.push(target);
+                    }
+                }
+                if let (Some(initial), Some(_sub)) = (&def.initial, &def.states) {
+                    let sub_path = format!("{}.{}", state_path, initial);
+                    if reachable.insert(sub_path.clone()) {
+                        queue.push(sub_path);
+                    }
+                }
+            }
+        }
+
+        let all_states = self.collect_all_state_paths(&self.states, &[]);
+        let mut warnings = Vec::new();
+        for state_path in &all_states {
+            if !reachable.contains(state_path) {
+                warnings.push(format!(
+                    "State '{}' appears unreachable — no transitions lead to it",
+                    state_path
+                ));
+            }
+        }
+        warnings
+    }
+
+    fn normalize_target(&self, target: &str) -> String {
+        if target.starts_with('^') {
+            target[1..].to_string()
+        } else {
+            target.to_string()
+        }
+    }
+
+    fn collect_all_state_paths(
+        &self,
+        states: &HashMap<String, StateDefinition>,
+        parent: &[String],
+    ) -> Vec<String> {
+        let mut paths = Vec::new();
+        for (name, def) in states {
+            let mut current: Vec<String> = parent.to_vec();
+            current.push(name.clone());
+            paths.push(current.join("."));
+            if let Some(ref sub) = def.states {
+                paths.extend(self.collect_all_state_paths(sub, &current));
+            }
+        }
+        paths
     }
 }
 
@@ -492,6 +594,7 @@ states:
             global_transitions: vec![],
             fallback: None,
             max_no_transition: None,
+            regenerate_on_transition: true,
         };
         assert!(config.validate().is_err());
     }
@@ -509,6 +612,7 @@ states:
                     intent: None,
                     auto: true,
                     priority: 0,
+                    cooldown_turns: None,
                 }],
                 ..Default::default()
             },
@@ -519,6 +623,7 @@ states:
             global_transitions: vec![],
             fallback: None,
             max_no_transition: None,
+            regenerate_on_transition: true,
         };
         assert!(config.validate().is_err());
     }

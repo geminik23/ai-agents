@@ -1542,7 +1542,21 @@ OVERALL: PASS/FAIL"#,
         let (transitions, evaluator, current_state) =
             match (&self.state_machine, &self.transition_evaluator) {
                 (Some(sm), Some(eval)) => {
-                    let auto_transitions = sm.auto_transitions();
+                    let auto_transitions: Vec<_> = sm
+                        .auto_transitions()
+                        .into_iter()
+                        .filter(|t| {
+                            // S7: skip transitions on cooldown
+                            match t.cooldown_turns {
+                                Some(cd) if cd > 0 => {
+                                    let resolved =
+                                        sm.config().resolve_full_path(&sm.current(), &t.to);
+                                    !sm.is_on_cooldown(&resolved, cd)
+                                }
+                                _ => true,
+                            }
+                        })
+                        .collect();
                     if auto_transitions.is_empty() {
                         return Ok(false);
                     }
@@ -1638,11 +1652,17 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
-    /// Execute on_enter actions for a state being entered.
+    /// Execute on_enter (or on_reenter) actions for a state being entered.
     async fn execute_state_enter_actions(&self, state_path: &str) {
         if let Some(ref sm) = self.state_machine {
             if let Some(def) = sm.get_definition(state_path) {
-                if !def.on_enter.is_empty() {
+                // Check if this state was previously visited
+                let is_reentry = sm.history().iter().any(|e| e.to == state_path);
+
+                if is_reentry && !def.on_reenter.is_empty() {
+                    debug!(state = %state_path, count = def.on_reenter.len(), "Executing on_reenter actions");
+                    self.execute_state_actions(&def.on_reenter).await;
+                } else if !def.on_enter.is_empty() {
                     debug!(state = %state_path, count = def.on_enter.len(), "Executing on_enter actions");
                     self.execute_state_actions(&def.on_enter).await;
                 }
@@ -2758,6 +2778,11 @@ Respond in JSON format:
             return Ok((content, false));
         }
 
+        // Check if we should skip re-generation after this transition
+        if !self.should_regenerate_after_transition() {
+            return Ok((content, true));
+        }
+
         // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
         // The current content was generated in the OLD state context and is stale.
         // Re-generate in the new state context so the LLM can reference on_enter results.
@@ -2834,6 +2859,23 @@ Respond in JSON format:
     }
 
     /// Build the final AgentResponse with all metadata.
+    /// Check whether to re-generate a response after a state transition.
+    fn should_regenerate_after_transition(&self) -> bool {
+        if let Some(ref sm) = self.state_machine {
+            // Global setting
+            if !sm.config().regenerate_on_transition {
+                return false;
+            }
+            // Per-state override on the new (current) state
+            if let Some(def) = sm.current_definition() {
+                if let Some(regen) = def.regenerate_on_enter {
+                    return regen;
+                }
+            }
+        }
+        true
+    }
+
     fn build_agent_response(
         &self,
         content: String,

@@ -253,6 +253,18 @@ impl StateMachine {
         let current = self.current.read();
         current.split('.').next().unwrap_or(&current).to_string()
     }
+
+    /// Check if a transition target is on cooldown (was recently transitioned to).
+    pub fn is_on_cooldown(&self, target: &str, cooldown_turns: u32) -> bool {
+        let history = self.history.read();
+        let total_transitions = history.len();
+        if total_transitions == 0 || cooldown_turns == 0 {
+            return false;
+        }
+        // Look at the last `cooldown_turns` transitions
+        let start = total_transitions.saturating_sub(cooldown_turns as usize);
+        history[start..].iter().any(|e| e.to == target)
+    }
 }
 
 #[cfg(test)]
@@ -273,6 +285,7 @@ mod tests {
                     intent: None,
                     auto: true,
                     priority: 10,
+                    cooldown_turns: None,
                 }],
                 ..Default::default()
             },
@@ -299,6 +312,7 @@ mod tests {
             global_transitions: vec![],
             fallback: None,
             max_no_transition: None,
+            regenerate_on_transition: true,
         }
     }
 
@@ -315,6 +329,7 @@ mod tests {
                     intent: None,
                     auto: true,
                     priority: 0,
+                    cooldown_turns: None,
                 }],
                 ..Default::default()
             },
@@ -330,6 +345,7 @@ mod tests {
                     intent: None,
                     auto: true,
                     priority: 0,
+                    cooldown_turns: None,
                 }],
                 ..Default::default()
             },
@@ -359,6 +375,7 @@ mod tests {
             global_transitions: vec![],
             fallback: None,
             max_no_transition: None,
+            regenerate_on_transition: true,
         }
     }
 
@@ -532,6 +549,7 @@ mod tests {
             intent: None,
             auto: true,
             priority: 100,
+            cooldown_turns: None,
         }];
 
         let sm = StateMachine::new(config).unwrap();
