@@ -1,0 +1,93 @@
+name: ToolScopedAgent
+version: "1.0.0"
+description: "Different tools available in different states"
+
+# Per-state tool scoping — control which tools are available in each state.
+#
+# Tool availability is resolved per state using 3-level filtering:
+#   - `tools: []` on a state = explicitly no tools (even if agent declares them)
+#   - `tools: [datetime]` on a state = only those tools, nothing else
+#   - omitting `tools` on a state = inherit from agent-level `tools:` list
+#
+# The framework auto-injects tool names and schemas into the system prompt, so the LLM only sees tools that are available in the current state.
+#
+# Flow: user input -> LLM (with state-scoped tool list) -> tool call or text response
+#                  -> evaluate `when` conditions -> transition -> new tool set applies
+#
+# NOTE: Do NOT list tool names in system_prompt. The framework injects them automatically.
+
+system_prompt: |
+  You are a helpful assistant with access to tools.
+  Only use tools when they would genuinely help answer the question.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# Three states with different tool access:
+#   greeting — tools: [] (no tools, pure conversation)
+#   lookup   — tools: [datetime, calculator] (explicit subset)
+#   closing  — tools omitted (inherits agent-level tools list)
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: |
+        Welcome the user. Ask what they need help with.
+        You can help with date/time questions and math calculations.
+      tools: []
+      transitions:
+        - to: lookup
+          when: "User asks about date, time, or math calculations"
+        - to: closing
+          when: "User says goodbye"
+
+    lookup:
+      prompt: |
+        Help the user with their question using the available tools.
+      tools:
+        - datetime
+        - calculator
+      transitions:
+        - to: closing
+          when: "User is satisfied with the answer"
+        - to: greeting
+          when: "User wants to start over"
+
+    closing:
+      prompt: |
+        Thank the user and wish them a good day.
+      tools: []
+      transitions:
+        - to: lookup
+          when: "User asks about date, time, or math calculations"
+        - to: greeting
+          when: "User has another question"
+
+
+# Agent-level tools — states that omit `tools:` inherit this list.
+# States that set `tools: []` or `tools: [...]` override it entirely.
+tools:
+  - datetime
+  - calculator
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Tool Scoping Demo ==="
+    hints:
+      - "Try: Hi! (in greeting — no tools available)"
+      - "Try: What time is it? (transitions to lookup — tools available)"
+      - "Try: Thanks! (transitions to closing — inherits agent-level tools)"
+    show_state: true

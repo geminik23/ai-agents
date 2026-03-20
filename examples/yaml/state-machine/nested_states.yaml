@@ -1,0 +1,93 @@
+name: NestedStatesAgent
+version: "1.0.0"
+description: "Hierarchical states with sub-states and ^ escape"
+
+# Hierarchical state machine - sub-states nested inside a parent state.
+#
+# A parent state can contain its own `initial` and `states` block.
+# Entering the parent automatically enters its `initial` sub-state.
+# Sub-states inherit the parent's prompt (appended by default).
+#
+# Use `^` prefix on transition targets to escape to a root-level state.
+# Without `^`, targets resolve as siblings within the same parent first.
+# `max_turns` + `timeout_to` auto-transitions when the sub-state runs too long.
+#
+# Flow: user input -> troubleshooting.diagnosing -> gather info -> fixing -> suggest solution
+#                  -> "^resolved" (escape to root) -> done
+#                  -> "^escalation" (escape to root) -> hand off
+#                  -> max_turns exceeded -> timeout_to "^escalation"
+
+system_prompt: |
+  You are a technical support agent.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# Parent state `troubleshooting` contains two sub-states: diagnosing and fixing.
+# Root-level states `resolved` and `escalation` are reachable via `^` escape.
+# `diagnosing` has a 5-turn limit - if exceeded, auto-escalates via timeout_to.
+states:
+  initial: troubleshooting
+  states:
+    troubleshooting:
+      prompt: |
+        You are troubleshooting a technical issue. Be methodical and patient.
+      initial: diagnosing
+      states:
+        diagnosing:
+          prompt: |
+            Ask questions to understand the problem.
+            What device? What happened? Any error messages?
+          max_turns: 5
+          timeout_to: "^escalation"
+          transitions:
+            - to: fixing
+              when: "Enough information to suggest a fix"
+            - to: "^escalation"
+              when: "Problem is too complex or user is frustrated"
+
+        fixing:
+          prompt: |
+            Suggest a specific solution with clear step-by-step instructions.
+          transitions:
+            - to: "^resolved"
+              when: "User confirms the fix worked"
+            - to: diagnosing
+              when: "Fix didn't work, need more information"
+            - to: "^escalation"
+              when: "Multiple fixes failed"
+
+    resolved:
+      prompt: |
+        The issue is resolved! Summarize what was done and ask if there's anything else.
+      transitions:
+        - to: troubleshooting
+          when: "User has another technical issue"
+
+    escalation:
+      prompt: |
+        This issue needs specialist attention.
+        Apologize for the inconvenience and summarize everything so far.
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Nested States Demo ==="
+    hints:
+      - "Try: My wifi keeps dropping every few minutes"
+      - "Try: I already tried restarting the router"
+      - "Try: That worked, thanks!"
+      - "Note: diagnosing has max_turns: 5 — auto-escalates after 5 turns"
+    show_state: true

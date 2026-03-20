@@ -902,4 +902,34 @@ llms:
         assert!(!spec.has_disambiguation());
         assert!(!spec.disambiguation.is_enabled());
     }
+
+    #[test]
+    fn test_state_machine_examples_parse() {
+        // Resolve workspace root: this crate is at crates/ai-agents-runtime
+        let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let examples = [
+            "examples/yaml/state-machine/two_state_greeting.yaml",
+            "examples/yaml/state-machine/guard_transitions.yaml",
+            "examples/yaml/state-machine/nested_states.yaml",
+            "examples/yaml/state-machine/state_with_tools.yaml",
+            "examples/yaml/state-machine/state_lifecycle.yaml",
+            "examples/yaml/state-machine/support_state_machine.yaml",
+        ];
+        for rel_path in &examples {
+            let path = workspace_root.join(rel_path);
+            let content = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("Failed to read {}", path.display()));
+            let spec: AgentSpec = serde_yaml::from_str(&content)
+                .unwrap_or_else(|e| panic!("Failed to parse {}: {}", path.display(), e));
+            if let Some(ref states) = spec.states {
+                states
+                    .validate()
+                    .unwrap_or_else(|e| panic!("Validation failed for {}: {}", path.display(), e));
+            }
+        }
+    }
 }

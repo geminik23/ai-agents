@@ -1,0 +1,182 @@
+name: LifecycleAgent
+version: "1.0.0"
+description: "State lifecycle hooks: on_enter, on_exit, on_reenter"
+
+# State lifecycle hooks example.
+#
+# This example shows how lifecycle actions run when a state is entered, left, or entered again later in the workflow.
+#
+# Flow: intake -> drafting -> review -> done
+#                  -> drafting (revise)
+#                  -> retry_review -> drafting (retry with cooldown)
+#
+# The main revise path stays simple so on_reenter is easy to observe.
+# A secondary retry path includes cooldown_turns so the file can also show how cooldown reduces rapid bouncing between states.
+system_prompt: |
+  You are a writing assistant.
+  Help the user create and refine a short piece of writing.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# Writing workflow with lifecycle hooks.
+#
+# What this example demonstrates:
+# - on_enter: first entry into drafting sets draft_version=1
+# - on_reenter: returning to drafting sets draft_version=2
+# - on_exit: leaving drafting records that a draft was produced
+# - cooldown_turns: applied only on the retry_review -> drafting path
+#
+# What to customize first:
+# - the intake prompt if you want a different writing task
+# - the drafting prompt if you want a different writing style
+# - the review action labels if you want different reply commands
+states:
+  initial: intake
+  states:
+    intake:
+      prompt: |
+        Ask the user what kind of short writing they want.
+        Examples: an email, an announcement, a summary, or a short paragraph.
+        Ask for the topic, tone, and any must-include points.
+      on_enter:
+        - set_context:
+            phase: "intake"
+      on_exit:
+        - set_context:
+            intake_completed: true
+      transitions:
+        - to: drafting
+          when: "User has clearly described what they want written"
+
+    drafting:
+      prompt: |
+        {% if context.draft_version is defined and context.draft_version > 1 %}
+        This is revision round {{ context.draft_version }}.
+        Rewrite the draft based on the user's latest revision request.
+        Make a noticeably improved version instead of repeating the previous draft.
+        {% else %}
+        Write the first draft based on the user's request.
+        Keep it clear, polished, and easy to review.
+        {% endif %}
+      # First entry sets the initial draft version.
+      on_enter:
+        - set_context:
+            phase: "drafting"
+            draft_version: 1
+      # Returning later uses on_reenter so the prompt can visibly change.
+      on_reenter:
+        - set_context:
+            phase: "drafting"
+            draft_version: 2
+      on_exit:
+        - set_context:
+            drafting_completed: true
+      transitions:
+        - to: review
+          when: "A draft is ready for the user to review"
+
+    review:
+      prompt: |
+        Present the current draft for review.
+
+        Then ask the user to reply in one of these explicit forms:
+        - "approve" -> finish the workflow
+        - "revise: <change request>" -> revise the draft now
+        - "retry: <change request>" -> request another rework through the retry path
+
+        Make the instruction clear and short.
+        If the user's intent is unclear, ask them to use one of the explicit forms above.
+      on_enter:
+        - set_context:
+            phase: "review"
+            review.action: null
+      # Extract a normalized action label from the user's reply.
+      # The guards below use this extracted value for deterministic routing.
+      extract:
+        - key: review.action
+          description: |
+            Classify the user's reply as one of these labels only:
+            - approve: if the user accepts the draft, says it is final, says no more changes are needed, says it's okay as-is, or says there is nothing to fix
+            - revise: if the user explicitly asks to revise, add, rewrite, update, change, improve, remove, or clearly requests another draft
+            - retry: if the user explicitly says retry and asks for another rework through the retry path
+            - __NONE__: if the intent is unclear
+
+            Return ONLY one of:
+            approve
+            revise
+            retry
+            __NONE__
+      transitions:
+        - to: done
+          guard:
+            context:
+              review.action:
+                eq: approve
+        - to: drafting
+          guard:
+            context:
+              review.action:
+                eq: revise
+        - to: retry_review
+          guard:
+            context:
+              review.action:
+                eq: retry
+
+    retry_review:
+      prompt: |
+        The user wants another rework cycle.
+        Briefly confirm that you understood the retry request.
+        Then ask them to clearly state the one change they want most.
+      on_enter:
+        - set_context:
+            phase: "retry_review"
+      transitions:
+        # cooldown_turns is based on recent transition history, not message count.
+        # This path is secondary, so cooldown can be demonstrated without blocking the main revise -> drafting path.
+        - to: drafting
+          when: "User clearly provides a retry instruction or asks for another rework"
+          cooldown_turns: 2
+
+    done:
+      prompt: |
+        The writing task is complete.
+        Summarize what was created and confirm that the final draft is ready.
+        Do not restart the workflow unless the user clearly asks for a new writing task.
+      on_enter:
+        - set_context:
+            phase: "done"
+            completed: true
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+# Built-in datetime context refreshed every turn.
+# The prompt can access it with {{ context.time.* }} if needed.
+context:
+  time:
+    type: builtin
+    source: datetime
+    refresh: per_turn
+
+metadata:
+  cli:
+    welcome: "=== State Lifecycle Demo ==="
+    hints:
+      - "Try: Write a short announcement about our Q1 sales meeting"
+      - "Then try: revise: make the opening sentence more formal"
+      - "Then try: approve"
+      - "Optional cooldown path: retry: rewrite it again from a different angle"
+      - "Notice how the drafting prompt changes on return visits"
+    show_state: true

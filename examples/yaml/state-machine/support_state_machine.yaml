@@ -1,26 +1,50 @@
-name: "{{ agent_name | default('CustomerSupportAgent') }}"
-version: "{{ agent_version | default('1.0.0') }}"
+name: "CustomerSupportAgent"
+version: "1.0.0"
 description: "A multi-branch customer support agent with state machine routing"
 
+# Full customer support state machine example.
+#
+# This example shows how to separate a support workflow into multiple states:
+# - greeting routes the request into the right branch
+# - technical_support uses hierarchical sub-states
+# - global_transitions handle escalation from any state
+# - fallback sends unclear conversations to a clarification state
+#
+# Flow: user input -> greeting -> selected support branch -> resolution -> closing
+#                  -> frustrated user -> escalation
+#                  -> 3 unclear turns -> confused -> re-route
 system_prompt: |
   You are a friendly and professional customer support agent.
   You help customers with technical issues, order inquiries, product questions, and more.
   Always be empathetic, clear, and solution-oriented.
   If the customer seems frustrated, acknowledge their feelings and escalate if needed.
 
-llm:
-  provider: "{{ llm_provider | default('openai') }}"
-  model: "{{ llm_model | default('gpt-4.1-nano') }}"
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
 
+llm:
+  default: default
+  router: router
+
+# State machine with global escalation, fallback clarification, and one hierarchical branch.
+# Customize this block first if you want to change the support categories or routing behavior.
 states:
   initial: greeting
   fallback: confused
   max_no_transition: 3
+
+  # Global transitions are checked from any state.
+  # This is useful for urgent escalation patterns such as anger or manager requests.
   global_transitions:
     - to: escalation
       when: "User is very frustrated, angry, or explicitly asks for a manager/supervisor"
-      auto: true
       priority: 100
+
   states:
     greeting:
       prompt: |
@@ -30,14 +54,14 @@ states:
       transitions:
         - to: technical_support
           when: "User mentions technical issues like login problems, errors, bugs, account access, or system issues"
-          auto: true
         - to: order_support
           when: "User asks about orders, shipping, delivery, tracking, returns, or refunds"
-          auto: true
         - to: product_inquiry
           when: "User asks about products, recommendations, features, pricing, or specifications"
-          auto: true
 
+    # Hierarchical technical support branch.
+    # Entering technical_support automatically enters its initial sub-state.
+    # Use ^ to escape back to a root-level state.
     technical_support:
       prompt: |
         You are now helping with a technical issue.
@@ -54,10 +78,9 @@ states:
           transitions:
             - to: proposing_solution
               when: "Enough information has been gathered to propose a solution"
-              auto: true
             - to: ^escalation
               when: "The issue is too complex or the user is frustrated"
-              auto: true
+
         proposing_solution:
           prompt: |
             Based on the information gathered, propose a solution or troubleshooting steps.
@@ -65,13 +88,10 @@ states:
           transitions:
             - to: ^closing
               when: "The user confirms the issue is resolved or thanks the agent"
-              auto: true
             - to: gathering_info
               when: "The solution didn't work, need to gather more information"
-              auto: true
             - to: ^escalation
               when: "Multiple solutions have failed or user requests escalation"
-              auto: true
 
     order_support:
       prompt: |
@@ -81,10 +101,8 @@ states:
       transitions:
         - to: closing
           when: "The order inquiry is resolved or the user is satisfied"
-          auto: true
         - to: escalation
           when: "The issue requires special handling or the user is unhappy"
-          auto: true
 
     product_inquiry:
       prompt: |
@@ -94,10 +112,8 @@ states:
       transitions:
         - to: closing
           when: "The user has the information they need or is satisfied"
-          auto: true
         - to: order_support
           when: "The user wants to check on an existing order"
-          auto: true
 
     escalation:
       prompt: |
@@ -108,8 +124,10 @@ states:
       transitions:
         - to: closing
           when: "The user feels heard and the escalation is acknowledged"
-          auto: true
 
+    # Fallback state reached after max_no_transition consecutive misses.
+    # Use this pattern when you want the agent to recover from vague or unclear conversations
+    # instead of staying stuck in the current branch.
     confused:
       prompt: |
         You're not sure what the customer needs.
@@ -118,13 +136,10 @@ states:
       transitions:
         - to: technical_support
           when: "User mentions technical issues like login problems, errors, bugs, account access, or system issues"
-          auto: true
         - to: order_support
           when: "User asks about orders, shipping, delivery, tracking, returns, or refunds"
-          auto: true
         - to: product_inquiry
           when: "User asks about products, recommendations, features, pricing, or specifications"
-          auto: true
 
     closing:
       prompt: |
@@ -135,7 +150,6 @@ states:
       transitions:
         - to: greeting
           when: "The user has another question or issue"
-          auto: true
 
 memory:
   type: in-memory
@@ -143,8 +157,9 @@ memory:
 
 max_iterations: 10
 
+# This example intentionally does not use tools.
+# Keep tools empty so the file stays focused on state routing behavior only.
 tools: []
-skills: []
 
 metadata:
   template: support_state_machine
@@ -156,8 +171,10 @@ metadata:
   cli:
     welcome: "=== State Machine Agent Demo ==="
     hints:
-      - "Try: I can't log in to my account"
-      - "Try: Where is my order?"
-      - "Try: I want a refund"
-      - "Try: What laptop do you recommend?"
+      - "Try: I can't log in to my account (-> technical_support)"
+      - "Try: Where is my order? (-> order_support)"
+      - "Try: I want a refund (-> order_support)"
+      - "Try: What laptop do you recommend? (-> product_inquiry)"
+      - "Try: I'm furious, get me a manager! (-> global escalation)"
+      - "Try 3 vague replies in a row to trigger the fallback confused state"
     show_state: true

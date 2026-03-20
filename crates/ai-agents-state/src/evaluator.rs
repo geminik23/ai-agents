@@ -247,10 +247,55 @@ fn match_value(value: Option<&Value>, matcher: &ContextMatcher) -> bool {
     }
 }
 
+/// Compare with type coercion: context extractors store all values as strings, but YAML guards may specify booleans (`eq: true`) or numbers (`eq: 42`).
+/// Coerce the string to the expected type before comparing.
+fn values_equal_coerced(value: &Value, expected: &Value) -> bool {
+    if value == expected {
+        return true;
+    }
+    // String value vs non-string expected: coerce the string
+    if let Some(s) = value.as_str() {
+        match expected {
+            Value::Bool(b) => match s {
+                "true" => return *b,
+                "false" => return !*b,
+                _ => {}
+            },
+            Value::Number(n) => {
+                if let Ok(parsed) = s.parse::<f64>() {
+                    if let Some(expected_f) = n.as_f64() {
+                        return (parsed - expected_f).abs() < f64::EPSILON;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Non-string value vs string expected: coerce the other way
+    if let Some(s) = expected.as_str() {
+        match value {
+            Value::Bool(b) => match s {
+                "true" => return *b,
+                "false" => return !*b,
+                _ => {}
+            },
+            Value::Number(n) => {
+                if let Ok(parsed) = s.parse::<f64>() {
+                    if let Some(val_f) = n.as_f64() {
+                        return (parsed - val_f).abs() < f64::EPSILON;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn compare_value(value: &Value, op: &CompareOp) -> bool {
     match op {
-        CompareOp::Eq(expected) => value == expected,
-        CompareOp::Neq(expected) => value != expected,
+        CompareOp::Eq(expected) => values_equal_coerced(value, expected),
+        CompareOp::Neq(expected) => !values_equal_coerced(value, expected),
         CompareOp::Gt(n) => value.as_f64().map(|v| v > *n).unwrap_or(false),
         CompareOp::Gte(n) => value.as_f64().map(|v| v >= *n).unwrap_or(false),
         CompareOp::Lt(n) => value.as_f64().map(|v| v < *n).unwrap_or(false),

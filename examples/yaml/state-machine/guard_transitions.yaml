@@ -1,0 +1,156 @@
+name: GuardTransitionAgent
+version: "1.0.0"
+description: "Guard-based transitions for deterministic routing"
+
+# Deterministic transitions using context guards - no LLM evaluation needed.
+#
+# Guards are checked before `when` conditions. When a guard's context matcher evaluates to true, the transition fires immediately without an LLM call.
+# This is useful for data-collection flows where you need reliable routing based on whether specific values exist in context.
+#
+# Each state uses `extract:` to pull structured data from user input into context via LLM.
+# Once a value is stored, the guard fires on the next turn — deterministic, no LLM transition eval.
+#
+# First pass: collect_name -> collect_email -> verify -> complete (guards only).
+# Correction: verify -> correct_name -> verify  (skips email — it's unchanged).
+#             verify -> correct_email -> verify (skips name — it's unchanged).
+#
+# Correction states clear their context value on entry so the old value doesn't make the guard fire before the user provides a new one.
+#
+# Flow: user input -> LLM response -> extract context values -> check guards -> transition or stay
+
+system_prompt: |
+  You are a form assistant. Collect user information step by step.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# Runtime context with defaults for CLI use.
+# In a Rust host, override via `agent.set_context("user", json!({...}))`.
+context:
+  user:
+    type: runtime
+    default:
+      verified: false
+
+# Linear data-collection flow with correction loops.
+# First-pass states (collect_name, collect_email) don't clear context on entry - the values don't exist yet, so the guards won't fire prematurely.
+# Correction states (correct_name, correct_email) DO clear the stale value on entry so the user gets a chance to provide a new one before the guard fires again.
+states:
+  initial: collect_name
+  states:
+    collect_name:
+      prompt: |
+        Ask the user for their name. Be friendly and concise.
+      extract:
+        - key: user.name
+          description: "The user's name"
+      transitions:
+        - to: collect_email
+          guard:
+            context:
+              user.name:
+                exists: true
+
+    collect_email:
+      prompt: |
+        The user's name is {{ context.user.name }}. Now ask for their email address.
+      extract:
+        - key: user.email
+          description: "The user's email address"
+      transitions:
+        - to: verify
+          guard:
+            context:
+              user.email:
+                exists: true
+
+    verify:
+      prompt: |
+        Always start by showing the full summary of ALL collected information:
+
+        Name: {{ context.user.name }}
+        Email: {{ context.user.email }}
+
+        Then ask the user to confirm that ALL the information above is correct.
+        Do not ask about individual fields - ask about the complete set.
+        If the user confirms, great. If not, ask which field they want to change.
+      on_enter:
+        - set_context:
+            user.verified: false
+      extract:
+        - key: user.verified
+          description: "Whether the user confirmed the information is correct (true or false)"
+      transitions:
+        - to: complete
+          guard:
+            context:
+              user.verified:
+                eq: true
+          priority: 10
+        - to: correct_name
+          when: "User wants to change their name"
+        - to: correct_email
+          when: "User wants to change their email"
+
+    # Correction states: fix one field, then go straight back to verify.
+    # The other field is still valid — no need to re-collect it.
+    correct_name:
+      prompt: |
+        The user wants to change their name (currently {{ context.user.name }}).
+        Ask for the new name.
+      on_enter:
+        - set_context:
+            user.name: null
+      extract:
+        - key: user.name
+          description: "The user's new name"
+      transitions:
+        - to: verify
+          guard:
+            context:
+              user.name:
+                exists: true
+
+    correct_email:
+      prompt: |
+        The user wants to change their email (currently {{ context.user.email }}).
+        Ask for the new email address.
+      on_enter:
+        - set_context:
+            user.email: null
+      extract:
+        - key: user.email
+          description: "The user's new email address"
+      transitions:
+        - to: verify
+          guard:
+            context:
+              user.email:
+                exists: true
+
+    complete:
+      prompt: |
+        The user's information is verified. Thank them by name ({{ context.user.name }}) and let them know registration is complete.
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Guard Transition Demo ==="
+    hints:
+      - "Guards fire instantly when context values match — no LLM call needed"
+      - "Try: My name is Alice"
+      - "Try: My email is alice@example.com"
+      - "At verify, try: I want to change my name"
+    show_state: true

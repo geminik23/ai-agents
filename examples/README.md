@@ -87,15 +87,25 @@ cargo run -p ai-agents-cli -- run examples/yaml/skills/skill_agent.yaml
 
 ### `yaml/state-machine/`
 
-Hierarchical state machine examples.
+Declarative state machine examples - from minimal transitions to production-grade multi-branch routing.
 
 | File | Description |
 |------|-------------|
-| `support_state_machine.yaml` | Customer support flow with greeting, technical, order, product, escalation, and fallback states |
+| `two_state_greeting.yaml` | Minimal: 2 states, 1 transition each |
+| `guard_transitions.yaml` | Context-based guard transitions (deterministic, no LLM call) |
+| `nested_states.yaml` | Hierarchical sub-states with `^` escape and turn timeout |
+| `state_with_tools.yaml` | Per-state tool scoping (`tools: []` vs inherit) |
+| `state_lifecycle.yaml` | `on_enter` / `on_exit` / `on_reenter` actions in a draft-review workflow, plus a secondary retry path with cooldown |
+| `support_state_machine.yaml` | Full customer support workflow with hierarchical technical support, global escalation, and fallback clarification |
 
-Example:
+Examples:
 
 ```sh
+cargo run -p ai-agents-cli -- run examples/yaml/state-machine/two_state_greeting.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/state-machine/guard_transitions.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/state-machine/nested_states.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/state-machine/state_with_tools.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/state-machine/state_lifecycle.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/state-machine/support_state_machine.yaml
 ```
 

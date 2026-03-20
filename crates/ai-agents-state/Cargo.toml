@@ -11,6 +11,7 @@ categories = ["asynchronous"]
 
 [dependencies]
 ai-agents-core = { workspace = true }
+ai-agents-process = { workspace = true }
 ai-agents-reasoning = { workspace = true }
 ai-agents-disambiguation = { workspace = true }
 serde = { workspace = true }

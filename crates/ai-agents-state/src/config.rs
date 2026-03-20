@@ -1,5 +1,6 @@
 use ai_agents_core::{AgentError, Result};
 use ai_agents_disambiguation::StateDisambiguationOverride;
+use ai_agents_process::ProcessConfig;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,8 +85,9 @@ pub struct StateDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub regenerate_on_enter: Option<bool>,
 
+    /// Context extractors: pull structured data from user input into context.
     #[serde(default)]
-    pub extract: Option<ContextExtractor>,
+    pub extract: Vec<ContextExtractor>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<ReasoningConfig>,
@@ -95,6 +97,10 @@ pub struct StateDefinition {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disambiguation: Option<StateDisambiguationOverride>,
+
+    /// Per-state process pipeline override (replaces agent-level pipeline for this state).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<ProcessConfig>,
 }
 
 fn default_inherit_parent() -> bool {
@@ -103,6 +109,10 @@ fn default_inherit_parent() -> bool {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_extractor_llm() -> String {
+    "router".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,9 +175,13 @@ fn default_threshold() -> f32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ContextMatcher {
-    Exact(Value),
-    Compare(CompareOp),
+    // Order matters for serde untagged: structured variants must come before
+    // Exact(Value) because Value matches any valid JSON — including objects
+    // like `{ "exists": true }` or `{ "eq": "admin" }` that should be parsed
+    // as Exists or Compare instead.
     Exists { exists: bool },
+    Compare(CompareOp),
+    Exact(Value),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -265,13 +279,27 @@ pub enum StateAction {
     },
 }
 
+/// Extract structured data from conversation into context via LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextExtractor {
+    /// Context key to store the extracted value.
     pub key: String,
+
+    /// Short description of what to extract (LLM-based).
     #[serde(default)]
-    pub pattern: Option<String>,
+    pub description: Option<String>,
+
+    /// Custom LLM extraction prompt (takes precedence over `description`).
     #[serde(default)]
     pub llm_extract: Option<String>,
+
+    /// LLM alias for extraction (default: "router").
+    #[serde(default = "default_extractor_llm")]
+    pub llm: String,
+
+    /// If true, extraction failure is logged as a warning.
+    #[serde(default)]
+    pub required: bool,
 }
 
 impl StateConfig {
@@ -916,5 +944,77 @@ states:
 
         let greeting = config.get_state("greeting").unwrap();
         assert!(greeting.disambiguation.is_none());
+    }
+
+    #[test]
+    fn test_context_extractor_vec_deserialize() {
+        let yaml = r#"
+initial: a
+states:
+  a:
+    extract:
+      - key: user_email
+        description: "The user's email address"
+      - key: order_id
+        llm_extract: "Extract the order ID"
+        required: true
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let state = config.get_state("a").unwrap();
+        assert_eq!(state.extract.len(), 2);
+        assert_eq!(state.extract[0].key, "user_email");
+        assert_eq!(
+            state.extract[0].description.as_deref(),
+            Some("The user's email address")
+        );
+        assert!(!state.extract[0].required);
+        assert_eq!(state.extract[0].llm, "router");
+        assert_eq!(state.extract[1].key, "order_id");
+        assert!(state.extract[1].required);
+        assert!(state.extract[1].llm_extract.is_some());
+    }
+
+    #[test]
+    fn test_context_extractor_default_empty() {
+        let yaml = r#"
+initial: a
+states:
+  a:
+    prompt: "Hello"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let state = config.get_state("a").unwrap();
+        assert!(state.extract.is_empty());
+    }
+
+    #[test]
+    fn test_state_process_override_deserialize() {
+        let yaml = r#"
+initial: a
+states:
+  a:
+    process:
+      input:
+        - type: normalize
+          config:
+            trim: true
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let state = config.get_state("a").unwrap();
+        assert!(state.process.is_some());
+        assert_eq!(state.process.as_ref().unwrap().input.len(), 1);
+    }
+
+    #[test]
+    fn test_state_process_default_none() {
+        let yaml = r#"
+initial: a
+states:
+  a:
+    prompt: "Hello"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let state = config.get_state("a").unwrap();
+        assert!(state.process.is_none());
     }
 }

@@ -1499,7 +1499,11 @@ OVERALL: PASS/FAIL"#,
         Ok(EvaluationResult::new(overall_pass, confidence).with_criteria(criteria_results))
     }
 
+    /// Process input through the pipeline (state-level override or agent-level).
     async fn process_input(&self, input: &str) -> Result<ProcessData> {
+        if let Some(processor) = self.get_state_process_processor() {
+            return processor.process_input(input).await;
+        }
         if let Some(ref processor) = self.process_processor {
             processor.process_input(input).await
         } else {
@@ -1507,16 +1511,32 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
+    /// Process output through the pipeline (state-level override or agent-level).
     async fn process_output(
         &self,
         output: &str,
         input_context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<ProcessData> {
+        if let Some(processor) = self.get_state_process_processor() {
+            return processor.process_output(output, input_context).await;
+        }
         if let Some(ref processor) = self.process_processor {
             processor.process_output(output, input_context).await
         } else {
             Ok(ProcessData::new(output))
         }
+    }
+
+    /// Build a ProcessProcessor from the current state's process config, if any.
+    fn get_state_process_processor(&self) -> Option<ProcessProcessor> {
+        let sm = self.state_machine.as_ref()?;
+        let def = sm.current_definition()?;
+        let config = def.process.as_ref()?;
+        let mut processor = ProcessProcessor::new(config.clone());
+        if let Some(ref registry) = Some(self.llm_registry.clone()) {
+            processor = processor.with_llm_registry(registry.clone());
+        }
+        Some(processor)
     }
 
     async fn check_turn_timeout(&self) -> Result<()> {
@@ -1763,6 +1783,67 @@ OVERALL: PASS/FAIL"#,
                             warn!(error = %e, "State action: LLM not found for prompt");
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// Run context extractors for the current state on the user's input.
+    async fn run_context_extractors(&self, user_message: &str) {
+        let extractors = match &self.state_machine {
+            Some(sm) => match sm.current_definition() {
+                Some(def) if !def.extract.is_empty() => def.extract.clone(),
+                _ => return,
+            },
+            None => return,
+        };
+
+        for extractor in &extractors {
+            let prompt = if let Some(ref custom) = extractor.llm_extract {
+                format!(
+                    "User message:\n\"{}\"\n\nInstruction:\n{}",
+                    user_message, custom
+                )
+            } else if let Some(ref desc) = extractor.description {
+                format!(
+                    "From the following message, extract: {}\n\n\
+                     Message: \"{}\"\n\n\
+                     If the information is present, return ONLY the extracted value.\n\
+                     If NOT present, return exactly: __NONE__",
+                    desc, user_message
+                )
+            } else {
+                continue;
+            };
+
+            let llm = match self
+                .llm_registry
+                .get(&extractor.llm)
+                .or_else(|_| self.llm_registry.get("router"))
+                .or_else(|_| self.llm_registry.get("default"))
+            {
+                Ok(llm) => llm,
+                Err(e) => {
+                    warn!(key = %extractor.key, error = %e, "Extractor LLM not found");
+                    continue;
+                }
+            };
+
+            let messages = vec![ChatMessage::user(&prompt)];
+            match llm.complete(&messages, None).await {
+                Ok(response) => {
+                    let value = response.content.trim().to_string();
+                    if value != "__NONE__" && !value.is_empty() {
+                        let _ = self
+                            .context_manager
+                            .update(&extractor.key, serde_json::Value::String(value.clone()));
+                        debug!(key = %extractor.key, value = %value, "Context extracted");
+                    } else if extractor.required {
+                        warn!(key = %extractor.key, "Required extraction returned no value");
+                    }
+                }
+                Err(e) => {
+                    warn!(key = %extractor.key, error = %e, "Context extraction LLM call failed");
                 }
             }
         }
@@ -2772,6 +2853,10 @@ Respond in JSON format:
         self.check_memory_compression().await?;
 
         self.increment_turn();
+
+        // Run context extractors so guards can check freshly-extracted values
+        self.run_context_extractors(processed_input).await;
+
         let transitioned = self.evaluate_transitions(processed_input, &content).await?;
 
         if !transitioned {
