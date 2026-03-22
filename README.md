@@ -81,8 +81,6 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 ## Roadmap
 
-> Features may be implemented in any order based on priority and need.
-
 | Feature | Description | Status |
 |---------|-------------|--------|
 | Advanced Memory | CompactingMemory, token budgeting, SQLite/Redis storage | ✅ Done |
@@ -91,24 +89,30 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 | Reasoning & Reflection | Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation | ✅ Done |
 | Intent Disambiguation | LLM-based ambiguity detection and clarification | ✅ Done |
 | MCP Integration | Model Context Protocol tool ecosystem | ✅ Done |
-| Hot Reload | Live YAML configuration updates without restart | Planned |
 | Dynamic Agent Spawning | Runtime agent creation, registry, inter-agent messaging | Planned |
 | Multi-Agent Orchestration | Supervisor, pipeline, crew patterns | Planned |
-| A2A Protocol | Agent-to-Agent communication and delegation | Planned |
+| Agent Persona | Structured, persistent, evolvable agent identity | Planned |
+| Session Management | Cross-session user memory, key facts extraction | Planned |
+| Relationship Memory | Per-actor trust, sentiment, rapport, and interaction history | Planned |
+| Episodic Memory | Structured event memory with participants, significance, and source tracking | Planned |
+| Knowledge Scoping | Source-based knowledge boundaries and access control | Planned |
+| VectorDB Tool | Embedding-based retrieval for RAG and semantic memory search | Planned |
+| Knowledge Base / RAG | Document ingestion, chunking, retrieval pipeline | Planned |
+| Conversation Style Modifiers | Dynamic tone, formality, verbosity adaptation | Planned |
+| Background Tasks & Scheduling | Cron-based, event-driven, interval tasks | Planned |
+| Shared Memory | Group-level shared memory across multiple agents | Planned |
+| Memory Dynamics | Salience scoring, decay, and context-aware retrieval | Planned |
 | Agent Composition | Multi-agent patterns (supervisor, pipeline, debate) | Planned |
+| Conversation Scripts | Declarative guided flows with LLM extraction | Planned |
+| Budget Control | Token/cost limits, LLM switching, cost prediction | Planned |
+| A2A Protocol | Agent-to-Agent communication and delegation | Planned |
 | Evaluation Framework | Dataset runner, metrics, LLM judge | Planned |
 | Observability & Tracing | Per-call latency, token usage, cost tracking | Planned |
-| Conversation Scripts | Declarative guided flows with LLM extraction | Planned |
 | Custom Reasoning Prompts | Domain/language-specific reasoning instructions | Planned |
 | Reasoning Depth Control | Auto shallow/standard/deep with resource limits | Planned |
-| Conversation Style Modifiers | Dynamic tone, formality, verbosity adaptation | Planned |
-| Session Management | Cross-session user memory, key facts extraction | Planned |
-| VectorDB Tool | Embedding-based retrieval for RAG | Planned |
-| Background Tasks & Scheduling | Cron-based, event-driven, interval tasks | Planned |
-| Knowledge Base / RAG | Document ingestion, chunking, retrieval pipeline | Planned |
+| Hot Reload | Live YAML configuration updates without restart | Planned |
 | Code Interpreter | Sandboxed Python/JS execution with templates | Planned |
 | Semantic Caching | Embedding-based response caching | Planned |
-| Budget Control | Token/cost limits, LLM switching, cost prediction | Planned |
 
 ## Install
 
