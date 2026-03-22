@@ -383,7 +383,6 @@ pub mod tool_security {
 
 pub mod tools {
     pub use ai_agents_core::{Tool, ToolInfo, ToolResult};
-    pub use ai_agents_tools::HttpTool;
     pub use ai_agents_tools::{
         CalculatorTool, ConditionEvaluator, DateTimeTool, EchoTool, EvaluationContext, FileTool,
         JsonTool, LLMGetter, MathTool, ProviderHealth, RandomTool, SimpleLLMGetter, TemplateTool,
@@ -391,6 +390,7 @@ pub mod tools {
         ToolProvider, ToolProviderError, ToolProviderType, ToolRegistry, TrustLevel,
         create_builtin_registry,
     };
+    pub use ai_agents_tools::{HttpTool, generate_schema};
 }
 
 /// MCP (Model Context Protocol) integration types.

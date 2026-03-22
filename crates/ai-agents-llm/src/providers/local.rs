@@ -144,14 +144,21 @@ fn messages_to_prompt(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
 
     for msg in messages {
-        let role_prefix = match msg.role {
-            Role::System => "System: ",
-            Role::User => "User: ",
-            Role::Assistant => "Assistant: ",
-            Role::Function => "Function: ",
-            Role::Tool => "Tool: ",
-        };
-        prompt.push_str(role_prefix);
+        match msg.role {
+            Role::Function | Role::Tool => {
+                let name = msg.name.as_deref().unwrap_or("tool");
+                prompt.push_str(&format!("[{} result]: ", name));
+            }
+            _ => {
+                let prefix = match msg.role {
+                    Role::System => "System: ",
+                    Role::User => "User: ",
+                    Role::Assistant => "Assistant: ",
+                    _ => unreachable!(),
+                };
+                prompt.push_str(prefix);
+            }
+        }
         prompt.push_str(&msg.content);
         prompt.push('\n');
     }

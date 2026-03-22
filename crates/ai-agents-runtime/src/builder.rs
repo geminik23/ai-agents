@@ -271,6 +271,22 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Auto-configure recovery, tool security, process pipeline, and built-in tools from the spec.
+    ///
+    /// **Call order matters for tools**: this method only registers built-in tools when `self.tools` is `None`.
+    /// If `.tool()` or `.tools()` was called before this, `self.tools` is already `Some` and built-ins will NOT be added.
+    ///
+    /// Correct:
+    /// ```ignore
+    /// .auto_configure_features()?   // registers built-ins (self.tools was None)
+    /// .tool(Arc::new(MyTool))       // adds MyTool into the builtin registry
+    /// ```
+    ///
+    /// Wrong — built-ins are lost:
+    /// ```ignore
+    /// .tool(Arc::new(MyTool))       // self.tools = Some(empty + MyTool)
+    /// .auto_configure_features()?   // self.tools is Some -> skips builtin registration
+    /// ```
     pub fn auto_configure_features(mut self) -> Result<Self> {
         if let Some(ref spec) = self.spec {
             self.recovery_manager = Some(RecoveryManager::new(spec.error_recovery.clone()));
@@ -679,6 +695,45 @@ impl AgentBuilder {
                 ids
             })
         });
+
+        // Validate: every non-MCP tool declared in the YAML spec must exist in the registry.
+        // MCP tools are excluded because they are registered via auto_configure_mcp() which
+        // may or may not have been called (and MCP view names are synthetic).
+        if let Some(ref ids) = declared_tool_ids {
+            let mcp_names: Vec<String> = self
+                .spec
+                .as_ref()
+                .and_then(|s| s.tools.as_ref())
+                .map(|tools| {
+                    let mut names = Vec::new();
+                    for entry in tools {
+                        if entry.is_mcp() {
+                            names.push(entry.name().to_string());
+                            if let Some(cfg) = entry.to_mcp_config() {
+                                names.extend(cfg.views.keys().cloned());
+                            }
+                        }
+                    }
+                    names
+                })
+                .unwrap_or_default();
+
+            let missing: Vec<&str> = ids
+                .iter()
+                .filter(|id| !mcp_names.contains(id))
+                .filter(|id| tools_arc.get(id).is_none())
+                .map(|s| s.as_str())
+                .collect();
+
+            if !missing.is_empty() {
+                return Err(AgentError::Config(format!(
+                    "Tools declared in YAML but not registered: [{}]. \
+                     Register them via .tool(Arc::new(...)) before .build(), \
+                     or remove them from the YAML tools: list.",
+                    missing.join(", ")
+                )));
+            }
+        }
 
         let mut agent = RuntimeAgent::new(
             info,
@@ -1319,5 +1374,120 @@ llm:
         let builder = AgentBuilder::from_yaml(yaml).unwrap();
         let spec = builder.spec.as_ref().unwrap();
         assert!(!spec.has_storage());
+    }
+
+    #[test]
+    fn test_build_fails_on_missing_declared_tool() {
+        use ai_agents_llm::mock::MockLLMProvider;
+
+        let yaml = r#"
+name: ToolAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+tools:
+  - name: lookup_order
+  - name: calculator
+"#;
+        let llm = Arc::new(MockLLMProvider::new("test"));
+        let result = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(llm)
+            .auto_configure_features()
+            .unwrap()
+            // NOT registering lookup_order — should fail
+            .build();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("lookup_order"),
+            "error should name the missing tool: {}",
+            err
+        );
+        // calculator is built-in, so it should NOT appear in the error
+        assert!(
+            !err.contains("calculator"),
+            "calculator is registered, should not be missing: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_build_succeeds_when_declared_tool_is_registered() {
+        use ai_agents_core::Tool;
+        use ai_agents_llm::mock::MockLLMProvider;
+
+        struct FakeTool;
+        #[async_trait::async_trait]
+        impl Tool for FakeTool {
+            fn id(&self) -> &str {
+                "lookup_order"
+            }
+            fn name(&self) -> &str {
+                "Order Lookup"
+            }
+            fn description(&self) -> &str {
+                "Look up an order"
+            }
+            fn input_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> ai_agents_core::ToolResult {
+                ai_agents_core::ToolResult::ok("ok")
+            }
+        }
+
+        let yaml = r#"
+name: ToolAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+tools:
+  - name: lookup_order
+  - name: calculator
+"#;
+        let llm = Arc::new(MockLLMProvider::new("test"));
+        let result = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(llm)
+            .auto_configure_features()
+            .unwrap()
+            .tool(Arc::new(FakeTool))
+            .build();
+
+        assert!(
+            result.is_ok(),
+            "build should succeed when all declared tools are registered: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_build_succeeds_with_no_tools_declared() {
+        use ai_agents_llm::mock::MockLLMProvider;
+
+        let yaml = r#"
+name: SimpleAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let llm = Arc::new(MockLLMProvider::new("test"));
+        let result = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(llm)
+            .auto_configure_features()
+            .unwrap()
+            .build();
+
+        assert!(
+            result.is_ok(),
+            "no tools: section means no validation needed: {:?}",
+            result.err()
+        );
     }
 }

@@ -9,6 +9,7 @@ members = [
     "rust/disambiguation",
     "rust/context",
     "rust/custom-llm",
+    "rust/custom-tools",
 ]
 
 [workspace.package]
@@ -28,3 +29,5 @@ serde_json = "1"
 async-trait = "0.1"
 parking_lot = "0.12"
 uuid = { version = "1", features = ["v4"] }
+schemars = "1.0"
+rand = "0.8"

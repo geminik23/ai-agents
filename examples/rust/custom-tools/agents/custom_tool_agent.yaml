@@ -1,0 +1,38 @@
+name: OrderSupportAgent
+version: "1.0.0"
+description: "Support agent with a Rust-implemented order lookup tool"
+
+# YAML agent with a Rust-implemented domain tool.
+#
+# The "lookup_order" tool has no built-in implementation.
+# The Rust binary registers it via .tool(Arc::new(OrderLookupTool)) before .build().
+# Built-in tools (calculator, datetime) are auto-registered by .auto_configure_features().
+
+system_prompt: |
+  You are an order support assistant.
+  When users ask about orders, use the order lookup tool.
+  Always provide the order status, items, and estimated delivery.
+
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+
+# "lookup_order" is registered from Rust code at build time.
+# "calculator" and "datetime" are built-in.
+tools:
+  - name: lookup_order
+  - name: calculator
+  - name: datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Order Support Agent ==="
+    hints:
+      - "Try: What's the status of order ORD-1234?"
+      - "Try: Look up order ORD-5678"
+      - "Try: When will ORD-1234 arrive?"
+    show_tools: true

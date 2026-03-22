@@ -1,0 +1,37 @@
+[package]
+name = "example-custom-tools"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+license.workspace = true
+
+[dependencies]
+ai-agents = { workspace = true }
+ai-agents-cli = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+
+[[bin]]
+name = "simple-tool"
+path = "src/simple_tool.rs"
+
+[[bin]]
+name = "schema-tool"
+path = "src/schema_tool.rs"
+
+[[bin]]
+name = "stateful-tool"
+path = "src/stateful_tool.rs"
+
+[[bin]]
+name = "yaml-custom-tool"
+path = "src/yaml_custom_tool.rs"
+
+[[bin]]
+name = "tool-provider"
+path = "src/tool_provider.rs"

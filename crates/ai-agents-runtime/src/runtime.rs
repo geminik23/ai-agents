@@ -2730,6 +2730,11 @@ Respond in JSON format:
             return Ok(ToolCallOutcome::TransitionFired);
         }
 
+        // Store the assistant's tool-call message so the LLM sees its own decision in conversation history. Without this, the model only sees the tool result and may repeat the same call.
+        self.memory
+            .add_message(ChatMessage::assistant(content))
+            .await?;
+
         let results = self.execute_tools_parallel(&tool_calls).await;
 
         for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
@@ -2904,6 +2909,10 @@ Respond in JSON format:
                     tools = tool_calls.len(),
                     "Post-transition tool call detected, executing"
                 );
+
+                self.memory
+                    .add_message(ChatMessage::assistant(&final_content))
+                    .await?;
 
                 let results = self.execute_tools_parallel(&tool_calls).await;
                 for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
@@ -3384,6 +3393,9 @@ Respond in JSON format:
                         }
                         continue;
                     }
+
+                    // Store the assistant's tool-call message (same as blocking path)
+                    let _ = self.memory.add_message(ChatMessage::assistant(&content)).await;
 
                     // Execute tools with streaming events
                     let results = self.execute_tools_parallel(&tool_calls).await;

@@ -372,6 +372,30 @@ LOCAL_LLM_BASE_URL=http://localhost:1234/v1 cargo run --bin openai-compatible
 cargo run --bin multi-provider
 ```
 
+### `rust/custom-tools/`
+
+custom tool examples - from a minimal `Tool` trait implementation to a full `ToolProvider` with dynamic discovery.
+
+| Binary | Description |
+|--------|-------------|
+| `simple-tool` | Minimal `Tool` trait - 5 methods, hand-written JSON Schema, `.tool()` registration |
+| `schema-tool` | Auto-generated `input_schema` via `schemars::JsonSchema` - no hand-written JSON |
+| `stateful-tool` | Tool with mutable state across calls using `RwLock` (interior mutability pattern) |
+| `yaml-custom-tool` | YAML-defined agent + Rust domain tool injection (recommended production pattern) |
+| `tool-provider` | Custom `ToolProvider` - dynamic tool discovery, health checks, multi-language aliases |
+
+Run from:
+
+```sh
+cd examples/rust/custom-tools
+
+cargo run --bin simple-tool
+cargo run --bin schema-tool
+cargo run --bin stateful-tool
+cargo run --bin yaml-custom-tool
+cargo run --bin tool-provider
+```
+
 ### `rust/disambiguation/`
 
 Advanced disambiguation demo with Rust-side startup options and metadata display.
