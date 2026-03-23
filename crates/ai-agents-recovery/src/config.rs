@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Top-level error recovery configuration for an agent.
+/// Controls retry, LLM failure handling, tool failure handling, and parse error handling.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ErrorRecoveryConfig {
     #[serde(default)]
@@ -13,6 +15,8 @@ pub struct ErrorRecoveryConfig {
     pub parsing: ParsingRecoveryConfig,
 }
 
+/// Retry policy: how many times to retry and with what backoff strategy.
+/// Applied to both LLM calls and tool calls unless overridden per-tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
     #[serde(default)]
@@ -41,6 +45,7 @@ impl Default for RetryConfig {
     }
 }
 
+/// Backoff timing configuration used between retry attempts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackoffConfig {
     #[serde(default = "default_backoff_type", rename = "type")]
@@ -64,6 +69,7 @@ impl Default for BackoffConfig {
     }
 }
 
+/// Strategy for computing the wait duration between successive retry attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BackoffType {
@@ -73,6 +79,7 @@ pub enum BackoffType {
     Exponential,
 }
 
+/// Classified error kinds used to decide whether a failure should be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorType {
@@ -87,6 +94,7 @@ pub enum ErrorType {
     ToolError,
 }
 
+/// LLM-specific recovery settings: what to do on total failure, rate limits, or context overflow.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LLMRecoveryConfig {
     #[serde(default)]
@@ -97,6 +105,7 @@ pub struct LLMRecoveryConfig {
     pub on_context_overflow: ContextOverflowAction,
 }
 
+/// Action to take when the primary LLM fails after all retries are exhausted.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum LLMFailureAction {
@@ -110,6 +119,7 @@ pub enum LLMFailureAction {
     },
 }
 
+/// Action to take when the LLM returns a rate-limit error.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RateLimitAction {
@@ -124,6 +134,7 @@ pub enum RateLimitAction {
     },
 }
 
+/// Action to take when the accumulated message history exceeds max_context_tokens.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ContextOverflowAction {
@@ -147,7 +158,7 @@ pub enum ContextOverflowAction {
     },
 }
 
-/// Filter configuration for message selection during summarization
+/// Selects which messages are passed to the summarizer during context compression.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FilterConfig {
@@ -157,6 +168,7 @@ pub enum FilterConfig {
     Custom { name: String },
 }
 
+/// Tool-level recovery: a default policy plus optional per-tool overrides.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolRecoveryConfig {
     #[serde(default)]
@@ -165,6 +177,7 @@ pub struct ToolRecoveryConfig {
     pub per_tool: HashMap<String, ToolRetryConfig>,
 }
 
+/// Retry and failure policy for a single tool (or the default for all tools).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolRetryConfig {
     #[serde(default)]
@@ -185,6 +198,7 @@ impl Default for ToolRetryConfig {
     }
 }
 
+/// Action to take when a tool call fails after all retries are exhausted.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ToolFailureAction {
@@ -196,6 +210,7 @@ pub enum ToolFailureAction {
     },
 }
 
+/// Recovery settings for malformed LLM output (invalid JSON, bad tool call format).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ParsingRecoveryConfig {
     #[serde(default)]
@@ -204,6 +219,7 @@ pub struct ParsingRecoveryConfig {
     pub on_invalid_tool_call: ParseErrorAction,
 }
 
+/// Action to take when the LLM response cannot be parsed as expected.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ParseErrorAction {

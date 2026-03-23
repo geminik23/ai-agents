@@ -1,0 +1,82 @@
+name: FallbackAgent
+version: "1.0.0"
+description: "Fall back to a different LLM when the primary fails"
+
+# LLM failover - transparent fallback when the primary LLM is unavailable.
+#
+# After all retries on the primary are exhausted, the framework switches to the named fallback LLM automatically. The user sees a normal response, not an error.
+#
+# Flow: LLM call -> retry N times -> still failing -> on_failure policy
+#                                                   -> fallback_llm: try backup
+#                                                   -> fallback_response: static msg
+#                                                   -> error: propagate (default)
+#
+system_prompt: |
+  You are a helpful assistant.
+  Answer questions clearly and concisely.
+
+# Two named LLMs: primary for normal use, fallback for resilience.
+# In production these would be different models or providers.
+# Here both use the same model so the example runs without extra setup.
+llms:
+  primary:
+    provider: openai
+    model: gpt-4.1-mini
+  fallback:
+    provider: openai
+    model: gpt-4.1-nano
+  # Real-world alternatives:
+  #
+  # Cloud + local fallback:
+  #   primary:   { provider: openai,  model: gpt-4.1-mini }
+  #   fallback:  { provider: ollama,  model: llama3 }
+
+llm:
+  default: primary
+
+# Try the primary up to 2 times total (1 retry) for transient errors.
+# For permanent errors (bad model name, auth failure) the fallback fires immediately after 1 attempt - no retries run for non-retriable errors.
+# The fallback itself is not retried - if it also fails, the error propagates.
+error_recovery:
+  default:
+    max_retries: 2
+    backoff:
+      type: exponential
+      initial_ms: 500
+
+  llm:
+    # Switch to the fallback LLM after all retries are exhausted.
+    on_failure:
+      action: fallback_llm
+      fallback_llm: fallback
+
+    # Use the fallback for summarization too when context overflows.
+    on_context_overflow:
+      action: summarize
+      summarizer_llm: fallback
+      keep_recent: 5
+
+  # NOTE: To see a static-message fallback instead of an LLM fallback, replace the on_failure block above with:
+  #
+  #   on_failure:
+  #     action: fallback_response
+  #     message: "I am temporarily unavailable. Please try again later."
+
+tools:
+  - calculator
+  - datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: "=== Fallback Agent (LLM failover) ==="
+    hints:
+      - "Chat normally -- if the primary LLM fails the fallback takes over"
+      - "To simulate failure: change primary.model to a nonexistent name"
+      - "In production point primary and fallback at different providers"
+      - "Set RUST_LOG=warn to see fallback activation in the logs"

@@ -1,0 +1,75 @@
+name: RetryAgent
+version: "1.0.0"
+description: "Automatic retry with exponential backoff on transient errors"
+
+# Retry on transient LLM and tool failures.
+#
+# When a call fails due to a timeout, rate limit, or server error, the framework retries automatically with an increasing wait between attempts.
+# No code changes needed -- configure once in YAML.
+#
+# Flow: LLM call fails -> classify error -> retriable? -> wait (backoff) -> retry
+#                                        -> not retriable -> propagate error
+system_prompt: |
+  You are a helpful assistant.
+  If a tool call fails, explain what happened and offer alternatives.
+
+llm:
+  provider: openai
+  model: gpt-4.1-mini
+
+# Retry policy for LLM calls and tools.
+# max_retries: 0 means no retry (fail immediately) -- the default.
+# Set > 0 to enable automatic retry with the configured backoff.
+error_recovery:
+  default:
+    max_retries: 3
+    backoff:
+      type: exponential
+      initial_ms: 500   # First retry after 500 ms
+      max_ms: 5000      # Never wait longer than 5 s
+      multiplier: 2.0   # Each retry doubles the wait
+
+    # All 9 ErrorType variants. Four are retriable, two are permanent, and three are omitted here because they are handled elsewhere.
+    #
+    # Retriable (transient - the same request may succeed on retry):
+    retry_on:
+      - timeout          # Request timed out before a response arrived
+      - rate_limit       # Provider returned 429; wait and retry
+      - connection_error # Network-level failure (DNS, TCP, TLS)
+      - server_error     # Provider returned 5xx
+
+    # Permanent (retrying cannot help - fix the config or the input):
+    no_retry_on:
+      - invalid_api_key  # Wrong or expired key; retrying wastes quota
+      - invalid_request  # Malformed request the provider will always reject
+
+    # Omitted (handled by dedicated mechanisms, not this retry loop):
+    # * context_too_long - routed to error_recovery.llm.on_context_overflow (truncate or summarize), not a simple retry
+    # * invalid_response - LLM returned unparseable output; wired to error_recovery.parsing.on_invalid_json / on_invalid_tool_call (retry-with-hint)
+    # * tool_error - tool execution failures use the per-tool retry config under error_recovery.tools.<id>.max_retries
+    #
+    # Three belong to other error_recovery sub-sections. (check other YAML examples)
+
+  # Per-tool override: give every tool call up to 2 retries.
+  tools:
+    default:
+      max_retries: 2
+      timeout_ms: 10000
+
+tools:
+  - calculator
+  - datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: "=== Retry Agent (exponential backoff) ==="
+    hints:
+      - "Chat normally -- retries happen transparently on transient errors"
+      - "Try: What is 42 * 17? (tool call with retry protection)"
+      - "Set RUST_LOG=ai_agents_recovery=warn to see retry attempts in the logs"

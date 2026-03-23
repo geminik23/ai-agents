@@ -11,7 +11,8 @@ use tracing::{debug, error, info, instrument, warn};
 
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
 use ai_agents_core::{
-    AgentError, AgentSnapshot, AgentStorage, ChatMessage, LLMProvider, Result, ToolResult,
+    AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMProvider, LLMResponse,
+    Result, ToolResult,
 };
 use ai_agents_disambiguation::{
     DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
@@ -34,7 +35,8 @@ use ai_agents_reasoning::{
 };
 use ai_agents_recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
-    MessageFilter, RecoveryManager, RetryConfig, SkipPatternFilter,
+    LLMFailureAction, MessageFilter, RecoveryManager, RetryConfig, SkipPatternFilter,
+    ToolFailureAction,
 };
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
 use ai_agents_state::{
@@ -1229,6 +1231,39 @@ impl RuntimeAgent {
                 .map_err(|e| AgentError::Tool(e.to_string()))
         } else {
             self.execute_tool(tool_call).await
+        };
+
+        // Apply on_failure policy when the tool fails after all retries.
+        let result = match result {
+            Ok(output) => Ok(output),
+            Err(e) => match &tool_config.on_failure {
+                ToolFailureAction::Skip => {
+                    warn!(
+                        tool = %tool_call.name,
+                        error = %e,
+                        "Tool failed, skipping per on_failure: skip policy"
+                    );
+                    Ok(format!(
+                        "{{\"skipped\": true, \"reason\": \"Tool '{}' was skipped after failure\"}}",
+                        tool_call.name
+                    ))
+                }
+                ToolFailureAction::Fallback { fallback_tool } => {
+                    warn!(
+                        tool = %tool_call.name,
+                        fallback = %fallback_tool,
+                        error = %e,
+                        "Tool failed, trying fallback tool"
+                    );
+                    let fallback_call = ToolCall {
+                        id: tool_call.id.clone(),
+                        name: fallback_tool.clone(),
+                        arguments: tool_call.arguments.clone(),
+                    };
+                    self.execute_tool(&fallback_call).await
+                }
+                ToolFailureAction::ReportError => Err(e),
+            },
         };
 
         let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
@@ -3092,19 +3127,54 @@ Respond in JSON format:
             self.hooks.on_llm_start(&messages).await;
             let llm_start = Instant::now();
 
-            let response = if self.recovery_manager.config().default.max_retries > 0 {
-                self.recovery_manager
-                    .with_retry("llm_call", None, || async {
-                        llm.complete(&messages, None)
-                            .await
-                            .map_err(|e| e.classify())
-                    })
-                    .await
-                    .map_err(|e| AgentError::LLM(e.to_string()))?
-            } else {
-                llm.complete(&messages, None)
-                    .await
-                    .map_err(|e| AgentError::LLM(e.to_string()))?
+            // Try primary LLM (with retry if configured), then apply on_failure policy.
+            let response = {
+                let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
+                    self.recovery_manager
+                        .with_retry("llm_call", None, || async {
+                            llm.complete(&messages, None)
+                                .await
+                                .map_err(|e| e.classify())
+                        })
+                        .await
+                        .map_err(|e| AgentError::LLM(e.to_string()))
+                } else {
+                    llm.complete(&messages, None)
+                        .await
+                        .map_err(|e| AgentError::LLM(e.to_string()))
+                };
+
+                match primary_result {
+                    Ok(resp) => resp,
+                    Err(primary_err) => match &self.recovery_manager.config().llm.on_failure {
+                        LLMFailureAction::FallbackLlm { fallback_llm } => {
+                            warn!(
+                                fallback = %fallback_llm,
+                                error = %primary_err,
+                                "Primary LLM failed, attempting fallback LLM"
+                            );
+                            let fb = self.llm_registry.get(fallback_llm).map_err(|e| {
+                                AgentError::Config(format!(
+                                    "Fallback LLM '{}' not found: {}",
+                                    fallback_llm, e
+                                ))
+                            })?;
+                            fb.complete(&messages, None)
+                                .await
+                                .map_err(|e| AgentError::LLM(e.to_string()))?
+                        }
+                        LLMFailureAction::FallbackResponse { message } => {
+                            warn!(
+                                error = %primary_err,
+                                "Primary LLM failed, using static fallback response"
+                            );
+                            LLMResponse::new(message.clone(), FinishReason::Stop)
+                        }
+                        LLMFailureAction::Error => {
+                            return Err(primary_err);
+                        }
+                    },
+                }
             };
 
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
@@ -4218,6 +4288,113 @@ memory:
                 || response.content.len() < 50, // rejection message is typically short
             "Expected rejection response, got: {}",
             response.content
+        );
+    }
+
+    // LLM fallback: primary fails, fallback LLM responds
+    #[tokio::test]
+    async fn test_llm_fallback_on_failure() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, LLMFailureAction, LLMRecoveryConfig};
+
+        let mut primary = MockLLMProvider::new("primary");
+        primary.set_error("Primary LLM is unavailable");
+
+        let mut fallback = MockLLMProvider::new("fallback");
+        fallback.set_response("Fallback response works!");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm_alias("default", Arc::new(primary))
+            .llm_alias("backup", Arc::new(fallback))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                llm: LLMRecoveryConfig {
+                    on_failure: LLMFailureAction::FallbackLlm {
+                        fallback_llm: "backup".to_string(),
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hello").await.unwrap();
+        assert!(
+            response.content.contains("Fallback response"),
+            "Expected fallback response, got: {}",
+            response.content
+        );
+    }
+
+    // LLM fallback: primary fails, static message returned
+    #[tokio::test]
+    async fn test_llm_fallback_response_static_message() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, LLMFailureAction, LLMRecoveryConfig};
+
+        let mut primary = MockLLMProvider::new("primary");
+        primary.set_error("Primary LLM is unavailable");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(primary))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                llm: LLMRecoveryConfig {
+                    on_failure: LLMFailureAction::FallbackResponse {
+                        message: "I am temporarily unavailable. Please try again later."
+                            .to_string(),
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hello").await.unwrap();
+        assert!(
+            response.content.contains("temporarily unavailable"),
+            "Expected static fallback message, got: {}",
+            response.content
+        );
+    }
+
+    // Tool skip: tool fails, on_failure: skip absorbs the error
+    #[tokio::test]
+    async fn test_tool_failure_skip() {
+        use ai_agents_recovery::{
+            ErrorRecoveryConfig, ToolFailureAction, ToolRecoveryConfig, ToolRetryConfig,
+        };
+
+        // LLM requests a nonexistent tool, then responds after seeing the skip result
+        let mock = mock_with_responses(vec![
+            r#"I'll use the nonexistent tool.
+[TOOL_CALL: {"name": "nonexistent_tool", "arguments": {}}]"#,
+            "The tool was unavailable, but I can still help you.",
+        ]);
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    default: ToolRetryConfig {
+                        max_retries: 0,
+                        timeout_ms: None,
+                        on_failure: ToolFailureAction::Skip,
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        // The tool will fail (not found), but on_failure: skip absorbs the error
+        let response = agent.chat("Use the nonexistent tool").await;
+        assert!(
+            response.is_ok(),
+            "Expected Ok with skip policy, got: {:?}",
+            response
         );
     }
 }

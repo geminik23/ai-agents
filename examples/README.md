@@ -62,7 +62,7 @@ cargo run -p ai-agents-cli -- run examples/yaml/basic/simple_tools.yaml
 
 ### `yaml/skills/`
 
-skill examples - from a single inline skill to multi-step tool pipelines.
+Skill examples - from a single inline skill to multi-step tool pipelines.
 
 | File | Description |
 |------|-------------|
@@ -73,7 +73,7 @@ skill examples - from a single inline skill to multi-step tool pipelines.
 | `skills/math_helper.skill.yaml` | External math skill (used by `skill_external_only` and `skill_agent`) |
 | `skills/weather_clothes.skill.yaml` | External weather/clothing skill (used by `skill_agent`) |
 
-The skill router (LLM) compares user input against each skill's `trigger` description and selects the best match.
+Note: The skill router (LLM) compares user input against each skill's `trigger` description and selects the best match.
 Skills that reference tools (e.g., `calculator`) must list those tools in the agent's `tools:` section.
 
 Examples:
@@ -123,7 +123,7 @@ Progressive tool usage examples — from basic tool calls to multi-tool composit
 | `http_tool.yaml` | External HTTP calls (makes real network requests) |
 | `mcp_agent.yaml` | MCP-backed filesystem tool with views - one MCP server scoped into `fs_read` and `fs_write` view tools for per-state least-privilege access |
 
-Note: the `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
+Note: The `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
 The framework auto-injects tool information (names, descriptions, argument schemas) into the prompt at runtime.
 The system prompt focuses on behavioral guidance only.
 
@@ -210,6 +210,28 @@ cargo run -p ai-agents-cli -- run examples/yaml/memory/memory_agent.yaml
 ```
 
 For session persistence (save/restore across restarts), see `rust/storage/` below.
+
+### `yaml/error-recovery/`
+
+Production-essential error recovery - from automatic retries to LLM failover and context overflow handling.
+
+| File | Description |
+|------|-------------|
+| `basic_retry.yaml` | Automatic retry with exponential backoff on transient errors |
+| `llm_fallback.yaml` | Fall back to a different LLM when the primary fails |
+| `context_overflow.yaml` | Summarize or truncate when the conversation exceeds the context window |
+
+Note: Error recovery is transparent and works behind the scenes.
+Set `RUST_LOG=ai_agents_recovery=warn` to see retry attempts and fallback activations, or `RUST_LOG=debug` for context overflow and summarization details.
+`context_overflow.yaml` uses a deliberately low token limit (2048) so overflow triggers within a few turns.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/basic_retry.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/llm_fallback.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/context_overflow.yaml
+```
 
 ### `yaml/reasoning/`
 
@@ -347,13 +369,11 @@ cargo run --bin reasoning-agent
 
 Custom LLM provider examples - from implementing `LLMProvider` from scratch to multi-provider routing.
 
-
 | Binary | Description |
 |--------|-------------|
 | `custom-provider` | Implement `LLMProvider` from scratch with an offline echo/rule-based provider - no API key needed |
 | `openai-compatible` | HTTP adapter for any OpenAI-compatible server (LM Studio, Ollama, vLLM, LocalAI, TGI) |
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
-
 
 Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` — no custom Rust code needed.
 
@@ -374,7 +394,7 @@ cargo run --bin multi-provider
 
 ### `rust/custom-tools/`
 
-custom tool examples - from a minimal `Tool` trait implementation to a full `ToolProvider` with dynamic discovery.
+Custom tool examples - from a minimal `Tool` trait implementation to a full `ToolProvider` with dynamic discovery.
 
 | Binary | Description |
 |--------|-------------|

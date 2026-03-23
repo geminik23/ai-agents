@@ -1,0 +1,94 @@
+name: OverflowAgent
+version: "1.0.0"
+description: "Summarize or truncate when the conversation exceeds the context window"
+
+# Context overflow handling
+#
+# keep long conversations coherent.
+#
+# When the conversation history grows beyond max_context_tokens, the framework can truncate old messages or summarize them with a fast LLM.
+# The agent keeps working without errors; the user just continues the conversation naturally.
+#
+# This example uses summarization. A cheap LLM compresses older messages into a short summary while the most recent messages are kept verbatim.
+#
+# Flow: build_messages -> token count > max_context_tokens -> on_context_overflow
+#                                                          -> summarize: compress old messages
+#                                                          -> truncate: drop oldest messages
+#                                                          -> error: fail (default)
+#
+# NOTE: Summarization runs inside build_messages() on every LLM call that exceeds the token limit.
+# The summary is NOT stored back to memory - it is rebuilt from the raw history each turn.
+# For persistent summarization that is stored in memory, use memory.type: compacting instead (see yaml/memory/).
+#
+# NOTE: max_context_tokens is set to 2048 here so overflow triggers quickly.
+# In production set it to your model's actual context window (e.g. 128000).
+system_prompt: |
+  You are a helpful assistant with excellent memory.
+  Even in long conversations you remember key details the user mentioned.
+  If your memory of early messages was compressed into a summary, work with
+  what you have and be transparent if the user asks about earlier context.
+
+# Main model for responses + a cheaper model dedicated to summarization.
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  summarizer:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+
+# Low limit to trigger overflow quickly for demo purposes.
+max_context_tokens: 2048
+
+# Overflow policy: summarize old messages rather than dropping them.
+# summarizer_llm: which LLM alias runs the compression (use a fast/cheap one).
+# max_summary_tokens: caps how much space the rolling summary can consume.
+# keep_recent: the N most recent messages are always kept word for word.
+error_recovery:
+  llm:
+    on_context_overflow:
+      action: summarize
+      summarizer_llm: summarizer
+      max_summary_tokens: 300
+      keep_recent: 4
+
+      # Optional: restrict which messages are fed to the summarizer.
+      # Uncomment to include only user/assistant turns and skip tool output.
+      # filter:
+      #   type: by_role
+      #   keep_roles:
+      #     - user
+      #     - assistant
+
+# Alternative: simple truncation with no LLM cost.
+# Swap the error_recovery block above for this to drop old messages instead:
+#
+# error_recovery:
+#   llm:
+#     on_context_overflow:
+#       action: truncate
+#       keep_recent: 10
+
+# Plain ring-buffer memory. When message 201 arrives the oldest is removed (dropped, not compressed). This is independent of on_context_overflow above.
+
+memory:
+  type: in-memory
+  max_messages: 200
+
+tools:
+  - calculator
+  - datetime
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: "=== Context Overflow Agent (auto-summarize) ==="
+    hints:
+      - "Have a long conversation -- ask varied questions over 20+ turns"
+      - "The agent summarizes old messages automatically when context fills up"
+      - "Try asking about something you mentioned early in the conversation"
+      - "Set RUST_LOG=debug to see overflow and summarization log lines"
