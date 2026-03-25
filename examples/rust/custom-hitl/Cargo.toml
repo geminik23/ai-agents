@@ -10,9 +10,15 @@ ai-agents = { workspace = true }
 ai-agents-cli = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
+schemars = { workspace = true }
 uuid = { workspace = true }
 
 [[bin]]
 name = "hitl-agent"
 path = "src/hitl_agent.rs"
+
+[[bin]]
+name = "simple-approval"
+path = "src/simple_approval.rs"

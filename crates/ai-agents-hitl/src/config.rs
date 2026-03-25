@@ -189,7 +189,10 @@ impl ApprovalMessage {
     pub fn is_empty(&self) -> bool {
         match self {
             ApprovalMessage::Simple(s) => s.is_empty(),
-            ApprovalMessage::MultiLanguage { messages, .. } => messages.is_empty(),
+            ApprovalMessage::MultiLanguage {
+                messages,
+                description,
+            } => messages.is_empty() && description.is_none(),
         }
     }
 

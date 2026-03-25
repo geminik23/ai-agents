@@ -233,6 +233,27 @@ cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/llm_fallback.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/context_overflow.yaml
 ```
 
+### `yaml/hitl/`
+
+Declarative human-in-the-loop approval - from a single tool requiring sign-off to localized multi-language approval messages.
+
+| File | Description |
+|------|-------------|
+| `hitl_basic.yaml` | Every HTTP call requires y/N approval before execution |
+| `hitl_conditions.yaml` | GET proceeds freely; POST/PUT/DELETE/PATCH requires approval |
+| `hitl_multilingual.yaml` | Context-driven localized approval messages -- process pipeline detects user language, HITL picks the matching translation (en/ko/ja) |
+
+Note: The CLI prompts interactively in the terminal. Use `metadata.cli.hitl.style: auto_approve` to bypass prompts in demos, or `auto_reject` to test rejection paths without user input.
+For a custom approval handler (Slack, webhook, email), see `rust/custom-hitl/` below.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/hitl/hitl_basic.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/hitl/hitl_conditions.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/hitl/hitl_multilingual.yaml
+```
+
 ### `yaml/reasoning/`
 
 Reasoning and reflection examples.
@@ -337,16 +358,22 @@ cargo run --bin context-injection
 
 ### `rust/custom-hitl/`
 
-Examples with custom approval handlers and custom tools.
+Custom approval handler examples - from a minimal y/N handler to a full modify-capable implementation.
 
 | Binary | Description |
 |--------|-------------|
-| `hitl-agent` | CLI-based approval handler for payments and record deletion, with multi-language messages |
+| `simple-approval` | Minimal `ApprovalHandler` implementation — one method, y/N only |
+| `hitl-agent` | Full handler with approve/reject/modify support and multi-language messages |
+
+Note: When the handler returns `Modified { changes }`, the runtime merges the new values into the tool arguments before execution.
+For example, changing a payment amount from $5000 to $500 in the modify prompt updates the actual tool call.
+The `simple-approval` handler supports y/N only; `hitl-agent` demonstrates the full approve/reject/modify flow.
 
 Run from:
 
 ```sh
 cd examples/rust/custom-hitl
+cargo run --bin simple-approval
 cargo run --bin hitl-agent
 ```
 

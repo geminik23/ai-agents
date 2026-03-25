@@ -54,10 +54,12 @@ impl<'a> MessageResolver<'a> {
             }
         }
 
-        Ok(approval_message
+        // Final fallback: use the raw message and render templates
+        let raw = approval_message
             .get_any()
             .or_else(|| approval_message.description().map(String::from))
-            .unwrap_or_else(|| "Approval required".to_string()))
+            .unwrap_or_else(|| "Approval required".to_string());
+        Ok(render_template(&raw, context))
     }
 
     async fn try_strategy(
@@ -95,7 +97,7 @@ impl<'a> MessageResolver<'a> {
 
             MessageLanguageStrategy::LlmGenerate => {
                 if let Some(registry) = self.llm_registry {
-                    let message = self
+                    match self
                         .generate_message_with_llm(
                             approval_message,
                             config.llm_generate.as_ref(),
@@ -103,8 +105,11 @@ impl<'a> MessageResolver<'a> {
                             handler,
                             registry,
                         )
-                        .await?;
-                    return Ok(Some(message));
+                        .await
+                    {
+                        Ok(message) => return Ok(Some(message)),
+                        Err(_) => return Ok(None),
+                    }
                 }
                 Ok(None)
             }
@@ -147,7 +152,7 @@ impl<'a> MessageResolver<'a> {
              Requirements:\n\
              - Keep it under 100 words\n\
              - Be direct and professional\n\
-             - Include any relevant context values using {{ key }} placeholders if applicable\n\
+             - Include the actual context values in the message, not placeholders\n\
              - Output only the message text, no explanations",
             target_lang, description, context_str
         );
@@ -178,7 +183,7 @@ fn get_user_language(context: &HashMap<String, Value>) -> Option<String> {
         .map(String::from)
 }
 
-fn render_template(template: &str, context: &HashMap<String, Value>) -> String {
+pub(crate) fn render_template(template: &str, context: &HashMap<String, Value>) -> String {
     let mut result = template.to_string();
 
     for (key, value) in context {

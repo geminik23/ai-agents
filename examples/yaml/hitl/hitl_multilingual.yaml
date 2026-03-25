@@ -1,0 +1,146 @@
+name: HitlMultilingualAgent
+version: "1.0.0"
+description: "HITL with localized approval messages driven by detected user language"
+
+# Context-driven multilingual approval messages.
+#
+# The process pipeline detects what language the user writes in and stores it in context as input.detected.language.
+# The HITL engine then uses strategy: user to pick the matching approval_message translation automatically.
+#
+# This demonstrates the full loop:
+#   process pipeline (detect) -> context_manager -> HITL localization -> correct language
+#
+# The approval messages are static templates you write yourself in each language.
+# The framework picks which one to show based on the detected language, then renders {{ }} variables. No LLM generates the message text.
+#
+# To let an LLM generate messages dynamically instead of writing them by hand, see Mode B (commented-out hitl block below).
+#
+# Flow: user input -> process pipeline detects language -> store in context
+#       -> LLM calls http -> HITL check -> strategy: user reads context
+#       -> picks matching approval_message -> render template -> prompt (y/N)
+#       -> y: execute tool -> N: HITLRejected -> agent explains rejection
+system_prompt: |
+  You are a multilingual assistant that can make HTTP requests.
+  Respond in the same language the user writes in.
+  Use the http tool immediately when asked - do not ask for confirmation yourself.
+
+# The router LLM handles language detection in the process pipeline.
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# Detect the user's language before the LLM sees the input.
+# store_in_context maps the LLM result key ("language") to a context path
+# (input.detected.language) that the HITL engine reads via strategy: user.
+process:
+  input:
+    - type: detect
+      id: detect_language
+      config:
+        llm: router
+        detect:
+          - language
+        store_in_context:
+          language: input.detected.language
+
+# --------------------------------------------------------------------------
+# Mode A: Static templates (active)
+#   You write approval_message in each language yourself.
+#   strategy: user picks the right one based on detected language.
+#   No LLM call for the message - just template selection + rendering.
+# --------------------------------------------------------------------------
+hitl:
+  default_timeout_seconds: 120  # seconds to wait for human. default: 300
+  on_timeout: reject            # action when no response. reject (default) | approve | error
+
+  # strategy: how to pick the approval message language.
+  #   auto     - detect from conversation context (placeholder, falls through to fallback)
+  #   approver - handler's preferred_language(). CLI returns None (skipped)
+  #   user     - read from context (input.detected.language / user.language / language)
+  #   explicit - always use the language code set in explicit: field
+  #   llm_generate - ask an LLM to generate the message dynamically
+  #
+  # fallback is tried in order when the primary strategy cannot determine a language.
+  message_language:
+    strategy: user              # pick language from context (input.detected.language)
+    fallback:
+      - approver
+      - explicit                # last resort: use the language below
+    explicit: en                # safety net when detection fails
+
+  # Per-tool approval. The key must match the tool ID (e.g. "http", "file").
+  #
+  # approval_message as a map: each key is a language code, each value is a
+  # Jinja2 template rendered with the tool's flat argument names.
+  # Variable names are flat keys - use {{ method }}, not {{ args.method }}.
+  # description is an internal label for logs and audit - not shown to the human.
+  tools:
+    http:
+      require_approval: true    # block until human decides. default: false
+      approval_context:         # which args to show in prompt. default: all
+        - method
+        - url
+      approval_message:
+        en: "Approve {{ method }} request to {{ url }}?"
+        ko: "{{ url }}에 {{ method }} 요청을 승인하시겠습니까?"
+        ja: "{{ url }}への{{ method }}リクエストを承認しますか？"
+        description: "HTTP request approval"
+
+# --------------------------------------------------------------------------
+# Mode B: LLM-generated messages (uncomment this block, comment out Mode A)
+#   The LLM generates the approval message dynamically in the user's language.
+#   You only provide a description - no per-language strings needed.
+# --------------------------------------------------------------------------
+# hitl:
+#   default_timeout_seconds: 120
+#   on_timeout: reject
+#
+#   message_language:
+#     strategy: llm_generate    # LLM generates message in the detected language
+#     fallback:
+#       - explicit
+#     explicit: en
+#     llm_generate:
+#       llm: router             # which named LLM to use. default: "router"
+#       include_context: true   # pass tool args to the LLM prompt. default: true
+#
+#   tools:
+#     http:
+#       require_approval: true
+#       approval_context:
+#         - method
+#         - url
+#       approval_message:
+#         description: "HTTP request approval"
+
+# # NOTE: This example makes real HTTP requests on approval.
+# tools:
+#   - http
+
+# memory:
+#   type: in-memory
+#   max_messages: 20
+
+# max_iterations: 5
+
+# The approval message is localized, but the y/N prompt itself is always English (CliApprovalHandler).
+# A custom handler (e.g. Slack bot) would render the full localized experience.
+metadata:
+  cli:
+    hitl:
+      style: prompt        # how CLI handles approval. prompt (default) | auto_approve | auto_reject
+      show_context: true   # show tool args in the prompt box. default: true
+    welcome: "=== HITL Multilingual: Language-Aware Approval Messages ==="
+    hints:
+      - "Try in English: Fetch https://httpbin.org/get"
+      - "Try in Korean: https://httpbin.org/get 을 가져와줘"
+      - "Try in Japanese: https://httpbin.org/get を取得してください"
+      - "The approval message language matches what you wrote in"

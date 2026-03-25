@@ -28,6 +28,9 @@ pub struct CliMetadata {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disable_builtin_commands: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hitl: Option<CliHitlMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -35,6 +38,29 @@ pub struct CliMetadata {
 pub enum CliPromptStyle {
     Simple,
     WithState,
+}
+
+/// Controls how the CLI handles HITL approval requests at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CliHitlStyle {
+    /// Interactive y/N prompt in the terminal (default).
+    #[default]
+    Prompt,
+    /// Silently approve all requests.
+    AutoApprove,
+    /// Silently reject all requests.
+    AutoReject,
+}
+
+/// CLI-specific HITL display settings from `metadata.cli.hitl`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CliHitlMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style: Option<CliHitlStyle>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_context: Option<bool>,
 }
 
 /// Configuration for LLM provider
@@ -153,6 +179,7 @@ disable_builtin_commands: false
         assert_eq!(metadata.streaming, Some(true));
         assert_eq!(metadata.prompt_style, Some(CliPromptStyle::WithState));
         assert_eq!(metadata.disable_builtin_commands, Some(false));
+        assert!(metadata.hitl.is_none());
     }
 
     #[test]
@@ -255,6 +282,37 @@ another_field: 123
         let selector = LLMSelector::new("main").with_router("cheap");
         assert_eq!(selector.default, "main");
         assert_eq!(selector.router, Some("cheap".to_string()));
+    }
+
+    #[test]
+    fn test_cli_hitl_metadata_deserialize() {
+        let yaml = r#"
+style: auto_approve
+show_context: false
+"#;
+        let meta: CliHitlMetadata = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(meta.style, Some(CliHitlStyle::AutoApprove));
+        assert_eq!(meta.show_context, Some(false));
+    }
+
+    #[test]
+    fn test_cli_hitl_style_default() {
+        assert_eq!(CliHitlStyle::default(), CliHitlStyle::Prompt);
+    }
+
+    #[test]
+    fn test_cli_metadata_with_hitl() {
+        let yaml = r#"
+welcome: "Hello"
+hints: []
+hitl:
+  style: prompt
+  show_context: true
+"#;
+        let meta: CliMetadata = serde_yaml::from_str(yaml).unwrap();
+        let hitl = meta.hitl.unwrap();
+        assert_eq!(hitl.style, Some(CliHitlStyle::Prompt));
+        assert_eq!(hitl.show_context, Some(true));
     }
 
     #[test]

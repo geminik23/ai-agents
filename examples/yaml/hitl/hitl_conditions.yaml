@@ -1,0 +1,68 @@
+name: HitlConditionsAgent
+version: "1.0.0"
+description: "Condition-based HITL: GET proceeds freely, POST/PUT/DELETE/PATCH needs approval"
+
+# Condition-based approval
+#
+# triggered by argument values, not tool identity.
+#
+# Instead of requiring approval for every call to a tool, conditions let you filter by what the tool is asked to do.
+# Here, read-only GET requests proceed freely while state-changing methods need human sign-off.
+#
+# Flow: LLM calls http -> evaluate condition against tool args
+#       -> condition false (GET) -> execute tool immediately
+#       -> condition true (POST/DELETE/...) -> approval prompt (y/N)
+#          -> y: execute tool -> N: HITLRejected -> agent explains rejection
+#
+system_prompt: |
+  You are a helpful assistant that can make HTTP requests.
+  Use GET for fetching data and POST/PUT/DELETE for state-changing operations.
+  Use the http tool immediately when asked - do not ask the user for confirmation.
+
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+
+# Conditions are checked against every tool call's arguments.
+# Evaluation is purely deterministic (no LLM call) - the framework parses the expression and compares it against the tool's argument values directly.
+# A condition only matches when the named field exists in the tool's arguments, so this condition only fires for tools that have a "method" argument.
+#
+# when: expression evaluated against flat argument keys (no prefix needed).
+#   Supported operators:
+#     numeric  - >, <, >=, <=, ==, !=
+#     string   - in [...], not in [...]
+#
+# approval_message is a Jinja2 template rendered with the tool's arguments.
+# Variable names are flat argument keys - use {{ method }}, not {{ args.method }}.
+# Default message when omitted: "Condition '<name>' matched"
+hitl:
+  default_timeout_seconds: 120  # seconds to wait for human. default: 300
+  on_timeout: reject            # action when no response. reject (default) | approve | error
+
+  conditions:
+    - name: state_changing_http                              # label for logs and audit
+      when: "method in [POST, PUT, DELETE, PATCH]"           # expression checked against tool args
+      require_approval: true                                 # block until human decides. default: false
+      approval_message: "Approve {{ method }} request to {{ url }}?"
+
+# NOTE: This example makes real HTTP requests on approval.
+tools:
+  - http
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+max_iterations: 5
+
+metadata:
+  cli:
+    hitl:
+      style: prompt        # how CLI handles approval. prompt (default) | auto_approve | auto_reject
+      show_context: true   # show tool args in the prompt box. default: true
+    welcome: "=== HITL Conditions: Approve by Argument Value ==="
+    hints:
+      - "Try: Fetch https://httpbin.org/get  (GET - no approval needed)"
+      - "Try: Post {\"hello\": \"world\"} to https://httpbin.org/post  (POST - approval required)"
+      - "Try: Delete https://httpbin.org/delete  (DELETE - approval required)"
+      - "Approve the POST, reject the DELETE - see how the agent handles each outcome"

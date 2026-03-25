@@ -12,7 +12,7 @@ system_prompt: |
 llms:
   default:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-4.1-mini
   router:
     provider: openai
     model: gpt-4.1-nano
@@ -56,11 +56,11 @@ hitl:
         description: "Record deletion approval"
   conditions:
     - name: high_value_transaction
-      when: "Transaction amount exceeds $1000"
+      when: "amount > 1000"
       require_approval: true
       approval_message:
-        en: "High value transaction detected"
-        ko: "고액 거래가 감지되었습니다"
+        en: "High value transaction detected: {{ amount }} {{ currency }}"
+        ko: "고액 거래 감지: {{ amount }} {{ currency }}"
 
 memory:
   type: in-memory
@@ -68,5 +68,7 @@ memory:
 
 max_iterations: 10
 
-tools: []
+tools:
+  - send_payment
+  - delete_record
 skills: []

@@ -241,11 +241,11 @@ pub mod skill {
 
 pub mod spec {
     pub use ai_agents_runtime::spec::{
-        AgentSpec, BuiltinProviderConfig, CliMetadata, CliPromptStyle, FileStorageConfig,
-        LLMConfig, LLMSelector, MemoryConfig, ProviderPolicyConfig, ProviderSecurityConfig,
-        ProvidersConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig,
-        StructuredToolEntry, ToolAliasesConfig, ToolConfig, ToolEntry, ToolPolicyConfig,
-        YamlProviderConfig, YamlToolConfig,
+        AgentSpec, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle, CliMetadata,
+        CliPromptStyle, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
+        ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
+        SqliteStorageConfig, StorageConfig, StructuredToolEntry, ToolAliasesConfig, ToolConfig,
+        ToolEntry, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
     };
 }
 

@@ -8,6 +8,7 @@ use ai_agents::{
 };
 use anyhow::{Context, Result};
 
+use crate::approval::CliApprovalHandler;
 use crate::cli::{Cli, Command as CliCommand, RunArgs};
 use crate::metadata::{CliOverrides, ResolvedCliMetadata};
 use crate::repl::{CliRepl, CliReplConfig, PromptStyle, ReplMode};
@@ -52,6 +53,7 @@ impl RunOptions {
             streaming: self.stream,
             prompt_style: None,
             disable_builtin_commands: self.no_builtins.then_some(true),
+            hitl: None,
         }
     }
 }
@@ -120,6 +122,17 @@ pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
     // warnings and compression events are silently discarded by NoopHooks.
     if spec.memory.is_compacting() || spec.memory.token_budget.is_some() {
         builder = builder.hooks(Arc::new(LoggingHooks::with_prefix("[Memory]")));
+    }
+
+    // Attach CLI approval handler when the spec declares HITL config.
+    if spec.hitl.is_some() {
+        let hitl_meta = spec
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("cli"))
+            .and_then(|c| serde_json::from_value::<ai_agents::spec::CliMetadata>(c.clone()).ok())
+            .and_then(|m| m.hitl);
+        builder = builder.approval_handler(CliApprovalHandler::from_metadata(hitl_meta.as_ref()));
     }
 
     builder.build().context("failed to build runtime agent")

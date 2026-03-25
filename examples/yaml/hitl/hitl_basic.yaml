@@ -1,0 +1,61 @@
+name: HitlBasicAgent
+version: "1.0.0"
+description: "HTTP tool with human approval required before every request"
+
+# Tool approval - the simplest form of human oversight.
+#
+# When the agent calls a tool with require_approval: true, the framework pauses and asks the human for permission before running it.
+# On approval the tool runs normally. On rejection the agent receives a HITLRejected error and explains the outcome to the user.
+#
+# Flow: LLM decides to call http -> HITL check -> require_approval: true
+#       -> approval prompt (y/N) -> y: execute tool, return result
+#                                -> N: HITLRejected -> agent explains rejection
+system_prompt: |
+  You are a helpful assistant that can fetch data from the web using HTTP.
+  When the user asks you to fetch something, use the http tool immediately.
+  Do NOT ask the user for confirmation yourself -- the approval system handles that.
+
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+
+# Per-tool approval. The key must match the tool ID (e.g. "http", "file"), not the display name shown in logs.
+#
+# approval_context controls which tool arguments appear in the approval box.
+# When empty (the default), all arguments are shown.
+#
+# approval_message is a Jinja2 template rendered with the tool's arguments.
+# Variable names are flat argument keys - use {{ method }}, not {{ args.method }}.
+# Default message when omitted: "Approve execution of tool '<id>'?"
+hitl:
+  default_timeout_seconds: 120  # seconds to wait for human. default: 300
+  on_timeout: reject            # action when no response. reject (default) | approve | error
+  tools:
+    http:
+      require_approval: true    # block until human decides. default: false
+      approval_context:         # which args to show in prompt. default: all
+        - method
+        - url
+      approval_message: "Approve {{ method }} request to {{ url }}?"
+
+# NOTE: This example makes real HTTP requests on approval.
+tools:
+  - http
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+max_iterations: 5
+
+metadata:
+  cli:
+    hitl:
+      style: prompt        # how CLI handles approval. prompt (default) | auto_approve | auto_reject
+      show_context: true   # show tool args in the prompt box. default: true
+    welcome: "=== HITL Basic: Tool Approval ==="
+    hints:
+      - "Try: Fetch https://httpbin.org/get"
+      - "Try: What is the current IP address of httpbin.org? (triggers HTTP approval)"
+      - "Try: Tell me a joke (no HTTP needed, no approval)"
+      - "Approve with y, reject with N -- see how the agent handles each"

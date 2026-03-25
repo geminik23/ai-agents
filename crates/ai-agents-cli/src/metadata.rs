@@ -1,4 +1,4 @@
-use ai_agents::spec::{CliMetadata, CliPromptStyle};
+use ai_agents::spec::{CliHitlMetadata, CliMetadata, CliPromptStyle};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Default)]
@@ -11,6 +11,7 @@ pub struct ResolvedCliMetadata {
     pub streaming: Option<bool>,
     pub prompt_style: Option<CliPromptStyle>,
     pub disable_builtin_commands: Option<bool>,
+    pub hitl: Option<CliHitlMetadata>,
 }
 
 impl ResolvedCliMetadata {
@@ -40,6 +41,7 @@ impl ResolvedCliMetadata {
             disable_builtin_commands: overrides
                 .disable_builtin_commands
                 .or(self.disable_builtin_commands),
+            hitl: overrides.hitl.or(self.hitl),
         }
     }
 }
@@ -55,6 +57,7 @@ impl From<CliMetadata> for ResolvedCliMetadata {
             streaming: value.streaming,
             prompt_style: value.prompt_style,
             disable_builtin_commands: value.disable_builtin_commands,
+            hitl: value.hitl,
         }
     }
 }
@@ -69,6 +72,7 @@ pub struct CliOverrides {
     pub streaming: Option<bool>,
     pub prompt_style: Option<CliPromptStyle>,
     pub disable_builtin_commands: Option<bool>,
+    pub hitl: Option<CliHitlMetadata>,
 }
 
 #[cfg(test)]
@@ -144,6 +148,7 @@ mod tests {
             streaming: Some(false),
             prompt_style: Some(CliPromptStyle::Simple),
             disable_builtin_commands: Some(false),
+            hitl: None,
         };
 
         let overrides = CliOverrides {
@@ -155,6 +160,7 @@ mod tests {
             streaming: Some(true),
             prompt_style: Some(CliPromptStyle::WithState),
             disable_builtin_commands: Some(true),
+            hitl: None,
         };
 
         let merged = base.merge_overrides(overrides);
@@ -179,6 +185,7 @@ mod tests {
             streaming: Some(false),
             prompt_style: Some(CliPromptStyle::WithState),
             disable_builtin_commands: Some(false),
+            hitl: None,
         };
 
         let merged = base.clone().merge_overrides(CliOverrides::default());

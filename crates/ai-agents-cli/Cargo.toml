@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 ai-agents = { workspace = true, features = ["full"] }
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 futures = { workspace = true }
 serde = { workspace = true }

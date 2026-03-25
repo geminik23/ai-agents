@@ -1,17 +1,25 @@
+// Full HITL demo -- interactive CLI handler with approve/reject/modify support.
+//
+// Flow: load YAML -> inject custom tools + approval handler -> run REPL
+//       -> tool call -> CliApprovalHandler -> [Y] execute / [N] reject / [M] modify
+//
+// For a minimal handler (y/N only), see src/simple_approval.rs.
+
+mod tools;
+
 use ai_agents::{
-    AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result, Tool, ToolResult,
+    AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result,
 };
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
 use async_trait::async_trait;
-use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
+use serde_json::json;
 
-// ============================================================================
-// Custom Approval Handler — interactive CLI
-// ============================================================================
+use tools::{SendPaymentTool, DeleteRecordTool};
 
+/// Interactive CLI handler with approve, reject, and modify support.
 struct CliApprovalHandler;
 
 #[async_trait]
@@ -71,92 +79,6 @@ impl ApprovalHandler for CliApprovalHandler {
         Some("en".to_string())
     }
 }
-
-// ============================================================================
-// Mock Tools
-// ============================================================================
-
-struct SendPaymentTool;
-
-#[async_trait]
-impl Tool for SendPaymentTool {
-    fn id(&self) -> &str {
-        "send_payment"
-    }
-    fn name(&self) -> &str {
-        "Send Payment"
-    }
-    fn description(&self) -> &str {
-        "Transfer funds to a recipient. Call immediately without asking for confirmation."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "amount": { "type": "number", "description": "Payment amount" },
-                "currency": { "type": "string", "description": "Currency code (USD, KRW, etc.)" },
-                "recipient": { "type": "string", "description": "Recipient name" }
-            },
-            "required": ["amount", "currency", "recipient"]
-        })
-    }
-    async fn execute(&self, args: Value) -> ToolResult {
-        let amount = args.get("amount").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let currency = args
-            .get("currency")
-            .and_then(|v| v.as_str())
-            .unwrap_or("USD");
-        let recipient = args
-            .get("recipient")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown");
-        let tx_id = &uuid::Uuid::new_v4().to_string()[..8];
-        ToolResult::ok(format!(
-            "Payment of {} {} to {} processed. TX: {}",
-            amount, currency, recipient, tx_id
-        ))
-    }
-}
-
-struct DeleteRecordTool;
-
-#[async_trait]
-impl Tool for DeleteRecordTool {
-    fn id(&self) -> &str {
-        "delete_record"
-    }
-    fn name(&self) -> &str {
-        "Delete Record"
-    }
-    fn description(&self) -> &str {
-        "Permanently delete a record. Call immediately without asking for confirmation."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "record_id": { "type": "string", "description": "Record ID to delete" },
-                "record_type": { "type": "string", "description": "Type (user, order, etc.)" }
-            },
-            "required": ["record_id", "record_type"]
-        })
-    }
-    async fn execute(&self, args: Value) -> ToolResult {
-        let id = args
-            .get("record_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let rtype = args
-            .get("record_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("record");
-        ToolResult::ok(format!("Deleted {} with ID: {}", rtype, id))
-    }
-}
-
-// ============================================================================
-// Main
-// ============================================================================
 
 #[tokio::main]
 async fn main() -> Result<()> {

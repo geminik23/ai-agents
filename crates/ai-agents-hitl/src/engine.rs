@@ -6,7 +6,7 @@ use ai_agents_llm::LLMRegistry;
 
 use super::config::{HITLConfig, StateApprovalTrigger, ToolApprovalConfig};
 use super::handler::ApprovalHandler;
-use super::localization::{MessageResolver, resolve_tool_message};
+use super::localization::{MessageResolver, render_template, resolve_tool_message};
 use super::types::{ApprovalTrigger, HITLCheckResult};
 
 pub struct HITLEngine {
@@ -26,10 +26,11 @@ impl HITLEngine {
         if let Some(tool_config) = self.config.tools.get(tool_name) {
             if tool_config.require_approval {
                 let context = self.build_tool_context(tool_config, args);
-                let message = tool_config
+                let raw = tool_config
                     .approval_message
                     .get_any()
                     .unwrap_or_else(|| format!("Approve execution of tool '{}'?", tool_name));
+                let message = render_template(&raw, &context);
                 let timeout = tool_config
                     .timeout_seconds
                     .or(Some(self.config.default_timeout_seconds));
@@ -49,12 +50,22 @@ impl HITLEngine {
         &self,
         tool_name: &str,
         args: &Value,
+        agent_context: &HashMap<String, Value>,
         handler: &dyn ApprovalHandler,
         llm_registry: Option<&LLMRegistry>,
     ) -> Result<HITLCheckResult> {
         if let Some(tool_config) = self.config.tools.get(tool_name) {
             if tool_config.require_approval {
-                let context = self.build_tool_context(tool_config, args);
+                let mut context = self.build_tool_context(tool_config, args);
+
+                // Merge language hints from agent context for message localization
+                for key in &["user.language", "input.detected.language", "language"] {
+                    if !context.contains_key(*key) {
+                        if let Some(val) = agent_context.get(*key) {
+                            context.insert(key.to_string(), val.clone());
+                        }
+                    }
+                }
 
                 let message = resolve_tool_message(
                     tool_config,
@@ -84,11 +95,6 @@ impl HITLEngine {
     pub fn check_conditions(&self, data: &Value) -> HITLCheckResult {
         for condition in &self.config.conditions {
             if condition.require_approval && self.evaluate_condition(&condition.when, data) {
-                let message = condition
-                    .approval_message
-                    .get_any()
-                    .unwrap_or_else(|| format!("Condition '{}' matched", condition.name));
-
                 let mut context = HashMap::new();
                 context.insert(
                     "condition_name".to_string(),
@@ -104,6 +110,12 @@ impl HITLEngine {
                     }
                 }
 
+                let raw = condition
+                    .approval_message
+                    .get_any()
+                    .unwrap_or_else(|| format!("Condition '{}' matched", condition.name));
+                let message = render_template(&raw, &context);
+
                 return HITLCheckResult::required(
                     ApprovalTrigger::condition(&condition.name, &condition.when),
                     context,
@@ -118,6 +130,7 @@ impl HITLEngine {
     pub async fn check_conditions_with_localization(
         &self,
         data: &Value,
+        agent_context: &HashMap<String, Value>,
         handler: &dyn ApprovalHandler,
         llm_registry: Option<&LLMRegistry>,
     ) -> Result<HITLCheckResult> {
@@ -135,6 +148,15 @@ impl HITLEngine {
                 if let Some(obj) = data.as_object() {
                     for (k, v) in obj {
                         context.insert(k.clone(), v.clone());
+                    }
+                }
+
+                // Merge language hints from agent context for message localization
+                for key in &["user.language", "input.detected.language", "language"] {
+                    if !context.contains_key(*key) {
+                        if let Some(val) = agent_context.get(*key) {
+                            context.insert(key.to_string(), val.clone());
+                        }
                     }
                 }
 
@@ -204,6 +226,7 @@ impl HITLEngine {
         &self,
         from: Option<&str>,
         to: &str,
+        agent_context: &HashMap<String, Value>,
         handler: &dyn ApprovalHandler,
         llm_registry: Option<&LLMRegistry>,
     ) -> Result<HITLCheckResult> {
@@ -217,6 +240,15 @@ impl HITLEngine {
                     );
                 }
                 context.insert("to_state".to_string(), Value::String(to.to_string()));
+
+                // Merge language hints from agent context for message localization
+                for key in &["user.language", "input.detected.language", "language"] {
+                    if !context.contains_key(*key) {
+                        if let Some(val) = agent_context.get(*key) {
+                            context.insert(key.to_string(), val.clone());
+                        }
+                    }
+                }
 
                 let message = if state_config.approval_message.is_empty() {
                     format!("Approve transition to state '{}'?", to)
@@ -736,6 +768,7 @@ mod tests {
             .check_tool_with_localization(
                 "localized_payment",
                 &serde_json::json!({}),
+                &HashMap::new(),
                 &handler,
                 None,
             )
@@ -784,6 +817,7 @@ mod tests {
             .check_state_transition_with_localization(
                 Some("greeting"),
                 "localized_escalation",
+                &HashMap::new(),
                 &handler,
                 None,
             )
@@ -792,6 +826,63 @@ mod tests {
 
         if let HITLCheckResult::Required { message, .. } = result {
             assert_eq!(message, "人間にエスカレーションしますか？");
+        } else {
+            panic!("Expected Required result");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_tool_with_localization_user_strategy() {
+        let mut config = create_test_config();
+
+        let mut messages = HashMap::new();
+        messages.insert(
+            "en".to_string(),
+            "Approve {{ method }} request?".to_string(),
+        );
+        messages.insert(
+            "ko".to_string(),
+            "{{ method }} 요청을 승인하시겠습니까?".to_string(),
+        );
+
+        config.tools.insert(
+            "http".to_string(),
+            ToolApprovalConfig {
+                require_approval: true,
+                approval_context: vec!["method".to_string(), "url".to_string()],
+                approval_message: ApprovalMessage::MultiLanguage {
+                    messages,
+                    description: None,
+                },
+                message_language: Some(MessageLanguageConfig {
+                    strategy: MessageLanguageStrategy::User,
+                    fallback: vec![],
+                    explicit: None,
+                    llm_generate: None,
+                }),
+                timeout_seconds: None,
+            },
+        );
+
+        let engine = HITLEngine::new(config);
+        let handler = TestHandler::new();
+
+        let args = serde_json::json!({"method": "GET", "url": "https://example.com"});
+
+        // Agent context carries the detected language from process pipeline
+        let mut agent_ctx = HashMap::new();
+        agent_ctx.insert(
+            "input.detected.language".to_string(),
+            serde_json::json!("ko"),
+        );
+
+        let result = engine
+            .check_tool_with_localization("http", &args, &agent_ctx, &handler, None)
+            .await
+            .unwrap();
+
+        if let HITLCheckResult::Required { message, .. } = result {
+            assert_eq!(message, "GET 요청을 승인하시겠습니까?");
         } else {
             panic!("Expected Required result");
         }
@@ -826,7 +917,7 @@ mod tests {
         let data = Value::Object(context_map);
 
         let result = engine
-            .check_conditions_with_localization(&data, &handler, None)
+            .check_conditions_with_localization(&data, &HashMap::new(), &handler, None)
             .await
             .unwrap();
 

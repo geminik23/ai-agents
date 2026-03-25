@@ -1109,6 +1109,7 @@ impl RuntimeAgent {
 
     #[instrument(skip(self, tool_call), fields(tool = %tool_call.name))]
     async fn execute_tool_smart(&self, tool_call: &ToolCall) -> Result<String> {
+        let mut tool_call = tool_call.clone();
         info!(args = %tool_call.arguments, "Executing tool");
 
         self.hooks
@@ -1141,7 +1142,14 @@ impl RuntimeAgent {
             }
         }
 
-        // FIX: note Check security FIRST — don't bother the human if security blocks
+        // Build language context for HITL localization.
+        let hitl_lang_ctx = self.build_hitl_language_context();
+
+        // Compute canonical tool ID before security/HITL checks so both use it.
+        // Use the tool ID (e.g. "http") instead of the name (e.g. "HTTP Client") so it matches the HITL config keys in hitl.tools.<id>.
+        let hitl_tool_id = resolved_id.as_deref().unwrap_or(&tool_name_lower);
+
+        // Check security FIRST -- don't bother the human if security blocks
         if self.tool_security.config().enabled {
             let security_result = self
                 .tool_security
@@ -1157,15 +1165,27 @@ impl RuntimeAgent {
                 SecurityCheckResult::RequireConfirmation { message } => {
                     // Route through HITL if available, otherwise error
                     if let Some(ref hitl_engine) = self.hitl_engine {
-                        let check_result =
-                            hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
-                        let approved = self.request_hitl_approval(check_result).await?;
-                        if !approved {
-                            warn!(tool = %tool_call.name, "Security confirmation rejected by approver");
-                            return Err(AgentError::Tool(format!(
-                                "Confirmation rejected: {}",
-                                message
-                            )));
+                        let check_result = hitl_engine
+                            .check_tool_with_localization(
+                                hitl_tool_id,
+                                &tool_call.arguments,
+                                &hitl_lang_ctx,
+                                self.approval_handler.as_ref(),
+                                Some(&self.llm_registry),
+                            )
+                            .await?;
+                        let result = self.request_hitl_approval(check_result).await?;
+                        match result {
+                            ApprovalResult::Approved | ApprovalResult::Modified { .. } => {}
+                            ApprovalResult::Rejected { reason } => {
+                                let reason_str = reason.as_deref().unwrap_or("rejected");
+                                warn!(tool = %tool_call.name, reason = %reason_str, "Security confirmation rejected by approver");
+                                return Err(AgentError::Tool(format!(
+                                    "Confirmation rejected: {}",
+                                    message
+                                )));
+                            }
+                            _ => {}
                         }
                     } else {
                         warn!(message = %message, "Tool requires confirmation but no HITL handler");
@@ -1183,28 +1203,67 @@ impl RuntimeAgent {
 
         // Check HITL approval for tool (after security passes)
         if let Some(ref hitl_engine) = self.hitl_engine {
-            let check_result = hitl_engine.check_tool(&tool_call.name, &tool_call.arguments);
+            let check_result = hitl_engine
+                .check_tool_with_localization(
+                    hitl_tool_id,
+                    &tool_call.arguments,
+                    &hitl_lang_ctx,
+                    self.approval_handler.as_ref(),
+                    Some(&self.llm_registry),
+                )
+                .await?;
             if check_result.is_required() {
-                let approved = self.request_hitl_approval(check_result).await?;
-                if !approved {
-                    warn!(tool = %tool_call.name, "Tool execution rejected by HITL");
-                    return Err(AgentError::HITLRejected(format!(
-                        "Tool '{}' was rejected by human approver. Do not retry.",
-                        tool_call.name
-                    )));
+                let result = self.request_hitl_approval(check_result).await?;
+                match result {
+                    ApprovalResult::Approved => {}
+                    ApprovalResult::Modified { changes } => {
+                        if let Some(obj) = tool_call.arguments.as_object_mut() {
+                            for (k, v) in changes {
+                                obj.insert(k, v);
+                            }
+                        }
+                        info!(tool = %tool_call.name, "Tool arguments modified by approver");
+                    }
+                    ApprovalResult::Rejected { reason: _reason } => {
+                        warn!(tool = %tool_call.name, "Tool execution rejected by HITL");
+                        return Err(AgentError::HITLRejected(format!(
+                            "Tool '{}' was rejected by human approver. Do not retry.",
+                            tool_call.name
+                        )));
+                    }
+                    _ => {}
                 }
             }
 
             // Check conditions (e.g., amount > 1000)
-            let condition_check = hitl_engine.check_conditions(&tool_call.arguments);
+            let condition_check = hitl_engine
+                .check_conditions_with_localization(
+                    &tool_call.arguments,
+                    &hitl_lang_ctx,
+                    self.approval_handler.as_ref(),
+                    Some(&self.llm_registry),
+                )
+                .await?;
             if condition_check.is_required() {
-                let approved = self.request_hitl_approval(condition_check).await?;
-                if !approved {
-                    warn!(tool = %tool_call.name, "Tool execution rejected by HITL condition");
-                    return Err(AgentError::HITLRejected(format!(
-                        "Tool '{}' was rejected due to policy condition. Do not retry.",
-                        tool_call.name
-                    )));
+                let result = self.request_hitl_approval(condition_check).await?;
+                match result {
+                    ApprovalResult::Approved => {}
+                    ApprovalResult::Modified { changes } => {
+                        if let Some(obj) = tool_call.arguments.as_object_mut() {
+                            for (k, v) in changes {
+                                obj.insert(k, v);
+                            }
+                        }
+                        info!(tool = %tool_call.name, "Tool arguments modified by approver (condition)");
+                    }
+                    ApprovalResult::Rejected { reason: _reason } => {
+                        warn!(tool = %tool_call.name, "Tool execution rejected by HITL condition");
+                        return Err(AgentError::HITLRejected(format!(
+                            "Tool '{}' was rejected due to policy condition. Do not retry.",
+                            tool_call.name
+                        )));
+                    }
+                    _ => {}
                 }
             }
         }
@@ -1230,7 +1289,7 @@ impl RuntimeAgent {
                 .await
                 .map_err(|e| AgentError::Tool(e.to_string()))
         } else {
-            self.execute_tool(tool_call).await
+            self.execute_tool(&tool_call).await
         };
 
         // Apply on_failure policy when the tool fails after all retries.
@@ -2533,8 +2592,11 @@ Respond in JSON format:
                             format!("User request needs human assistance: {}", reason),
                             Some(hitl.config().default_timeout_seconds),
                         );
-                        let approved = self.request_hitl_approval(check_result).await?;
-                        if approved {
+                        let result = self.request_hitl_approval(check_result).await?;
+                        if matches!(
+                            result,
+                            ApprovalResult::Approved | ApprovalResult::Modified { .. }
+                        ) {
                             return self.run_loop_internal(input).await;
                         }
                     }
@@ -3746,14 +3808,14 @@ Respond in JSON format:
                                 Some(hitl.config().default_timeout_seconds),
                             );
                             match self.request_hitl_approval(check_result).await {
-                                Ok(true) => {
+                                Ok(result) if matches!(result, ApprovalResult::Approved | ApprovalResult::Modified { .. }) => {
                                     let mut inner = self.run_loop_internal_stream(input);
                                     while let Some(chunk) = inner.next().await {
                                         yield chunk;
                                     }
                                     return;
                                 }
-                                Ok(false) => {}
+                                Ok(_) => {}
                                 Err(e) => {
                                     yield StreamChunk::error(e.to_string());
                                     return;
@@ -3846,9 +3908,21 @@ Respond in JSON format:
         &self.approval_handler
     }
 
-    async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<bool> {
+    /// Build a context map with language hints from context_manager for HITL message localization.
+    fn build_hitl_language_context(&self) -> HashMap<String, Value> {
+        let mut ctx = HashMap::new();
+        for key in &["user.language", "input.detected.language", "language"] {
+            if let Some(val) = self.context_manager.get(key) {
+                ctx.insert(key.to_string(), val);
+            }
+        }
+        ctx
+    }
+
+    /// Send a HITL check result through the approval flow and return the full ApprovalResult.
+    async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
-            return Ok(true);
+            return Ok(ApprovalResult::Approved);
         };
 
         self.hooks.on_approval_requested(&request).await;
@@ -3869,36 +3943,49 @@ Respond in JSON format:
 
         self.hooks.on_approval_result(&request_id, &result).await;
 
-        match result {
-            ApprovalResult::Approved => Ok(true),
-            ApprovalResult::Modified { .. } => Ok(true),
-            ApprovalResult::Rejected { reason } => {
-                if let Some(r) = reason {
-                    info!(reason = %r, "HITL rejected");
-                }
-                Ok(false)
-            }
+        // Resolve timeout action
+        let result = match result {
             ApprovalResult::Timeout => {
                 if let Some(ref engine) = self.hitl_engine {
                     match engine.config().on_timeout {
-                        TimeoutAction::Approve => Ok(true),
-                        TimeoutAction::Reject => Ok(false),
+                        TimeoutAction::Approve => ApprovalResult::Approved,
+                        TimeoutAction::Reject => ApprovalResult::Rejected {
+                            reason: Some("Timeout".to_string()),
+                        },
                         TimeoutAction::Error => {
-                            Err(AgentError::Other("HITL approval timeout".to_string()))
+                            return Err(AgentError::Other("HITL approval timeout".to_string()));
                         }
                     }
                 } else {
-                    Ok(false)
+                    ApprovalResult::Rejected {
+                        reason: Some("Timeout (no engine)".to_string()),
+                    }
                 }
             }
-        }
+            other => other,
+        };
+
+        Ok(result)
     }
 
     pub async fn check_state_hitl(&self, from: Option<&str>, to: &str) -> Result<bool> {
         if let Some(ref hitl_engine) = self.hitl_engine {
-            let check_result = hitl_engine.check_state_transition(from, to);
+            let hitl_lang_ctx = self.build_hitl_language_context();
+            let check_result = hitl_engine
+                .check_state_transition_with_localization(
+                    from,
+                    to,
+                    &hitl_lang_ctx,
+                    self.approval_handler.as_ref(),
+                    Some(&self.llm_registry),
+                )
+                .await?;
             if check_result.is_required() {
-                return self.request_hitl_approval(check_result).await;
+                let result = self.request_hitl_approval(check_result).await?;
+                return Ok(matches!(
+                    result,
+                    ApprovalResult::Approved | ApprovalResult::Modified { .. }
+                ));
             }
         }
         Ok(true)
