@@ -592,6 +592,74 @@ impl AgentBuilder {
         self
     }
 
+    /// Wire spawner tools when the spec has a `spawner:` section.
+    /// Call after `auto_configure_llms()` and `auto_configure_features()`.
+    pub fn auto_configure_spawner(mut self) -> Result<Self> {
+        let spawner_config = match self.spec.as_ref().and_then(|s| s.spawner.as_ref()) {
+            Some(c) => c.clone(),
+            None => return Ok(self),
+        };
+
+        use crate::spawner::{
+            AgentRegistry, AgentSpawner,
+            config::{configure_spawner_tools, resolve_templates},
+        };
+
+        let mut spawner = AgentSpawner::new();
+
+        if spawner_config.shared_llms {
+            if let Some(ref reg) = self.llm_registry {
+                spawner = spawner.with_shared_llms(reg.clone());
+            }
+        }
+
+        if !spawner_config.shared_context.is_empty() {
+            spawner = spawner.with_shared_context_map(spawner_config.shared_context.clone());
+        }
+
+        if let Some(max) = spawner_config.max_agents {
+            spawner = spawner.with_max_agents(max);
+        }
+
+        if let Some(ref prefix) = spawner_config.name_prefix {
+            spawner = spawner.with_name_prefix(prefix.clone());
+        }
+
+        // Resolve file-path templates against the parent YAML directory.
+        if !spawner_config.templates.is_empty() {
+            let resolved = resolve_templates(&spawner_config.templates, self.yaml_dir.as_deref())?;
+            spawner = spawner.with_templates(resolved);
+        }
+
+        if let Some(ref allowed) = spawner_config.allowed_tools {
+            spawner = spawner.with_allowed_tools(allowed.clone());
+        }
+
+        let spawner = Arc::new(spawner);
+        let registry = Arc::new(AgentRegistry::new());
+        let llm_for_tools = Arc::new(self.llm_registry.clone().unwrap_or_default());
+        let agent_name = self
+            .spec
+            .as_ref()
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+
+        let tools = configure_spawner_tools(
+            Arc::clone(&spawner),
+            Arc::clone(&registry),
+            llm_for_tools,
+            &agent_name,
+        );
+
+        let tool_registry = self.tools.get_or_insert_with(create_builtin_registry);
+        for tool in tools {
+            let _ = tool_registry.register(tool);
+        }
+
+        tracing::info!("Spawner tools registered");
+        Ok(self)
+    }
+
     pub fn build(mut self) -> Result<RuntimeAgent> {
         let base_prompt = self
             .system_prompt

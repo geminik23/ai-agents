@@ -115,7 +115,9 @@ pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
         .context("failed to auto-configure agent features")?
         .auto_configure_mcp()
         .await
-        .context("failed to auto-configure MCP tools")?;
+        .context("failed to auto-configure MCP tools")?
+        .auto_configure_spawner()
+        .context("failed to auto-configure spawner")?;
 
     // Attach LoggingHooks when the agent uses memory features that produce
     // hook events (compacting memory, token budgeting). Without this, budget

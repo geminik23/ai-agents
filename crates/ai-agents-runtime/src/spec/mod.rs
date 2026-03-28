@@ -3,6 +3,7 @@
 mod llm;
 mod memory;
 mod provider;
+pub mod spawner;
 mod storage;
 mod tool;
 
@@ -12,6 +13,7 @@ pub use provider::{
     BuiltinProviderConfig, ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig,
     ToolAliasesConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
+pub use spawner::{SpawnerConfig, TemplateSource};
 pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
 pub use tool::{StructuredToolEntry, ToolConfig, ToolEntry};
 
@@ -111,6 +113,10 @@ pub struct AgentSpec {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
+
+    /// Dynamic agent spawning configuration (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawner: Option<SpawnerConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +204,7 @@ impl Default for AgentSpec {
             provider_security: ProviderSecurityConfig::default(),
             tool_aliases: ToolAliasesConfig::default(),
             metadata: None,
+            spawner: None,
         }
     }
 }

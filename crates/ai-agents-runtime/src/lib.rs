@@ -4,6 +4,7 @@ mod builder;
 mod runtime;
 mod streaming;
 
+pub mod spawner;
 pub mod spec;
 
 pub use builder::AgentBuilder;

@@ -63,6 +63,7 @@
 //! | [`hooks`] | Lifecycle event hooks for logging, metrics, monitoring |
 //! | [`spec`] | YAML agent specification types |
 //! | [`template`] | Template loading with Jinja2 rendering and inheritance |
+//! | [`spawner`] | Dynamic agent spawning, registry, and inter-agent messaging |
 //!
 //! # Feature Flags
 //!
@@ -244,8 +245,8 @@ pub mod spec {
         AgentSpec, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle, CliMetadata,
         CliPromptStyle, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
         ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
-        SqliteStorageConfig, StorageConfig, StructuredToolEntry, ToolAliasesConfig, ToolConfig,
-        ToolEntry, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+        SpawnerConfig, SqliteStorageConfig, StorageConfig, StructuredToolEntry, ToolAliasesConfig,
+        ToolConfig, ToolEntry, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
     };
 }
 
@@ -398,6 +399,16 @@ pub mod mcp {
     pub use ai_agents_tools::mcp::{
         MCPViewConfig, MCPViewTool, MCPWrapperConfig, MCPWrapperSecurity, MCPWrapperTool,
         MCPWrapperTransport,
+    };
+}
+
+/// Dynamic agent spawning, registry, and inter-agent messaging.
+pub mod spawner {
+    pub use ai_agents_runtime::spawner::{
+        AgentRegistry, AgentSpawner, GenerateAgentTool, ListAgentsTool, NamespacedStorage,
+        RegistryHooks, RemoveAgentTool, ResolvedTemplate, SendMessageTool, SpawnedAgent,
+        SpawnedAgentInfo, auto_configure_spawner, configure_spawner_tools, resolve_templates,
+        spawner_from_config,
     };
 }
 

@@ -1,0 +1,141 @@
+name: GameMaster
+version: "1.0.0"
+description: "Game master that creates and manages NPC agents dynamically"
+
+# Dynamic agent spawning example -- agent-as-factory pattern.
+#
+# The game master uses four spawner tools to create, message, list, and remove child agents at runtime.
+# Each spawned NPC is a full RuntimeAgent with its own memory, personality, and conversation history.
+#
+# Prerequisites:
+#   - The CLI must wire spawner tools via configure_spawner_tools() without that wiring the four tool IDs below will not resolve.
+#
+# Spawner tools:
+#   generate_agent  - create a new agent from a description or named template
+#   send_message    - send a message to another registered agent
+#   list_agents     - list all currently registered agents as JSON
+#   remove_agent    - remove an agent from the registry by ID
+#
+# Flow: user asks for NPC -> LLM calls generate_agent tool
+#         -> template path: render npc_base with variables -> spawn agent -> register
+#         -> LLM path: router LLM generates YAML -> validate -> spawn -> register
+#       user asks NPC question -> LLM calls send_message -> registry.send() -> NPC response
+#       user asks to list NPCs -> LLM calls list_agents -> JSON list
+#       user asks to remove NPC -> LLM calls remove_agent -> deregister
+#
+# The system prompt focuses on behavioral guidance only.
+# Tool names, descriptions, and argument schemas are auto-injected by the framework.
+# Template names and variables are auto-discovered from template metadata - the generate_agent tool description includes them automatically.
+system_prompt: |
+  You are a Game Master for the world of Westeros from Game of Thrones.
+  You create and manage NPCs (non-player characters) that players can interact with.
+
+  Your responsibilities:
+  - Generate unique NPCs with distinct personalities when asked
+  - Send messages between NPCs to simulate world events
+  - Remove NPCs that are no longer needed
+  - List all active NPCs when asked
+
+  When creating NPCs, give them:
+  - A memorable name fitting the Westeros setting (e.g. Ser Brynden, Maester Luwin)
+  - A clear role (knight, maester, sellsword, innkeeper, blacksmith, spy, etc.)
+  - A distinct personality with 2-3 defining traits
+  - A short backstory referencing houses, regions, or events of Westeros
+
+  Always use the available template when creating NPCs.
+  The generate_agent tool shows available templates and their variables.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+# Compacting memory so the game master remembers which NPCs it created and what happened in the world across a long session.
+memory:
+  type: compacting
+  max_messages: 200
+  compress_threshold: 30   # summarize after 30 messages
+  summarizer_llm: router   # use the cheap/fast model for summaries
+
+# Tool scoping (optional):
+#   Spawner tools (generate_agent, send_message, list_agents, remove_agent) are registered automatically by auto_configure_spawner() at startup.
+#
+#   When `tools:` is omitted, the LLM sees ALL registered tools - spawner tools plus builtins (calculator, datetime, http, json, etc.).
+#   When `tools:` lists specific IDs, the LLM sees ONLY those tools.
+#   When `tools: []` is empty, the LLM sees NO tools at all.
+#
+# Uncomment below to restrict the LLM to spawner tools only:
+tools:
+  - generate_agent
+  - send_message
+  - list_agents
+  - remove_agent
+
+# Spawner configuration - controls how child agents are created.
+#
+# shared_llms: true means spawned NPCs reuse this agent's LLM connections instead of creating new provider instances. Saves memory and API setup.
+#
+# Templates support two source types:
+#   1. File path (recommended for complex templates):
+#        npc_base:
+#          path: ./templates/npc_base.yaml
+#   2. Inline string (convenient for short/simple templates):
+#        simple_npc: |
+#          name: "{{ name }}"
+#          system_prompt: "You are {{ name }}."
+#
+# File paths are resolved relative to this YAML file's directory. Absolute paths (e.g. /opt/templates/npc.yaml) are used as-is.
+#
+# Template variables:
+#   - Caller variables are top-level: {{ name }}, {{ role }}, {{ personality }}
+#   - Shared context is under the context. prefix: {{ context.world_name }}
+spawner:
+  shared_llms: true                  # NPCs share this agent's LLM connections
+  max_agents: 50                     # hard limit on total spawned NPCs
+  name_prefix: "npc_"               # auto-naming: npc_001, npc_002, ...
+
+  # Values injected into every spawned agent's context manager at spawn time.
+  # Available in NPC templates as {{ context.<key> }}.
+  #
+  # NOTE: shared_context is a one-time snapshot, not a live reference.
+  # - Already-spawned agents do NOT see updates made after they were created.
+  # - Spawned agents cannot write back to shared_context.
+  # - The parent agent does not automatically receive these values
+  #   (declare them separately in the parent's context: section if needed).
+  # Live cross-agent shared state is planned for future work.
+  shared_context:
+    world_name: "Westeros"
+    current_era: "War of the Five Kings"
+    setting: "Game of Thrones"
+
+  # Named templates for spawn_from_template().
+  # The generate_agent tool uses these when a "template" argument is provided.
+  templates:
+    # File-based template (recommended for complex templates).
+    # See templates/npc_base.yaml for the full template with Jinja2 variables.
+    npc_base:
+      path: ./templates/npc_base.yaml
+
+    # Inline template (convenient for short/simple templates).
+    # The entire YAML spec is embedded as a string value directly.
+    simple_npc: |
+      name: "{{ name }}"
+      system_prompt: "You are {{ name }}, a simple NPC in {{ context.world_name }}. Keep responses to one sentence."
+
+metadata:
+  cli:
+    welcome: "=== Game Master: Westeros NPC Spawning ==="
+    hints:
+      - "Try: Create a grizzled Night's Watch deserter hiding in the Riverlands"
+      - "Try: Create a cunning spymaster loyal to House Lannister"
+      - "Try: List all NPCs"
+      - "Try: Ask the deserter what he saw beyond the Wall (uses send_message)"
+      - "Try: Make the spymaster and the deserter talk to each other"
+      - "Try: Remove the deserter"

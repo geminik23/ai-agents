@@ -282,6 +282,23 @@ Example:
 cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_agent.yaml
 ```
 
+### `yaml/spawner/`
+
+Dynamic agent spawning - create, message, list, and remove agents at runtime from a parent agent.
+
+| File | Description |
+|------|-------------|
+| `game_master.yaml` | Game master that spawns NPC agents on demand using four spawner tools (`generate_agent`, `send_message`, `list_agents`, `remove_agent`) with shared LLMs, named templates, and auto-naming |
+
+Note: The spawner tools are auto-registered by `AgentBuilder::auto_configure_spawner()` when the YAML has a `spawner:` section.
+The `spawner:` section defines shared LLMs, storage, context, spawn limits, naming, and templates for child agents.
+
+Example:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/spawner/game_master.yaml
+```
+
 ## Rust Examples
 
 Rust examples are for embedding and extension scenarios.

@@ -38,6 +38,7 @@ tracing = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
+minijinja = { workspace = true }
 
 [features]
 default = []
