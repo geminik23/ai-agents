@@ -4,7 +4,7 @@ set -eu
 if ! command -v zola >/dev/null 2>&1; then
   mkdir -p .bin
   if [ ! -x .bin/zola ]; then
-    curl -L https://github.com/getzola/zola/releases/download/v0.19.2/zola-v0.19.2-x86_64-unknown-linux-gnu.tar.gz \
+    curl -L https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz \
       | tar -xz -C .bin
     chmod +x .bin/zola
   fi
