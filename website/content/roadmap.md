@@ -10,8 +10,6 @@ This page tracks what has shipped in each release candidate, what we are working
 
 ## What's Shipped
 
-Each release candidate builds on the previous one. The framework has been in active development since the pre-RC era.
-
 | Release | Highlights |
 |---------|------------|
 | **Pre-RC** | Core framework: YAML agents, tools, skills, states, hooks, HITL, streaming, error recovery, process pipeline |
@@ -41,13 +39,9 @@ Structured, persistent, evolvable agent identity - personality, role, backstory,
 
 Persistent user context and key facts across sessions. The agent remembers who you are and what matters between conversations.
 
-### LLM Provider Enhancement
+### Relationship Memory
 
-Stable LLM client layer with accurate token counting, provider factory/plugin architecture, and improved config passthrough. Foundation for observability and budget control.
-
-### Observability & Tracing
-
-Per-call latency, token usage, and cost tracking integrated into the hooks system. Export to JSON, CSV, or Prometheus.
+Per-actor trust, sentiment, rapport, and interaction history with LLM-based auto-evaluation. Agents build and maintain relationships over time.
 
 ---
 
@@ -67,27 +61,27 @@ Every planned feature and its current status. Features are independent unless no
 | **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | Planned |
 | **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals | Planned |
 | **Session Management + Key Facts** | Persistent user context and key facts across sessions | Planned |
+| **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |
+| **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | Planned |
 | **Evaluation Framework** | YAML-driven scenario runner with assertions, LLM judge, and metrics | Planned |
 | **Observability & Tracing** | Per-call latency, token usage, cost tracking via hooks | Planned |
-| **Budget Control** | Per-session and per-agent cost limits with fallback on budget exceeded | Planned - needs Observability |
-| **Custom Reasoning Prompts** | Domain and language-specific CoT/ReAct instruction templates | Planned |
-| **Reasoning Depth Control** | Auto shallow/standard/deep reasoning with resource limits | Planned - needs Custom Reasoning Prompts |
+| **Budget Control** | Per-session and per-agent cost limits with fallback on budget exceeded | Planned — needs Observability |
 | **Conversation Scripts** | Declarative guided flows (wizards, forms) with LLM extraction | Planned |
 | **Conversation Style Modifiers** | LLM-based dynamic tone, formality, and style adaptation | Planned |
+| **Custom Reasoning Prompts** | Domain and language-specific CoT/ReAct instruction templates | Planned |
+| **Reasoning Depth Control** | Auto shallow/standard/deep reasoning with resource limits | Planned — needs Custom Reasoning Prompts |
 | **VectorDB Tool** | Embedding storage and similarity search tool | Planned |
-| **Knowledge Base / RAG Pipeline** | Document ingestion, chunking, and retrieval-augmented generation | Planned - needs VectorDB |
+| **Knowledge Base / RAG Pipeline** | Document ingestion, chunking, and retrieval-augmented generation | Planned — needs VectorDB |
+| **Knowledge Scoping** | Source-based knowledge boundaries and access control | Planned |
+| **Shared Memory** | Group-level shared memory stores with publish/subscribe | Planned — needs Multi-Agent Orchestration |
+| **Memory Dynamics** | Salience scoring, time-based decay, and context-aware retrieval ranking | Planned |
 | **Background Tasks & Scheduling** | Async job execution with cron, interval, event triggers, and DAG dependencies | Planned |
 | **Hot Reload** | Live YAML config updates with graceful session handling and auto-rollback | Planned |
 | **Code Interpreter** | Sandboxed code execution with templates and persistent library | Planned |
 | **Semantic Caching** | Cache semantically similar queries to reduce LLM calls | Planned |
-| **A2A Protocol** | Cross-service agent collaboration protocol | Planned - needs Multi-Agent Orchestration |
-| **Agent Composition Patterns** | Composite workflows, magentic orchestration, advanced multi-agent patterns | Planned - needs Multi-Agent Orchestration |
-| **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |
-| **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
-| **Knowledge Scoping** | Source-based knowledge boundaries and access control | Planned |
-| **Shared Memory** | Group-level shared memory stores with publish/subscribe | Planned - needs Multi-Agent Orchestration |
-| **Memory Dynamics** | Salience scoring, time-based decay, and context-aware retrieval ranking | Planned |
+| **A2A Protocol** | Cross-service agent collaboration protocol | Planned — needs Multi-Agent Orchestration |
+| **Agent Composition Patterns** | Composite workflows, magentic orchestration, advanced multi-agent patterns | Planned — needs Multi-Agent Orchestration |
 
 ---
 
