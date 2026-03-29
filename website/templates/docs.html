@@ -93,9 +93,11 @@ get_section(path="docs/_index.md") %}
     /* ── Layout ──────────────────────────────────────────────── */
     .docs-layout {
         display: flex;
+        width: 90%;
         max-width: 1280px;
         margin: 0 auto;
         min-height: calc(100vh - 8rem);
+        overflow-x: hidden;
     }
 
     /* ── Sidebar ─────────────────────────────────────────────── */
@@ -175,7 +177,9 @@ get_section(path="docs/_index.md") %}
     .docs-main {
         flex: 1;
         min-width: 0;
+        max-width: 860px;
         padding: 2rem 2.5rem 4rem;
+        overflow-x: hidden;
     }
 
     .docs-content-title {
@@ -217,6 +221,7 @@ get_section(path="docs/_index.md") %}
         border-radius: 8px;
         padding: 1.25rem 1.5rem;
         overflow-x: auto;
+        max-width: 100%;
         margin: 1.5rem 0;
         transition:
             background 0.2s,
@@ -238,10 +243,11 @@ get_section(path="docs/_index.md") %}
     }
 
     .docs-body :not(pre) > code {
-        background: var(--accent-muted);
-        color: var(--accent);
+        background: var(--inline-code-bg);
+        color: var(--inline-code-text);
         padding: 0.15em 0.4em;
         border-radius: 4px;
+        font-size: 0.9em;
     }
 
     .docs-body a {
@@ -283,9 +289,13 @@ get_section(path="docs/_index.md") %}
 
     .docs-body table {
         width: 100%;
+        max-width: 100%;
         border-collapse: collapse;
         margin: 1.5rem 0;
         font-size: 0.9rem;
+        display: block;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
     }
 
     .docs-body table th,
@@ -497,8 +507,21 @@ get_section(path="docs/_index.md") %}
             display: block;
         }
 
+        .docs-layout {
+            width: 90%;
+        }
+
         .docs-main {
-            padding: 1.5rem 1rem 4rem;
+            padding: 1.5rem 0 4rem;
+        }
+
+        .docs-body table {
+            font-size: 0.82rem;
+        }
+
+        .docs-body table th,
+        .docs-body table td {
+            padding: 0.5rem 0.65rem;
         }
 
         .docs-pager {

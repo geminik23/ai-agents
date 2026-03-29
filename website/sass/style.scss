@@ -69,10 +69,12 @@ html {
   scroll-behavior: smooth;
   font-size: 16px;
   -webkit-text-size-adjust: 100%;
+  overflow-x: hidden;
 }
 
 body {
   margin: 0;
+  overflow-x: hidden;
   font-family: var(--font-sans);
   font-size: 1rem;
   line-height: 1.7;
@@ -110,13 +112,17 @@ p { margin: 0 0 1.25em; }
 
 // ── Layout ────────────────────────────────────
 .container {
+  width: 90%;
   max-width: 1200px;
   margin: 0 auto;
-  padding: 0 2rem;
 }
 
 .section-padding {
   padding: 3rem 0;
+
+  @media (max-width: 767px) {
+    padding: 2rem 0;
+  }
 }
 
 // ══════════════════════════════════════════════
@@ -514,6 +520,7 @@ pre {
   border-radius: 8px;
   padding: 1.25rem 1.5rem;
   overflow-x: auto;
+  max-width: 100%;
   margin: 1.5rem 0;
   transition: background 0.2s, border-color 0.2s;
 
@@ -753,6 +760,7 @@ pre {
 .docs-content {
   min-width: 0;
   max-width: 800px;
+  width: 100%;
 }
 
 .docs-toc {
@@ -926,15 +934,24 @@ a.badge-tag:hover {
 // ══════════════════════════════════════════════
 table {
   width: 100%;
+  max-width: 100%;
   border-collapse: collapse;
   margin: 1.5rem 0;
   font-size: 0.9rem;
+  display: block;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
 
   th, td {
     padding: 0.65rem 1rem;
     text-align: left;
     border: 1px solid var(--border);
     transition: background 0.2s, border-color 0.2s;
+  }
+
+  @media (max-width: 767px) {
+    font-size: 0.82rem;
+    th, td { padding: 0.5rem 0.65rem; }
   }
 
   th {
