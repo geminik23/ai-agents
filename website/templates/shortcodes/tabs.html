@@ -1,0 +1,46 @@
+{#
+  CSS-only tabs shortcode. Uses radio buttons for tab switching.
+  Parameters: labels (comma-separated tab labels)
+  Body: tab content panels separated by <!-- tab --> markers
+#}
+
+{% set tab_labels = labels | split(pat=",") %}
+{% set tab_contents = body | split(pat="<!-- tab -->") %}
+{% set uid = labels | slugify %}
+
+<div class="tabs" id="tabs-{{ uid }}">
+  <style>
+    #tabs-{{ uid }} .tab-panel { display: none; }
+    #tabs-{{ uid }} input[type="radio"] { display: none; }
+    {% for label in tab_labels %}
+    #tabs-{{ uid }} #tab-{{ uid }}-{{ loop.index0 }}:checked ~ .tab-panels .tab-panel-{{ loop.index0 }} { display: block; }
+    #tabs-{{ uid }} #tab-{{ uid }}-{{ loop.index0 }}:checked ~ .tab-nav label[for="tab-{{ uid }}-{{ loop.index0 }}"] {
+      border-bottom: 2px solid currentColor;
+      font-weight: bold;
+    }
+    {% endfor %}
+  </style>
+
+  {# Radio inputs at the top level so sibling selectors work #}
+  {% for label in tab_labels %}
+  <input type="radio" name="tabs-{{ uid }}" id="tab-{{ uid }}-{{ loop.index0 }}"{% if loop.first %} checked{% endif %}>
+  {% endfor %}
+
+  <div class="tab-nav" style="display: flex; gap: 0; border-bottom: 1px solid #ddd; margin-bottom: 1rem;">
+    {% for label in tab_labels %}
+    <label for="tab-{{ uid }}-{{ loop.index0 }}" style="padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; user-select: none;">
+      {{ label | trim }}
+    </label>
+    {% endfor %}
+  </div>
+
+  <div class="tab-panels">
+    {% for label in tab_labels %}
+    <div class="tab-panel tab-panel-{{ loop.index0 }}">
+      {% if tab_contents[loop.index0] is defined %}
+        {{ tab_contents[loop.index0] | safe }}
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+</div>

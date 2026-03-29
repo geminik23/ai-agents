@@ -1,124 +1,47 @@
 # AI Agents Framework
 
+[![Crates.io](https://img.shields.io/crates/v/ai-agents?style=flat-square&color=06b6d4)](https://crates.io/crates/ai-agents)
+[![docs.rs](https://img.shields.io/docsrs/ai-agents?style=flat-square&label=docs.rs)](https://docs.rs/ai-agents)
+[![License](https://img.shields.io/crates/l/ai-agents?style=flat-square)](https://github.com/geminik23/ai-agents)
+[![GitHub Stars](https://img.shields.io/github/stars/geminik23/ai-agents?style=flat-square&color=f59e0b)](https://github.com/geminik23/ai-agents)
+
 **One YAML = Any Agent.**
 
 A Rust framework for building AI agents from a single YAML specification. No code required for common use cases.
 
+**[ai-agents.rs](https://ai-agents.rs)** - Documentation, guides, and examples
+
 - Declarative behavior - everything in YAML, not code
 - Language-agnostic semantics - intent, extraction, validation via LLM (no regex)
-- Layered overrides - global -> agent -> state -> skill -> turn
+- Layered overrides - global → agent → state → skill → turn
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.6**
->
-> Under active development. APIs and YAML schema may change between minor versions.
-> Documentation and more examples are coming.
+> Status: **1.0.0-rc.7** — Under active development. APIs and YAML schema may change between minor versions.
 
 ## Features
 
-### Agent Core
-- YAML-defined agents - system prompt, tools, skills, states, memory, and behavior in one file
-- Multi-LLM support - multiple providers built-in; multiple providers with aliases (default, router, evaluator); auto-fallback on failure
-- Skill system - reusable "tool + prompt" workflows with LLM-based intent routing
-- Input/output process - declarative pipeline: normalize, detect, extract, sanitize, validate, transform, format
-- Streaming - real-time token streaming with tool call and state transition events
+- **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
+- **Hierarchical state machine** - nested sub-states, LLM-evaluated transitions, guard-based short-circuiting, intent-based routing, entry/exit actions
+- **Skill system** - reusable tool + prompt workflows with LLM-based intent routing
+- **built-in tools + MCP** - datetime, JSON, HTTP, file, text, template, math, calculator, random, echo; connect any MCP server for hundreds more
+- **Tool scoping & conditions** - 3-level filtering (state → spec → registry), context/state/time/semantic conditions, multi-language aliases, parallel execution
+- **Input/output process pipeline** - normalize, detect, extract, sanitize, validate, transform, format - all LLM-based, works across languages
+- **CompactingMemory** - LLM-based rolling summarization, token budgeting, SQLite/Redis/file persistence
+- **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
+- **Reasoning & reflection** - chain-of-thought, ReAct, plan-and-execute, auto mode; LLM self-evaluation with criteria and retry
+- **Intent disambiguation** - LLM-based ambiguity detection, clarification generation, multi-turn resolution
+- **Safety & control** - error recovery with backoff, tool security (rate limits, domain restrictions), human-in-the-loop approvals with multi-language messages
+- **Dynamic agent spawning** - runtime agent creation from YAML/templates, agent registry, inter-agent messaging
+- **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`
 
-### State Machine
-- Hierarchical states - nested sub-states with prompt inheritance
-- Auto transitions - LLM-evaluated conditions with guard-based short-circuiting
-- Intent-based routing - deterministic `intent:` transitions after disambiguation (no LLM call)
-- Entry/exit actions - execute tools, skills, prompts, or set context on state change
-- Turn timeout - automatic state transition after max turns
-
-### Context & Memory
-- Dynamic context - runtime, file, HTTP, env, and callback sources with per-turn refresh
-- Template rendering - Jinja2-compatible templates (minijinja) in system prompts
-- CompactingMemory - LLM-based rolling summarization with configurable thresholds
-- Token budgeting - per-component token allocation with overflow strategies
-- Persistence - SQLite, Redis, and file storage backends with session management
-
-### Tools
-- Built-in tools - datetime, JSON, random, HTTP, file, text, template, math, calculator(for dev)
-- MCP integration - connect to any MCP server (stdio/HTTP) for instant access to hundreds of tools via rmcp SDK
-- Tool scoping - 3-level filtering: `state.tools` -> `spec.tools` -> registry (all)
-- Conditional availability - context, state, time, semantic (LLM-based), and composite conditions
-- Multi-language aliases - tool names and descriptions in any language
-- Parallel execution - concurrent tool calls with configurable concurrency
-
-### Safety & Control
-- Error recovery - retry with backoff, LLM fallback, context overflow handling (truncate/summarize)
-- Tool security - rate limiting, domain/path restrictions, confirmation requirements
-- Human-in-the-loop - tool, condition, and state approval with multi-language message support
-
-### Intelligence
-- Reasoning modes - none, chain-of-thought, ReAct, plan-and-execute, auto (LLM selects)
-- Reflection - LLM self-evaluation with criteria, retry on failure, configurable thresholds
-- Intent disambiguation - LLM-based ambiguity detection, clarification generation, multi-turn resolution
-
-### Extensibility
-- Agent hooks - lifecycle events for logging, metrics, monitoring (message, LLM, tool, state, memory, HITL)
-- Custom providers - built-in `openai-compatible` for any OpenAI-compatible server; implement `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer` traits for full control
-
-### Supported LLM Providers
-
-| Provider | YAML `provider:` | Env Var |
-|----------|-------------------|---------|
-| OpenAI | `openai` | `OPENAI_API_KEY` |
-| Anthropic | `anthropic` | `ANTHROPIC_API_KEY` |
-| Google Gemini | `google` | `GOOGLE_API_KEY` |
-| Ollama | `ollama` | *(none — local)* |
-| DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` |
-| Groq | `groq` | `GROQ_API_KEY` |
-| Mistral | `mistral` | `MISTRAL_API_KEY` |
-| Cohere | `cohere` | `COHERE_API_KEY` |
-| xAI (Grok) | `xai` | `XAI_API_KEY` |
-| Phind | `phind` | `PHIND_API_KEY` |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
-| Any OpenAI-compatible | `openai-compatible` | *(optional, via `api_key_env`)* |
-
-`openai-compatible` requires `base_url` and `model`. Use `api_key_env` to specify which environment variable holds the API key.
-
-## Roadmap
-
-| Feature | Description | Status |
-|---------|-------------|--------|
-| Advanced Memory | CompactingMemory, token budgeting, SQLite/Redis storage | ✅ Done |
-| Tool Provider System | ToolProvider trait, multi-language aliases, extensibility | ✅ Done |
-| Workspace Refactoring | 17 modular crates for parallel compilation | ✅ Done |
-| Reasoning & Reflection | Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation | ✅ Done |
-| Intent Disambiguation | LLM-based ambiguity detection and clarification | ✅ Done |
-| MCP Integration | Model Context Protocol tool ecosystem | ✅ Done |
-| Dynamic Agent Spawning | Runtime agent creation, registry, inter-agent messaging | Planned |
-| Multi-Agent Orchestration | Supervisor, pipeline, crew patterns | Planned |
-| Agent Persona | Structured, persistent, evolvable agent identity | Planned |
-| Session Management | Cross-session user memory, key facts extraction | Planned |
-| Relationship Memory | Per-actor trust, sentiment, rapport, and interaction history | Planned |
-| Episodic Memory | Structured event memory with participants, significance, and source tracking | Planned |
-| Knowledge Scoping | Source-based knowledge boundaries and access control | Planned |
-| VectorDB Tool | Embedding-based retrieval for RAG and semantic memory search | Planned |
-| Knowledge Base / RAG | Document ingestion, chunking, retrieval pipeline | Planned |
-| Conversation Style Modifiers | Dynamic tone, formality, verbosity adaptation | Planned |
-| Background Tasks & Scheduling | Cron-based, event-driven, interval tasks | Planned |
-| Shared Memory | Group-level shared memory across multiple agents | Planned |
-| Memory Dynamics | Salience scoring, decay, and context-aware retrieval | Planned |
-| Agent Composition | Multi-agent patterns (supervisor, pipeline, debate) | Planned |
-| Conversation Scripts | Declarative guided flows with LLM extraction | Planned |
-| Budget Control | Token/cost limits, LLM switching, cost prediction | Planned |
-| A2A Protocol | Agent-to-Agent communication and delegation | Planned |
-| Evaluation Framework | Dataset runner, metrics, LLM judge | Planned |
-| Observability & Tracing | Per-call latency, token usage, cost tracking | Planned |
-| Custom Reasoning Prompts | Domain/language-specific reasoning instructions | Planned |
-| Reasoning Depth Control | Auto shallow/standard/deep with resource limits | Planned |
-| Hot Reload | Live YAML configuration updates without restart | Planned |
-| Code Interpreter | Sandboxed Python/JS execution with templates | Planned |
-| Semantic Caching | Embedding-based response caching | Planned |
+See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 
 ## Install
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.6"
+ai-agents = "1.0.0-rc.7"
 ```
 
 ## Quick Start
@@ -140,7 +63,7 @@ llm:
 #   provider: openai-compatible
 #   model: qwen3:8b
 #   base_url: http://localhost:11434/v1
-  
+
 # Provider-specific extra params are also allowed.
 # Example for OpenAI reasoning-capable models:
 # llms:
@@ -201,83 +124,54 @@ See the [examples/](examples/) directory for more.
 
 ## CLI
 
-The `ai-agents-cli` crate is the framework's command-line runner.
+```sh
+# Install from crates.io
+cargo install ai-agents-cli --version 1.0.0-rc.7
 
-### Install
+# Or run directly from source
+cargo run -p ai-agents-cli -- run agent.yaml
+```
 
 ```sh
-# Install the published CLI from crates.io
-cargo install ai-agents-cli --version 1.0.0-rc.6
-
-# From the framework repo
-cargo install --path crates/ai-agents-cli
-
-# Or run directly without installing
-cargo run -p ai-agents-cli -- <command>
+ai-agents-cli run agent.yaml                          # interactive REPL
+ai-agents-cli run agent.yaml --stream --show-tools     # stream tokens, show tool calls
+ai-agents-cli run agent.yaml --show-state --show-timing # show state transitions and timing
+ai-agents-cli validate agent.yaml                      # check YAML without starting
 ```
 
-### Run an agent
+See the [CLI Guide](https://ai-agents.rs/docs/cli/) for REPL commands, metadata configuration, and full reference.
 
-```sh
-ai-agents-cli run agent.yaml
-```
+## Roadmap
 
-With options:
+See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's next, and the complete feature catalog.
 
-```sh
-ai-agents-cli run agent.yaml --stream           # stream tokens in real time
-ai-agents-cli run agent.yaml --show-tools        # display tool calls
-ai-agents-cli run agent.yaml --show-state        # show state machine transitions
-ai-agents-cli run agent.yaml --show-timing       # show response time
-ai-agents-cli run agent.yaml --stream --show-tools --show-state  # combine flags
-```
+## Documentation
 
-### Validate a YAML file
+| Resource | Description |
+|----------|-------------|
+| [Getting Started](https://ai-agents.rs/docs/getting-started/) | Install and run your first agent in under a minute |
+| [YAML Reference](https://ai-agents.rs/docs/yaml-reference/) | Complete spec for agent definition files |
+| [CLI Guide](https://ai-agents.rs/docs/cli/) | All commands, flags, and REPL features |
+| [Rust API](https://ai-agents.rs/docs/rust-api/) | Embedding agents in your Rust application |
+| [Providers](https://ai-agents.rs/docs/providers/) | Setup for all 12 LLM providers |
+| [Concepts](https://ai-agents.rs/docs/concepts/) | Architecture, lifecycle, and core ideas |
+| [Examples](https://ai-agents.rs/examples/) | YAML and Rust examples for every feature |
+| [API Docs](https://docs.rs/ai-agents) | Auto-generated Rust API reference |
 
-Check an agent definition without starting the REPL:
+## Key Dependencies
 
-```sh
-ai-agents-cli validate agent.yaml
-```
-
-### REPL commands
-
-Once inside the interactive session:
-
-| Command | Description |
-|---------|-------------|
-| `/help`, `?` | Show available commands |
-| `/reset` | Clear memory and reset state |
-| `/state` | Show current state machine state |
-| `/history` | Show state transition history |
-| `/info` | Show agent name, version, skills, spawned agents |
-| `/memory`, `/mem` | Show memory status and token budget |
-| `/save [name]` | Save session (parent + all spawned agents). Default name: `default` |
-| `/save self [name]` | Save parent session only |
-| `/save agent <id>` | Save one spawned agent's session |
-| `/load [name]` | Load session (parent + restore spawned agents) |
-| `/load self [name]` | Load parent session only |
-| `/load agent <id>` | Load one spawned agent's session |
-| `/sessions` | List saved sessions |
-| `/delete <name>` | Delete a saved session |
-| `/quit`, `/exit` | Exit the REPL |
-
-### YAML CLI metadata
-
-YAML files can include optional `metadata.cli` for a better interactive experience:
-
-```yaml
-metadata:
-  cli:
-    welcome: "=== My Agent ==="
-    hints:
-      - "Try asking about the weather"
-      - "Type 'help' for commands"
-```
+| Crate | Role |
+|-------|------|
+| [llm](https://crates.io/crates/llm) | Unified LLM provider interface (OpenAI, Anthropic, Google, Ollama, and more) |
+| [rmcp](https://crates.io/crates/rmcp) | Official Rust SDK for Model Context Protocol (MCP) |
+| [tokio](https://crates.io/crates/tokio) | Async runtime |
+| [minijinja](https://crates.io/crates/minijinja) | Jinja2-compatible template engine for system prompts and spawner templates |
+| [sqlx](https://crates.io/crates/sqlx) | SQLite storage backend (optional, `sqlite` feature) |
+| [redis](https://crates.io/crates/redis) | Redis storage backend (optional, `redis-storage` feature) |
 
 ## License
 
 Licensed under either of
 
-- Apache License, Version 2.0 (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license (LICENSE-MIT)
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT))

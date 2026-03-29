@@ -1,0 +1,5 @@
+{#- Callout box shortcode. Use type: info | warning | tip | danger -#}
+{% set callout_type = type | default(value="info") %}
+<div class="callout callout-{{ callout_type }}">
+  {{ body }}
+</div>

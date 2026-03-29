@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 authors.workspace = true
 description = "A Rust framework for building AI agents from YAML specifications with trait-based extensibility"
 readme = "../../README.md"

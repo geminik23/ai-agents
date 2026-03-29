@@ -1,0 +1,48 @@
+base_url = "https://ai-agents.rs"
+title = "AI Agents Framework"
+description = "One YAML = Any Agent. A Rust framework for building AI agents from a single YAML specification."
+
+# Compilation & build
+compile_sass = true
+build_search_index = true
+generate_feeds = true
+feed_filenames = ["atom.xml"]
+
+# Taxonomies
+taxonomies = [
+    { name = "tags", feed = true, paginate_by = 20 },
+]
+
+# Markdown rendering
+[markdown]
+smart_punctuation = true
+
+[markdown.highlighting]
+style = "class"
+light_theme = "github-light"
+dark_theme = "github-dark"
+
+# Search
+[search]
+include_title = true
+include_description = true
+include_content = true
+
+# Link checker (build only)
+[link_checker]
+skip_prefixes = ["http://[::1]"]
+skip_anchor_prefixes = ["https://github.com/"]
+
+# Slugify
+[slugify]
+paths = "on"
+taxonomies = "on"
+anchors = "on"
+
+# Extra site-wide variables
+# Access these in templates via `config.extra.<key>`
+[extra]
+github = "https://github.com/geminik23/ai-agents"
+crates_io = "https://crates.io/crates/ai-agents"
+docs_rs = "https://docs.rs/ai-agents"
+version = "1.0.0-rc.7"

@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+
+{% block title %}{{ term.name | title }} — {{ config.title }}{% endblock title %}
+
+{% block content %}
+<div class="container section-padding">
+  <h1>
+    <span class="text-muted">Tagged:</span> {{ term.name }}
+  </h1>
+
+  <div class="blog-list">
+    {% for page in term.pages %}
+    <article class="blog-card">
+      <h2><a href="{{ page.permalink }}">{{ page.title }}</a></h2>
+      <div class="blog-meta">
+        {% if page.date %}
+        <time datetime="{{ page.date }}">{{ page.date | date(format="%B %e, %Y") }}</time>
+        {% endif %}
+        {% if page.reading_time %}
+        <span>&middot; {{ page.reading_time }} min read</span>
+        {% endif %}
+      </div>
+      {% if page.description %}
+      <p>{{ page.description }}</p>
+      {% elif page.summary %}
+      <p>{{ page.summary | safe }}</p>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+
+  <p class="back-link"><a href="{{ get_url(path='@/blog/_index.md') }}">&larr; Back to Blog</a></p>
+</div>
+{% endblock content %}

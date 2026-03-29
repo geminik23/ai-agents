@@ -1,0 +1,471 @@
+{% extends "base.html" %} {% block title %}{{ config.title }} — One YAML = Any Agent{% endblock
+title %} {% block content %}
+<!--HERO-->
+<section class="hero">
+    <div class="hero-inner container">
+        <h1 class="hero-heading">One YAML = Any Agent.</h1>
+        <p class="hero-subtitle">
+            A Rust framework for building AI agents from a single YAML specification.<br />
+            No code required.
+        </p>
+
+        <div class="hero-badges">
+            <a href="{{ config.extra.crates_io }}" target="_blank" rel="noopener noreferrer">
+                <img
+                    src="https://img.shields.io/crates/v/ai-agents?style=flat-square&color=06b6d4"
+                    alt="crates.io version"
+                    loading="lazy"
+                />
+            </a>
+            <a href="{{ config.extra.docs_rs }}" target="_blank" rel="noopener noreferrer">
+                <img
+                    src="https://img.shields.io/docsrs/ai-agents?style=flat-square&label=docs.rs"
+                    alt="docs.rs"
+                    loading="lazy"
+                />
+            </a>
+            <a
+                href="{{ config.extra.github }}/blob/main/LICENSE-MIT"
+                target="_blank"
+                rel="noopener noreferrer"
+            >
+                <img
+                    src="https://img.shields.io/crates/l/ai-agents?style=flat-square"
+                    alt="license"
+                    loading="lazy"
+                />
+            </a>
+            <a href="{{ config.extra.github }}" target="_blank" rel="noopener noreferrer">
+                <img
+                    src="https://img.shields.io/github/stars/geminik23/ai-agents?style=flat-square&color=f59e0b"
+                    alt="GitHub stars"
+                    loading="lazy"
+                />
+            </a>
+        </div>
+
+        <div class="hero-actions">
+            <a href="{{ get_url(path='@/docs/getting-started.md') }}" class="btn btn-primary"
+                >Get Started</a
+            >
+            <a
+                href="{{ config.extra.github }}"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="btn btn-outline"
+            >
+                <svg
+                    class="btn-icon"
+                    width="18"
+                    height="18"
+                    viewBox="0 0 24 24"
+                    fill="currentColor"
+                    aria-hidden="true"
+                >
+                    <path
+                        d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"
+                    />
+                </svg>
+                View on GitHub
+            </a>
+        </div>
+
+        <div class="hero-code">
+            <div class="code-window">
+                <div class="code-window-header">
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-title">agent.yaml</span>
+                </div>
+                <pre
+                    class="code-block"
+                ><code class="language-yaml"><span class="code-key">name</span>: <span class="code-string">MyAgent</span>
+<span class="code-key">system_prompt</span>: <span class="code-string">"You are a helpful assistant."</span>
+<span class="code-key">llm</span>:
+  <span class="code-key">provider</span>: <span class="code-string">openai</span>
+  <span class="code-key">model</span>: <span class="code-string">gpt-4.1-nano</span></code></pre>
+            </div>
+
+            <div class="hero-terminal">
+                <div class="code-window">
+                    <div class="code-window-header">
+                        <span class="code-window-dot"></span>
+                        <span class="code-window-dot"></span>
+                        <span class="code-window-dot"></span>
+                        <span class="code-window-title">Terminal</span>
+                    </div>
+                    <pre
+                        class="code-block code-block--terminal"
+                    ><code><span class="code-prompt">$</span> cargo run -p ai-agents-cli -- run agent.yaml</code></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!--FEATURES-->
+<section class="features" id="features">
+    <div class="features-inner container">
+        <h2 class="section-heading">Why AI Agents?</h2>
+        <p class="section-subtitle">
+            Everything you need to build production-ready agents, out of the box.
+        </p>
+
+        <div class="features-grid">
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg
+                        width="28"
+                        height="28"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                        <polyline points="14 2 14 8 20 8" />
+                        <line x1="16" y1="13" x2="8" y2="13" />
+                        <line x1="16" y1="17" x2="8" y2="17" />
+                    </svg>
+                </div>
+                <h3 class="feature-title">Declarative</h3>
+                <p class="feature-description">
+                    Define agents entirely in YAML. No boilerplate, no compile step &mdash; just
+                    describe what you want.
+                </p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg
+                        width="28"
+                        height="28"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <circle cx="12" cy="12" r="10" />
+                        <path d="M2 12h20" />
+                        <path
+                            d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"
+                        />
+                    </svg>
+                </div>
+                <h3 class="feature-title">12+ LLM Providers</h3>
+                <p class="feature-description">
+                    OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, and more. Swap providers in
+                    one line.
+                </p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg
+                        width="28"
+                        height="28"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+                    </svg>
+                </div>
+                <h3 class="feature-title">State Machine</h3>
+                <p class="feature-description">
+                    Hierarchical states with automatic transitions. Model complex workflows as
+                    simple YAML trees.
+                </p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg
+                        width="28"
+                        height="28"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+                        <line x1="8" y1="21" x2="16" y2="21" />
+                        <line x1="12" y1="17" x2="12" y2="21" />
+                    </svg>
+                </div>
+                <h3 class="feature-title">MCP Integration</h3>
+                <p class="feature-description">
+                    Connect to any MCP server for instant tool access. File systems, databases, APIs
+                    &mdash; all via standard protocol.
+                </p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg
+                        width="28"
+                        height="28"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                    </svg>
+                </div>
+                <h3 class="feature-title">Safety by Default</h3>
+                <p class="feature-description">
+                    Built-in tool policies, human-in-the-loop approvals, and error recovery. Ship
+                    with confidence.
+                </p>
+            </div>
+
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg
+                        width="28"
+                        height="28"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        aria-hidden="true"
+                    >
+                        <path d="M5 8l6 6" />
+                        <path d="M4 14l6-6 2-3" />
+                        <path d="M2 5h12" />
+                        <path d="M7 2h1" />
+                        <path d="M22 22l-5-10-5 10" />
+                        <path d="M14 18h6" />
+                    </svg>
+                </div>
+                <h3 class="feature-title">Any Language</h3>
+                <p class="feature-description">
+                    Works with any human language out of the box. No regex, no hardcoded strings
+                    &mdash; truly multilingual.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- QUICK START -->
+<section class="quickstart" id="quickstart">
+    <div class="quickstart-inner container">
+        <h2 class="section-heading">Quick Start</h2>
+        <p class="section-subtitle">Three ways to get going in under a minute.</p>
+
+        <div class="quickstart-tabs" role="tablist" aria-label="Quick start methods">
+            <button
+                class="tab-btn is-active"
+                role="tab"
+                aria-selected="true"
+                aria-controls="tab-cli"
+                id="btn-cli"
+            >
+                From CLI
+            </button>
+            <button
+                class="tab-btn"
+                role="tab"
+                aria-selected="false"
+                aria-controls="tab-yaml"
+                id="btn-yaml"
+            >
+                From YAML + Rust
+            </button>
+            <button
+                class="tab-btn"
+                role="tab"
+                aria-selected="false"
+                aria-controls="tab-api"
+                id="btn-api"
+            >
+                From Rust API
+            </button>
+        </div>
+
+        <!-- Tab 1: CLI -->
+        <div class="tab-panel is-active" role="tabpanel" id="tab-cli" aria-labelledby="btn-cli">
+            <div class="code-window">
+                <div class="code-window-header">
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-title">Terminal</span>
+                </div>
+                <pre
+                    class="code-block code-block--terminal"
+                ><code><span class="code-comment"># Install the CLI</span>
+<span class="code-prompt">$</span> cargo install ai-agents-cli --version 1.0.0-rc.7
+
+<span class="code-comment"># Create agent.yaml</span>
+<span class="code-prompt">$</span> cat agent.yaml
+<span class="code-key">name</span>: <span class="code-string">MyAgent</span>
+<span class="code-key">system_prompt</span>: <span class="code-string">"You are a helpful assistant."</span>
+<span class="code-key">llm</span>:
+  <span class="code-key">provider</span>: <span class="code-string">openai</span>
+  <span class="code-key">model</span>: <span class="code-string">gpt-4.1-nano</span>
+
+<span class="code-comment"># Run it</span>
+<span class="code-prompt">$</span> ai-agents-cli run agent.yaml</code></pre>
+            </div>
+        </div>
+
+        <!-- Tab 2: YAML + Rust -->
+        <div class="tab-panel" role="tabpanel" id="tab-yaml" aria-labelledby="btn-yaml" hidden>
+            <div class="code-window">
+                <div class="code-window-header">
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-title">main.rs</span>
+                </div>
+                <pre
+                    class="code-block"
+                ><code class="language-rust"><span class="code-keyword">use</span> ai_agents::{Agent, AgentBuilder};
+
+<span class="code-attribute">#[tokio::main]</span>
+<span class="code-keyword">async fn</span> <span class="code-fn">main</span>() -> ai_agents::Result&lt;()&gt; {
+    <span class="code-keyword">let</span> agent = AgentBuilder::from_yaml_file(<span class="code-string">"agent.yaml"</span>)?
+        .auto_configure_llms()?
+        .auto_configure_features()?
+        .build()?;
+
+    <span class="code-keyword">let</span> response = agent.chat(<span class="code-string">"Hello!"</span>).<span class="code-keyword">await</span>?;
+    println!(<span class="code-string">"{}"</span>, response.content);
+    Ok(())
+}</code></pre>
+            </div>
+        </div>
+
+        <!-- Tab 3: Rust API -->
+        <div class="tab-panel" role="tabpanel" id="tab-api" aria-labelledby="btn-api" hidden>
+            <div class="code-window">
+                <div class="code-window-header">
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-dot"></span>
+                    <span class="code-window-title">main.rs</span>
+                </div>
+                <pre
+                    class="code-block"
+                ><code class="language-rust"><span class="code-keyword">use</span> ai_agents::{AgentBuilder, UnifiedLLMProvider, ProviderType};
+<span class="code-keyword">use</span> std::sync::Arc;
+
+<span class="code-attribute">#[tokio::main]</span>
+<span class="code-keyword">async fn</span> <span class="code-fn">main</span>() -> ai_agents::Result&lt;()&gt; {
+    <span class="code-keyword">let</span> llm = UnifiedLLMProvider::from_env(
+        ProviderType::OpenAI, <span class="code-string">"gpt-4.1-nano"</span>
+    )?;
+
+    <span class="code-keyword">let</span> agent = AgentBuilder::new()
+        .system_prompt(<span class="code-string">"You are a helpful assistant."</span>)
+        .llm(Arc::new(llm))
+        .build()?;
+
+    <span class="code-keyword">let</span> response = agent.chat(<span class="code-string">"Hello!"</span>).<span class="code-keyword">await</span>?;
+    println!(<span class="code-string">"{}"</span>, response.content);
+    Ok(())
+}</code></pre>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!--PROVIDERS-->
+<section class="providers" id="providers">
+    <div class="providers-inner container">
+        <h2 class="section-heading">Works with Every Major Provider</h2>
+
+        <ul class="provider-list">
+            <li class="provider-badge">OpenAI</li>
+            <li class="provider-badge">Anthropic</li>
+            <li class="provider-badge">Google Gemini</li>
+            <li class="provider-badge">Ollama</li>
+            <li class="provider-badge">DeepSeek</li>
+            <li class="provider-badge">Groq</li>
+            <li class="provider-badge">Mistral</li>
+            <li class="provider-badge">Cohere</li>
+            <li class="provider-badge">xAI</li>
+            <li class="provider-badge">Phind</li>
+            <li class="provider-badge">OpenRouter</li>
+        </ul>
+
+        <p class="providers-note">
+            Plus any OpenAI-compatible server via
+            <code>openai-compatible</code> provider.
+        </p>
+    </div>
+</section>
+
+<!--CTA-->
+<section class="cta">
+    <div class="cta-inner container">
+        <h2 class="cta-heading">Ready to build?</h2>
+        <p class="cta-subtitle">Go from zero to a running agent in under a minute.</p>
+        <div class="cta-actions">
+            <a href="{{ get_url(path='@/docs/getting-started.md') }}" class="btn btn-primary btn-lg"
+                >Get Started</a
+            >
+            <a
+                href="{{ config.extra.docs_rs }}"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="btn btn-outline btn-lg"
+                >Read the API Docs</a
+            >
+        </div>
+    </div>
+</section>
+
+<!-- Tab switching (inline, no deps)-->
+<script>
+    (function () {
+        var tabs = document.querySelectorAll(".quickstart-tabs .tab-btn");
+        var panels = document.querySelectorAll(".quickstart .tab-panel");
+
+        tabs.forEach(function (tab) {
+            tab.addEventListener("click", function () {
+                // Deactivate all tabs and panels
+                tabs.forEach(function (t) {
+                    t.classList.remove("is-active");
+                    t.setAttribute("aria-selected", "false");
+                });
+                panels.forEach(function (p) {
+                    p.classList.remove("is-active");
+                    p.setAttribute("hidden", "");
+                });
+
+                // Activate clicked tab and matching panel
+                tab.classList.add("is-active");
+                tab.setAttribute("aria-selected", "true");
+                var panel = document.getElementById(tab.getAttribute("aria-controls"));
+                if (panel) {
+                    panel.classList.add("is-active");
+                    panel.removeAttribute("hidden");
+                }
+            });
+        });
+    })();
+</script>
+{% endblock content %}

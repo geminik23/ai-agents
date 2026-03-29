@@ -1,0 +1,31 @@
+{% extends "base.html" %} {% block title %}{{ page.title }} | {{ config.title
+}}{% endblock title %} {% block content %}
+<div class="container section-padding">
+    <article>
+        <h1>{{ page.title }}</h1>
+
+        {% if page.date %}
+        <div class="blog-meta">
+            <time datetime="{{ page.date | date(format='%Y-%m-%d') }}">
+                {{ page.date | date(format="%B %d, %Y") }}
+            </time>
+        </div>
+        {% endif %}
+
+        <div class="docs-content">{{ page.content | safe }}</div>
+
+        {% if page.taxonomies.tags is defined and page.taxonomies.tags | length
+        > 0 %}
+        <footer style="margin-top: 2rem">
+            {% for tag in page.taxonomies.tags %}
+            <a
+                href="{{ get_taxonomy_url(kind='tags', name=tag) }}"
+                class="badge-tag"
+                >{{ tag }}</a
+            >
+            {% endfor %}
+        </footer>
+        {% endif %}
+    </article>
+</div>
+{% endblock content %}

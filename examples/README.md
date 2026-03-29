@@ -2,8 +2,8 @@
 
 Examples are organized by usage style:
 
-- `yaml/` — YAML-first examples run with `ai-agents-cli`
-- `rust/` — Rust examples for embedding, extension, and custom integrations
+- `yaml/` - YAML-first examples run with `ai-agents-cli`
+- `rust/` - Rust examples for embedding, extension, and custom integrations
 
 ## Quick Start
 
@@ -111,11 +111,11 @@ cargo run -p ai-agents-cli -- run examples/yaml/state-machine/support_state_mach
 
 ### `yaml/tools/`
 
-Progressive tool usage examples — from basic tool calls to multi-tool composition.
+Progressive tool usage examples - from basic tool calls to multi-tool composition.
 
 | File | Description |
 |------|-------------|
-| `basic_tools.yaml` | Calculator and DateTime — LLM auto-selects the right tool |
+| `basic_tools.yaml` | Calculator and DateTime - LLM auto-selects the right tool |
 | `text_and_json.yaml` | Unicode-aware text processing and structured JSON operations |
 | `file_and_template.yaml` | File I/O and Jinja2 template rendering |
 | `math_and_random.yaml` | Statistical math and random value generation |
@@ -164,15 +164,15 @@ cargo run -p ai-agents-cli -- run examples/yaml/process/output_sanitize.yaml
 
 ### `yaml/context/`
 
-Dynamic context injection examples — from runtime values to environment variables and state integration.
+Dynamic context injection examples - from runtime values to environment variables and state integration.
 
 | File | Description |
 |------|-------------|
-| `runtime_context.yaml` | Inject user data at runtime — system prompt adapts via `{{ context.user.* }}` |
+| `runtime_context.yaml` | Inject user data at runtime - system prompt adapts via `{{ context.user.* }}` |
 | `builtin_context.yaml` | Built-in sources (datetime, session, agent info) with auto-refresh |
-| `env_context.yaml` | Environment variable injection — config and secrets without hardcoding |
+| `env_context.yaml` | Environment variable injection - config and secrets without hardcoding |
 | `template_context.yaml` | Jinja2 conditionals, defaults, and filters for tier-based behavior |
-| `context_with_state.yaml` | Context + state machine — personalized multi-step support flow |
+| `context_with_state.yaml` | Context + state machine - personalized multi-step support flow |
 
 Note: The CLI does not currently support injecting runtime context values at startup.
 All `runtime` context sources in these examples include `default:` blocks so they work out of the box.
@@ -191,13 +191,13 @@ cargo run -p ai-agents-cli -- run examples/yaml/context/context_with_state.yaml
 
 ### `yaml/memory/`
 
-Progressive memory examples — from simplest to production-grade.
+Progressive memory examples - from simplest to production-grade.
 
 | File | Description |
 |------|-------------|
-| `memory_basic.yaml` | Simplest memory — in-memory storage with a message limit |
+| `memory_basic.yaml` | Simplest memory - in-memory storage with a message limit |
 | `memory_compacting.yaml` | Compacting memory with automatic LLM-based summarization |
-| `memory_budget.yaml` | Token budgeting — per-component allocation controlling prompt size |
+| `memory_budget.yaml` | Token budgeting - per-component allocation controlling prompt size |
 | `memory_agent.yaml` | Full production config combining compacting, budgeting, and hooks |
 
 Examples:
@@ -346,9 +346,9 @@ Programmatic memory and persistence examples.
 
 | Binary | Description |
 |--------|-------------|
-| `save-restore-session` | Minimal session persistence — `/save` and `/load` only |
+| `save-restore-session` | Minimal session persistence - `/save` and `/load` only |
 | `memory-agent` | Compacting memory with hooks monitoring compression and budget warnings |
-| `sqlite-persistence` | Full session CRUD — save, load, list, search, delete, info |
+| `sqlite-persistence` | Full session CRUD - save, load, list, search, delete, info |
 
 Run from:
 
@@ -361,7 +361,7 @@ cargo run --bin sqlite-persistence
 
 ### `rust/context/`
 
-Rust-side context injection — `set_context()` and custom `ContextProvider` implementation.
+Rust-side context injection - `set_context()` and custom `ContextProvider` implementation.
 
 | Binary | Description |
 |--------|-------------|
@@ -380,7 +380,7 @@ Custom approval handler examples - from a minimal y/N handler to a full modify-c
 
 | Binary | Description |
 |--------|-------------|
-| `simple-approval` | Minimal `ApprovalHandler` implementation — one method, y/N only |
+| `simple-approval` | Minimal `ApprovalHandler` implementation - one method, y/N only |
 | `hitl-agent` | Full handler with approve/reject/modify support and multi-language messages |
 
 Note: When the handler returns `Modified { changes }`, the runtime merges the new values into the tool arguments before execution.
@@ -420,7 +420,7 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `openai-compatible` | HTTP adapter for any OpenAI-compatible server (LM Studio, Ollama, vLLM, LocalAI, TGI) |
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
 
-Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` — no custom Rust code needed.
+Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` - no custom Rust code needed.
 
 Run from:
 

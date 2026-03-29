@@ -121,15 +121,15 @@ hitl:
 #       approval_message:
 #         description: "HTTP request approval"
 
-# # NOTE: This example makes real HTTP requests on approval.
-# tools:
-#   - http
+# NOTE: This example makes real HTTP requests on approval.
+tools:
+  - http
 
-# memory:
-#   type: in-memory
-#   max_messages: 20
+memory:
+  type: in-memory
+  max_messages: 20
 
-# max_iterations: 5
+max_iterations: 5
 
 # The approval message is localized, but the y/N prompt itself is always English (CliApprovalHandler).
 # A custom handler (e.g. Slack bot) would render the full localized experience.
