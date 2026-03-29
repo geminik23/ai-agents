@@ -33,6 +33,8 @@
   --accent-muted: rgba(225, 29, 72, 0.1);
   --code-bg: #0c0c0e;
   --code-text: #d4d4dc;
+  --inline-code-bg: rgba(180, 180, 189, 0.1);
+  --inline-code-text: #d4d4dc;
   --success: #22c55e;
   --warning: #f59e0b;
   --danger: #ef4444;
@@ -53,6 +55,8 @@
   --accent-muted: rgba(190, 18, 60, 0.07);
   --code-bg: #f4f4f5;
   --code-text: #18181b;
+  --inline-code-bg: rgba(39, 39, 42, 0.08);
+  --inline-code-text: #3f3f46;
   --success: #16a34a;
   --warning: #d97706;
   --danger: #dc2626;
@@ -425,10 +429,11 @@ code {
 }
 
 :not(pre) > code {
-  background: var(--accent-muted);
-  color: var(--accent);
+  background: var(--inline-code-bg);
+  color: var(--inline-code-text);
   padding: 0.15em 0.4em;
   border-radius: 4px;
+  font-size: 0.9em;
 }
 
 .code-window {
