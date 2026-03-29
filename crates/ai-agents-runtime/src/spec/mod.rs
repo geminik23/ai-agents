@@ -4,7 +4,7 @@ mod llm;
 mod memory;
 mod provider;
 pub mod spawner;
-mod storage;
+pub(crate) mod storage;
 mod tool;
 
 pub use llm::{CliHitlMetadata, CliHitlStyle, CliMetadata, CliPromptStyle, LLMConfig, LLMSelector};

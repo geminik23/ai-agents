@@ -289,14 +289,15 @@ Dynamic agent spawning - create, message, list, and remove agents at runtime fro
 | File | Description |
 |------|-------------|
 | `game_master.yaml` | Game master that spawns NPC agents on demand using four spawner tools (`generate_agent`, `send_message`, `list_agents`, `remove_agent`) with shared LLMs, named templates, and auto-naming |
+| `team_manager.yaml` | Team manager that spawns specialist agents (researcher, writer) with shared SQLite storage, tool allowlist, and multi-template LLM selection |
 
 Note: The spawner tools are auto-registered by `AgentBuilder::auto_configure_spawner()` when the YAML has a `spawner:` section.
-The `spawner:` section defines shared LLMs, storage, context, spawn limits, naming, and templates for child agents.
 
-Example:
+Examples:
 
 ```sh
 cargo run -p ai-agents-cli -- run examples/yaml/spawner/game_master.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/spawner/team_manager.yaml
 ```
 
 ## Rust Examples

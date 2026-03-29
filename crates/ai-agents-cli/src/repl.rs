@@ -1,7 +1,10 @@
+use std::io::{self, Write};
+use std::sync::Arc;
+
 use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
+use ai_agents::spec::AgentSpec;
 use ai_agents::{Agent, AgentResponse, RuntimeAgent, StreamChunk};
 use futures::StreamExt;
-use std::io::{self, Write};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplMode {
@@ -237,7 +240,22 @@ impl CliRepl {
             };
         }
 
-        match input.to_lowercase().as_str() {
+        // Commands that need the original input (preserve agent ID casing).
+        let lower = input.to_lowercase();
+        if lower.starts_with("/save") {
+            self.handle_save(input).await;
+            return Some(CommandAction::Continue);
+        }
+        if lower.starts_with("/load") {
+            self.handle_load(input).await;
+            return Some(CommandAction::Continue);
+        }
+        if lower.starts_with("/delete") {
+            self.handle_delete(input).await;
+            return Some(CommandAction::Continue);
+        }
+
+        match lower.as_str() {
             "/quit" | "/exit" => Some(CommandAction::Quit),
             "/help" | "?" => {
                 self.print_help();
@@ -268,7 +286,7 @@ impl CliRepl {
                 } else {
                     println!("State transitions:");
                     for event in &history {
-                        println!("  {} → {} ({})", event.from, event.to, event.reason);
+                        println!("  {} -> {} ({})", event.from, event.to, event.reason);
                     }
                 }
                 Some(CommandAction::Continue)
@@ -283,10 +301,19 @@ impl CliRepl {
                 if let Some(state) = self.agent.current_state() {
                     println!("State: {}", state);
                 }
+                if self.agent.has_spawner() {
+                    if let Some(registry) = self.agent.spawner_registry() {
+                        println!("Spawned agents: {}", registry.list().len());
+                    }
+                }
                 Some(CommandAction::Continue)
             }
             "/memory" | "/mem" => {
                 self.print_memory_status().await;
+                Some(CommandAction::Continue)
+            }
+            "/sessions" => {
+                self.handle_sessions().await;
                 Some(CommandAction::Continue)
             }
             _ => None,
@@ -295,14 +322,354 @@ impl CliRepl {
 
     fn print_help(&self) {
         println!("Commands:");
-        println!("  /help, ?      Show this help message");
-        println!("  /quit, /exit  Exit the REPL");
-        println!("  /reset        Clear memory and reset state");
-        println!("  /state        Show current state");
-        println!("  /history      Show state transition history");
-        println!("  /info         Show agent information");
-        println!("  /memory, /mem Show memory status and token budget");
+        println!("  /help, ?             Show this help message");
+        println!("  /quit, /exit         Exit the REPL");
+        println!("  /reset               Clear memory and reset state");
+        println!("  /state               Show current state");
+        println!("  /history             Show state transition history");
+        println!("  /info                Show agent information");
+        println!("  /memory, /mem        Show memory status and token budget");
+        println!("  /save [name]         Save session (parent + all spawned agents)");
+        println!("  /save self [name]    Save parent session only");
+        println!("  /save agent <id>     Save one spawned agent's session");
+        println!("  /load [name]         Load session (parent + restore spawned agents)");
+        println!("  /load self [name]    Load parent session only");
+        println!("  /load agent <id>     Load one spawned agent's session");
+        println!("  /sessions            List saved sessions");
+        println!("  /delete <name>       Delete a saved session");
         println!();
+    }
+
+    // Session persistence commands
+
+    /// Ensure storage is initialized. Returns true if storage is available.
+    async fn ensure_storage(&self) -> bool {
+        if self.agent.storage().is_some() {
+            return true;
+        }
+        if let Err(e) = self.agent.init_storage().await {
+            eprintln!("[Error] Failed to init storage: {}", e);
+            return false;
+        }
+        if self.agent.storage().is_some() {
+            return true;
+        }
+        eprintln!("No storage configured. Add a storage: section to the YAML.");
+        false
+    }
+
+    async fn handle_save(&self, input: &str) {
+        if !self.ensure_storage().await {
+            return;
+        }
+        let (scope, name) = match parse_save_load_args(input) {
+            Some(parsed) => parsed,
+            None => return,
+        };
+        match scope {
+            SaveScope::All => self.save_all(&name).await,
+            SaveScope::SelfOnly => self.save_self(&name).await,
+            SaveScope::Agent(id) => self.save_agent(&id, &name).await,
+        }
+    }
+
+    async fn save_all(&self, name: &str) {
+        // Save parent with full snapshot (includes registry manifest).
+        let snapshot = match self.agent.save_state_full().await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[Error] Failed to build snapshot: {}", e);
+                return;
+            }
+        };
+        if let Some(storage) = self.agent.storage() {
+            if let Err(e) = storage.save(name, &snapshot).await {
+                eprintln!("[Error] Failed to save parent session: {}", e);
+                return;
+            }
+        }
+
+        // Save each child agent's session.
+        let mut child_count = 0;
+        if let Some(registry) = self.agent.spawner_registry() {
+            for info in registry.list() {
+                if let Some(agent) = registry.get(&info.id) {
+                    let _ = agent.init_storage().await;
+                    if let Err(e) = agent.save_session(name).await {
+                        eprintln!("  [Warn] Failed to save {}: {}", info.id, e);
+                        continue;
+                    }
+                    child_count += 1;
+                }
+            }
+        }
+
+        if child_count > 0 {
+            println!("Saved session '{}' (parent + {} agents)", name, child_count);
+        } else {
+            println!("Saved session '{}'", name);
+        }
+    }
+
+    async fn save_self(&self, name: &str) {
+        if let Err(e) = self.agent.save_session(name).await {
+            eprintln!("[Error] Failed to save session: {}", e);
+            return;
+        }
+        println!("Saved session '{}' (parent only)", name);
+    }
+
+    async fn save_agent(&self, id: &str, name: &str) {
+        let registry = match self.agent.spawner_registry() {
+            Some(r) => r,
+            None => {
+                eprintln!("No spawner configured.");
+                return;
+            }
+        };
+        let agent = match registry.get(id) {
+            Some(a) => a,
+            None => {
+                eprintln!("Agent not found: {}", id);
+                return;
+            }
+        };
+        let _ = agent.init_storage().await;
+        if let Err(e) = agent.save_session(name).await {
+            eprintln!("[Error] Failed to save {}: {}", id, e);
+            return;
+        }
+        println!("Saved agent '{}' session '{}'", id, name);
+    }
+
+    async fn handle_load(&self, input: &str) {
+        if !self.ensure_storage().await {
+            return;
+        }
+        let (scope, name) = match parse_save_load_args(input) {
+            Some(parsed) => parsed,
+            None => return,
+        };
+        match scope {
+            SaveScope::All => self.load_all(&name).await,
+            SaveScope::SelfOnly => self.load_self(&name).await,
+            SaveScope::Agent(id) => self.load_agent(&id, &name).await,
+        }
+    }
+
+    async fn load_all(&self, name: &str) {
+        // Peek at the parent snapshot to read the registry manifest before restoring.
+        let manifest = {
+            let storage = match self.agent.storage() {
+                Some(s) => s,
+                None => {
+                    eprintln!("No storage available.");
+                    return;
+                }
+            };
+            match storage.load(name).await {
+                Ok(Some(snapshot)) => snapshot.spawned_agents.clone(),
+                Ok(None) => {
+                    eprintln!("Session '{}' not found.", name);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("[Error] Failed to load session: {}", e);
+                    return;
+                }
+            }
+        };
+
+        // Restore parent state.
+        match self.agent.load_session(name).await {
+            Ok(true) => {}
+            Ok(false) => {
+                eprintln!("Session '{}' not found.", name);
+                return;
+            }
+            Err(e) => {
+                eprintln!("[Error] Failed to load parent session: {}", e);
+                return;
+            }
+        }
+
+        // Recreate spawned agents from manifest.
+        let mut child_count = 0;
+        if let (Some(entries), Some(spawner), Some(registry)) = (
+            manifest,
+            self.agent.spawner(),
+            self.agent.spawner_registry(),
+        ) {
+            for entry in &entries {
+                // If agent already exists in registry, just restore its session.
+                if let Some(agent) = registry.get(&entry.id) {
+                    let _ = agent.init_storage().await;
+                    let _ = agent.load_session(name).await;
+                    child_count += 1;
+                    continue;
+                }
+
+                // Recreate from saved spec YAML with the original agent ID.
+                let spec: AgentSpec = match serde_yaml::from_str(&entry.spec_yaml) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("  [Warn] Failed to parse spec for {}: {}", entry.id, e);
+                        continue;
+                    }
+                };
+                match spawner.spawn_with_id(entry.id.clone(), spec).await {
+                    Ok(agent) => {
+                        let agent_handle = Arc::clone(&agent.agent);
+                        let agent_id = agent.id.clone();
+                        if let Err(e) = registry.register(agent).await {
+                            eprintln!("  [Warn] Failed to register {}: {}", entry.id, e);
+                            continue;
+                        }
+                        // Restore child's session from NamespacedStorage.
+                        let _ = agent_handle.init_storage().await;
+                        match agent_handle.load_session(name).await {
+                            Ok(_) => child_count += 1,
+                            Err(e) => {
+                                eprintln!("  [Warn] Failed to restore {}: {}", agent_id, e);
+                                child_count += 1;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  [Warn] Failed to recreate {}: {}", entry.id, e);
+                    }
+                }
+            }
+        }
+
+        if child_count > 0 {
+            println!(
+                "Loaded session '{}' (parent + {} agents)",
+                name, child_count
+            );
+        } else {
+            println!("Loaded session '{}'", name);
+        }
+    }
+
+    async fn load_self(&self, name: &str) {
+        match self.agent.load_session(name).await {
+            Ok(true) => println!("Loaded session '{}' (parent only)", name),
+            Ok(false) => eprintln!("Session '{}' not found.", name),
+            Err(e) => eprintln!("[Error] Failed to load session: {}", e),
+        }
+    }
+
+    async fn load_agent(&self, id: &str, name: &str) {
+        let registry = match self.agent.spawner_registry() {
+            Some(r) => r,
+            None => {
+                eprintln!("No spawner configured.");
+                return;
+            }
+        };
+        let agent = match registry.get(id) {
+            Some(a) => a,
+            None => {
+                eprintln!("Agent not found: {}. Must be registered first.", id);
+                return;
+            }
+        };
+        let _ = agent.init_storage().await;
+        match agent.load_session(name).await {
+            Ok(true) => println!("Loaded agent '{}' session '{}'", id, name),
+            Ok(false) => eprintln!("No saved session '{}' for agent '{}'", name, id),
+            Err(e) => eprintln!("[Error] Failed to load {}: {}", id, e),
+        }
+    }
+
+    async fn handle_sessions(&self) {
+        if !self.ensure_storage().await {
+            return;
+        }
+        match self.agent.list_sessions().await {
+            Ok(sessions) => {
+                if sessions.is_empty() {
+                    println!("No saved sessions.");
+                    return;
+                }
+                let mut parent_keys = Vec::new();
+                let mut child_keys = Vec::new();
+                for s in &sessions {
+                    if s.contains('/') {
+                        child_keys.push(s.as_str());
+                    } else {
+                        parent_keys.push(s.as_str());
+                    }
+                }
+                println!("Saved sessions:");
+                for s in &parent_keys {
+                    println!("  {}", s);
+                }
+                if !child_keys.is_empty() {
+                    println!("Agent sessions:");
+                    for s in &child_keys {
+                        println!("  {}", s);
+                    }
+                }
+            }
+            Err(e) => eprintln!("[Error] {}", e),
+        }
+    }
+
+    async fn handle_delete(&self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let name = match parts.get(1) {
+            Some(n) => n.to_string(),
+            None => {
+                eprintln!("Usage: /delete <session_name>");
+                return;
+            }
+        };
+
+        if !self.ensure_storage().await {
+            return;
+        }
+
+        // Read manifest from saved snapshot so we can delete child sessions
+        // even if those agents are no longer in the registry.
+        let manifest_ids: Vec<String> = if let Some(storage) = self.agent.storage() {
+            match storage.load(&name).await {
+                Ok(Some(snapshot)) => snapshot
+                    .spawned_agents
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|e| e.id.clone())
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+
+        if let Err(e) = self.agent.delete_session(&name).await {
+            eprintln!("[Error] Failed to delete session: {}", e);
+            return;
+        }
+
+        // Delete child sessions using the manifest.
+        let mut child_count = 0;
+        if let Some(storage) = self.agent.storage() {
+            for id in &manifest_ids {
+                let child_key = format!("{}/{}", id, name);
+                let _ = storage.delete(&child_key).await;
+                child_count += 1;
+            }
+        }
+
+        if child_count > 0 {
+            println!(
+                "Deleted session '{}' (parent + {} agents)",
+                name, child_count
+            );
+        } else {
+            println!("Deleted session '{}'", name);
+        }
     }
 
     async fn print_memory_status(&self) {
@@ -474,5 +841,41 @@ impl CliRepl {
                 eprintln!("\n[Error] {}\n", e);
             }
         }
+    }
+}
+
+// Command parsing helpers
+
+enum SaveScope {
+    All,
+    SelfOnly,
+    Agent(String),
+}
+
+/// Parse /save and /load arguments into (scope, session_name).
+fn parse_save_load_args(input: &str) -> Option<(SaveScope, String)> {
+    let parts: Vec<&str> = input.split_whitespace().collect();
+    // parts[0] = "/save" or "/load"
+    match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+        None => Some((SaveScope::All, "default".to_string())),
+        Some("self") => {
+            let name = parts.get(2).unwrap_or(&"default").to_string();
+            Some((SaveScope::SelfOnly, name))
+        }
+        Some("agent") => {
+            let id = match parts.get(2) {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => {
+                    eprintln!("Usage: {} agent <id> [name]", parts[0]);
+                    return None;
+                }
+            };
+            let name = parts
+                .get(3)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| id.clone());
+            Some((SaveScope::Agent(id), name))
+        }
+        Some(name) => Some((SaveScope::All, name.to_string())),
     }
 }

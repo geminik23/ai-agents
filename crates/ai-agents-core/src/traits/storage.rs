@@ -5,6 +5,14 @@ use async_trait::async_trait;
 use crate::error::Result;
 use crate::types::StateMachineSnapshot;
 
+/// Minimal record of a spawned agent for session persistence.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SpawnedAgentEntry {
+    pub id: String,
+    pub name: String,
+    pub spec_yaml: String,
+}
+
 /// Snapshot of agent state for persistence
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentSnapshot {
@@ -16,6 +24,8 @@ pub struct AgentSnapshot {
     pub memory: super::memory::MemorySnapshot,
     #[serde(default)]
     pub context: std::collections::HashMap<String, serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_agents: Option<Vec<SpawnedAgentEntry>>,
 }
 
 impl AgentSnapshot {
@@ -27,6 +37,7 @@ impl AgentSnapshot {
             state_machine: None,
             memory: super::memory::MemorySnapshot::default(),
             context: std::collections::HashMap::new(),
+            spawned_agents: None,
         }
     }
 
@@ -45,6 +56,11 @@ impl AgentSnapshot {
         context: std::collections::HashMap<String, serde_json::Value>,
     ) -> Self {
         self.context = context;
+        self
+    }
+
+    pub fn with_spawned_agents(mut self, agents: Vec<SpawnedAgentEntry>) -> Self {
+        self.spawned_agents = Some(agents);
         self
     }
 }

@@ -1,0 +1,41 @@
+# Content writer template for spawn_from_template().
+#
+# Jinja2 variables:
+#   {{ name }}                    - caller-provided agent name
+#   {{ style }}                   - writing style
+#   {{ audience }}                - target audience
+#   {{ context.team }}            - from spawner shared_context
+#   {{ context.organization }}    - from spawner shared_context
+
+name: "{{ name }}"
+description: "Content writer that produces clear, well-structured text for a target audience"
+
+metadata:
+  template:
+    variables:
+      style: "Writing style (technical, conversational, academic, journalistic)"
+      audience: "Target audience (general public, developers, executives, students)"
+
+system_prompt: |
+  You are {{ name }}, a content writer at {{ context.organization }} ({{ context.team }}).
+
+  Your style: {{ style }}
+  Your audience: {{ audience }}
+
+  Your responsibilities:
+  - Transform information into clear, engaging text
+  - Adapt tone and complexity to your target audience
+  - Structure content with headings and key takeaways
+  - Be concise -- prefer short paragraphs
+
+  Keep responses well-organized and readable.
+
+tools:
+  - calculator
+  - datetime
+
+memory:
+  type: compacting
+  max_messages: 50
+  compress_threshold: 15
+  summarizer_llm: router

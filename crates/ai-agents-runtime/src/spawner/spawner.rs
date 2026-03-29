@@ -173,9 +173,18 @@ impl AgentSpawner {
 
     /// Spawn an agent from a pre-built AgentSpec.
     pub async fn spawn_from_spec(&self, spec: AgentSpec) -> Result<SpawnedAgent> {
-        self.check_spawn_limit()?;
-
         let agent_id = self.generate_id(&spec.name);
+        self.spawn_inner(agent_id, spec).await
+    }
+
+    /// Spawn an agent with a specific ID, used for session restore.
+    pub async fn spawn_with_id(&self, id: String, spec: AgentSpec) -> Result<SpawnedAgent> {
+        self.spawn_inner(id, spec).await
+    }
+
+    /// Internal spawn with an explicit ID. All builder wiring lives here.
+    async fn spawn_inner(&self, agent_id: String, spec: AgentSpec) -> Result<SpawnedAgent> {
+        self.check_spawn_limit()?;
 
         // Build the agent through the standard runtime pipeline.
         let mut builder = AgentBuilder::from_spec(spec.clone());

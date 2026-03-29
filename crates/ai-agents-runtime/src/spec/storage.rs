@@ -175,6 +175,26 @@ impl SqliteStorageConfig {
     }
 }
 
+use ai_agents_storage::StorageConfig as StorageStorageConfig;
+
+/// Convert spec StorageConfig to storage crate StorageConfig for backend instantiation.
+pub fn to_storage_config(config: &StorageConfig) -> StorageStorageConfig {
+    match config {
+        StorageConfig::None => StorageStorageConfig::None,
+        StorageConfig::File(fc) => StorageStorageConfig::File {
+            path: fc.path.clone(),
+        },
+        StorageConfig::Sqlite(sc) => StorageStorageConfig::Sqlite {
+            path: sc.path.clone(),
+        },
+        StorageConfig::Redis(rc) => StorageStorageConfig::Redis {
+            url: rc.url.clone(),
+            prefix: rc.prefix.clone(),
+            ttl_seconds: rc.ttl_seconds,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +356,34 @@ url: "redis://localhost:6379"
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("type: redis"));
         assert!(yaml.contains("url: redis://localhost:6379"));
+    }
+
+    #[test]
+    fn test_to_storage_config_none() {
+        use ai_agents_storage::StorageConfig as SC;
+        let result = to_storage_config(&StorageConfig::None);
+        assert!(matches!(result, SC::None));
+    }
+
+    #[test]
+    fn test_to_storage_config_file() {
+        use ai_agents_storage::StorageConfig as SC;
+        let config = StorageConfig::file("./data/sessions");
+        let result = to_storage_config(&config);
+        match result {
+            SC::File { path } => assert_eq!(path, "./data/sessions"),
+            other => panic!("expected File, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_to_storage_config_sqlite() {
+        use ai_agents_storage::StorageConfig as SC;
+        let config = StorageConfig::sqlite("./data/db.sqlite");
+        let result = to_storage_config(&config);
+        match result {
+            SC::Sqlite { path } => assert_eq!(path, "./data/db.sqlite"),
+            other => panic!("expected Sqlite, got {:?}", other),
+        }
     }
 }

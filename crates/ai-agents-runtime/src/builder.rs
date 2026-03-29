@@ -56,6 +56,8 @@ pub struct AgentBuilder {
     reasoning: Option<ReasoningConfig>,
     reflection: Option<ReflectionConfig>,
     streaming: Option<StreamingConfig>,
+    spawner: Option<Arc<crate::spawner::AgentSpawner>>,
+    spawner_registry: Option<Arc<crate::spawner::AgentRegistry>>,
 }
 
 impl AgentBuilder {
@@ -89,6 +91,8 @@ impl AgentBuilder {
             storage_config: None,
             storage: None,
             streaming: None,
+            spawner: None,
+            spawner_registry: None,
         }
     }
 
@@ -128,6 +132,8 @@ impl AgentBuilder {
             reasoning,
             reflection,
             streaming: None,
+            spawner: None,
+            spawner_registry: None,
         }
     }
 
@@ -594,7 +600,7 @@ impl AgentBuilder {
 
     /// Wire spawner tools when the spec has a `spawner:` section.
     /// Call after `auto_configure_llms()` and `auto_configure_features()`.
-    pub fn auto_configure_spawner(mut self) -> Result<Self> {
+    pub async fn auto_configure_spawner(mut self) -> Result<Self> {
         let spawner_config = match self.spec.as_ref().and_then(|s| s.spawner.as_ref()) {
             Some(c) => c.clone(),
             None => return Ok(self),
@@ -635,8 +641,27 @@ impl AgentBuilder {
             spawner = spawner.with_allowed_tools(allowed.clone());
         }
 
+        // Resolve shared storage from YAML config into a live backend.
+        if let Some(ref sc) = spawner_config.shared_storage {
+            let converted = crate::spec::storage::to_storage_config(sc);
+            if let Some(st) = ai_agents_storage::create_storage(&converted).await? {
+                spawner = spawner.with_shared_storage(Arc::clone(&st));
+
+                // Auto-inject into parent when no explicit storage: is configured.
+                let parent_has_storage = self.storage.is_some()
+                    || self.storage_config.is_some()
+                    || self.spec.as_ref().map_or(false, |s| s.has_storage());
+                if !parent_has_storage {
+                    self.storage = Some(st);
+                }
+            }
+        }
+
         let spawner = Arc::new(spawner);
         let registry = Arc::new(AgentRegistry::new());
+
+        self.spawner = Some(Arc::clone(&spawner));
+        self.spawner_registry = Some(Arc::clone(&registry));
         let llm_for_tools = Arc::new(self.llm_registry.clone().unwrap_or_default());
         let agent_name = self
             .spec
@@ -910,6 +935,11 @@ impl AgentBuilder {
         }
         if let Some(storage) = self.storage {
             agent = agent.with_storage(storage);
+        }
+
+        // Wire spawner handles into the agent so CLI can access registry.
+        if let (Some(spawner), Some(registry)) = (self.spawner, self.spawner_registry) {
+            agent = agent.with_spawner_handles(spawner, registry);
         }
 
         // Configure hooks
@@ -1531,6 +1561,28 @@ tools:
             "build should succeed when all declared tools are registered: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_spawner_config_deserializes_shared_storage() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: "Test"
+llm:
+  provider: openai
+  model: gpt-4
+spawner:
+  shared_llms: true
+  shared_storage:
+    type: sqlite
+    path: ./data/test.db
+  max_agents: 5
+"#;
+        let builder = AgentBuilder::from_yaml(yaml).unwrap();
+        let spec = builder.spec.as_ref().unwrap();
+        let sc = spec.spawner.as_ref().unwrap();
+        assert!(sc.shared_storage.is_some());
+        assert!(sc.shared_storage.as_ref().unwrap().is_sqlite());
     }
 
     #[test]

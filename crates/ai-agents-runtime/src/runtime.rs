@@ -101,6 +101,10 @@ pub struct RuntimeAgent {
     declared_tool_ids: Option<Vec<String>>,
     /// Whether the context manager has been initialized (defaults loaded, env resolved, etc.)
     context_initialized: AtomicBool,
+    /// Spawner for dynamic agent creation (set when YAML has a spawner: section).
+    spawner: Option<Arc<crate::spawner::AgentSpawner>>,
+    /// Registry tracking spawned agents (set when YAML has a spawner: section).
+    spawner_registry: Option<Arc<crate::spawner::AgentRegistry>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -192,6 +196,8 @@ impl RuntimeAgent {
             current_plan: RwLock::new(None),
             declared_tool_ids: None,
             context_initialized: AtomicBool::new(false),
+            spawner: None,
+            spawner_registry: None,
         }
     }
 
@@ -262,20 +268,7 @@ impl RuntimeAgent {
     }
 
     fn convert_storage_config(&self) -> StorageStorageConfig {
-        match &self.storage_config {
-            StorageConfig::None => StorageStorageConfig::None,
-            StorageConfig::File(fc) => StorageStorageConfig::File {
-                path: fc.path.clone(),
-            },
-            StorageConfig::Sqlite(sc) => StorageStorageConfig::Sqlite {
-                path: sc.path.clone(),
-            },
-            StorageConfig::Redis(rc) => StorageStorageConfig::Redis {
-                url: rc.url.clone(),
-                prefix: rc.prefix.clone(),
-                ttl_seconds: rc.ttl_seconds,
-            },
-        }
+        crate::spec::storage::to_storage_config(&self.storage_config)
     }
 
     pub fn storage(&self) -> Option<Arc<dyn AgentStorage>> {
@@ -284,6 +277,30 @@ impl RuntimeAgent {
 
     pub fn storage_config(&self) -> &StorageConfig {
         &self.storage_config
+    }
+
+    /// Returns the spawner if configured via a spawner: YAML section.
+    pub fn spawner(&self) -> Option<&Arc<crate::spawner::AgentSpawner>> {
+        self.spawner.as_ref()
+    }
+
+    /// Returns the agent registry if configured via a spawner: YAML section.
+    pub fn spawner_registry(&self) -> Option<&Arc<crate::spawner::AgentRegistry>> {
+        self.spawner_registry.as_ref()
+    }
+
+    pub fn has_spawner(&self) -> bool {
+        self.spawner_registry.is_some()
+    }
+
+    pub fn with_spawner_handles(
+        mut self,
+        spawner: Arc<crate::spawner::AgentSpawner>,
+        registry: Arc<crate::spawner::AgentRegistry>,
+    ) -> Self {
+        self.spawner = Some(spawner);
+        self.spawner_registry = Some(registry);
+        self
     }
 
     pub fn with_hooks(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
@@ -410,6 +427,18 @@ impl RuntimeAgent {
                     history: vec![],
                 }),
             ))
+    }
+
+    /// Save state including spawned agents manifest for session persistence.
+    pub async fn save_state_full(&self) -> Result<AgentSnapshot> {
+        let mut snapshot = self.save_state().await?;
+        if let Some(ref registry) = self.spawner_registry {
+            let entries = registry.list_with_specs();
+            if !entries.is_empty() {
+                snapshot = snapshot.with_spawned_agents(entries);
+            }
+        }
+        Ok(snapshot)
     }
 
     pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {

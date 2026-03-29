@@ -211,6 +211,14 @@ pub async fn auto_configure_spawner(
         spawner = spawner.with_allowed_tools(allowed.clone());
     }
 
+    // Resolve shared storage from YAML config into a live backend.
+    if let Some(ref sc) = spawner_config.shared_storage {
+        let converted = crate::spec::storage::to_storage_config(sc);
+        if let Some(st) = ai_agents_storage::create_storage(&converted).await? {
+            spawner = spawner.with_shared_storage(st);
+        }
+    }
+
     let spawner = Arc::new(spawner);
     let registry = Arc::new(AgentRegistry::new());
 
@@ -537,5 +545,24 @@ system_prompt: "You are {{ name }}."
         let tpl = spawner.templates().get("base").unwrap();
         assert!(tpl.content.contains("{{ name }}"));
         assert_eq!(tpl.description.as_deref(), Some("Base"));
+    }
+
+    #[test]
+    fn test_spawner_from_config_with_storage() {
+        let storage: Arc<dyn AgentStorage> =
+            Arc::new(ai_agents_storage::FileStorage::new("/tmp/test_spawner_cfg"));
+        let config = SpawnerConfig {
+            shared_storage: Some(crate::spec::StorageConfig::sqlite("./test.db")),
+            ..Default::default()
+        };
+        let spawner = spawner_from_config(&config, None, Some(storage), None).unwrap();
+        assert!(spawner.shared_storage().is_some());
+    }
+
+    #[test]
+    fn test_spawner_from_config_without_storage() {
+        let config = SpawnerConfig::default();
+        let spawner = spawner_from_config(&config, None, None, None).unwrap();
+        assert!(spawner.shared_storage().is_none());
     }
 }

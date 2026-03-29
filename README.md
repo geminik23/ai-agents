@@ -4,11 +4,11 @@
 
 A Rust framework for building AI agents from a single YAML specification. No code required for common use cases.
 
-- Declarative behavior -- everything in YAML, not code
-- Language-agnostic semantics -- intent, extraction, validation via LLM (no regex)
-- Layered overrides -- global -> agent -> state -> skill -> turn
-- Safety by default -- tool policies, HITL approvals, error recovery
-- Extensible -- custom LLMs, tools, memory, storage, hooks
+- Declarative behavior - everything in YAML, not code
+- Language-agnostic semantics - intent, extraction, validation via LLM (no regex)
+- Layered overrides - global -> agent -> state -> skill -> turn
+- Safety by default - tool policies, HITL approvals, error recovery
+- Extensible - custom LLMs, tools, memory, storage, hooks
 
 > Status: **1.0.0-rc.6**
 >
@@ -18,47 +18,47 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 ## Features
 
 ### Agent Core
-- YAML-defined agents -- system prompt, tools, skills, states, memory, and behavior in one file
-- Multi-LLM support -- multiple providers built-in; multiple providers with aliases (default, router, evaluator); auto-fallback on failure
-- Skill system -- reusable "tool + prompt" workflows with LLM-based intent routing
-- Input/output process -- declarative pipeline: normalize, detect, extract, sanitize, validate, transform, format
-- Streaming -- real-time token streaming with tool call and state transition events
+- YAML-defined agents - system prompt, tools, skills, states, memory, and behavior in one file
+- Multi-LLM support - multiple providers built-in; multiple providers with aliases (default, router, evaluator); auto-fallback on failure
+- Skill system - reusable "tool + prompt" workflows with LLM-based intent routing
+- Input/output process - declarative pipeline: normalize, detect, extract, sanitize, validate, transform, format
+- Streaming - real-time token streaming with tool call and state transition events
 
 ### State Machine
-- Hierarchical states -- nested sub-states with prompt inheritance
-- Auto transitions -- LLM-evaluated conditions with guard-based short-circuiting
-- Intent-based routing -- deterministic `intent:` transitions after disambiguation (no LLM call)
-- Entry/exit actions -- execute tools, skills, prompts, or set context on state change
-- Turn timeout -- automatic state transition after max turns
+- Hierarchical states - nested sub-states with prompt inheritance
+- Auto transitions - LLM-evaluated conditions with guard-based short-circuiting
+- Intent-based routing - deterministic `intent:` transitions after disambiguation (no LLM call)
+- Entry/exit actions - execute tools, skills, prompts, or set context on state change
+- Turn timeout - automatic state transition after max turns
 
 ### Context & Memory
-- Dynamic context -- runtime, file, HTTP, env, and callback sources with per-turn refresh
-- Template rendering -- Jinja2-compatible templates (minijinja) in system prompts
-- CompactingMemory -- LLM-based rolling summarization with configurable thresholds
-- Token budgeting -- per-component token allocation with overflow strategies
-- Persistence -- SQLite, Redis, and file storage backends with session management
+- Dynamic context - runtime, file, HTTP, env, and callback sources with per-turn refresh
+- Template rendering - Jinja2-compatible templates (minijinja) in system prompts
+- CompactingMemory - LLM-based rolling summarization with configurable thresholds
+- Token budgeting - per-component token allocation with overflow strategies
+- Persistence - SQLite, Redis, and file storage backends with session management
 
 ### Tools
-- Built-in tools -- datetime, JSON, random, HTTP, file, text, template, math, calculator(for dev)
-- MCP integration -- connect to any MCP server (stdio/HTTP) for instant access to hundreds of tools via rmcp SDK
-- Tool scoping -- 3-level filtering: `state.tools` -> `spec.tools` -> registry (all)
-- Conditional availability -- context, state, time, semantic (LLM-based), and composite conditions
-- Multi-language aliases -- tool names and descriptions in any language
-- Parallel execution -- concurrent tool calls with configurable concurrency
+- Built-in tools - datetime, JSON, random, HTTP, file, text, template, math, calculator(for dev)
+- MCP integration - connect to any MCP server (stdio/HTTP) for instant access to hundreds of tools via rmcp SDK
+- Tool scoping - 3-level filtering: `state.tools` -> `spec.tools` -> registry (all)
+- Conditional availability - context, state, time, semantic (LLM-based), and composite conditions
+- Multi-language aliases - tool names and descriptions in any language
+- Parallel execution - concurrent tool calls with configurable concurrency
 
 ### Safety & Control
-- Error recovery -- retry with backoff, LLM fallback, context overflow handling (truncate/summarize)
-- Tool security -- rate limiting, domain/path restrictions, confirmation requirements
-- Human-in-the-loop -- tool, condition, and state approval with multi-language message support
+- Error recovery - retry with backoff, LLM fallback, context overflow handling (truncate/summarize)
+- Tool security - rate limiting, domain/path restrictions, confirmation requirements
+- Human-in-the-loop - tool, condition, and state approval with multi-language message support
 
 ### Intelligence
-- Reasoning modes -- none, chain-of-thought, ReAct, plan-and-execute, auto (LLM selects)
-- Reflection -- LLM self-evaluation with criteria, retry on failure, configurable thresholds
-- Intent disambiguation -- LLM-based ambiguity detection, clarification generation, multi-turn resolution
+- Reasoning modes - none, chain-of-thought, ReAct, plan-and-execute, auto (LLM selects)
+- Reflection - LLM self-evaluation with criteria, retry on failure, configurable thresholds
+- Intent disambiguation - LLM-based ambiguity detection, clarification generation, multi-turn resolution
 
 ### Extensibility
-- Agent hooks -- lifecycle events for logging, metrics, monitoring (message, LLM, tool, state, memory, HITL)
-- Custom providers -- built-in `openai-compatible` for any OpenAI-compatible server; implement `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer` traits for full control
+- Agent hooks - lifecycle events for logging, metrics, monitoring (message, LLM, tool, state, memory, HITL)
+- Custom providers - built-in `openai-compatible` for any OpenAI-compatible server; implement `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer` traits for full control
 
 ### Supported LLM Providers
 
@@ -250,7 +250,16 @@ Once inside the interactive session:
 | `/reset` | Clear memory and reset state |
 | `/state` | Show current state machine state |
 | `/history` | Show state transition history |
-| `/info` | Show agent name, version, skills |
+| `/info` | Show agent name, version, skills, spawned agents |
+| `/memory`, `/mem` | Show memory status and token budget |
+| `/save [name]` | Save session (parent + all spawned agents). Default name: `default` |
+| `/save self [name]` | Save parent session only |
+| `/save agent <id>` | Save one spawned agent's session |
+| `/load [name]` | Load session (parent + restore spawned agents) |
+| `/load self [name]` | Load parent session only |
+| `/load agent <id>` | Load one spawned agent's session |
+| `/sessions` | List saved sessions |
+| `/delete <name>` | Delete a saved session |
 | `/quit`, `/exit` | Exit the REPL |
 
 ### YAML CLI metadata

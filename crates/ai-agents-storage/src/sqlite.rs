@@ -77,6 +77,21 @@ impl SqliteStorage {
     }
 
     async fn connect(path: &str) -> Result<sqlx::SqlitePool> {
+        // Ensure parent directories exist -- SQLite's create_if_missing only creates the file.
+        if path != ":memory:" {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        AgentError::Persistence(format!(
+                            "failed to create directory {}: {}",
+                            parent.display(),
+                            e
+                        ))
+                    })?;
+                }
+            }
+        }
+
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(path)
             .map_err(|e| AgentError::Persistence(e.to_string()))?
             .create_if_missing(true)

@@ -1,0 +1,98 @@
+name: TeamManager
+version: "1.0.0"
+description: "Manager that spawns specialist agents for research and writing tasks"
+
+# General-purpose agent-as-factory pattern with shared storage and tool sandbox.
+#
+# Demonstrates SpawnerConfig features not shown in game_master.yaml:
+#   - shared_storage:  all spawned agents persist sessions to one SQLite DB
+#   - allowed_tools:   spawned agents can only use calculator and datetime
+#
+# Also demonstrates multi-template LLM selection: the generate_agent tool description auto-includes template names, descriptions, and variables from metadata.
+# template.variables in each template file. The LLM reads these and picks the right template without any system prompt instructions.
+#
+# Flow: user asks to create specialist -> LLM calls generate_agent
+#         -> template path: render researcher or writer template -> spawn -> register
+#         -> LLM path: router generates YAML -> validate -> allowed_tools filter -> spawn
+#       user asks specialist a question -> LLM calls send_message -> agent response
+#       user asks to list team -> LLM calls list_agents -> JSON list
+#       user asks to remove agent -> LLM calls remove_agent -> deregister
+
+system_prompt: |
+  You are a team manager. You create specialist agents and delegate tasks.
+
+  Your responsibilities:
+  - Create specialist agents (researchers, writers) when asked
+  - Send tasks to agents and relay their responses
+  - List all active team members
+  - Remove agents that are no longer needed
+
+  Always use the available template when creating agents.
+  The generate_agent tool shows available templates and their variables.
+
+  When delegating work, use send_message to communicate with your team members.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-4.1-mini
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_messages: 100
+  compress_threshold: 20
+  summarizer_llm: router
+
+# Only spawner tools - team manager delegates, does not use tools directly.
+tools:
+  - generate_agent
+  - send_message
+  - list_agents
+  - remove_agent
+
+spawner:
+  shared_llms: true
+  max_agents: 10
+  name_prefix: "agent_"
+
+  # All spawned agents persist to one SQLite DB.
+  # Each agent's sessions are isolated via NamespacedStorage (agent_id/ prefix).
+  shared_storage:
+    type: sqlite
+    path: ./data/team_sessions.db
+
+  # Spawned agents can ONLY use these tools.
+  # Tools not in this list are stripped from the agent spec before spawning.
+  allowed_tools:
+    - calculator
+    - datetime
+
+  shared_context:
+    team: "Research Division"
+    organization: "AI Agents"
+
+  # Two templates with description and metadata.template.variables.
+  # The LLM selects the right one based on template descriptions.
+  templates:
+    researcher:
+      path: ./templates/researcher.yaml
+    writer:
+      path: ./templates/writer.yaml
+
+metadata:
+  cli:
+    welcome: "=== Team Manager: Specialist Agent Spawning ==="
+    hints:
+      - "Try: Create a data researcher who specializes in market analysis"
+      - "Try: Create a technical writer who explains complex topics simply"
+      - "Try: List all team members"
+      - "Try: Ask the researcher to analyze recent AI trends"
+      - "Try: Ask the writer to summarize the researcher's findings"
+      - "Try: Remove the researcher"

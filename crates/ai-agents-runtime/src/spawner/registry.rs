@@ -98,6 +98,28 @@ impl AgentRegistry {
             .collect()
     }
 
+    /// List all registered agents with their specs serialized as YAML for session persistence.
+    pub fn list_with_specs(&self) -> Vec<ai_agents_core::SpawnedAgentEntry> {
+        let agents = self.agents.read();
+        agents
+            .values()
+            .filter_map(|sa| {
+                let spec_yaml = match serde_yaml::to_string(&sa.spec) {
+                    Ok(y) => y,
+                    Err(e) => {
+                        warn!(agent_id = %sa.id, error = %e, "Failed to serialize agent spec");
+                        return None;
+                    }
+                };
+                Some(ai_agents_core::SpawnedAgentEntry {
+                    id: sa.id.clone(),
+                    name: sa.spec.name.clone(),
+                    spec_yaml,
+                })
+            })
+            .collect()
+    }
+
     /// Remove an agent from the registry and return it.
     pub async fn remove(&self, id: &str) -> Option<Arc<SpawnedAgent>> {
         let removed = {

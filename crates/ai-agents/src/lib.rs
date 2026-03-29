@@ -191,7 +191,9 @@ pub mod memory {
 pub mod persistence {
     use std::sync::Arc;
 
-    pub use ai_agents_core::{AgentSnapshot, AgentStorage, MemorySnapshot, Result};
+    pub use ai_agents_core::{
+        AgentSnapshot, AgentStorage, MemorySnapshot, Result, SpawnedAgentEntry,
+    };
     #[cfg(feature = "sqlite")]
     pub use ai_agents_storage::SqliteStorage;
     pub use ai_agents_storage::{
@@ -459,7 +461,7 @@ pub use context::{
 pub use persistence::SqliteStorage;
 pub use persistence::{
     AgentSnapshot, AgentStorage, FileStorage, MemorySnapshot, SessionInfo, SessionMetadata,
-    SessionOrderBy, SessionQuery, create_storage,
+    SessionOrderBy, SessionQuery, SpawnedAgentEntry, create_storage,
 };
 #[cfg(feature = "redis-storage")]
 pub use persistence::{RedisSessionMeta, RedisStorage};

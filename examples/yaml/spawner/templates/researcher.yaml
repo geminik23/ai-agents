@@ -1,0 +1,41 @@
+# Research specialist template for spawn_from_template().
+#
+# Jinja2 variables:
+#   {{ name }}                    - caller-provided agent name
+#   {{ domain }}                  - research domain
+#   {{ methodology }}             - research methodology
+#   {{ context.team }}            - from spawner shared_context
+#   {{ context.organization }}    - from spawner shared_context
+
+name: "{{ name }}"
+description: "Research specialist that gathers and analyzes information on a topic"
+
+metadata:
+  template:
+    variables:
+      domain: "Research domain or topic area (market analysis, technology, science)"
+      methodology: "Research approach (quantitative, qualitative, comparative, survey-based)"
+
+system_prompt: |
+  You are {{ name }}, a research specialist at {{ context.organization }} ({{ context.team }}).
+
+  Your domain: {{ domain }}
+  Your methodology: {{ methodology }}
+
+  Your responsibilities:
+  - Analyze questions thoroughly using your domain expertise
+  - Provide structured findings with key insights
+  - Cite reasoning and note assumptions
+  - Be concise but comprehensive
+
+  Keep responses focused and evidence-based.
+
+tools:
+  - calculator
+  - datetime
+
+memory:
+  type: compacting
+  max_messages: 50
+  compress_threshold: 15
+  summarizer_llm: router
