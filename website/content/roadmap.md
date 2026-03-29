@@ -31,7 +31,7 @@ These are the features we are actively planning for the next few release candida
 
 ### Multi-Agent Orchestration
 
-Supervisor, pipeline, and routing patterns for multi-agent systems. The `AgentRegistry` from rc.7 provides the foundation - orchestration adds structured coordination on top.
+Five orchestration patterns for multi-agent systems: **Router** (central controller picks a specialist), **Pipeline** (linear stage chain), **Concurrent** (parallel execution with aggregation), **GroupChat** (shared conversation with turn management), and **Handoff** (dynamic control transfer between peers). Includes cross-cutting context policy, orchestration-level error recovery, and HITL approval gates. The `AgentRegistry` from rc.7 provides the foundation.
 
 ### Agent Persona
 
@@ -64,7 +64,7 @@ Every planned feature and its current status. Features are independent unless no
 | **Intent Disambiguation** | LLM-based ambiguity detection and clarification | ✅ Done (rc.5) |
 | **MCP Integration** | Connect to any MCP server for instant tool access | ✅ Done (rc.6) |
 | **Dynamic Agent Spawning** | Runtime agent creation from YAML/templates, agent registry, parent-to-child messaging | ✅ Done (rc.7) |
-| **Multi-Agent Orchestration** | Supervisor, pipeline, and routing patterns for multi-agent systems | Planned |
+| **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | Planned |
 | **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals | Planned |
 | **Session Management + Key Facts** | Persistent user context and key facts across sessions | Planned |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | Planned |
@@ -82,7 +82,7 @@ Every planned feature and its current status. Features are independent unless no
 | **Code Interpreter** | Sandboxed code execution with templates and persistent library | Planned |
 | **Semantic Caching** | Cache semantically similar queries to reduce LLM calls | Planned |
 | **A2A Protocol** | Cross-service agent collaboration protocol | Planned - needs Multi-Agent Orchestration |
-| **Agent Composition Patterns** | Supervisor, pipeline, crew, debate, and ensemble multi-agent patterns | Planned - needs Multi-Agent Orchestration |
+| **Agent Composition Patterns** | Composite workflows, magentic orchestration, advanced multi-agent patterns | Planned - needs Multi-Agent Orchestration |
 | **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
 | **Knowledge Scoping** | Source-based knowledge boundaries and access control | Planned |
