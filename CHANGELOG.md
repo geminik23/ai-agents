@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.0-rc.7
+
+### Added
+- Dynamic agent spawning: create and manage child agents at runtime from YAML templates or LLM-generated specs, with shared LLMs, storage, shared context, spawn limits and  tool allowlists
+- Spawner template metadata: generate_agent tool auto-discovers template names, descriptions, and variables so the LLM selects the right template without system prompt instructions
+- CLI session persistence: /save, /load, /sessions, /delete commands with spawner-aware cascading that persists the full multi-agent graph
+- CLI HITL approval handler with multi-language support, configurable via metadata.cli.hitl
+- Error recovery wiring: fallback_llm, fallback_response, tool skip, and tool fallback actions now execute at runtime
+- State machine: on_reenter action, regeneration control, transition cooldown, dead state detection, LLM-based context extractors, and per-state process pipeline override
+- Build-time tool validation: agent build fails if YAML declares tools not registered in the tool registry
+
+### Changed
+- Spawner templates support file path references alongside inline strings
+- HITL approval returns a full result type instead of boolean, and Modified arguments are merged into the tool call
+
+### Fixed
+- Exists and Compare guards were ignored during YAML parsing due to variant ordering in ContextMatcher
+- Context extractor dotted keys were stored flat instead of nested, and guard comparison did not coerce types between strings and YAML booleans or numbers
+- Tool result messages did not include the tool name, and assistant tool-call messages were not stored before execution
+- HITL checks used display names instead of tool IDs, approval messages showed raw template syntax instead of rendered text, and LLM-based message fallback failed when the router LLM was missing
+- Spawner shared_storage was deserialized but silently ignored at runtime
+- SqliteStorage failed to open when parent directories did not exist
 
 ## 1.0.0-rc.6
 
