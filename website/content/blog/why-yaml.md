@@ -131,13 +131,13 @@ One file, one agent. It is a simple idea, but it has already covered a surprisin
 
 These are the principles behind the framework:
 
-1. **Language agnosticism** - no regex for semantic operations. The LLM handles all languages equally.
-2. **Declarative over imperative** - if something can be declared, it should not require code.
+1. **Language-agnostic semantics** - no regex for semantic operations. The LLM handles all languages equally.
+2. **Declarative behavior** - if something can be declared, it should not require code.
 3. **LLM-first for semantics** - intent detection, entity extraction, validation, and transitions should be driven by the LLM, not by pattern matching.
-4. **Layered configuration** - defaults set globally and overridden only where needed, whether per agent, per state, or per skill.
+4. **Layered overrides** - defaults set globally and overridden only where needed, whether per agent, per state, or per skill.
 5. **Opt-in complexity** - every feature has sensible defaults. A minimal agent stays minimal.
-6. **Production safety** - error recovery, tool security, human-in-the-loop approvals, and budget control are part of the core design from the start.
-7. **Extensibility via traits** - `LLMProvider`, `Tool`, `Memory`, `ApprovalHandler`, and `AgentHooks` are easy to extend with small, focused implementations.
+6. **Safety by default** - error recovery, tool security, human-in-the-loop approvals, and budget control are part of the core design from the start.
+7. **Extensible** - `LLMProvider`, `Tool`, `Memory`, `ApprovalHandler`, and `AgentHooks` are easy to extend with small, focused implementations.
 8. **Composability** - agents can be spawned, orchestrated, chained, and federated. One agent is a building block, not a dead end.
 
 If you want to try it:
