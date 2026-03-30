@@ -137,6 +137,14 @@ pub struct LLMConfig {
     pub presence_penalty: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -151,6 +159,10 @@ impl Default for LLMConfig {
             frequency_penalty: None,
             presence_penalty: None,
             stop_sequences: None,
+            timeout_seconds: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
             extra: HashMap::new(),
         }
     }
@@ -191,6 +203,26 @@ impl LLMConfig {
         self
     }
 
+    pub fn with_timeout_seconds(mut self, timeout: u64) -> Self {
+        self.timeout_seconds = Some(timeout);
+        self
+    }
+
+    pub fn with_reasoning(mut self, enabled: bool) -> Self {
+        self.reasoning = Some(enabled);
+        self
+    }
+
+    pub fn with_reasoning_effort(mut self, effort: impl Into<String>) -> Self {
+        self.reasoning_effort = Some(effort.into());
+        self
+    }
+
+    pub fn with_reasoning_budget_tokens(mut self, budget: u32) -> Self {
+        self.reasoning_budget_tokens = Some(budget);
+        self
+    }
+
     pub fn merge(mut self, other: &LLMConfig) -> Self {
         if other.temperature.is_some() {
             self.temperature = other.temperature;
@@ -212,6 +244,18 @@ impl LLMConfig {
         }
         if other.stop_sequences.is_some() {
             self.stop_sequences = other.stop_sequences.clone();
+        }
+        if other.timeout_seconds.is_some() {
+            self.timeout_seconds = other.timeout_seconds;
+        }
+        if other.reasoning.is_some() {
+            self.reasoning = other.reasoning;
+        }
+        if other.reasoning_effort.is_some() {
+            self.reasoning_effort = other.reasoning_effort.clone();
+        }
+        if other.reasoning_budget_tokens.is_some() {
+            self.reasoning_budget_tokens = other.reasoning_budget_tokens;
         }
         for (k, v) in &other.extra {
             self.extra.insert(k.clone(), v.clone());
@@ -341,10 +385,33 @@ mod tests {
             frequency_penalty: None,
             presence_penalty: None,
             stop_sequences: None,
+            timeout_seconds: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
             extra: HashMap::new(),
         };
         let merged = config1.merge(&config2);
         assert_eq!(merged.temperature, Some(0.5));
         assert_eq!(merged.max_tokens, Some(1000));
+    }
+
+    #[test]
+    fn test_llm_config_merge_reasoning_fields() {
+        let base = LLMConfig::default().with_timeout_seconds(60);
+
+        let overlay = LLMConfig {
+            timeout_seconds: Some(120),
+            reasoning: Some(true),
+            reasoning_effort: Some("high".to_string()),
+            reasoning_budget_tokens: Some(16384),
+            ..LLMConfig::default()
+        };
+
+        let merged = base.merge(&overlay);
+        assert_eq!(merged.timeout_seconds, Some(120));
+        assert_eq!(merged.reasoning, Some(true));
+        assert_eq!(merged.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(merged.reasoning_budget_tokens, Some(16384));
     }
 }

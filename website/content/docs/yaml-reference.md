@@ -147,6 +147,10 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `top_p` | `f32` | `null` | Nucleus sampling |
 | `base_url` | `string` | `null` | API endpoint override (required for `openai-compatible`) |
 | `api_key_env` | `string` | `null` | Env var holding the API key (overrides provider default) |
+| `timeout_seconds` | `u64` | `null` | Request timeout in seconds |
+| `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
+| `reasoning_effort` | `string` | `null` | Reasoning effort: `low`, `medium`, or `high` |
+| `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
 | *(any other key)* | | | Passed through as provider-specific extra parameter |
 
 ```yaml
@@ -157,14 +161,17 @@ llm:
   max_tokens: 4000
 ```
 
-Any field not listed above is captured in an `extra` map via `#[serde(flatten)]`. Currently only `reasoning_effort` is read from `extra` and forwarded to the LLM client:
+Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-specific search (`openai_enable_web_search`, `xai_search_mode`, etc.). See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
 
 ```yaml
-llms:
-  default:
-    provider: openai
-    model: gpt-5.1-mini
-    reasoning_effort: low    # low | medium | high
+# Reasoning model with timeout
+llm:
+  provider: openai
+  model: o3
+  reasoning: true
+  reasoning_effort: high
+  reasoning_budget_tokens: 16384
+  timeout_seconds: 120
 ```
 
 ### Named LLMs - `llms`

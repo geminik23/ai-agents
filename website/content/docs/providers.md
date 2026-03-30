@@ -65,7 +65,7 @@ llm:
   default: default
 ```
 
-The `reasoning_effort` parameter controls how much reasoning the model applies before answering. It is passed through as a provider-specific extra parameter. See [Extra Parameters](#extra-parameters) below.
+The `reasoning_effort` parameter controls how much reasoning the model applies before answering. See [Reasoning Parameters](#reasoning-parameters) below.
 
 ---
 
@@ -462,9 +462,10 @@ Every provider accepts these optional parameters in the `llm:` or `llms:` block:
 llm:
   provider: openai
   model: gpt-5.4-mini
-  temperature: 0.7      # Creativity (0.0 = deterministic, 1.0+ = creative)
-  max_tokens: 4096       # Max tokens in the response
-  top_p: 0.9             # Nucleus sampling threshold
+  temperature: 0.7        # Creativity (0.0 = deterministic, 1.0+ = creative)
+  max_tokens: 4096         # Max tokens in the response
+  top_p: 0.9               # Nucleus sampling threshold
+  timeout_seconds: 120     # Request timeout in seconds
 ```
 
 | Parameter | Type | Default | Description |
@@ -472,30 +473,114 @@ llm:
 | `temperature` | `f32` | `0.7` | Sampling temperature |
 | `max_tokens` | `u32` | `2000` | Maximum response tokens |
 | `top_p` | `f32` | - | Nucleus sampling threshold |
+| `timeout_seconds` | `u64` | - | Request timeout in seconds |
+
+---
+
+## Reasoning Parameters
+
+For models that support extended thinking (e.g. OpenAI `o3`, `gpt-5.4-mini`), you can control reasoning behavior with first-class YAML fields:
+
+```yaml
+llm:
+  provider: openai
+  model: o3
+  reasoning: true
+  reasoning_effort: high
+  reasoning_budget_tokens: 16384
+  timeout_seconds: 120
+```
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `reasoning` | `bool` | - | Enable extended thinking / reasoning mode |
+| `reasoning_effort` | `string` | - | Reasoning effort: `low`, `medium`, or `high` |
+| `reasoning_budget_tokens` | `u32` | - | Maximum token budget for reasoning |
+
+These work across any provider that supports reasoning. Use `timeout_seconds` alongside reasoning-heavy models since they can take longer to respond.
 
 ---
 
 ## Extra Parameters
 
-Any field not recognized by the framework is captured as a provider-specific extra parameter and passed through to the underlying LLM client. This allows provider-specific features without framework changes.
+Any YAML field not recognized as a named parameter is captured as a provider-specific extra and forwarded to the underlying LLM client. This lets you use provider-specific features without framework changes.
 
-### `reasoning_effort` (OpenAI)
+### Transport-Level Resilience
 
-For OpenAI reasoning-capable models (e.g. `gpt-5.4`, `gpt-5.4-mini`), you can control how much reasoning the model applies:
+The `llm` crate supports HTTP-level retry with exponential backoff, complementary to the framework's agent-level `error_recovery`. Both can be active simultaneously.
 
 ```yaml
-llms:
-  default:
-    provider: openai
-    model: gpt-5.4-mini
-    reasoning_effort: low    # low | medium | high
+llm:
+  provider: openai
+  model: gpt-4
+  resilient: true
+  resilient_attempts: 3
+  resilient_base_delay_ms: 1000
+  resilient_max_delay_ms: 30000
+  resilient_jitter: true
 ```
 
-| Value | Behavior |
-| --- | --- |
-| `low` | Minimal reasoning - fast and cheap |
-| `medium` | Balanced reasoning |
-| `high` | Maximum reasoning - slower but more thorough |
+| Parameter | Type | Description |
+| --- | --- | --- |
+| `resilient` | `bool` | Enable transport-level retry |
+| `resilient_attempts` | `u64` | Max retry attempts |
+| `resilient_base_delay_ms` | `u64` | Base delay for exponential backoff |
+| `resilient_max_delay_ms` | `u64` | Maximum backoff delay |
+| `resilient_jitter` | `bool` | Add randomness to backoff timing |
+
+> **Note:** If you also have an `error_recovery:` section in your agent spec, the agent retries at the conversation level while `resilient` retries at the HTTP level. A failed request could trigger up to `resilient_attempts x max_retries` total API calls.
+
+### Azure OpenAI
+
+To use Azure OpenAI endpoints, pass `api_version` and `deployment_id` as extra parameters:
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-4
+  base_url: "https://my-resource.openai.azure.com"
+  api_version: "2024-06-01"
+  deployment_id: my-gpt4-deployment
+```
+
+> **Note:** Full Azure support (dedicated `azure-openai` provider type) is planned for a future release. The extra-based approach above works today.
+
+### OpenAI Web Search
+
+For OpenAI models that support web search:
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-4
+  openai_enable_web_search: true
+  openai_web_search_context_size: medium
+```
+
+### xAI Search
+
+For xAI (Grok) models with search capabilities:
+
+```yaml
+llm:
+  provider: xai
+  model: grok-3
+  xai_search_mode: auto
+  xai_max_search_results: 10
+```
+
+### `extra_body` (Escape Hatch)
+
+For any parameter not modeled by the framework, inject raw JSON into the request body:
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-4
+  extra_body:
+    logprobs: true
+    top_logprobs: 5
+```
 
 ---
 

@@ -89,6 +89,22 @@ pub struct LLMConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
 
+    /// Request timeout in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+
+    /// Enable extended thinking / reasoning mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+
+    /// Reasoning effort level: "low", "medium", or "high".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
+    /// Maximum token budget for reasoning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_budget_tokens: Option<u32>,
+
     /// Additional provider-specific configuration
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -112,6 +128,10 @@ impl Default for LLMConfig {
             top_p: None,
             base_url: None,
             api_key_env: None,
+            timeout_seconds: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_budget_tokens: None,
             extra: HashMap::new(),
         }
     }
@@ -324,5 +344,27 @@ router: router_llm
         let selector: LLMSelector = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(selector.default, "main");
         assert_eq!(selector.router, Some("router_llm".to_string()));
+    }
+
+    #[test]
+    fn test_llm_config_reasoning_fields_deser() {
+        let yaml = r#"
+provider: openai
+model: o3
+timeout_seconds: 120
+reasoning: true
+reasoning_effort: high
+reasoning_budget_tokens: 16384
+"#;
+        let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.timeout_seconds, Some(120));
+        assert_eq!(config.reasoning, Some(true));
+        assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(config.reasoning_budget_tokens, Some(16384));
+        // Must NOT leak into extra
+        assert!(!config.extra.contains_key("timeout_seconds"));
+        assert!(!config.extra.contains_key("reasoning"));
+        assert!(!config.extra.contains_key("reasoning_effort"));
+        assert!(!config.extra.contains_key("reasoning_budget_tokens"));
     }
 }

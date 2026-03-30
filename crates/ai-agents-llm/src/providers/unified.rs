@@ -153,12 +153,42 @@ fn compute_config_hash(config: &LLMConfig, system_prompt: Option<&str>) -> u64 {
     if let Some(k) = config.top_k {
         k.hash(&mut hasher);
     }
-    if let Some(ref re) = config
-        .extra
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-    {
-        re.hash(&mut hasher);
+    // First-class fields
+    if let Some(timeout) = config.timeout_seconds {
+        timeout.hash(&mut hasher);
+    }
+    if let Some(reasoning) = config.reasoning {
+        reasoning.hash(&mut hasher);
+    }
+    if let Some(ref effort) = config.reasoning_effort {
+        effort.hash(&mut hasher);
+    }
+    if let Some(budget) = config.reasoning_budget_tokens {
+        budget.hash(&mut hasher);
+    }
+    // Extra keys forwarded to the builder
+    const FORWARDED_EXTRA_KEYS: &[&str] = &[
+        "normalize_response",
+        "api_version",
+        "deployment_id",
+        "resilient",
+        "resilient_attempts",
+        "resilient_base_delay_ms",
+        "resilient_max_delay_ms",
+        "resilient_jitter",
+        "extra_body",
+        "openai_enable_web_search",
+        "openai_web_search_context_size",
+        "xai_search_mode",
+        "xai_max_search_results",
+        "xai_search_from_date",
+        "xai_search_to_date",
+    ];
+    for key in FORWARDED_EXTRA_KEYS {
+        if let Some(v) = config.extra.get(*key) {
+            key.hash(&mut hasher);
+            v.to_string().hash(&mut hasher);
+        }
     }
     if let Some(sp) = system_prompt {
         sp.hash(&mut hasher);
@@ -375,26 +405,155 @@ impl UnifiedLLMProvider {
             }
         }
 
-        // Reasoning effort from extra
-        if let Some(reasoning_effort) = config
-            .extra
-            .get("reasoning_effort")
-            .and_then(|v| v.as_str())
-        {
-            let effort = match reasoning_effort.to_lowercase().as_str() {
-                "low" => Some(ReasoningEffort::Low),
-                "medium" => Some(ReasoningEffort::Medium),
-                "high" => Some(ReasoningEffort::High),
-                _ => {
+        // --- Timeout (first-class, fallback to extra) ---
+        let timeout = config
+            .timeout_seconds
+            .or_else(|| config.extra.get("timeout_seconds").and_then(|v| v.as_u64()));
+        if let Some(t) = timeout {
+            builder = builder.timeout_seconds(t);
+        }
+
+        // --- Extended reasoning (first-class, fallback to extra) ---
+        let reasoning = config
+            .reasoning
+            .or_else(|| config.extra.get("reasoning").and_then(|v| v.as_bool()));
+        if let Some(r) = reasoning {
+            builder = builder.reasoning(r);
+        }
+
+        // --- Reasoning effort (first-class, fallback to extra) ---
+        let reasoning_effort = config.reasoning_effort.as_deref().or_else(|| {
+            config
+                .extra
+                .get("reasoning_effort")
+                .and_then(|v| v.as_str())
+        });
+        if let Some(effort) = reasoning_effort {
+            let re = match effort.to_lowercase().as_str() {
+                "low" => ReasoningEffort::Low,
+                "medium" => ReasoningEffort::Medium,
+                "high" => ReasoningEffort::High,
+                other => {
                     return Err(LLMError::Config(format!(
-                        "Invalid reasoning_effort '{}'. Expected one of: low, medium, high",
-                        reasoning_effort
+                        "Invalid reasoning_effort '{}'. Expected: low, medium, high",
+                        other
                     )));
                 }
             };
+            builder = builder.reasoning_effort(re);
+        }
 
-            if let Some(effort) = effort {
-                builder = builder.reasoning_effort(effort);
+        // --- Reasoning budget (first-class, fallback to extra) ---
+        let budget = config.reasoning_budget_tokens.or_else(|| {
+            config
+                .extra
+                .get("reasoning_budget_tokens")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32)
+        });
+        if let Some(b) = budget {
+            builder = builder.reasoning_budget_tokens(b);
+        }
+
+        // --- Normalize streaming tool call chunks ---
+        if let Some(normalize) = config
+            .extra
+            .get("normalize_response")
+            .and_then(|v| v.as_bool())
+        {
+            builder = builder.normalize_response(normalize);
+        }
+
+        // --- Azure OpenAI ---
+        if let Some(api_version) = config.extra.get("api_version").and_then(|v| v.as_str()) {
+            builder = builder.api_version(api_version);
+        }
+        if let Some(deployment_id) = config.extra.get("deployment_id").and_then(|v| v.as_str()) {
+            builder = builder.deployment_id(deployment_id);
+        }
+
+        // --- Transport-level resilience (complementary to agent-level recovery) ---
+        if let Some(resilient) = config.extra.get("resilient").and_then(|v| v.as_bool()) {
+            builder = builder.resilient(resilient);
+        }
+        if let Some(attempts) = config
+            .extra
+            .get("resilient_attempts")
+            .and_then(|v| v.as_u64())
+        {
+            builder = builder.resilient_attempts(attempts as usize);
+        }
+        if let Some(base_delay) = config
+            .extra
+            .get("resilient_base_delay_ms")
+            .and_then(|v| v.as_u64())
+        {
+            let max_delay = config
+                .extra
+                .get("resilient_max_delay_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(base_delay.saturating_mul(30));
+            builder = builder.resilient_backoff(base_delay, max_delay);
+        }
+        if let Some(jitter) = config
+            .extra
+            .get("resilient_jitter")
+            .and_then(|v| v.as_bool())
+        {
+            builder = builder.resilient_jitter(jitter);
+        }
+
+        // --- Extra body (universal escape hatch for arbitrary provider JSON) ---
+        if let Some(extra_body) = config.extra.get("extra_body") {
+            builder = builder.extra_body(extra_body.clone());
+        }
+
+        // --- Provider-specific: OpenAI web search ---
+        if matches!(
+            self.provider_type,
+            ProviderType::OpenAI | ProviderType::OpenAICompatible
+        ) {
+            if let Some(enable) = config
+                .extra
+                .get("openai_enable_web_search")
+                .and_then(|v| v.as_bool())
+            {
+                builder = builder.openai_enable_web_search(enable);
+            }
+            if let Some(ctx) = config
+                .extra
+                .get("openai_web_search_context_size")
+                .and_then(|v| v.as_str())
+            {
+                builder = builder.openai_web_search_context_size(ctx);
+            }
+        }
+
+        // --- Provider-specific: XAI search ---
+        if self.provider_type == ProviderType::XAI {
+            if let Some(mode) = config.extra.get("xai_search_mode").and_then(|v| v.as_str()) {
+                builder = builder.xai_search_mode(mode);
+            }
+            if let Some(max) = config
+                .extra
+                .get("xai_max_search_results")
+                .and_then(|v| v.as_u64())
+            {
+                builder = builder.xai_max_search_results(max as u32);
+            }
+            if let Some(from) = config
+                .extra
+                .get("xai_search_from_date")
+                .and_then(|v| v.as_str())
+            {
+                builder = builder.xai_search_from_date(from);
+            }
+            if let Some(to) = config
+                .extra
+                .get("xai_search_to_date")
+                .and_then(|v| v.as_str())
+            {
+                builder = builder.xai_search_to_date(to);
             }
         }
 
@@ -698,21 +857,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut extra = HashMap::new();
-        extra.insert(
-            "reasoning_effort".to_string(),
-            serde_json::Value::String("low".to_string()),
-        );
-
         let config = LLMConfig {
-            temperature: Some(0.7),
-            max_tokens: Some(2000),
-            top_p: Some(0.9),
-            top_k: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            stop_sequences: None,
-            extra,
+            reasoning_effort: Some("low".to_string()),
+            ..LLMConfig::default()
         };
 
         let result = provider.build_llm(Some(&config));
@@ -728,21 +875,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let mut extra = HashMap::new();
-        extra.insert(
-            "reasoning_effort".to_string(),
-            serde_json::Value::String("invalid".to_string()),
-        );
-
         let config = LLMConfig {
-            temperature: Some(0.7),
-            max_tokens: Some(2000),
-            top_p: Some(0.9),
-            top_k: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            stop_sequences: None,
-            extra,
+            reasoning_effort: Some("invalid".to_string()),
+            ..LLMConfig::default()
         };
 
         let result = provider.build_llm(Some(&config));
@@ -756,12 +891,7 @@ mod tests {
         let config = LLMConfig {
             temperature: Some(0.5),
             max_tokens: Some(4096),
-            top_p: None,
-            top_k: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            stop_sequences: None,
-            extra: HashMap::new(),
+            ..LLMConfig::default()
         };
 
         let provider = UnifiedLLMProvider::from_spec_config(
@@ -808,16 +938,7 @@ mod tests {
 
     #[test]
     fn test_config_hash_stability() {
-        let config = LLMConfig {
-            temperature: Some(0.7),
-            max_tokens: Some(2000),
-            top_p: Some(0.9),
-            top_k: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            stop_sequences: None,
-            extra: HashMap::new(),
-        };
+        let config = LLMConfig::default();
 
         let hash1 = compute_config_hash(&config, Some("system prompt"));
         let hash2 = compute_config_hash(&config, Some("system prompt"));
@@ -828,6 +949,138 @@ mod tests {
 
         let hash4 = compute_config_hash(&config, None);
         assert_ne!(hash1, hash4);
+    }
+
+    #[test]
+    fn test_build_llm_forwards_timeout() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("gpt-4")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let config = LLMConfig::default().with_timeout_seconds(120);
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_llm_forwards_reasoning_and_budget() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("o3")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let config = LLMConfig {
+            reasoning: Some(true),
+            reasoning_effort: Some("high".to_string()),
+            reasoning_budget_tokens: Some(16384),
+            ..LLMConfig::default()
+        };
+
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_llm_forwards_resilient_settings() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("gpt-4")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let config = LLMConfig::default()
+            .with_extra("resilient", serde_json::json!(true))
+            .with_extra("resilient_attempts", serde_json::json!(3))
+            .with_extra("resilient_base_delay_ms", serde_json::json!(1000))
+            .with_extra("resilient_max_delay_ms", serde_json::json!(30000))
+            .with_extra("resilient_jitter", serde_json::json!(true));
+
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_llm_forwards_azure_fields() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("gpt-4")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let config = LLMConfig::default()
+            .with_extra("api_version", serde_json::json!("2024-06-01"))
+            .with_extra("deployment_id", serde_json::json!("my-gpt4-deploy"));
+
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_llm_forwards_extra_body() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("gpt-4")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        let config =
+            LLMConfig::default().with_extra("extra_body", serde_json::json!({"logprobs": true}));
+
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reasoning_effort_extra_fallback() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("o3")
+            .api_key("XXXXXXXXXX")
+            .build()
+            .unwrap();
+
+        // reasoning_effort via extra (backward compat)
+        let config =
+            LLMConfig::default().with_extra("reasoning_effort", serde_json::json!("medium"));
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_hash_changes_with_forwarded_extra() {
+        let config_a = LLMConfig::default();
+        let config_b = LLMConfig::default().with_timeout_seconds(120);
+
+        let hash_a = compute_config_hash(&config_a, None);
+        let hash_b = compute_config_hash(&config_b, None);
+        assert_ne!(hash_a, hash_b);
+    }
+
+    #[test]
+    fn test_config_hash_changes_with_reasoning_fields() {
+        let config_a = LLMConfig::default();
+        let config_b = LLMConfig {
+            reasoning: Some(true),
+            reasoning_effort: Some("high".to_string()),
+            ..LLMConfig::default()
+        };
+        let config_c = LLMConfig::default().with_extra("resilient", serde_json::json!(true));
+
+        let ha = compute_config_hash(&config_a, None);
+        let hb = compute_config_hash(&config_b, None);
+        let hc = compute_config_hash(&config_c, None);
+
+        assert_ne!(ha, hb);
+        assert_ne!(ha, hc);
+        assert_ne!(hb, hc);
     }
 
     #[test]

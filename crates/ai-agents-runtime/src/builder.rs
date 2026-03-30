@@ -195,6 +195,10 @@ impl AgentBuilder {
                     frequency_penalty: None,
                     presence_penalty: None,
                     stop_sequences: None,
+                    timeout_seconds: config.timeout_seconds,
+                    reasoning: config.reasoning,
+                    reasoning_effort: config.reasoning_effort.clone(),
+                    reasoning_budget_tokens: config.reasoning_budget_tokens,
                     extra: config.extra.clone(),
                 };
                 // base_url: first-class field, fallback to extra for backward compat
@@ -245,6 +249,10 @@ impl AgentBuilder {
                 frequency_penalty: None,
                 presence_penalty: None,
                 stop_sequences: None,
+                timeout_seconds: config.timeout_seconds,
+                reasoning: config.reasoning,
+                reasoning_effort: config.reasoning_effort.clone(),
+                reasoning_budget_tokens: config.reasoning_budget_tokens,
                 extra: config.extra.clone(),
             };
             // base_url: first-class field, fallback to extra for backward compat
