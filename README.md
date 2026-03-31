@@ -169,6 +169,14 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 | [sqlx](https://crates.io/crates/sqlx) | SQLite storage backend (optional, `sqlite` feature) |
 | [redis](https://crates.io/crates/redis) | Redis storage backend (optional, `redis-storage` feature) |
 
+## Independence Notice
+
+This repository is an independent open-source project maintained by the author in a personal capacity.
+
+It is not an official product or offering of any employer, and no employer owns or governs this project.
+
+See [INDEPENDENCE.md](./INDEPENDENCE.md) for details.
+
 ## License
 
 Licensed under either of
