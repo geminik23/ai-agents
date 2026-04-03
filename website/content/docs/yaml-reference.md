@@ -419,7 +419,7 @@ on_exit:
 
 ## Skills
 
-Skills are reusable multi-step pipelines triggered by natural language. The router LLM picks the right skill based on `trigger` matching.
+Skills are reusable multi-step pipelines triggered by natural language. The router LLM picks the right skill based on `trigger` matching. Skills are **stateless and single-shot**: the executor runs each step prompt as an isolated LLM call with no conversation history or memory.
 
 ### Inline Skill
 
@@ -429,6 +429,21 @@ Skills are reusable multi-step pipelines triggered by natural language. The rout
 | `description` | `string` | What this skill does (shown to router) |
 | `trigger` | `string` | Natural-language trigger condition |
 | `steps` | `list` | Ordered list of `prompt` or `tool` steps |
+| `disambiguation` | `object` | Optional skill-level disambiguation override (see [Skill-Level Disambiguation Override](#skill-level-disambiguation-override)) |
+| `reasoning` | `object` | Optional skill-level reasoning override (see [Skill-Level Reasoning Override](#skill-level-reasoning-override)) |
+| `reflection` | `object` | Optional skill-level reflection override |
+
+Step prompts are rendered as Jinja2 templates with these variables:
+
+| Variable | Type | Description |
+|----------|------|-------------|
+| `user_input` | `string` | The user's message (or enriched input after disambiguation) |
+| `steps` | `list` | Previous step results. Access via `steps[N].result` and `steps[N].args` |
+| `context` | `object` | Extra context passed to the executor (empty `{}` by default) |
+
+> **Important:** If a step prompt does not reference `{{ user_input }}`, the LLM cannot see what the user said.
+
+> **Note:** Skills are single-shot. After execution, the next user message goes through full routing - it does not return to the skill. Do not ask for "confirmation" or "reply with X" in step prompts. To collect parameters before execution, use `required_clarity` in the skill's `disambiguation` override.
 
 ```yaml
 skills:
@@ -1320,6 +1335,10 @@ reflection:
 
 Detect ambiguous user messages and ask clarifying questions before proceeding.
 
+> **Note:** Disambiguation relies on the router LLM to detect ambiguity, classify the type, and generate clarification questions. Very small models (e.g. gpt-4.1-nano) may misclassify ambiguity types or ignore style instructions. Use at least a mid-tier model or latest model (e.g. gpt-4.1-mini or gpt-5.4-nano) for the router if disambiguation quality matters.
+
+The threshold is the sole decision for ambiguity. The detector LLM returns a confidence score (0.0-1.0) for how clear the user's intent is. Messages scoring below the threshold trigger clarification.
+
 ### `disambiguation.enabled`
 
 | Detail | Value |
@@ -1331,29 +1350,138 @@ Detect ambiguous user messages and ask clarifying questions before proceeding.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `llm` | `string` | `null` | LLM alias for detection |
-| `threshold` | `f64` | `0.7` | Ambiguity score threshold to trigger clarification |
-| `aspects` | `list` | `[]` | What to check for |
+| `llm` | `string` | `"router"` | LLM alias for detection |
+| `threshold` | `f64` | `0.7` | Confidence cutoff (0.0-1.0). Messages below this trigger clarification. Lower = more sensitive |
+| `aspects` | `list` | `[missing_target, missing_action, missing_parameters, vague_references]` | Which ambiguity types to check for |
+| `prompt` | `string` | _(none)_ | Optional custom detection prompt. Replaces the built-in prompt sent to the detection LLM. Omit to use the default |
 
 Available aspects:
-- `missing_target` - unclear what the user is referring to
-- `missing_action` - unclear what action to take
-- `missing_parameters` - key details are missing
-- `multiple_intents` - message contains multiple requests
-- `vague_references` - pronouns or references without context
-- `implicit_context` - assumes shared knowledge
+- `missing_target` - unclear what the user is referring to ("Send it" - send what?)
+- `missing_action` - unclear what action to take ("The report" - do what with it?)
+- `missing_parameters` - key details are missing ("Book a flight" - when? where?)
+- `multiple_intents` - message contains multiple possible requests ("Cancel" in a state with multiple intent-labeled transitions)
+- `vague_references` - pronouns or references without context ("Do that again" - do what?)
+- `implicit_context` - assumes shared knowledge ("The usual" - what is "the usual"?)
 
 ### `disambiguation.clarification`
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `style` | `string` | `"auto"` | How to ask: `auto`, `options`, `open_ended` |
-| `max_attempts` | `u32` | `2` | Max clarification rounds |
+| `style` | `string` | `"auto"` | How to ask: `auto`, `options`, `open`, `yes_no`, `hybrid` |
+| `llm` | `string` | _(none)_ | Optional LLM alias for generating clarification questions. Falls back to the detection LLM if not set |
+| `max_options` | `u32` | `4` | Max choices in options/hybrid style |
+| `include_other_option` | `bool` | `true` | Add an "Other" freeform choice to options/hybrid |
+| `max_attempts` | `u32` | `2` | Max clarification exchanges before giving up. The initial question counts as attempt 1 |
 | `on_max_attempts` | `string` | `"proceed_with_best_guess"` | Action when limit is reached |
+
+Clarification styles:
+
+| Style | Behavior |
+|-------|----------|
+| `auto` | LLM picks the best format based on ambiguity type (default) |
+| `options` | Multiple choice with labeled options (A, B, C) |
+| `open` | Single open-ended question, no options |
+| `yes_no` | Single yes/no confirmation question |
+| `hybrid` | Options plus a freeform "or describe what you need" |
+
+`on_max_attempts` actions:
+
+| Action | Behavior |
+|--------|----------|
+| `proceed_with_best_guess` | Continue with the best interpretation (default) |
+| `apologize_and_stop` | Apologize and drop the request |
+| `escalate` | Trigger HITL approval flow (requires `hitl:` config) |
+
+If the user abandons clarification mid-flow (e.g. "forget it", "never mind") the framework detects this and cancels the pending question gracefully.
+If the user switches to a different topic during clarification, the new input is processed from scratch instead of being consumed as a clarification response.
+
+### `disambiguation.context`
+
+Controls what information is fed into the detection prompt for context-aware analysis.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `recent_messages` | `usize` | `5` | How many recent messages to include |
+| `include_state` | `bool` | `true` | Include current state name and prompt |
+| `include_available_tools` | `bool` | `true` | List tool names in detection prompt |
+| `include_available_skills` | `bool` | `true` | List skill triggers in detection prompt |
+| `include_user_context` | `bool` | `true` | Include runtime user context |
 
 ### `disambiguation.skip_when`
 
-Skip disambiguation for certain message types.
+Conditions that bypass disambiguation entirely. No detection LLM call is made when a condition matches.
+
+| Type | Fields | LLM call? | Description |
+|------|--------|-----------|-------------|
+| `social` | - | Yes | Greetings, thanks, goodbyes |
+| `short_input` | `max_chars` | No | Messages under `max_chars` characters |
+| `answering_agent_question` | - | Yes | User replying to the agent's last question (LLM verifies the response is actually an answer) |
+| `complete_tool_call` | - | Yes | Direct tool invocations like "What is 2+2?" |
+| `in_state` | `states` (list) | No | Skip when in specific named states |
+| `custom` | `condition` (string) | Yes | Arbitrary LLM-evaluated condition |
+
+### State-Level Disambiguation Override
+
+A state can override agent-level disambiguation settings. Useful for sensitive states (e.g. payment) that need higher clarity.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `threshold` | `f64` | Override the agent-level confidence cutoff |
+| `require_confirmation` | `bool` | Ask "Did you mean X?" even after clarification resolves |
+| `required_clarity` | `list` | Fields that must be explicitly stated. If any are missing, clarification is forced regardless of confidence |
+
+```yaml
+states:
+  states:
+    payment:
+      prompt: "Process the payment."
+      disambiguation:
+        threshold: 0.95
+        require_confirmation: true
+        required_clarity:
+          - amount
+          - recipient
+```
+
+`required_clarity` is a hard gate: if the detector reports any of these fields in `what_is_unclear`, clarification is forced even if confidence is above the threshold.
+
+### Skill-Level Disambiguation Override
+
+A skill can declare its own disambiguation settings. After the skill router identifies a matching skill, the runtime runs a second disambiguation pass with the skill's override before executing the skill steps.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `enabled` | `bool` | Enable skill-level disambiguation |
+| `threshold` | `f64` | Override the agent-level confidence cutoff |
+| `required_clarity` | `list` | Fields that must be explicitly stated |
+| `clarification_templates` | `map` | Static question strings keyed by field name |
+
+```yaml
+skills:
+  - id: transfer_money
+    description: "Transfer money between accounts"
+    trigger: "When user wants to send or transfer money"
+    disambiguation:
+      enabled: true
+      threshold: 0.9
+      required_clarity:
+        - recipient
+        - amount
+      clarification_templates:
+        missing_recipient: "Who should I send the money to?"
+        missing_amount: "How much would you like to transfer?"
+    steps:
+      - prompt: "Process the transfer."
+```
+
+Template key lookup order:
+1. Match by ambiguity type (`missing_target`, `missing_action`, `missing_parameters`, `vague_reference`)
+2. Match by `what_is_unclear` field: for each unclear field (e.g. "recipient"), check `missing_recipient` then `recipient` against template keys
+3. No match: fall through to LLM-generated question
+
+> **Note:** Templates are static strings with a fixed language. When a template matches, it is used as-is with no LLM call. For multilingual clarification, omit templates and let the clarifier LLM generate the question instead.
+
+### Full Example
 
 ```yaml
 disambiguation:
@@ -1370,10 +1498,20 @@ disambiguation:
       - implicit_context
   clarification:
     style: auto
+    max_options: 4
+    include_other_option: true
     max_attempts: 2
     on_max_attempts: proceed_with_best_guess
+  context:
+    recent_messages: 5
+    include_state: true
+    include_available_tools: true
+    include_available_skills: true
+    include_user_context: true
   skip_when:
     - type: social
+    - type: answering_agent_question
+    - type: complete_tool_call
     - type: short_input
       max_chars: 5
 ```

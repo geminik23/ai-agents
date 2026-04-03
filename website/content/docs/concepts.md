@@ -169,6 +169,8 @@ A skill is a reusable workflow that bundles prompts and tool calls into a named,
 
 Each skill has one or more steps. A step can be a `prompt` (send text to the LLM), a `tool` call (run a specific tool with arguments), or a combination. This lets you build multi-step recipes like "fetch data, then analyze it, then summarize."
 
+Skills are **stateless and single-shot**: the executor runs each step as an isolated LLM call with no conversation history. Step prompts must use `{{ user_input }}` to access the user's message. After a skill finishes, the next user message goes through normal routing — it does not return to the skill. See the [YAML Reference](@/docs/yaml-reference.md#skills) for template variables and examples.
+
 Skills can define their own reasoning and reflection settings independently of the agent-level defaults. You can also put skills in external `.skill.yaml` files and reference them by path.
 
 ```yaml
