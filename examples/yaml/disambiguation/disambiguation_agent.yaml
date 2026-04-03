@@ -1,7 +1,22 @@
 name: DisambiguationAgent
 version: "1.0.0"
-description: "Agent with LLM-based intent disambiguation"
+description: "Full disambiguation config - all aspects, context-awareness, skip rules"
 
+# Full disambiguation example
+#
+# every detection aspect, context-aware analysis, and all skip rule types in one agent.
+#
+# It combines all features shown individually in the earlier examples:
+#   - disambiguation_basic.yaml: core clarification flow
+#   - disambiguation_with_state.yaml: state machine + intent routing
+#   - disambiguation_multilingual.yaml: multi-language + skill overrides
+#
+# The context section feeds recent messages, current state, available tools/skills, and user context into the detection prompt so the LLM can resolve references like "do that again" by looking at conversation history.
+#
+# Flow: user input -> skip check (social / answering_agent_question / complete_tool_call / short)
+#                  -> pass -> detector (all 6 aspects + context) -> confidence >= 0.7 -> normal
+#                                                                -> confidence < 0.7 -> clarify
+#                  -> skipped -> normal response (no detection overhead)
 system_prompt: |
   You are a helpful assistant with intent disambiguation capabilities.
 
@@ -16,35 +31,64 @@ system_prompt: |
 llms:
   default:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-mini
   router:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-nano
 
 llm:
   default: default
   router: router
 
+# All 6 ambiguity aspects enabled, context-aware detection, and comprehensive skip rules.
+#
+# aspects: each one targets a different class of vagueness. All six together give the broadest possible coverage - disable specific ones to reduce false positives.
+# The full set is: missing_target, missing_action, missing_parameters, multiple_intents, vague_references, implicit_context.
+#
+# context: feeds conversation history and agent state into the detection prompt.
+# This lets the detector resolve anaphora ("do that again") and implicit references by checking what tools, skills, and recent messages are available.
+# All context fields default to true except recent_messages which defaults to 5.
+#
+# skip_when: conditions that bypass disambiguation entirely.
+# See disambiguation_basic.yaml for the full list of available types.
+# NOTE: social, answering_agent_question, complete_tool_call, and custom types use an LLM call to evaluate the condition.
+# short_input and in_state are pure checks with no LLM cost.
 disambiguation:
   enabled: true
   detection:
-    llm: router
-    threshold: 0.7
+    llm: router                          # cheap/fast model for detection. default: router
+    threshold: 0.7                       # confidence cutoff. lower = more sensitive
     aspects:
-      - missing_target
-      - missing_action
-      - missing_parameters
-      - multiple_intents
-      - vague_references
-      - implicit_context
+      - missing_target                   # "Send it" - send what?
+      - missing_action                   # "The report" - do what with it?
+      - missing_parameters               # "Book a flight" - when? where?
+      - multiple_intents                 # "Cancel and also reschedule" - two actions
+      - vague_references                 # "Do that again" - do what?
+      - implicit_context                 # "The usual" - what is "the usual"?
   clarification:
-    style: auto
-    max_attempts: 2
+    style: auto                          # auto (default) | options | open | yes_no | hybrid
+    max_options: 4                       # max choices in options/hybrid style. default: 4
+    include_other_option: true           # add "Other" freeform choice. default: false
+    max_attempts: 2                      # max clarification rounds before giving up. default: 2
+    # what to do after max_attempts clarification rounds still fail:
+    #   proceed_with_best_guess - continue with the best interpretation (default)
+    #   apologize_and_stop      - apologize and drop the request
+    #   escalate                - trigger HITL approval flow (requires hitl: config)
     on_max_attempts: proceed_with_best_guess
+  # Context fields control what extra information the detection LLM receives.
+  # More context helps resolve references like "do that again" or "the usual" but increases prompt size and token cost per detection call.
+  context:
+    recent_messages: 5                   # how many recent messages to include. default: 5
+    include_state: true                  # include current state name/prompt. default: true
+    include_available_tools: true        # list tool names in detection prompt. default: true
+    include_available_skills: true       # list skill triggers in detection prompt. default: true
+    include_user_context: true           # include runtime user context values. default: true
   skip_when:
-    - type: social
+    - type: social                       # greetings, thanks, goodbyes. uses LLM call
+    - type: answering_agent_question     # user replying to agent's last question. uses LLM call
+    - type: complete_tool_call           # direct tool invocations like "What is 2+2?". uses LLM call
     - type: short_input
-      max_chars: 5
+      max_chars: 5                       # messages of 5 chars or fewer. no LLM call
 
 memory:
   type: in-memory
@@ -60,10 +104,18 @@ skills: []
 
 metadata:
   cli:
-    welcome: "=== Disambiguation Agent Demo ==="
+    welcome: |
+      === Disambiguation Agent (Full Config) ===
+      All 6 ambiguity aspects, context-awareness, and advanced skip rules.
+      Start with disambiguation_basic.yaml if this is your first time.
     hints:
-      - "Try: Send it"
-      - "Try: Do the thing"
-      - "Try: 그거 보내줘"
-      - "Try: あれをお願いします"
-      - "Try: What time is it?"
+      - "Ambiguous: 'Send it' (vague_references)"
+      - "Ambiguous: 'Do the thing' (missing_action)"
+      - "Ambiguous: 'Book it for tomorrow and also cancel the other one' (multiple_intents)"
+      - "Ambiguous: 'You know what I mean' (implicit_context)"
+      - "Clear: 'What is 42 * 17?' (direct tool call)"
+      - "Skipped: 'Hello!' (social)"
+      - "Skipped: 'Yes' (answering_agent_question)"
+      - "Abandon: say 'forget it' during clarification to cancel"
+      - "Switch: say something unrelated during clarification to start fresh"
+    show_tools: true

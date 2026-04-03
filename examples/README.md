@@ -270,15 +270,21 @@ cargo run -p ai-agents-cli -- run examples/yaml/reasoning/reasoning_agent.yaml
 
 ### `yaml/disambiguation/`
 
-Intent disambiguation and clarification examples.
+LLM-based intent disambiguation and clarification - the agent asks before acting on vague input. No regex, works in any language.
 
 | File | Description |
 |------|-------------|
-| `disambiguation_agent.yaml` | LLM-based ambiguity detection and clarification flow |
+| `disambiguation_basic.yaml` | Enable disambiguation in 4 lines, clarification flow, social skip |
+| `disambiguation_with_state.yaml` | State machine + `intent:` labels for deterministic routing after disambiguation |
+| `disambiguation_multilingual.yaml` | Multi-language detection + skill-level overrides with `clarification_templates` |
+| `disambiguation_agent.yaml` | Full config with all aspects, context-aware detection, and all skip rules |
 
-Example:
+Examples:
 
 ```sh
+cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_basic.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_with_state.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_multilingual.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_agent.yaml
 ```
 
@@ -464,10 +470,11 @@ cargo run --bin tool-provider
 ### `rust/disambiguation/`
 
 Advanced disambiguation demo with Rust-side startup options and metadata display.
+Start with `yaml/disambiguation/` for the core concepts.
 
 | Binary | Description |
 |--------|-------------|
-| `disambiguation-agent` | Ambiguity detection and clarification with additional runtime metadata display |
+| `disambiguation-agent` | Override clarification style and fallback at runtime, display disambiguation metadata via AgentHooks |
 
 Run from:
 

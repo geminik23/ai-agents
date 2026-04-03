@@ -64,6 +64,16 @@ enum ToolCallOutcome {
     Rejected(AgentResponse),
 }
 
+/// Outcome of skill routing — used by `try_skill_route`.
+enum SkillRouteResult {
+    /// No skill matched, continue to normal LLM chat.
+    NoMatch,
+    /// Skill executed successfully.
+    Response(String),
+    /// Skill matched but needs disambiguation first.
+    NeedsClarification(AgentResponse),
+}
+
 pub struct RuntimeAgent {
     info: AgentInfo,
     llm_registry: Arc<LLMRegistry>,
@@ -96,6 +106,10 @@ pub struct RuntimeAgent {
     reasoning_config: ReasoningConfig,
     reflection_config: ReflectionConfig,
     disambiguation_manager: Option<DisambiguationManager>,
+    /// Skill ID that triggered the current pending disambiguation.
+    /// Set by try_skill_route() when skill-level disambiguation triggers clarification.
+    /// Read by run_loop() when clarification resolves to route directly to the skill.
+    pending_skill_id: RwLock<Option<String>>,
     current_plan: RwLock<Option<Plan>>,
     /// Tool IDs declared in the top-level `tools:` spec.
     declared_tool_ids: Option<Vec<String>>,
@@ -193,6 +207,7 @@ impl RuntimeAgent {
             reasoning_config: ReasoningConfig::default(),
             reflection_config: ReflectionConfig::default(),
             disambiguation_manager: None,
+            pending_skill_id: RwLock::new(None),
             current_plan: RwLock::new(None),
             declared_tool_ids: None,
             context_initialized: AtomicBool::new(false),
@@ -880,6 +895,14 @@ impl RuntimeAgent {
 
         let current_state = self.current_state().map(|s| s.to_string());
 
+        // Include the current state's prompt text so the detector understands
+        // what kind of input is expected (e.g., "Ask for the order number").
+        let state_prompt: Option<String> = self
+            .state_machine
+            .as_ref()
+            .and_then(|sm| sm.current_definition())
+            .and_then(|def| def.prompt.clone());
+
         let available_tools: Vec<String> = self
             .get_available_tool_ids()
             .await
@@ -906,6 +929,7 @@ impl RuntimeAgent {
         Ok(DisambiguationContext::from_agent_state(
             recent_messages,
             current_state,
+            state_prompt,
             available_tools,
             available_skills,
             available_intents,
@@ -1391,7 +1415,11 @@ impl RuntimeAgent {
         result
     }
 
-    async fn try_skill_route(&self, input: &str) -> Result<Option<String>> {
+    /// Result of skill routing — three possible outcomes.
+    /// NoMatch: no skill matched, continue to normal LLM chat.
+    /// Response: skill executed successfully, here is the response string.
+    /// NeedsClarification: skill matched but needs disambiguation first.
+    async fn try_skill_route(&self, input: &str) -> Result<SkillRouteResult> {
         if let Some(ref router) = self.skill_router {
             let available_skills = self.get_available_skills();
             let skill_ids: Vec<&str> = available_skills.iter().map(|s| s.id.as_str()).collect();
@@ -1403,38 +1431,174 @@ impl RuntimeAgent {
                     .get_skill(&skill_id)
                     .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
 
-                if let Some(ref executor) = self.skill_executor {
-                    let skill_reasoning = self.get_skill_reasoning_config(skill);
-                    let skill_reflection = self.get_skill_reflection_config(skill);
+                // Skill-level disambiguation check: if the skill has a disambiguation
+                // override and it's enabled, run a second disambiguation pass before
+                // executing. This lets skills enforce stricter thresholds and
+                // required_clarity fields (e.g. transfer_money requiring recipient + amount).
+                if let Some(ref skill_disambig) = skill.disambiguation {
+                    if skill_disambig.enabled.unwrap_or(false) {
+                        if let Some(ref disambiguator) = self.disambiguation_manager {
+                            let context = self.build_disambiguation_context().await?;
+                            let state_override = self
+                                .state_machine
+                                .as_ref()
+                                .and_then(|sm| sm.current_definition())
+                                .and_then(|def| def.disambiguation.clone());
 
-                    debug!(
-                        skill_id = %skill_id,
-                        reasoning_mode = ?skill_reasoning.mode,
-                        reflection_enabled = ?skill_reflection.enabled,
-                        "Skill reasoning/reflection config"
-                    );
+                            match disambiguator
+                                .process_input_with_override(
+                                    input,
+                                    &context,
+                                    state_override.as_ref(),
+                                    Some(skill_disambig),
+                                )
+                                .await?
+                            {
+                                DisambiguationResult::Clear => {
+                                    debug!(skill_id = %skill_id, "Skill disambiguation: clear");
+                                    // Fall through to execute_skill below
+                                }
+                                DisambiguationResult::NeedsClarification {
+                                    question,
+                                    detection,
+                                } => {
+                                    info!(
+                                        skill_id = %skill_id,
+                                        ambiguity_type = ?detection.ambiguity_type,
+                                        confidence = detection.confidence,
+                                        "Skill requires clarification before execution"
+                                    );
+                                    // Tag the runtime with the skill ID so the next turn
+                                    // routes directly to this skill after clarification resolves.
+                                    *self.pending_skill_id.write() = Some(skill_id.clone());
 
-                    let response = executor
-                        .execute(skill, input, serde_json::json!({}))
-                        .await?;
-
-                    if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
-                        let should_reflect = self
-                            .should_reflect_with_config(input, &response, &skill_reflection)
-                            .await?;
-                        if should_reflect {
-                            let evaluated = self
-                                .evaluate_and_retry_with_config(input, response, &skill_reflection)
-                                .await?;
-                            return Ok(Some(evaluated));
+                                    return Ok(SkillRouteResult::NeedsClarification(
+                                        AgentResponse::new(&question.question).with_metadata(
+                                            "disambiguation",
+                                            serde_json::json!({
+                                                "status": "awaiting_clarification",
+                                                "skill_id": skill_id,
+                                                "options": question.options,
+                                                "clarifying": question.clarifying,
+                                                "detection": {
+                                                    "type": detection.ambiguity_type,
+                                                    "confidence": detection.confidence,
+                                                    "what_is_unclear": detection.what_is_unclear,
+                                                }
+                                            }),
+                                        ),
+                                    ));
+                                }
+                                DisambiguationResult::Clarified { enriched_input, .. } => {
+                                    info!(
+                                        skill_id = %skill_id,
+                                        enriched = %enriched_input,
+                                        "Skill disambiguation clarified, executing with enriched input"
+                                    );
+                                    return Ok(SkillRouteResult::Response(
+                                        self.execute_skill(skill, &enriched_input).await?,
+                                    ));
+                                }
+                                DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                                    info!(skill_id = %skill_id, "Skill disambiguation: proceeding with best guess");
+                                    return Ok(SkillRouteResult::Response(
+                                        self.execute_skill(skill, &enriched_input).await?,
+                                    ));
+                                }
+                                DisambiguationResult::GiveUp { reason } => {
+                                    warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
+                                    let apology = self
+                                        .generate_localized_apology(
+                                            "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                                            &reason,
+                                        )
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            format!("I'm sorry, I couldn't understand your request: {}", reason)
+                                        });
+                                    return Ok(SkillRouteResult::NeedsClarification(
+                                        AgentResponse::new(&apology),
+                                    ));
+                                }
+                                DisambiguationResult::Escalate { reason } => {
+                                    info!(skill_id = %skill_id, reason = %reason, "Skill disambiguation escalating");
+                                    let apology = self
+                                        .generate_localized_apology(
+                                            "Explain briefly that you're transferring the user to a human agent for help.",
+                                            &reason,
+                                        )
+                                        .await
+                                        .unwrap_or_else(|_| {
+                                            format!("I need human assistance to help with your request: {}", reason)
+                                        });
+                                    return Ok(SkillRouteResult::NeedsClarification(
+                                        AgentResponse::new(&apology),
+                                    ));
+                                }
+                                DisambiguationResult::Abandoned { .. } => {
+                                    // User abandoned during skill-level disambiguation.
+                                    // Return NoMatch so run_loop falls through to normal processing.
+                                    debug!(skill_id = %skill_id, "Skill disambiguation abandoned");
+                                    return Ok(SkillRouteResult::NoMatch);
+                                }
+                            }
                         }
                     }
-
-                    return Ok(Some(response));
                 }
+
+                return Ok(SkillRouteResult::Response(
+                    self.execute_skill(skill, input).await?,
+                ));
             }
         }
-        Ok(None)
+        Ok(SkillRouteResult::NoMatch)
+    }
+
+    /// Execute a skill with reasoning and reflection, returning the response string.
+    async fn execute_skill(&self, skill: &SkillDefinition, input: &str) -> Result<String> {
+        if let Some(ref executor) = self.skill_executor {
+            let skill_reasoning = self.get_skill_reasoning_config(skill);
+            let skill_reflection = self.get_skill_reflection_config(skill);
+
+            debug!(
+                skill_id = %skill.id,
+                reasoning_mode = ?skill_reasoning.mode,
+                reflection_enabled = ?skill_reflection.enabled,
+                "Skill reasoning/reflection config"
+            );
+
+            let response = executor
+                .execute(skill, input, serde_json::json!({}))
+                .await?;
+
+            if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
+                let should_reflect = self
+                    .should_reflect_with_config(input, &response, &skill_reflection)
+                    .await?;
+                if should_reflect {
+                    let evaluated = self
+                        .evaluate_and_retry_with_config(input, response, &skill_reflection)
+                        .await?;
+                    return Ok(evaluated);
+                }
+            }
+
+            return Ok(response);
+        }
+        Err(AgentError::Skill(
+            "No skill executor configured".to_string(),
+        ))
+    }
+
+    /// Execute a skill by ID, bypassing the skill router.
+    /// Used after skill-triggered disambiguation resolves to route directly to the matched skill.
+    async fn execute_skill_by_id(&self, skill_id: &str, input: &str) -> Result<String> {
+        let skill = self
+            .skill_router
+            .as_ref()
+            .and_then(|r| r.get_skill(skill_id).cloned())
+            .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
+        self.execute_skill(&skill, input).await
     }
 
     async fn should_reflect_with_config(
@@ -2586,15 +2750,35 @@ Respond in JSON format:
                         .context_manager
                         .set("disambiguation.resolved", serde_json::Value::Bool(true));
 
-                    // The enriched input provides context for the LLM to generate a relevant response.
-                    // It does NOT drive routing decisions.
+                    // Check if this clarification was triggered by a skill-level override.
+                    // If so, route directly to the matched skill instead of going through
+                    // skill routing again (which might match a different skill).
+                    let skill_id = self.pending_skill_id.read().clone();
+                    if let Some(skill_id) = skill_id {
+                        info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input");
+                        return self
+                            .recheck_skill_disambiguation(&skill_id, &enriched_input)
+                            .await;
+                    }
+
                     return self.run_loop_internal(&enriched_input).await;
                 }
                 DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
                     info!("Proceeding with best guess interpretation");
+
+                    // Same skill-id re-check for best-guess path
+                    let skill_id = self.pending_skill_id.read().clone();
+                    if let Some(skill_id) = skill_id {
+                        info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input");
+                        return self
+                            .recheck_skill_disambiguation(&skill_id, &enriched_input)
+                            .await;
+                    }
+
                     return self.run_loop_internal(&enriched_input).await;
                 }
                 DisambiguationResult::GiveUp { reason } => {
+                    *self.pending_skill_id.write() = None;
                     warn!(reason = %reason, "Disambiguation gave up");
                     let apology = self
                         .generate_localized_apology(
@@ -2608,6 +2792,7 @@ Respond in JSON format:
                     return Ok(AgentResponse::new(&apology));
                 }
                 DisambiguationResult::Escalate { reason } => {
+                    *self.pending_skill_id.write() = None;
                     info!(reason = %reason, "Escalating to human");
                     if let Some(ref hitl) = self.hitl_engine {
                         let trigger =
@@ -2639,6 +2824,44 @@ Respond in JSON format:
                             format!("I need human assistance to help with your request: {}", reason)
                         });
                     return Ok(AgentResponse::new(&apology));
+                }
+                DisambiguationResult::Abandoned { new_input } => {
+                    *self.pending_skill_id.write() = None;
+
+                    info!(
+                        has_new_input = new_input.is_some(),
+                        "Clarification abandoned by user"
+                    );
+
+                    self.memory.add_message(ChatMessage::user(input)).await?;
+
+                    match new_input {
+                        Some(fresh_input) => {
+                            // Topic switch: process the user's new input from scratch.
+                            // The LLM sees full conversation context including the abandoned exchange.
+                            return self.run_loop_internal(&fresh_input).await;
+                        }
+                        None => {
+                            // Pure abandonment: generate a brief acknowledgment.
+                            let ack = self
+                                .generate_localized_apology(
+                                    "The user changed their mind about their previous request. \
+                                     Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
+                                     Do NOT apologize excessively. Be concise.",
+                                    "User abandoned clarification",
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    "OK, no problem. What else can I help with?".to_string()
+                                });
+
+                            self.memory
+                                .add_message(ChatMessage::assistant(&ack))
+                                .await?;
+
+                            return Ok(AgentResponse::new(&ack));
+                        }
+                    }
                 }
             }
         }
@@ -2729,6 +2952,184 @@ Respond in JSON format:
                 let _ = self.context_manager.set(key, serde_json::Value::Null);
             }
         }
+    }
+
+    /// Re-run skill disambiguation on enriched input before executing the skill.
+    /// After clarification resolves, the enriched input may still be missing required_clarity fields (e.g. "Transfer money to Jane." still lacks amount).
+    /// This method re-runs the skill's disambiguation pass.
+    /// If fields are still missing, it returns the new clarification question and keeps pending_skill_id set.
+    /// If all fields are present (Clear), it executes the skill and returns the response.
+    async fn recheck_skill_disambiguation(
+        &self,
+        skill_id: &str,
+        enriched_input: &str,
+    ) -> Result<AgentResponse> {
+        let skill = self
+            .skill_router
+            .as_ref()
+            .and_then(|r| r.get_skill(skill_id).cloned());
+
+        // If the skill has disambiguation enabled, re-run it on the enriched input.
+        if let Some(ref skill) = skill {
+            if let Some(ref skill_disambig) = skill.disambiguation {
+                if skill_disambig.enabled.unwrap_or(false) {
+                    if let Some(ref disambiguator) = self.disambiguation_manager {
+                        let context = self.build_disambiguation_context().await?;
+                        let state_override = self
+                            .state_machine
+                            .as_ref()
+                            .and_then(|sm| sm.current_definition())
+                            .and_then(|def| def.disambiguation.clone());
+
+                        match disambiguator
+                            .process_input_with_override(
+                                enriched_input,
+                                &context,
+                                state_override.as_ref(),
+                                Some(skill_disambig),
+                            )
+                            .await?
+                        {
+                            DisambiguationResult::Clear => {
+                                debug!(skill_id = %skill_id, "Skill re-check: all fields present");
+                            }
+                            DisambiguationResult::NeedsClarification {
+                                question,
+                                detection,
+                            } => {
+                                info!(
+                                    skill_id = %skill_id,
+                                    ambiguity_type = ?detection.ambiguity_type,
+                                    what_is_unclear = ?detection.what_is_unclear,
+                                    "Skill re-check: still missing fields, asking again"
+                                );
+                                // Keep pending_skill_id set (do NOT clear it).
+                                // The next turn will resolve this new clarification and
+                                // re-enter this method until all fields are present.
+                                self.memory
+                                    .add_message(ChatMessage::user(enriched_input))
+                                    .await?;
+                                self.memory
+                                    .add_message(ChatMessage::assistant(&question.question))
+                                    .await?;
+
+                                return Ok(AgentResponse::new(&question.question).with_metadata(
+                                    "disambiguation",
+                                    serde_json::json!({
+                                        "status": "awaiting_clarification",
+                                        "skill_id": skill_id,
+                                        "options": question.options,
+                                        "clarifying": question.clarifying,
+                                        "detection": {
+                                            "type": detection.ambiguity_type,
+                                            "confidence": detection.confidence,
+                                            "what_is_unclear": detection.what_is_unclear,
+                                        }
+                                    }),
+                                ));
+                            }
+                            DisambiguationResult::Clarified {
+                                enriched_input: re_enriched,
+                                ..
+                            } => {
+                                debug!(skill_id = %skill_id, "Skill re-check: clarified immediately, executing");
+                                // Fall through to execute with the further-enriched input.
+                                *self.pending_skill_id.write() = None;
+                                let skill_response =
+                                    self.execute_skill_by_id(skill_id, &re_enriched).await?;
+                                self.memory
+                                    .add_message(ChatMessage::user(&re_enriched))
+                                    .await?;
+                                return self
+                                    .handle_skill_response(
+                                        &re_enriched,
+                                        skill_response,
+                                        &HashMap::new(),
+                                    )
+                                    .await;
+                            }
+                            DisambiguationResult::ProceedWithBestGuess {
+                                enriched_input: re_enriched,
+                            } => {
+                                debug!(skill_id = %skill_id, "Skill re-check: proceeding with best guess");
+                                *self.pending_skill_id.write() = None;
+                                let skill_response =
+                                    self.execute_skill_by_id(skill_id, &re_enriched).await?;
+                                self.memory
+                                    .add_message(ChatMessage::user(&re_enriched))
+                                    .await?;
+                                return self
+                                    .handle_skill_response(
+                                        &re_enriched,
+                                        skill_response,
+                                        &HashMap::new(),
+                                    )
+                                    .await;
+                            }
+                            DisambiguationResult::GiveUp { reason } => {
+                                *self.pending_skill_id.write() = None;
+                                let apology = self
+                                    .generate_localized_apology(
+                                        "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                                        &reason,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        format!("I'm sorry, I couldn't understand your request: {}", reason)
+                                    });
+                                return Ok(AgentResponse::new(&apology));
+                            }
+                            DisambiguationResult::Escalate { reason } => {
+                                *self.pending_skill_id.write() = None;
+                                let apology = self
+                                    .generate_localized_apology(
+                                        "Explain briefly that you're transferring the user to a human agent for help.",
+                                        &reason,
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        format!("I need human assistance to help with your request: {}", reason)
+                                    });
+                                return Ok(AgentResponse::new(&apology));
+                            }
+                            DisambiguationResult::Abandoned { new_input } => {
+                                // User abandoned during skill re-check.
+                                // Clear skill routing state and fall through to normal execution.
+                                *self.pending_skill_id.write() = None;
+                                debug!(skill_id = %skill_id, "Skill re-check: abandoned by user");
+                                if let Some(fresh) = new_input {
+                                    return self.run_loop_internal(&fresh).await;
+                                }
+                                let ack = self
+                                    .generate_localized_apology(
+                                        "The user changed their mind about their previous request. \
+                                         Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
+                                         Do NOT apologize excessively. Be concise.",
+                                        "User abandoned clarification",
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        "OK, no problem. What else can I help with?".to_string()
+                                    });
+                                self.memory
+                                    .add_message(ChatMessage::assistant(&ack))
+                                    .await?;
+                                return Ok(AgentResponse::new(&ack));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Skill has no disambiguation or all fields present: execute.
+        *self.pending_skill_id.write() = None;
+        let skill_response = self.execute_skill_by_id(skill_id, enriched_input).await?;
+        self.memory
+            .add_message(ChatMessage::user(enriched_input))
+            .await?;
+        self.handle_skill_response(enriched_input, skill_response, &HashMap::new())
+            .await
     }
 
     /// Handle skill routing result: output processing, memory, transitions.
@@ -3156,13 +3557,37 @@ Respond in JSON format:
 
         let processed_input = &input_data.content;
 
-        if let Some(skill_response) = self.try_skill_route(processed_input).await? {
-            self.memory
-                .add_message(ChatMessage::user(processed_input))
-                .await?;
-            return self
-                .handle_skill_response(processed_input, skill_response, &input_data.context)
-                .await;
+        match self.try_skill_route(processed_input).await? {
+            SkillRouteResult::Response(skill_response) => {
+                self.memory
+                    .add_message(ChatMessage::user(processed_input))
+                    .await?;
+                return self
+                    .handle_skill_response(processed_input, skill_response, &input_data.context)
+                    .await;
+            }
+            SkillRouteResult::NeedsClarification(response) => {
+                self.memory
+                    .add_message(ChatMessage::user(processed_input))
+                    .await?;
+                if let Some(q) = response
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| m.get("disambiguation"))
+                    .and_then(|d| d.get("status"))
+                    .and_then(|s| s.as_str())
+                {
+                    if q == "awaiting_clarification" {
+                        // Store the clarification question in memory so the next turn
+                        // can be handled as a clarification response.
+                        self.memory
+                            .add_message(ChatMessage::assistant(&response.content))
+                            .await?;
+                    }
+                }
+                return Ok(response);
+            }
+            SkillRouteResult::NoMatch => {} // continue to normal LLM chat
         }
 
         let effective_reasoning = self.get_effective_reasoning_config();
@@ -3381,7 +3806,7 @@ Respond in JSON format:
 
             // Skill routing
             match self.try_skill_route(processed_input).await {
-                Ok(Some(skill_response)) => {
+                Ok(SkillRouteResult::Response(skill_response)) => {
                     let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
                     match self.handle_skill_response(processed_input, skill_response, &input_data.context).await {
                         Ok(resp) => {
@@ -3395,7 +3820,14 @@ Respond in JSON format:
                         }
                     }
                 }
-                Ok(None) => {} // no skill matched, continue
+                Ok(SkillRouteResult::NeedsClarification(response)) => {
+                    let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    let _ = self.memory.add_message(ChatMessage::assistant(&response.content)).await;
+                    yield StreamChunk::content(&response.content);
+                    yield StreamChunk::Done {};
+                    return;
+                }
+                Ok(SkillRouteResult::NoMatch) => {} // no skill matched, continue
                 Err(e) => {
                     yield StreamChunk::error(e.to_string());
                     return;
@@ -3792,6 +4224,25 @@ Respond in JSON format:
                             .context_manager
                             .set("disambiguation.resolved", serde_json::Value::Bool(true));
 
+                        // Check if this clarification was triggered by a skill-level override.
+                        // Re-run skill disambiguation to verify all required_clarity fields
+                        // are present before executing.
+                        let skill_id = self.pending_skill_id.read().clone();
+                        if let Some(skill_id) = skill_id {
+                            info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input (stream)");
+                            match self.recheck_skill_disambiguation(&skill_id, &enriched_input).await {
+                                Ok(resp) => {
+                                    yield StreamChunk::content(&resp.content);
+                                    yield StreamChunk::Done {};
+                                    return;
+                                }
+                                Err(e) => {
+                                    yield StreamChunk::error(e.to_string());
+                                    return;
+                                }
+                            }
+                        }
+
                         // Forward to internal stream with enriched input
                         let mut inner = self.run_loop_internal_stream(&enriched_input);
                         while let Some(chunk) = inner.next().await {
@@ -3801,6 +4252,24 @@ Respond in JSON format:
                     }
                     DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
                         info!("Proceeding with best guess (stream)");
+
+                        // Same skill-id re-check for best-guess path
+                        let skill_id = self.pending_skill_id.read().clone();
+                        if let Some(skill_id) = skill_id {
+                            info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input (stream)");
+                            match self.recheck_skill_disambiguation(&skill_id, &enriched_input).await {
+                                Ok(resp) => {
+                                    yield StreamChunk::content(&resp.content);
+                                    yield StreamChunk::Done {};
+                                    return;
+                                }
+                                Err(e) => {
+                                    yield StreamChunk::error(e.to_string());
+                                    return;
+                                }
+                            }
+                        }
+
                         let mut inner = self.run_loop_internal_stream(&enriched_input);
                         while let Some(chunk) = inner.next().await {
                             yield chunk;
@@ -3808,6 +4277,7 @@ Respond in JSON format:
                         return;
                     }
                     DisambiguationResult::GiveUp { reason } => {
+                        *self.pending_skill_id.write() = None;
                         warn!(reason = %reason, "Disambiguation gave up (stream)");
                         let apology = self
                             .generate_localized_apology(
@@ -3823,6 +4293,7 @@ Respond in JSON format:
                         return;
                     }
                     DisambiguationResult::Escalate { reason } => {
+                        *self.pending_skill_id.write() = None;
                         info!(reason = %reason, "Escalating to human (stream)");
                         if let Some(ref hitl) = self.hitl_engine {
                             let trigger =
@@ -3864,6 +4335,50 @@ Respond in JSON format:
                         yield StreamChunk::Done {};
                         return;
                     }
+                    DisambiguationResult::Abandoned { new_input } => {
+                        *self.pending_skill_id.write() = None;
+
+                        info!(
+                            has_new_input = new_input.is_some(),
+                            "Clarification abandoned by user (stream)"
+                        );
+
+                        let _ = self.memory.add_message(ChatMessage::user(input)).await;
+
+                        match new_input {
+                            Some(fresh_input) => {
+                                // Topic switch: forward to internal stream with fresh input.
+                                let mut inner = self.run_loop_internal_stream(&fresh_input);
+                                while let Some(chunk) = inner.next().await {
+                                    yield chunk;
+                                }
+                                return;
+                            }
+                            None => {
+                                // Pure abandonment: generate a brief acknowledgment.
+                                let ack = self
+                                    .generate_localized_apology(
+                                        "The user changed their mind about their previous request. \
+                                         Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
+                                         Do NOT apologize excessively. Be concise.",
+                                        "User abandoned clarification",
+                                    )
+                                    .await
+                                    .unwrap_or_else(|_| {
+                                        "OK, no problem. What else can I help with?".to_string()
+                                    });
+
+                                let _ = self
+                                    .memory
+                                    .add_message(ChatMessage::assistant(&ack))
+                                    .await;
+
+                                yield StreamChunk::content(&ack);
+                                yield StreamChunk::Done {};
+                                return;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -3887,6 +4402,7 @@ Respond in JSON format:
         self.memory.clear().await?;
         *self.iteration_count.write() = 0;
         self.tool_call_history.write().clear();
+        *self.pending_skill_id.write() = None;
         if let Some(ref sm) = self.state_machine {
             sm.reset();
         }

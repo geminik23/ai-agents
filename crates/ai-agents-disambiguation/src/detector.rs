@@ -55,8 +55,12 @@ impl AmbiguityDetector {
                 }
                 SkipCondition::AnsweringAgentQuestion => {
                     if !context.previous_questions.is_empty() {
-                        debug!("Skipping: answering agent question");
-                        return Ok(true);
+                        // Syntactic pre-filter passed (last assistant message ends with '?').
+                        // Now do a semantic check: is the user actually answering that question?
+                        if self.is_answering_previous_question(input, context).await? {
+                            debug!("Skipping: answering agent question (semantic match)");
+                            return Ok(true);
+                        }
                     }
                 }
                 SkipCondition::CompleteToolCall => {
@@ -159,7 +163,43 @@ Check for these aspects of ambiguity:
         }
 
         if let Some(ref state) = context.current_state {
-            prompt.push_str(&format!("Current state: {}\n\n", state));
+            prompt.push_str(&format!("Current state: {}\n", state));
+            if let Some(ref state_prompt) = context.state_prompt {
+                prompt.push_str(&format!(
+                    "State instructions: {}\nThe user's message is likely a response to what this state is asking for. Consider this before flagging ambiguity.\n\n",
+                    state_prompt.trim()
+                ));
+            } else {
+                prompt.push('\n');
+            }
+        }
+
+        if !context.available_intents.is_empty() {
+            prompt.push_str(&format!(
+                "Available intents in current state: {}\nIf the user's message could match multiple intents, use ambiguity_type \"multiple_intents\".\n\n",
+                context.available_intents.join(", ")
+            ));
+        }
+
+        if !context.required_clarity.is_empty() {
+            let fields = context.required_clarity.join(", ");
+            prompt.push_str(&format!(
+                r#"REQUIRED FIELDS CHECK -- this overrides all other analysis.
+The following fields MUST each have a specific, concrete value in the user's message: {fields}
+For EACH field, decide: does the message contain an explicit value for it?
+A field is present only if the user stated a specific value (a name, a number, a date, etc.).
+A field is missing if the message refers to the action but does not supply that value.
+
+Rules:
+- Add every missing field name to what_is_unclear.
+- Set is_ambiguous to true if ANY required field is missing.
+- Set ambiguity_type to "missing_parameters" if ANY required field is missing.
+- Set confidence below 0.5 if ANY required field is missing.
+- NEVER return an empty what_is_unclear when required fields are missing.
+
+"# // "Required fields for this operation: {}\nEven if the message intent is clear, check whether each required field is EXPLICITLY present in the user's message. Report any missing required fields in what_is_unclear. If any required fields are missing, set ambiguity_type to \"missing_parameters\".\n\n",
+                   // context.required_clarity.join(", ")
+            ));
         }
 
         prompt.push_str(
@@ -206,11 +246,13 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
             AgentError::Other(format!("Failed to parse disambiguation response: {}", e))
         })?;
 
-        let is_ambiguous = parsed["is_ambiguous"].as_bool().unwrap_or(false);
+        let _is_ambiguous = parsed["is_ambiguous"].as_bool().unwrap_or(false);
         let confidence = parsed["confidence"].as_f64().unwrap_or(1.0) as f32;
 
-        // If confidence is below threshold, mark as ambiguous
-        let is_ambiguous = is_ambiguous || confidence < self.config.threshold;
+        // Threshold is the sole decision: confidence below threshold = ambiguous.
+        // The LLM's is_ambiguous boolean is kept in the result for logging/hooks
+        // but does not override the user-configured threshold.
+        let is_ambiguous = confidence < self.config.threshold;
 
         if !is_ambiguous {
             return Ok(AmbiguityDetectionResult::clear());
@@ -256,6 +298,50 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
         }
 
         Ok(result)
+    }
+
+    /// LLM-based check for whether the user's input answers the assistant's last question.
+    async fn is_answering_previous_question(
+        &self,
+        input: &str,
+        context: &DisambiguationContext,
+    ) -> Result<bool> {
+        let llm = match self.llm_registry.get(&self.config.llm) {
+            Ok(l) => l,
+            Err(_) => return Ok(false),
+        };
+
+        let last_question = context
+            .previous_questions
+            .last()
+            .cloned()
+            .unwrap_or_default();
+
+        let prompt = format!(
+            r#"The assistant previously asked: {}
+
+The user responded: "{}"
+
+Is the user's message a direct answer or response to the assistant's question?
+
+Answer "yes" ONLY if the user is clearly trying to answer or respond to that specific question.
+Answer "no" if the user is:
+- Making a new, unrelated request
+- Repeating a previous request
+- Asking their own question
+- Ignoring the assistant's question and saying something else
+
+Answer only "yes" or "no"."#,
+            last_question, input
+        );
+
+        let messages = vec![ChatMessage::user(&prompt)];
+        let response = llm.complete(&messages, None).await.map_err(|e| {
+            warn!(error = %e, "Answering-agent-question semantic check failed");
+            AgentError::LLM(e.to_string())
+        })?;
+
+        Ok(response.content.trim().to_lowercase().starts_with("yes"))
     }
 
     async fn is_social_message(&self, input: &str) -> Result<bool> {

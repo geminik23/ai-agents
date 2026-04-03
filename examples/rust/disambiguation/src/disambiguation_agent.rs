@@ -1,3 +1,13 @@
+// Rust-first disambiguation example with runtime config override and metadata hooks.
+//
+// This Rust example adds what YAML alone cannot do:
+//   - Override clarification style and fallback action at startup (runtime config mutation)
+//   - Display disambiguation metadata after each response via AgentHooks
+//
+// Flow: startup menu -> select style + fallback
+//    -> load YAML agent -> override config -> run REPL
+//    -> user input -> disambiguation -> hooks print metadata -> response
+
 use ai_agents::{
     AgentBuilder, AgentHooks, AgentResponse, ClarificationStyle, MaxAttemptsAction, Result,
 };
@@ -6,9 +16,9 @@ use async_trait::async_trait;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-// ============================================================================
-// Hooks — display disambiguation metadata after each response
-// ============================================================================
+// Display disambiguation metadata after each response.
+// The runtime attaches a "disambiguation" key to AgentResponse.metadata
+// when clarification is triggered or resolved.
 
 struct DisambiguationHooks;
 
@@ -68,9 +78,8 @@ impl AgentHooks for DisambiguationHooks {
     }
 }
 
-// ============================================================================
-// Startup menu — choose clarification style and fallback action
-// ============================================================================
+// Startup menu - choose clarification style and fallback action.
+// These override the values from the YAML config at runtime.
 
 fn ask_choice(prompt: &str, options: &[&str], default: usize) -> usize {
     println!("{}", prompt);
@@ -131,9 +140,7 @@ fn select_options() -> (ClarificationStyle, MaxAttemptsAction) {
     (style, fallback)
 }
 
-// ============================================================================
-// Main
-// ============================================================================
+// Build agent from YAML, apply runtime overrides, start REPL.
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -161,12 +168,16 @@ async fn main() -> Result<()> {
     Repl::new(agent)
         .welcome(&format!("Disambiguation: enabled | Style: {:?}", style))
         .show_tool_calls()
-        .hint("Ambiguous: 'Send it'             (missing target)")
-        .hint("Ambiguous: 'Do the thing'         (vague action)")
+        .hint("Ambiguous: 'Send it'             (vague_references)")
+        .hint("Ambiguous: 'Do the thing'         (missing_action)")
         .hint("Ambiguous: '그거 보내줘'           (Korean: vague)")
         .hint("Ambiguous: 'あれをお願いします'     (Japanese: vague)")
-        .hint("Clear:     'What time is it?'     (no disambiguation)")
+        .hint("Clear:     'What is 42 * 17?'     (direct tool call)")
         .hint("Skipped:   'Hello!'               (social)")
+        .hint("Skipped:   'Yes'                  (answering_agent_question)")
+        .hint("Abandon:   'forget it'            (cancel pending clarification)")
+        .hint("Switch:    new topic mid-clarification (processed fresh)")
+        .hint("Start with YAML examples if this is your first time")
         .run()
         .await
 }

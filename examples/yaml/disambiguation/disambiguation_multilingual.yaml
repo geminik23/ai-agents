@@ -1,0 +1,154 @@
+name: DisambiguationMultilingual
+version: "1.0.0"
+description: "Multi-language disambiguation with skill-level overrides"
+
+# Multi-language disambiguation - works in any language without regex (Core Principle #1).
+#
+# The detection LLM analyzes ambiguity in Korean, Japanese, Chinese, English, or any other language equally.
+# Clarification questions are generated in the detected language.
+# No patterns, no keyword lists - the LLM understands all languages natively.
+#
+# Skills can override disambiguation with their own threshold, required_clarity fields, and clarification_templates for domain-specific questions.
+# The transfer_money skill demands both recipient and amount before proceeding (threshold 0.9).
+#
+# Flow: user input -> detector (any language) -> ambiguous -> clarify in same language
+#                                             -> clear -> skill router -> skill steps -> response
+#       skill match -> skill override applied -> higher threshold + required_clarity check
+#                   -> clarification_templates used if ambiguity_type matches a template key
+system_prompt: |
+  You are a multilingual banking assistant.
+  You handle money transfers, balance inquiries, and account management.
+  Always respond in the same language the user writes in.
+  Korean, Japanese, Chinese, English - all supported equally.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router
+
+# Agent-level disambiguation with broad aspect coverage.
+#
+# The full aspect set is: missing_target, missing_action, missing_parameters, multiple_intents, vague_references, implicit_context.
+# This example uses 5.
+# implicit_context catches messages that rely on unstated assumptions ("the usual") - useful for banking where users expect the agent to remember their habits.
+disambiguation:
+  enabled: true
+  detection:
+    llm: router
+    threshold: 0.7                       # agent-level default. skills can override
+    aspects:
+      - missing_target                   # "Send it" - send what?
+      - missing_action                   # "The account" - do what with it?
+      - missing_parameters               # "Transfer the money" - to whom? how much?
+      - vague_references                 # "Do that again" - do what?
+      - implicit_context                 # "The usual" - what is "the usual"?
+  clarification:
+    style: auto                          # auto (default) | options | open | yes_no | hybrid
+    max_options: 4                       # max choices in options/hybrid style. default: 4
+    include_other_option: true           # add "Other" freeform choice. default: false
+    max_attempts: 2                      # max clarification rounds before giving up. default: 2
+    # what to do after max_attempts clarification rounds still fail:
+    #   proceed_with_best_guess - continue with the best interpretation (default)
+    #   apologize_and_stop      - apologize and drop the request
+    #   escalate                - trigger HITL approval flow (requires hitl: config)
+    on_max_attempts: proceed_with_best_guess
+  # Conditions that bypass disambiguation entirely.
+  # See disambiguation_basic.yaml for the full list of available types.
+  skip_when:
+    - type: social                       # greetings, thanks, goodbyes (LLM-checked)
+    - type: short_input
+      max_chars: 3                       # messages of 3 chars or fewer. no LLM call
+
+# Skill-level disambiguation overrides.
+#
+# A skill can declare its own `disambiguation:` block, similar to per-state overrides. Available override fields:
+#   enabled                - enable/disable disambiguation for this skill
+#   threshold              - override agent-level confidence cutoff
+#   required_clarity       - fields that must be explicit. if the detector reports any of these in what_is_unclear, clarification is forced regardless of confidence score.
+#   clarification_templates - map of ambiguity keys to canned question strings.
+#                            - keys are matched against the detector's what_is_unclear output.
+#                            when a key matches, the template string is used directly as the clarification question (no LLM generation).
+#                            keys are freeform - use names like "missing_recipient", "missing_amount", etc. to match your required_clarity fields.
+#
+# transfer_money has threshold 0.9 (vs agent-level 0.7) because financial operations need explicit parameters before execution.
+#
+# Skill-level disambiguation is wired in the runtime: after the skill router identifies a matching skill, the runtime runs a second disambiguation pass with the skill's override before executing the skill steps.
+#
+# required_clarity is a hard gate enforced across multiple rounds.
+# When clarification resolves but fields are still missing, the runtime re-runs skill disambiguation on the enriched input.
+# This loops until all required fields are present, then the skill executes once with the complete enriched input.
+# With per-field templates, one template fires per round.
+# Without templates, the LLM can ask about all missing fields in one question.
+skills:
+  - id: transfer_money
+    description: "Transfer money between accounts"
+    trigger: "When user wants to send or transfer money"
+    disambiguation:
+      enabled: true
+      threshold: 0.9                     # override agent-level 0.7. stricter for financial ops
+      required_clarity:
+        - recipient                      # must know who to pay
+        - amount                         # must know how much
+      # Template lookup order:
+      #   1. Match by ambiguity_type: missing_target, missing_action, missing_parameters, vague_reference
+      #   2. Match by what_is_unclear fields: for each unclear field (e.g. "recipient"),
+      #      check "missing_recipient" then "recipient" against template keys. First match wins.
+      #   3. No match -> fall through to LLM-generated question.
+      #
+      # Here, missing_recipient matches when what_is_unclear contains "recipient".
+      # Only one template is used per turn - if both are unclear, the first match wins and the LLM handles the rest on the next clarification round.
+      #
+      # NOTE: Templates are static strings with a fixed language. When a template matches, the string is used as-is with no LLM call - the response language does NOT adapt to the user's language.
+      #   For true multilingual clarification, omit templates and let the clarifier LLM generate the question instead.
+      clarification_templates:
+        missing_recipient: "Who should I send the money to?"
+        missing_amount: "How much would you like to transfer?"
+    # {{ user_input }} contains the enriched input after disambiguation collects all required fields.
+    # e.g. "Send $50 to Alice." when both recipient and amount are resolved.
+    steps:
+      - prompt: |
+          The user wants to transfer money. Their request: {{ user_input }}
+          Extract the recipient name and dollar amount from the message above.
+          State the exact values you found and say the transfer has been processed.
+          Do NOT ask for extra fields like source account, purpose, or method.
+          Do NOT ask for confirmation - just process it.
+
+  - id: check_balance
+    description: "Check account balance"
+    trigger: "When user asks about their balance or account status"
+    # No disambiguation override. Agent-level threshold (0.7) applies.
+    steps:
+      - prompt: "The user asked: {{ user_input }}. Tell the user their balance is $1,234.56 (demo value)."
+
+tools:
+  - name: calculator
+  - name: datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: |
+      === Multilingual Disambiguation ===
+      This agent handles vague inputs in any language. Try Korean, Japanese, or Chinese.
+      Skills have their own disambiguation thresholds and custom templates.
+    hints:
+      - "Korean: '그거 보내줘' (Send that thing - vague)"
+      - "Japanese: 'あれをお願いします' (Please do that - vague)"
+      - "Chinese: '把那个发过来' (Send that over - vague)"
+      - "English: 'Transfer the money' (missing recipient, amount)"
+      - "Clear: 'Send $100 to Alice'"
+      - "Clear: '잔액 확인해줘' (Check my balance - clear)"
+      - "Abandon: say 'forget it' during clarification to cancel"
+      - "Switch: say something unrelated during clarification to start fresh"

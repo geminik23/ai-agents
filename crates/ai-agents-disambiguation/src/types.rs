@@ -207,6 +207,9 @@ pub enum DisambiguationResult {
 
     /// Escalating to human (HITL)
     Escalate { reason: String },
+
+    /// User abandoned or switched topics during clarification
+    Abandoned { new_input: Option<String> },
 }
 
 impl DisambiguationResult {
@@ -221,7 +224,10 @@ impl DisambiguationResult {
     pub fn is_resolved(&self) -> bool {
         matches!(
             self,
-            Self::Clear | Self::Clarified { .. } | Self::ProceedWithBestGuess { .. }
+            Self::Clear
+                | Self::Clarified { .. }
+                | Self::ProceedWithBestGuess { .. }
+                | Self::Abandoned { .. }
         )
     }
 
@@ -238,6 +244,9 @@ impl DisambiguationResult {
 pub struct DisambiguationContext {
     pub recent_messages: Vec<String>,
     pub current_state: Option<String>,
+    /// The current state's prompt text (e.g., "Ask for the order number if not provided").
+    /// Helps the detector understand what kind of input is expected in this state.
+    pub state_prompt: Option<String>,
     pub available_tools: Vec<String>,
     pub available_skills: Vec<String>,
     /// Canonical intent labels from the state machine (e.g., ["cancel_order", "cancel_reservation"]).
@@ -246,6 +255,10 @@ pub struct DisambiguationContext {
     pub user_context: HashMap<String, serde_json::Value>,
     pub clarification_attempts: u32,
     pub previous_questions: Vec<String>,
+    /// Domain-required fields from state/skill overrides (e.g., ["recipient", "amount"]).
+    /// The detector checks whether each field is explicitly present in the user's message and reports missing ones in `what_is_unclear`.
+    /// The manager enforces these as a hard gate: if any required field is missing, clarification is forced regardless of confidence.
+    pub required_clarity: Vec<String>,
 }
 
 impl DisambiguationContext {
@@ -260,6 +273,11 @@ impl DisambiguationContext {
 
     pub fn with_state(mut self, state: impl Into<String>) -> Self {
         self.current_state = Some(state.into());
+        self
+    }
+
+    pub fn with_state_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.state_prompt = Some(prompt.into());
         self
     }
 
@@ -364,5 +382,18 @@ mod tests {
 
         ctx.add_previous_question("What do you mean?".to_string());
         assert_eq!(ctx.previous_questions.len(), 1);
+    }
+
+    #[test]
+    fn test_disambiguation_result_abandoned() {
+        let result = DisambiguationResult::Abandoned { new_input: None };
+        assert!(result.is_resolved());
+        assert!(!result.is_clear());
+        assert!(!result.needs_clarification());
+
+        let result = DisambiguationResult::Abandoned {
+            new_input: Some("do something else".to_string()),
+        };
+        assert!(result.is_resolved());
     }
 }

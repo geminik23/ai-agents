@@ -33,6 +33,7 @@ struct PendingClarification {
     question: ClarificationQuestion,
     detection: AmbiguityDetectionResult,
     attempts: u32,
+    required_clarity: Vec<String>,
 }
 
 impl DisambiguationManager {
@@ -118,8 +119,16 @@ impl DisambiguationManager {
         // Determine effective threshold
         let threshold = self.get_effective_threshold(state_override, skill_override);
 
+        // Populate required_clarity on context so the detector prompt knows
+        // which domain-required fields to check for in the user's message.
+        let mut context = context.clone();
+        let rc = self.get_required_clarity(state_override, skill_override);
+        if !rc.is_empty() {
+            context.required_clarity = rc;
+        }
+
         // Detect ambiguity
-        let detection = self.detector.detect(input, context).await?;
+        let detection = self.detector.detect(input, &context).await?;
 
         info!(
             is_ambiguous = detection.is_ambiguous,
@@ -129,12 +138,9 @@ impl DisambiguationManager {
             "Ambiguity detection complete"
         );
 
-        // Check against effective threshold
-        if !detection.is_ambiguous && detection.confidence >= threshold {
-            return Ok(DisambiguationResult::Clear);
-        }
-
-        // Check required clarity fields
+        // Check required clarity fields BEFORE the threshold check.
+        // required_clarity is a hard gate: if any required field appears in what_is_unclear, force clarification regardless of confidence score.
+        // This handles domain ambiguity ("transfer money" is linguistically clear but missing recipient/amount for the operation).
         let required_clarity = self.get_required_clarity(state_override, skill_override);
         if !required_clarity.is_empty() {
             let missing: Vec<_> = required_clarity
@@ -144,16 +150,83 @@ impl DisambiguationManager {
                 .collect();
 
             if !missing.is_empty() {
-                debug!(
+                info!(
                     missing_fields = ?missing,
-                    "Required clarity fields missing"
+                    confidence = detection.confidence,
+                    "Required clarity fields missing — forcing clarification"
                 );
+                // Override the detection to ensure we proceed to clarification
+                // even though confidence might be above threshold.
+                let mut forced_detection = detection.clone();
+                forced_detection.is_ambiguous = true;
+                if forced_detection.ambiguity_type.is_none() {
+                    forced_detection.ambiguity_type =
+                        Some(super::types::AmbiguityType::MissingParameters);
+                }
+                // Merge missing required fields into what_is_unclear
+                for field in &missing {
+                    if !forced_detection.what_is_unclear.contains(field) {
+                        forced_detection.what_is_unclear.push(field.clone());
+                    }
+                }
+
+                // Get custom template if available
+                let custom_template = skill_override.and_then(|s| {
+                    if s.clarification_templates.is_empty() {
+                        return None;
+                    }
+                    forced_detection.what_is_unclear.iter().find_map(|field| {
+                        let prefixed = format!("missing_{}", field);
+                        s.clarification_templates
+                            .get(&prefixed)
+                            .or_else(|| s.clarification_templates.get(field.as_str()))
+                            .map(|v| v.as_str())
+                    })
+                });
+
+                let question = self
+                    .clarifier
+                    .generate(
+                        input,
+                        &forced_detection,
+                        &context,
+                        custom_template,
+                        &required_clarity,
+                    )
+                    .await?;
+
+                *self.pending_clarification.write().await = Some(PendingClarification {
+                    original_input: input.to_string(),
+                    question: question.clone(),
+                    detection: forced_detection.clone(),
+                    attempts: 1,
+                    required_clarity: required_clarity.clone(),
+                });
+
+                return Ok(DisambiguationResult::NeedsClarification {
+                    question,
+                    detection: forced_detection,
+                });
             }
         }
 
-        // Get custom template if available from skill override
+        // Check against effective threshold
+        if !detection.is_ambiguous && detection.confidence >= threshold {
+            return Ok(DisambiguationResult::Clear);
+        }
+
+        // Get custom template if available from skill override.
+        // Lookup order:
+        //   1. Match by ambiguity_type (missing_target, missing_action, etc.)
+        //   2. Match by what_is_unclear fields (e.g. "recipient" -> "missing_recipient" or "recipient")
+        //   3. No match -> None -> fall through to LLM generation
         let custom_template = skill_override.and_then(|s| {
-            detection.ambiguity_type.as_ref().and_then(|t| {
+            if s.clarification_templates.is_empty() {
+                return None;
+            }
+
+            // Step 1: try ambiguity type match
+            let by_type = detection.ambiguity_type.as_ref().and_then(|t| {
                 let key = match t {
                     super::types::AmbiguityType::MissingTarget => "missing_target",
                     super::types::AmbiguityType::MissingAction => "missing_action",
@@ -161,14 +234,34 @@ impl DisambiguationManager {
                     super::types::AmbiguityType::VagueReference => "vague_reference",
                     _ => return None,
                 };
-                s.clarification_templates.get(key).map(|s| s.as_str())
+                s.clarification_templates.get(key).map(|v| v.as_str())
+            });
+
+            if by_type.is_some() {
+                return by_type;
+            }
+
+            // Step 2: try what_is_unclear field match (supports custom keys)
+            detection.what_is_unclear.iter().find_map(|field| {
+                let prefixed = format!("missing_{}", field);
+                s.clarification_templates
+                    .get(&prefixed)
+                    .or_else(|| s.clarification_templates.get(field.as_str()))
+                    .map(|v| v.as_str())
             })
         });
 
         // Generate clarification question
+        let required_clarity = self.get_required_clarity(state_override, skill_override);
         let question = self
             .clarifier
-            .generate(input, &detection, context, custom_template)
+            .generate(
+                input,
+                &detection,
+                &context,
+                custom_template,
+                &required_clarity,
+            )
             .await?;
 
         // Store pending clarification
@@ -177,6 +270,7 @@ impl DisambiguationManager {
             question: question.clone(),
             detection: detection.clone(),
             attempts: 1,
+            required_clarity: required_clarity.clone(),
         });
 
         Ok(DisambiguationResult::NeedsClarification {
@@ -225,7 +319,7 @@ impl DisambiguationManager {
             ClarificationParseResult::NotUnderstood => {
                 let new_attempts = pending.attempts + 1;
 
-                if new_attempts > self.config.clarification.max_attempts {
+                if new_attempts >= self.config.clarification.max_attempts {
                     // Clear pending state
                     *self.pending_clarification.write().await = None;
 
@@ -245,6 +339,7 @@ impl DisambiguationManager {
                         &pending.detection,
                         &new_context,
                         None,
+                        &pending.required_clarity,
                     )
                     .await?;
 
@@ -254,6 +349,7 @@ impl DisambiguationManager {
                     question: question.clone(),
                     detection: pending.detection.clone(),
                     attempts: new_attempts,
+                    required_clarity: pending.required_clarity.clone(),
                 });
 
                 warn!(
@@ -265,6 +361,18 @@ impl DisambiguationManager {
                 Ok(DisambiguationResult::NeedsClarification {
                     question,
                     detection: pending.detection.clone(),
+                })
+            }
+            ClarificationParseResult::Abandoned => {
+                *self.pending_clarification.write().await = None;
+                info!("User abandoned clarification");
+                Ok(DisambiguationResult::Abandoned { new_input: None })
+            }
+            ClarificationParseResult::TopicSwitch => {
+                *self.pending_clarification.write().await = None;
+                info!("User switched to a different topic during clarification");
+                Ok(DisambiguationResult::Abandoned {
+                    new_input: Some(response.to_string()),
                 })
             }
         }
@@ -365,20 +473,36 @@ impl DisambiguationContext {
     pub fn from_agent_state(
         recent_messages: Vec<String>,
         current_state: Option<String>,
+        state_prompt: Option<String>,
         available_tools: Vec<String>,
         available_skills: Vec<String>,
         available_intents: Vec<String>,
         user_context: HashMap<String, serde_json::Value>,
     ) -> Self {
+        // Populate previous_questions from recent assistant messages that end with '?'.
+        // This lets the answering_agent_question skip condition work: if the last assistant message was a question, the user's next input is likely an answer, not a new ambiguous request.
+        // Only check the most recent assistant message for a trailing '?'.
+        // Multiple historical questions are noise - only the last one matters for the answering_agent_question skip decision.
+        let previous_questions: Vec<String> = recent_messages
+            .iter()
+            .rev()
+            .find(|m| m.starts_with("Assistant:"))
+            .filter(|m| m.trim_end().ends_with('?'))
+            .cloned()
+            .into_iter()
+            .collect();
+
         Self {
             recent_messages,
             current_state,
+            state_prompt,
             available_tools,
             available_skills,
             available_intents,
             user_context,
             clarification_attempts: 0,
-            previous_questions: Vec::new(),
+            previous_questions,
+            required_clarity: Vec::new(),
         }
     }
 }
@@ -390,19 +514,44 @@ mod tests {
     #[test]
     fn test_disambiguation_context_builder() {
         let ctx = DisambiguationContext::from_agent_state(
-            vec!["Hello".to_string()],
+            vec![
+                "Assistant: What is your order number?".to_string(),
+                "User: Hello".to_string(),
+            ],
             Some("greeting".to_string()),
+            Some("Welcome the user".to_string()),
             vec!["search".to_string()],
             vec!["greet".to_string()],
             vec!["cancel_order".to_string()],
             HashMap::new(),
         );
 
-        assert_eq!(ctx.recent_messages.len(), 1);
+        assert_eq!(ctx.recent_messages.len(), 2);
         assert_eq!(ctx.current_state, Some("greeting".to_string()));
+        assert_eq!(ctx.state_prompt, Some("Welcome the user".to_string()));
         assert_eq!(ctx.available_tools.len(), 1);
         assert_eq!(ctx.available_skills.len(), 1);
         assert_eq!(ctx.clarification_attempts, 0);
+        // Assistant message ending with '?' is detected
+        assert_eq!(ctx.previous_questions.len(), 1);
+    }
+
+    #[test]
+    fn test_previous_questions_not_populated_without_question_mark() {
+        let ctx = DisambiguationContext::from_agent_state(
+            vec![
+                "Assistant: Here is your result.".to_string(),
+                "User: Thanks".to_string(),
+            ],
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        assert!(ctx.previous_questions.is_empty());
     }
 
     #[test]

@@ -1,0 +1,97 @@
+name: DisambiguationBasic
+version: "1.0.0"
+description: "Minimal disambiguation - the agent asks when unsure"
+
+# Simplest disambiguation setup - enable it, set a threshold, and the agent asks clarifying questions automatically when user input is vague.
+#
+# The detection LLM analyzes each message for ambiguity before the main LLM responds.
+# If confidence falls below the threshold, the clarifier generates a question.
+# Clear messages and social greetings pass through without interruption.
+#
+# Flow: user input -> detector (router LLM) -> confidence >= 0.6 -> normal response
+#                                            -> confidence < 0.6 -> clarification question
+#                  -> user answers -> enriched input -> normal response
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_basic.yaml
+
+system_prompt: |
+  You are a helpful assistant.
+  When you receive a clarified request, fulfill it directly.
+  You have access to calculator and datetime tools.
+
+# NOTE: Disambiguation relies on the router LLM to detect ambiguity, classify the type, and generate clarification questions.
+# Very small models (e.g. gpt-4.1-nano) may misclassify ambiguity types or ignore style instructions. Use at least a mid-tier model or latest model (e.g. gpt-4.1-mini, gpt-5.4-nano) for the router if disambiguation quality matters.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router
+
+# Enable disambiguation with a few lines: enabled + detection LLM + threshold + style.
+# This is the minimal config. See disambiguation_agent.yaml for the full option set including aspects, context-awareness, and all skip rule types.
+#
+# Detection:
+#   threshold controls sensitivity. The detector LLM returns a confidence score (0.0-1.0) for how clear the user's intent is.
+# Messages scoring below the threshold trigger clarification. Lower values = more sensitive = more clarification questions.
+#
+# Clarification:
+#   style controls how the clarifier asks questions.
+#   on_max_attempts controls what happens when clarification rounds are exhausted.
+#
+# Skip rules:
+#   skip_when lists conditions that bypass disambiguation entirely (no LLM call).
+#   This example only uses "social". See disambiguation_agent.yaml for all types.
+disambiguation:
+  enabled: true                          # turn on disambiguation. default: false
+  detection:
+    llm: router                          # which named LLM to use for detection. default: router
+    threshold: 0.6                       # confidence cutoff (0.0-1.0). default: 0.7
+  clarification:
+    style: auto                          # auto | options | open | yes_no | hybrid. default: auto
+    max_attempts: 2                      # max clarification rounds before giving up. default: 2
+    # what to do after max_attempts clarification rounds still fail:
+    #   proceed_with_best_guess - continue with the best interpretation (default)
+    #   apologize_and_stop      - apologize and drop the request
+    #   escalate                - trigger HITL approval flow (requires hitl: config)
+    on_max_attempts: proceed_with_best_guess
+  # Conditions that bypass disambiguation entirely (no detection LLM call).
+  # Available types:
+  #   social                 - greetings, thanks, goodbyes (LLM-checked)
+  #   short_input            - messages under max_chars characters
+  #   answering_agent_question - user replying to the agent's last question (LLM-verified)
+  #   complete_tool_call     - direct tool invocations like "What is 2+2?"
+  #   in_state               - skip when in specific named states
+  #   custom                 - arbitrary LLM-evaluated condition string
+  skip_when:
+    - type: social                       # skip greetings, thanks, goodbyes
+
+tools:
+  - name: calculator
+  - name: datetime
+
+memory:
+  type: in-memory
+  max_messages: 30
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: |
+      === Disambiguation Basic ===
+      The agent asks for clarification when your message is vague.
+    hints:
+      - "Ambiguous: 'Send it' (send what? to whom?)"
+      - "Ambiguous: 'Cancel' (cancel what?)"
+      - "Clear: 'What time is it?' (no disambiguation needed)"
+      - "Skipped: 'Hello!' (social message, auto-skipped)"
+      - "Abandon: say 'forget it' during clarification to cancel"
+      - "Switch: say something unrelated during clarification to start fresh"
+      - "Next: yaml/disambiguation/disambiguation_with_state.yaml"

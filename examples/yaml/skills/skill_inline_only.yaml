@@ -11,7 +11,20 @@ description: "Single inline skill with LLM-based trigger routing"
 # Flow: user input -> skill router (LLM) -> skill steps -> response
 #                  -> no match -> normal LLM chat -> response
 #
-# {{ user_input }} is a Jinja2 variable containing the user's original message.
+# Skill execution model:
+#   Skills are STATELESS and SINGLE-SHOT.
+#   The executor runs each step prompt as a standalone LLM call with no conversation history, no memory, and no system prompt.
+#   The only way to pass the user's message into a step prompt is the {{ user_input }} Jinja2 variable.
+#   Without {{ user_input }}, the LLM cannot see what the user said.
+#
+#   Because skills are single-shot, step prompts should NOT ask the user to "confirm" or "reply with X".
+#   The user's next message goes through full routing again, not back to the skill.
+#
+# Available template variables inside step prompts:
+#   {{ user_input }}       - the user's original message (or enriched input after disambiguation)
+#   {{ steps[N].result }}  - result from step N (see skill_with_tools.yaml for multi-step examples)
+#   {{ steps[N].args }}    - args passed to step N
+#   {{ context }}          - extra context passed to the executor
 
 system_prompt: |
   You are a friendly, helpful assistant.

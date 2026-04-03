@@ -1,6 +1,6 @@
 name: DisambiguationAgent
 version: "1.0.0"
-description: "Agent with LLM-based intent disambiguation"
+description: "Full disambiguation config - all aspects, context-awareness, skip rules"
 
 system_prompt: |
   You are a helpful assistant with intent disambiguation capabilities.
@@ -16,10 +16,10 @@ system_prompt: |
 llms:
   default:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-mini
   router:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-nano
 
 llm:
   default: default
@@ -39,10 +39,20 @@ disambiguation:
       - implicit_context
   clarification:
     style: auto
+    max_options: 4
+    include_other_option: true
     max_attempts: 2
     on_max_attempts: proceed_with_best_guess
+  context:
+    recent_messages: 5
+    include_state: true
+    include_available_tools: true
+    include_available_skills: true
+    include_user_context: true
   skip_when:
     - type: social
+    - type: answering_agent_question
+    - type: complete_tool_call
     - type: short_input
       max_chars: 5
 
@@ -60,12 +70,18 @@ skills: []
 
 metadata:
   cli:
-    welcome: "=== Disambiguation Agent Demo ==="
+    welcome: |
+      === Disambiguation Agent (Full Config) ===
+      All 6 ambiguity aspects, context-awareness, and advanced skip rules.
+      The Rust wrapper lets you override style and fallback at startup.
     hints:
-      - "Ambiguous: Send it"
-      - "Ambiguous: Do the thing"
-      - "Ambiguous: 그거 보내줘"
-      - "Ambiguous: あれをお願いします"
-      - "Clear: What time is it?"
-      - "Skipped: Hello!"
+      - "Ambiguous: 'Send it' (vague_references)"
+      - "Ambiguous: 'Do the thing' (missing_action)"
+      - "Ambiguous: 'Book it for tomorrow and also cancel the other one' (multiple_intents)"
+      - "Ambiguous: 'You know what I mean' (implicit_context)"
+      - "Clear: 'What is 42 * 17?' (direct tool call)"
+      - "Skipped: 'Hello!' (social)"
+      - "Skipped: 'Yes' (answering_agent_question)"
+      - "Abandon: say 'forget it' during clarification to cancel"
+      - "Switch: say something unrelated during clarification to start fresh"
     show_tools: true

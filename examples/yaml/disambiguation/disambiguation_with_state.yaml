@@ -1,0 +1,168 @@
+name: DisambiguationWithState
+version: "1.0.0"
+description: "Disambiguation + state machine with intent-based deterministic routing"
+
+# State machine integration - disambiguation drives navigation using intent labels.
+#
+# Each transition can declare an `intent:` field.
+# When the user says something ambiguous like "Cancel" in a state with multiple intent-labeled transitions, the disambiguator collects available_intents from the current state and constrains clarification options to those intents.
+# Once the user picks one, the resolved intent matches the transition deterministically - no LLM call needed for transition evaluation.
+#
+# Per-state overrides let sensitive states (like payment) demand higher clarity.
+# The payment state uses threshold 0.95 and required_clarity so even "pay them" is flagged.
+#
+# Flow: user input -> detector -> ambiguous + multiple intents
+#                  -> clarifier (options constrained to available_intents)
+#                  -> user picks -> resolved_intent set in context
+#                  -> state machine matches intent: field -> deterministic transition
+#
+#       clear input -> detector -> confidence >= threshold -> normal LLM transition eval
+
+system_prompt: |
+  You are a customer service assistant.
+  You help users cancel orders, cancel subscriptions, and make payments.
+  Always confirm important actions before proceeding.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router
+
+# Agent-level disambiguation with aspect detection.
+#
+# aspects list which ambiguity types the detector checks for.
+# The full set is: missing_target, missing_action, missing_parameters, multiple_intents, vague_references, implicit_context.
+# This example uses 4. multiple_intents is critical here - it fires when the user's message could match more than one intent-labeled transition in the current state.
+disambiguation:
+  enabled: true
+  detection:
+    llm: router
+    threshold: 0.7                       # agent-level default. states can override
+    aspects:
+      - missing_target                   # "Send it" - send what?
+      - missing_action                   # "The order" - do what with it?
+      - multiple_intents                 # "Cancel" - cancel which thing?
+      - vague_references                 # "Do that again" - do what?
+  clarification:
+    style: auto                          # auto (default) | options | open | yes_no | hybrid
+    max_options: 3                       # max choices in options/hybrid style. default: 4
+    max_attempts: 2                      # max clarification rounds before giving up. default: 2
+    # what to do after max_attempts clarification rounds still fail:
+    #   proceed_with_best_guess - continue with the best interpretation (default)
+    #   apologize_and_stop      - apologize and drop the request
+    #   escalate                - trigger HITL approval flow (requires hitl: config)
+    on_max_attempts: proceed_with_best_guess
+  # Conditions that bypass disambiguation entirely.
+  # See disambiguation_basic.yaml for the full list of available types.
+  skip_when:
+    - type: social                       # greetings, thanks, goodbyes (LLM-checked)
+    - type: short_input
+      max_chars: 3                       # messages of 3 chars or fewer. no LLM call
+
+# State machine with intent-labeled transitions.
+#
+# The `intent:` field on a transition is a plain string tag (not a prompt).
+# When disambiguation resolves an intent, the state machine evaluator checks context["resolved_intent"] against each transition's `intent:` value.
+# If it matches, the transition fires immediately - no LLM call needed.
+# If no match, normal `when:` LLM evaluation runs as fallback.
+#
+# Per-state disambiguation overrides:
+#   A state can declare its own `disambiguation:` block to override agent-level settings.
+#   Available override fields:
+#     threshold            - override the agent-level confidence cutoff
+#     require_confirmation - ask "Did you mean X?" even after clarification resolves
+#     required_clarity     - list of fields that must be explicitly stated.
+#                            if the detector reports any of these in what_is_unclear, clarification is forced regardless of confidence score.
+states:
+  initial: main
+  states:
+    main:
+      prompt: |
+        You are in the main menu. Help the user with their request.
+        Available actions: cancel an order, cancel a subscription, or make a payment.
+      transitions:
+        # intent: tags enable deterministic routing after disambiguation.
+        # "Cancel" triggers multiple_intents -> clarifier asks which one ->
+        # user picks -> resolved_intent = "cancel_order" -> matches this transition.
+        - to: cancel_order
+          intent: cancel_order           # matched against resolved_intent in context
+          when: "User wants to cancel an order"
+        - to: cancel_subscription
+          intent: cancel_subscription
+          when: "User wants to cancel their subscription"
+        - to: payment
+          when: "User wants to make a payment or send money"
+
+    cancel_order:
+      prompt: |
+        The user wants to cancel an order.
+        Step 1: Ask for the order number if not already provided.
+        Step 2: Repeat the order number back and ask "Are you sure you want to cancel order #X?"
+        Step 3: Only after the user explicitly confirms (yes, confirm, go ahead), say the order is canceled.
+        NEVER cancel without explicit confirmation from the user.
+      transitions:
+        - to: main
+          when: "User explicitly confirmed and the cancellation is done"
+
+    cancel_subscription:
+      prompt: |
+        The user wants to cancel their subscription.
+        Explain what they will lose, then ask for explicit confirmation before proceeding.
+        NEVER cancel without the user saying yes or confirming.
+      transitions:
+        - to: main
+          when: "User explicitly confirmed and the cancellation is done"
+
+    # Per-state override: payment demands high clarity before proceeding.
+    # threshold 0.95 (vs agent-level 0.7) flags even somewhat-clear messages like "pay them".
+    # required_clarity: if the detector reports "amount" or "recipient" in what_is_unclear,
+    # clarification is forced even if confidence is above the threshold.
+    # require_confirmation: after clarification resolves, the agent still asks "Did you mean X?"
+    payment:
+      prompt: |
+        The user wants to make a payment.
+        You need the exact amount and recipient. Ask for any missing details first.
+        Once you have both, repeat them back and ask for explicit confirmation.
+        NEVER process a payment without the user saying yes or confirming.
+      disambiguation:
+        threshold: 0.95                  # override agent-level 0.7. nearly everything is flagged
+        require_confirmation: true       # ask "Did you mean X?" even after clarification
+        required_clarity:
+          - amount                       # must be explicitly stated
+          - recipient                    # must be explicitly stated
+      transitions:
+        - to: main
+          when: "Payment is complete or user wants to do something else"
+
+tools:
+  - name: calculator
+  - name: datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+max_iterations: 10
+
+metadata:
+  cli:
+    welcome: |
+      === Disambiguation + State Machine ===
+      This agent routes "Cancel" to the right state using intent-based disambiguation.
+      The payment state requires high clarity (threshold 0.95).
+    hints:
+      - "Ambiguous: 'Cancel' (cancel what? order or subscription?)"
+      - "Ambiguous: 'Pay them' (in payment state: who? how much?)"
+      - "Clear: 'Cancel my order #12345'"
+      - "Try: 'I want to cancel' then pick an option"
+      - "Abandon: say 'forget it' during clarification to cancel"
+      - "Switch: say something unrelated during clarification to start fresh"
+    show_state: true
+    show_tools: true
