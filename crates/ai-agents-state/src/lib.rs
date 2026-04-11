@@ -6,9 +6,13 @@ mod machine;
 
 pub use ai_agents_core::{StateMachineSnapshot, StateTransitionEvent};
 pub use config::{
-    CompareOp, ContextExtractor, ContextMatcher, GuardConditions, PromptMode, StateAction,
-    StateConfig, StateDefinition, StateMatcher, TimeMatcher, ToolCondition, ToolRef, Transition,
-    TransitionGuard,
+    AggregationConfig, AggregationStrategy, ChatManagerConfig, ChatParticipant, ChatStyle,
+    CompareOp, ConcurrentAgentRef, ConcurrentStateConfig, ContextExtractor, ContextMatcher,
+    DebateStyleConfig, DelegateContextMode, GroupChatStateConfig, GuardConditions,
+    HandoffStateConfig, MakerCheckerConfig, MaxIterationsAction, PartialFailureAction,
+    PipelineStageEntry, PipelineStateConfig, PromptMode, StateAction, StateConfig, StateDefinition,
+    StateMatcher, TerminationConfig, TerminationMethod, TiebreakerStrategy, TimeMatcher,
+    ToolCondition, ToolRef, Transition, TransitionGuard, TurnMethod, VoteConfig, VoteMethod,
 };
 pub use evaluator::{
     GuardOnlyEvaluator, LLMTransitionEvaluator, TransitionContext, TransitionEvaluator,

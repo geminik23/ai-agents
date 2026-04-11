@@ -1,0 +1,6 @@
+name: Editor
+system_prompt: "You are a content editor. Polish and finalize content based on review feedback. Fix grammar, improve flow, and tighten prose."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

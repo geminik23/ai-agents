@@ -1,0 +1,6 @@
+name: GeneralSupport
+system_prompt: "You are a general support agent. Assess the customer's issue and provide initial guidance. If the issue needs a specialist, describe what kind of help is needed."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-nano

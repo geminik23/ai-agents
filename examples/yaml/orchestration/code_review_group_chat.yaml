@@ -1,0 +1,104 @@
+name: CodeReview
+version: "1.0.0"
+description: "Multi-agent code review with consensus."
+
+# Group chat pattern - multiple agents discuss a topic in a shared thread.
+# The `group_chat` field on a state triggers a dedicated runtime handler.
+# Agents talk among themselves (not with the user) in round-robin turns.
+# The conversation ends on consensus, max rounds, or stall detection.
+# response.content contains the full formatted transcript for brainstorm/consensus styles.
+#
+# Flow: user input (code to review) -> agents discuss (round-robin turns)
+#                                   -> consensus / timeout / stall -> result
+#
+# Prerequisites:
+#   - Sub-agent files in agents/ directory
+
+system_prompt: |
+  You are a code review coordinator.
+  When the user provides code or a PR description, your review team
+  (architect, security, performance) will discuss it automatically.
+  Present whatever the reviewers produce.
+
+max_context_tokens: 128000         # group chat transcripts can grow large. default: 4096
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router                   # used for consensus detection
+
+
+# Spawn review participants at startup.
+# Each agent brings a different expertise to the discussion.
+spawner:
+  shared_llms: true                # sub-agents reuse parent LLM connections. default: false
+  auto_spawn:
+    - id: architect
+      agent: agents/architect.yaml
+    - id: security
+      agent: agents/security_reviewer.yaml
+    - id: performance
+      agent: agents/performance_reviewer.yaml
+
+# Single group chat state - the user's message goes directly to the reviewers as the topic.
+states:
+  initial: review
+  states:
+    review:
+      group_chat:
+        participants:
+          - id: architect            # agent ID from spawner.auto_spawn
+          - id: security
+            role: "security reviewer"  # included in each turn's prompt so the agent knows what the group expects
+          - id: performance
+            role: "performance reviewer"
+        # Style selects the conversation loop implementation.
+        #   brainstorm (default) - all agents speak each round, free-form. Ends on max_rounds or stall.
+        #   consensus  - same loop as brainstorm, but router LLM checks for agreement after each round.
+        #                Ends early when all participants agree.
+        #   debate     - dedicated loop: structured pro/con rounds + synthesizer agent writes conclusion.
+        #                Requires debate.rounds and debate.synthesizer.
+        #   maker_checker - dedicated loop: one agent creates, another reviews until accepted.
+        #                   Requires maker_checker.acceptance_criteria.
+        #                   on_max_iterations: accept_last (default) | escalate | fail
+        style: consensus
+        max_rounds: 5              # max conversation rounds. default: 5
+        # manager controls turn ordering within each round.
+        # method: round_robin (default) | random | llm_directed
+        # agent: registry agent ID that controls termination and speaker selection.
+        #   When set with method: llm_directed, the manager agent picks speakers.
+        #   When set with termination: manager_decides, the manager agent decides when to stop.
+        # manager:
+        #   agent: facilitator
+        #   method: llm_directed
+        # Termination controls when the conversation ends.
+        #   manager_decides (default) - stops on max_rounds or stall.
+        #     When manager.agent is set, the agent replaces stall detection entirely.
+        #   max_rounds     - runs exactly max_rounds rounds. Stall detection is disabled.
+        #   consensus_reached - router LLM checks agreement after each round (redundant with style: consensus).
+        termination:
+          method: manager_decides
+          max_stall_rounds: 2      # stop if no new content for N rounds. default: 2. Ignored by max_rounds.
+        # Each user message starts a fresh group chat with no memory of previous rounds.
+        # context_mode enriches the topic with parent conversation history so participants
+        # know what was discussed before. summary uses a router LLM to condense history.
+        # context_mode: summary    # input_only (default) | summary | full
+
+metadata:
+  cli:
+    welcome: |
+      Code Review - group chat orchestration demo.
+      Three reviewers (architect, security, performance) discuss your code.
+    hints:
+      - "Paste a code snippet or describe a PR to start the review"
+      - "The agents discuss among themselves, not with you"
+
+# Example
+# 'from flask import Flask, request, jsonify\nimport time, traceback\napp = Flask(__name__)\nSECRET_KEY = "1234"\nDEBUG_MODE = True\nusers = [{"id": 1, "username": "admin", "password": "admin123", "role": "admin"}, {"id": 2, "username": "user1", "password": "1234", "role": "user"}]\nposts = []\n@app.route("/login", methods=["GET"])\ndef login():\n    username = request.args.get("username")\n    password = request.args.get("password")\n    for user in users:\n        if user["username"] == username and user["password"] == password:\n            return jsonify({"message": "login success", "token": SECRET_KEY + "_" + username, "user": user})\n    return jsonify({"message": "login failed"}), 401\n@app.route("/users", methods=["GET"])\ndef get_users():\n    return jsonify(users)\n@app.route("/posts", methods=["POST"])\ndef create_post():\n    try:\n        data = request.json\n        time.sleep(2)\n        title = data["title"]\n        content = data["content"]\n        author = data.get("author", "anonymous")\n        post = {"id": len(posts) + 1, "title": title, "content": content, "author": author}\n        posts.append(post)\n        return jsonify({"message": "post created", "post": post})\n    except Exception as e:\n        return jsonify({"message": "server error", "error": str(e), "trace": traceback.format_exc()}), 500\n@app.route("/posts", methods=["GET"])\ndef list_posts():\n    keyword = request.args.get("keyword", "")\n    result = []\n    for post in posts:\n        time.sleep(0.1)\n        if keyword.lower() in post["title"].lower() or keyword.lower() in post["content"].lower():\n            result.append(post)\n    return jsonify({"count": len(result), "items": result})\n@app.route("/admin/delete_user", methods=["POST"])\ndef delete_user():\n    global users\n    data = request.json\n    user_id = data["id"]\n    new_users = []\n    for user in users:\n        time.sleep(0.05)\n        if user["id"] != user_id:\n            new_users.append(user)\n    users = new_users\n    return jsonify({"message": "user deleted"})\n@app.route("/health", methods=["GET"])\ndef health():\n    return jsonify({"status": "ok", "debug": DEBUG_MODE, "secret_key": SECRET_KEY, "user_count": len(users), "post_count": len(posts)})\napp.run(host="0.0.0.0", port=5000, debug=True)'

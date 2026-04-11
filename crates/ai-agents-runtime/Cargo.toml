@@ -40,6 +40,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 parking_lot = { workspace = true }
 minijinja = { workspace = true }
+rand = { workspace = true }
 
 [features]
 default = []

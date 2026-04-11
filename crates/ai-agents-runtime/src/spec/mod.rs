@@ -13,7 +13,7 @@ pub use provider::{
     BuiltinProviderConfig, ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig,
     ToolAliasesConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
-pub use spawner::{SpawnerConfig, TemplateSource};
+pub use spawner::{AutoSpawnEntry, OrchestrationToolsConfig, SpawnerConfig, TemplateSource};
 pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
 pub use tool::{StructuredToolEntry, ToolConfig, ToolEntry};
 

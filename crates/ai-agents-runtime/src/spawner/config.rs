@@ -241,6 +241,7 @@ pub async fn auto_configure_spawner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::spec::OrchestrationToolsConfig;
 
     // -- extract_template_metadata tests --
 
@@ -539,6 +540,8 @@ system_prompt: "You are {{ name }}."
             name_prefix: Some("npc_".to_string()),
             templates,
             allowed_tools: Some(vec!["echo".to_string()]),
+            auto_spawn: Vec::new(),
+            orchestration_tools: OrchestrationToolsConfig::default(),
         };
 
         let spawner = spawner_from_config(&config, None, None, None).unwrap();

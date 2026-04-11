@@ -254,11 +254,11 @@ pub mod spec {
 
 pub mod state {
     pub use ai_agents_state::{
-        CompareOp, ContextExtractor, ContextMatcher, GuardConditions, GuardOnlyEvaluator,
-        LLMTransitionEvaluator, PromptMode, StateAction, StateConfig, StateDefinition,
-        StateMachine, StateMachineSnapshot, StateMatcher, StateTransitionEvent, TimeMatcher,
-        ToolCondition, ToolRef, Transition, TransitionContext, TransitionEvaluator,
-        TransitionGuard,
+        CompareOp, ContextExtractor, ContextMatcher, DelegateContextMode, GuardConditions,
+        GuardOnlyEvaluator, HandoffStateConfig, LLMTransitionEvaluator, PipelineStageEntry,
+        PipelineStateConfig, PromptMode, StateAction, StateConfig, StateDefinition, StateMachine,
+        StateMachineSnapshot, StateMatcher, StateTransitionEvent, TimeMatcher, ToolCondition,
+        ToolRef, Transition, TransitionContext, TransitionEvaluator, TransitionGuard,
     };
 }
 
@@ -412,6 +412,20 @@ pub mod spawner {
         SpawnedAgentInfo, auto_configure_spawner, configure_spawner_tools, resolve_templates,
         spawner_from_config,
     };
+}
+
+// Multi-agent orchestration patterns and tool wrappers.
+pub mod orchestration {
+    pub use ai_agents_runtime::orchestration::context::prepare_delegate_input;
+    pub use ai_agents_runtime::orchestration::tools::{
+        ConcurrentAskTool, GroupDiscussionTool, HandoffConversationTool, PipelineProcessTool,
+        RouteToAgentTool, configure_orchestration_tools,
+    };
+    pub use ai_agents_runtime::orchestration::types::{
+        AgentResult, ChatTurn, ConcurrentResult, GroupChatResult, HandoffEvent, HandoffResult,
+        PipelineResult, PipelineStage, RouteResult, RoutingMethod, StageOutput,
+    };
+    pub use ai_agents_runtime::orchestration::{concurrent, group_chat, handoff, pipeline, route};
 }
 
 // Top-level re-exports (legacy interface)

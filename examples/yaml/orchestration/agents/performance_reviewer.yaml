@@ -1,0 +1,6 @@
+name: PerformanceReviewer
+system_prompt: "You are a performance reviewer. Identify bottlenecks, unnecessary allocations, and optimization opportunities."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

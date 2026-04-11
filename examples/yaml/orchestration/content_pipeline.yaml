@@ -1,0 +1,92 @@
+name: ContentPipeline
+version: "1.0.0"
+description: "Process content through writer, reviewer, and editor in one pipeline state."
+
+# Pipeline pattern - sequential content processing in a single state.
+# The `pipeline` field on a state triggers a dedicated runtime handler.
+# All stages run in one chat() call with no manual state chaining needed.
+# Per-stage input templates give each agent the context it needs.
+#
+# Template variables available in each stage's `input:`:
+#   {{ previous_output }}    - output from the immediately previous stage
+#   {{ original_input }}     - the user's original input
+#   {{ stages.<agent_id> }} - output from any earlier stage by agent ID
+#
+# {{ stages.<id> }} lets later stages reference any earlier stage explicitly.
+# Without it, the editor would only see the reviewer's feedback (previous_output)
+# and lose the writer's original draft.
+#
+# Flow: user input -> writer (draft) -> reviewer (feedback) -> editor (polish) -> result
+#
+# Prerequisites:
+#   - Sub-agent files in agents/ directory (writer.yaml, reviewer.yaml, editor.yaml)
+
+system_prompt: "Process content through review stages."
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-nano
+
+# Pre-spawn sub-agents at startup.
+spawner:
+  shared_llms: true                # sub-agents reuse parent LLM connections. default: false
+  auto_spawn:
+    - id: writer
+      agent: agents/writer.yaml
+    - id: reviewer
+      agent: agents/reviewer.yaml
+    - id: editor
+      agent: agents/editor.yaml
+
+# Single pipeline state runs all three stages sequentially.
+# Stage 1 (writer) receives the original user input directly.
+# Stages 2+ use Jinja2 input templates with access to all previous stage outputs.
+states:
+  initial: process
+  states:
+    process:
+      pipeline:
+        stages:
+          - writer                 # plain string = agent ID, receives raw user input
+          - id: reviewer           # structured entry with Jinja2 input template
+            input: |
+              Review this draft and provide feedback:
+
+              {{ stages.writer }}
+
+              Original request: {{ original_input }}
+          - id: editor
+            # stages.writer gives the original draft, stages.reviewer gives the feedback.
+            # Without stages.<id>, the editor would only see reviewer output via previous_output.
+            input: |
+              Polish this content into a final version.
+
+              Original draft:
+              {{ stages.writer }}
+
+              Reviewer feedback:
+              {{ stages.reviewer }}
+
+              Original request: {{ original_input }}
+        timeout_ms: 60000          # total pipeline timeout in ms. default: none (no limit)
+        # Each user message starts a fresh pipeline with no memory of previous runs.
+        # context_mode enriches the first stage's input with parent conversation history.
+        # Later stages see it via {{ original_input }}. summary uses a router LLM to condense.
+        # context_mode: summary    # input_only (default) | summary | full
+      transitions:
+        - to: done
+          when: "Pipeline complete"
+
+    done:
+      prompt: "Content pipeline complete. The final version is ready."
+
+metadata:
+  cli:
+    welcome: |
+      Content Pipeline - sequential orchestration demo.
+      Three agents (writer, reviewer, editor) process your content in order.
+      The editor sees both the original draft and reviewer feedback via stages.<id>.
+    hints:
+      - "Write a short blog post about Rust error handling"
+      - "Create a product description for wireless earbuds"

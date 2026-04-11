@@ -386,6 +386,79 @@ spawner:
 
 ---
 
+## Multi-Agent Orchestration
+
+Building on the spawner and registry, orchestration lets a parent agent coordinate multiple sub-agents in structured patterns. The parent agent owns the conversation with the user. Sub-agents work behind the scenes.
+
+Five coordination patterns are available. Three have dedicated state types wired into the runtime. Two are composed from `delegate` states with different transition topologies. All five are also available as orchestration tools for LLM-decided coordination at runtime.
+
+| Pattern | State machine (declarative) | Dynamic (tool) |
+|---------|----------------------------|----------------|
+| **Router** | `delegate` states + LLM-evaluated `when` transitions. No dedicated state type - the existing transition evaluator does the routing. | `route_to_agent` tool calls `orchestration::route()` |
+| **Pipeline** | `pipeline` field on state definition. Sequential agent chain with Jinja2 per-stage input templates. `{{ stages.<agent_id> }}` lets any stage reference any earlier stage's output by name. Runs in one `chat()` call. Also achievable via chained `delegate` states with auto-transitions. | `pipeline_process` tool calls `orchestration::pipeline()` |
+| **Concurrent** | `concurrent` field on state definition. Dedicated runtime handler runs agents in parallel and aggregates results. | `concurrent_ask` tool calls `orchestration::concurrent()` |
+| **Group Chat** | `group_chat` field on state definition. Dedicated runtime handler manages multi-agent conversation with turn management. Styles: `brainstorm` (free-form), `consensus` (same loop but router LLM checks agreement after each round), `debate` (structured pro/con with synthesizer agent), `maker_checker` (create-review loop). Turn order supports `round_robin`, `random`, and `llm_directed` (LLM picks one speaker at a time). | `group_discussion` tool calls `orchestration::group_chat()` |
+| **Handoff** | `handoff` field on state definition. LLM-directed agent-to-agent control transfer with structured JSON decisions. Runs in one `chat()` call. Also achievable via `delegate` states with peer-to-peer transitions. | `handoff_conversation` tool calls `orchestration::handoff()` |
+
+All five patterns have dedicated fields on `StateDefinition` (`delegate`, `concurrent`, `group_chat`, `pipeline`, `handoff`). Router composes from `delegate` + transitions. Pipeline and Handoff can also be composed from `delegate` states but have dedicated state types for single-state convenience.
+
+A `delegate` state forwards user messages to a registry agent instead of processing them locally. The parent's transition evaluator continues watching the delegate's responses:
+
+```yaml
+spawner:
+  shared_llms: true
+  auto_spawn:
+    - id: billing
+      agent: agents/billing_agent.yaml
+    - id: technical
+      agent: agents/technical_agent.yaml
+
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Determine what the user needs."
+      transitions:
+        - to: billing_help
+          when: "User has a billing question"
+        - to: tech_help
+          when: "User has a technical issue"
+    billing_help:
+      delegate: billing
+      transitions:
+        - to: triage
+          when: "Issue resolved"
+    tech_help:
+      delegate: technical
+      transitions:
+        - to: triage
+          when: "Issue resolved"
+```
+
+For dynamic orchestration, set `orchestration_tools: true` in the spawner section. The LLM can then call `route_to_agent`, `pipeline_process`, `concurrent_ask`, `group_discussion`, and `handoff_conversation` at runtime without a predefined state graph.
+
+Delegate states support a `delegate_context` mode (`input_only`, `summary`, `full`) that controls what conversation history reaches the sub-agent. With `input_only` (default) only the user's current message is forwarded. With `full` the last 20 messages are included as conversation history. With `summary` the parent uses its router LLM to summarize the conversation into 2-3 sentences before forwarding.
+
+The same context enrichment is available for all orchestration patterns via the `context_mode` field. Set `context_mode: summary` or `context_mode: full` on any `concurrent`, `group_chat`, `pipeline`, or `handoff` block to forward parent conversation history to sub-agents. The enrichment runs before `input` template rendering, so `{{ user_input }}` in templates contains the history-enriched text. When omitted, the default is `input_only` which preserves the original behavior.
+
+Because orchestration runs through the normal `RuntimeAgent` loop, all existing features work automatically: HITL approvals on state transitions, error recovery per delegate, hooks for observability, memory for the parent conversation, and streaming.
+
+Concurrent states accept a `vote` config to control how individual agent responses are aggregated into a final answer. `vote.method` selects the strategy: `majority` (default), `weighted`, or `unanimous`. `vote.tiebreaker` decides ties: `first` (declaration order), `random`, or `router_decides` (asks the router LLM). Per-agent weights are set via `vote.weights` (a map of agent id to numeric weight, used when method is `weighted`). The `on_partial_failure` field controls behavior when some agents fail: `abort` (default) fails the entire concurrent call, while `proceed_with_available` aggregates only the successful responses.
+
+After each orchestration call the runtime stores the full structured result in `context.orchestration`. Subsequent states can reference the data in prompt templates and guard conditions. The object includes a `type` field (`delegate`, `concurrent`, `group_chat`, `pipeline`, or `handoff`) plus type-specific data such as per-agent responses, the full group chat transcript, pipeline stage outputs, handoff chain events, round counts, and timing. Backward-compatible flat keys (`delegation.<id>.last_response`, `concurrent.result`, `group_chat.conclusion`, `pipeline.result`, `handoff.result`) are also set. The same structure is attached to `response.metadata["orchestration"]` for CLI and hook consumers.
+
+For group chat brainstorm and consensus styles, `response.content` contains the full formatted transcript (`[Round N] speaker: message`) rather than only the last speaker's final line. Debate and maker-checker styles are unaffected because they already produce a synthesized conclusion or final draft. Users on the `InMemoryHistory` backend should be aware that long transcripts consume a ring-buffer slot; `CompactingMemory` handles overflow via summarization. For the maker-checker style, `on_max_iterations` controls what happens when the review loop hits its limit: `accept_last` uses the final draft as-is, `escalate` forwards to a human or parent agent, and `fail` returns an error.
+
+Group chat supports three turn-order methods via `manager.method`. `round_robin` (default) cycles through all participants in declaration order. `random` shuffles each round. `llm_directed` uses the router LLM to pick one speaker at a time after seeing the latest message, capping at `participants.len()` speakers per round for consistent stall detection. `llm_directed` requires a router LLM; the builder returns a config error if none is configured. When `manager.agent` is set to a registry agent id, that agent takes over termination decisions and speaker selection instead of the built-in logic, allowing fully custom orchestration within the group chat loop.
+
+Handoff decisions use structured JSON. The evaluator LLM returns `{"action": "agent_id_or_stay", "confidence": 0.0-1.0, "reason": "..."}`. The runtime parses JSON first (handling markdown code blocks and preamble text), then falls back to fuzzy text matching if JSON extraction fails. This makes handoff robust to variations in LLM output formatting.
+
+When `auto_spawn` is configured, the builder validates that every agent referenced by an orchestration state (`delegate`, `concurrent`, `group_chat`, `pipeline`, `handoff`) was successfully spawned. Missing agents produce a clear build-time error listing each unresolved reference, the state that needs it, and the orchestration pattern involved.
+
+See [YAML Reference - Orchestration States](@/docs/yaml-reference.md#orchestration-states) for the complete field reference.
+
+---
+
 ## Safety
 
 The framework provides multiple safety layers to keep agents predictable and secure.

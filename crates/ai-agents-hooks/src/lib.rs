@@ -37,6 +37,36 @@ pub trait AgentHooks: Send + Sync {
     async fn on_memory_evict(&self, _event: &MemoryEvictEvent) {}
 
     async fn on_memory_budget_warning(&self, _event: &MemoryBudgetEvent) {}
+
+    /// Fired when a delegated state starts forwarding to a registry agent.
+    async fn on_delegate_start(&self, _agent_id: &str, _state: &str) {}
+
+    /// Fired when a delegated state completes.
+    async fn on_delegate_complete(&self, _agent_id: &str, _state: &str, _duration_ms: u64) {}
+
+    /// Fired when a concurrent state completes aggregation.
+    async fn on_concurrent_complete(
+        &self,
+        _agent_ids: &[String],
+        _strategy: &str,
+        _duration_ms: u64,
+    ) {
+    }
+
+    /// Fired when a group chat round completes.
+    async fn on_group_chat_round(&self, _round: u32, _speaker: &str, _content: &str) {}
+
+    /// Fired after each pipeline stage completes.
+    async fn on_pipeline_stage(&self, _stage: usize, _agent_id: &str, _duration_ms: u64) {}
+
+    /// Fired when a pipeline completes all stages.
+    async fn on_pipeline_complete(&self, _stages: usize, _duration_ms: u64) {}
+
+    /// Fired when a handoff chain starts.
+    async fn on_handoff_start(&self, _initial_agent: &str) {}
+
+    /// Fired on each agent-to-agent control transfer.
+    async fn on_handoff(&self, _from: &str, _to: &str, _reason: &str) {}
 }
 
 pub struct NoopHooks;
@@ -186,6 +216,64 @@ impl AgentHooks for LoggingHooks {
             event.budget_tokens
         );
     }
+
+    async fn on_delegate_start(&self, agent_id: &str, state: &str) {
+        info!(
+            "{} Delegation started: agent={}, state={}",
+            self.prefix, agent_id, state
+        );
+    }
+
+    async fn on_delegate_complete(&self, agent_id: &str, state: &str, duration_ms: u64) {
+        info!(
+            "{} Delegation complete: agent={}, state={}, duration={}ms",
+            self.prefix, agent_id, state, duration_ms
+        );
+    }
+
+    async fn on_concurrent_complete(&self, agent_ids: &[String], strategy: &str, duration_ms: u64) {
+        info!(
+            "{} Concurrent complete: agents={:?}, strategy={}, duration={}ms",
+            self.prefix, agent_ids, strategy, duration_ms
+        );
+    }
+
+    async fn on_group_chat_round(&self, round: u32, speaker: &str, content: &str) {
+        let preview = if content.len() > 80 {
+            format!("{}...", &content[..80])
+        } else {
+            content.to_string()
+        };
+        debug!(
+            "{} Group chat round {}: {} said: {}",
+            self.prefix, round, speaker, preview
+        );
+    }
+
+    async fn on_pipeline_stage(&self, stage: usize, agent_id: &str, duration_ms: u64) {
+        info!(
+            "{} Pipeline stage {}: agent={}, duration={}ms",
+            self.prefix, stage, agent_id, duration_ms
+        );
+    }
+
+    async fn on_pipeline_complete(&self, stages: usize, duration_ms: u64) {
+        info!(
+            "{} Pipeline complete: {} stages, duration={}ms",
+            self.prefix, stages, duration_ms
+        );
+    }
+
+    async fn on_handoff_start(&self, initial_agent: &str) {
+        info!(
+            "{} Handoff chain started: initial_agent={}",
+            self.prefix, initial_agent
+        );
+    }
+
+    async fn on_handoff(&self, from: &str, to: &str, reason: &str) {
+        info!("{} Handoff: {} -> {} ({})", self.prefix, from, to, reason);
+    }
 }
 
 pub struct CompositeHooks {
@@ -290,6 +378,56 @@ impl AgentHooks for CompositeHooks {
     async fn on_memory_budget_warning(&self, event: &MemoryBudgetEvent) {
         for hook in &self.hooks {
             hook.on_memory_budget_warning(event).await;
+        }
+    }
+
+    async fn on_delegate_start(&self, agent_id: &str, state: &str) {
+        for hook in &self.hooks {
+            hook.on_delegate_start(agent_id, state).await;
+        }
+    }
+
+    async fn on_delegate_complete(&self, agent_id: &str, state: &str, duration_ms: u64) {
+        for hook in &self.hooks {
+            hook.on_delegate_complete(agent_id, state, duration_ms)
+                .await;
+        }
+    }
+
+    async fn on_concurrent_complete(&self, agent_ids: &[String], strategy: &str, duration_ms: u64) {
+        for hook in &self.hooks {
+            hook.on_concurrent_complete(agent_ids, strategy, duration_ms)
+                .await;
+        }
+    }
+
+    async fn on_group_chat_round(&self, round: u32, speaker: &str, content: &str) {
+        for hook in &self.hooks {
+            hook.on_group_chat_round(round, speaker, content).await;
+        }
+    }
+
+    async fn on_pipeline_stage(&self, stage: usize, agent_id: &str, duration_ms: u64) {
+        for hook in &self.hooks {
+            hook.on_pipeline_stage(stage, agent_id, duration_ms).await;
+        }
+    }
+
+    async fn on_pipeline_complete(&self, stages: usize, duration_ms: u64) {
+        for hook in &self.hooks {
+            hook.on_pipeline_complete(stages, duration_ms).await;
+        }
+    }
+
+    async fn on_handoff_start(&self, initial_agent: &str) {
+        for hook in &self.hooks {
+            hook.on_handoff_start(initial_agent).await;
+        }
+    }
+
+    async fn on_handoff(&self, from: &str, to: &str, reason: &str) {
+        for hook in &self.hooks {
+            hook.on_handoff(from, to, reason).await;
         }
     }
 }

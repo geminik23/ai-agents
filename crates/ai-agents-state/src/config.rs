@@ -101,6 +101,30 @@ pub struct StateDefinition {
     /// Per-state process pipeline override (replaces agent-level pipeline for this state).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<ProcessConfig>,
+
+    /// Delegate state messages to a registry agent by ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<String>,
+
+    /// Context mode for delegated states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate_context: Option<DelegateContextMode>,
+
+    /// Run multiple registry agents concurrently in this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrent: Option<ConcurrentStateConfig>,
+
+    /// Run a multi-agent group chat in this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_chat: Option<GroupChatStateConfig>,
+
+    /// Run a sequential agent pipeline in this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<PipelineStateConfig>,
+
+    /// Run an LLM-directed handoff chain in this state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<HandoffStateConfig>,
 }
 
 fn default_inherit_parent() -> bool {
@@ -300,6 +324,341 @@ pub struct ContextExtractor {
     /// If true, extraction failure is logged as a warning.
     #[serde(default)]
     pub required: bool,
+}
+
+//
+// Multi-agent orchestration config types for state delegation, concurrent execution, and group chat.
+//
+
+/// Context mode for delegated states.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegateContextMode {
+    /// Delegated agent receives only the user's current message.
+    #[default]
+    InputOnly,
+    /// Parent summarizes recent conversation via router LLM.
+    Summary,
+    /// Parent passes full recent message history.
+    Full,
+}
+
+/// Config for running multiple registry agents concurrently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConcurrentStateConfig {
+    /// Agent IDs in the registry (simple list or weighted entries).
+    pub agents: Vec<ConcurrentAgentRef>,
+    /// Jinja2 template for input sent to each agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// How to aggregate results from all agents.
+    pub aggregation: AggregationConfig,
+    /// Minimum agents that must succeed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_required: Option<usize>,
+    /// What to do when some agents fail.
+    #[serde(default)]
+    pub on_partial_failure: PartialFailureAction,
+    /// Per-agent timeout in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Parent conversation context forwarded to each agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<DelegateContextMode>,
+}
+
+/// Either a plain agent ID string or a weighted entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ConcurrentAgentRef {
+    Id(String),
+    Weighted { id: String, weight: f64 },
+}
+
+impl ConcurrentAgentRef {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Id(id) => id,
+            Self::Weighted { id, .. } => id,
+        }
+    }
+
+    pub fn weight(&self) -> f64 {
+        match self {
+            Self::Id(_) => 1.0,
+            Self::Weighted { weight, .. } => *weight,
+        }
+    }
+}
+
+/// How to aggregate results from concurrent agents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AggregationConfig {
+    /// Aggregation strategy.
+    pub strategy: AggregationStrategy,
+    /// LLM alias for synthesis or vote extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesizer_llm: Option<String>,
+    /// Custom prompt for LLM synthesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesizer_prompt: Option<String>,
+    /// Voting sub-config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote: Option<VoteConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AggregationStrategy {
+    Voting,
+    LlmSynthesis,
+    FirstWins,
+    All,
+}
+
+/// Voting config for concurrent agent aggregation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoteConfig {
+    #[serde(default)]
+    pub method: VoteMethod,
+    #[serde(default)]
+    pub tiebreaker: TiebreakerStrategy,
+    /// Custom prompt for extracting a vote from each agent's response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vote_prompt: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VoteMethod {
+    #[default]
+    Majority,
+    Weighted,
+    Unanimous,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TiebreakerStrategy {
+    #[default]
+    First,
+    Random,
+    RouterDecides,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PartialFailureAction {
+    #[default]
+    ProceedWithAvailable,
+    Abort,
+}
+
+/// Group chat state config for multi-agent conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupChatStateConfig {
+    /// Participant agent IDs with optional roles.
+    pub participants: Vec<ChatParticipant>,
+    /// Conversation style.
+    #[serde(default)]
+    pub style: ChatStyle,
+    /// Maximum conversation rounds.
+    #[serde(default = "default_max_rounds")]
+    pub max_rounds: u32,
+    /// Chat manager config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager: Option<ChatManagerConfig>,
+    /// When and how to terminate.
+    #[serde(default)]
+    pub termination: TerminationConfig,
+    /// Debate-specific config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debate: Option<DebateStyleConfig>,
+    /// Maker-checker-specific config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maker_checker: Option<MakerCheckerConfig>,
+    /// Total timeout for the group chat in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Jinja2 template for the topic sent to participants.
+    /// {{ user_input }} is the user's message. {{ context.<key> }} accesses context values. When omitted, the raw user message is used as the topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// Parent conversation context included in the topic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<DelegateContextMode>,
+}
+
+/// A participant in a group chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatParticipant {
+    /// Agent ID in the registry.
+    pub id: String,
+    /// Role description visible to all participants.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatStyle {
+    #[default]
+    Brainstorm,
+    Debate,
+    MakerChecker,
+    Consensus,
+}
+
+/// Chat manager config for controlling turn order.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatManagerConfig {
+    /// Registry agent ID for chat management.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Built-in turn policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<TurnMethod>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnMethod {
+    RoundRobin,
+    Random,
+    LlmDirected,
+}
+
+/// Termination config for group chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminationConfig {
+    #[serde(default)]
+    pub method: TerminationMethod,
+    #[serde(default = "default_stall_rounds")]
+    pub max_stall_rounds: u32,
+}
+
+impl Default for TerminationConfig {
+    fn default() -> Self {
+        Self {
+            method: TerminationMethod::default(),
+            max_stall_rounds: default_stall_rounds(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminationMethod {
+    #[default]
+    ManagerDecides,
+    MaxRounds,
+    ConsensusReached,
+}
+
+/// Debate-specific config for group chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebateStyleConfig {
+    #[serde(default = "default_debate_rounds")]
+    pub rounds: u32,
+    /// Agent ID that synthesizes the final answer.
+    pub synthesizer: String,
+}
+
+/// Maker-checker-specific config for group chat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MakerCheckerConfig {
+    #[serde(default = "default_maker_checker_iterations")]
+    pub max_iterations: u32,
+    /// LLM-evaluated acceptance criteria.
+    pub acceptance_criteria: String,
+    #[serde(default)]
+    pub on_max_iterations: MaxIterationsAction,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxIterationsAction {
+    #[default]
+    AcceptLast,
+    Escalate,
+    Fail,
+}
+
+fn default_max_rounds() -> u32 {
+    5
+}
+fn default_stall_rounds() -> u32 {
+    2
+}
+fn default_debate_rounds() -> u32 {
+    3
+}
+fn default_maker_checker_iterations() -> u32 {
+    3
+}
+
+/// Config for a pipeline state type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineStateConfig {
+    pub stages: Vec<PipelineStageEntry>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Parent conversation context forwarded to the first stage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<DelegateContextMode>,
+}
+
+/// A single stage in a pipeline state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PipelineStageEntry {
+    /// Simple agent ID string.
+    Id(String),
+    /// Agent with optional input template.
+    Config {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+    },
+}
+
+impl PipelineStageEntry {
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Id(id) => id,
+            Self::Config { id, .. } => id,
+        }
+    }
+
+    pub fn input(&self) -> Option<&str> {
+        match self {
+            Self::Id(_) => None,
+            Self::Config { input, .. } => input.as_deref(),
+        }
+    }
+}
+
+/// Config for a handoff state type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HandoffStateConfig {
+    pub initial_agent: String,
+    pub available_agents: Vec<String>,
+
+    #[serde(default = "default_max_handoffs")]
+    pub max_handoffs: u32,
+
+    /// Jinja2 template for the input sent to the initial agent.
+    /// {{ user_input }} is the user's message. {{ context.<key> }} accesses context values. When omitted, the raw user message is forwarded directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// Parent conversation context forwarded to the initial agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_mode: Option<DelegateContextMode>,
+}
+
+fn default_max_handoffs() -> u32 {
+    5
 }
 
 impl StateConfig {

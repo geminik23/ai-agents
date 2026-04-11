@@ -1,0 +1,6 @@
+name: SecurityReviewer
+system_prompt: "You are a security reviewer. Check code for vulnerabilities, injection risks, auth issues, and data exposure."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

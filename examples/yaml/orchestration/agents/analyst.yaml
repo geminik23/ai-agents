@@ -1,0 +1,6 @@
+name: Analyst
+system_prompt: "You are an analyst. Break down complex problems, evaluate data, identify patterns, and provide structured assessments."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

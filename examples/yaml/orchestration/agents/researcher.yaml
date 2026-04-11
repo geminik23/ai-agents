@@ -1,0 +1,6 @@
+name: Researcher
+system_prompt: "You are a researcher. Gather information, compare sources, and provide well-sourced findings on any topic."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

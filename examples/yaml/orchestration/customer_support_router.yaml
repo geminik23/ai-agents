@@ -1,0 +1,66 @@
+name: CustomerSupportRouter
+version: "1.0.0"
+description: "Routes customer queries to billing or technical specialists."
+
+# Router pattern - triage state delegates to specialist agents via LLM-evaluated transitions.
+# No dedicated orchestration type needed. Uses standard `delegate:` states and `when:` transitions.
+# The transition evaluator picks the right specialist; each specialist uses delegate to forward messages.
+#
+# Compare with support_handoff.yaml which uses the handoff pattern for the same routing problem.
+# Router is better when you want explicit states per specialist.
+# Handoff is better when you want the LLM to decide transfers mid-conversation.
+#
+# Flow: user input -> routing (LLM evaluates transitions) -> specialist delegate -> response
+#                  -> resolved -> back to routing
+system_prompt: "You are a customer support router. Determine what the user needs."
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+
+# Pre-spawn sub-agents from YAML files at startup.
+spawner:
+  shared_llms: true                # sub-agents reuse parent LLM connections. default: false
+  auto_spawn:
+    - id: billing                  # registry ID used by delegate: below
+      agent: agents/billing_agent.yaml
+    - id: technical
+      agent: agents/technical_agent.yaml
+
+# Routing state evaluates transitions, specialist states delegate to registry agents.
+states:
+  initial: routing
+  states:
+    routing:
+      prompt: "Determine what kind of help the user needs."
+      transitions:
+        - to: billing_help
+          when: "User has a billing, payment, or invoice question"
+        - to: technical_help
+          when: "User has a technical issue, bug, or error"
+
+    # delegate forwards user messages to a registry agent instead of processing locally.
+    # delegate_context controls what history reaches the sub-agent.
+    # input_only (default) | summary | full
+    billing_help:
+      delegate: billing            # registry agent ID from spawner.auto_spawn
+      transitions:
+        - to: routing
+          when: "Issue is resolved or user has a different question"
+
+    technical_help:
+      delegate: technical
+      transitions:
+        - to: routing
+          when: "Issue is resolved or user has a different question"
+
+metadata:
+  cli:
+    welcome: |
+      Customer Support Router - delegate orchestration demo.
+      Billing and technical specialists are auto-spawned at startup.
+    hints:
+      - "I have a question about my invoice"
+      - "My app crashes when I click submit"
+      - "Next: yaml/orchestration/support_handoff.yaml"

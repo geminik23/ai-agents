@@ -1,0 +1,6 @@
+name: TechnicalSupport
+system_prompt: "You are a technical support specialist. Help customers resolve technical issues and bugs."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

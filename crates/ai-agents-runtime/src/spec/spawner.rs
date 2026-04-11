@@ -5,6 +5,50 @@ use std::collections::HashMap;
 
 use super::StorageConfig;
 
+/// An agent to create at startup and register in the AgentRegistry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoSpawnEntry {
+    /// Registry ID for this agent.
+    pub id: String,
+    /// Path to the agent YAML file (resolved relative to parent YAML directory).
+    pub agent: String,
+}
+
+/// Orchestration tool selection: all tools or a specific subset.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum OrchestrationToolsConfig {
+    /// `orchestration_tools: true` registers all orchestration tools.
+    All(bool),
+    /// `orchestration_tools: [route_to_agent, group_discussion]` registers listed tools.
+    Selected(Vec<String>),
+}
+
+impl Default for OrchestrationToolsConfig {
+    fn default() -> Self {
+        Self::All(false)
+    }
+}
+
+impl OrchestrationToolsConfig {
+    /// Returns true if any orchestration tools are enabled.
+    pub fn is_enabled(&self) -> bool {
+        match self {
+            Self::All(v) => *v,
+            Self::Selected(v) => !v.is_empty(),
+        }
+    }
+
+    /// Returns true if the given tool name is included.
+    pub fn includes(&self, tool_name: &str) -> bool {
+        match self {
+            Self::All(true) => true,
+            Self::All(false) => false,
+            Self::Selected(v) => v.iter().any(|t| t == tool_name),
+        }
+    }
+}
+
 /// Configuration for dynamic agent spawning declared in the `spawner:` YAML section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnerConfig {
@@ -35,6 +79,14 @@ pub struct SpawnerConfig {
     /// Tool names that spawned agents are allowed to use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_tools: Option<Vec<String>>,
+
+    /// Agents to create at startup and register in the AgentRegistry.
+    #[serde(default)]
+    pub auto_spawn: Vec<AutoSpawnEntry>,
+
+    /// Register orchestration tools (route_to_agent, group_discussion, etc.).
+    #[serde(default)]
+    pub orchestration_tools: OrchestrationToolsConfig,
 }
 
 /// A spawner template source: either an inline YAML string or a file path reference.
@@ -73,6 +125,8 @@ impl Default for SpawnerConfig {
             name_prefix: None,
             templates: HashMap::new(),
             allowed_tools: None,
+            auto_spawn: Vec::new(),
+            orchestration_tools: OrchestrationToolsConfig::default(),
         }
     }
 }
@@ -86,6 +140,8 @@ impl SpawnerConfig {
             || self.max_agents.is_some()
             || self.name_prefix.is_some()
             || !self.templates.is_empty()
+            || !self.auto_spawn.is_empty()
+            || self.orchestration_tools.is_enabled()
     }
 }
 
@@ -120,6 +176,58 @@ templates:
         assert_eq!(config.shared_context.len(), 2);
         assert!(config.templates.contains_key("npc_base"));
         assert!(config.templates.get("npc_base").unwrap().is_inline());
+        assert!(config.is_configured());
+    }
+
+    #[test]
+    fn test_deserialize_auto_spawn() {
+        let yaml = r#"
+shared_llms: true
+auto_spawn:
+  - id: billing
+    agent: agents/billing_agent.yaml
+  - id: technical
+    agent: agents/technical_agent.yaml
+"#;
+        let config: SpawnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.auto_spawn.len(), 2);
+        assert_eq!(config.auto_spawn[0].id, "billing");
+        assert_eq!(config.auto_spawn[0].agent, "agents/billing_agent.yaml");
+    }
+
+    #[test]
+    fn test_deserialize_orchestration_tools_all() {
+        let yaml = r#"
+orchestration_tools: true
+"#;
+        let config: SpawnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.orchestration_tools.is_enabled());
+        assert!(config.orchestration_tools.includes("route_to_agent"));
+    }
+
+    #[test]
+    fn test_deserialize_orchestration_tools_selected() {
+        let yaml = r#"
+orchestration_tools:
+  - route_to_agent
+  - group_discussion
+"#;
+        let config: SpawnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.orchestration_tools.is_enabled());
+        assert!(config.orchestration_tools.includes("route_to_agent"));
+        assert!(config.orchestration_tools.includes("group_discussion"));
+        assert!(!config.orchestration_tools.includes("concurrent_ask"));
+    }
+
+    #[test]
+    fn test_auto_spawn_makes_configured() {
+        let config = SpawnerConfig {
+            auto_spawn: vec![AutoSpawnEntry {
+                id: "test".to_string(),
+                agent: "test.yaml".to_string(),
+            }],
+            ..SpawnerConfig::default()
+        };
         assert!(config.is_configured());
     }
 
@@ -181,6 +289,8 @@ templates:
             name_prefix: Some("test_".to_string()),
             templates: HashMap::new(),
             allowed_tools: Some(vec!["echo".to_string()]),
+            auto_spawn: Vec::new(),
+            orchestration_tools: OrchestrationToolsConfig::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();
         let parsed: SpawnerConfig = serde_yaml::from_str(&yaml).unwrap();

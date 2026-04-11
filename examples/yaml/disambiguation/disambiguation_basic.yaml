@@ -11,9 +11,6 @@ description: "Minimal disambiguation - the agent asks when unsure"
 # Flow: user input -> detector (router LLM) -> confidence >= 0.6 -> normal response
 #                                            -> confidence < 0.6 -> clarification question
 #                  -> user answers -> enriched input -> normal response
-#
-# Usage:
-#   cargo run -p ai-agents-cli -- run examples/yaml/disambiguation/disambiguation_basic.yaml
 
 system_prompt: |
   You are a helpful assistant.

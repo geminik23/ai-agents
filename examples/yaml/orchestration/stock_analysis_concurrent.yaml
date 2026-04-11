@@ -1,0 +1,92 @@
+name: StockAnalyzer
+version: "1.0.0"
+description: "Analyze stocks from fundamental, technical, and sentiment perspectives."
+
+# Concurrent pattern - multiple agents analyze in parallel, results aggregated via LLM.
+# The `concurrent` field on a state triggers a dedicated runtime handler.
+# All agents receive the same input and run in parallel via tokio::JoinSet.
+# An aggregation strategy combines the results into a single response.
+#
+# For the dynamic tool variant, see game_world_dynamic.yaml (concurrent_ask tool).
+#
+# NOTE: Orchestration states (concurrent, group_chat, pipeline, handoff) only run when
+# a user message arrives in that state. Post-transition re-generation does NOT invoke
+# orchestration handlers. Design so the user's message lands directly in the orchestration state.
+#
+# Flow: user input -> concurrent [fundamental, technical, sentiment] (parallel)
+#                  -> LLM synthesis -> response
+#
+# Prerequisites:
+#   - Sub-agent files in agents/ directory
+system_prompt: |
+  You are a stock analysis coordinator.
+  When the user mentions a stock ticker or company name, your three specialist analysts
+  (fundamental, technical, sentiment) will automatically analyze it in parallel.
+  Present whatever the analysts produce. Do not analyze stocks yourself.
+
+max_context_tokens: 128000
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router                   # used for LLM synthesis of concurrent results
+
+# Pre-spawn three analyst agents with different specialties.
+spawner:
+  shared_llms: true                # sub-agents reuse parent LLM connections. default: false
+  auto_spawn:
+    - id: fundamental
+      agent: agents/fundamental_analyst.yaml
+    - id: technical
+      agent: agents/technical_analyst.yaml
+    - id: sentiment
+      agent: agents/sentiment_analyst.yaml
+
+# Collect state gathers the ticker, analyze state fans out to all analysts.
+# Single concurrent state - the user's message goes directly to all three analysts.
+# No collect state needed. The system_prompt tells the agent what it does.
+states:
+  initial: analyze
+  states:
+    analyze:
+      concurrent:
+        agents: [fundamental, technical, sentiment]  # registry agent IDs to run in parallel
+        # {{ user_input }} injects the user's actual message into the template.
+        # {{ context.<key> }} accesses context manager values if needed.
+        # Without input:, agents receive the raw message. With it, you control the framing.
+        input: "Analyze {{ user_input }}. Focus on your specialty area. Be concise."
+        timeout_ms: 30000          # per-agent timeout in ms. default: none (no limit)
+        # min_required: 2          # minimum agents that must succeed. default: none (all)
+        # on_partial_failure: proceed_with_available  # proceed_with_available (default) | abort
+        # Each user message starts a fresh concurrent run with no memory of previous analysis.
+        # context_mode enriches the input with parent conversation history so agents know
+        # what was already analyzed. When an input: template is set, {{ user_input }} contains
+        # the history-enriched text instead of the raw message.
+        # context_mode: summary    # input_only (default) | summary | full
+        aggregation:
+          strategy: llm_synthesis  # voting | llm_synthesis | first_wins | all
+          synthesizer_llm: router  # which LLM alias to use for synthesis
+          # synthesizer_prompt: "..." # custom prompt for the synthesizer. default: built-in
+          # vote:                     # voting sub-config (only used with strategy: voting)
+          #   method: majority        # majority (default) | weighted | unanimous
+          #   tiebreaker: first       # first (default) | random | router_decides
+          # Per-agent weights for weighted voting (default weight is 1.0):
+          # agents:
+          #   - { id: senior, weight: 2.0 }
+          #   - junior_a              # plain string = weight 1.0
+
+metadata:
+  cli:
+    welcome: |
+      Stock Analyzer - concurrent orchestration demo.
+      Three analysts (fundamental, technical, sentiment) run in parallel.
+    hints:
+      - "Analyze AAPL"
+      - "What do you think about TSLA?"

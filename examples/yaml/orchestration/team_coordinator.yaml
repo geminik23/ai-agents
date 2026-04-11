@@ -1,0 +1,102 @@
+name: TeamCoordinator
+version: "1.0.0"
+description: "Team coordinator that uses orchestration tools to coordinate pre-spawned specialists."
+
+# Orchestration tools - LLM decides which coordination pattern to use at runtime.
+# Instead of a fixed state machine, the coordinator LLM picks the best tool for each request.
+# The framework auto-injects orchestration tool schemas into the LLM prompt.
+#
+# Available tools (registered by orchestration_tools: true):
+#   route_to_agent        - pick the best agent for a question
+#   pipeline_process      - chain agents sequentially (draft -> review -> edit)
+#   concurrent_ask        - ask multiple agents in parallel and aggregate
+#   group_discussion      - multi-agent conversation on a topic
+#   handoff_conversation  - start with one agent, LLM transfers to another if needed
+#
+# Compare with game_world_dynamic.yaml which creates agents dynamically.
+# This example pre-spawns all agents at build time.
+#
+# Flow: user input -> coordinator LLM -> picks a tool -> orchestration runs -> response
+#                  -> no tool needed -> coordinator responds directly
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/orchestration/team_coordinator.yaml
+#
+# Prerequisites:
+#   - OPENAI_API_KEY environment variable
+#   - Sub-agent files in agents/ directory
+
+system_prompt: |
+  You are a team coordinator managing a group of specialists.
+  You have these agents available: writer, reviewer, editor, researcher, analyst.
+
+  Use your orchestration tools to coordinate them:
+
+  - When the user wants content created and polished, use pipeline_process
+    with stages ["writer", "reviewer", "editor"].
+  - When the user asks a question that benefits from multiple perspectives,
+    use concurrent_ask with the relevant agents.
+  - When agents need to discuss a topic together, use group_discussion.
+  - When you need to pick the single best agent for a task, use route_to_agent.
+  - When a task might need to be transferred between specialists,
+    use handoff_conversation starting with the most likely agent.
+
+  For simple questions you can answer yourself, respond directly without tools.
+
+max_context_tokens: 128000
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router                   # used by route, concurrent synthesis, and handoff decisions
+
+# Pre-spawn 5 specialist agents at startup.
+# orchestration_tools: true registers all 5 coordination tools.
+spawner:
+  shared_llms: true                # sub-agents reuse parent LLM connections. default: false
+  orchestration_tools: true        # register all 5 tools: route, pipeline, concurrent, group, handoff. default: false
+  auto_spawn:
+    - id: writer                   # registry ID the LLM passes to orchestration tools
+      agent: agents/writer.yaml    # path relative to this YAML file
+    - id: reviewer
+      agent: agents/reviewer.yaml
+    - id: editor
+      agent: agents/editor.yaml
+    - id: researcher
+      agent: agents/researcher.yaml
+    - id: analyst
+      agent: agents/analyst.yaml
+
+# No state machine needed. The coordinator uses tools to decide at runtime.
+# Try these prompts:
+#
+#   "Write a blog post about Rust async programming"
+#     -> coordinator calls pipeline_process with [writer, reviewer, editor]
+#
+#   "What are the pros and cons of microservices?"
+#     -> coordinator calls concurrent_ask with [researcher, analyst]
+#
+#   "Have the team discuss whether we should adopt GraphQL"
+#     -> coordinator calls group_discussion with [researcher, analyst, writer]
+#
+#   "I need help with market research"
+#     -> coordinator calls route_to_agent with [researcher, analyst]
+
+metadata:
+  cli:
+    welcome: |
+      Team Coordinator - orchestration tools demo.
+      5 specialists available: writer, reviewer, editor, researcher, analyst.
+      The coordinator LLM picks which tool and agents to use for each request.
+    hints:
+      - "Write a blog post about Rust async programming"
+      - "What are the pros and cons of microservices?"
+      - "Have the team discuss whether we should adopt GraphQL"
+      - "I need help with market research"

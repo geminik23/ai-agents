@@ -1,0 +1,6 @@
+name: Writer
+system_prompt: "You are a content writer. Create well-structured drafts based on the given topic or request."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

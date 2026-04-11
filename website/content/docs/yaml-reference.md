@@ -415,6 +415,229 @@ on_exit:
       drafting_completed: true
 ```
 
+### Orchestration States
+
+The framework supports five orchestration patterns. Each has a dedicated field on `StateDefinition` wired into the runtime.
+
+| Pattern | State type field | Description |
+|---------|-----------------|-------------|
+| **Router** | `delegate` | `delegate` states + LLM-evaluated `when` transitions. The existing transition evaluator does the routing. |
+| **Pipeline** | `pipeline` | Sequential agent chain with optional per-stage input templates. Runs in one `chat()` call. |
+| **Concurrent** | `concurrent` | Parallel agent execution with aggregation strategies. Runs in one `chat()` call. |
+| **Group Chat** | `group_chat` | Multi-agent conversation with turn management and termination detection. Runs in one `chat()` call. |
+| **Handoff** | `handoff` | LLM-directed agent-to-agent control transfer. Runs in one `chat()` call. |
+
+All five patterns are also available as [orchestration tools](@/docs/yaml-reference.md#orchestration-tools) for LLM-decided coordination at runtime. `delegate`, `concurrent`, `group_chat`, `pipeline`, and `handoff` are mutually exclusive on a state.
+
+All orchestration states require a `spawner:` section with `auto_spawn` so the referenced agents exist in the registry at startup. See [Spawner](@/docs/yaml-reference.md#spawner-dynamic-agent-spawning) for setup.
+
+#### `delegate`
+
+Forward all user messages to a registry agent. The parent's transition evaluator watches the delegate's responses and fires transitions when conditions match.
+
+```yaml
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Determine what the user needs."
+      transitions:
+        - to: billing_help
+          when: "User has a billing question"
+    billing_help:
+      delegate: billing              # agent ID from auto_spawn
+      delegate_context: input_only   # input_only (default) | summary | full
+      transitions:
+        - to: triage
+          when: "Issue resolved"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `delegate` | `string` | - | Registry agent ID to forward messages to |
+| `delegate_context` | `string` | `input_only` | Context passed to the delegate: `input_only` (just the message), `summary` (LLM-summarized history), `full` (recent messages) |
+
+#### `concurrent`
+
+Run multiple agents in parallel and aggregate their results. The state completes in one `chat()` call.
+
+```yaml
+    analyze:
+      concurrent:
+        agents: [fundamental, technical, sentiment]
+        input: "Analyze the stock the user mentioned."
+        timeout_ms: 30000
+        aggregation:
+          strategy: llm_synthesis
+          synthesizer_llm: router
+      transitions:
+        - to: present
+          auto: true
+```
+
+Agents can also carry weights for weighted voting:
+
+```yaml
+      concurrent:
+        agents:
+          - id: senior
+            weight: 2.0
+          - id: junior
+            weight: 1.0
+        aggregation:
+          strategy: voting
+          vote:
+            method: weighted
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `concurrent.agents` | `list` | - | Agent IDs (strings) or weighted entries (`{id, weight}`) |
+| `concurrent.input` | `string` | - | Jinja2 template for the input sent to each agent. `{{ user_input }}` is the user's message; `{{ context.<key> }}` accesses context manager values. When omitted, agents receive the raw user input directly. |
+| `concurrent.timeout_ms` | `u64` | - | Per-agent timeout in milliseconds |
+| `concurrent.min_required` | `u32` | - | Minimum agents that must succeed |
+| `concurrent.on_partial_failure` | `string` | `proceed_with_available` | `proceed_with_available` continues with successful agents only, ignoring failures. `abort` fails the entire concurrent block if any agent fails. |
+| `concurrent.aggregation.strategy` | `string` | - | `voting`, `llm_synthesis`, `first_wins`, or `all` |
+| `concurrent.aggregation.synthesizer_llm` | `string` | - | LLM alias for synthesis or vote extraction |
+| `concurrent.aggregation.vote.method` | `string` | `majority` | `majority` (most common answer wins), `weighted` (uses agent `weight` values from the `agents` list; `- id: agent_a` defaults to weight 1.0, `- { id: agent_a, weight: 2.0 }` sets explicit weight), or `unanimous` (all agents must agree or tiebreaker applies). |
+| `concurrent.aggregation.vote.tiebreaker` | `string` | `first` | `first` (deterministic, picks first response in agent order), `random` (random selection among tied answers), or `router_decides` (router LLM breaks the tie). |
+| `concurrent.context_mode` | `string` | `input_only` | Parent conversation context forwarded to each agent: `input_only` (just the message), `summary` (LLM-summarized history), `full` (recent messages). When set, `{{ user_input }}` in `input` templates contains the enriched text. |
+
+#### `group_chat`
+
+Run a multi-agent conversation. Agents talk to each other in a shared thread until termination.
+
+```yaml
+    review:
+      group_chat:
+        participants:
+          - id: architect
+          - id: security
+            role: "security reviewer"
+        style: consensus
+        max_rounds: 5
+        termination:
+          method: manager_decides
+          max_stall_rounds: 2
+      transitions:
+        - to: approved
+          when: "Consensus reached"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `group_chat.participants` | `list` | - | Agent entries with `id` and optional `role` |
+| `group_chat.style` | `string` | `brainstorm` | `brainstorm` (free-form discussion), `consensus` (same loop but router LLM checks agreement after each round), `debate` (structured pro/con with synthesizer), or `maker_checker` (create-review loop) |
+| `group_chat.max_rounds` | `u32` | `5` | Maximum conversation rounds |
+| `group_chat.timeout_ms` | `u64` | - | Total timeout for the entire conversation |
+| `group_chat.termination.method` | `string` | `manager_decides` | `manager_decides` (stops on max_rounds or stall), `max_rounds` (runs exactly max_rounds rounds, stall detection disabled), or `consensus_reached` (router LLM checks agreement after each round). Note: `style: consensus` automatically enables agreement checks regardless of this setting. |
+| `group_chat.termination.max_stall_rounds` | `u32` | `2` | Stop if no new content for this many rounds |
+| `group_chat.manager.method` | `string` | - | Turn order policy: `round_robin`, `random`, or `llm_directed`. `llm_directed` requires a router LLM configured in `llms`/`llm`; the LLM picks one speaker at a time after seeing the latest message. |
+| `group_chat.manager.agent` | `string` | - | Registry agent ID that acts as the manager. When set, the manager agent controls termination decisions (replaces stall detection when `termination.method: manager_decides`) and speaker selection (when `manager.method: llm_directed`). |
+| `group_chat.debate.rounds` | `u32` | `3` | Fixed rounds for debate style |
+| `group_chat.debate.synthesizer` | `string` | - | Agent ID that produces the final answer |
+| `group_chat.maker_checker.max_iterations` | `u32` | `3` | Create-review loop limit |
+| `group_chat.maker_checker.acceptance_criteria` | `string` | - | LLM-evaluated acceptance criteria |
+| `group_chat.maker_checker.on_max_iterations` | `string` | `accept_last` | `accept_last` (returns the last draft as the result), `escalate` (returns with `termination_reason: "escalated"`), or `fail` (returns an error). |
+| `group_chat.input` | `string` | - | Jinja2 template for the topic sent to participants. `{{ user_input }}` is the user's message; `{{ context.<key> }}` accesses context values. When omitted, the raw user message is used as the topic. |
+| `group_chat.context_mode` | `string` | `input_only` | Parent conversation context included in the topic: `input_only` (just the message), `summary` (LLM-summarized history), `full` (recent messages). When set, `{{ user_input }}` in `input` templates contains the enriched text. |
+
+#### `pipeline`
+
+Run agents sequentially in a single `chat()` call. Each stage can have a Jinja2 input template. Available template variables:
+
+- `{{ previous_output }}` - output from the immediately previous stage
+- `{{ original_input }}` - the user's original input
+- `{{ user_input }}` - alias for `original_input` (consistent with concurrent templates)
+- `{{ stages.<agent_id> }}` - output from any earlier stage by agent ID
+- `{{ context.<key> }}` - values from the context manager (same as concurrent templates)
+
+`{{ stages.<id> }}` lets later stages reference any earlier stage explicitly. Without it, the editor in a writer-reviewer-editor pipeline would only see the reviewer's feedback and lose the writer's original draft.
+
+```yaml
+    process:
+      pipeline:
+        stages:
+          - writer
+          - id: reviewer
+            input: "Review this draft:\n{{ stages.writer }}\n\nOriginal: {{ original_input }}"
+          - id: editor
+            input: "Polish this content.\n\nDraft:\n{{ stages.writer }}\n\nFeedback:\n{{ stages.reviewer }}\n\nOriginal: {{ original_input }}"
+        timeout_ms: 60000
+      transitions:
+        - to: done
+          when: "Pipeline complete"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `pipeline.stages` | `list` | - | Agent IDs (strings) or entries with `{id, input}` for per-stage Jinja2 templates |
+| `pipeline.timeout_ms` | `u64` | - | Total pipeline timeout in milliseconds |
+| `pipeline.context_mode` | `string` | `input_only` | Parent conversation context forwarded to the first stage: `input_only` (just the message), `summary` (LLM-summarized history), `full` (recent messages). Later stages access the enriched input via `{{ original_input }}`. |
+
+Stage input templates and concurrent/group_chat `input` templates all support the same variables: `{{ user_input }}` for the user's message and `{{ context.<key> }}` for context manager values. Pipeline stages additionally have `{{ previous_output }}`, `{{ original_input }}`, and `{{ stages.<agent_id> }}`.
+
+#### `handoff`
+
+LLM-directed agent-to-agent control transfer. A router LLM evaluates each agent's response and decides whether to hand off to another specialist.
+
+```yaml
+    support:
+      handoff:
+        initial_agent: triage
+        available_agents: [technical, billing]
+        max_handoffs: 3
+      transitions:
+        - to: done
+          when: "Issue resolved"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `handoff.initial_agent` | `string` | - | Starting agent ID |
+| `handoff.available_agents` | `list` | - | Agent IDs that can receive handoffs |
+| `handoff.max_handoffs` | `u32` | `5` | Maximum control transfers before stopping |
+| `handoff.input` | `string` | - | Jinja2 template for the input sent to the initial agent. `{{ user_input }}` is the user's message; `{{ context.<key> }}` accesses context values. When omitted, the raw user message is forwarded directly. |
+| `handoff.context_mode` | `string` | `input_only` | Parent conversation context forwarded to the initial agent: `input_only` (just the message), `summary` (LLM-summarized history), `full` (recent messages). Intra-chain handoffs still pass the previous agent's response as context. |
+
+#### Orchestration Result Storage
+
+After each orchestration call the runtime stores the full structured result in `context.orchestration`. Subsequent states can reference this data in prompt templates and guard conditions. Backward-compatible flat keys are also set so existing templates keep working.
+
+| Pattern | `context.orchestration` fields | Backward-compatible key |
+|---------|-------------------------------|------------------------|
+| `delegate` | `type`, `agent`, `state`, `response`, `duration_ms` | `delegation.<id>.last_response` |
+| `concurrent` | `type`, `result`, `strategy`, `agents[]` (per-agent `id`, `response`, `success`, `error`, `duration_ms`), `duration_ms` | `concurrent.result` |
+| `group_chat` | `type`, `conclusion`, `transcript[]` (per-turn `speaker`, `round`, `content`), `rounds`, `termination`, `duration_ms` | `group_chat.conclusion` |
+| `pipeline` | `type`, `result`, `stages[]` (per-stage `agent_id`, `output`, `duration_ms`, `skipped`), `duration_ms` | `pipeline.result` |
+| `handoff` | `type`, `result`, `final_agent`, `handoff_chain[]` (per-handoff `from`, `to`, `reason`), `duration_ms` | `handoff.result` |
+
+The same structure is attached to `response.metadata["orchestration"]` for CLI and hook consumers.
+
+Example - accessing concurrent per-agent results in a follow-up state:
+
+```yaml
+    present_results:
+      prompt: |
+        Analysis results:
+        {% for agent in context.orchestration.agents %}
+        {{ agent.id }}: {{ agent.response }}
+        {% endfor %}
+
+        Strategy: {{ context.orchestration.strategy }}
+```
+
+Example - using group chat metadata in a follow-up state:
+
+```yaml
+    summary:
+      prompt: |
+        The discussion concluded after {{ context.orchestration.rounds }} rounds.
+        Reason: {{ context.orchestration.termination }}
+```
+
+For group chat brainstorm and consensus styles, `response.content` contains the full formatted transcript (`[Round N] speaker: message`) rather than only the last speaker's final line. Debate and maker-checker styles are unaffected.
+
 ---
 
 ## Skills
@@ -1668,6 +1891,54 @@ In templates, caller-provided variables are top-level (`{{ name }}`, `{{ role }}
 ### Security
 
 The `allowed_tools` list prevents spawned agents from accessing sensitive tools. `generate_agent` is never injected into spawned agents by default, preventing recursive spawning. LLM-generated YAML that references tools outside the allowlist is stripped before the agent is built.
+
+### Auto-Spawn (Pre-Spawn Agents at Startup)
+
+`auto_spawn` creates agents from YAML files when the parent agent starts. These agents are registered in the `AgentRegistry` and available for orchestration states (`delegate`, `concurrent`, `group_chat`).
+
+```yaml
+spawner:
+  shared_llms: true
+  auto_spawn:
+    - id: billing
+      agent: agents/billing_agent.yaml
+    - id: technical
+      agent: agents/technical_agent.yaml
+    - id: sales
+      agent: agents/sales_agent.yaml
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `auto_spawn[].id` | `string` | Registry ID for this agent (referenced by `delegate`, `concurrent`, etc.) |
+| `auto_spawn[].agent` | `string` | Path to the agent YAML file (resolved relative to the parent YAML directory) |
+
+When `shared_llms: true`, auto-spawned agents inherit the parent's LLM connections. Each agent is built through the standard `AgentBuilder` pipeline with `auto_configure_llms()` and `auto_configure_features()`.
+
+### Orchestration Tools
+
+`orchestration_tools` registers multi-agent coordination patterns as tools that the LLM can call at runtime. This enables dynamic orchestration where the LLM decides which agents to involve.
+
+```yaml
+spawner:
+  shared_llms: true
+  orchestration_tools: true    # register all 5 orchestration tools
+  # or selectively:
+  # orchestration_tools: [route_to_agent, pipeline_process, concurrent_ask, group_discussion, handoff_conversation]
+  templates:
+    merchant:
+      system_prompt: "You are a merchant."
+```
+
+| Tool | Description |
+|------|-------------|
+| `route_to_agent` | Route input to the best-matched agent from a set of candidates |
+| `pipeline_process` | Chain agents sequentially with per-stage Jinja2 templates (`{{ user_input }}`, `{{ previous_output }}`, `{{ original_input }}`, `{{ stages.<agent_id> }}`) |
+| `concurrent_ask` | Ask multiple agents the same question in parallel and aggregate |
+| `group_discussion` | Run a multi-agent conversation on a topic |
+| `handoff_conversation` | Start with one agent and allow dynamic handoffs to others |
+
+Accepts `true` (all 5 tools) or a list of specific tool names.
 
 ---
 

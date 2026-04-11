@@ -1,0 +1,85 @@
+name: SupportHandoff
+version: "1.0.0"
+description: "Customer support with dynamic handoff between specialists."
+
+# Handoff pattern - LLM-directed agent-to-agent control transfer.
+# The `handoff` field on a state triggers a dedicated runtime handler.
+# A router LLM evaluates each agent's response and returns a structured JSON decision on whether to transfer control to a different specialist.
+# The chain continues until the LLM decides to stay or max_handoffs is reached.
+#
+# Compare with customer_support_router.yaml which uses delegate states with LLM transitions for a similar routing effect.
+# Handoff is better when the decision to switch should happen mid-conversation.
+#
+# Flow: user input -> general agent -> LLM decides (JSON)
+#                  -> {"action":"billing"} -> billing agent -> LLM decides
+#                  -> {"action":"stay"} -> return response
+#
+# Prerequisites:
+#   - Sub-agent files in agents/ directory
+
+system_prompt: "Handle support with dynamic specialist routing."
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router                   # used for handoff decisions
+
+# Pre-spawn support specialists.
+spawner:
+  shared_llms: true                # sub-agents reuse parent LLM connections. default: false
+  auto_spawn:
+    - id: general                  # registry ID used by initial_agent below
+      agent: agents/general_agent.yaml
+    - id: technical
+      agent: agents/technical_agent.yaml
+    - id: billing
+      agent: agents/billing_agent.yaml
+
+# Single handoff state manages the entire specialist chain.
+states:
+  initial: support
+  states:
+    support:
+      handoff:
+        initial_agent: general             # agent that handles the first message
+        available_agents: [technical, billing]  # agents the LLM can transfer to
+        max_handoffs: 3            # max transfers before stopping. default: 5
+        # Without context_mode, each message restarts the handoff chain with no memory
+        # of previous turns. The initial agent receives only the raw user message.
+        # With summary, the router LLM summarizes recent parent conversation into 2-3
+        # sentences and prepends it, so the initial agent knows what happened before.
+        context_mode: summary      # input_only (default) | summary | full
+      transitions:
+        - to: done
+          when: "User says they are done, satisfied, or the issue is resolved"
+
+    # Jinja2 template accesses orchestration results stored in context.
+    done:
+      prompt: |
+        Support session complete.
+
+        Handoff path:
+        {% for h in context.orchestration.handoff_chain %}
+        - {{ h.from }} -> {{ h.to }} ({{ h.reason }})
+        {% endfor %}
+
+        Final agent: {{ context.orchestration.final_agent }}
+
+        Summarize what was resolved and by whom.
+
+metadata:
+  cli:
+    welcome: |
+      Support Handoff - handoff orchestration demo.
+      General, technical, and billing specialists are available.
+      The router LLM decides when to transfer between them.
+    hints:
+      - "My internet is not working"
+      - "I was charged twice on my last bill"

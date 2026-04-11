@@ -20,16 +20,13 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.5** | Intent disambiguation - LLM-based ambiguity detection and clarification |
 | **rc.6** | MCP integration, tool scoping, intent-based routing, `openai-compatible` provider |
 | **rc.7** | Dynamic agent spawning - runtime agent creation, registry, template system |
+| **rc.8** | Multi-agent orchestration - router, pipeline, concurrent, group chat, handoff patterns |
 
 ---
 
 ## Up Next
 
 These are the features we are actively planning for the next few release candidates.
-
-### Multi-Agent Orchestration
-
-Five orchestration patterns for multi-agent systems: **Router** (central controller picks a specialist), **Pipeline** (linear stage chain), **Concurrent** (parallel execution with aggregation), **GroupChat** (shared conversation with turn management), and **Handoff** (dynamic control transfer between peers). Includes cross-cutting context policy, orchestration-level error recovery, and HITL approval gates. The `AgentRegistry` from rc.7 provides the foundation.
 
 ### Agent Persona
 
@@ -58,7 +55,7 @@ Every planned feature and its current status. Features are independent unless no
 | **Intent Disambiguation** | LLM-based ambiguity detection and clarification | ✅ Done (rc.5) |
 | **MCP Integration** | Connect to any MCP server for instant tool access | ✅ Done (rc.6) |
 | **Dynamic Agent Spawning** | Runtime agent creation from YAML/templates, agent registry, parent-to-child messaging | ✅ Done (rc.7) |
-| **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | Planned |
+| **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | ✅ Done (rc.8) |
 | **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals | Planned |
 | **Session Management + Key Facts** | Persistent user context and key facts across sessions | Planned |
 | **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |

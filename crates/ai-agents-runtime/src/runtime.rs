@@ -3536,7 +3536,572 @@ Respond in JSON format:
         response
     }
 
-    /// run_loop_internal: blocking (non-streaming) agent pipeline
+    // Handle delegation: forward user input to a registry agent.
+    async fn handle_delegated_state(
+        &self,
+        input: &str,
+        delegate_id: &str,
+        state_def: &ai_agents_state::StateDefinition,
+    ) -> Result<AgentResponse> {
+        use std::time::Instant;
+
+        let registry = self.spawner_registry.as_ref().ok_or_else(|| {
+            AgentError::Config(format!(
+                "State delegates to '{}' but no agent registry is configured. \
+                 Add a spawner section with auto_spawn to your YAML.",
+                delegate_id
+            ))
+        })?;
+
+        let state_name = self
+            .state_machine
+            .as_ref()
+            .map(|sm| sm.current())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        self.hooks.on_delegate_start(delegate_id, &state_name).await;
+        let start = Instant::now();
+
+        let delegate = registry.get(delegate_id).ok_or_else(|| {
+            AgentError::Other(format!(
+                "State '{}' delegates to '{}' but no agent with that ID exists in the registry.",
+                state_name, delegate_id
+            ))
+        })?;
+
+        // Prepare input based on delegate_context mode.
+        let context_mode = state_def.delegate_context.clone().unwrap_or_default();
+        let effective_input = crate::orchestration::context::prepare_delegate_input(
+            input,
+            &context_mode,
+            &*self.memory,
+            self.llm_registry.get("router").ok().as_deref(),
+        )
+        .await?;
+
+        let response = delegate.chat(&effective_input).await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        self.hooks
+            .on_delegate_complete(delegate_id, &state_name, duration_ms)
+            .await;
+
+        // Backward-compatible context key.
+        let ctx_key = format!("delegation.{}.last_response", delegate_id);
+        let _ = self.context_manager.set(
+            &ctx_key,
+            serde_json::Value::String(response.content.clone()),
+        );
+
+        // Structured orchestration context.
+        let _ = self.context_manager.set(
+            "orchestration",
+            serde_json::json!({
+                "type": "delegate",
+                "agent": delegate_id,
+                "state": state_name,
+                "response": response.content,
+                "duration_ms": duration_ms,
+            }),
+        );
+
+        // Add user message to parent memory for tracking.
+        self.memory
+            .add_message(ai_agents_llm::ChatMessage::user(input))
+            .await?;
+
+        // post_loop_processing adds the assistant message, runs transitions, and re-generates if needed.
+        let (final_content, _transitioned) = self
+            .post_loop_processing(
+                input,
+                format!("[Delegated to {}]: {}", delegate_id, response.content),
+            )
+            .await?;
+
+        let mut result = AgentResponse::new(final_content);
+
+        let metadata = serde_json::json!({
+            "orchestration": {
+                "type": "delegate",
+                "agent": delegate_id,
+                "state": state_name,
+                "response": response.content,
+                "duration_ms": duration_ms,
+            }
+        });
+        result.metadata = Some(
+            serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                metadata,
+            )
+            .unwrap_or_default(),
+        );
+
+        self.hooks.on_response(&result).await;
+        Ok(result)
+    }
+
+    // Handle concurrent execution: run multiple registry agents in parallel and aggregate.
+    async fn handle_concurrent_state(
+        &self,
+        input: &str,
+        config: &ai_agents_state::ConcurrentStateConfig,
+    ) -> Result<AgentResponse> {
+        use std::time::Instant;
+
+        let registry = self.spawner_registry.as_ref().ok_or_else(|| {
+            AgentError::Config(
+                "Concurrent state requires an agent registry. Add a spawner section.".into(),
+            )
+        })?;
+
+        // Render input template if provided, otherwise use the raw input.
+        // Uses direct minijinja rendering (same approach as pipeline) so variables
+        // are top-level: {{ user_input }}, not {{ context.user_input }}.
+        // Enrich input with parent conversation history when context_mode is set.
+        let context_mode = config.context_mode.clone().unwrap_or_default();
+        let context_input = crate::orchestration::context::prepare_delegate_input(
+            input,
+            &context_mode,
+            &*self.memory,
+            self.llm_registry.get("router").ok().as_deref(),
+        )
+        .await?;
+
+        let effective_input = if let Some(ref tmpl) = config.input {
+            render_concurrent_template(tmpl, &context_input, &self.context_manager.get_all())
+                .unwrap_or_else(|_| context_input.clone())
+        } else {
+            context_input
+        };
+
+        let start = Instant::now();
+
+        let llm_name = config
+            .aggregation
+            .synthesizer_llm
+            .as_deref()
+            .unwrap_or("router");
+        let llm_provider = self.llm_registry.get(llm_name).ok();
+
+        let result = crate::orchestration::concurrent(
+            registry,
+            &effective_input,
+            &config.agents,
+            &config.aggregation,
+            llm_provider.as_deref(),
+            config.min_required,
+            config.timeout_ms,
+            config.on_partial_failure.clone(),
+        )
+        .await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let agent_ids: Vec<String> = config.agents.iter().map(|a| a.id().to_string()).collect();
+        let strategy = format!("{:?}", config.aggregation.strategy);
+        self.hooks
+            .on_concurrent_complete(&agent_ids, &strategy, duration_ms)
+            .await;
+
+        // Backward-compatible context key.
+        let _ = self.context_manager.set(
+            "concurrent.result",
+            serde_json::Value::String(result.response.content.clone()),
+        );
+
+        // Build per-agent result data for context and metadata.
+        let agents_json: Vec<serde_json::Value> = result
+            .agent_results
+            .iter()
+            .map(|ar| {
+                serde_json::json!({
+                    "id": ar.agent_id,
+                    "response": ar.response.as_ref().map(|r| r.content.as_str()),
+                    "success": ar.success,
+                    "error": ar.error,
+                    "duration_ms": ar.duration_ms,
+                })
+            })
+            .collect();
+
+        // Structured orchestration context with per-agent results.
+        let _ = self.context_manager.set(
+            "orchestration",
+            serde_json::json!({
+                "type": "concurrent",
+                "result": result.response.content,
+                "strategy": strategy,
+                "agents": agents_json,
+                "duration_ms": duration_ms,
+            }),
+        );
+
+        // Add user message to parent memory for tracking.
+        self.memory
+            .add_message(ai_agents_llm::ChatMessage::user(input))
+            .await?;
+
+        // post_loop_processing adds the assistant message, runs transitions, and re-generates if needed.
+        let (final_content, _transitioned) = self
+            .post_loop_processing(input, result.response.content.clone())
+            .await?;
+
+        let mut response = AgentResponse::new(final_content);
+        let metadata = serde_json::json!({
+            "orchestration": {
+                "type": "concurrent",
+                "result": result.response.content,
+                "strategy": strategy,
+                "agents": agents_json,
+                "duration_ms": duration_ms,
+            }
+        });
+        response.metadata = Some(
+            serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                metadata,
+            )
+            .unwrap_or_default(),
+        );
+
+        self.hooks.on_response(&response).await;
+        Ok(response)
+    }
+
+    // Handle group chat: run a multi-turn multi-agent conversation.
+    async fn handle_group_chat_state(
+        &self,
+        input: &str,
+        config: &ai_agents_state::GroupChatStateConfig,
+    ) -> Result<AgentResponse> {
+        use std::time::Instant;
+
+        let registry = self.spawner_registry.as_ref().ok_or_else(|| {
+            AgentError::Config(
+                "Group chat state requires an agent registry. Add a spawner section.".into(),
+            )
+        })?;
+
+        let start = Instant::now();
+
+        let llm_provider = self.llm_registry.get("router").ok();
+
+        // Enrich input with parent conversation history when context_mode is set.
+        let context_mode = config.context_mode.clone().unwrap_or_default();
+        let context_input = crate::orchestration::context::prepare_delegate_input(
+            input,
+            &context_mode,
+            &*self.memory,
+            self.llm_registry.get("router").ok().as_deref(),
+        )
+        .await?;
+
+        // Render input template if provided, otherwise use the raw user message as topic.
+        let effective_topic = if let Some(ref tmpl) = config.input {
+            render_concurrent_template(tmpl, &context_input, &self.context_manager.get_all())
+                .unwrap_or_else(|_| context_input.clone())
+        } else {
+            context_input
+        };
+
+        let result = crate::orchestration::group_chat(
+            registry,
+            &effective_topic,
+            config,
+            llm_provider.as_deref(),
+            Some(&*self.hooks),
+        )
+        .await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Backward-compatible context key.
+        let _ = self.context_manager.set(
+            "group_chat.conclusion",
+            serde_json::Value::String(result.response.content.clone()),
+        );
+
+        // Build transcript data for context and metadata.
+        let transcript_json: Vec<serde_json::Value> = result
+            .transcript
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "speaker": t.speaker,
+                    "round": t.round,
+                    "content": t.content,
+                })
+            })
+            .collect();
+
+        // Structured orchestration context with full transcript.
+        let _ = self.context_manager.set(
+            "orchestration",
+            serde_json::json!({
+                "type": "group_chat",
+                "conclusion": result.response.content,
+                "transcript": transcript_json,
+                "rounds": result.rounds_completed,
+                "termination": result.termination_reason,
+                "duration_ms": duration_ms,
+            }),
+        );
+
+        // Add user message to parent memory for tracking.
+        self.memory
+            .add_message(ai_agents_llm::ChatMessage::user(input))
+            .await?;
+
+        // post_loop_processing adds the assistant message, runs transitions, and re-generates if needed.
+        let (final_content, _transitioned) = self
+            .post_loop_processing(input, result.response.content.clone())
+            .await?;
+
+        let mut response = AgentResponse::new(final_content);
+        let metadata = serde_json::json!({
+            "orchestration": {
+                "type": "group_chat",
+                "conclusion": result.response.content,
+                "transcript": transcript_json,
+                "rounds": result.rounds_completed,
+                "termination": result.termination_reason,
+                "duration_ms": duration_ms,
+            }
+        });
+        response.metadata = Some(
+            serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                metadata,
+            )
+            .unwrap_or_default(),
+        );
+
+        self.hooks.on_response(&response).await;
+        Ok(response)
+    }
+
+    // Handle pipeline: run agents sequentially with per-stage input templates.
+    async fn handle_pipeline_state(
+        &self,
+        input: &str,
+        config: &ai_agents_state::PipelineStateConfig,
+    ) -> Result<AgentResponse> {
+        use std::time::Instant;
+
+        let registry = self.spawner_registry.as_ref().ok_or_else(|| {
+            AgentError::Config(
+                "Pipeline state requires an agent registry. Add a spawner section.".into(),
+            )
+        })?;
+
+        let start = Instant::now();
+
+        let stages: Vec<crate::orchestration::PipelineStage> = config
+            .stages
+            .iter()
+            .map(|entry| {
+                let mut stage = crate::orchestration::PipelineStage::id(entry.id());
+                if let Some(tmpl) = entry.input() {
+                    stage = stage.with_input(tmpl);
+                }
+                stage
+            })
+            .collect();
+
+        // Enrich input with parent conversation history when context_mode is set.
+        let context_mode = config.context_mode.clone().unwrap_or_default();
+        let context_input = crate::orchestration::context::prepare_delegate_input(
+            input,
+            &context_mode,
+            &*self.memory,
+            self.llm_registry.get("router").ok().as_deref(),
+        )
+        .await?;
+
+        let context_values = self.context_manager.get_all();
+        let result = crate::orchestration::pipeline(
+            registry,
+            &context_input,
+            &stages,
+            config.timeout_ms,
+            Some(&*self.hooks),
+            Some(&context_values),
+        )
+        .await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Backward-compatible context key.
+        let _ = self.context_manager.set(
+            "pipeline.result",
+            serde_json::Value::String(result.response.content.clone()),
+        );
+
+        // Build per-stage data for context and metadata.
+        let stages_json: Vec<serde_json::Value> = result
+            .stage_outputs
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "agent_id": s.agent_id,
+                    "output": s.output,
+                    "duration_ms": s.duration_ms,
+                    "skipped": s.skipped,
+                })
+            })
+            .collect();
+
+        // Structured orchestration context.
+        let _ = self.context_manager.set(
+            "orchestration",
+            serde_json::json!({
+                "type": "pipeline",
+                "result": result.response.content,
+                "stages": stages_json,
+                "duration_ms": duration_ms,
+            }),
+        );
+
+        // Add user message to parent memory for tracking.
+        self.memory
+            .add_message(ai_agents_llm::ChatMessage::user(input))
+            .await?;
+
+        let (final_content, _transitioned) = self
+            .post_loop_processing(input, result.response.content.clone())
+            .await?;
+
+        let mut response = AgentResponse::new(final_content);
+        let metadata = serde_json::json!({
+            "orchestration": {
+                "type": "pipeline",
+                "result": result.response.content,
+                "stages": stages_json,
+                "duration_ms": duration_ms,
+            }
+        });
+        response.metadata = Some(
+            serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                metadata,
+            )
+            .unwrap_or_default(),
+        );
+
+        self.hooks.on_response(&response).await;
+        Ok(response)
+    }
+
+    // Handle handoff: LLM-directed agent-to-agent control transfer.
+    async fn handle_handoff_state(
+        &self,
+        input: &str,
+        config: &ai_agents_state::HandoffStateConfig,
+    ) -> Result<AgentResponse> {
+        use std::time::Instant;
+
+        let registry = self.spawner_registry.as_ref().ok_or_else(|| {
+            AgentError::Config(
+                "Handoff state requires an agent registry. Add a spawner section.".into(),
+            )
+        })?;
+
+        let llm = self
+            .llm_registry
+            .get("router")
+            .map_err(|_| AgentError::Config("Handoff state requires a router LLM.".into()))?;
+
+        let start = Instant::now();
+
+        // Enrich input with parent conversation history when context_mode is set.
+        let context_mode = config.context_mode.clone().unwrap_or_default();
+        let context_input = crate::orchestration::context::prepare_delegate_input(
+            input,
+            &context_mode,
+            &*self.memory,
+            self.llm_registry.get("router").ok().as_deref(),
+        )
+        .await?;
+
+        // Render input template if provided, otherwise forward the raw user message.
+        let effective_input = if let Some(ref tmpl) = config.input {
+            render_concurrent_template(tmpl, &context_input, &self.context_manager.get_all())
+                .unwrap_or_else(|_| context_input.clone())
+        } else {
+            context_input
+        };
+
+        let result = crate::orchestration::handoff(
+            registry,
+            &effective_input,
+            &config.initial_agent,
+            &config.available_agents,
+            config.max_handoffs,
+            llm.as_ref(),
+            Some(&*self.hooks),
+        )
+        .await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        // Backward-compatible context key.
+        let _ = self.context_manager.set(
+            "handoff.result",
+            serde_json::Value::String(result.response.content.clone()),
+        );
+
+        // Build handoff chain data for context and metadata.
+        let chain_json: Vec<serde_json::Value> = result
+            .handoff_chain
+            .iter()
+            .map(|h| {
+                serde_json::json!({
+                    "from": h.from_agent,
+                    "to": h.to_agent,
+                    "reason": h.reason,
+                })
+            })
+            .collect();
+
+        // Structured orchestration context.
+        let _ = self.context_manager.set(
+            "orchestration",
+            serde_json::json!({
+                "type": "handoff",
+                "result": result.response.content,
+                "final_agent": result.final_agent,
+                "handoff_chain": chain_json,
+                "duration_ms": duration_ms,
+            }),
+        );
+
+        // Add user message to parent memory for tracking.
+        self.memory
+            .add_message(ai_agents_llm::ChatMessage::user(input))
+            .await?;
+
+        let (final_content, _transitioned) = self
+            .post_loop_processing(input, result.response.content.clone())
+            .await?;
+
+        let mut response = AgentResponse::new(final_content);
+        let metadata = serde_json::json!({
+            "orchestration": {
+                "type": "handoff",
+                "result": result.response.content,
+                "final_agent": result.final_agent,
+                "handoff_chain": chain_json,
+                "duration_ms": duration_ms,
+            }
+        });
+        response.metadata = Some(
+            serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(
+                metadata,
+            )
+            .unwrap_or_default(),
+        );
+
+        self.hooks.on_response(&response).await;
+        Ok(response)
+    }
+
+    // run_loop_internal: blocking (non-streaming) agent pipeline.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         let input_data = self.process_input(input).await?;
 
@@ -3556,6 +4121,37 @@ Respond in JSON format:
         }
 
         let processed_input = &input_data.content;
+
+        // Handle orchestration states (delegate, concurrent, group_chat, pipeline, handoff).
+        if let Some(ref sm) = self.state_machine {
+            if let Some(def) = sm.current_definition() {
+                if let Some(ref delegate_id) = def.delegate {
+                    return self
+                        .handle_delegated_state(processed_input, delegate_id, &def)
+                        .await;
+                }
+                if let Some(ref concurrent_config) = def.concurrent {
+                    return self
+                        .handle_concurrent_state(processed_input, concurrent_config)
+                        .await;
+                }
+                if let Some(ref group_chat_config) = def.group_chat {
+                    return self
+                        .handle_group_chat_state(processed_input, group_chat_config)
+                        .await;
+                }
+                if let Some(ref pipeline_config) = def.pipeline {
+                    return self
+                        .handle_pipeline_state(processed_input, pipeline_config)
+                        .await;
+                }
+                if let Some(ref handoff_config) = def.handoff {
+                    return self
+                        .handle_handoff_state(processed_input, handoff_config)
+                        .await;
+                }
+            }
+        }
 
         match self.try_skill_route(processed_input).await? {
             SkillRouteResult::Response(skill_response) => {
@@ -3803,6 +4399,38 @@ Respond in JSON format:
             }
 
             let processed_input = &input_data.content;
+
+            // Handle orchestration states in streaming mode.
+            if let Some(ref sm) = self.state_machine {
+                if let Some(def) = sm.current_definition() {
+                    let orchestration_result = if let Some(ref delegate_id) = def.delegate {
+                        Some(self.handle_delegated_state(processed_input, delegate_id, &def).await)
+                    } else if let Some(ref concurrent_config) = def.concurrent {
+                        Some(self.handle_concurrent_state(processed_input, concurrent_config).await)
+                    } else if let Some(ref group_chat_config) = def.group_chat {
+                        Some(self.handle_group_chat_state(processed_input, group_chat_config).await)
+                    } else if let Some(ref pipeline_config) = def.pipeline {
+                        Some(self.handle_pipeline_state(processed_input, pipeline_config).await)
+                    } else if let Some(ref handoff_config) = def.handoff {
+                        Some(self.handle_handoff_state(processed_input, handoff_config).await)
+                    } else {
+                        None
+                    };
+
+                    if let Some(result) = orchestration_result {
+                        match result {
+                            Ok(response) => {
+                                yield StreamChunk::content(&response.content);
+                                yield StreamChunk::Done {};
+                            }
+                            Err(e) => {
+                                yield StreamChunk::error(e.to_string());
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
 
             // Skill routing
             match self.try_skill_route(processed_input).await {
@@ -4604,6 +5232,38 @@ impl Agent for RuntimeAgent {
         }
         Ok(())
     }
+}
+
+//
+// Render a concurrent input template using direct minijinja.
+// Same approach as pipeline's render_stage_template so variables are top-level.
+//
+// Available variables:
+//   {{ user_input }}    - the user's actual message
+//   {{ context.<key> }} - values from the context manager
+//
+fn render_concurrent_template(
+    template: &str,
+    user_input: &str,
+    context_values: &std::collections::HashMap<String, serde_json::Value>,
+) -> Result<String> {
+    let mut env = minijinja::Environment::new();
+    env.add_template("concurrent", template)
+        .map_err(|e| AgentError::Other(format!("Concurrent template parse error: {}", e)))?;
+
+    let mut ctx = std::collections::BTreeMap::new();
+    ctx.insert("user_input".to_string(), minijinja::Value::from(user_input));
+
+    // Expose context manager values under {{ context.<key> }}.
+    let context_obj = minijinja::Value::from_serialize(context_values);
+    ctx.insert("context".to_string(), context_obj);
+
+    let tmpl = env
+        .get_template("concurrent")
+        .map_err(|e| AgentError::Other(format!("Concurrent template error: {}", e)))?;
+
+    tmpl.render(minijinja::Value::from_serialize(&ctx))
+        .map_err(|e| AgentError::Other(format!("Concurrent template render error: {}", e)))
 }
 
 #[cfg(test)]

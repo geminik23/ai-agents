@@ -680,7 +680,7 @@ impl AgentBuilder {
         let tools = configure_spawner_tools(
             Arc::clone(&spawner),
             Arc::clone(&registry),
-            llm_for_tools,
+            Arc::clone(&llm_for_tools),
             &agent_name,
         );
 
@@ -690,6 +690,122 @@ impl AgentBuilder {
         }
 
         tracing::info!("Spawner tools registered");
+
+        // Register orchestration tools if configured.
+        if spawner_config.orchestration_tools.is_enabled() {
+            let orch_tools = crate::orchestration::tools::configure_orchestration_tools(
+                &spawner_config.orchestration_tools,
+                Arc::clone(&registry),
+                Arc::clone(&llm_for_tools),
+            );
+            let tool_registry = self.tools.get_or_insert_with(create_builtin_registry);
+            for tool in orch_tools {
+                let _ = tool_registry.register(tool);
+            }
+            tracing::info!("Orchestration tools registered");
+        }
+
+        // Auto-spawn agents from YAML files and register them.
+        for entry in &spawner_config.auto_spawn {
+            let yaml_path = if let Some(ref dir) = self.yaml_dir {
+                dir.join(&entry.agent)
+            } else {
+                std::path::PathBuf::from(&entry.agent)
+            };
+
+            tracing::info!(id = %entry.id, path = %yaml_path.display(), "Auto-spawning agent");
+
+            match AgentBuilder::from_yaml_file(&yaml_path) {
+                Ok(mut sub_builder) => {
+                    if spawner_config.shared_llms {
+                        if let Some(ref reg) = self.llm_registry {
+                            sub_builder = sub_builder.llm_registry(reg.clone());
+                        }
+                    }
+                    match sub_builder
+                        .auto_configure_llms()
+                        .and_then(|b| b.auto_configure_features())
+                    {
+                        Ok(configured) => match configured.build() {
+                            Ok(agent) => {
+                                let spec_yaml =
+                                    std::fs::read_to_string(&yaml_path).unwrap_or_default();
+                                let spec: crate::spec::AgentSpec =
+                                    serde_yaml::from_str(&spec_yaml).unwrap_or_default();
+
+                                let spawned = crate::spawner::spawner::SpawnedAgent {
+                                    id: entry.id.clone(),
+                                    agent: Arc::new(agent),
+                                    spec,
+                                    spawned_at: chrono::Utc::now(),
+                                };
+
+                                if let Err(e) = registry.register(spawned).await {
+                                    tracing::warn!(
+                                        id = %entry.id,
+                                        error = %e,
+                                        "Failed to register auto-spawned agent"
+                                    );
+                                } else {
+                                    tracing::info!(id = %entry.id, "Auto-spawned agent registered");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    id = %entry.id,
+                                    error = %e,
+                                    "Failed to build auto-spawn agent"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                id = %entry.id,
+                                error = %e,
+                                "Failed to configure auto-spawn agent"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        id = %entry.id,
+                        path = %yaml_path.display(),
+                        error = %e,
+                        "Failed to load auto-spawn YAML"
+                    );
+                }
+            }
+        }
+
+        // Validate that all orchestration state references have matching agents.
+        if let Some(ref spec) = self.spec {
+            if let Some(ref state_config) = spec.states {
+                let refs = collect_orchestration_refs(&state_config.states);
+                let mut missing: Vec<String> = Vec::new();
+
+                for (agent_id, state_name, pattern) in &refs {
+                    if !registry.contains(agent_id) {
+                        missing.push(format!(
+                            "  - '{}' (referenced by state '{}' via {})",
+                            agent_id, state_name, pattern
+                        ));
+                    }
+                }
+
+                if !missing.is_empty() {
+                    missing.sort();
+                    missing.dedup();
+                    return Err(AgentError::Config(format!(
+                        "Auto-spawn validation failed. These agents are referenced by \
+                         orchestration states but were not successfully spawned:\n\n{}\n\n\
+                         Check that agent YAML files exist and contain valid specs.",
+                        missing.join("\n")
+                    )));
+                }
+            }
+        }
+
         Ok(self)
     }
 
@@ -992,6 +1108,47 @@ impl AgentBuilder {
 
         Ok(agent)
     }
+}
+
+/// Collect all agent IDs referenced by orchestration state fields.
+fn collect_orchestration_refs(
+    states: &std::collections::HashMap<String, ai_agents_state::StateDefinition>,
+) -> Vec<(String, String, &'static str)> {
+    let mut refs = Vec::new();
+
+    for (state_name, def) in states {
+        if let Some(ref delegate_id) = def.delegate {
+            refs.push((delegate_id.clone(), state_name.clone(), "delegate"));
+        }
+        if let Some(ref concurrent) = def.concurrent {
+            for agent_ref in &concurrent.agents {
+                refs.push((agent_ref.id().to_string(), state_name.clone(), "concurrent"));
+            }
+        }
+        if let Some(ref gc) = def.group_chat {
+            for participant in &gc.participants {
+                refs.push((participant.id.clone(), state_name.clone(), "group_chat"));
+            }
+        }
+        if let Some(ref pipeline) = def.pipeline {
+            for stage in &pipeline.stages {
+                refs.push((stage.id().to_string(), state_name.clone(), "pipeline"));
+            }
+        }
+        if let Some(ref handoff) = def.handoff {
+            refs.push((handoff.initial_agent.clone(), state_name.clone(), "handoff"));
+            for agent_id in &handoff.available_agents {
+                refs.push((agent_id.clone(), state_name.clone(), "handoff"));
+            }
+        }
+
+        // Recurse into sub-states.
+        if let Some(ref sub_states) = def.states {
+            refs.extend(collect_orchestration_refs(sub_states));
+        }
+    }
+
+    refs
 }
 
 impl Default for AgentBuilder {

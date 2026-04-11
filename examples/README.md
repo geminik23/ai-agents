@@ -306,6 +306,33 @@ cargo run -p ai-agents-cli -- run examples/yaml/spawner/game_master.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/spawner/team_manager.yaml
 ```
 
+### `yaml/orchestration/`
+
+Multi-agent orchestration patterns using pre-spawned sub-agents. All five patterns (router, pipeline, concurrent, group chat, handoff) have dedicated state types.
+
+| File | Description |
+|------|-------------|
+| `customer_support_router.yaml` | Router pattern - routing state delegates to billing or technical sub-agents via LLM-evaluated transitions |
+| `content_pipeline.yaml` | Pipeline state - writer, reviewer, editor run sequentially in one state with per-stage input templates |
+| `stock_analysis_concurrent.yaml` | Concurrent state - three analysts run in parallel, results aggregated via LLM synthesis |
+| `code_review_group_chat.yaml` | Group chat state - architect, security, and performance reviewers discuss until consensus |
+| `support_handoff.yaml` | Handoff state - LLM-directed agent-to-agent control transfer between general, technical, and billing |
+| `team_coordinator.yaml` | Orchestration tools - coordinator LLM picks which tool and agents to use for each request (route, pipeline, concurrent, group discussion, handoff) |
+| `agents/*.yaml` | Sub-agent stubs - general, billing, technical, writer, reviewer, editor, researcher, analyst, 3 analysts, architect, security reviewer, performance reviewer |
+
+Note: Orchestration uses `spawner.auto_spawn` to create sub-agents at startup. Each sub-agent is a standalone YAML file in `agents/`. Delegate states forward messages to registry agents. Pipeline, concurrent, group chat, and handoff states run entirely within a single `chat()` call. The parent's transition evaluator watches orchestration responses to decide when to move on.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/orchestration/customer_support_router.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/orchestration/content_pipeline.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/orchestration/stock_analysis_concurrent.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/orchestration/code_review_group_chat.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/orchestration/support_handoff.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/orchestration/team_coordinator.yaml
+```
+
 ## Rust Examples
 
 Rust examples are for embedding and extension scenarios.

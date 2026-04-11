@@ -1,0 +1,6 @@
+name: BillingSpecialist
+system_prompt: "You are a billing specialist. Help customers with invoices, payments, and billing questions."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

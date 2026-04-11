@@ -1,0 +1,6 @@
+name: Reviewer
+system_prompt: "You are a content reviewer. Evaluate drafts for clarity, accuracy, and completeness. Provide specific feedback."
+max_context_tokens: 128000
+llm:
+  provider: openai
+  model: gpt-5.4-mini

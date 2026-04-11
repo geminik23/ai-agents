@@ -507,6 +507,14 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 | `on_memory_compress`        | Memory compression triggered                 |
 | `on_memory_evict`           | Messages evicted from memory                 |
 | `on_memory_budget_warning`  | Token budget threshold exceeded              |
+| `on_delegate_start`         | Orchestration: delegation to a registry agent begins |
+| `on_delegate_complete`      | Orchestration: delegation completes (with timing)    |
+| `on_concurrent_complete`    | Orchestration: parallel agent execution completes    |
+| `on_group_chat_round`       | Orchestration: a group chat round finishes            |
+| `on_pipeline_stage`         | Orchestration: a pipeline stage completes             |
+| `on_pipeline_complete`      | Orchestration: full pipeline execution completes      |
+| `on_handoff_start`          | Orchestration: a handoff chain begins                 |
+| `on_handoff`                | Orchestration: an agent-to-agent handoff occurs       |
 
 ---
 
