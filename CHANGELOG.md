@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.0.0-rc.8
+
+### Added
+- Orchestration: five coordination patterns (router, pipeline, concurrent, group chat, handoff) as declarative state configs or LLM-invoked tools
+- Orchestration: delegate states forward messages to registry agents with context mode (input_only, summary, full) controlling how much parent history reaches the sub-agent
+- Orchestration: context_mode field on all four non-delegate patterns forwards parent conversation history to sub-agents across turns
+- Orchestration: group chat with four styles (brainstorm, consensus, debate, maker-checker), LLM-directed speaker selection, manager.agent for custom termination and turn control, participant roles in prompts, and consensus auto-detection
+- Orchestration: concurrent execution with aggregation strategies (voting, llm_synthesis, first_wins, all), weighted voting, tiebreaker (first, random, router_decides), and on_partial_failure (abort, proceed_with_available)
+- Orchestration: pipeline with per-stage Jinja2 templates, named stage references via stages.<agent_id>, and minijinja rendering
+- Orchestration: handoff with structured JSON decisions (action, confidence, reason) and fuzzy text fallback
+- Orchestration: maker-checker on_max_iterations supports accept_last, escalate, and fail
+- Orchestration: auto-spawn build-time validation fails with a clear error when referenced agents are missing
+- Orchestration: five tool implementations (route_to_agent, pipeline_process, concurrent_ask, group_discussion, handoff_conversation) registered via orchestration_tools config
+- Orchestration: structured results stored in context.orchestration after each run, accessible in Jinja2 templates and guard conditions
+- Orchestration: all input templates expose user_input and context.<key> variables consistently
+- Orchestration: lifecycle hooks for delegate, concurrent, group chat round, pipeline stage, and handoff events
+- LLM config: timeout_seconds, reasoning, reasoning_effort, reasoning_budget_tokens as first-class YAML fields with merge support
+- LLM builder forwarding: resilient transport settings, Azure config, extra_body escape hatch, OpenAI web search, and xAI search params read from YAML extra fields
+- Disambiguation: skill-level overrides with required_clarity enforcement fire at runtime after skill routing
+- Disambiguation: LLM-based detection of clarification abandonment and topic switches during pending clarification
+
+### Changed
+- LLM config: reasoning_effort promoted from extra-only to a first-class field with backward-compatible fallback
+
+### Fixed
+- Disambiguation: detection threshold was overridden by the LLM is_ambiguous boolean, causing false positives on clear inputs
+- Disambiguation: clarification_templates with custom keys were silently ignored
+- Disambiguation: required_clarity fields were not enforced, allowing unrequested fields in clarification
+- Disambiguation: answering_agent_question skip condition fired on any assistant message ending with a question mark instead of checking semantic relevance
+- Disambiguation: max_attempts off-by-one produced one extra exchange
+- Disambiguation: skill-level pending state was cleared before the runtime read it, silently falling through to re-routing
+
 ## 1.0.0-rc.7
 
 ### Added

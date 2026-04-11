@@ -14,7 +14,7 @@ The `ai-agents-cli` crate gives you a ready-made command-line tool for running a
 ### From crates.io (recommended)
 
 ```sh
-cargo install ai-agents-cli --version 1.0.0-rc.7
+cargo install ai-agents-cli --version 1.0.0-rc.8
 ```
 
 ### From source
