@@ -69,7 +69,7 @@ llm:
 # llms:
 #   default:
 #     provider: openai
-#     model: gpt-5.1-mini
+#     model: gpt-5.4-mini
 #     reasoning_effort: low
 # llm:
 #   default: default

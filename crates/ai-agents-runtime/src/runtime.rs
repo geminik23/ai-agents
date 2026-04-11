@@ -31,7 +31,7 @@ use ai_agents_process::{ProcessData, ProcessProcessor};
 use ai_agents_reasoning::{
     CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
     ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
-    ReflectionMetadata,
+    ReflectionMetadata, StepFailureAction,
 };
 use ai_agents_recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
@@ -1754,7 +1754,7 @@ OVERALL: PASS/FAIL"#,
             .map_err(|e| AgentError::LLM(format!("Evaluation failed: {}", e)))?;
 
         let content = eval_response.content.to_uppercase();
-        let overall_pass = content.contains("OVERALL: PASS");
+        let llm_pass = content.contains("OVERALL: PASS");
 
         let confidence = content
             .lines()
@@ -1764,7 +1764,11 @@ OVERALL: PASS/FAIL"#,
                     .nth(1)
                     .and_then(|v| v.trim().parse::<f32>().ok())
             })
-            .unwrap_or(if overall_pass { 0.8 } else { 0.4 });
+            .unwrap_or(if llm_pass { 0.8 } else { 0.4 });
+
+        // Gate pass against confidence threshold.
+        // LLM may say PASS but with low confidence - the threshold catches this.
+        let overall_pass = llm_pass && confidence >= config.pass_threshold;
 
         let mut criteria_results = Vec::new();
         for (i, criterion) in criteria.iter().enumerate() {
@@ -2381,7 +2385,8 @@ Answer YES or NO only."#,
     }
 
     async fn generate_plan(&self, input: &str) -> Result<Plan> {
-        let planning_config = self.reasoning_config.get_planning();
+        let effective = self.get_effective_reasoning_config();
+        let planning_config = effective.get_planning();
 
         let planner_llm = planning_config
             .and_then(|c| c.planner_llm.as_ref())
@@ -2390,11 +2395,21 @@ Answer YES or NO only."#,
             .or_else(|| self.llm_registry.default().ok())
             .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
 
-        let available_tools: Vec<String> = self
+        let mut available_tools: Vec<String> = self
             .get_available_tool_ids()
             .await
             .unwrap_or_else(|_| self.tools.list_ids());
-        let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
+        let mut available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
+
+        // Apply planning-level tool and skill filters.
+        if let Some(config) = planning_config {
+            if !config.available.tools.is_all() {
+                available_tools.retain(|t| config.available.tools.allows(t));
+            }
+            if !config.available.skills.is_all() {
+                available_skills.retain(|s| config.available.skills.allows(s));
+            }
+        }
 
         let prompt = format!(
             r#"Create a step-by-step plan to accomplish this goal.
@@ -2500,11 +2515,8 @@ Respond in JSON format:
     async fn execute_plan(&self, plan: &mut Plan) -> Result<String> {
         let llm = self.get_state_llm()?;
         let mut results: HashMap<String, serde_json::Value> = HashMap::new();
-        let max_steps = self
-            .reasoning_config
-            .get_planning()
-            .map(|c| c.max_steps)
-            .unwrap_or(10);
+        let effective = self.get_effective_reasoning_config();
+        let max_steps = effective.get_planning().map(|c| c.max_steps).unwrap_or(10);
 
         plan.status = PlanStatus::InProgress;
 
@@ -2603,16 +2615,55 @@ Respond in JSON format:
             plan.steps[step_idx].mark_completed(Some(result));
         }
 
-        plan.status = PlanStatus::Completed;
+        // Set plan status based on whether any steps actually failed.
+        let has_failures = plan.steps.iter().any(|s| s.status.is_failed());
+        if has_failures {
+            let failed_ids: Vec<String> = plan
+                .steps
+                .iter()
+                .filter(|s| s.status.is_failed())
+                .map(|s| s.id.clone())
+                .collect();
+            plan.status = PlanStatus::Failed {
+                error: format!("Steps failed: {}", failed_ids.join(", ")),
+            };
+        } else {
+            plan.status = PlanStatus::Completed;
+        }
 
-        let final_output = results
-            .values()
-            .filter_map(|v| v.get("output").and_then(|o| o.as_str()))
-            .last()
-            .unwrap_or("Plan execution completed.")
-            .to_string();
+        // Synthesize final output from all completed step results.
+        let all_outputs: Vec<String> = plan
+            .steps
+            .iter()
+            .filter(|s| s.status.is_completed())
+            .filter_map(|s| {
+                s.result
+                    .as_ref()
+                    .and_then(|r| r.get("output"))
+                    .and_then(|o| o.as_str())
+                    .map(|o| format!("{}: {}", s.description, o))
+            })
+            .collect();
 
-        Ok(final_output)
+        if all_outputs.is_empty() {
+            return Ok("Plan execution completed but produced no results.".to_string());
+        }
+
+        if all_outputs.len() == 1 {
+            return Ok(all_outputs.into_iter().next().unwrap());
+        }
+
+        // Synthesize a coherent summary from multiple step results via LLM.
+        let context = all_outputs.join("\n\n");
+        let prompt = format!(
+            "You completed a multi-step plan for: \"{}\"\n\nStep results:\n{}\n\nProvide a coherent final response that synthesizes these results.",
+            plan.goal, context
+        );
+        let messages = vec![ChatMessage::user(&prompt)];
+        match llm.complete(&messages, None).await {
+            Ok(resp) => Ok(resp.content.trim().to_string()),
+            Err(_) => Ok(context),
+        }
     }
 
     async fn evaluate_response(&self, input: &str, response: &str) -> Result<EvaluationResult> {
@@ -2633,7 +2684,7 @@ Respond in JSON format:
     }
 
     fn format_response_with_thinking(&self, thinking: Option<&str>, answer: &str) -> String {
-        match self.reasoning_config.output {
+        match self.get_effective_reasoning_config().output {
             ReasoningOutput::Hidden => answer.to_string(),
             ReasoningOutput::Visible => {
                 if let Some(t) = thinking {
@@ -3159,26 +3210,73 @@ Respond in JSON format:
     }
 
     /// Run the Plan-and-Execute flow: generate plan, execute steps, finalize.
+    /// Supports plan-level reflection with replan loop when configured.
     async fn handle_plan_and_execute(
         &self,
         processed_input: &str,
         input_context: &HashMap<String, Value>,
         auto_detected: bool,
     ) -> Result<AgentResponse> {
+        let effective = self.get_effective_reasoning_config();
+        let plan_reflection = effective
+            .get_planning()
+            .map(|c| c.reflection.clone())
+            .unwrap_or_default();
+
+        let max_attempts = if plan_reflection.enabled {
+            1 + plan_reflection.max_replans
+        } else {
+            1
+        };
+
         let mut plan = self.generate_plan(processed_input).await?;
         info!(
             plan_id = %plan.id,
             steps = plan.steps.len(),
             "Plan generated"
         );
-        *self.current_plan.write() = Some(plan.clone());
 
-        let plan_result = self.execute_plan(&mut plan).await?;
-        info!(
-            plan_status = ?plan.status,
-            completed_steps = plan.completed_steps().count(),
-            "Plan execution completed"
-        );
+        let mut plan_result = String::new();
+
+        for attempt in 0..max_attempts {
+            *self.current_plan.write() = Some(plan.clone());
+            plan_result = self.execute_plan(&mut plan).await?;
+
+            info!(
+                plan_status = ?plan.status,
+                completed_steps = plan.completed_steps().count(),
+                attempt = attempt + 1,
+                "Plan execution completed"
+            );
+
+            if !plan_reflection.enabled {
+                break;
+            }
+
+            let has_failures = plan.steps.iter().any(|s| s.status.is_failed());
+            if !has_failures {
+                break;
+            }
+
+            if attempt + 1 >= max_attempts {
+                break;
+            }
+
+            match plan_reflection.on_step_failure {
+                StepFailureAction::Replan => {
+                    info!(attempt = attempt + 1, "Plan had failures, replanning");
+                    plan = self.generate_plan(processed_input).await?;
+                }
+                StepFailureAction::Abort => {
+                    warn!("Plan step failed, aborting");
+                    break;
+                }
+                StepFailureAction::Skip | StepFailureAction::Continue => {
+                    break;
+                }
+            }
+        }
+
         *self.current_plan.write() = Some(plan);
 
         let output_data = self.process_output(&plan_result, input_context).await?;
@@ -4217,9 +4315,16 @@ Respond in JSON format:
         let llm = self.get_state_llm()?;
 
         loop {
-            if iterations >= self.max_iterations {
-                let err =
-                    AgentError::Other(format!("Max iterations ({}) exceeded", self.max_iterations));
+            // When reasoning is active, cap iterations at the reasoning-specific limit.
+            let effective_max = if reasoning_mode != ReasoningMode::None {
+                let rc = self.get_effective_reasoning_config();
+                self.max_iterations.min(rc.max_iterations)
+            } else {
+                self.max_iterations
+            };
+
+            if iterations >= effective_max {
+                let err = AgentError::Other(format!("Max iterations ({}) exceeded", effective_max));
                 self.hooks.on_error(&err).await;
                 error!(iterations = iterations, "Max iterations exceeded");
                 return Err(err);
@@ -4227,11 +4332,7 @@ Respond in JSON format:
             iterations += 1;
             *self.iteration_count.write() = iterations;
 
-            debug!(
-                iteration = iterations,
-                max = self.max_iterations,
-                "LLM call"
-            );
+            debug!(iteration = iterations, max = effective_max, "LLM call");
 
             let mut messages = self.build_messages().await?;
             self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
@@ -4510,8 +4611,16 @@ Respond in JSON format:
             let mut thinking_content: Option<String> = None;
 
             loop {
-                if iterations >= self.max_iterations {
-                    let err_msg = format!("Max iterations ({}) exceeded", self.max_iterations);
+                // When reasoning is active, cap iterations at the reasoning-specific limit.
+                let effective_max = if reasoning_mode != ReasoningMode::None {
+                    let rc = self.get_effective_reasoning_config();
+                    self.max_iterations.min(rc.max_iterations)
+                } else {
+                    self.max_iterations
+                };
+
+                if iterations >= effective_max {
+                    let err_msg = format!("Max iterations ({}) exceeded", effective_max);
                     let err = AgentError::Other(err_msg.clone());
                     self.hooks.on_error(&err).await;
                     error!(iterations = iterations, "Max iterations exceeded (stream)");
@@ -4521,11 +4630,7 @@ Respond in JSON format:
                 iterations += 1;
                 *self.iteration_count.write() = iterations;
 
-                debug!(
-                    iteration = iterations,
-                    max = self.max_iterations,
-                    "LLM call (stream)"
-                );
+                debug!(iteration = iterations, max = effective_max, "LLM call (stream)");
 
                 let mut messages = match self.build_messages().await {
                     Ok(m) => m,

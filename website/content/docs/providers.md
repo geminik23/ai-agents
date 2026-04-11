@@ -13,7 +13,7 @@ AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI
 
 | Provider | YAML `provider:` value | Environment Variable | Example Models |
 | --- | --- | --- | --- |
-| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-5.1-nano`, `gpt-5.1-mini`, `gpt-5.1` |
+| OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-5.4-nano`, `gpt-5.4-mini`, `gpt-5.4` |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4.6`, `claude-haiku-4.5` |
 | Google Gemini | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash`, `gemini-2.5-pro` |
 | Ollama | `ollama` | *(none)* | `llama3.1`, `qwen3:8b`, `mistral` |
@@ -48,12 +48,12 @@ Other model options:
 # Good balance of speed and quality
 llm:
   provider: openai
-  model: gpt-5.1-mini
+  model: gpt-5.4-mini
 
 # Most capable
 llm:
   provider: openai
-  model: gpt-5.1
+  model: gpt-5.4
 
 # Reasoning-capable model with effort control
 llms:
@@ -252,7 +252,7 @@ llm:
 ```yaml
 llm:
   provider: openrouter
-  model: openai/gpt-5.1-mini
+  model: openai/gpt-5.4-mini
 ```
 
 ---
@@ -413,7 +413,7 @@ Use the `error_recovery` block to handle provider failures gracefully. If the pr
 llms:
   primary:
     provider: openai
-    model: gpt-5.1-mini
+    model: gpt-5.4-mini
 
   fallback:
     provider: ollama

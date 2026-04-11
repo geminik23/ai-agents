@@ -1454,8 +1454,8 @@ Controls how the agent thinks through complex problems before responding.
 |-------|------|---------|-------------|
 | `mode` | `string` | `"none"` | `none`, `cot`, `react`, `plan_and_execute`, `auto` |
 | `judge_llm` | `string` | `null` | LLM alias for judging reasoning quality |
-| `output` | `string` | `"hidden"` | `hidden`, `visible`, `tagged` |
-| `max_iterations` | `u32` | `5` | Max reasoning iterations |
+| `output` | `string` | `"hidden"` | `hidden`, `visible`, `tagged` - can be overridden per state |
+| `max_iterations` | `u32` | `5` | Max reasoning iterations (capped at the lower of this and agent-level `max_iterations`) |
 
 ```yaml
 reasoning:
@@ -1479,6 +1479,16 @@ reasoning:
 
 Extra settings for `plan_and_execute` mode.
 
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `planner_llm` | `string` | `null` | LLM alias for plan generation |
+| `max_steps` | `u32` | `10` | Maximum plan steps to execute |
+| `available.tools` | `"all"` or `list` | `"all"` | Tools the planner may use. `"all"` allows every tool available to the agent. A list restricts to those IDs only. |
+| `available.skills` | `"all"` or `list` | `"all"` | Skills the planner may use. Same semantics as `available.tools`. |
+| `reflection.enabled` | `bool` | `true` | Enable plan-level reflection on step failures |
+| `reflection.on_step_failure` | `string` | `"replan"` | `replan`, `abort`, `skip`, or `continue` |
+| `reflection.max_replans` | `u32` | `2` | Maximum replan attempts when steps fail |
+
 ```yaml
 reasoning:
   mode: plan_and_execute
@@ -1488,8 +1498,20 @@ reasoning:
     available:
       tools: [calculator, datetime]
       skills: [math_helper]
-    reflection: true
+    reflection:
+      enabled: true
+      on_step_failure: replan
+      max_replans: 2
 ```
+
+When `reflection.enabled` is `true` and a plan step fails, the runtime checks `on_step_failure`:
+
+- **replan** - generate a fresh plan and retry (up to `max_replans` times).
+- **abort** - stop execution immediately.
+- **skip** / **continue** - failed steps are skipped during execution (no retry loop).
+
+If all replans are exhausted the plan is marked `Failed` with the IDs of the failing steps.
+Multi-step plan output is synthesized into a coherent response via the LLM instead of returning only the last step's result.
 
 ### State-Level Reasoning Override
 
@@ -1537,7 +1559,7 @@ Self-evaluation: the agent checks its own response against criteria and retries 
 | `enabled` | `bool` or `string` | `false` | `true`, `false`, or `"auto"` |
 | `evaluator_llm` | `string` | `null` | LLM alias for evaluation |
 | `max_retries` | `u32` | `2` | Maximum re-generation attempts |
-| `pass_threshold` | `f64` | `0.7` | Score threshold (0.0–1.0) to pass |
+| `pass_threshold` | `f64` | `0.7` | Confidence threshold (0.0-1.0). The LLM must say PASS *and* report confidence at or above this value. |
 | `criteria` | `list` | `[]` | Natural-language quality criteria |
 
 ```yaml

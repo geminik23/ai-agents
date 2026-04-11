@@ -323,15 +323,22 @@ system_prompt: |
 
 ## Reasoning & Reflection
 
-Reasoning controls how the agent thinks before answering. Four modes are available:
+Reasoning controls how the agent thinks before answering. Five modes are available:
 
 - **none** - answer directly, no extra thinking.
 - **cot** (chain-of-thought) - think step-by-step before responding.
-- **react** - interleave reasoning and tool use (Thought → Action → Observation loop).
+- **react** - interleave reasoning and tool use (Thought -> Action -> Observation loop).
 - **plan_and_execute** - create a plan first, then execute each step.
 - **auto** - let the LLM pick the best mode for each query.
 
-Reflection adds self-evaluation. After producing an answer, the agent scores it against criteria you define (accuracy, completeness, tone). If the score falls below a threshold, the agent retries. Both reasoning and reflection can be overridden at the state or skill level.
+When reasoning is active (cot, react, plan_and_execute, or auto), the iteration loop is capped at the lower of the agent-level `max_iterations` and `reasoning.max_iterations`.
+This keeps the reasoning-specific cap as a tighter limit inside the agent's overall safety cap.
+
+For `plan_and_execute` mode, a plan-level reflection loop retries failed plans.
+When `planning.reflection.enabled` is true and a step fails, the runtime checks `on_step_failure` to decide whether to replan, abort, or skip.
+Multi-step plan output is synthesized into a coherent response via the LLM rather than returning only the last step's raw result.
+
+Reflection adds self-evaluation. After producing an answer, the agent scores it against criteria you define (accuracy, completeness, tone). The LLM must say PASS and report a confidence score at or above `pass_threshold` for the evaluation to succeed. If it fails, the agent retries. Both reasoning and reflection can be overridden at the state or skill level.
 
 ```yaml
 reasoning:
