@@ -9,7 +9,7 @@ authors.workspace = true
 description = "A Rust framework for building AI agents from YAML specifications with trait-based extensibility"
 readme = "../../README.md"
 keywords = ["AI", "Agent", "LLM", "YAML", "Framework"]
-categories = ["asynchronous"]
+categories = ["artificial-intelligence", "config", "asynchronous"]
 
 [dependencies]
 ai-agents-core = { workspace = true }
