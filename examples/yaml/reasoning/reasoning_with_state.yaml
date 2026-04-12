@@ -23,6 +23,7 @@ description: "Per-state reasoning overrides for cost-efficient agents"
 #                  -> effective config = state config or agent config
 #                  -> reasoning mode applied per effective config
 #                  -> state transitions evaluated -> new state, new config
+#                  -> if new state has a reasoning override, re-dispatch fires in the same turn so CoT activates immediately, not next turn
 
 system_prompt: |
   You are a helpful assistant.

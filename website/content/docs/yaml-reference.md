@@ -254,7 +254,7 @@ The `states` block defines a finite-state machine that controls conversation flo
 | `initial` | `string` | - | Name of the starting state (required) |
 | `fallback` | `string` | `null` | State to enter after `max_no_transition` turns with no match |
 | `max_no_transition` | `u32` | `null` | Turns without a transition before falling back |
-| `regenerate_on_transition` | `bool` | `true` | Re-generate response in the new state after transitioning |
+| `regenerate_on_transition` | `bool` | `true` | Re-generate response in the new state after transitioning. When the target state is an orchestration state (`concurrent`, `group_chat`, `pipeline`, `handoff`, `delegate`) or has a non-`none` reasoning mode, the runtime re-enters the full dispatch path instead of using a plain LLM call - the correct handler activates in the same turn. |
 | `global_transitions` | `list` | `[]` | Transitions checked from every state |
 | `states` | `map` | - | Named state definitions |
 

@@ -74,6 +74,17 @@ enum SkillRouteResult {
     NeedsClarification(AgentResponse),
 }
 
+/// Outcome of post_loop_processing - drives the caller's next step.
+enum PostLoopResult {
+    /// No transition fired. Content is the LLM response for this turn.
+    NoTransition(String),
+    /// Transition fired. Content is from plain post-transition re-generation.
+    Transitioned(String),
+    /// Transition fired into a state that requires full dispatch.
+    /// Caller re-enters run_loop_internal to apply the correct handler.
+    NeedsRedispatch,
+}
+
 pub struct RuntimeAgent {
     info: AgentInfo,
     llm_registry: Arc<LLMRegistry>,
@@ -119,6 +130,9 @@ pub struct RuntimeAgent {
     spawner: Option<Arc<crate::spawner::AgentSpawner>>,
     /// Registry tracking spawned agents (set when YAML has a spawner: section).
     spawner_registry: Option<Arc<crate::spawner::AgentRegistry>>,
+    /// Re-dispatch depth for post-transition full dispatch.
+    /// 0 = not re-dispatching. > 0 = user message already in memory, skip re-adding.
+    redispatch_depth: RwLock<u32>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -213,6 +227,7 @@ impl RuntimeAgent {
             context_initialized: AtomicBool::new(false),
             spawner: None,
             spawner_registry: None,
+            redispatch_depth: RwLock::new(0),
         }
     }
 
@@ -3573,34 +3588,57 @@ Respond in JSON format:
         }
     }
 
-    /// Add assistant message, memory compression, transitions, and post-transition re-generation.
-    /// Returns (final_content, transitioned).
+    /// Record the assistant turn, evaluate transitions, and decide what to do next.
+    /// Returns PostLoopResult so callers can apply_post_loop_result for re-dispatch.
     async fn post_loop_processing(
         &self,
         processed_input: &str,
         content: String,
-    ) -> Result<(String, bool)> {
-        self.memory
-            .add_message(ChatMessage::assistant(&content))
-            .await?;
-
-        self.check_memory_compression().await?;
+    ) -> Result<PostLoopResult> {
+        // Do NOT add the assistant message to memory yet.
+        // evaluate_transitions receives content as a direct parameter, so the message does not need to be in memory for transitions to evaluate correctly.
+        // For NeedsRedispatch we skip adding the stale old-state response entirely, keeping memory clean for the re-dispatched handler.
 
         self.increment_turn();
 
-        // Run context extractors so guards can check freshly-extracted values
+        // Run context extractors so guards can check freshly-extracted values.
         self.run_context_extractors(processed_input).await;
 
         let transitioned = self.evaluate_transitions(processed_input, &content).await?;
 
         if !transitioned {
-            return Ok((content, false));
+            self.memory
+                .add_message(ChatMessage::assistant(&content))
+                .await?;
+            self.check_memory_compression().await?;
+            return Ok(PostLoopResult::NoTransition(content));
         }
 
-        // Check if we should skip re-generation after this transition
+        // Check if we should skip re-generation after this transition.
         if !self.should_regenerate_after_transition() {
-            return Ok((content, true));
+            self.memory
+                .add_message(ChatMessage::assistant(&content))
+                .await?;
+            self.check_memory_compression().await?;
+            return Ok(PostLoopResult::Transitioned(content));
         }
+
+        // Check if the new state needs full dispatch.
+        // Orchestration states (concurrent, group_chat, pipeline, handoff, delegate) need their dedicated handlers.
+        // Any non-None effective reasoning mode needs CoT/ReAct prompt injection, the plan-and-execute handler, or Auto re-determination - all of which live in run_loop_internal, not here.
+        if self.needs_redispatch_for_new_state() {
+            info!("Post-transition NeedsRedispatch: new state requires full dispatch");
+            // Stale old-state content is NOT added to memory.
+            // apply_post_loop_result will increment redispatch_depth and call run_loop_internal, which produces the correct response and adds it.
+            return Ok(PostLoopResult::NeedsRedispatch);
+        }
+
+        // Normal post-transition re-generation (plain LLM with optional tool calls).
+        // Add the stale response to history so the new LLM sees the conversation.
+        self.memory
+            .add_message(ChatMessage::assistant(&content))
+            .await?;
+        self.check_memory_compression().await?;
 
         // If a transition fired, on_enter actions already executed (e.g., HTTP calls).
         // The current content was generated in the OLD state context and is stale.
@@ -3665,11 +3703,11 @@ Respond in JSON format:
                 continue;
             }
 
-            // No tool call — this is the final text response.
+            // No tool call - this is the final text response.
             self.memory
                 .add_message(ChatMessage::assistant(&final_content))
                 .await?;
-            return Ok((final_content, true));
+            return Ok(PostLoopResult::Transitioned(final_content));
         }
 
         // Exhausted post-transition iterations (unlikely). Return last content.
@@ -3678,7 +3716,7 @@ Respond in JSON format:
             .add_message(ChatMessage::assistant(&final_content))
             .await?;
 
-        Ok((final_content, true))
+        Ok(PostLoopResult::Transitioned(final_content))
     }
 
     /// Build the final AgentResponse with all metadata.
@@ -3697,6 +3735,66 @@ Respond in JSON format:
             }
         }
         true
+    }
+
+    /// Return true when the new state requires full dispatch via run_loop_internal.
+    /// Covers orchestration states and any non-None effective reasoning mode.
+    fn needs_redispatch_for_new_state(&self) -> bool {
+        if let Some(ref sm) = self.state_machine {
+            if let Some(def) = sm.current_definition() {
+                if def.concurrent.is_some()
+                    || def.group_chat.is_some()
+                    || def.pipeline.is_some()
+                    || def.handoff.is_some()
+                    || def.delegate.is_some()
+                {
+                    return true;
+                }
+                // Any non-None effective reasoning mode requires the main dispatch loop.
+                let effective = self.get_effective_reasoning_config();
+                if !matches!(effective.mode, ReasoningMode::None) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Consume a PostLoopResult. NeedsRedispatch re-enters run_loop_internal.
+    /// The user message is already in memory - redispatch_depth suppresses re-adding it.
+    async fn apply_post_loop_result(
+        &self,
+        processed_input: &str,
+        result: PostLoopResult,
+    ) -> Result<String> {
+        match result {
+            PostLoopResult::NoTransition(content) | PostLoopResult::Transitioned(content) => {
+                Ok(content)
+            }
+            PostLoopResult::NeedsRedispatch => {
+                const MAX_REDISPATCH_DEPTH: u32 = 3;
+                let current_depth = *self.redispatch_depth.read();
+                if current_depth >= MAX_REDISPATCH_DEPTH {
+                    warn!(
+                        depth = current_depth,
+                        "Post-transition re-dispatch depth limit reached, returning empty response"
+                    );
+                    let content = String::new();
+                    self.memory
+                        .add_message(ChatMessage::assistant(&content))
+                        .await?;
+                    return Ok(content);
+                }
+                *self.redispatch_depth.write() += 1;
+                info!(
+                    depth = current_depth + 1,
+                    "Re-dispatching for new state after transition"
+                );
+                let resp = Box::pin(self.run_loop_internal(processed_input)).await;
+                *self.redispatch_depth.write() -= 1;
+                resp.map(|r| r.content)
+            }
+        }
     }
 
     fn build_agent_response(
@@ -3807,18 +3905,22 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking.
-        self.memory
-            .add_message(ai_agents_llm::ChatMessage::user(input))
-            .await?;
+        // Add user message to parent memory for tracking (skip on redispatch - already present).
+        if *self.redispatch_depth.read() == 0 {
+            self.memory
+                .add_message(ai_agents_llm::ChatMessage::user(input))
+                .await?;
+        }
 
-        // post_loop_processing adds the assistant message, runs transitions, and re-generates if needed.
-        let (final_content, _transitioned) = self
+        // post_loop_processing records the assistant turn and evaluates transitions.
+        // apply_post_loop_result handles NeedsRedispatch by re-entering run_loop_internal.
+        let post_result = self
             .post_loop_processing(
                 input,
                 format!("[Delegated to {}]: {}", delegate_id, response.content),
             )
             .await?;
+        let final_content = self.apply_post_loop_result(input, post_result).await?;
 
         let mut result = AgentResponse::new(final_content);
 
@@ -3937,15 +4039,17 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking.
-        self.memory
-            .add_message(ai_agents_llm::ChatMessage::user(input))
-            .await?;
+        // Add user message to parent memory for tracking (skip on redispatch - already present).
+        if *self.redispatch_depth.read() == 0 {
+            self.memory
+                .add_message(ai_agents_llm::ChatMessage::user(input))
+                .await?;
+        }
 
-        // post_loop_processing adds the assistant message, runs transitions, and re-generates if needed.
-        let (final_content, _transitioned) = self
+        let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
+        let final_content = self.apply_post_loop_result(input, post_result).await?;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -4047,15 +4151,17 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking.
-        self.memory
-            .add_message(ai_agents_llm::ChatMessage::user(input))
-            .await?;
+        // Add user message to parent memory for tracking (skip on redispatch - already present).
+        if *self.redispatch_depth.read() == 0 {
+            self.memory
+                .add_message(ai_agents_llm::ChatMessage::user(input))
+                .await?;
+        }
 
-        // post_loop_processing adds the assistant message, runs transitions, and re-generates if needed.
-        let (final_content, _transitioned) = self
+        let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
+        let final_content = self.apply_post_loop_result(input, post_result).await?;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -4161,14 +4267,17 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking.
-        self.memory
-            .add_message(ai_agents_llm::ChatMessage::user(input))
-            .await?;
+        // Add user message to parent memory for tracking (skip on redispatch - already present).
+        if *self.redispatch_depth.read() == 0 {
+            self.memory
+                .add_message(ai_agents_llm::ChatMessage::user(input))
+                .await?;
+        }
 
-        let (final_content, _transitioned) = self
+        let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
+        let final_content = self.apply_post_loop_result(input, post_result).await?;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -4273,14 +4382,17 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking.
-        self.memory
-            .add_message(ai_agents_llm::ChatMessage::user(input))
-            .await?;
+        // Add user message to parent memory for tracking (skip on redispatch - already present).
+        if *self.redispatch_depth.read() == 0 {
+            self.memory
+                .add_message(ai_agents_llm::ChatMessage::user(input))
+                .await?;
+        }
 
-        let (final_content, _transitioned) = self
+        let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
+        let final_content = self.apply_post_loop_result(input, post_result).await?;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -4357,17 +4469,21 @@ Respond in JSON format:
 
         match self.try_skill_route(processed_input).await? {
             SkillRouteResult::Response(skill_response) => {
-                self.memory
-                    .add_message(ChatMessage::user(processed_input))
-                    .await?;
+                if *self.redispatch_depth.read() == 0 {
+                    self.memory
+                        .add_message(ChatMessage::user(processed_input))
+                        .await?;
+                }
                 return self
                     .handle_skill_response(processed_input, skill_response, &input_data.context)
                     .await;
             }
             SkillRouteResult::NeedsClarification(response) => {
-                self.memory
-                    .add_message(ChatMessage::user(processed_input))
-                    .await?;
+                if *self.redispatch_depth.read() == 0 {
+                    self.memory
+                        .add_message(ChatMessage::user(processed_input))
+                        .await?;
+                }
                 if let Some(q) = response
                     .metadata
                     .as_ref()
@@ -4400,17 +4516,21 @@ Respond in JSON format:
         );
 
         if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
-            self.memory
-                .add_message(ChatMessage::user(processed_input))
-                .await?;
+            if *self.redispatch_depth.read() == 0 {
+                self.memory
+                    .add_message(ChatMessage::user(processed_input))
+                    .await?;
+            }
             return self
                 .handle_plan_and_execute(processed_input, &input_data.context, auto_detected)
                 .await;
         }
 
-        self.memory
-            .add_message(ChatMessage::user(processed_input))
-            .await?;
+        if *self.redispatch_depth.read() == 0 {
+            self.memory
+                .add_message(ChatMessage::user(processed_input))
+                .await?;
+        }
 
         let mut iterations = 0u32;
         let mut all_tool_calls: Vec<ToolCall> = Vec::new();
@@ -4534,12 +4654,14 @@ Respond in JSON format:
             final_content =
                 self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
 
-            // Post-loop: memory, transitions, post-transition re-generation
-            let (_transitioned, final_content) = {
-                let (content, transitioned) = self
+            // Post-loop: memory, transitions, post-transition re-generation.
+            // apply_post_loop_result handles NeedsRedispatch by re-entering
+            // run_loop_internal so the new state's full dispatch activates.
+            let final_content = {
+                let result = self
                     .post_loop_processing(processed_input, final_content)
                     .await?;
-                (transitioned, content)
+                self.apply_post_loop_result(processed_input, result).await?
             };
 
             let reflected = reflection_metadata.is_some();
@@ -4640,7 +4762,9 @@ Respond in JSON format:
             // Skill routing
             match self.try_skill_route(processed_input).await {
                 Ok(SkillRouteResult::Response(skill_response)) => {
-                    let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    if *self.redispatch_depth.read() == 0 {
+                        let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    }
                     match self.handle_skill_response(processed_input, skill_response, &input_data.context).await {
                         Ok(resp) => {
                             yield StreamChunk::content(&resp.content);
@@ -4654,7 +4778,9 @@ Respond in JSON format:
                     }
                 }
                 Ok(SkillRouteResult::NeedsClarification(response)) => {
-                    let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    if *self.redispatch_depth.read() == 0 {
+                        let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    }
                     let _ = self.memory.add_message(ChatMessage::assistant(&response.content)).await;
                     yield StreamChunk::content(&response.content);
                     yield StreamChunk::Done {};
@@ -4686,7 +4812,9 @@ Respond in JSON format:
 
             // Plan-and-Execute: yield final result as single chunk (not token-by-token)
             if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
-                let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                if *self.redispatch_depth.read() == 0 {
+                    let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                }
                 match self.handle_plan_and_execute(processed_input, &input_data.context, auto_detected).await {
                     Ok(resp) => {
                         yield StreamChunk::content(&resp.content);
@@ -4700,7 +4828,9 @@ Respond in JSON format:
                 }
             }
 
-            let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+            if *self.redispatch_depth.read() == 0 {
+                let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+            }
 
             let llm = match self.get_state_llm() {
                 Ok(llm) => llm,
@@ -4928,8 +5058,10 @@ Respond in JSON format:
                     yield StreamChunk::content(&final_content);
                 }
 
-                // Post-loop: memory, transitions, post-transition re-generation
-                let (final_content, transitioned) = match self
+                // Post-loop: memory, transitions, post-transition re-generation.
+                // For NeedsRedispatch, run_loop_internal handles the new state's full
+                // dispatch and its result is yielded as a single non-streamed chunk.
+                let post_result = match self
                     .post_loop_processing(processed_input, final_content)
                     .await
                 {
@@ -4940,13 +5072,47 @@ Respond in JSON format:
                     }
                 };
 
+                let (final_content, transitioned) = match post_result {
+                    PostLoopResult::NoTransition(content) => (content, false),
+                    PostLoopResult::Transitioned(content) => (content, true),
+                    PostLoopResult::NeedsRedispatch => {
+                        const MAX_REDISPATCH_DEPTH: u32 = 3;
+                        let current_depth = *self.redispatch_depth.read();
+                        let content = if current_depth >= MAX_REDISPATCH_DEPTH {
+                            warn!(
+                                depth = current_depth,
+                                "Post-transition re-dispatch depth limit reached (stream)"
+                            );
+                            let c = String::new();
+                            let _ = self.memory.add_message(ChatMessage::assistant(&c)).await;
+                            c
+                        } else {
+                            *self.redispatch_depth.write() += 1;
+                            info!(
+                                depth = current_depth + 1,
+                                "Re-dispatching for new state after transition (stream)"
+                            );
+                            let result = self.run_loop_internal(processed_input).await;
+                            *self.redispatch_depth.write() -= 1;
+                            match result {
+                                Ok(resp) => resp.content,
+                                Err(e) => {
+                                    yield StreamChunk::error(e.to_string());
+                                    return;
+                                }
+                            }
+                        };
+                        (content, true)
+                    }
+                };
+
                 if transitioned {
                     if include_state_events {
                         if let Some(state) = self.current_state() {
                             yield StreamChunk::state_transition(None, state);
                         }
                     }
-                    // The post-transition re-generated content should be yielded
+                    // Yield the post-transition re-generated or re-dispatched content.
                     yield StreamChunk::content(&final_content);
                 }
 

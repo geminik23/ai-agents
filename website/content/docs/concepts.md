@@ -355,6 +355,8 @@ Multi-step plan output is synthesized into a coherent response via the LLM rathe
 
 Reflection adds self-evaluation. After producing an answer, the agent scores it against criteria you define (accuracy, completeness, tone). The LLM must say PASS and report a confidence score at or above `pass_threshold` for the evaluation to succeed. If it fails, the agent retries. Both reasoning and reflection can be overridden at the state or skill level.
 
+When a state transition fires mid-turn and the target state has a `reasoning:` override (or the agent-level mode is non-`none`), the runtime re-enters the full dispatch path for the new state in the same turn. CoT/ReAct prompt injection, auto-detection, and the plan-and-execute handler all activate immediately - the user does not need to send another message for the new state's reasoning config to take effect.
+
 ```yaml
 reasoning:
   mode: auto
@@ -464,6 +466,8 @@ Delegate states support a `delegate_context` mode (`input_only`, `summary`, `ful
 The same context enrichment is available for all orchestration patterns via the `context_mode` field. Set `context_mode: summary` or `context_mode: full` on any `concurrent`, `group_chat`, `pipeline`, or `handoff` block to forward parent conversation history to sub-agents. The enrichment runs before `input` template rendering, so `{{ user_input }}` in templates contains the history-enriched text. When omitted, the default is `input_only` which preserves the original behavior.
 
 Because orchestration runs through the normal `RuntimeAgent` loop, all existing features work automatically: HITL approvals on state transitions, error recovery per delegate, hooks for observability, memory for the parent conversation, and streaming.
+
+When a state transition fires mid-turn and the target state is an orchestration state (`concurrent`, `group_chat`, `pipeline`, `handoff`, or `delegate`), the runtime detects this and re-enters the full dispatch path for the new state in the same turn. The correct orchestration handler activates immediately - the user does not need to send another message to trigger it. Up to three chained transitions are resolved this way before the runtime stops and returns the last available response.
 
 Concurrent states accept a `vote` config to control how individual agent responses are aggregated into a final answer. `vote.method` selects the strategy: `majority` (default), `weighted`, or `unanimous`. `vote.tiebreaker` decides ties: `first` (declaration order), `random`, or `router_decides` (asks the router LLM). Per-agent weights are set via `vote.weights` (a map of agent id to numeric weight, used when method is `weighted`). The `on_partial_failure` field controls behavior when some agents fail: `abort` (default) fails the entire concurrent call, while `proceed_with_available` aggregates only the successful responses.
 
