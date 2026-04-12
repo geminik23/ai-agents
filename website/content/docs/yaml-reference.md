@@ -1470,10 +1470,12 @@ reasoning:
 | Mode | Description |
 |------|-------------|
 | `none` | No explicit reasoning |
-| `cot` | Chain-of-thought: think step by step before answering |
-| `react` | ReAct: interleave reasoning and tool use |
-| `plan_and_execute` | Create a plan first, then execute each step |
-| `auto` | Framework picks the best mode based on the query |
+| `cot` | Prompt injection: appends a "think step by step" instruction and parses `<thinking>` tags from the output. Useful for non-thinking models. Redundant for thinking models - use `llm.reasoning: true` instead. |
+| `react` | Prompt injection variant: structures the tool-use loop as Thought -> Action -> Observation. Same caveat as `cot`. |
+| `plan_and_execute` | Real orchestration: generates a structured plan (JSON steps), executes each step, synthesizes the result. Adds value regardless of model type. |
+| `auto` | Judge LLM classifies each input and picks the best mode |
+
+Note: `cot` and `react` are prompt-level techniques, not native model thinking. Thinking models (o3, o4-mini, gpt-5.4, Claude with extended thinking) already reason internally via API-level reasoning tokens configured in the [LLM section](#single-llm-llm-shorthand) (`reasoning`, `reasoning_effort`, `reasoning_budget_tokens`). A future version will wire `mode: cot` to native thinking when the model supports it, with prompt injection as fallback.
 
 ### `reasoning.planning`
 

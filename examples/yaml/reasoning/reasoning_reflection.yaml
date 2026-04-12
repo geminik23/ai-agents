@@ -1,0 +1,79 @@
+name: ReasoningReflection
+version: "1.0.0"
+description: "Self-evaluation and retry with domain-specific quality criteria"
+
+# Reflection (self-correction).
+#
+# After the LLM generates a response, the framework evaluates it against a list of criteria using a separate evaluator LLM.
+# If the evaluation fails, the framework injects feedback into the conversation and asks the LLM to try again.
+#
+# Reflection is independent of reasoning mode.
+# This example uses no reasoning (mode defaults to none) to show reflection in isolation.
+# In practice you can combine reflection with any reasoning mode.
+#
+# max_retries is the number of retries after the initial attempt.
+# max_retries: 2 means up to 3 total LLM calls (1 original + 2 retries).
+# The retry prompt tells the LLM which criteria it failed, then asks for improvement.
+#
+# pass_threshold gates evaluation: the LLM must say PASS and report confidence at or above this value.
+# When the LLM says PASS but omits a confidence score, confidence defaults to 0.8.
+#
+# Use domain-specific criteria.
+# The defaults ("addresses the question", "complete and not cut off", "accurate and helpful") are generic.
+# Custom criteria enforce the quality standard in your system prompt.
+#
+# Flow: user input -> LLM response -> evaluator checks criteria
+#                  -> pass: return response
+#                  -> fail: feedback injected -> LLM retries -> re-evaluate
+#                  -> after max_retries: return best attempt
+
+system_prompt: |
+  You are a technical writing assistant.
+  When explaining concepts, always include a concrete example.
+  When comparing options, discuss trade-offs from multiple angles.
+  Be thorough but concise.
+
+# Two LLMs: main responder and cheap evaluator.
+# The evaluator only reads the response and scores criteria.
+# It does not generate content.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  evaluator:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+
+# No reasoning block. Reflection works independently.
+# The LLM gives a direct response, then reflection evaluates it.
+
+# Domain-specific evaluation criteria.
+# Each criterion is sent to the evaluator LLM, which scores it PASS or FAIL.
+# Generic criteria like "is helpful" waste evaluator calls.
+# Specific criteria enforce the quality standard defined in the system prompt.
+reflection:
+  enabled: true                          # true | false | auto. default: disabled
+  evaluator_llm: evaluator              # LLM alias for evaluation. falls back to router then default
+  max_retries: 2                         # retry count after initial attempt. 0 = evaluate but never retry. default: 2
+  criteria:
+    - "Response includes at least one concrete example"
+    - "Response addresses trade-offs or limitations, not just benefits"
+    - "Response is structured with clear sections or steps"
+  pass_threshold: 0.7                    # LLM must say PASS and confidence >= this value. default: 0.7
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Reflection Demo ==="
+    hints:
+      - "Try: Explain how TCP/IP works"
+      - "Try: Compare SQL and NoSQL databases"
+      - "Try: What is the builder pattern in Rust?"
+      - "If reflection triggers, you may see the agent retry with improved output"
+      - "Criteria: must include examples, trade-offs, and clear structure"

@@ -256,16 +256,22 @@ cargo run -p ai-agents-cli -- run examples/yaml/hitl/hitl_multilingual.yaml
 
 ### `yaml/reasoning/`
 
-Reasoning and reflection examples.
+Progressive reasoning and reflection examples - from single-mode isolation to per-state overrides.
 
 | File | Description |
 |------|-------------|
-| `reasoning_agent.yaml` | Reasoning-enabled YAML agent with reflection configuration |
+| `reasoning_cot.yaml` | Chain-of-thought with tagged output and visible step-by-step thinking |
+| `reasoning_plan.yaml` | Plan-and-execute with planner LLM, tool filtering, and plan-level reflection (replan on failure) |
+| `reasoning_reflection.yaml` | Self-evaluation with domain-specific criteria, confidence threshold, and retry loop |
+| `reasoning_with_state.yaml` | Per-state reasoning overrides - full replacement semantics (not merge) |
 
-Example:
+Examples:
 
 ```sh
-cargo run -p ai-agents-cli -- run examples/yaml/reasoning/reasoning_agent.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/reasoning/reasoning_cot.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/reasoning/reasoning_plan.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/reasoning/reasoning_reflection.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/reasoning/reasoning_with_state.yaml
 ```
 
 ### `yaml/disambiguation/`
@@ -426,21 +432,6 @@ Run from:
 cd examples/rust/custom-hitl
 cargo run --bin simple-approval
 cargo run --bin hitl-agent
-```
-
-### `rust/reasoning/`
-
-Advanced reasoning demo with Rust-side interactive mode selection and metadata display.
-
-| Binary | Description |
-|--------|-------------|
-| `reasoning-agent` | Interactive mode selection (CoT, ReAct, Plan-and-Execute, Auto) with reflection and reasoning metadata display |
-
-Run from:
-
-```sh
-cd examples/rust/reasoning
-cargo run --bin reasoning-agent
 ```
 
 ### `rust/custom-llm/`

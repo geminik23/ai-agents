@@ -1,0 +1,109 @@
+name: ReasoningWithState
+version: "1.0.0"
+description: "Per-state reasoning overrides for cost-efficient agents"
+
+# Per-state reasoning overrides.
+#
+# Each state can declare its own reasoning: block.
+# The state config fully replaces the agent-level config for that state.
+# Fields not declared in the state's reasoning block get their struct defaults, NOT the agent-level values. This is a full replacement, not a merge.
+#
+# Example: agent has output: tagged, state has reasoning: { mode: cot }.
+# In that state, output is hidden (default), not tagged.
+# To get tagged output in the state, declare it explicitly.
+#
+# Same pattern applies to reflection: overrides per state and to per-skill overrides via skills[].reasoning.
+#
+# This lets you:
+#   - Use CoT only for complex analysis states
+#   - Skip reasoning entirely for greetings (save cost)
+#   - Apply reflection only in high-stakes states
+#
+# Flow: user input -> current state checked for reasoning override
+#                  -> effective config = state config or agent config
+#                  -> reasoning mode applied per effective config
+#                  -> state transitions evaluated -> new state, new config
+
+system_prompt: |
+  You are a helpful assistant.
+  In analysis mode, think carefully through problems step by step.
+  In casual conversation, respond naturally without over-thinking.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Agent-level default: no reasoning.
+# States override this selectively.
+reasoning:
+  mode: none
+
+states:
+  initial: greeting
+  states:
+    # Greeting state: no reasoning override. Uses agent-level mode: none.
+    # Fast, direct responses. No CoT overhead.
+    greeting:
+      prompt: |
+        Welcome the user warmly. Ask what they need help with.
+        Keep it brief and friendly.
+      transitions:
+        - to: analysis
+          when: "User asks a complex question, comparison, or multi-step problem"
+        - to: closing
+          when: "User says goodbye or is done"
+
+    # Analysis state: CoT reasoning with visible thinking.
+    #
+    # This override fully replaces the agent-level reasoning: { mode: none }.
+    # output: visible is declared explicitly because the override replaces the entire reasoning config, not just the mode field.
+    # Reflection is also enabled only in this state with domain criteria.
+    analysis:
+      prompt: |
+        Help the user with their complex question.
+        Think through the problem step by step.
+        Wrap your reasoning in <thinking> tags.
+      reasoning:
+        mode: cot
+        output: visible                  # must be declared here, not inherited from agent level
+      reflection:
+        enabled: true
+        criteria:
+          - "Response breaks the problem into clear steps"
+          - "Response reaches a definitive conclusion"
+      tools:
+        - calculator
+        - datetime
+      transitions:
+        - to: greeting
+          when: "User is satisfied or asks a new casual question"
+        - to: closing
+          when: "User says goodbye"
+
+    # Closing state: no reasoning override. Uses agent-level mode: none.
+    closing:
+      prompt: |
+        Thank the user and wish them well.
+      transitions:
+        - to: greeting
+          when: "User wants to continue"
+
+tools:
+  - calculator
+  - datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Per-State Reasoning Demo ==="
+    hints:
+      - "Try: Hi there! (greeting state - no reasoning)"
+      - "Try: Compare Python and Rust for web backends (analysis state - CoT)"
+      - "Try: What is 15 * 7 + 23? (analysis state - CoT with calculator)"
+      - "Try: Thanks, bye! (closing state - no reasoning)"
+      - "Watch how reasoning activates only in the analysis state"
+    show_state: true
+    show_tools: true

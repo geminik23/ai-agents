@@ -323,13 +323,28 @@ system_prompt: |
 
 ## Reasoning & Reflection
 
-Reasoning controls how the agent thinks before answering. Five modes are available:
+Two kinds of "thinking" exist in this framework:
+
+**Model-level native thinking** is controlled by the LLM config fields `reasoning`, `reasoning_effort`, and `reasoning_budget_tokens`. Thinking models (o3, o4-mini, gpt-5.4, Claude with extended thinking) reason internally via API-level reasoning tokens. This is the real thing - the model architecture is trained to reason in a dedicated phase.
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+  reasoning: true
+  reasoning_effort: medium
+  reasoning_budget_tokens: 8000
+```
+
+**Framework-level reasoning modes** are controlled by `reasoning.mode`. Five modes are available:
 
 - **none** - answer directly, no extra thinking.
-- **cot** (chain-of-thought) - think step-by-step before responding.
-- **react** - interleave reasoning and tool use (Thought -> Action -> Observation loop).
-- **plan_and_execute** - create a plan first, then execute each step.
-- **auto** - let the LLM pick the best mode for each query.
+- **cot** (chain-of-thought) - prompt injection that asks the LLM to think step by step. The framework appends an instruction to the system prompt and parses `<thinking>` tags from the output. This is useful for non-thinking models. For thinking models it is redundant - the model already reasons natively.
+- **react** - prompt injection variant that structures the tool-use loop as Thought -> Action -> Observation. Same caveat as CoT - thinking models do this naturally.
+- **plan_and_execute** - real orchestration. The framework generates a structured plan (JSON steps), executes each step using tools/skills/LLM, and synthesizes the result. This is genuinely different from CoT/ReAct and adds value regardless of model type.
+- **auto** - a judge LLM classifies each input and picks the best mode.
+
+For thinking models, prefer native thinking (`llm.reasoning: true`) over `mode: cot`. A future version will wire `mode: cot` to native thinking when the model supports it, with prompt injection as fallback.
 
 When reasoning is active (cot, react, plan_and_execute, or auto), the iteration loop is capped at the lower of the agent-level `max_iterations` and `reasoning.max_iterations`.
 This keeps the reasoning-specific cap as a tighter limit inside the agent's overall safety cap.

@@ -2395,7 +2395,7 @@ Answer YES or NO only."#,
             .or_else(|| self.llm_registry.default().ok())
             .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
 
-        let mut available_tools: Vec<String> = self
+        let mut available_tool_ids: Vec<String> = self
             .get_available_tool_ids()
             .await
             .unwrap_or_else(|_| self.tools.list_ids());
@@ -2404,37 +2404,71 @@ Answer YES or NO only."#,
         // Apply planning-level tool and skill filters.
         if let Some(config) = planning_config {
             if !config.available.tools.is_all() {
-                available_tools.retain(|t| config.available.tools.allows(t));
+                available_tool_ids.retain(|t| config.available.tools.allows(t));
             }
             if !config.available.skills.is_all() {
                 available_skills.retain(|s| config.available.skills.allows(s));
             }
         }
 
+        // Build tool descriptions with argument schemas so the planner
+        // knows how to construct valid args for each step.
+        let tool_descriptions: Vec<String> = available_tool_ids
+            .iter()
+            .filter_map(|id| {
+                self.tools.get(id).map(|tool| {
+                    let schema = tool.input_schema();
+                    let args_desc = schema
+                        .get("properties")
+                        .and_then(|p| serde_json::to_string(p).ok())
+                        .unwrap_or_else(|| "{}".to_string());
+                    format!(
+                        "- {} ({}): {}\n  Arguments: {}",
+                        id,
+                        tool.name(),
+                        tool.description(),
+                        args_desc
+                    )
+                })
+            })
+            .collect();
+
+        let tools_section = if tool_descriptions.is_empty() {
+            "Available tools: none".to_string()
+        } else {
+            format!("Available tools:\n{}", tool_descriptions.join("\n"))
+        };
+
+        let skills_section = if available_skills.is_empty() {
+            "Available skills: none".to_string()
+        } else {
+            format!("Available skills: {}", available_skills.join(", "))
+        };
+
         let prompt = format!(
             r#"Create a step-by-step plan to accomplish this goal.
 
 Goal: "{}"
 
-Available tools: {}
-Available skills: {}
+{}
+
+{}
 
 Create a plan with clear steps. For each step, specify:
 - description: What this step accomplishes
 - action_type: "tool", "skill", "think", or "respond"
-- action_target: The tool/skill name (if applicable)
+- action_target: The tool/skill id (if applicable)
+- args: The arguments object matching the tool's schema (if action_type is "tool")
 - dependencies: List of step IDs this depends on (empty if none)
 
 Respond in JSON format:
 {{
   "steps": [
-    {{"id": "step1", "description": "...", "action_type": "tool", "action_target": "tool_name", "args": {{}}, "dependencies": []}},
+    {{"id": "step1", "description": "...", "action_type": "tool", "action_target": "tool_id", "args": {{"required_field": "value"}}, "dependencies": []}},
     {{"id": "step2", "description": "...", "action_type": "think", "action_target": "...", "dependencies": ["step1"]}}
   ]
 }}"#,
-            input,
-            available_tools.join(", "),
-            available_skills.join(", ")
+            input, tools_section, skills_section,
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
@@ -2539,10 +2573,80 @@ Respond in JSON format:
 
             let result = match &plan.steps[step_idx].action {
                 PlanAction::Tool { tool, args } => {
+                    // When a tool step has dependency results, ask the LLM to
+                    // produce the correct arguments given the context and tool schema.
+                    // This avoids brittle {{stepN}} template substitution and lets
+                    // the LLM handle type adaptation (e.g. picking the iso field
+                    // from a datetime result for a downstream format call).
+                    let has_dep_results = plan.steps[step_idx]
+                        .dependencies
+                        .iter()
+                        .any(|dep| results.contains_key(dep));
+
+                    let final_args = if has_dep_results {
+                        let dep_context: String = plan.steps[step_idx]
+                            .dependencies
+                            .iter()
+                            .filter_map(|dep| results.get(dep).map(|r| format!("{}: {}", dep, r)))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+
+                        let tool_schema = self
+                            .tools
+                            .get(tool)
+                            .map(|t| {
+                                let schema = t.input_schema();
+                                let props = schema
+                                    .get("properties")
+                                    .and_then(|p| serde_json::to_string(p).ok())
+                                    .unwrap_or_else(|| "{}".to_string());
+                                format!(
+                                    "{}: {}\nArguments schema: {}",
+                                    t.id(),
+                                    t.description(),
+                                    props
+                                )
+                            })
+                            .unwrap_or_default();
+
+                        let step_desc = &plan.steps[step_idx].description;
+                        let arg_prompt = format!(
+                            "Generate the JSON arguments for a tool call.\n\n\
+                             Tool: {}\n\n\
+                             Task: {}\n\n\
+                             Previous step results:\n{}\n\n\
+                             Planner's draft arguments: {}\n\n\
+                             Produce ONLY a valid JSON object with the correct argument values.\n\
+                             Use actual values from the previous step results, not template references.",
+                            tool_schema,
+                            step_desc,
+                            dep_context,
+                            serde_json::to_string(args).unwrap_or_default()
+                        );
+                        let messages = vec![ChatMessage::user(&arg_prompt)];
+                        match llm.complete(&messages, None).await {
+                            Ok(resp) => {
+                                let content = resp.content.trim();
+                                // Parse the LLM's JSON response, fall back to planner args.
+                                let json_start = content.find('{');
+                                let json_end = content.rfind('}');
+                                if let (Some(start), Some(end)) = (json_start, json_end) {
+                                    serde_json::from_str(&content[start..=end])
+                                        .unwrap_or_else(|_| args.clone())
+                                } else {
+                                    args.clone()
+                                }
+                            }
+                            Err(_) => args.clone(),
+                        }
+                    } else {
+                        args.clone()
+                    };
+
                     let tool_call = ToolCall {
                         id: uuid::Uuid::new_v4().to_string(),
                         name: tool.clone(),
-                        arguments: args.clone(),
+                        arguments: final_args,
                     };
                     match self.execute_tool_smart(&tool_call).await {
                         Ok(output) => serde_json::json!({ "output": output }),

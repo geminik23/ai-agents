@@ -1,0 +1,70 @@
+name: ReasoningCoT
+version: "1.0.0"
+description: "Chain-of-thought reasoning with visible thinking"
+
+# Chain-of-thought (CoT) reasoning via prompt injection.
+#
+# The framework appends a CoT instruction to the system prompt asking the LLM to think step by step before answering.
+# The LLM wraps its reasoning in <thinking> tags.
+# The framework extracts the thinking and formats it based on the output setting.
+#
+# output modes:
+#   hidden  - strip thinking, show answer only (default)
+#   visible - show "Thinking: ... Answer: ..." in plain text
+#   tagged  - preserve <thinking> tags in the response
+#
+# Important: this is prompt-level CoT, not native model thinking.
+# The framework injects a "think step by step" instruction into the system prompt and parses <thinking> tags from the output.
+# Thinking models (o3, o4-mini, gpt-5.4, Claude with extended thinking) already think natively via API-level reasoning tokens.
+#
+# For those models, use the LLM-level config instead:
+#   llm:
+#     reasoning: true
+#     reasoning_effort: medium
+#     reasoning_budget_tokens: 8000
+#
+# A future version will replace: cot to native thinking when the model supports it, with prompt injection as fallback.
+#
+# The iteration loop is capped at the lower of agent-level max_iterations and reasoning.max_iterations when reasoning is active.
+#
+# Flow: user input -> CoT instruction injected -> LLM thinks step by step
+#                  -> <thinking> extracted -> formatted per output mode
+#                  -> tool calls if needed -> response
+
+system_prompt: |
+  You are a thoughtful assistant that shows your reasoning process.
+  When you think through a problem, wrap your reasoning in <thinking> tags.
+  Then provide your final answer after the closing tag.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Chain-of-thought: think step by step on every turn.
+# judge_llm is not needed here. It is only used in auto mode where the framework asks an LLM to decide whether reasoning is needed.
+#
+# For models with native thinking (o3, gpt-5.4, etc.), consider using llm-level reasoning: true instead of mode: cot.
+# mode: cot is most useful for non-thinking models where prompt injection is the only way to get step-by-step reasoning.
+reasoning:
+  mode: cot                              # cot | react | plan_and_execute | auto | none
+  output: tagged                         # how thinking is shown. hidden (default) | visible | tagged
+  max_iterations: 5                      # reasoning iteration cap. effective cap = min(this, agent-level max_iterations)
+
+# Calculator lets CoT show its work: "Step 1: multiply 15 * 7 = 105..." then call the tool to verify.
+tools:
+  - name: calculator
+  - name: datetime
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Chain-of-Thought Demo ==="
+    hints:
+      - "Try: What is 15 * 7 + 23? (see the step-by-step thinking)"
+      - "Try: If I leave at 3pm and drive 120 miles at 60mph, when do I arrive?"
+      - "Try: Compare the pros and cons of Python vs Rust"
+      - "The <thinking> tags show the LLM's reasoning process"
+    show_tools: true

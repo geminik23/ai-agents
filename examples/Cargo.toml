@@ -5,7 +5,6 @@ members = [
     "rust/state-machine",
     "rust/storage",
     "rust/custom-hitl",
-    "rust/reasoning",
     "rust/disambiguation",
     "rust/context",
     "rust/custom-llm",

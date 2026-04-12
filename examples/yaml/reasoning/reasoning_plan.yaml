@@ -1,0 +1,85 @@
+name: ReasoningPlan
+version: "1.0.0"
+description: "Plan-and-execute reasoning with multi-step tool usage"
+
+# Plan-and-Execute reasoning.
+#
+# For complex multi-step tasks, the framework generates a structured plan before executing anything.
+# The planner LLM creates steps with types: tool, skill, think, respond.
+# Each step can declare dependencies on previous steps.
+# The executor runs steps in order, skipping any whose dependencies failed.
+#
+# This mode takes a completely separate code path from CoT/ReAct.
+# The main LLM loop is not used. Instead:
+#   1. generate_plan: planner LLM outputs JSON steps
+#   2. execute_plan: steps run sequentially
+#   3. if reflection is enabled and steps failed: replan and retry
+#   4. synthesize final output from all completed step results via LLM
+#
+# Use a cheap model as planner_llm to save cost on plan generation.
+# The execution LLM (default) handles tool calls and thinking steps.
+#
+# Flow: user input -> planner LLM generates plan (JSON)
+#                  -> execute steps in order (tool/skill/think/respond)
+#                  -> step failure? -> replan if reflection.on_step_failure is replan
+#                  -> synthesized result -> response
+
+system_prompt: |
+  You are an assistant that breaks complex tasks into steps and executes them.
+  You have access to tools for calculations, date/time queries, and math operations.
+  When given a multi-part question, plan your approach before answering.
+
+# Two LLMs: cheap planner, capable executor.
+# The planner only generates the plan structure (JSON).
+# The executor handles actual tool calls and reasoning within steps.
+# In production, use a cheaper model for the planner (e.g. gpt-5.4-nano vs gpt-5.4-mini).
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  planner:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+
+reasoning:
+  mode: plan_and_execute
+  planning:
+    planner_llm: planner                 # LLM alias for plan generation. falls back to router then default
+    max_steps: 5                         # max steps the plan can contain. default: 10
+
+    # Which tools and skills the planner can reference in plan steps.
+    # "all" (default) means everything the agent has registered.
+    # An explicit list restricts what appears in the planner prompt.
+    available:
+      tools: [calculator, datetime, math]  # explicit list restricts the planner prompt
+      skills: all                          # "all" allows every registered skill (default)
+
+    # Plan-level reflection: what to do when a step fails during execution.
+    # On replan, the runtime generates a fresh plan and retries.
+    # The plan is marked Failed if steps still fail after all attempts.
+    reflection:
+      enabled: true
+      on_step_failure: replan            # replan (default) | skip | abort | continue
+      max_replans: 2                     # how many times to regenerate the plan. default: 2
+
+tools:
+  - name: calculator
+  - name: datetime
+  - name: math
+
+memory:
+  type: in-memory
+  max_messages: 50
+
+metadata:
+  cli:
+    welcome: "=== Plan-and-Execute Demo ==="
+    hints:
+      - "Try: What is today's date, and how many days until Christmas?"
+      - "Try: Calculate the average of 12, 45, 78, 23, 56 and tell me which are above average"
+      - "Try: What time is it in UTC, and what is 3.5 hours from now?"
+      - "The agent creates a plan with steps before executing"
+    show_tools: true
