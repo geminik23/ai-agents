@@ -17,7 +17,7 @@ Pick whichever option fits your workflow.
 ### Option 1: CLI only (fastest)
 
 ```sh
-cargo install ai-agents-cli --version 1.0.0-rc.8
+cargo install ai-agents-cli --version 1.0.0-rc.9
 ```
 
 ### Option 2: As a library
@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.8"
+ai-agents = "1.0.0-rc.9"
 ```
 
 ### Option 3: From source

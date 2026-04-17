@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.0-rc.9
+
+### Added
+- Agent persona: structured identity, traits, goals, secrets, evolution, and templates via a top-level persona block in YAML
+- Persona prompt injection: identity, traits, goals, and backstory are rendered into the system prompt automatically and preserved across all prompt_mode values
+- Context-conditional secrets: secrets are revealed only when typed matcher conditions pass against runtime context
+- Persona evolution: mutable persona fields can change over time with audit history, with optional LLM-driven updates behind double opt-in
+- Persona persistence: persona state is saved and restored as part of session snapshots
+- Agent hooks: persona evolution and secret reveal events are exposed through AgentHooks
+- Reasoning: plan reflection loop with on_step_failure handling and max_replans is now active
+- Reasoning: multi-step plan results are synthesized into a coherent final response
+
+### Changed
+- AgentSnapshot now includes an optional persona field with backward-compatible loading
+
+### Fixed
+- Reasoning: max_iterations now caps the reasoning loop at the lower of the agent-level and reasoning-level limits
+- Reasoning: reflection.pass_threshold now requires both a PASS verdict and confidence at or above the threshold
+- Reasoning: state-level reasoning.output, planning config, and max_steps overrides are now respected at runtime
+- Reasoning: planning.available.tools and planning.available.skills now filter the planner prompt to the specified IDs
+- Reasoning: plan status now reflects step failures instead of always reporting as completed
+- Reasoning: planner prompts now include tool descriptions and argument schemas so the LLM generates valid tool arguments
+- Reasoning: tool steps with dependencies now use LLM-driven argument generation instead of brittle template substitution
+- Orchestration: post-transition re-generation now re-enters full dispatch so transitions into orchestration or reasoning states activate the correct handler in the same turn
+
+
+---
+
 ## 1.0.0-rc.8
 
 ### Added

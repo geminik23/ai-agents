@@ -21,16 +21,13 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.6** | MCP integration, tool scoping, intent-based routing, `openai-compatible` provider |
 | **rc.7** | Dynamic agent spawning - runtime agent creation, registry, template system |
 | **rc.8** | Multi-agent orchestration - router, pipeline, concurrent, group chat, handoff patterns |
+| **rc.9** | Agent persona - structured identity, evolution, secrets, templates; dot-path refactor |
 
 ---
 
 ## Up Next
 
 These are the features we are actively planning for the next few release candidates.
-
-### Agent Persona
-
-Structured, persistent, evolvable agent identity - personality, role, backstory, goals, and secrets defined in YAML. Enables consistent character behavior across sessions.
 
 ### Session Management + Key Facts
 
@@ -56,7 +53,7 @@ Every planned feature and its current status. Features are independent unless no
 | **MCP Integration** | Connect to any MCP server for instant tool access | ✅ Done (rc.6) |
 | **Dynamic Agent Spawning** | Runtime agent creation from YAML/templates, agent registry, parent-to-child messaging | ✅ Done (rc.7) |
 | **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | ✅ Done (rc.8) |
-| **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals | Planned |
+| **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals, secrets | ✅ Done (rc.9) |
 | **Session Management + Key Facts** | Persistent user context and key facts across sessions | Planned |
 | **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |

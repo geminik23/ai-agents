@@ -12,7 +12,7 @@ categories = ["asynchronous"]
 
 [dependencies]
 ai-agents-core = { workspace = true }
-ai-agents-context = { path = "../ai-agents-context", version = "1.0.0-rc.8" }
+ai-agents-context = { path = "../ai-agents-context", version = "1.0.0-rc.9" }
 ai-agents-state = { workspace = true }
 
 serde = { workspace = true }
