@@ -1,0 +1,27 @@
+[package]
+name = "ai-agents-persona"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Agent persona system for AI Agents framework"
+keywords = ["AI", "Agent", "LLM", "Persona", "Identity"]
+categories = ["asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+ai-agents-context = { path = "../ai-agents-context", version = "1.0.0-rc.8" }
+ai-agents-state = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+schemars = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

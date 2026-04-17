@@ -365,17 +365,7 @@ impl HITLEngine {
     }
 
     fn get_field_value(&self, data: &Value, field: &str) -> Option<f64> {
-        let value = if field.contains('.') {
-            let parts: Vec<&str> = field.split('.').collect();
-            let mut current = data;
-            for part in parts {
-                current = current.get(part)?;
-            }
-            current
-        } else {
-            data.get(field)?
-        };
-
+        let value = ai_agents_core::get_dot_path(data, field)?;
         value.as_f64().or_else(|| value.as_i64().map(|i| i as f64))
     }
 }

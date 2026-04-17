@@ -24,6 +24,7 @@ use ai_agents_context::ContextSource;
 use ai_agents_core::{AgentError, Result};
 use ai_agents_disambiguation::DisambiguationConfig;
 use ai_agents_hitl::HITLConfig;
+use ai_agents_persona::PersonaConfig;
 use ai_agents_process::ProcessConfig;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use ai_agents_recovery::ErrorRecoveryConfig;
@@ -117,6 +118,10 @@ pub struct AgentSpec {
     /// Dynamic agent spawning configuration (optional).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawner: Option<SpawnerConfig>,
+
+    /// Agent persona configuration (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<PersonaConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +210,7 @@ impl Default for AgentSpec {
             tool_aliases: ToolAliasesConfig::default(),
             metadata: None,
             spawner: None,
+            persona: None,
         }
     }
 }
@@ -294,6 +300,10 @@ impl AgentSpec {
 
     pub fn has_disambiguation(&self) -> bool {
         self.disambiguation.is_enabled()
+    }
+
+    pub fn has_persona(&self) -> bool {
+        self.persona.as_ref().map_or(false, |p| p.is_configured())
     }
 }
 

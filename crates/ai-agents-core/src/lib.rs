@@ -1,10 +1,12 @@
 //! Core types and traits for AI Agents framework
 
+pub mod dot_path;
 pub mod error;
 pub mod message;
 pub mod traits;
 pub mod types;
 
+pub use dot_path::{get_dot_path, get_dot_path_from_map, set_dot_path};
 pub use error::{AgentError, Result};
 pub use message::{ChatMessage, Role};
 pub use traits::llm::{LLMCapability, LLMError, LLMProvider, TaskContext, ToolSelection};

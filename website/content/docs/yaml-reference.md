@@ -1843,6 +1843,175 @@ tools:
 
 ---
 
+## Persona (Agent Identity)
+
+The `persona:` section defines structured identity, personality traits, goals, secrets, and evolution rules for an agent. Persona is prepended to the system prompt automatically and coexists with `system_prompt`.
+
+### Minimal Persona
+
+```yaml
+persona:
+  identity:
+    name: "Alex"
+    role: "Customer Support"
+    description: "Friendly support agent for general inquiries"
+  traits:
+    personality: [helpful, patient, professional]
+    speaking_style: "warm, professional, concise"
+```
+
+### `persona.identity`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `string` | **Required.** Display name |
+| `role` | `string` | **Required.** Functional role description |
+| `description` | `string` | Short one-liner for UI/API responses |
+| `backstory` | `string` | Rich background text. Supports Jinja2 templates with context values |
+| `affiliation` | `string` | Group, organization, team, faction, or department (domain-neutral) |
+
+### `persona.traits`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `personality` | `list` | Core personality descriptors (e.g., `[disciplined, suspicious, loyal]`) |
+| `values` | `list` | What the agent cares about |
+| `fears` | `list` | What the agent avoids |
+| `speaking_style` | `string` | Speaking style instruction included verbatim in the prompt |
+
+### `persona.goals`
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `primary` | `list` | Public goals included in the LLM prompt |
+| `hidden` | `list` | Goals NOT included in the prompt. For programmatic access only (application code reads via `persona_manager()`) |
+
+### `persona.secrets`
+
+Secrets are information the agent withholds until context conditions are met. Each secret has a `content` string and optional `reveal_conditions`.
+
+```yaml
+persona:
+  secrets:
+    - content: "Investigating a smuggling ring"
+      reveal_conditions:
+        all:
+          - context:
+              relationships.current_actor.trust:
+                gte: 0.8
+          - context:
+              actor.is_watch_member:
+                eq: true
+    - content: "Manual-only secret"
+      # No reveal_conditions = never auto-revealed (API-only)
+```
+
+Conditions use the same typed matchers as state machine guards: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `in`, `exists`. Combine with `all:` (every condition must pass) or `any:` (at least one).
+
+### `persona.evolution`
+
+Controls how the persona changes over time.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Allow `evolve()` calls from Rust API and hooks |
+| `allow_llm_evolve` | `bool` | `false` | Also register a `persona_evolve` tool for the LLM (double opt-in) |
+| `mutable_fields` | `list` | `[]` | Dot-notation paths that may be mutated (e.g., `traits.personality`, `goals.primary`) |
+| `track_changes` | `bool` | `false` | Keep an audit trail of all mutations |
+
+Valid `mutable_fields` paths: `identity.name`, `identity.role`, `identity.description`, `identity.backstory`, `identity.affiliation`, `traits.personality`, `traits.values`, `traits.fears`, `traits.speaking_style`, `goals.primary`, `goals.hidden`. Secrets paths are always rejected.
+
+```yaml
+persona:
+  evolution:
+    enabled: true
+    allow_llm_evolve: true
+    track_changes: true
+    mutable_fields:
+      - traits.personality
+      - traits.speaking_style
+      - goals.primary
+```
+
+### `persona.templates`
+
+Reference a reusable persona template registered via the Rust API.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `base` | `string` | Name of the registered persona template |
+| `overrides` | `map` | Dot-notation field overrides applied on top of the base |
+
+```yaml
+persona:
+  templates:
+    base: "guard_base"
+    overrides:
+      identity.name: "Captain Tam"
+      identity.backstory: "A former sailor turned guard."
+  goals:
+    primary: [protect_harbor]
+```
+
+### `persona.max_prompt_tokens`
+
+Optional token cap for the persona section. When the full rendering exceeds this limit, a condensed format is used (name, role, personality, speaking style only - backstory, values, fears, goals, and secrets are dropped).
+
+### Prompt Injection Order
+
+Persona is injected **after** `prompt_mode` is applied, so it always survives `prompt_mode: replace`.
+
+| `prompt_mode` | Resulting system prompt |
+|---------------|------------------------|
+| `append` (default) | `[persona] + [base_prompt] + [state_prompt]` |
+| `replace` | `[persona] + [state_prompt]` |
+| `prepend` | `[persona] + [state_prompt] + [base_prompt]` |
+
+### Full Persona Example
+
+```yaml
+persona:
+  identity:
+    name: "Captain Elira"
+    role: "Harbor Guard Captain"
+    description: "A disciplined former soldier guarding the harbor"
+    backstory: |
+      Former soldier who served in the Eastern Campaign.
+      Now guards the harbor after losing faith in the army.
+    affiliation: "Harbor Watch"
+  traits:
+    personality: [disciplined, suspicious, loyal]
+    values: [duty, order, justice]
+    fears: [civil_unrest, betrayal]
+    speaking_style: "formal military cadence, short clipped sentences"
+  goals:
+    primary:
+      - protect_harbor
+      - investigate_smuggling
+    hidden:
+      - "Find the spy within the Watch"
+  secrets:
+    - content: "Investigating a smuggling ring"
+      reveal_conditions:
+        all:
+          - context:
+              relationships.current_actor.trust:
+                gte: 0.8
+          - context:
+              actor.is_watch_member:
+                eq: true
+  evolution:
+    enabled: true
+    mutable_fields:
+      - traits.personality
+      - traits.speaking_style
+    track_changes: true
+    allow_llm_evolve: false
+  max_prompt_tokens: 400
+```
+
+---
+
 ## Spawner (Dynamic Agent Spawning)
 
 The `spawner:` section lets a parent agent create and manage child agents at runtime. Child agents can be spawned from inline YAML, `AgentSpec` objects, or named Jinja2 templates. A central registry tracks spawned agents and provides inter-agent messaging.

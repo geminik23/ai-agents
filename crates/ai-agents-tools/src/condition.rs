@@ -141,23 +141,7 @@ impl<G: LLMGetter> ConditionEvaluator<G> {
     }
 
     fn get_context_value(&self, path: &str, context: &HashMap<String, Value>) -> Option<Value> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.is_empty() {
-            return None;
-        }
-
-        let mut current: Option<&Value> = context.get(parts[0]);
-
-        for part in &parts[1..] {
-            match current {
-                Some(Value::Object(map)) => {
-                    current = map.get(*part);
-                }
-                _ => return None,
-            }
-        }
-
-        current.cloned()
+        ai_agents_core::get_dot_path_from_map(context, path)
     }
 
     fn match_value(&self, value: Option<&Value>, matcher: &ContextMatcher) -> bool {

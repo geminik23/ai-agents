@@ -16,6 +16,7 @@ pub use config::{
 };
 pub use evaluator::{
     GuardOnlyEvaluator, LLMTransitionEvaluator, TransitionContext, TransitionEvaluator,
-    evaluate_conditions, evaluate_expression, evaluate_guard, get_context_value,
+    compare_value, evaluate_conditions, evaluate_context_matchers, evaluate_expression,
+    evaluate_guard, get_context_value, match_value,
 };
 pub use machine::StateMachine;

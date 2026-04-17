@@ -67,6 +67,19 @@ pub trait AgentHooks: Send + Sync {
 
     /// Fired on each agent-to-agent control transfer.
     async fn on_handoff(&self, _from: &str, _to: &str, _reason: &str) {}
+
+    /// Fired when a persona field is mutated via evolve().
+    async fn on_persona_evolve(
+        &self,
+        _field: &str,
+        _old_value: &Value,
+        _new_value: &Value,
+        _reason: Option<&str>,
+    ) {
+    }
+
+    /// Fired when a secret's reveal conditions are satisfied for the first time.
+    async fn on_secret_revealed(&self, _content: &str) {}
 }
 
 pub struct NoopHooks;
@@ -274,6 +287,26 @@ impl AgentHooks for LoggingHooks {
     async fn on_handoff(&self, from: &str, to: &str, reason: &str) {
         info!("{} Handoff: {} -> {} ({})", self.prefix, from, to, reason);
     }
+
+    async fn on_persona_evolve(
+        &self,
+        field: &str,
+        _old_value: &Value,
+        new_value: &Value,
+        reason: Option<&str>,
+    ) {
+        info!(
+            "{} Persona evolved: field={}, new_value={}, reason={}",
+            self.prefix,
+            field,
+            new_value,
+            reason.unwrap_or("(none)")
+        );
+    }
+
+    async fn on_secret_revealed(&self, content: &str) {
+        info!("{} Secret revealed: {}", self.prefix, content);
+    }
 }
 
 pub struct CompositeHooks {
@@ -425,9 +458,28 @@ impl AgentHooks for CompositeHooks {
         }
     }
 
-    async fn on_handoff(&self, from: &str, to: &str, reason: &str) {
+    async fn on_handoff(&self, _from: &str, _to: &str, _reason: &str) {
         for hook in &self.hooks {
-            hook.on_handoff(from, to, reason).await;
+            hook.on_handoff(_from, _to, _reason).await;
+        }
+    }
+
+    async fn on_persona_evolve(
+        &self,
+        _field: &str,
+        _old_value: &Value,
+        _new_value: &Value,
+        _reason: Option<&str>,
+    ) {
+        for hook in &self.hooks {
+            hook.on_persona_evolve(_field, _old_value, _new_value, _reason)
+                .await;
+        }
+    }
+
+    async fn on_secret_revealed(&self, _content: &str) {
+        for hook in &self.hooks {
+            hook.on_secret_revealed(_content).await;
         }
     }
 }

@@ -377,6 +377,44 @@ reflection:
 
 ---
 
+## Agent Persona
+
+The `persona:` section defines structured identity for an agent - name, role, personality traits, speaking style, goals, secrets, and evolution rules. Persona separates *who the agent is* from *what it does* (system prompt) and *what it remembers* (memory).
+
+Persona is prepended to the system prompt automatically. It survives `prompt_mode: replace` in state machines, so an NPC guard in a "patrol" state still knows its name and personality even when the state prompt is fully replaced.
+
+**Identity** gives the agent a name, role, optional backstory, and affiliation. **Traits** define personality descriptors, values, fears, and speaking style - all included verbatim in the LLM prompt. **Goals** list what the agent pursues; hidden goals are excluded from the prompt but readable by application code. **Secrets** are information the agent withholds until context conditions are met (e.g., trust level reaches a threshold). Conditions use the same typed matchers as state machine guards (`eq`, `gte`, `in`, `exists`, etc.).
+
+**Evolution** lets persona fields change over time. When `evolution.enabled` is true, Rust code and hooks can call `evolve()` on whitelisted fields. When `evolution.allow_llm_evolve` is also true, a `persona_evolve` tool is auto-registered so the LLM itself can trigger changes (double opt-in for safety). All mutations are validated against `mutable_fields` and optionally recorded in an audit trail.
+
+```yaml
+persona:
+  identity:
+    name: "Captain Elira"
+    role: "Harbor Guard Captain"
+    backstory: "Former soldier who served in the Eastern Campaign."
+    affiliation: "Harbor Watch"
+  traits:
+    personality: [disciplined, suspicious, loyal]
+    values: [duty, order, justice]
+    speaking_style: "formal military cadence, short clipped sentences"
+  goals:
+    primary: [protect_harbor, investigate_smuggling]
+    hidden: ["Find the spy within the Watch"]
+  secrets:
+    - content: "Investigating a smuggling ring"
+      reveal_conditions:
+        context:
+          relationships.current_actor.trust:
+            gte: 0.8
+  evolution:
+    enabled: true
+    mutable_fields: [traits.personality, traits.speaking_style]
+    track_changes: true
+```
+
+---
+
 ## Dynamic Agent Spawning
 
 A parent agent can create and manage child agents at runtime using the spawner system. This enables patterns like a game master that spawns NPC agents on demand, or a team manager that creates specialist agents for different tasks.

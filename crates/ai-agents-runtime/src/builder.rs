@@ -58,6 +58,8 @@ pub struct AgentBuilder {
     streaming: Option<StreamingConfig>,
     spawner: Option<Arc<crate::spawner::AgentSpawner>>,
     spawner_registry: Option<Arc<crate::spawner::AgentRegistry>>,
+    persona_manager: Option<Arc<ai_agents_persona::PersonaManager>>,
+    persona_templates: Option<Arc<ai_agents_persona::PersonaTemplateRegistry>>,
 }
 
 impl AgentBuilder {
@@ -93,6 +95,8 @@ impl AgentBuilder {
             streaming: None,
             spawner: None,
             spawner_registry: None,
+            persona_manager: None,
+            persona_templates: None,
         }
     }
 
@@ -134,6 +138,8 @@ impl AgentBuilder {
             streaming: None,
             spawner: None,
             spawner_registry: None,
+            persona_manager: None,
+            persona_templates: None,
         }
     }
 
@@ -599,6 +605,21 @@ impl AgentBuilder {
         self
     }
 
+    /// Set persona config directly (overrides spec).
+    pub fn persona(mut self, manager: Arc<ai_agents_persona::PersonaManager>) -> Self {
+        self.persona_manager = Some(manager);
+        self
+    }
+
+    /// Provide a shared persona template registry.
+    pub fn persona_templates(
+        mut self,
+        registry: Arc<ai_agents_persona::PersonaTemplateRegistry>,
+    ) -> Self {
+        self.persona_templates = Some(registry);
+        self
+    }
+
     pub fn streaming(mut self, enabled: bool) -> Self {
         let mut config = self.streaming.unwrap_or_default();
         config.enabled = enabled;
@@ -814,7 +835,7 @@ impl AgentBuilder {
             .system_prompt
             .ok_or_else(|| AgentError::Config("System prompt is required".into()))?;
 
-        let tools = self.tools.unwrap_or_else(ToolRegistry::new);
+        let mut tools = self.tools.unwrap_or_else(ToolRegistry::new);
 
         // ERROR NOTE: Don't include tools prompt here
         // - it will be added AFTER template rendering in get_effective_system_prompt() to avoid Jinja2 parsing JSON braces
@@ -889,6 +910,39 @@ impl AgentBuilder {
             }
         });
 
+        // Configure persona before freezing tools (evolve tool may need registration).
+        let persona_manager: Option<Arc<ai_agents_persona::PersonaManager>> =
+            if let Some(pm) = self.persona_manager.take() {
+                Some(pm)
+            } else if let Some(ref spec) = self.spec {
+                if spec.has_persona() {
+                    let persona_config = spec.persona.clone().unwrap();
+                    let renderer = ai_agents_context::TemplateRenderer::new();
+                    let registry = self.persona_templates.clone();
+                    let manager = ai_agents_persona::PersonaManager::from_config(
+                        persona_config,
+                        registry,
+                        renderer,
+                    )
+                    .map_err(|e| {
+                        AgentError::Config(format!("Failed to create PersonaManager: {}", e))
+                    })?;
+                    Some(Arc::new(manager))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+        // Register persona_evolve tool if allow_llm_evolve is true.
+        if let Some(ref pm) = persona_manager {
+            if pm.should_register_evolve_tool() {
+                let evolve_tool = ai_agents_persona::PersonaEvolveTool::new(pm.clone());
+                let _ = tools.register(Arc::new(evolve_tool));
+            }
+        }
+
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
 
@@ -907,6 +961,15 @@ impl AgentBuilder {
                             ids.push(view_name.clone());
                         }
                     }
+                }
+
+                // Auto-registered tools must bypass scoping when the user has an explicit list.
+                // persona_evolve is auto-registered when allow_llm_evolve is true.
+                if persona_manager
+                    .as_ref()
+                    .is_some_and(|pm| pm.should_register_evolve_tool())
+                {
+                    ids.push("persona_evolve".to_string());
                 }
 
                 ids
@@ -1104,6 +1167,11 @@ impl AgentBuilder {
             if spec.disambiguation.is_enabled() {
                 agent = agent.with_disambiguation(spec.disambiguation.clone());
             }
+        }
+
+        // Wire persona manager into the agent (created earlier before tools_arc).
+        if let Some(pm) = persona_manager {
+            agent = agent.with_persona(pm);
         }
 
         Ok(agent)

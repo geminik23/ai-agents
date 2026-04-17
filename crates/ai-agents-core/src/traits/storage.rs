@@ -26,6 +26,9 @@ pub struct AgentSnapshot {
     pub context: std::collections::HashMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawned_agents: Option<Vec<SpawnedAgentEntry>>,
+    /// Persona snapshot (serialized as Value to avoid core->persona dependency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persona: Option<serde_json::Value>,
 }
 
 impl AgentSnapshot {
@@ -38,6 +41,7 @@ impl AgentSnapshot {
             memory: super::memory::MemorySnapshot::default(),
             context: std::collections::HashMap::new(),
             spawned_agents: None,
+            persona: None,
         }
     }
 

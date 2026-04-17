@@ -312,6 +312,26 @@ cargo run -p ai-agents-cli -- run examples/yaml/spawner/game_master.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/spawner/team_manager.yaml
 ```
 
+### `yaml/persona/`
+
+Agent persona - structured identity, personality traits, evolution, and context-conditional secrets.
+
+| File | Description |
+|------|-------------|
+| `persona_basic.yaml` | Minimal persona with identity (name, role, affiliation), personality traits, speaking style, goals, and hidden goals that coexist with `system_prompt` |
+| `persona_evolution.yaml` | Evolvable persona where `traits.personality`, `traits.speaking_style`, and `goals.primary` can be mutated at runtime via Rust API or the auto-registered `persona_evolve` tool |
+| `persona_secrets.yaml` | Persona with context-conditional secrets revealed only when `ContextManager` values satisfy typed conditions (`gte`, `eq`, `all`, `any`) - includes runtime context defaults for CLI testing |
+
+Note: Persona is prepended to the system prompt automatically. It survives `prompt_mode: replace` in state machines. The `persona_evolve` tool is auto-registered only when `evolution.allow_llm_evolve: true`. Secrets with no `reveal_conditions` never auto-reveal (API-only access).
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/persona/persona_basic.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/persona/persona_evolution.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/persona/persona_secrets.yaml
+```
+
 ### `yaml/orchestration/`
 
 Multi-agent orchestration patterns using pre-spawned sub-agents. All five patterns (router, pipeline, concurrent, group chat, handoff) have dedicated state types.

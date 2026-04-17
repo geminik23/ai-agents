@@ -117,6 +117,8 @@ pub struct RuntimeAgent {
     reasoning_config: ReasoningConfig,
     reflection_config: ReflectionConfig,
     disambiguation_manager: Option<DisambiguationManager>,
+    /// Structured persona manager for identity, evolution, and secrets.
+    persona_manager: Option<Arc<ai_agents_persona::PersonaManager>>,
     /// Skill ID that triggered the current pending disambiguation.
     /// Set by try_skill_route() when skill-level disambiguation triggers clarification.
     /// Read by run_loop() when clarification resolves to route directly to the skill.
@@ -152,6 +154,7 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("reasoning_mode", &self.reasoning_config.mode)
             .field("reflection_enabled", &self.reflection_config.enabled)
             .field("declared_tool_ids", &self.declared_tool_ids)
+            .field("has_persona", &self.persona_manager.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -221,6 +224,7 @@ impl RuntimeAgent {
             reasoning_config: ReasoningConfig::default(),
             reflection_config: ReflectionConfig::default(),
             disambiguation_manager: None,
+            persona_manager: None,
             pending_skill_id: RwLock::new(None),
             current_plan: RwLock::new(None),
             declared_tool_ids: None,
@@ -262,6 +266,15 @@ impl RuntimeAgent {
 
     pub fn reflection_config(&self) -> &ReflectionConfig {
         &self.reflection_config
+    }
+
+    pub fn with_persona(mut self, manager: Arc<ai_agents_persona::PersonaManager>) -> Self {
+        self.persona_manager = Some(manager);
+        self
+    }
+
+    pub fn persona_manager(&self) -> Option<&Arc<ai_agents_persona::PersonaManager>> {
+        self.persona_manager.as_ref()
     }
 
     pub fn with_disambiguation(mut self, config: DisambiguationConfig) -> Self {
@@ -445,7 +458,7 @@ impl RuntimeAgent {
         let state_machine_snapshot = self.state_machine.as_ref().map(|sm| sm.snapshot());
         let context_snapshot = self.context_manager.snapshot();
 
-        Ok(AgentSnapshot::new(self.info.id.clone())
+        let mut snapshot = AgentSnapshot::new(self.info.id.clone())
             .with_memory(memory_snapshot)
             .with_context(context_snapshot)
             .with_state_machine(
@@ -456,7 +469,13 @@ impl RuntimeAgent {
                     no_transition_count: 0,
                     history: vec![],
                 }),
-            ))
+            );
+
+        if let Some(ref persona) = self.persona_manager {
+            snapshot.persona = Some(persona.snapshot_as_value()?);
+        }
+
+        Ok(snapshot)
     }
 
     /// Save state including spawned agents manifest for session persistence.
@@ -481,6 +500,13 @@ impl RuntimeAgent {
         }
 
         self.context_manager.restore(snapshot.context);
+
+        if let (Some(persona_value), Some(persona_manager)) =
+            (snapshot.persona, &self.persona_manager)
+        {
+            persona_manager.restore_from_value(persona_value)?;
+        }
+
         info!(agent_id = %snapshot.agent_id, "State restored");
         Ok(())
     }
@@ -764,6 +790,21 @@ impl RuntimeAgent {
     async fn get_effective_system_prompt(&self) -> Result<String> {
         let rendered_base = self.render_system_prompt()?;
 
+        // Render persona prompt (if configured) and fire hooks for newly revealed secrets.
+        let persona_prefix = if let Some(ref persona) = self.persona_manager {
+            let context = self.context_manager.get_all();
+            let render_result = persona.render_prompt(&context)?;
+
+            // Fire on_secret_revealed for each newly revealed secret.
+            for content in &render_result.newly_revealed {
+                self.hooks.on_secret_revealed(content).await;
+            }
+
+            render_result.prompt
+        } else {
+            String::new()
+        };
+
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
                 let state_prompt = if let Some(ref prompt) = state_def.prompt {
@@ -809,6 +850,13 @@ impl RuntimeAgent {
                     }
                 };
 
+                // Persona always prepended regardless of prompt_mode.
+                let with_persona = if persona_prefix.is_empty() {
+                    combined
+                } else {
+                    format!("{}\n\n{}", persona_prefix, combined)
+                };
+
                 let available_tool_ids = self.get_available_tool_ids().await?;
                 // Only add tools prompt if tools are available.
                 // When tools: [] is set (explicitly empty), show NO tools to the LLM.
@@ -818,31 +866,38 @@ impl RuntimeAgent {
                         self.parallel_tools.enabled,
                     );
                     if !tools_prompt.is_empty() {
-                        return Ok(format!("{}\n\n{}", combined, tools_prompt));
+                        return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
                     }
                 }
-                return Ok(combined);
+                return Ok(with_persona);
             }
         }
+
+        // No state machine - prepend persona to base.
+        let with_persona = if persona_prefix.is_empty() {
+            rendered_base
+        } else {
+            format!("{}\n\n{}", persona_prefix, rendered_base)
+        };
 
         let tools_prompt = match &self.declared_tool_ids {
             Some(ids) if !ids.is_empty() => self
                 .tools
                 .generate_filtered_prompt_with_parallel(ids, self.parallel_tools.enabled),
             Some(_) => {
-                // tools: [] — explicitly no tools, empty prompt
+                // tools: [] - explicitly no tools, empty prompt
                 String::new()
             }
             None => {
-                // tools: not specified — all registered tools
+                // tools: not specified - all registered tools
                 self.tools
                     .generate_tools_prompt_with_parallel(self.parallel_tools.enabled)
             }
         };
         if !tools_prompt.is_empty() {
-            Ok(format!("{}\n\n{}", rendered_base, tools_prompt))
+            Ok(format!("{}\n\n{}", with_persona, tools_prompt))
         } else {
-            Ok(rendered_base)
+            Ok(with_persona)
         }
     }
 

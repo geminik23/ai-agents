@@ -198,7 +198,7 @@ pub fn evaluate_conditions(conditions: &GuardConditions, ctx: &TransitionContext
     }
 }
 
-fn evaluate_context_matchers(
+pub fn evaluate_context_matchers(
     matchers: &HashMap<String, ContextMatcher>,
     context: &HashMap<String, Value>,
 ) -> bool {
@@ -212,26 +212,10 @@ fn evaluate_context_matchers(
 }
 
 pub fn get_context_value(path: &str, context: &HashMap<String, Value>) -> Option<Value> {
-    let parts: Vec<&str> = path.split('.').collect();
-    if parts.is_empty() {
-        return None;
-    }
-
-    let mut current: Option<&Value> = context.get(parts[0]);
-
-    for part in &parts[1..] {
-        match current {
-            Some(Value::Object(map)) => {
-                current = map.get(*part);
-            }
-            _ => return None,
-        }
-    }
-
-    current.cloned()
+    ai_agents_core::get_dot_path_from_map(context, path)
 }
 
-fn match_value(value: Option<&Value>, matcher: &ContextMatcher) -> bool {
+pub fn match_value(value: Option<&Value>, matcher: &ContextMatcher) -> bool {
     match matcher {
         ContextMatcher::Exact(expected) => value.map(|v| v == expected).unwrap_or(false),
         ContextMatcher::Exists { exists } => {
@@ -292,7 +276,7 @@ fn values_equal_coerced(value: &Value, expected: &Value) -> bool {
     false
 }
 
-fn compare_value(value: &Value, op: &CompareOp) -> bool {
+pub fn compare_value(value: &Value, op: &CompareOp) -> bool {
     match op {
         CompareOp::Eq(expected) => values_equal_coerced(value, expected),
         CompareOp::Neq(expected) => !values_equal_coerced(value, expected),

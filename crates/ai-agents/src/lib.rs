@@ -93,6 +93,10 @@ pub mod error {
     pub use ai_agents_core::{AgentError, Result};
 }
 
+pub mod dot_path {
+    pub use ai_agents_core::{get_dot_path, get_dot_path_from_map, set_dot_path};
+}
+
 pub mod hitl {
     pub use ai_agents_hitl::{
         ApprovalCondition, ApprovalHandler, ApprovalMessage, ApprovalRequest, ApprovalResult,
@@ -357,6 +361,15 @@ pub mod template {
             Self { inner }
         }
     }
+}
+
+pub mod persona {
+    pub use ai_agents_persona::{
+        EvolutionConfig, PERSONA_CHANGE_METADATA_KEY, PersonaChange, PersonaConfig,
+        PersonaEvolveTool, PersonaGoals, PersonaIdentity, PersonaManager, PersonaRenderResult,
+        PersonaSecret, PersonaSnapshot, PersonaTemplateRef, PersonaTemplateRegistry, PersonaTraits,
+        SecretRevealCondition, VALID_EVOLVE_PATHS,
+    };
 }
 
 pub mod reasoning {

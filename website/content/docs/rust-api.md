@@ -515,6 +515,8 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 | `on_pipeline_complete`      | Orchestration: full pipeline execution completes      |
 | `on_handoff_start`          | Orchestration: a handoff chain begins                 |
 | `on_handoff`                | Orchestration: an agent-to-agent handoff occurs       |
+| `on_persona_evolve`         | Persona: a persona field was mutated via `evolve()`   |
+| `on_secret_revealed`        | Persona: a secret's reveal conditions were satisfied for the first time |
 
 ---
 

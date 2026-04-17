@@ -80,19 +80,8 @@ impl ContextManager {
     }
 
     pub fn get_path(&self, path: &str) -> Option<Value> {
-        let parts: Vec<&str> = path.split('.').collect();
-        if parts.is_empty() {
-            return None;
-        }
-
         let values = self.values.read();
-        let mut current = values.get(parts[0])?;
-
-        for part in &parts[1..] {
-            current = current.get(part)?;
-        }
-
-        Some(current.clone())
+        ai_agents_core::get_dot_path_from_map(&values, path)
     }
 
     pub fn get_all(&self) -> HashMap<String, Value> {
