@@ -4,6 +4,8 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use super::palette::ThemeColors;
+
 /// Color and style theme for the TUI.
 pub struct Theme {
     pub user_style: Style,
@@ -112,6 +114,36 @@ impl Theme {
             hint_text_style: Style::default()
                 .fg(Color::Blue)
                 .add_modifier(Modifier::ITALIC),
+        }
+    }
+
+    /// Build a theme from an RGB color palette.
+    pub fn from_palette(p: &ThemeColors) -> Self {
+        Self {
+            user_style: Style::default().fg(p.accent),
+            agent_style: Style::default().fg(p.fg),
+            system_style: Style::default().fg(p.warning),
+            error_style: Style::default().fg(p.error),
+            status_bg: Style::default().bg(p.surface),
+            status_fg: Style::default().fg(p.fg).bg(p.surface),
+            hint_style: Style::default().fg(p.dim),
+            border_style: Style::default().fg(p.muted),
+            highlight_style: Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            input_style: Style::default().fg(p.fg),
+            tool_style: Style::default().fg(p.secondary),
+            state_current: Style::default().fg(p.success).add_modifier(Modifier::BOLD),
+            state_normal: Style::default().fg(p.dim),
+            panel_title: Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+            panel_border: Style::default().fg(p.muted),
+            label_style: Style::default().fg(p.dim),
+            value_style: Style::default().fg(p.fg),
+            budget_low: Style::default().fg(p.success),
+            budget_mid: Style::default().fg(p.warning),
+            budget_high: Style::default().fg(p.error),
+            spinner_style: Style::default().fg(p.info),
+            toast_style: Style::default().fg(p.bg).bg(p.warning),
+            log_style: Style::default().fg(p.dim),
+            hint_text_style: Style::default().fg(p.info).add_modifier(Modifier::ITALIC),
         }
     }
 

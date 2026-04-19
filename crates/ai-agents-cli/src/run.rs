@@ -27,6 +27,7 @@ pub struct RunOptions {
     pub contexts: Vec<String>,
     pub context_file: Option<PathBuf>,
     pub plain: bool,
+    pub theme: Option<String>,
 }
 
 impl RunOptions {
@@ -43,6 +44,7 @@ impl RunOptions {
             contexts: args.contexts.clone(),
             context_file: args.context_file.clone(),
             plain: args.plain,
+            theme: args.theme.clone(),
         }
     }
 
@@ -61,6 +63,7 @@ impl RunOptions {
             prompt_style: None,
             disable_builtin_commands: self.no_builtins.then_some(true),
             hitl: None,
+            theme: self.theme.clone(),
         }
     }
 }
@@ -104,7 +107,8 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
             .await
             .context("failed to run interactive session")
     } else {
-        crate::tui::run_tui(agent, config)
+        let theme_name = metadata.theme.clone();
+        crate::tui::run_tui(agent, config, theme_name)
             .await
             .context("failed to run TUI session")
     }

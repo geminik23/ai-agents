@@ -73,6 +73,7 @@ Parses and validates the YAML spec. Returns exit code `0` on success, `1` on fai
 | `--context <KEY=VALUE>`   | Inject a runtime context value (repeatable, supports dotted paths) |
 | `--context-file <PATH>`   | Load runtime context from a JSON file                        |
 | `--plain`                 | Force plain line REPL even on interactive TTY                |
+| `--theme <name>`          | Color theme (one-dark, catppuccin-mocha, dracula, tokyo-night, vscode-dark, nord, gruvbox-dark, one-half-light, github-light) |
 
 ### Examples
 
@@ -213,7 +214,8 @@ Press the same key again to close a panel. Press `Esc` to close all panels.
 | `PageUp/Down`   | Scroll chat history |
 | `Esc`           | Cancel streaming or close panels |
 | `F1` - `F8`     | Toggle side panels |
-| `/`             | Start a slash command |
+| `Ctrl+T`        | Cycle color theme |
+| `/`             | Start a slash command (opens completion popup) |
 
 ### Chat Display
 
@@ -233,6 +235,33 @@ Agent responses with multiple paragraph breaks are normalized - consecutive blan
 
 In TUI mode, tracing output is captured and rendered as dim log cards in the chat timeline instead of writing raw text to the terminal.
 The default level is WARN. Set `RUST_LOG=info` or `RUST_LOG=debug` for more detail.
+
+### Themes
+
+The TUI ships with 11 color themes. Use `--theme` to select one:
+
+```sh
+ai-agents-cli run agent.yaml --theme one-dark
+ai-agents-cli run agent.yaml --theme catppuccin-mocha
+```
+
+Available themes: `dark` (default), `one-dark`, `catppuccin-mocha`, `dracula`, `tokyo-night`, `vscode-dark`, `nord`, `gruvbox-dark`, `light`, `one-half-light`, `github-light`.
+
+Set a default theme in YAML:
+
+```yaml
+metadata:
+  cli:
+    theme: one-dark
+```
+
+Press `Ctrl+T` in the TUI to cycle through themes at runtime.
+The `dark` and `light` themes use standard ANSI colors and work on all terminals.
+All other themes use exact RGB colors for consistent appearance across modern terminals.
+
+### Command Completion
+
+When you type `/` in the input area, a floating completion popup appears above the input showing all available slash commands with descriptions. Type more characters to filter the list. Use `Up`/`Down` to navigate, `Tab` to fill the selected command, `Enter` to fill and execute, or `Esc` to dismiss.
 
 ### Streaming
 
@@ -288,6 +317,7 @@ metadata:
 | `show_timing`              | bool       | Show response times by default           |
 | `prompt_style`             | string     | `"simple"` or `"with_state"`             |
 | `disable_builtin_commands` | bool       | Disable slash commands except `/quit`    |
+| `theme`                    | string     | Color theme name (see Themes section)    |
 
 ---
 

@@ -1,5 +1,6 @@
 pub mod agents_panel;
 pub mod chat;
+pub mod completion;
 pub mod context_panel;
 pub mod facts_panel;
 pub mod help_panel;

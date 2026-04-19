@@ -5,6 +5,7 @@
 pub mod app;
 pub mod event;
 pub mod log_layer;
+pub mod palette;
 pub mod theme;
 pub mod widgets;
 
@@ -30,9 +31,14 @@ use crate::repl::CliReplConfig;
 use self::app::{App, UpdateResult};
 use self::event::AppMessage;
 use self::log_layer::TuiLogLayer;
+use self::palette::resolve_theme;
 
 /// Run the ratatui TUI event loop.
-pub async fn run_tui(agent: RuntimeAgent, config: CliReplConfig) -> Result<()> {
+pub async fn run_tui(
+    agent: RuntimeAgent,
+    config: CliReplConfig,
+    theme_name: Option<String>,
+) -> Result<()> {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppMessage>();
 
     // Install a global tracing subscriber that captures logs into the TUI channel.
@@ -52,6 +58,13 @@ pub async fn run_tui(agent: RuntimeAgent, config: CliReplConfig) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
     terminal.clear().context("failed to clear terminal")?;
+
+    // Resolve the initial theme. CLI flag / YAML metadata -> fallback to "dark".
+    let initial_theme_name = theme_name.unwrap_or_else(|| "dark".to_string());
+    let initial_theme = resolve_theme(&initial_theme_name).unwrap_or_else(|| {
+        // Unknown name: fall back to dark and show a toast later.
+        resolve_theme("dark").unwrap()
+    });
 
     // Spawn async terminal event reader using crossterm event-stream.
     let tx_keys = tx.clone();
@@ -88,7 +101,7 @@ pub async fn run_tui(agent: RuntimeAgent, config: CliReplConfig) -> Result<()> {
     });
 
     let agent_arc = Arc::new(agent);
-    let mut app = App::new(agent_arc, config, tx);
+    let mut app = App::new(agent_arc, config, tx, initial_theme, initial_theme_name);
 
     // Main event loop.
     loop {

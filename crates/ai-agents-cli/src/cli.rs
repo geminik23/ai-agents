@@ -66,6 +66,10 @@ pub struct RunArgs {
     /// Force plain line REPL (skip TUI even on interactive TTY)
     #[arg(long, action = ArgAction::SetTrue)]
     pub plain: bool,
+
+    /// Color theme (dark, one-dark, catppuccin-mocha, dracula, tokyo-night, vscode-dark, nord, gruvbox-dark, light, one-half-light, github-light)
+    #[arg(long)]
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Parser)]

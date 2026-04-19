@@ -9,7 +9,7 @@ use tracing::Level;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders};
 use tokio::sync::mpsc::UnboundedSender;
 use tui_textarea::TextArea;
 
@@ -17,10 +17,12 @@ use ai_agents::{Agent, RuntimeAgent, StreamChunk};
 
 use crate::repl::{CliReplConfig, ReplMode};
 use crate::tui::event::AppMessage;
+use crate::tui::palette::{THEME_NAMES, resolve_theme, theme_bg_color};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{
     agents_panel::{AgentEntry, AgentsPanelState, render_agents_panel},
     chat::{ChatState, DisplayMessage, Role, render_chat},
+    completion::{CompletionState, SLASH_COMMANDS, render_completions},
     context_panel::{ContextPanelState, render_context_panel},
     facts_panel::render_facts_panel,
     help_panel::render_help_panel,
@@ -54,36 +56,21 @@ pub enum PanelSlot {
     Agents,
 }
 
-/// Slash command names for tab completion.
-const SLASH_COMMANDS: &[&str] = &[
-    "/help",
-    "/quit",
-    "/exit",
-    "/reset",
-    "/state",
-    "/history",
-    "/info",
-    "/memory",
-    "/context",
-    "/save",
-    "/load",
-    "/sessions",
-    "/delete",
-];
-
 /// Main TUI application state, owning all widgets, agent handle, and input.
 pub struct App {
     agent: Arc<RuntimeAgent>,
     config: CliReplConfig,
     theme: Theme,
+    theme_name: String,
+    bg_fill: Option<Color>,
     tx: UnboundedSender<AppMessage>,
 
     // Input
     input: TextArea<'static>,
     is_command_mode: bool,
 
-    // Slash command suggestion
-    suggestion: Option<String>,
+    // Slash command completion popup
+    completions: CompletionState,
 
     // Chat
     chat: ChatState,
@@ -115,6 +102,8 @@ impl App {
         agent: Arc<RuntimeAgent>,
         config: CliReplConfig,
         tx: UnboundedSender<AppMessage>,
+        theme: Theme,
+        theme_name: String,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(Style::default());
@@ -145,14 +134,17 @@ impl App {
             });
         }
 
+        let bg_fill = theme_bg_color(&theme_name);
         Self {
             agent,
             config,
-            theme: Theme::dark(),
+            theme,
+            theme_name,
+            bg_fill,
             tx,
             input,
             is_command_mode: false,
-            suggestion: None,
+            completions: CompletionState::new(),
             chat,
             is_thinking: false,
             spinner_frame: 0,
@@ -263,6 +255,12 @@ impl App {
             return UpdateResult::Continue;
         }
 
+        // Ctrl+T cycles the color theme.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.cycle_theme();
+            return UpdateResult::Continue;
+        }
+
         // Scroll keys
         match key.code {
             KeyCode::PageUp => {
@@ -315,10 +313,52 @@ impl App {
             _ => {}
         }
 
-        // Esc cancels streaming, closes panels, or clears suggestion.
+        // Completion popup intercept (before textarea and before existing Enter/Tab).
+        if self.completions.visible {
+            match key.code {
+                KeyCode::Up => {
+                    self.completions.move_up();
+                    return UpdateResult::Continue;
+                }
+                KeyCode::Down => {
+                    self.completions.move_down();
+                    return UpdateResult::Continue;
+                }
+                KeyCode::Tab => {
+                    if let Some(cmd) = self.completions.selected_command() {
+                        let cmd = cmd.to_string();
+                        self.input.select_all();
+                        self.input.cut();
+                        self.input.insert_str(&cmd);
+                    }
+                    self.completions.close();
+                    return UpdateResult::Continue;
+                }
+                KeyCode::Enter => {
+                    if let Some(cmd) = self.completions.selected_command() {
+                        let cmd = cmd.to_string();
+                        self.input.select_all();
+                        self.input.cut();
+                        self.input.insert_str(&cmd);
+                    }
+                    self.completions.close();
+                    // Fall through to the existing Enter handler.
+                }
+                KeyCode::Esc => {
+                    self.completions.close();
+                    return UpdateResult::Continue;
+                }
+                _ => {
+                    // Let the key go through to the textarea below.
+                    // update_completions() will run after input.input(key).
+                }
+            }
+        }
+
+        // Esc cancels streaming, closes panels, or closes completion.
         if key.code == KeyCode::Esc {
-            if self.suggestion.is_some() {
-                self.suggestion = None;
+            if self.completions.visible {
+                self.completions.close();
                 return UpdateResult::Continue;
             }
             if self.is_thinking {
@@ -334,28 +374,15 @@ impl App {
             return UpdateResult::Continue;
         }
 
-        // Tab accepts the current suggestion or cycles to next match.
+        // Tab accepts the selected completion (popup already handled above when visible).
         if key.code == KeyCode::Tab {
-            let current_text = self.input.lines().first().map(|s| s.as_str()).unwrap_or("");
-            if current_text.starts_with('/') {
-                if let Some(ref suggestion) = self.suggestion.clone() {
-                    // Accept the suggestion: replace input content.
-                    self.input.select_all();
-                    self.input.cut();
-                    self.input.insert_str(suggestion);
-                    self.suggestion = None;
-                    self.update_suggestion();
-                } else {
-                    self.update_suggestion();
-                }
-            }
             return UpdateResult::Continue;
         }
 
         // Enter sends the current input.  Intercept before textarea so
         // Enter does not insert a newline into the buffer.
         if key.code == KeyCode::Enter && !self.is_thinking {
-            self.suggestion = None;
+            self.completions.close();
             let lines: Vec<String> = self.input.lines().iter().map(|s| s.to_string()).collect();
             let text = lines.join("\n").trim().to_string();
             if text.is_empty() {
@@ -414,31 +441,60 @@ impl App {
             return UpdateResult::Continue;
         }
 
-        // Forward everything else to the text area, then refresh suggestion.
+        // Forward everything else to the text area, then refresh completions.
         self.input.input(key);
-        self.update_suggestion();
+        self.update_completions();
         UpdateResult::Continue
     }
 
-    /// Compute a slash command suggestion based on current input.
-    fn update_suggestion(&mut self) {
-        let current = self
+    /// Update the completion popup based on current input text.
+    fn update_completions(&mut self) {
+        let text = self
             .input
             .lines()
             .first()
             .map(|s| s.to_string())
             .unwrap_or_default();
-        if !current.starts_with('/') || current.len() < 2 {
-            self.suggestion = None;
-            self.is_command_mode = current.starts_with('/');
+
+        // Only show popup when "/" is first char and no space yet (not typing args).
+        if !text.starts_with('/') || text.contains(' ') {
+            self.completions.close();
+            self.is_command_mode = text.starts_with('/');
             return;
         }
+
         self.is_command_mode = true;
-        let prefix = current.to_lowercase();
-        self.suggestion = SLASH_COMMANDS
+        let prefix = text.to_lowercase();
+
+        self.completions.items = SLASH_COMMANDS
             .iter()
-            .find(|cmd| cmd.starts_with(&prefix) && **cmd != prefix)
-            .map(|cmd| cmd.to_string());
+            .filter(|cmd| cmd.name.starts_with(&prefix))
+            .collect();
+
+        if self.completions.items.is_empty() {
+            self.completions.visible = false;
+        } else {
+            self.completions.visible = true;
+            self.completions.selected = self
+                .completions
+                .selected
+                .min(self.completions.items.len().saturating_sub(1));
+        }
+    }
+
+    /// Cycle to the next color theme.
+    fn cycle_theme(&mut self) {
+        let current_idx = THEME_NAMES
+            .iter()
+            .position(|n| *n == self.theme_name)
+            .unwrap_or(0);
+        let next_idx = (current_idx + 1) % THEME_NAMES.len();
+        self.theme_name = THEME_NAMES[next_idx].to_string();
+        if let Some(theme) = resolve_theme(&self.theme_name) {
+            self.theme = theme;
+        }
+        self.bg_fill = theme_bg_color(&self.theme_name);
+        self.add_toast(&format!("Theme: {}", self.theme_name));
     }
 
     fn handle_stream_chunk(&mut self, chunk: StreamChunk) {
@@ -692,16 +748,21 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         let size = frame.area();
 
-        // Vertical: title bar | content | input | suggestion | hint bar
+        // For RGB themes, fill the entire alternate screen with the theme background
+        // before any widgets are drawn. ANSI themes (dark, light) leave bg_fill as
+        // None and defer to the terminal's native background color.
+        if let Some(bg) = self.bg_fill {
+            frame.buffer_mut().set_style(size, Style::default().bg(bg));
+        }
+
+        // Vertical: title bar | content | input | hint bar
         let input_height = 3u16;
-        let suggestion_height = if self.suggestion.is_some() { 1 } else { 0 };
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
                 Constraint::Min(5),
                 Constraint::Length(input_height),
-                Constraint::Length(suggestion_height),
                 Constraint::Length(1),
             ])
             .split(size);
@@ -735,14 +796,15 @@ impl App {
         input_block.render(main_chunks[2], frame.buffer_mut());
         frame.render_widget(&self.input, input_inner);
 
-        // Suggestion line (Tab to accept)
-        if let Some(ref suggestion) = self.suggestion {
-            let sug_line = Line::from(vec![
-                Span::styled("  Tab -> ", self.theme.hint_style),
-                Span::styled(suggestion.as_str(), self.theme.system_style),
-            ]);
-            let p = Paragraph::new(sug_line);
-            p.render(main_chunks[3], frame.buffer_mut());
+        // Completion popup (overlay above input).
+        if self.completions.visible {
+            render_completions(
+                main_chunks[2],
+                size,
+                frame.buffer_mut(),
+                &self.completions,
+                &self.theme,
+            );
         }
 
         // Hint bar
@@ -750,7 +812,7 @@ impl App {
             is_command_mode: self.is_command_mode,
             panels_enabled: true,
         };
-        render_hint_bar(main_chunks[4], frame.buffer_mut(), &hint_state, &self.theme);
+        render_hint_bar(main_chunks[3], frame.buffer_mut(), &hint_state, &self.theme);
 
         // Modal overlay
         if let Some(ref modal) = self.modal {

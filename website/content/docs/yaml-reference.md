@@ -123,6 +123,7 @@ metadata:
     streaming: true
     prompt_style: with_state   # simple | with_state
     disable_builtin_commands: false
+    theme: one-dark            # dark | light | one-dark | catppuccin-mocha | dracula | tokyo-night | vscode-dark | nord | gruvbox-dark | one-half-light | github-light
     hitl:
       style: prompt            # prompt | auto_approve | auto_reject
       show_context: true

@@ -12,6 +12,7 @@ pub struct ResolvedCliMetadata {
     pub prompt_style: Option<CliPromptStyle>,
     pub disable_builtin_commands: Option<bool>,
     pub hitl: Option<CliHitlMetadata>,
+    pub theme: Option<String>,
 }
 
 impl ResolvedCliMetadata {
@@ -42,6 +43,7 @@ impl ResolvedCliMetadata {
                 .disable_builtin_commands
                 .or(self.disable_builtin_commands),
             hitl: overrides.hitl.or(self.hitl),
+            theme: overrides.theme.or(self.theme),
         }
     }
 }
@@ -58,6 +60,7 @@ impl From<CliMetadata> for ResolvedCliMetadata {
             prompt_style: value.prompt_style,
             disable_builtin_commands: value.disable_builtin_commands,
             hitl: value.hitl,
+            theme: value.theme,
         }
     }
 }
@@ -73,6 +76,7 @@ pub struct CliOverrides {
     pub prompt_style: Option<CliPromptStyle>,
     pub disable_builtin_commands: Option<bool>,
     pub hitl: Option<CliHitlMetadata>,
+    pub theme: Option<String>,
 }
 
 #[cfg(test)]
@@ -149,6 +153,7 @@ mod tests {
             prompt_style: Some(CliPromptStyle::Simple),
             disable_builtin_commands: Some(false),
             hitl: None,
+            theme: None,
         };
 
         let overrides = CliOverrides {
@@ -161,6 +166,7 @@ mod tests {
             prompt_style: Some(CliPromptStyle::WithState),
             disable_builtin_commands: Some(true),
             hitl: None,
+            theme: None,
         };
 
         let merged = base.merge_overrides(overrides);
@@ -186,6 +192,7 @@ mod tests {
             prompt_style: Some(CliPromptStyle::WithState),
             disable_builtin_commands: Some(false),
             hitl: None,
+            theme: None,
         };
 
         let merged = base.clone().merge_overrides(CliOverrides::default());

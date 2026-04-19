@@ -31,6 +31,9 @@ pub struct CliMetadata {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hitl: Option<CliHitlMetadata>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
