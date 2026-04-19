@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.9** — Under active development. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.10** — Under active development. APIs and YAML schema may change between minor versions.
 
 ## Features
 
@@ -41,7 +41,7 @@ See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.9"
+ai-agents = "1.0.0-rc.10"
 ```
 
 ## Quick Start
@@ -126,7 +126,7 @@ See the [examples/](examples/) directory for more.
 
 ```sh
 # Install from crates.io
-cargo install ai-agents-cli --version 1.0.0-rc.9
+cargo install ai-agents-cli --version 1.0.0-rc.10
 
 # Or run directly from source
 cargo run -p ai-agents-cli -- run agent.yaml

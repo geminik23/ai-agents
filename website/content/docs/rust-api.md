@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.9"
+ai-agents = "1.0.0-rc.10"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,7 +35,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0.0-rc.9", features = ["full"] }
+ai-agents = { version = "1.0.0-rc.10", features = ["full"] }
 ```
 
 ---
@@ -576,10 +576,10 @@ Session persistence requires a storage backend. Enable one via feature flags:
 
 ```toml
 # SQLite (file-based, good for single-server)
-ai-agents = { version = "1.0.0-rc.9", features = ["sqlite"] }
+ai-agents = { version = "1.0.0-rc.10", features = ["sqlite"] }
 
 # Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.9", features = ["redis-storage"] }
+ai-agents = { version = "1.0.0-rc.10", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -614,7 +614,7 @@ agent.load_from(storage.as_ref(), "my-session").await?;
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.9)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.10)**
 
 ---
 

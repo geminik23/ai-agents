@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.0.0-rc.10
+
+### Added
+- TUI: ratatui alternate-screen interface starts automatically on interactive terminals; use --plain to force the line REPL
+- TUI status bar: agent name, version, current state, token budget percentage, and thinking spinner
+- TUI side panels toggled with F1-F8: Help (commands), States (machine visualization), Memory (token budget), Context (values), Tools (last call), Persona (identity), Facts, Agents (spawned registry)
+- TUI HITL modal: approval requests appear as an overlay dialog so the user can approve or reject without leaving the chat
+- TUI streaming: tokens appear in real time with tool calls and state transitions shown inline in the chat
+- TUI log rendering: tracing events captured and shown as dim cards in the chat timeline instead of writing raw text to the terminal
+- TUI themes: 11 color themes (dark, light, one-dark, catppuccin-mocha, dracula, tokyo-night, vscode-dark, nord, gruvbox-dark, one-half-light, github-light) selectable via --theme flag, metadata.cli.theme YAML field, or Ctrl+T cycling at runtime
+- TUI command completion: typing / opens a floating popup listing all slash commands with descriptions; Tab fills, Enter executes, Up/Down navigates
+- CLI --context and --context-file flags: inject runtime context values at startup without writing Rust code
+- REPL /context set and /context unset commands: modify context values during a session
+- REPL /info command: shows agent name, version, skill count, and current state
+
+### Changed
+- TUI startup hints displayed as a grouped block with > prefix markers and distinct italic styling, separate from system messages
+- TUI default tracing level is WARN in TUI mode; set RUST_LOG=info for verbose output
+- RGB themes fill the terminal background with their own color for consistent appearance across terminals; ANSI themes (dark, light) defer to the terminal's native background
+
+### Fixed
+- TUI log corruption: tracing output no longer writes raw bytes into the alternate screen in TUI mode
+- TUI input area: typed text clears correctly after pressing Enter instead of persisting on screen
+- TUI agent responses: consecutive blank lines from LLM paragraph breaks are stripped; blank line separators appear only when the message role changes
+
+
+---
+
 ## 1.0.0-rc.9
 
 ### Added
