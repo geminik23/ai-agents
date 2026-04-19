@@ -22,6 +22,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.7** | Dynamic agent spawning - runtime agent creation, registry, template system |
 | **rc.8** | Multi-agent orchestration - router, pipeline, concurrent, group chat, handoff patterns |
 | **rc.9** | Agent persona - structured identity, evolution, secrets, templates; dot-path refactor |
+| **rc.10** | CLI context injection (`--context`, `--context-file`, `--plain`) and ratatui TUI with side panels, streaming, themes |
 
 ---
 
@@ -54,6 +55,7 @@ Every planned feature and its current status. Features are independent unless no
 | **Dynamic Agent Spawning** | Runtime agent creation from YAML/templates, agent registry, parent-to-child messaging | ✅ Done (rc.7) |
 | **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | ✅ Done (rc.8) |
 | **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals, secrets | ✅ Done (rc.9) |
+| **CLI Context Injection + TUI** | Runtime context injection (--context, --context-file), ratatui-based TUI with side panels, --plain fallback, streaming render | ✅ Done (rc.10) |
 | **Session Management + Key Facts** | Persistent user context and key facts across sessions | Planned |
 | **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |

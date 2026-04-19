@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ pub struct RunOptions {
     pub show_state: Option<bool>,
     pub show_timing: Option<bool>,
     pub no_builtins: bool,
+    pub contexts: Vec<String>,
+    pub context_file: Option<PathBuf>,
+    pub plain: bool,
 }
 
 impl RunOptions {
@@ -36,6 +40,9 @@ impl RunOptions {
             show_state: args.show_state.then_some(true),
             show_timing: args.show_timing.then_some(true),
             no_builtins: args.no_builtins,
+            contexts: args.contexts.clone(),
+            context_file: args.context_file.clone(),
+            plain: args.plain,
         }
     }
 
@@ -71,13 +78,64 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
         .merge_overrides(options.to_overrides());
 
     let agent = build_agent(&options.agent_path).await?;
+
+    // Inject context from --context and --context-file
+    inject_context(&agent, &options)?;
+
     let config = resolve_cli_config(&spec, &metadata);
 
-    CliRepl::new(agent)
-        .with_config(config)
-        .run()
-        .await
-        .context("failed to run interactive session")
+    // Dispatch: plain REPL for piped/--plain, TUI for interactive TTY.
+    if options.plain || !std::io::stdout().is_terminal() {
+        CliRepl::new(agent)
+            .with_config(config)
+            .run()
+            .await
+            .context("failed to run interactive session")
+    } else {
+        crate::tui::run_tui(agent, config)
+            .await
+            .context("failed to run TUI session")
+    }
+}
+
+/// Parse "key=value" where key supports dotted paths and value is auto-typed.
+fn parse_context_pair(pair: &str) -> Result<(String, serde_json::Value)> {
+    let (key, raw_value) = pair
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("expected key=value, got: {}", pair))?;
+    let value = serde_json::from_str(raw_value)
+        .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()));
+    Ok((key.to_string(), value))
+}
+
+/// Inject context values from --context flags and --context-file into the agent.
+fn inject_context(agent: &RuntimeAgent, options: &RunOptions) -> Result<()> {
+    // Load context file first (--context overrides file values).
+    if let Some(ref path) = options.context_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read context file: {}", path.display()))?;
+        let obj: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse context file as JSON: {}", path.display()))?;
+        if let serde_json::Value::Object(map) = obj {
+            for (key, value) in map {
+                agent
+                    .set_context(&key, value)
+                    .with_context(|| format!("failed to set context key: {}", key))?;
+            }
+        } else {
+            anyhow::bail!("context file must contain a JSON object at the top level");
+        }
+    }
+
+    // Then apply --context pairs (overrides file values on conflict).
+    for pair in &options.contexts {
+        let (key, value) = parse_context_pair(pair)?;
+        agent
+            .set_context(&key, value)
+            .with_context(|| format!("failed to set context: {}", pair))?;
+    }
+
+    Ok(())
 }
 
 pub async fn validate_agent(path: &Path) -> Result<()> {

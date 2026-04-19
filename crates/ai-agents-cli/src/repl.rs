@@ -5,6 +5,7 @@ use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
 use ai_agents::spec::AgentSpec;
 use ai_agents::{Agent, AgentResponse, RuntimeAgent, StreamChunk};
 use futures::StreamExt;
+use serde_json;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplMode {
@@ -254,6 +255,10 @@ impl CliRepl {
             self.handle_delete(input).await;
             return Some(CommandAction::Continue);
         }
+        if lower.starts_with("/context") {
+            self.handle_context(input).await;
+            return Some(CommandAction::Continue);
+        }
 
         match lower.as_str() {
             "/quit" | "/exit" => Some(CommandAction::Quit),
@@ -337,7 +342,86 @@ impl CliRepl {
         println!("  /load agent <id>     Load one spawned agent's session");
         println!("  /sessions            List saved sessions");
         println!("  /delete <name>       Delete a saved session");
+        println!("  /context             Show current context values");
+        println!("  /context set <k> <v> Set a context value");
+        println!("  /context unset <k>   Remove a context value");
         println!();
+    }
+
+    async fn handle_context(&self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+            None => {
+                let ctx = self.agent.get_context();
+                if ctx.is_empty() {
+                    println!("\n  (no context values)\n");
+                    return;
+                }
+                println!();
+                let mut keys: Vec<&String> = ctx.keys().collect();
+                keys.sort();
+                for key in keys {
+                    let value = &ctx[key];
+                    match value {
+                        serde_json::Value::Object(map) => {
+                            println!("  {}:", key);
+                            let mut subkeys: Vec<&String> = map.keys().collect();
+                            subkeys.sort();
+                            for sk in subkeys {
+                                let sv = &map[sk];
+                                let display = match sv {
+                                    serde_json::Value::String(s) => format!("\"{}\"", s),
+                                    other => other.to_string(),
+                                };
+                                println!("    {}: {}", sk, display);
+                            }
+                        }
+                        serde_json::Value::String(s) => println!("  {}: \"{}\"", key, s),
+                        other => println!("  {}: {}", key, other),
+                    }
+                }
+                println!();
+            }
+            Some("set") => {
+                let key = match parts.get(2) {
+                    Some(k) => *k,
+                    None => {
+                        eprintln!("Usage: /context set <key> <value>");
+                        return;
+                    }
+                };
+                let raw_value = parts[3..].join(" ");
+                if raw_value.is_empty() {
+                    eprintln!("Usage: /context set <key> <value>");
+                    return;
+                }
+                let value: serde_json::Value = serde_json::from_str(&raw_value)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw_value));
+                match self.agent.set_context(key, value) {
+                    Ok(()) => println!("  Set: {}", key),
+                    Err(e) => eprintln!("[Error] Failed to set context: {}", e),
+                }
+            }
+            Some("unset") => {
+                let key = match parts.get(2) {
+                    Some(k) => *k,
+                    None => {
+                        eprintln!("Usage: /context unset <key>");
+                        return;
+                    }
+                };
+                match self.agent.remove_context(key) {
+                    Some(_) => println!("  Removed: {}", key),
+                    None => println!("  Key not found: {}", key),
+                }
+            }
+            Some(other) => {
+                eprintln!(
+                    "Unknown context command: {}. Use: /context, /context set, /context unset",
+                    other
+                );
+            }
+        }
     }
 
     // Session persistence commands

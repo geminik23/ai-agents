@@ -61,15 +61,18 @@ Parses and validates the YAML spec. Returns exit code `0` on success, `1` on fai
 
 ## Run Options
 
-| Flag              | Description                                          |
-| ----------------- | ---------------------------------------------------- |
-| `--stream`        | Stream tokens to the terminal as they arrive         |
-| `--show-tools`    | Print tool calls and their results                   |
-| `--show-state`    | Display the current state in the prompt and show transitions |
-| `--show-timing`   | Show elapsed time for each LLM response              |
-| `--no-builtins`   | Disable built-in REPL slash commands                 |
-| `--welcome <msg>` | Override the YAML metadata welcome message           |
-| `--hint <text>`   | Add a startup hint (can be repeated)                 |
+| Flag                      | Description                                                  |
+| ------------------------- | ------------------------------------------------------------ |
+| `--stream`                | Stream tokens to the terminal as they arrive                 |
+| `--show-tools`            | Print tool calls and their results                           |
+| `--show-state`            | Display the current state in the prompt and show transitions |
+| `--show-timing`           | Show elapsed time for each LLM response                     |
+| `--no-builtins`           | Disable built-in REPL slash commands                         |
+| `--welcome <msg>`         | Override the YAML metadata welcome message                   |
+| `--hint <text>`           | Add a startup hint (can be repeated)                         |
+| `--context <KEY=VALUE>`   | Inject a runtime context value (repeatable, supports dotted paths) |
+| `--context-file <PATH>`   | Load runtime context from a JSON file                        |
+| `--plain`                 | Force plain line REPL even on interactive TTY                |
 
 ### Examples
 
@@ -99,6 +102,46 @@ ai-agents-cli run agent.yaml --welcome "Welcome to the demo!" --hint "Try: hello
 
 ---
 
+## Context Injection
+
+Agents that declare `context.user.type: runtime` need context values at startup.
+The CLI provides two ways to inject them.
+
+### Via command-line flags
+
+```sh
+# String values
+ai-agents-cli run agent.yaml --context user.id=customer_123 --context user.name=Jane
+
+# Numeric and boolean values (auto-detected)
+ai-agents-cli run agent.yaml --context user.tier=3 --context user.verified=true
+
+# JSON object value
+ai-agents-cli run agent.yaml --context 'player={"id":"p1","name":"Hero"}'
+```
+
+### Via JSON file
+
+```sh
+ai-agents-cli run agent.yaml --context-file ./test_context.json
+```
+
+The JSON file must contain a top-level object:
+
+```json
+{
+  "user": {
+    "id": "customer_123",
+    "name": "Jane",
+    "language": "ko"
+  }
+}
+```
+
+Both flags can be combined. `--context` values override `--context-file` values when keys conflict.
+
+---
+
 ## REPL Commands
 
 Once inside the REPL, these slash commands are available (unless `--no-builtins` is set):
@@ -111,6 +154,9 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 | `/history`           | Show state transition history                                        |
 | `/info`              | Show agent name, version, skills, spawned agents                     |
 | `/memory`, `/mem`    | Show memory status and token budget                                  |
+| `/context`           | Show all current context values                                      |
+| `/context set <key> <value>` | Set a runtime context value                                  |
+| `/context unset <key>` | Remove a context value                                             |
 | `/save [name]`       | Save session (parent + all spawned agents). Default name: `default`  |
 | `/save self [name]`  | Save parent session only                                             |
 | `/save agent <id>`   | Save one spawned agent's session                                     |
@@ -122,6 +168,67 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 | `/quit`, `/exit`     | Exit the REPL                                                        |
 
 `/quit` and `/exit` always work, even when builtins are disabled.
+
+---
+
+## TUI Mode
+
+When running on an interactive terminal, the CLI launches a ratatui-based TUI with an alternate-screen interface.
+Use `--plain` to skip the TUI and use the traditional line REPL instead.
+
+### Layout
+
+The TUI has four zones:
+
+- **Status bar** (top) - agent name, version, current state, token budget percentage, thinking spinner
+- **Chat area** (center) - scrollable message history with role-colored output
+- **Input area** (bottom) - multi-line text input
+- **Hint bar** (bottom line) - key bindings and contextual hints
+
+### Side Panels
+
+Toggle side panels with function keys:
+
+| Key  | Panel   | Content |
+| ---- | ------- | ------- |
+| `F1` | Help    | Key bindings and command reference |
+| `F2` | States  | State machine visualization |
+| `F3` | Memory  | Token budget breakdown and compression stats |
+| `F4` | Context | Current context values |
+| `F5` | Tools   | Available tools and last call result |
+| `F6` | Persona | Agent persona identity, traits, goals |
+| `F7` | Facts   | Key facts (available after session management feature) |
+| `F8` | Agents  | Spawned agents and orchestration status |
+
+Press the same key again to close a panel. Press `Esc` to close all panels.
+
+### Key Bindings
+
+| Key             | Action |
+| --------------- | ------ |
+| `Enter`         | Send message |
+| `Ctrl+C`        | Quit |
+| `Ctrl+L`        | Clear chat display |
+| `Ctrl+S`        | Quick save session |
+| `PageUp/Down`   | Scroll chat history |
+| `Esc`           | Cancel streaming or close panels |
+| `F1` - `F8`     | Toggle side panels |
+| `/`             | Start a slash command |
+
+### Streaming
+
+When `--stream` is enabled, tokens appear in real time in the chat area.
+Tool calls and state transitions are displayed inline as they happen.
+
+### Plain Mode Fallback
+
+The plain REPL is used automatically when stdout is not a terminal (piped input, CI).
+Force it with `--plain`:
+
+```sh
+ai-agents-cli run agent.yaml --plain
+echo "hello" | ai-agents-cli run agent.yaml --plain
+```
 
 ---
 
@@ -208,6 +315,9 @@ When `--show-state` is active, the prompt changes to show the current state:
 [working] You > done
 [idle] You >
 ```
+
+> **Tip:** In TUI mode, the same commands work as slash commands in the input area.
+> Press `F1` for the help panel with all key bindings.
 
 ---
 

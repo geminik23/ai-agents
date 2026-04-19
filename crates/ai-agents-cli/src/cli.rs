@@ -54,6 +54,18 @@ pub struct RunArgs {
     /// Add an extra startup hint (can be repeated)
     #[arg(long = "hint")]
     pub hints: Vec<String>,
+
+    /// Inject a runtime context value as key=value (repeatable, supports dotted paths)
+    #[arg(long = "context", value_name = "KEY=VALUE")]
+    pub contexts: Vec<String>,
+
+    /// Inject runtime context from a JSON file
+    #[arg(long = "context-file", value_name = "PATH")]
+    pub context_file: Option<PathBuf>,
+
+    /// Force plain line REPL (skip TUI even on interactive TTY)
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub plain: bool,
 }
 
 #[derive(Debug, Clone, Parser)]

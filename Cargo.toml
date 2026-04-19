@@ -77,3 +77,8 @@ ai-agents-persona = { path = "crates/ai-agents-persona", version = "1.0.0-rc.9" 
 ai-agents-template = { path = "crates/ai-agents-template", version = "1.0.0-rc.9" }
 ai-agents-runtime = { path = "crates/ai-agents-runtime", version = "1.0.0-rc.9" }
 ai-agents = { path = "crates/ai-agents", version = "1.0.0-rc.9" }
+
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-textarea = "0.7"
+dirs = "6"

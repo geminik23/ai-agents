@@ -3,6 +3,7 @@ pub mod cli;
 pub mod metadata;
 pub mod repl;
 pub mod run;
+pub mod tui;
 
 pub use approval::CliApprovalHandler;
 pub use cli::{Cli, Command, RunArgs, ValidateArgs};

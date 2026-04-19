@@ -75,6 +75,10 @@ impl ContextManager {
         Ok(())
     }
 
+    pub fn remove(&self, key: &str) -> Option<Value> {
+        self.values.write().remove(key)
+    }
+
     pub fn get(&self, key: &str) -> Option<Value> {
         self.values.read().get(key).cloned()
     }

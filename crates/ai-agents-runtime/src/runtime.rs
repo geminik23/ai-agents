@@ -423,6 +423,10 @@ impl RuntimeAgent {
         self.context_manager.get_all()
     }
 
+    pub fn remove_context(&self, key: &str) -> Option<Value> {
+        self.context_manager.remove(key)
+    }
+
     pub async fn refresh_context(&self, key: &str) -> Result<()> {
         self.context_manager.refresh(key).await
     }
