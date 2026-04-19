@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod event;
+pub mod log_layer;
 pub mod theme;
 pub mod widgets;
 
@@ -20,7 +21,7 @@ use crossterm::terminal::{
 use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
 
 use ai_agents::RuntimeAgent;
 
@@ -28,24 +29,29 @@ use crate::repl::CliReplConfig;
 
 use self::app::{App, UpdateResult};
 use self::event::AppMessage;
+use self::log_layer::TuiLogLayer;
 
 /// Run the ratatui TUI event loop.
 pub async fn run_tui(agent: RuntimeAgent, config: CliReplConfig) -> Result<()> {
-    // Replace the global tracing subscriber with one that writes to stderr
-    // so log output does not corrupt the alternate screen.
-    let stderr_subscriber = tracing_subscriber::fmt()
-        .with_writer(std::io::stderr.with_max_level(tracing::Level::WARN))
-        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "ai_agents=warn".to_string()))
-        .finish();
-    let _guard = tracing::subscriber::set_default(stderr_subscriber);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppMessage>();
+
+    // Install a global tracing subscriber that captures logs into the TUI channel.
+    // This must happen BEFORE enable_raw_mode so no fmt subscriber ever writes to the terminal.
+    // Default to WARN to avoid flooding the chat with per-turn INFO lines.
+    let log_level = std::env::var("RUST_LOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(tracing::Level::WARN);
+    let log_layer = TuiLogLayer::new(tx.clone(), log_level);
+    let subscriber = tracing_subscriber::registry().with(log_layer);
+    let _ = tracing::subscriber::set_global_default(subscriber);
 
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
-
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AppMessage>();
+    terminal.clear().context("failed to clear terminal")?;
 
     // Spawn async terminal event reader using crossterm event-stream.
     let tx_keys = tx.clone();

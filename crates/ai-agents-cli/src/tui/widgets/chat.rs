@@ -13,6 +13,8 @@ pub enum Role {
     User,
     Agent,
     System,
+    Log,
+    Hint,
 }
 
 /// A single message for display.
@@ -54,14 +56,25 @@ impl ChatState {
             return 0;
         }
         let mut total: u16 = 0;
-        for msg in &self.messages {
+        for (i, msg) in self.messages.iter().enumerate() {
+            // Blank separator line on role change.
+            if i > 0 && self.messages[i - 1].role != msg.role {
+                total += 1;
+            }
             total += message_lines(msg, w, self.show_tool_calls, self.show_timing);
-            total += 1;
         }
         if let Some(ref sc) = self.streaming_content {
+            // Separator before streaming if last message is not Agent.
+            if self
+                .messages
+                .last()
+                .map(|m| m.role != Role::Agent)
+                .unwrap_or(false)
+            {
+                total += 1;
+            }
             let line = format!("Agent: {}", sc);
             total += (line.len() as u16 / w as u16) + 1;
-            total += 1;
         }
         total
     }
@@ -79,11 +92,13 @@ fn message_lines(msg: &DisplayMessage, width: usize, show_tools: bool, show_timi
         Role::User => 5,
         Role::Agent => 7,
         Role::System => 0,
+        Role::Log => 0,
+        Role::Hint => 3,
     };
-    // Count actual content lines including newlines in the message.
-    let content_lines = msg.content.split('\n').count() as u16;
-    let first_line_len = prefix_len + msg.content.split('\n').next().map(|s| s.len()).unwrap_or(0);
-    // Approximate wrap lines for the first line.
+    let clean = strip_quotes(&msg.content);
+    let trimmed = clean.trim_end_matches('\n');
+    let content_lines = trimmed.split('\n').count() as u16;
+    let first_line_len = prefix_len + trimmed.split('\n').next().map(|s| s.len()).unwrap_or(0);
     let wrap_extra = if width > 0 {
         (first_line_len / width) as u16
     } else {
@@ -123,18 +138,35 @@ pub fn render_chat(area: Rect, buf: &mut Buffer, state: &ChatState, theme: &Them
 
     let mut lines: Vec<Line> = Vec::new();
 
-    for msg in &state.messages {
+    for (msg_idx, msg) in state.messages.iter().enumerate() {
+        // Blank separator line only on role change.
+        if msg_idx > 0 && state.messages[msg_idx - 1].role != msg.role {
+            lines.push(Line::from(""));
+        }
+
         let (prefix, style) = match msg.role {
             Role::User => ("You: ", theme.user_style),
             Role::Agent => ("Agent: ", theme.agent_style),
             Role::System => ("", theme.system_style),
+            Role::Log => ("", theme.log_style),
+            Role::Hint => (" > ", theme.hint_text_style),
         };
 
-        // Split content on newlines so multi-line messages render correctly.
+        // Trim trailing newlines so they don't stack with separator lines.
         let clean_content = strip_quotes(&msg.content);
-        let content_lines: Vec<&str> = clean_content.split('\n').collect();
+        let trimmed_content = clean_content.trim_end_matches('\n');
+        let content_lines: Vec<&str> = trimmed_content.split('\n').collect();
+
+        // For Hint role, repeat the prefix on every line instead of indenting.
+        let repeat_prefix = msg.role == Role::Hint;
 
         for (i, line_text) in content_lines.iter().enumerate() {
+            // Skip blank lines within message content.
+            // Role-change separators handle spacing between messages.
+            if line_text.trim().is_empty() {
+                continue;
+            }
+
             if i == 0 && !prefix.is_empty() {
                 // First line gets the role prefix.
                 lines.push(Line::from(vec![
@@ -142,8 +174,14 @@ pub fn render_chat(area: Rect, buf: &mut Buffer, state: &ChatState, theme: &Them
                     Span::styled(*line_text, style),
                 ]));
             } else if i == 0 {
-                // System messages have no prefix.
+                // System/log messages have no prefix.
                 lines.push(Line::from(Span::styled(*line_text, style)));
+            } else if repeat_prefix {
+                // Hint lines repeat the prefix on every line.
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, style.add_modifier(Modifier::BOLD)),
+                    Span::styled(*line_text, style),
+                ]));
             } else {
                 // Continuation lines indented to align with content.
                 let indent = " ".repeat(prefix.len());
@@ -170,14 +208,27 @@ pub fn render_chat(area: Rect, buf: &mut Buffer, state: &ChatState, theme: &Them
                 lines.push(Line::from(Span::styled(timing, theme.hint_style)));
             }
         }
-
-        lines.push(Line::from(""));
     }
 
     if let Some(ref content) = state.streaming_content {
-        // Streaming content can also contain newlines.
-        let stream_lines: Vec<&str> = content.split('\n').collect();
+        // Separator before streaming content on role change.
+        if state
+            .messages
+            .last()
+            .map(|m| m.role != Role::Agent)
+            .unwrap_or(false)
+        {
+            lines.push(Line::from(""));
+        }
+
+        // Trim trailing newlines from streaming content too.
+        let trimmed = content.trim_end_matches('\n');
+        let stream_lines: Vec<&str> = trimmed.split('\n').collect();
         for (i, line_text) in stream_lines.iter().enumerate() {
+            if line_text.trim().is_empty() {
+                continue;
+            }
+
             if i == 0 {
                 lines.push(Line::from(vec![
                     Span::styled("Agent: ", theme.agent_style.add_modifier(Modifier::BOLD)),
@@ -191,7 +242,6 @@ pub fn render_chat(area: Rect, buf: &mut Buffer, state: &ChatState, theme: &Them
                 ]));
             }
         }
-        lines.push(Line::from(""));
     }
 
     let text = Text::from(lines);

@@ -28,6 +28,8 @@ pub struct Theme {
     pub budget_high: Style,
     pub spinner_style: Style,
     pub toast_style: Style,
+    pub log_style: Style,
+    pub hint_text_style: Style,
 }
 
 impl Default for Theme {
@@ -68,6 +70,10 @@ impl Theme {
             budget_high: Style::default().fg(Color::Red),
             spinner_style: Style::default().fg(Color::Cyan),
             toast_style: Style::default().fg(Color::Black).bg(Color::Yellow),
+            log_style: Style::default().fg(Color::DarkGray),
+            hint_text_style: Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::ITALIC),
         }
     }
 
@@ -102,6 +108,10 @@ impl Theme {
             budget_high: Style::default().fg(Color::Red),
             spinner_style: Style::default().fg(Color::Blue),
             toast_style: Style::default().fg(Color::White).bg(Color::Blue),
+            log_style: Style::default().fg(Color::Gray),
+            hint_text_style: Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::ITALIC),
         }
     }
 

@@ -5,6 +5,8 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use tracing::Level;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -132,10 +134,11 @@ impl App {
             });
         }
 
-        for hint in &config.hints {
+        if !config.hints.is_empty() {
+            let grouped = config.hints.join("\n");
             chat.messages.push(DisplayMessage {
-                role: Role::System,
-                content: hint.clone(),
+                role: Role::Hint,
+                content: grouped,
                 tools: Vec::new(),
                 state_transition: None,
                 timing_ms: None,
@@ -212,6 +215,27 @@ impl App {
                     toast.tick();
                 }
                 self.toasts.retain(|t| !t.is_expired());
+                UpdateResult::Continue
+            }
+            AppMessage::Log(entry) => {
+                let level_tag = match entry.level {
+                    Level::ERROR => "[ERROR",
+                    Level::WARN => "[WARN ",
+                    Level::INFO => "[INFO ",
+                    Level::DEBUG => "[DEBUG",
+                    Level::TRACE => "[TRACE",
+                };
+                let short_target = entry.target.rsplit("::").next().unwrap_or(&entry.target);
+                let content = format!("{} {}] {}", level_tag, short_target, entry.message);
+
+                self.chat.messages.push(DisplayMessage {
+                    role: Role::Log,
+                    content,
+                    tools: Vec::new(),
+                    state_transition: None,
+                    timing_ms: None,
+                });
+                self.chat.auto_scroll = true;
                 UpdateResult::Continue
             }
         }

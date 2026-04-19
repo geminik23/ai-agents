@@ -6,6 +6,8 @@ use crossterm::event::KeyEvent;
 
 use ai_agents::{AgentResponse, StreamChunk};
 
+use super::log_layer::LogEntry;
+
 /// Messages from all async sources into the main event loop.
 #[derive(Debug)]
 pub enum AppMessage {
@@ -20,4 +22,7 @@ pub enum AppMessage {
 
     // Background
     Tick,
+
+    // Captured tracing output
+    Log(LogEntry),
 }

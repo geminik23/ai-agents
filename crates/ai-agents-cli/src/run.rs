@@ -68,7 +68,10 @@ impl RunOptions {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         CliCommand::Run(args) => run_agent(RunOptions::from_run_args(&args)).await,
-        CliCommand::Validate(args) => validate_agent(&args.agent).await,
+        CliCommand::Validate(args) => {
+            crate::init_tracing();
+            validate_agent(&args.agent).await
+        }
     }
 }
 
@@ -76,6 +79,15 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     let spec = load_spec(&options.agent_path)?;
     let metadata = ResolvedCliMetadata::from_metadata_value(spec.metadata.as_ref())
         .merge_overrides(options.to_overrides());
+
+    let is_tui = !options.plain && std::io::stdout().is_terminal();
+    if !is_tui {
+        // Plain mode: standard fmt subscriber to stdout.
+        crate::init_tracing();
+    }
+    // TUI mode: no subscriber installed yet.
+    // Tracing calls during build_agent() are silently dropped.
+    // The TUI installs a channel-based subscriber inside run_tui().
 
     let agent = build_agent(&options.agent_path).await?;
 
@@ -85,7 +97,7 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     let config = resolve_cli_config(&spec, &metadata);
 
     // Dispatch: plain REPL for piped/--plain, TUI for interactive TTY.
-    if options.plain || !std::io::stdout().is_terminal() {
+    if !is_tui {
         CliRepl::new(agent)
             .with_config(config)
             .run()

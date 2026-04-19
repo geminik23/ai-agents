@@ -1,6 +1,6 @@
 use clap::Parser;
 
-use ai_agents_cli::{cli::Cli, init_tracing, run};
+use ai_agents_cli::{cli::Cli, run};
 
 #[tokio::main]
 async fn main() {
@@ -11,7 +11,6 @@ async fn main() {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    init_tracing();
     let args = Cli::parse();
     run(args).await
 }

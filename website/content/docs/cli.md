@@ -181,7 +181,7 @@ Use `--plain` to skip the TUI and use the traditional line REPL instead.
 The TUI has four zones:
 
 - **Status bar** (top) - agent name, version, current state, token budget percentage, thinking spinner
-- **Chat area** (center) - scrollable message history with role-colored output
+- **Chat area** (center) - scrollable message history with role-colored output, hint markers, and log cards
 - **Input area** (bottom) - multi-line text input
 - **Hint bar** (bottom line) - key bindings and contextual hints
 
@@ -214,6 +214,25 @@ Press the same key again to close a panel. Press `Esc` to close all panels.
 | `Esc`           | Cancel streaming or close panels |
 | `F1` - `F8`     | Toggle side panels |
 | `/`             | Start a slash command |
+
+### Chat Display
+
+The chat area renders messages with role-specific styling:
+
+- **You:** - cyan, bold prefix
+- **Agent:** - white, bold prefix, continuation lines indented
+- System messages - yellow, no prefix (welcome banner, state transitions, errors)
+- Hints - italic with `>` prefix, visually distinct from system messages
+- Log cards - dim gray, shown when tracing events are captured (see below)
+
+Startup hints defined in `metadata.cli.hints` or via `--hint` are grouped into a single block with `>` markers so they stand out from the conversation.
+
+Agent responses with multiple paragraph breaks are normalized - consecutive blank lines are collapsed to at most one, and trailing whitespace is trimmed.
+
+### Log Rendering
+
+In TUI mode, tracing output is captured and rendered as dim log cards in the chat timeline instead of writing raw text to the terminal.
+The default level is WARN. Set `RUST_LOG=info` or `RUST_LOG=debug` for more detail.
 
 ### Streaming
 
@@ -351,9 +370,15 @@ You can also use a `.env` file or your shell's secret manager — the CLI reads 
 
 ### Tracing / Logging
 
-The CLI initializes `tracing-subscriber` with `RUST_LOG` support:
+The CLI initializes `tracing-subscriber` with `RUST_LOG` support.
+In plain mode, logs go to stdout as usual.
+In TUI mode, logs are captured via a channel-based layer and rendered as dim cards in the chat area (default level: WARN).
 
 ```sh
+# Plain mode
+RUST_LOG=info ai-agents-cli run agent.yaml --plain
+
+# TUI mode (default WARN, override with RUST_LOG)
 RUST_LOG=info ai-agents-cli run agent.yaml
 RUST_LOG=ai_agents=debug ai-agents-cli run agent.yaml
 ```
