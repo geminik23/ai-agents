@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.0-rc.11
+
+### Added
+- Actor memory: cross-session identity via --actor flag or from_context path; returning actor's facts load automatically before the first turn without any application code
+- Key facts extraction: router LLM extracts structured facts after each turn, persists to SQLite, and injects them via {{ actor_facts }} in the system prompt
+- Session metadata: memory.session block for static tags and TTL on sessions; /cleanup removes sessions past their TTL
+- Key facts dedup: exact mode (Levenshtein with same-category and cross-category thresholds) and llm mode (prompt-based semantic dedup)
+- Actor identity: switching actors mid-session invalidates the cache and loads the new actor's facts on the next turn
+- token_budget.allocation.facts: controls the injected fact block token size, overriding injection.max_tokens when set
+- Actor memory hooks: on_facts_extracted, on_actor_memory_loaded, on_session_created, on_sessions_expired
+- CLI --actor <ID> flag: sets actor identity at startup
+- REPL /actor, /actor set, /actor facts, /actor delete commands
+- REPL /facts and /facts extract commands
+- REPL /sessions --actor and /sessions --tag for filtered session listing; /cleanup for TTL-based session removal
+- REPL /memory extended with actor identity and cached fact count
+- TUI: status bar shows active actor ID; facts panel shows live fact entries for the current actor
+- TUI: /actor, /facts, /sessions, /cleanup slash commands and autocomplete wired for all actor memory commands
+- Extraction errors visible by default: ai_agents_facts=warn added to the default tracing filter; post-turn [facts] notification shows how many facts were extracted each turn
+
+### Changed
+- Actor memory: streaming and blocking chat paths share the same actor loading, fact extraction, and session lifecycle
+- Storage: AgentStorage extended with 9 methods for session metadata and actor facts; FileStorage and RedisStorage compile unchanged using no-op defaults
+- Key facts: fact eviction is now durable; evicted facts are deleted from storage, not just dropped from the in-memory set
+
+---
+
 ## 1.0.0-rc.10
 
 ### Added

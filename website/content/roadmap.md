@@ -23,16 +23,13 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.8** | Multi-agent orchestration - router, pipeline, concurrent, group chat, handoff patterns |
 | **rc.9** | Agent persona - structured identity, evolution, secrets, templates; dot-path refactor |
 | **rc.10** | CLI context injection (`--context`, `--context-file`, `--plain`) and ratatui TUI with side panels, streaming, themes |
+| **rc.11** | Session management and key facts - cross-session actor memory, key facts extraction, session metadata, and CLI/TUI actor commands |
 
 ---
 
 ## Up Next
 
 These are the features we are actively planning for the next few release candidates.
-
-### Session Management + Key Facts
-
-Persistent user context and key facts across sessions. The agent remembers who you are and what matters between conversations.
 
 ### Relationship Memory
 
@@ -56,7 +53,7 @@ Every planned feature and its current status. Features are independent unless no
 | **Multi-Agent Orchestration** | Router, pipeline, concurrent, group chat, and handoff patterns with context policy and HITL gates | ✅ Done (rc.8) |
 | **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals, secrets | ✅ Done (rc.9) |
 | **CLI Context Injection + TUI** | Runtime context injection (--context, --context-file), ratatui-based TUI with side panels, --plain fallback, streaming render | ✅ Done (rc.10) |
-| **Session Management + Key Facts** | Persistent user context and key facts across sessions | Planned |
+| **Session Management + Key Facts** | Cross-session actor memory, key facts extraction, and session metadata | ✅ Done (rc.11) |
 | **Relationship Memory** | Per-actor trust, sentiment, rapport, and interaction history | Planned |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | Planned |
