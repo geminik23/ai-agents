@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -362,6 +363,148 @@ pub struct StateMachineSnapshot {
     pub turn_count: u32,
     pub no_transition_count: u32,
     pub history: Vec<StateTransitionEvent>,
+}
+
+//
+// Key Facts types for session management and actor memory.
+//
+
+/// A single extracted fact about an actor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyFact {
+    pub id: String,
+    /// Which actor this fact is about. None means a general fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    pub category: FactCategory,
+    /// Fact content in natural language (always English for cross-language dedup).
+    pub content: String,
+    /// Extraction confidence from 0.0 to 1.0.
+    pub confidence: f32,
+    /// Importance score from 0.0 to 1.0. Reserved for time-based decay algorithms.
+    #[serde(default = "default_salience")]
+    pub salience: f32,
+    pub extracted_at: DateTime<Utc>,
+    /// Last time this fact was injected into context. Reserved for recency tracking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_accessed: Option<DateTime<Utc>>,
+    /// Which message triggered this extraction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<String>,
+    /// Language of the original conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_language: Option<String>,
+}
+
+fn default_salience() -> f32 {
+    1.0
+}
+
+impl KeyFact {
+    /// Priority score used for ranking and eviction.
+    pub fn priority(&self) -> f32 {
+        self.salience * self.confidence
+    }
+}
+
+/// Built-in categories plus extensible custom categories.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum FactCategory {
+    UserPreference,
+    UserContext,
+    Decision,
+    Agreement,
+    #[serde(untagged)]
+    Custom(String),
+}
+
+impl std::fmt::Display for FactCategory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FactCategory::UserPreference => write!(f, "preference"),
+            FactCategory::UserContext => write!(f, "context"),
+            FactCategory::Decision => write!(f, "decision"),
+            FactCategory::Agreement => write!(f, "agreement"),
+            FactCategory::Custom(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+/// Filter for querying facts.
+#[derive(Debug, Clone, Default)]
+pub struct FactFilter {
+    pub actor_id: Option<String>,
+    pub category: Option<FactCategory>,
+    pub min_confidence: Option<f32>,
+    pub min_salience: Option<f32>,
+    pub limit: Option<usize>,
+}
+
+//
+// Session metadata types for actor memory and session lifecycle.
+//
+
+/// Metadata attached to a session for filtering, TTL, and actor tracking.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    /// Primary actor interacting in this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// All actors that participated in this session.
+    #[serde(default)]
+    pub actors: Vec<String>,
+    /// Freeform tags for filtering.
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Custom metadata.
+    #[serde(default)]
+    pub custom: HashMap<String, serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    pub message_count: usize,
+    /// Session TTL in seconds. None means no expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds: Option<u64>,
+}
+
+impl Default for SessionMetadata {
+    fn default() -> Self {
+        let now = Utc::now();
+        Self {
+            actor_id: None,
+            actors: vec![],
+            tags: vec![],
+            custom: HashMap::new(),
+            created_at: now,
+            last_active: now,
+            message_count: 0,
+            ttl_seconds: None,
+        }
+    }
+}
+
+/// Filter for listing sessions.
+#[derive(Debug, Clone, Default)]
+pub struct SessionFilter {
+    pub actor_id: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub agent_id: Option<String>,
+    pub created_after: Option<DateTime<Utc>>,
+    pub created_before: Option<DateTime<Utc>>,
+    pub limit: Option<usize>,
+}
+
+/// Compact summary returned by list operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub agent_id: String,
+    pub actor_id: Option<String>,
+    pub tags: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub last_active: DateTime<Utc>,
+    pub message_count: usize,
 }
 
 #[cfg(test)]

@@ -80,6 +80,18 @@ pub trait AgentHooks: Send + Sync {
 
     /// Fired when a secret's reveal conditions are satisfied for the first time.
     async fn on_secret_revealed(&self, _content: &str) {}
+
+    /// Fired after facts are extracted from a conversation turn.
+    async fn on_facts_extracted(&self, _actor_id: &str, _facts: &[ai_agents_core::KeyFact]) {}
+
+    /// Fired when actor memory (facts) is loaded from storage at session start.
+    async fn on_actor_memory_loaded(&self, _actor_id: &str, _fact_count: usize) {}
+
+    /// Fired when a session is created with metadata.
+    async fn on_session_created(&self, _session_id: &str) {}
+
+    /// Fired when sessions are cleaned up due to TTL expiry.
+    async fn on_sessions_expired(&self, _count: usize) {}
 }
 
 pub struct NoopHooks;
@@ -305,7 +317,31 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_secret_revealed(&self, content: &str) {
-        info!("{} Secret revealed: {}", self.prefix, content);
+        debug!("{}[secret_revealed] {}", self.prefix, content);
+    }
+
+    async fn on_facts_extracted(&self, actor_id: &str, facts: &[ai_agents_core::KeyFact]) {
+        debug!(
+            "{}[facts_extracted] actor={} count={}",
+            self.prefix,
+            actor_id,
+            facts.len()
+        );
+    }
+
+    async fn on_actor_memory_loaded(&self, actor_id: &str, fact_count: usize) {
+        debug!(
+            "{}[actor_memory_loaded] actor={} facts={}",
+            self.prefix, actor_id, fact_count
+        );
+    }
+
+    async fn on_session_created(&self, session_id: &str) {
+        debug!("{}[session_created] session={}", self.prefix, session_id);
+    }
+
+    async fn on_sessions_expired(&self, count: usize) {
+        debug!("{}[sessions_expired] count={}", self.prefix, count);
     }
 }
 
@@ -477,9 +513,33 @@ impl AgentHooks for CompositeHooks {
         }
     }
 
-    async fn on_secret_revealed(&self, _content: &str) {
+    async fn on_secret_revealed(&self, content: &str) {
         for hook in &self.hooks {
-            hook.on_secret_revealed(_content).await;
+            hook.on_secret_revealed(content).await;
+        }
+    }
+
+    async fn on_facts_extracted(&self, actor_id: &str, facts: &[ai_agents_core::KeyFact]) {
+        for hook in &self.hooks {
+            hook.on_facts_extracted(actor_id, facts).await;
+        }
+    }
+
+    async fn on_actor_memory_loaded(&self, actor_id: &str, fact_count: usize) {
+        for hook in &self.hooks {
+            hook.on_actor_memory_loaded(actor_id, fact_count).await;
+        }
+    }
+
+    async fn on_session_created(&self, session_id: &str) {
+        for hook in &self.hooks {
+            hook.on_session_created(session_id).await;
+        }
+    }
+
+    async fn on_sessions_expired(&self, count: usize) {
+        for hook in &self.hooks {
+            hook.on_sessions_expired(count).await;
         }
     }
 }

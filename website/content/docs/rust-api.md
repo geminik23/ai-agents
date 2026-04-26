@@ -517,6 +517,10 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 | `on_handoff`                | Orchestration: an agent-to-agent handoff occurs       |
 | `on_persona_evolve`         | Persona: a persona field was mutated via `evolve()`   |
 | `on_secret_revealed`        | Persona: a secret's reveal conditions were satisfied for the first time |
+| `on_facts_extracted`        | Facts: new facts were extracted from a conversation turn |
+| `on_actor_memory_loaded`    | Facts: actor facts were loaded from storage at session start |
+| `on_session_created`        | Session: a new session was created with metadata      |
+| `on_sessions_expired`       | Session: expired sessions were cleaned up via TTL     |
 
 ---
 
@@ -571,6 +575,59 @@ let sessions = agent.list_sessions().await?;
 // Delete a session
 agent.delete_session("session-abc-123").await?;
 ```
+
+---
+
+## Actor Memory & Key Facts
+
+Track facts about each actor across sessions. Facts are extracted automatically after each turn and injected into the system prompt on the next session.
+
+```rust
+// Set the current actor ID (user, player, other agent).
+agent.set_actor_id("customer_42")?;
+// Convenience alias:
+agent.set_user_id("customer_42")?;
+
+// Load previously stored facts for this actor from storage.
+agent.load_actor_memory().await?;
+
+// Read the current actor ID.
+let actor = agent.actor_id(); // Option<String>
+
+// Read cached facts (loaded from storage or extracted this session).
+let facts = agent.actor_facts(); // Vec<KeyFact>
+
+// Manually extract facts from the last N messages.
+let new_facts = agent.extract_facts(10).await?;
+
+// Access the FactStore for direct manipulation.
+if let Some(store) = agent.fact_store() {
+    let all = store.get_facts("customer_42").await?;
+}
+
+// Privacy-aware deletion. Returns Err when memory.actor_memory.privacy.allow_deletion is false.
+agent.delete_actor_data("customer_42").await?;
+
+// Session metadata APIs.
+let meta = agent.session_metadata();              // current SessionMetadata
+agent.set_session_metadata(meta);                 // overwrite tags, ttl, custom
+
+// TTL cleanup and filtered listings (sqlite backend).
+let removed = agent.cleanup_expired_sessions().await?;
+let filter = ai_agents::facts::SessionFilter {
+    actor_id: Some("customer_42".to_string()),
+    tags: None,
+    agent_id: None,
+    created_after: None,
+    created_before: None,
+    limit: Some(10),
+};
+let summaries = agent.list_sessions_filtered(&filter).await?;
+```
+
+When `auto_extract: true` (the default), extraction runs after every turn - no manual calls needed. Configure via `memory.facts` and `memory.actor_memory` in YAML. See [YAML Reference](@/docs/yaml-reference.md#facts-key-facts-extraction) for the full schema.
+
+Switching actors mid-session via `set_actor_id()` (or via `from_context` resolution when the configured context path changes) clears the cached facts and reloads on the next turn, so prompt injection always reflects the current actor.
 
 Session persistence requires a storage backend. Enable one via feature flags:
 

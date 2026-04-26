@@ -64,8 +64,44 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "List saved sessions",
     },
     SlashCommand {
+        name: "/sessions --actor",
+        description: "List sessions for a specific actor",
+    },
+    SlashCommand {
+        name: "/sessions --tag",
+        description: "List sessions matching a tag",
+    },
+    SlashCommand {
         name: "/delete",
         description: "Delete saved session",
+    },
+    SlashCommand {
+        name: "/cleanup",
+        description: "Delete sessions past their TTL",
+    },
+    SlashCommand {
+        name: "/actor",
+        description: "Show current actor ID",
+    },
+    SlashCommand {
+        name: "/actor set",
+        description: "Set actor ID and load their facts",
+    },
+    SlashCommand {
+        name: "/actor facts",
+        description: "Show facts for current actor",
+    },
+    SlashCommand {
+        name: "/actor delete",
+        description: "Delete all data for current actor",
+    },
+    SlashCommand {
+        name: "/facts",
+        description: "Show all facts for current actor",
+    },
+    SlashCommand {
+        name: "/facts extract",
+        description: "Manually extract facts from recent messages",
     },
 ];
 

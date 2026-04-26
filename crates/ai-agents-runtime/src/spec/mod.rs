@@ -305,6 +305,14 @@ impl AgentSpec {
     pub fn has_persona(&self) -> bool {
         self.persona.as_ref().map_or(false, |p| p.is_configured())
     }
+
+    pub fn has_actor_memory(&self) -> bool {
+        self.memory.has_actor_memory()
+    }
+
+    pub fn has_facts(&self) -> bool {
+        self.memory.has_facts()
+    }
 }
 
 #[cfg(test)]

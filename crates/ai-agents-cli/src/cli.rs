@@ -63,6 +63,10 @@ pub struct RunArgs {
     #[arg(long = "context-file", value_name = "PATH")]
     pub context_file: Option<PathBuf>,
 
+    /// Set actor_id at startup (enables cross-session actor memory)
+    #[arg(long, value_name = "ID")]
+    pub actor: Option<String>,
+
     /// Force plain line REPL (skip TUI even on interactive TTY)
     #[arg(long, action = ArgAction::SetTrue)]
     pub plain: bool,

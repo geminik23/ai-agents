@@ -831,6 +831,13 @@ impl AgentBuilder {
     }
 
     pub fn build(mut self) -> Result<RuntimeAgent> {
+        // Capture actor memory and facts configs before partial moves of spec consume fields.
+        let actor_memory_config = self
+            .spec
+            .as_ref()
+            .and_then(|s| s.memory.actor_memory.clone());
+        let facts_config = self.spec.as_ref().and_then(|s| s.memory.facts.clone());
+
         let base_prompt = self
             .system_prompt
             .ok_or_else(|| AgentError::Config("System prompt is required".into()))?;
@@ -1172,6 +1179,15 @@ impl AgentBuilder {
         // Wire persona manager into the agent (created earlier before tools_arc).
         if let Some(pm) = persona_manager {
             agent = agent.with_persona(pm);
+        }
+
+        // Store actor memory and facts configs on the agent now.
+        // The actual FactStore and extractor are created lazily in init_storage()
+        // once the storage backend is available. This avoids the sync/async
+        // mismatch that caused the builder to silently skip facts setup when
+        // storage was not yet initialized at build() time.
+        if actor_memory_config.is_some() || facts_config.is_some() {
+            agent = agent.with_facts_config(actor_memory_config, facts_config);
         }
 
         Ok(agent)

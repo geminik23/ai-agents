@@ -259,6 +259,14 @@ impl CliRepl {
             self.handle_context(input).await;
             return Some(CommandAction::Continue);
         }
+        if lower.starts_with("/actor") {
+            self.handle_actor(input).await;
+            return Some(CommandAction::Continue);
+        }
+        if lower.starts_with("/facts") {
+            self.handle_facts(input).await;
+            return Some(CommandAction::Continue);
+        }
 
         match lower.as_str() {
             "/quit" | "/exit" => Some(CommandAction::Quit),
@@ -317,11 +325,17 @@ impl CliRepl {
                 self.print_memory_status().await;
                 Some(CommandAction::Continue)
             }
-            "/sessions" => {
-                self.handle_sessions().await;
+            "/cleanup" => {
+                self.handle_cleanup().await;
                 Some(CommandAction::Continue)
             }
-            _ => None,
+            _ => {
+                if lower.starts_with("/sessions") {
+                    self.handle_sessions(input).await;
+                    return Some(CommandAction::Continue);
+                }
+                None
+            }
         }
     }
 
@@ -341,10 +355,18 @@ impl CliRepl {
         println!("  /load self [name]    Load parent session only");
         println!("  /load agent <id>     Load one spawned agent's session");
         println!("  /sessions            List saved sessions");
+        println!("  /sessions --actor <id>   Filter sessions by actor ID");
+        println!("  /sessions --tag <tag>    Filter sessions by tag");
+        println!("  /cleanup             Delete sessions past their TTL");
         println!("  /delete <name>       Delete a saved session");
         println!("  /context             Show current context values");
         println!("  /context set <k> <v> Set a context value");
         println!("  /context unset <k>   Remove a context value");
+        println!("  /actor               Show current actor ID");
+        println!("  /actor set <id>      Set actor ID");
+        println!("  /actor facts [cat]   Show facts for current actor");
+        println!("  /actor delete        Delete all actor data");
+        println!("  /facts extract [n]   Extract facts from recent messages");
         println!();
     }
 
@@ -667,10 +689,76 @@ impl CliRepl {
         }
     }
 
-    async fn handle_sessions(&self) {
+    async fn handle_sessions(&self, input: &str) {
         if !self.ensure_storage().await {
             return;
         }
+
+        // Parse optional filter flags: --actor <id>, --tag <tag>.
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let mut actor_filter: Option<String> = None;
+        let mut tag_filter: Option<String> = None;
+        let mut i = 1;
+        while i < parts.len() {
+            match parts[i] {
+                "--actor" => {
+                    if let Some(v) = parts.get(i + 1) {
+                        actor_filter = Some(v.to_string());
+                        i += 2;
+                        continue;
+                    }
+                }
+                "--tag" => {
+                    if let Some(v) = parts.get(i + 1) {
+                        tag_filter = Some(v.to_string());
+                        i += 2;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+
+        // Filtered listing uses session metadata stored alongside each snapshot.
+        if actor_filter.is_some() || tag_filter.is_some() {
+            let filter = ai_agents::facts::SessionFilter {
+                actor_id: actor_filter.clone(),
+                tags: tag_filter.clone().map(|t| vec![t]),
+                agent_id: None,
+                created_after: None,
+                created_before: None,
+                limit: None,
+            };
+            match self.agent.list_sessions_filtered(&filter).await {
+                Ok(summaries) => {
+                    if summaries.is_empty() {
+                        println!("No sessions match the filter.");
+                        return;
+                    }
+                    println!("Sessions ({} matched):", summaries.len());
+                    for s in &summaries {
+                        let actor = s.actor_id.as_deref().unwrap_or("-");
+                        let tags = if s.tags.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", s.tags.join(","))
+                        };
+                        println!(
+                            "  {}  actor={}{}  msgs={}  active={}",
+                            s.session_id,
+                            actor,
+                            tags,
+                            s.message_count,
+                            s.last_active.format("%Y-%m-%d %H:%M")
+                        );
+                    }
+                }
+                Err(e) => eprintln!("[Error] {}", e),
+            }
+            return;
+        }
+
         match self.agent.list_sessions().await {
             Ok(sessions) => {
                 if sessions.is_empty() {
@@ -698,6 +786,17 @@ impl CliRepl {
                 }
             }
             Err(e) => eprintln!("[Error] {}", e),
+        }
+    }
+
+    async fn handle_cleanup(&self) {
+        if !self.ensure_storage().await {
+            return;
+        }
+        match self.agent.cleanup_expired_sessions().await {
+            Ok(0) => println!("No expired sessions to clean up."),
+            Ok(n) => println!("Cleaned up {} expired session(s).", n),
+            Err(e) => eprintln!("[Error] Cleanup failed: {}", e),
         }
     }
 
@@ -753,6 +852,134 @@ impl CliRepl {
             );
         } else {
             println!("Deleted session '{}'", name);
+        }
+    }
+
+    async fn handle_actor(&self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+
+        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+            None | Some("") => match self.agent.actor_id() {
+                Some(id) => println!("Actor: {}", id),
+                None => println!("No actor ID set. Use /actor set <id>"),
+            },
+            Some("set") => {
+                if let Some(id) = parts.get(2) {
+                    match self.agent.set_actor_id(id) {
+                        Ok(()) => {
+                            println!("Actor ID set to: {}", id);
+                            if let Err(e) = self.agent.load_actor_memory().await {
+                                eprintln!("[Warning] Failed to load actor memory: {}", e);
+                            } else {
+                                let facts = self.agent.actor_facts();
+                                if !facts.is_empty() {
+                                    println!("  Loaded {} facts from storage.", facts.len());
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[Error] {}", e),
+                    }
+                } else {
+                    println!("Usage: /actor set <id>");
+                }
+            }
+            Some("facts") => {
+                let actor_id = match self.agent.actor_id() {
+                    Some(id) => id,
+                    None => {
+                        println!("No actor ID set. Use /actor set <id>");
+                        return;
+                    }
+                };
+
+                let facts = self.agent.actor_facts();
+                if facts.is_empty() {
+                    println!("No facts stored for actor: {}", actor_id);
+                    return;
+                }
+
+                let cat_filter = parts.get(2).map(|s| s.to_lowercase());
+                let filtered: Vec<_> = if let Some(ref cat) = cat_filter {
+                    facts
+                        .iter()
+                        .filter(|f| f.category.to_string().to_lowercase() == *cat)
+                        .collect()
+                } else {
+                    facts.iter().collect()
+                };
+
+                println!(
+                    "Facts for actor {} ({} total, {} shown):",
+                    actor_id,
+                    facts.len(),
+                    filtered.len()
+                );
+                for fact in &filtered {
+                    println!(
+                        "  [{}] {} (confidence: {:.2})",
+                        fact.category, fact.content, fact.confidence
+                    );
+                }
+            }
+            Some("delete") => {
+                let actor_id = match self.agent.actor_id() {
+                    Some(id) => id,
+                    None => {
+                        println!("No actor ID set. Use /actor set <id>");
+                        return;
+                    }
+                };
+                // Goes through the runtime so privacy.allow_deletion is honored.
+                match self.agent.delete_actor_data(&actor_id).await {
+                    Ok(()) => println!("All data deleted for actor: {}", actor_id),
+                    Err(e) => eprintln!("[Error] Failed to delete actor data: {}", e),
+                }
+            }
+            _ => {
+                println!("Usage: /actor [set <id> | facts [category] | delete]");
+            }
+        }
+    }
+
+    async fn handle_facts(&self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+
+        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+            Some("extract") => {
+                let n: usize = parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+
+                match self.agent.extract_facts(n).await {
+                    Ok(facts) => {
+                        if facts.is_empty() {
+                            println!("No new facts extracted.");
+                        } else {
+                            println!("Extracted {} facts:", facts.len());
+                            for fact in &facts {
+                                println!(
+                                    "  [{}] {} (confidence: {:.2})",
+                                    fact.category, fact.content, fact.confidence
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("[Error] Fact extraction failed: {}", e),
+                }
+            }
+            _ => {
+                // Default: show current actor facts (alias for /actor facts).
+                let facts = self.agent.actor_facts();
+                if facts.is_empty() {
+                    println!("No facts stored for current actor.");
+                } else {
+                    println!("Facts ({}):", facts.len());
+                    for fact in &facts {
+                        println!(
+                            "  [{}] {} (confidence: {:.2})",
+                            fact.category, fact.content, fact.confidence
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -839,21 +1066,76 @@ impl CliRepl {
                 recent_tokens, budget.allocation.recent_messages, r_pct
             );
 
+            let facts_count = self.agent.actor_facts().len();
+            let facts_tokens: u32 = self
+                .agent
+                .actor_facts()
+                .iter()
+                .map(|f| (f.content.len() as u32 / 4) + 10)
+                .sum();
+            let f_pct = if budget.allocation.facts > 0 {
+                facts_tokens as f64 / budget.allocation.facts as f64 * 100.0
+            } else {
+                0.0
+            };
             println!(
-                "    Facts:           {:>5} / {:>5} ( 0.0%)",
-                0, budget.allocation.facts
+                "    Facts:           {:>5} / {:>5} ({:.1}%)",
+                facts_tokens, budget.allocation.facts, f_pct
             );
 
             println!("    Overflow:        {:?}", budget.overflow_strategy);
             println!("    Warning at:      {}%", budget.warn_at_percent);
+
+            if facts_count > 0 {
+                println!();
+                println!(
+                    "  Actor Facts: {} stored, {} tokens used",
+                    facts_count, facts_tokens
+                );
+            }
+        }
+
+        // Show actor and facts info even without token budget.
+        if self.agent.memory_token_budget().is_none() {
+            let actor = self.agent.actor_id();
+            let facts = self.agent.actor_facts();
+            if actor.is_some() || !facts.is_empty() {
+                println!();
+                if let Some(ref id) = actor {
+                    println!("  Actor: {}", id);
+                }
+                if !facts.is_empty() {
+                    println!("  Facts: {} stored", facts.len());
+                    for fact in facts.iter().take(5) {
+                        println!(
+                            "    [{}] {} ({:.2})",
+                            fact.category, fact.content, fact.confidence
+                        );
+                    }
+                    if facts.len() > 5 {
+                        println!("    ... +{} more", facts.len() - 5);
+                    }
+                }
+            }
         }
 
         println!("---------------------\n");
     }
 
     async fn handle_chat(&self, input: &str) {
+        let facts_before = self.agent.actor_facts().len();
         match self.agent.chat(input).await {
-            Ok(response) => self.print_response(&response),
+            Ok(response) => {
+                self.print_response(&response);
+                let facts_after = self.agent.actor_facts().len();
+                if facts_after > facts_before {
+                    let new_count = facts_after - facts_before;
+                    println!(
+                        "  [facts] {} new fact(s) extracted ({} total). Use /facts to inspect.\n",
+                        new_count, facts_after
+                    );
+                }
+            }
             Err(e) => eprintln!("\n[Error] {}\n", e),
         }
     }

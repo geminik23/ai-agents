@@ -428,6 +428,18 @@ pub mod spawner {
 }
 
 // Multi-agent orchestration patterns and tool wrappers.
+/// Key facts extraction and actor memory.
+pub mod facts {
+    pub use ai_agents_core::{SessionFilter, SessionMetadata, SessionSummary};
+    pub use ai_agents_facts::deduplicate_exact;
+    pub use ai_agents_facts::{
+        ActorMemoryConfig, CategoryDefinition, DedupConfig, DedupMethod, FactExtractor, FactStore,
+        FactsConfig, IdentificationConfig, IdentificationMethod, InjectionConfig, InjectionMode,
+        LLMFactExtractor, PrivacyConfig, SessionConfig,
+    };
+    pub use ai_agents_facts::{FactCategory, FactFilter, KeyFact};
+}
+
 pub mod orchestration {
     pub use ai_agents_runtime::orchestration::context::prepare_delegate_input;
     pub use ai_agents_runtime::orchestration::tools::{

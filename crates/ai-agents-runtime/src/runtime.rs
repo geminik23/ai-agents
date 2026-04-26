@@ -135,6 +135,27 @@ pub struct RuntimeAgent {
     /// Re-dispatch depth for post-transition full dispatch.
     /// 0 = not re-dispatching. > 0 = user message already in memory, skip re-adding.
     redispatch_depth: RwLock<u32>,
+    /// Current actor ID for cross-session memory.
+    actor_id: RwLock<Option<String>>,
+    /// Actor whose facts are currently cached. Used to trigger reload on actor change.
+    last_loaded_actor_id: RwLock<Option<String>>,
+    /// Fact store for managing per-actor extracted facts.
+    fact_store: RwLock<Option<Arc<ai_agents_facts::FactStore>>>,
+    /// Fact extractor for LLM-based fact extraction.
+    /// None when actor_memory is enabled without facts.enabled.
+    fact_extractor: RwLock<Option<Arc<dyn ai_agents_facts::FactExtractor>>>,
+    /// Cached actor facts loaded from storage, injected into prompt context.
+    actor_facts_cache: RwLock<Vec<ai_agents_core::KeyFact>>,
+    /// Number of messages since last fact extraction.
+    messages_since_extraction: RwLock<usize>,
+    /// Actor memory configuration.
+    actor_memory_config: Option<ai_agents_facts::ActorMemoryConfig>,
+    /// Facts configuration.
+    facts_config: Option<ai_agents_facts::FactsConfig>,
+    /// Session-scoped metadata (tags, ttl, actor roster).
+    session_metadata: RwLock<ai_agents_core::SessionMetadata>,
+    /// Session id currently bound to this runtime instance.
+    current_session_id: RwLock<Option<String>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -232,6 +253,16 @@ impl RuntimeAgent {
             spawner: None,
             spawner_registry: None,
             redispatch_depth: RwLock::new(0),
+            actor_id: RwLock::new(None),
+            last_loaded_actor_id: RwLock::new(None),
+            fact_store: RwLock::new(None),
+            fact_extractor: RwLock::new(None),
+            actor_facts_cache: RwLock::new(Vec::new()),
+            messages_since_extraction: RwLock::new(0),
+            actor_memory_config: None,
+            facts_config: None,
+            session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
+            current_session_id: RwLock::new(None),
         }
     }
 
@@ -266,6 +297,302 @@ impl RuntimeAgent {
 
     pub fn reflection_config(&self) -> &ReflectionConfig {
         &self.reflection_config
+    }
+
+    /// Set only the actor memory and facts configs without creating the store.
+    /// The store and extractor are created lazily in init_storage().
+    pub fn with_facts_config(
+        mut self,
+        actor_memory_config: Option<ai_agents_facts::ActorMemoryConfig>,
+        facts_config: Option<ai_agents_facts::FactsConfig>,
+    ) -> Self {
+        self.actor_memory_config = actor_memory_config;
+        self.facts_config = facts_config;
+        self
+    }
+
+    /// Configure fact store and optional extractor for actor memory.
+    /// Pass `None` for `extractor` to load existing facts without running extraction.
+    pub fn with_facts(
+        mut self,
+        store: Arc<ai_agents_facts::FactStore>,
+        extractor: Option<Arc<dyn ai_agents_facts::FactExtractor>>,
+        actor_memory_config: Option<ai_agents_facts::ActorMemoryConfig>,
+        facts_config: Option<ai_agents_facts::FactsConfig>,
+    ) -> Self {
+        *self.fact_store.write() = Some(store);
+        *self.fact_extractor.write() = extractor;
+        self.actor_memory_config = actor_memory_config;
+        self.facts_config = facts_config;
+        self
+    }
+
+    /// Get the fact store for direct fact manipulation.
+    pub fn fact_store(&self) -> Option<Arc<ai_agents_facts::FactStore>> {
+        self.fact_store.read().clone()
+    }
+
+    /// Get the current actor ID.
+    pub fn actor_id(&self) -> Option<String> {
+        self.actor_id.read().clone()
+    }
+
+    /// Set the current actor ID (player, user, another agent, etc.).
+    /// Clears the cached facts so the next turn reloads them for the new actor.
+    pub fn set_actor_id(&self, actor_id: &str) -> ai_agents_core::Result<()> {
+        let changed = self.actor_id.read().as_deref() != Some(actor_id);
+        *self.actor_id.write() = Some(actor_id.to_string());
+        if changed {
+            self.actor_facts_cache.write().clear();
+            *self.last_loaded_actor_id.write() = None;
+        }
+        // Record actor in session metadata roster.
+        {
+            let mut meta = self.session_metadata.write();
+            meta.actor_id = Some(actor_id.to_string());
+            if !meta.actors.iter().any(|a| a == actor_id) {
+                meta.actors.push(actor_id.to_string());
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the current actor ID. Convenience wrapper around set_actor_id.
+    pub fn set_user_id(&self, user_id: &str) -> ai_agents_core::Result<()> {
+        self.set_actor_id(user_id)
+    }
+
+    /// Load facts for the current actor from storage and cache them for prompt injection.
+    pub async fn load_actor_memory(&self) -> ai_agents_core::Result<()> {
+        let actor_id = match self.actor_id.read().clone() {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        let store_opt = self.fact_store.read().clone();
+        if let Some(store) = store_opt {
+            let facts = store.get_facts(&actor_id).await?;
+            let count = facts.len();
+            *self.actor_facts_cache.write() = facts;
+            *self.last_loaded_actor_id.write() = Some(actor_id.clone());
+            self.hooks.on_actor_memory_loaded(&actor_id, count).await;
+            tracing::debug!("loaded {} facts for actor {}", count, actor_id);
+        }
+
+        Ok(())
+    }
+
+    /// Load actor memory only when the actor has changed or facts were never loaded.
+    async fn maybe_load_actor_memory(&self) {
+        let current = self.actor_id.read().clone();
+        let last = self.last_loaded_actor_id.read().clone();
+        if current.is_none() {
+            return;
+        }
+        if current != last {
+            let _ = self.load_actor_memory().await;
+        }
+    }
+
+    /// Pre-turn lifecycle shared by streaming and non-streaming paths.
+    async fn pre_turn_session_lifecycle(&self) {
+        self.resolve_actor_id_from_context();
+        self.maybe_load_actor_memory().await;
+        *self.messages_since_extraction.write() += 1;
+    }
+
+    /// Post-turn lifecycle shared by streaming and non-streaming paths.
+    async fn post_turn_session_lifecycle(&self) {
+        *self.messages_since_extraction.write() += 1;
+        self.auto_extract_facts().await;
+    }
+
+    /// Get cached actor facts.
+    pub fn actor_facts(&self) -> Vec<ai_agents_core::KeyFact> {
+        self.actor_facts_cache.read().clone()
+    }
+
+    /// Manually extract facts from the last N messages.
+    pub async fn extract_facts(
+        &self,
+        last_n: usize,
+    ) -> ai_agents_core::Result<Vec<ai_agents_core::KeyFact>> {
+        let extractor = match self.fact_extractor.read().clone() {
+            Some(e) => e,
+            None => return Ok(vec![]),
+        };
+
+        let messages = self.memory.get_messages(None).await?;
+        let recent: Vec<_> = messages.iter().rev().take(last_n).rev().cloned().collect();
+
+        if recent.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let actor_id = self.actor_id.read().clone();
+        let existing = self.actor_facts_cache.read().clone();
+
+        let categories = self
+            .facts_config
+            .as_ref()
+            .map(|c| c.custom_categories.clone())
+            .unwrap_or_default();
+
+        let facts = extractor
+            .extract(&recent, &existing, actor_id.as_deref(), &categories)
+            .await?;
+
+        // Save to storage and update cache.
+        if !facts.is_empty() {
+            let fact_store_opt = self.fact_store.read().clone();
+            if let (Some(store), Some(aid)) = (fact_store_opt, &actor_id) {
+                // add_facts now returns the authoritative post-write set.
+                let authoritative = store.add_facts(aid, facts.clone()).await?;
+                *self.actor_facts_cache.write() = authoritative;
+            } else {
+                let mut cache = self.actor_facts_cache.write();
+                cache.extend(facts.clone());
+            }
+
+            if let Some(ref aid) = actor_id {
+                self.hooks.on_facts_extracted(aid, &facts).await;
+            }
+        }
+
+        Ok(facts)
+    }
+
+    /// Resolve actor_id from context if method is from_context.
+    /// Supports dotted paths (e.g. "player.id", "user.profile.id").
+    fn resolve_actor_id_from_context(&self) {
+        if let Some(ref am_config) = self.actor_memory_config {
+            if am_config.identification.method == ai_agents_facts::IdentificationMethod::FromContext
+            {
+                if let Some(ref path) = am_config.identification.context_path {
+                    // get_path resolves dotted paths; get only handles top-level keys.
+                    let val = self
+                        .context_manager
+                        .get_path(path)
+                        .or_else(|| self.context_manager.get(path));
+                    if let Some(val) = val {
+                        if let Some(id_str) = val.as_str() {
+                            let current = self.actor_id.read().clone();
+                            if current.as_deref() != Some(id_str) {
+                                *self.actor_id.write() = Some(id_str.to_string());
+                                // Invalidate cache on actor change so next turn reloads.
+                                self.actor_facts_cache.write().clear();
+                                *self.last_loaded_actor_id.write() = None;
+                                let mut meta = self.session_metadata.write();
+                                meta.actor_id = Some(id_str.to_string());
+                                if !meta.actors.iter().any(|a| a == id_str) {
+                                    meta.actors.push(id_str.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Format actor facts for template injection.
+    fn format_actor_facts_for_context(&self) -> String {
+        // Respect inject_in_context: false.
+        let should_inject = self
+            .facts_config
+            .as_ref()
+            .map(|c| c.inject_in_context)
+            .unwrap_or(true);
+        if !should_inject {
+            return String::new();
+        }
+
+        let facts = self.actor_facts_cache.read();
+        if facts.is_empty() {
+            return String::new();
+        }
+
+        let am_config = self.actor_memory_config.as_ref();
+        // Effective token cap: prefer memory.token_budget.allocation.facts when present,
+        // otherwise fall back to actor_memory.injection.max_tokens.
+        let facts_budget = self
+            .memory_token_budget
+            .as_ref()
+            .map(|b| b.allocation.facts as usize)
+            .filter(|n| *n > 0);
+        let default_max = am_config.map(|c| c.injection.max_tokens).unwrap_or(800);
+        let max_tokens = facts_budget.unwrap_or(default_max);
+
+        // Filter by category when injection.mode = category.
+        let filtered: Vec<ai_agents_core::KeyFact> = if let Some(cfg) = am_config {
+            if cfg.injection.mode == ai_agents_facts::InjectionMode::OnDemand {
+                return String::new();
+            }
+            if cfg.injection.mode == ai_agents_facts::InjectionMode::Category
+                && !cfg.injection.categories.is_empty()
+            {
+                facts
+                    .iter()
+                    .filter(|f| {
+                        cfg.injection
+                            .categories
+                            .iter()
+                            .any(|c| f.category.to_string() == *c)
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                facts.clone()
+            }
+        } else {
+            facts.clone()
+        };
+
+        if filtered.is_empty() {
+            return String::new();
+        }
+
+        if let Some(store) = self.fact_store.read().clone() {
+            store.format_for_context(&filtered, max_tokens)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Run auto-extraction after a chat turn.
+    async fn auto_extract_facts(&self) {
+        let should_extract = self
+            .facts_config
+            .as_ref()
+            .map(|c| c.enabled && c.auto_extract)
+            .unwrap_or(false);
+
+        if !should_extract {
+            return;
+        }
+
+        let msgs_since = *self.messages_since_extraction.read();
+        if msgs_since < 2 {
+            return;
+        }
+
+        match self.extract_facts(msgs_since).await {
+            Ok(facts) => {
+                if !facts.is_empty() {
+                    info!(
+                        count = facts.len(),
+                        actor = ?self.actor_id.read().as_deref(),
+                        "facts extracted"
+                    );
+                    *self.messages_since_extraction.write() = 0;
+                } else {
+                    debug!("fact extraction ran but found no new facts");
+                }
+            }
+            Err(e) => {
+                warn!("fact extraction failed: {}", e);
+            }
+        }
     }
 
     pub fn with_persona(mut self, manager: Arc<ai_agents_persona::PersonaManager>) -> Self {
@@ -307,7 +634,67 @@ impl RuntimeAgent {
         let storage_config = self.convert_storage_config();
         let storage = create_storage(&storage_config).await?;
         *self.storage.write() = storage;
+        // Complete facts setup now that storage is available.
+        self.complete_facts_init().await;
         Ok(())
+    }
+
+    /// Initialize fact store and extractor from stored config + current storage.
+    /// Called from init_storage() so facts are ready before the first turn.
+    async fn complete_facts_init(&self) {
+        if self.fact_store.read().is_some() {
+            return;
+        }
+        let storage = match self.storage.read().clone() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let facts_enabled = self
+            .facts_config
+            .as_ref()
+            .map(|f| f.enabled)
+            .unwrap_or(false);
+        let actor_memory_enabled = self
+            .actor_memory_config
+            .as_ref()
+            .map(|a| a.enabled)
+            .unwrap_or(false);
+
+        if !facts_enabled && !actor_memory_enabled {
+            return;
+        }
+
+        let fc = self.facts_config.clone().unwrap_or_default();
+        let store = Arc::new(ai_agents_facts::FactStore::new(
+            storage,
+            self.info.id.clone(),
+            fc.clone(),
+        ));
+
+        let extractor: Option<Arc<dyn ai_agents_facts::FactExtractor>> = if facts_enabled {
+            let extractor_llm = fc
+                .extractor_llm
+                .as_ref()
+                .and_then(|alias| self.llm_registry.get(alias).ok())
+                .or_else(|| self.llm_registry.router().ok())
+                .or_else(|| self.llm_registry.default().ok());
+            extractor_llm.map(|llm| {
+                Arc::new(ai_agents_facts::LLMFactExtractor::new(llm, fc.clone()))
+                    as Arc<dyn ai_agents_facts::FactExtractor>
+            })
+        } else {
+            None
+        };
+
+        *self.fact_store.write() = Some(store);
+        *self.fact_extractor.write() = extractor;
+        debug!(
+            agent = %self.info.id,
+            facts_enabled,
+            actor_memory_enabled,
+            "facts storage initialized"
+        );
     }
 
     fn convert_storage_config(&self) -> StorageStorageConfig {
@@ -457,6 +844,71 @@ impl RuntimeAgent {
             .unwrap_or_default()
     }
 
+    /// Get a copy of current session metadata.
+    pub fn session_metadata(&self) -> ai_agents_core::SessionMetadata {
+        self.session_metadata.read().clone()
+    }
+
+    /// Delete all facts and sessions for an actor, gated by privacy.allow_deletion.
+    /// Returns Err when actor_memory.privacy.allow_deletion is false.
+    pub async fn delete_actor_data(&self, actor_id: &str) -> Result<()> {
+        let allowed = self
+            .actor_memory_config
+            .as_ref()
+            .map(|c| c.privacy.allow_deletion)
+            .unwrap_or(true);
+        if !allowed {
+            return Err(AgentError::Config(
+                "privacy.allow_deletion is false; actor data deletion is not permitted".into(),
+            ));
+        }
+        if let Some(store) = self.fact_store.read().clone() {
+            store.delete_actor_data(actor_id).await?;
+            // Clear cache if we just deleted the current actor.
+            if self.actor_id.read().as_deref() == Some(actor_id) {
+                self.actor_facts_cache.write().clear();
+                *self.last_loaded_actor_id.write() = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// Overwrite session metadata (tags, ttl, custom fields).
+    pub fn set_session_metadata(&self, meta: ai_agents_core::SessionMetadata) {
+        *self.session_metadata.write() = meta;
+    }
+
+    /// Delete sessions whose TTL has expired. Returns number of sessions removed.
+    pub async fn cleanup_expired_sessions(&self) -> Result<usize> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => {
+                let count = s.cleanup_expired().await?;
+                if count > 0 {
+                    self.hooks.on_sessions_expired(count).await;
+                }
+                Ok(count)
+            }
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
+    /// List sessions matching a filter. Supports actor, tag, and date filters.
+    pub async fn list_sessions_filtered(
+        &self,
+        filter: &ai_agents_core::SessionFilter,
+    ) -> Result<Vec<ai_agents_core::SessionSummary>> {
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(s) => s.list_sessions_filtered(filter).await,
+            None => Err(AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )),
+        }
+    }
+
     pub async fn save_state(&self) -> Result<AgentSnapshot> {
         let memory_snapshot = self.memory.snapshot().await?;
         let state_machine_snapshot = self.state_machine.as_ref().map(|sm| sm.snapshot());
@@ -532,7 +984,41 @@ impl RuntimeAgent {
     pub async fn save_session(&self, session_id: &str) -> Result<()> {
         let storage = self.storage.read().clone();
         match storage {
-            Some(s) => self.save_to(s.as_ref(), session_id).await,
+            Some(s) => {
+                // Fire on_session_created when this session id is first seen on this runtime.
+                let is_new = {
+                    let cur = self.current_session_id.read().clone();
+                    cur.as_deref() != Some(session_id)
+                };
+                if is_new {
+                    *self.current_session_id.write() = Some(session_id.to_string());
+                    self.hooks.on_session_created(session_id).await;
+                }
+
+                // Update metadata before persisting.
+                {
+                    let now = chrono::Utc::now();
+                    let msg_count = self
+                        .memory
+                        .get_messages(None)
+                        .await
+                        .map(|v| v.len())
+                        .unwrap_or(0);
+                    let mut meta = self.session_metadata.write();
+                    meta.last_active = now;
+                    meta.message_count = msg_count;
+                    if meta.actor_id.is_none() {
+                        meta.actor_id = self.actor_id.read().clone();
+                    }
+                }
+
+                self.save_to(s.as_ref(), session_id).await?;
+
+                // Persist metadata alongside the snapshot.
+                let meta = self.session_metadata.read().clone();
+                let _ = s.save_metadata(session_id, &meta).await;
+                Ok(())
+            }
             None => Err(AgentError::Config(
                 "No storage configured. Use with_storage_config() or with_storage() first".into(),
             )),
@@ -542,7 +1028,20 @@ impl RuntimeAgent {
     pub async fn load_session(&self, session_id: &str) -> Result<bool> {
         let storage = self.storage.read().clone();
         match storage {
-            Some(s) => self.load_from(s.as_ref(), session_id).await,
+            Some(s) => {
+                let loaded = self.load_from(s.as_ref(), session_id).await?;
+                if loaded {
+                    // Restore session metadata alongside the snapshot.
+                    if let Ok(Some(meta)) = s.load_metadata(session_id).await {
+                        if let Some(ref aid) = meta.actor_id {
+                            let _ = self.set_actor_id(aid);
+                        }
+                        *self.session_metadata.write() = meta;
+                    }
+                    *self.current_session_id.write() = Some(session_id.to_string());
+                }
+                Ok(loaded)
+            }
             None => Err(AgentError::Config(
                 "No storage configured. Use with_storage_config() or with_storage() first".into(),
             )),
@@ -685,7 +1184,17 @@ impl RuntimeAgent {
     }
 
     fn render_system_prompt(&self) -> Result<String> {
-        let context = self.context_manager.get_all();
+        let mut context = self.context_manager.get_all();
+
+        // Inject actor_facts for {{ actor_facts }} template variable.
+        let facts_text = self.format_actor_facts_for_context();
+        if !facts_text.is_empty() {
+            context.insert(
+                "actor_facts".to_string(),
+                serde_json::Value::String(facts_text),
+            );
+        }
+
         self.template_renderer
             .render(&self.base_system_prompt, &context)
     }
@@ -4476,6 +4985,9 @@ Respond in JSON format:
 
     // run_loop_internal: blocking (non-streaming) agent pipeline.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
+        // Resolve actor_id from context, reload facts if actor changed, bump counter.
+        self.pre_turn_session_lifecycle().await;
+
         let input_data = self.process_input(input).await?;
 
         // Inject process context (detect/extract results) into agent context
@@ -4738,6 +5250,9 @@ Respond in JSON format:
 
             self.hooks.on_response(&response).await;
 
+            // Bump counter for assistant message and run auto-extraction.
+            self.post_turn_session_lifecycle().await;
+
             let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
             info!(
                 tool_calls = tool_call_count,
@@ -4761,6 +5276,9 @@ Respond in JSON format:
         let include_state_events = self.streaming.include_state_events;
 
         Box::pin(async_stream::stream! {
+            // Parity with non-stream: resolve actor from context and load facts if changed.
+            self.pre_turn_session_lifecycle().await;
+
             let input_data = match self.process_input(input).await {
                 Ok(data) => data,
                 Err(e) => {
@@ -5174,6 +5692,9 @@ Respond in JSON format:
                     // Yield the post-transition re-generated or re-dispatched content.
                     yield StreamChunk::content(&final_content);
                 }
+
+                // Parity with non-stream: bump counter and run auto-extraction.
+                self.post_turn_session_lifecycle().await;
 
                 yield StreamChunk::Done {};
                 return;

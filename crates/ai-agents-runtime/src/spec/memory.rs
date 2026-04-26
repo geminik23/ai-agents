@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+use ai_agents_facts::{ActorMemoryConfig, FactsConfig, SessionConfig};
 use ai_agents_memory::{CompactingMemoryConfig, MemoryTokenBudget};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,6 +29,18 @@ pub struct MemoryConfig {
     #[serde(default)]
     pub summarizer_llm: Option<String>,
 
+    /// Cross-session actor memory configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_memory: Option<ActorMemoryConfig>,
+
+    /// Key facts extraction configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub facts: Option<FactsConfig>,
+
+    /// Session-level metadata defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionConfig>,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -50,6 +63,9 @@ impl Default for MemoryConfig {
             summarize_batch_size: None,
             token_budget: None,
             summarizer_llm: None,
+            actor_memory: None,
+            facts: None,
+            session: None,
             extra: HashMap::new(),
         }
     }
@@ -58,6 +74,19 @@ impl Default for MemoryConfig {
 impl MemoryConfig {
     pub fn is_compacting(&self) -> bool {
         self.memory_type == "compacting"
+    }
+
+    /// Check if actor memory is enabled.
+    pub fn has_actor_memory(&self) -> bool {
+        self.actor_memory
+            .as_ref()
+            .map(|am| am.enabled)
+            .unwrap_or(false)
+    }
+
+    /// Check if facts extraction is enabled.
+    pub fn has_facts(&self) -> bool {
+        self.facts.as_ref().map(|f| f.enabled).unwrap_or(false)
     }
 
     pub fn to_compacting_config(&self) -> CompactingMemoryConfig {
@@ -112,6 +141,53 @@ db_path: "/path/to/db.sqlite"
 "#;
         let config: MemoryConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.extra.contains_key("db_path"));
+    }
+
+    #[test]
+    fn test_memory_config_with_actor_memory() {
+        let yaml = r#"
+type: compacting
+max_messages: 100
+actor_memory:
+  enabled: true
+  identification:
+    method: from_context
+    context_path: user.id
+  injection:
+    mode: all
+    max_tokens: 800
+  privacy:
+    retention_days: 365
+    allow_deletion: true
+facts:
+  enabled: true
+  extractor_llm: router
+  auto_extract: true
+  categories:
+    - user_preference
+    - user_context
+  max_facts: 30
+session:
+  tags: [support]
+  ttl_seconds: 86400
+"#;
+        let config: MemoryConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.has_actor_memory());
+        assert!(config.has_facts());
+        let am = config.actor_memory.unwrap();
+        assert!(am.enabled);
+        assert_eq!(
+            am.identification.method,
+            ai_agents_facts::IdentificationMethod::FromContext
+        );
+        assert_eq!(am.identification.context_path.as_deref(), Some("user.id"));
+        let facts = config.facts.unwrap();
+        assert!(facts.enabled);
+        assert_eq!(facts.extractor_llm.as_deref(), Some("router"));
+        assert_eq!(facts.max_facts, 30);
+        let session = config.session.unwrap();
+        assert_eq!(session.tags, vec!["support"]);
+        assert_eq!(session.ttl_seconds, Some(86400));
     }
 
     #[test]

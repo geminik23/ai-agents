@@ -25,7 +25,7 @@ impl TemplateRenderer {
     pub fn render(&self, template: &str, context: &HashMap<String, Value>) -> Result<String> {
         let mut ctx = HashMap::new();
 
-        // Build context map
+        // Build context map - all values available as {{ context.<key> }}
         let mut context_map = serde_json::Map::new();
         for (key, value) in context {
             context_map.insert(key.clone(), value.clone());
@@ -38,6 +38,16 @@ impl TemplateRenderer {
 
         if let Some(state) = context.get("state") {
             ctx.insert("state", json_to_minijinja(state));
+        }
+
+        // Hoist a fixed set of well-known top-level variables so system prompt
+        // templates can use {{ actor_facts }} directly instead of
+        // {{ context.actor_facts }}. Any key listed here is also accessible via
+        // the context. prefix, so both forms work.
+        for key in &["actor_facts"] {
+            if let Some(value) = context.get(*key) {
+                ctx.insert(key, json_to_minijinja(value));
+            }
         }
 
         let tmpl = self
@@ -208,5 +218,57 @@ mod tests {
         let template = "{{ context.missing | default('N/A') }}";
         let result = renderer.render(template, &context).unwrap();
         assert_eq!(result, "N/A");
+    }
+
+    // actor_facts must be accessible as a top-level variable {{ actor_facts }}
+    // because that is the form used in system prompt templates.
+    // It is also accessible as {{ context.actor_facts }}.
+    #[test]
+    fn test_actor_facts_top_level_variable() {
+        let renderer = TemplateRenderer::new();
+        let mut context = HashMap::new();
+        context.insert(
+            "actor_facts".into(),
+            json!("- User name is Jay.\n- User works as an AI engineer.\n"),
+        );
+
+        // Top-level form used in system prompts.
+        let template = "{% if actor_facts %}Known facts:\n{{ actor_facts }}{% endif %}";
+        let result = renderer.render(template, &context).unwrap();
+        assert!(
+            result.contains("User name is Jay"),
+            "actor_facts must render at top level without context. prefix"
+        );
+        assert!(
+            result.contains("Known facts"),
+            "{{% if actor_facts %}} must evaluate to true for non-empty string"
+        );
+    }
+
+    #[test]
+    fn test_actor_facts_also_accessible_via_context_prefix() {
+        let renderer = TemplateRenderer::new();
+        let mut context = HashMap::new();
+        context.insert("actor_facts".into(), json!("- User name is Jay.\n"));
+
+        // Both forms must work.
+        let template_top = "{{ actor_facts }}";
+        let template_ctx = "{{ context.actor_facts }}";
+        let result_top = renderer.render(template_top, &context).unwrap();
+        let result_ctx = renderer.render(template_ctx, &context).unwrap();
+        assert_eq!(result_top, result_ctx);
+    }
+
+    #[test]
+    fn test_actor_facts_if_block_false_when_absent() {
+        let renderer = TemplateRenderer::new();
+        let context = HashMap::new(); // no actor_facts key
+
+        let template = "base{% if actor_facts %} facts: {{ actor_facts }}{% endif %} end";
+        let result = renderer.render(template, &context).unwrap();
+        assert_eq!(
+            result, "base end",
+            "{{% if actor_facts %}} must be false when actor_facts is not in context"
+        );
     }
 }

@@ -7,9 +7,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentError, AgentSnapshot, AgentStorage, Result};
+use ai_agents_core::{
+    FactCategory, FactFilter, KeyFact, SessionFilter, SessionMetadata, SessionSummary,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct SessionMetadata {
+pub struct SqliteMetadata {
     #[serde(default)]
     pub tags: Vec<String>,
     #[serde(default)]
@@ -31,7 +34,7 @@ pub struct SessionInfo {
     pub message_count: usize,
     pub current_state: Option<String>,
     #[serde(default)]
-    pub metadata: SessionMetadata,
+    pub metadata: SqliteMetadata,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -153,6 +156,49 @@ impl SqliteStorage {
         .await
         .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
+        // actor_facts table for cross-session fact persistence.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS actor_facts (
+                id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                content TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                salience REAL NOT NULL DEFAULT 1.0,
+                extracted_at TEXT NOT NULL,
+                last_accessed TEXT,
+                source_message_id TEXT,
+                source_language TEXT,
+                PRIMARY KEY (agent_id, actor_id, id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_actor_facts_agent_actor
+            ON actor_facts(agent_id, actor_id)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_actor_facts_category
+            ON actor_facts(agent_id, actor_id, category)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
         Ok(())
     }
 
@@ -165,7 +211,7 @@ impl SqliteStorage {
         current_state: Option<String>,
         metadata_json: Option<String>,
     ) -> SessionInfo {
-        let metadata = metadata_json
+        let metadata: SqliteMetadata = metadata_json
             .and_then(|m| serde_json::from_str(&m).ok())
             .unwrap_or_default();
 
@@ -188,7 +234,7 @@ impl SqliteStorage {
         &self,
         session_id: &str,
         snapshot: &AgentSnapshot,
-        metadata: &SessionMetadata,
+        metadata: &SqliteMetadata,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let data =
@@ -244,7 +290,7 @@ impl SqliteStorage {
         Ok(())
     }
 
-    pub async fn get_metadata(&self, session_id: &str) -> Result<Option<SessionMetadata>> {
+    pub async fn get_metadata(&self, session_id: &str) -> Result<Option<SqliteMetadata>> {
         let row: Option<(Option<String>,)> =
             sqlx::query_as("SELECT metadata FROM sessions WHERE session_id = ?")
                 .bind(session_id)
@@ -254,11 +300,11 @@ impl SqliteStorage {
 
         match row {
             Some((Some(metadata_json),)) => {
-                let metadata = serde_json::from_str(&metadata_json)
+                let metadata: SqliteMetadata = serde_json::from_str(&metadata_json)
                     .map_err(|e| AgentError::Persistence(e.to_string()))?;
                 Ok(Some(metadata))
             }
-            Some((None,)) => Ok(Some(SessionMetadata::default())),
+            Some((None,)) => Ok(Some(SqliteMetadata::default())),
             None => Ok(None),
         }
     }
@@ -494,7 +540,7 @@ impl SqliteStorage {
 #[async_trait]
 impl AgentStorage for SqliteStorage {
     async fn save(&self, session_id: &str, snapshot: &AgentSnapshot) -> Result<()> {
-        self.save_with_metadata(session_id, snapshot, &SessionMetadata::default())
+        self.save_with_metadata(session_id, snapshot, &SqliteMetadata::default())
             .await
     }
 
@@ -533,6 +579,372 @@ impl AgentStorage for SqliteStorage {
                 .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
         Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    // --- Session metadata extensions ---
+
+    async fn save_metadata(&self, session_id: &str, metadata: &SessionMetadata) -> Result<()> {
+        let meta_json =
+            serde_json::to_string(metadata).map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        sqlx::query("UPDATE sessions SET metadata = ? WHERE session_id = ?")
+            .bind(&meta_json)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn load_metadata(&self, session_id: &str) -> Result<Option<SessionMetadata>> {
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT metadata FROM sessions WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        match row {
+            Some((Some(json),)) => {
+                let meta: SessionMetadata = serde_json::from_str(&json).unwrap_or_default();
+                Ok(Some(meta))
+            }
+            Some((None,)) => Ok(Some(SessionMetadata::default())),
+            None => Ok(None),
+        }
+    }
+
+    async fn list_sessions_filtered(&self, filter: &SessionFilter) -> Result<Vec<SessionSummary>> {
+        let mut sql = String::from(
+            "SELECT session_id, agent_id, created_at, updated_at, message_count, metadata FROM sessions WHERE 1=1",
+        );
+        let mut binds: Vec<String> = vec![];
+
+        if let Some(ref agent_id) = filter.agent_id {
+            sql.push_str(" AND agent_id = ?");
+            binds.push(agent_id.clone());
+        }
+        if let Some(ref actor_id) = filter.actor_id {
+            sql.push_str(" AND json_extract(metadata, '$.actor_id') = ?");
+            binds.push(actor_id.clone());
+        }
+        if let Some(ref tags) = filter.tags {
+            for tag in tags {
+                sql.push_str(
+                    " AND session_id IN (SELECT session_id FROM session_tags WHERE tag = ?)",
+                );
+                binds.push(tag.clone());
+            }
+        }
+        if let Some(ref after) = filter.created_after {
+            sql.push_str(" AND created_at >= ?");
+            binds.push(after.to_rfc3339());
+        }
+        if let Some(ref before) = filter.created_before {
+            sql.push_str(" AND created_at <= ?");
+            binds.push(before.to_rfc3339());
+        }
+
+        sql.push_str(" ORDER BY updated_at DESC");
+
+        if let Some(limit) = filter.limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        let mut q =
+            sqlx::query_as::<_, (String, String, String, String, i64, Option<String>)>(&sql);
+        for b in &binds {
+            q = q.bind(b);
+        }
+
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(session_id, agent_id, created_at, updated_at, message_count, metadata_json)| {
+                    let meta: SessionMetadata = metadata_json
+                        .and_then(|j| serde_json::from_str(&j).ok())
+                        .unwrap_or_default();
+                    SessionSummary {
+                        session_id,
+                        agent_id,
+                        actor_id: meta.actor_id,
+                        tags: meta.tags,
+                        created_at: DateTime::parse_from_rfc3339(&created_at)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        last_active: DateTime::parse_from_rfc3339(&updated_at)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        message_count: message_count as usize,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn cleanup_expired(&self) -> Result<usize> {
+        // Find sessions with TTL set where last_active + TTL < now.
+        let now = Utc::now().to_rfc3339();
+        let result = sqlx::query(
+            r#"
+            DELETE FROM sessions
+            WHERE session_id IN (
+                SELECT s.session_id FROM sessions s
+                WHERE json_extract(s.metadata, '$.ttl_seconds') IS NOT NULL
+                AND datetime(s.updated_at, '+' || json_extract(s.metadata, '$.ttl_seconds') || ' seconds') < ?
+            )
+            "#,
+        )
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(result.rows_affected() as usize)
+    }
+
+    async fn save_facts(&self, agent_id: &str, actor_id: &str, facts: &[KeyFact]) -> Result<()> {
+        for fact in facts {
+            let category_str = fact.category.to_string();
+            let extracted_at = fact.extracted_at.to_rfc3339();
+            let last_accessed = fact.last_accessed.map(|dt| dt.to_rfc3339());
+
+            sqlx::query(
+                r#"
+                INSERT INTO actor_facts
+                    (id, agent_id, actor_id, category, content, confidence, salience,
+                     extracted_at, last_accessed, source_message_id, source_language)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(agent_id, actor_id, id) DO UPDATE SET
+                    category = excluded.category,
+                    content = excluded.content,
+                    confidence = excluded.confidence,
+                    salience = excluded.salience,
+                    last_accessed = excluded.last_accessed,
+                    source_message_id = excluded.source_message_id,
+                    source_language = excluded.source_language
+                "#,
+            )
+            .bind(&fact.id)
+            .bind(agent_id)
+            .bind(actor_id)
+            .bind(&category_str)
+            .bind(&fact.content)
+            .bind(fact.confidence)
+            .bind(fact.salience)
+            .bind(&extracted_at)
+            .bind(&last_accessed)
+            .bind(&fact.source_message_id)
+            .bind(&fact.source_language)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    async fn load_facts(&self, agent_id: &str, actor_id: &str) -> Result<Vec<KeyFact>> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            f64,
+            f64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = sqlx::query_as(
+            r#"
+            SELECT id, category, content, confidence, salience,
+                   extracted_at, last_accessed, source_message_id, source_language
+            FROM actor_facts
+            WHERE agent_id = ? AND actor_id = ?
+            ORDER BY (salience * confidence) DESC
+            "#,
+        )
+        .bind(agent_id)
+        .bind(actor_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    category,
+                    content,
+                    confidence,
+                    salience,
+                    extracted_at,
+                    last_accessed,
+                    source_msg,
+                    source_lang,
+                )| {
+                    KeyFact {
+                        id,
+                        actor_id: Some(actor_id.to_string()),
+                        category: parse_fact_category(&category),
+                        content,
+                        confidence: confidence as f32,
+                        salience: salience as f32,
+                        extracted_at: DateTime::parse_from_rfc3339(&extracted_at)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        last_accessed: last_accessed.and_then(|ref s| {
+                            DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        source_message_id: source_msg,
+                        source_language: source_lang,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn query_facts(&self, agent_id: &str, filter: &FactFilter) -> Result<Vec<KeyFact>> {
+        let mut sql = String::from(
+            "SELECT id, actor_id, category, content, confidence, salience, extracted_at, last_accessed, source_message_id, source_language FROM actor_facts WHERE agent_id = ?",
+        );
+        let mut str_binds: Vec<String> = vec![agent_id.to_string()];
+
+        if let Some(ref actor_id) = filter.actor_id {
+            sql.push_str(" AND actor_id = ?");
+            str_binds.push(actor_id.clone());
+        }
+        if let Some(ref category) = filter.category {
+            sql.push_str(" AND category = ?");
+            str_binds.push(category.to_string());
+        }
+        if let Some(min_conf) = filter.min_confidence {
+            sql.push_str(&format!(" AND confidence >= {}", min_conf));
+        }
+        if let Some(min_sal) = filter.min_salience {
+            sql.push_str(&format!(" AND salience >= {}", min_sal));
+        }
+
+        sql.push_str(" ORDER BY (salience * confidence) DESC");
+
+        if let Some(limit) = filter.limit {
+            sql.push_str(&format!(" LIMIT {}", limit));
+        }
+
+        let mut q = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                f64,
+                f64,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(&sql);
+        // query_facts selects 10 columns including actor_id
+        for b in &str_binds {
+            q = q.bind(b);
+        }
+
+        let rows = q
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(
+                |(
+                    id,
+                    actor_id,
+                    category,
+                    content,
+                    confidence,
+                    salience,
+                    extracted_at,
+                    last_accessed,
+                    source_msg,
+                    source_lang,
+                )| {
+                    KeyFact {
+                        id,
+                        actor_id: Some(actor_id),
+                        category: parse_fact_category(&category),
+                        content,
+                        confidence: confidence as f32,
+                        salience: salience as f32,
+                        extracted_at: DateTime::parse_from_rfc3339(&extracted_at)
+                            .map(|dt| dt.with_timezone(&Utc))
+                            .unwrap_or_else(|_| Utc::now()),
+                        last_accessed: last_accessed.and_then(|ref s| {
+                            DateTime::parse_from_rfc3339(s)
+                                .ok()
+                                .map(|dt| dt.with_timezone(&Utc))
+                        }),
+                        source_message_id: source_msg,
+                        source_language: source_lang,
+                    }
+                },
+            )
+            .collect())
+    }
+
+    async fn delete_fact(&self, agent_id: &str, actor_id: &str, fact_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM actor_facts WHERE agent_id = ? AND actor_id = ? AND id = ?")
+            .bind(agent_id)
+            .bind(actor_id)
+            .bind(fact_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn delete_actor_data(&self, agent_id: &str, actor_id: &str) -> Result<()> {
+        // Delete all facts for this actor.
+        sqlx::query("DELETE FROM actor_facts WHERE agent_id = ? AND actor_id = ?")
+            .bind(agent_id)
+            .bind(actor_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        // Delete sessions associated with this actor.
+        sqlx::query(
+            "DELETE FROM sessions WHERE agent_id = ? AND json_extract(metadata, '$.actor_id') = ?",
+        )
+        .bind(agent_id)
+        .bind(actor_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(())
+    }
+}
+
+/// Parse a category string back into FactCategory enum.
+#[cfg(feature = "sqlite")]
+fn parse_fact_category(s: &str) -> FactCategory {
+    match s {
+        "preference" | "user_preference" => FactCategory::UserPreference,
+        "context" | "user_context" => FactCategory::UserContext,
+        "decision" => FactCategory::Decision,
+        "agreement" => FactCategory::Agreement,
+        _ => FactCategory::Custom(s.to_string()),
     }
 }
 
@@ -598,7 +1010,7 @@ mod tests {
         let storage = SqliteStorage::in_memory().await.unwrap();
         let snapshot = create_test_snapshot().await;
 
-        let metadata = SessionMetadata {
+        let metadata = SqliteMetadata {
             tags: vec!["vip".to_string(), "support".to_string()],
             user_id: Some("user-123".to_string()),
             ..Default::default()
@@ -639,7 +1051,7 @@ mod tests {
         let storage = SqliteStorage::in_memory().await.unwrap();
         let snapshot = create_test_snapshot().await;
 
-        let metadata = SessionMetadata {
+        let metadata = SqliteMetadata {
             tags: vec!["vip".to_string()],
             user_id: Some("user-123".to_string()),
             ..Default::default()

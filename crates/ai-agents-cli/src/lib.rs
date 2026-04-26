@@ -14,7 +14,7 @@ pub use run::{
 };
 
 pub fn init_tracing() {
-    init_tracing_with_default("ai_agents=info");
+    init_tracing_with_default("ai_agents=info,ai_agents_facts=warn");
 }
 
 pub fn init_tracing_with_default(default_filter: &str) {

@@ -52,6 +52,9 @@ pub async fn run_tui(
     let subscriber = tracing_subscriber::registry().with(log_layer);
     let _ = tracing::subscriber::set_global_default(subscriber);
 
+    // Initialize storage eagerly so fact_store is ready before the first turn.
+    let _ = agent.init_storage().await;
+
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).context("failed to enter alternate screen")?;

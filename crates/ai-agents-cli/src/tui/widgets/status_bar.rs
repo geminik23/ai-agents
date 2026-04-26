@@ -14,6 +14,8 @@ pub struct StatusBarState {
     pub budget_percent: Option<f64>,
     pub is_thinking: bool,
     pub spinner_frame: usize,
+    /// Current actor ID for cross-session memory. Rendered after state when set.
+    pub actor_id: Option<String>,
 }
 
 pub fn render_status_bar(area: Rect, buf: &mut Buffer, state: &StatusBarState, theme: &Theme) {
@@ -38,12 +40,18 @@ pub fn render_status_bar(area: Rect, buf: &mut Buffer, state: &StatusBarState, t
         .map(|s| format!("  [{}]", s))
         .unwrap_or_default();
 
+    let actor_str = state
+        .actor_id
+        .as_deref()
+        .map(|a| format!("  actor:{}", a))
+        .unwrap_or_default();
+
     let budget_str = state
         .budget_percent
         .map(|p| format!("  {:.0}% tok", p))
         .unwrap_or_default();
 
-    // Left side: agent identity and state.
+    // Left side: agent identity, state, and actor.
     let left_spans = vec![
         Span::styled(" ", theme.status_fg),
         Span::styled(
@@ -52,6 +60,7 @@ pub fn render_status_bar(area: Rect, buf: &mut Buffer, state: &StatusBarState, t
         ),
         Span::styled(format!(" v{}", state.agent_version), theme.status_fg),
         Span::styled(&state_str, theme.status_fg),
+        Span::styled(&actor_str, theme.status_fg),
     ];
 
     // Right side: budget and spinner.

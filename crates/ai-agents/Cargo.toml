@@ -27,6 +27,7 @@ ai-agents-recovery = { workspace = true }
 ai-agents-reasoning = { workspace = true }
 ai-agents-disambiguation = { workspace = true }
 ai-agents-persona = { workspace = true }
+ai-agents-facts = { workspace = true }
 ai-agents-template = { workspace = true }
 ai-agents-runtime = { workspace = true }
 serde_yaml = { workspace = true }

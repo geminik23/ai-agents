@@ -3,6 +3,10 @@
 mod snapshot;
 mod storage;
 
+pub use ai_agents_core::{
+    FactCategory, FactFilter, KeyFact, SessionFilter, SessionMetadata, SessionSummary,
+};
+
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
@@ -14,7 +18,7 @@ pub use snapshot::StateMachineSnapshot;
 pub use storage::FileStorage;
 
 #[cfg(feature = "sqlite")]
-pub use sqlite::{SessionInfo, SessionMetadata, SessionOrderBy, SessionQuery, SqliteStorage};
+pub use sqlite::{SessionInfo, SessionOrderBy, SessionQuery, SqliteMetadata, SqliteStorage};
 
 #[cfg(feature = "redis-storage")]
 pub use redis::{RedisSessionMeta, RedisStorage};
@@ -93,7 +97,7 @@ mod sqlite_types {
     use std::collections::HashMap;
 
     #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-    pub struct SessionMetadata {
+    pub struct SqliteMetadata {
         #[serde(default)]
         pub tags: Vec<String>,
         #[serde(default)]
@@ -115,7 +119,7 @@ mod sqlite_types {
         pub message_count: usize,
         pub current_state: Option<String>,
         #[serde(default)]
-        pub metadata: SessionMetadata,
+        pub metadata: SqliteMetadata,
     }
 
     #[derive(Debug, Clone, Default)]

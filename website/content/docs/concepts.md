@@ -415,6 +415,47 @@ persona:
 
 ---
 
+## Actor Memory & Key Facts
+
+Agents can remember facts about the people they talk to across sessions. The `actor_memory` and `facts` blocks inside `memory:` enable this. An **actor** is any entity the agent interacts with - a customer, a game player, another agent. The framework uses `actor_id` as a universal identifier.
+
+**How it works:** After each conversation turn, the framework runs a fast LLM call to extract structured facts (preferences, context, decisions, agreements) from the messages. Facts are stored in the same storage backend as session snapshots, keyed by `(agent_id, actor_id)`. When the same actor returns in a new session, their facts are loaded and injected into the system prompt via the `{{ actor_facts }}` Jinja2 variable.
+
+**Actor identification** can be explicit (set via `--actor` CLI flag or `set_actor_id()` API) or context-based (read from a context path like `player.id`). Context-based identification is useful for NPC agents where the hosting application sets the current player before each turn.
+
+**Fact content is always English** regardless of conversation language, so cross-language deduplication works consistently. The LLM handles translation during extraction. Facts are ranked by `salience * confidence` for priority - when the fact count exceeds `max_facts`, lowest-priority facts are evicted.
+
+**Custom categories** extend the built-in set (`user_preference`, `user_context`, `decision`, `agreement`) with domain-specific types. An NPC guard might track `suspicion` and `favor` categories; a medical assistant might track `medical_history`.
+
+```yaml
+memory:
+  actor_memory:
+    enabled: true
+    identification:
+      method: from_context
+      context_path: user.id
+  facts:
+    enabled: true
+    extractor_llm: router
+    auto_extract: true
+    categories: [user_preference, user_context, decision]
+    custom_categories:
+      - name: suspicion
+        description: "Suspicious behavior observed"
+    max_facts: 50
+
+system_prompt: |
+  You are a helpful assistant.
+  {% if actor_facts %}
+  What you know about this person:
+  {{ actor_facts }}
+  {% endif %}
+```
+
+The `/actor` and `/facts` REPL commands let you inspect and manage facts interactively. Use `/actor set <id>` to switch actors, `/actor facts` to list facts, and `/facts extract` to trigger manual extraction.
+
+---
+
 ## Dynamic Agent Spawning
 
 A parent agent can create and manage child agents at runtime using the spawner system. This enables patterns like a game master that spawns NPC agents on demand, or a team manager that creates specialist agents for different tasks.

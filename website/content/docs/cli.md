@@ -72,6 +72,7 @@ Parses and validates the YAML spec. Returns exit code `0` on success, `1` on fai
 | `--hint <text>`           | Add a startup hint (can be repeated)                         |
 | `--context <KEY=VALUE>`   | Inject a runtime context value (repeatable, supports dotted paths) |
 | `--context-file <PATH>`   | Load runtime context from a JSON file                        |
+| `--actor <ID>`            | Set actor ID at startup for cross-session memory             |
 | `--plain`                 | Force plain line REPL even on interactive TTY                |
 | `--theme <name>`          | Color theme (one-dark, catppuccin-mocha, dracula, tokyo-night, vscode-dark, nord, gruvbox-dark, one-half-light, github-light) |
 
@@ -165,7 +166,16 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 | `/load self [name]`  | Load parent session only                                             |
 | `/load agent <id>`   | Load one spawned agent's session                                     |
 | `/sessions`          | List saved sessions                                                  |
+| `/sessions --actor <id>` | List sessions for a specific actor (requires session metadata)   |
+| `/sessions --tag <tag>` | List sessions matching a tag (requires session metadata)          |
+| `/cleanup`           | Delete sessions whose TTL has expired                                |
 | `/delete <name>`     | Delete a saved session                                               |
+| `/actor`             | Show current actor ID                                                |
+| `/actor set <id>`    | Set actor ID for cross-session memory                                |
+| `/actor facts [cat]` | Show facts for the current actor, optionally filtered by category    |
+| `/actor delete`      | Delete all data for the current actor (GDPR)                         |
+| `/facts`             | Show all facts for the current actor                                 |
+| `/facts extract [n]` | Manually extract facts from the last N messages (default: 10)        |
 | `/quit`, `/exit`     | Exit the REPL                                                        |
 
 `/quit` and `/exit` always work, even when builtins are disabled.
@@ -181,7 +191,7 @@ Use `--plain` to skip the TUI and use the traditional line REPL instead.
 
 The TUI has four zones:
 
-- **Status bar** (top) - agent name, version, current state, token budget percentage, thinking spinner
+- **Status bar** (top) - agent name, version, current state, current actor ID, token budget percentage, thinking spinner
 - **Chat area** (center) - scrollable message history with role-colored output, hint markers, and log cards
 - **Input area** (bottom) - multi-line text input
 - **Hint bar** (bottom line) - key bindings and contextual hints
@@ -198,7 +208,7 @@ Toggle side panels with function keys:
 | `F4` | Context | Current context values |
 | `F5` | Tools   | Available tools and last call result |
 | `F6` | Persona | Agent persona identity, traits, goals |
-| `F7` | Facts   | Key facts (available after session management feature) |
+| `F7` | Facts   | Live actor facts when `memory.facts` is enabled and an actor is set |
 | `F8` | Agents  | Spawned agents and orchestration status |
 
 Press the same key again to close a panel. Press `Esc` to close all panels.

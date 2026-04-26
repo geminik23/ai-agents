@@ -1008,6 +1008,135 @@ memory:
     warn_at_percent: 70
 ```
 
+### `actor_memory` (Cross-Session Actor Memory)
+
+Track facts about each actor (user, player, other agent) across sessions. When the same actor returns, previously extracted facts are loaded from storage and injected into the system prompt via `{{ actor_facts }}`.
+
+```yaml
+memory:
+  actor_memory:
+    enabled: true
+    identification:
+      method: from_context         # explicit (set via API/--actor) | from_context (read from context path)
+      context_path: user.id        # dot path into context. used when method: from_context
+    injection:
+      mode: all                    # all | category | on_demand. default: all
+      max_tokens: 800              # max tokens for injected facts. default: 800
+      categories:                  # only inject these categories (when mode: category)
+        - user_preference
+    privacy:
+      retention_days: 365          # auto-delete facts after N days. null = keep forever
+      allow_deletion: true         # actor can request full data wipe. default: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable cross-session actor memory |
+| `identification.method` | string | `explicit` | How to resolve actor ID. `explicit` = set via `set_actor_id()` or `--actor` flag. `from_context` = read from context path |
+| `identification.context_path` | string | - | Dot path into context to read actor ID (when method is `from_context`) |
+| `injection.mode` | string | `all` | `all` = inject all facts. `category` = inject only listed categories. `on_demand` = no auto-injection |
+| `injection.max_tokens` | int | `800` | Maximum tokens for injected facts in the prompt |
+| `privacy.retention_days` | int | - | Auto-delete facts older than N days. Omit for no expiry |
+| `privacy.allow_deletion` | bool | `true` | Whether actors can request deletion of all their data |
+
+### `facts` (Key Facts Extraction)
+
+Extract structured facts from conversations using an LLM. Facts persist in the same storage backend as session snapshots. Fact content is always stored in English for consistent cross-language deduplication.
+
+```yaml
+memory:
+  facts:
+    enabled: true
+    extractor_llm: router           # which LLM runs extraction. default: router
+    auto_extract: true              # extract after every turn. default: true
+    categories:                     # built-in categories to look for
+      - user_preference             # "I prefer...", "I like..."
+      - user_context                # "I am a...", "I work at..."
+      - decision                    # "I decided to..."
+      - agreement                   # "Yes, agreed"
+    custom_categories:              # domain-specific categories
+      - name: suspicion
+        description: "Suspicious behavior observed"
+    inject_in_context: true         # make facts available as {{ actor_facts }}. default: true
+    max_facts: 50                   # max facts per actor before eviction. default: 50
+    dedup:
+      enabled: true                 # deduplicate against existing facts. default: true
+      method: exact                 # exact (string similarity) | llm (semantic). default: exact
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable fact extraction |
+| `extractor_llm` | string | router | Which named LLM to use for extraction |
+| `auto_extract` | bool | `true` | Extract facts after every turn. Set `false` for manual extraction only |
+| `categories` | list | `[]` | Built-in categories: `user_preference`, `user_context`, `decision`, `agreement` |
+| `custom_categories` | list | `[]` | Domain-specific categories with `name` and `description` |
+| `inject_in_context` | bool | `true` | Make facts available as `{{ actor_facts }}` in system prompt |
+| `max_facts` | int | `50` | Maximum facts per actor. Lowest-priority facts are evicted when exceeded |
+| `dedup.enabled` | bool | `true` | Deduplicate new facts against existing ones |
+| `dedup.method` | string | `exact` | `exact` = run normalized string similarity locally after extraction. `llm` = include existing facts in the extraction prompt and trust the model to skip duplicates (no local post-filter) |
+
+When `token_budget.allocation.facts` is set on the surrounding `memory:` block, that value is used as the effective cap for fact injection and overrides `actor_memory.injection.max_tokens`.
+
+### `session` (Session Metadata)
+
+Static metadata and TTL for the agent's sessions.
+
+```yaml
+memory:
+  session:
+    tags: [support, tier-1]          # freeform tags for filtering
+    ttl_seconds: 86400               # session expiration (24h). null = no expiry
+```
+
+Tags and TTL are persisted alongside each session snapshot when `save_session()` is called. The CLI exposes filtered listings and TTL cleanup via `/sessions --actor <id>`, `/sessions --tag <tag>`, and `/cleanup`. Programmatically, use `RuntimeAgent::list_sessions_filtered()` and `RuntimeAgent::cleanup_expired_sessions()`. Session metadata is currently only persisted by the `sqlite` storage backend; `file` and `redis` backends accept the configuration but do not store metadata yet.
+
+### Complete Actor Memory Example
+
+```yaml
+memory:
+  type: compacting
+  max_recent_messages: 20
+  compress_threshold: 15
+  summarizer_llm: router
+  token_budget:
+    total: 4000
+    allocation:
+      summary: 0.3
+      recent_messages: 0.5
+      facts: 0.2
+  actor_memory:
+    enabled: true
+    identification:
+      method: from_context
+      context_path: user.id
+    injection:
+      mode: all
+      max_tokens: 800
+  facts:
+    enabled: true
+    extractor_llm: router
+    auto_extract: true
+    categories:
+      - user_preference
+      - user_context
+      - decision
+    max_facts: 50
+  session:
+    ttl_seconds: 604800
+```
+
+Use `{{ actor_facts }}` in `system_prompt` to inject the formatted fact list:
+
+```yaml
+system_prompt: |
+  You are a helpful assistant.
+  {% if actor_facts %}
+  What you know about this person:
+  {{ actor_facts }}
+  {% endif %}
+```
+
 ---
 
 ## Storage

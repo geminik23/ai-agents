@@ -26,6 +26,7 @@ pub struct RunOptions {
     pub no_builtins: bool,
     pub contexts: Vec<String>,
     pub context_file: Option<PathBuf>,
+    pub actor: Option<String>,
     pub plain: bool,
     pub theme: Option<String>,
 }
@@ -43,6 +44,7 @@ impl RunOptions {
             no_builtins: args.no_builtins,
             contexts: args.contexts.clone(),
             context_file: args.context_file.clone(),
+            actor: args.actor.clone(),
             plain: args.plain,
             theme: args.theme.clone(),
         }
@@ -93,6 +95,11 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     // The TUI installs a channel-based subscriber inside run_tui().
 
     let agent = build_agent(&options.agent_path).await?;
+
+    // Initialize storage eagerly so fact_store is ready before the first turn.
+    // Without this, storage is only created lazily on the first /save or /load,
+    // and fact extraction would silently skip on every turn.
+    let _ = agent.init_storage().await;
 
     // Inject context from --context and --context-file
     inject_context(&agent, &options)?;
@@ -149,6 +156,13 @@ fn inject_context(agent: &RuntimeAgent, options: &RunOptions) -> Result<()> {
         agent
             .set_context(&key, value)
             .with_context(|| format!("failed to set context: {}", pair))?;
+    }
+
+    // Set actor_id from --actor flag.
+    if let Some(ref actor_id) = options.actor {
+        agent
+            .set_actor_id(actor_id)
+            .with_context(|| format!("failed to set actor_id: {}", actor_id))?;
     }
 
     Ok(())
