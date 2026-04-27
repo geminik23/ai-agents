@@ -1,0 +1,122 @@
+name: FactsBasicAgent
+version: "1.0.0"
+description: "Minimal agent with LLM-based key facts extraction and cross-session memory"
+
+# Key Facts Extraction
+#
+# The framework extracts structured facts from conversations using a secondary LLM.
+# Facts are stored in SQLite and loaded back automatically when the same actor returns,
+# so the agent remembers what it learned across sessions without any application code.
+#
+# A "fact" is a short, structured piece of information about the actor:
+#   - their preferences ("prefers dark mode")
+#   - their background ("works as a backend engineer")
+#   - decisions they made ("chose the Pro plan")
+#
+# Extraction runs after every turn automatically when auto_extract is true.
+# The extractor LLM reads the recent messages, outputs a JSON array of facts, and the framework filters, deduplicates, and saves them to storage.
+# Facts are always stored in English regardless of the conversation language.
+#
+# On the next session, the facts for that actor are loaded before the first turn and injected into the system prompt via {{ actor_facts }}.
+# The actor sees a personalized response without having to repeat themselves.
+#
+# NOTE: Without --actor <id>, no actor_id is set and facts are not stored.
+#       Always pass --actor or call set_actor_id() from your application code.
+#
+# Flow: user input -> LLM response
+#                  -> extractor LLM reads recent messages -> facts saved to DB
+#                  -> next turn: facts injected into {{ actor_facts }} in system prompt
+#
+# New session, same actor:
+#   start -> load facts from DB -> inject into {{ actor_facts }} -> chat as usual
+#
+# Prerequisites:
+#   - OPENAI_API_KEY set in environment
+#   - SQLite storage configured below (facts persist in ./data/facts_basic.db)
+#
+# Usage:
+#   # First session - tell the agent something about yourself
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/facts_basic.yaml --actor user_1
+#
+#   # Second session - the agent remembers without being told again
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/facts_basic.yaml --actor user_1
+
+system_prompt: |
+  You are a helpful assistant with a good memory.
+  {% if actor_facts %}
+  Known facts about this person:
+  {{ actor_facts }}
+  Use these facts naturally. If you know their name, address them by name.
+  {% endif %}
+
+# Two LLMs: default handles conversation, router handles fact extraction.
+# The router LLM only reads and classifies text - use a fast, cheap model.
+# It does not generate conversation content.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_recent_messages: 20           # keep last 20 messages in full
+  compress_threshold: 15            # summarize when message count exceeds this
+  summarizer_llm: router
+
+  # Key facts extraction.
+  # The extractor LLM scans recent messages after each turn and outputs structured facts.
+  # Only messages since the last successful extraction are scanned, not the full history.
+  # Extraction fires after the assistant message, so each turn contributes at most one batch.
+  facts:
+    enabled: true
+    extractor_llm: router           # which LLM runs extraction. default: router
+    auto_extract: true              # extract after every turn. default: true
+                                    # set false for manual extraction only (/facts extract N)
+    categories:                     # which built-in categories to look for
+      - user_preference             # preferences, likes, dislikes ("I prefer dark mode")
+      - user_context                # background, role, situation ("I am a backend engineer")
+      - decision                    # choices made during this conversation ("I chose plan A")
+    inject_in_context: true         # make facts available as {{ actor_facts }}. default: true
+                                    # set false to store silently without prompt injection
+    max_facts: 50                   # max stored facts per actor before eviction. default: 50
+                                    # lowest-priority (salience * confidence) facts are removed first
+    dedup:
+      enabled: true                 # deduplicate new facts against existing ones. default: true
+      method: exact                 # exact: Levenshtein similarity check after extraction
+                                    # llm: include existing facts in the extraction prompt
+
+# SQLite storage is required for facts to persist across sessions.
+# File and Redis backends accept the configuration but do not store facts.
+storage:
+  type: sqlite
+  path: ./data/facts_basic.db
+
+tools: []
+
+metadata:
+  cli:
+    welcome: |
+      === Facts Basic Demo ===
+      The agent extracts facts from your conversation and remembers them across sessions.
+      After each turn, a "[facts]" note shows how many facts were extracted.
+      Run again with the same --actor flag to see memory in action.
+
+      NOTE: Facts are extracted AFTER the response, so the current turn will not
+      reference what you just said. The NEXT turn will know it.
+    hints:
+      - "My name is Alex and I work as a backend engineer."
+      - "I prefer Python over Go for scripting tasks."
+      - "I am based in Berlin and have been coding for 10 years."
+      - "I decided to migrate our stack to microservices this quarter."
+      - "After your first message, watch for the [facts] line below the response."
+      - "Then ask: do you know anything about me? -- the agent should answer yes."
+      - "Use /facts to inspect the full extracted fact list."
+      - "Use /actor facts preference to filter by category."
+      - "Exit and re-run with --actor user_1 to verify facts survive the session."
+      - "Run with RUST_LOG=warn to see extraction errors if [facts] never appears."

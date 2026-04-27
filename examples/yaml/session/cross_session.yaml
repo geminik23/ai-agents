@@ -1,0 +1,153 @@
+name: CrossSessionAgent
+version: "1.0.0"
+description: "Agent with cross-session actor memory - facts persist across sessions and reload automatically"
+
+# Cross-Session Actor Memory
+#
+# The agent remembers facts about each actor across separate sessions.
+# On the first session, no prior facts exist and the agent responds normally.
+# On every subsequent session, facts extracted in previous conversations are loaded from storage before the first turn and injected into the system prompt.
+# The actor sees a personalized response without having to repeat themselves.
+#
+# Two YAML blocks work together here:
+#   actor_memory - ties fact loading and injection to a specific actor identity
+#   facts        - controls how facts are extracted and stored after each turn
+#
+# Actor identity uses method: explicit here.
+# The actor ID is set via the --actor flag at the CLI or set_actor_id() in Rust code.
+# The same ID must be used across sessions to connect the two runs.
+#
+# injection.mode: all injects every stored fact into {{ actor_facts }}.
+# Use mode: category to inject only selected categories.
+# Use mode: on_demand to store silently and inject manually via the Rust API.
+#
+# privacy.retention_days and allow_deletion are wired but the retention sweep
+# is not yet automatic. allow_deletion gates /actor delete and delete_actor_data().
+#
+# session.ttl_seconds marks sessions as eligible for TTL cleanup.
+# Run /cleanup in the REPL or call cleanup_expired_sessions() to remove them.
+#
+# Flow (first session):
+#   start -> no prior facts -> chat -> extract facts -> save to DB
+#
+# Flow (returning session, same actor):
+#   start -> load facts from DB -> inject into {{ actor_facts }}
+#          -> chat -> extract new facts -> merge into DB
+#
+# Prerequisites:
+#   - OPENAI_API_KEY set in environment
+#   - SQLite storage configured below (persists in ./data/cross_session.db)
+#
+# Usage:
+#   # Session 1: introduce yourself
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/cross_session.yaml --actor customer_42
+#
+#   # Session 2: the agent remembers without being told again
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/cross_session.yaml --actor customer_42
+
+system_prompt: |
+  You are a personal assistant with excellent memory.
+  {% if actor_facts %}
+  Here is what you remember about this person from previous conversations:
+  {{ actor_facts }}
+
+  Use this knowledge naturally. Do not list facts unless asked.
+  {% endif %}
+
+# Two LLMs: default handles conversation, router handles fact extraction and summarization.
+# The router LLM only reads and classifies text - use a fast, cheap model.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_recent_messages: 20           # keep last 20 messages in full
+  compress_threshold: 15            # summarize when message count exceeds this
+  summarizer_llm: router
+
+  # Token budget controls how the context window is divided.
+  # allocation values are token counts, not percentages.
+  # 1200 + 2000 + 800 = 4000 total tokens.
+  # When token_budget.allocation.facts is set, it overrides actor_memory.injection.max_tokens.
+  token_budget:
+    total: 4000
+    allocation:
+      summary: 1200                 # 30% of 4000 for the rolling conversation summary
+      recent_messages: 2000         # 50% of 4000 for recent messages
+      facts: 800                    # 20% of 4000 reserved for injected actor facts
+    overflow_strategy: truncate_oldest
+
+  # Actor memory ties all extracted facts to a specific actor identity.
+  # On session start, facts for the current actor are loaded from storage
+  # and cached in memory. The cache is cleared automatically when the actor changes.
+  actor_memory:
+    enabled: true
+    identification:
+      method: explicit              # explicit: actor ID set via --actor flag or set_actor_id() API
+                                    # from_context: read actor ID from a context path (see multi_actor.yaml)
+    injection:
+      mode: all                     # all: inject every stored fact. default: all
+                                    # category: inject only listed categories
+                                    # on_demand: store silently, inject manually via API
+      max_tokens: 800               # max tokens for the injected fact block. default: 800
+                                    # overridden by token_budget.allocation.facts when set
+    privacy:
+      retention_days: 365           # facts older than this are eligible for deletion. null = keep forever
+                                    # NOTE: automatic sweep is not yet implemented. use delete_actor_data() explicitly.
+      allow_deletion: true          # true: /actor delete and delete_actor_data() are permitted. default: true
+                                    # false: deletion attempts return an error
+
+  # Fact extraction runs after each turn when auto_extract is true.
+  # The extractor LLM reads the messages since the last extraction, outputs a JSON array of structured facts, and the framework filters (confidence < 0.5 discarded), deduplicates, and saves them.
+  facts:
+    enabled: true
+    extractor_llm: router           # which LLM alias runs extraction. default: router
+    auto_extract: true              # extract automatically after every turn. default: true
+    categories:                     # built-in categories to look for
+      - user_preference             # preferences, likes, dislikes, habits
+      - user_context                # background, role, location, situation
+      - decision                    # choices made during the conversation
+      - agreement                   # things the actor agreed to or confirmed
+    inject_in_context: true         # expose facts as {{ actor_facts }} in system prompt. default: true
+    max_facts: 50                   # max stored facts per actor. lowest-priority facts evicted first. default: 50
+    dedup:
+      enabled: true                 # deduplicate new facts against existing ones. default: true
+      method: exact                 # exact: Levenshtein similarity check after extraction. default: exact
+                                    # llm: include existing facts in the extraction prompt for semantic dedup
+
+  # Session metadata and TTL.
+  # Tags and TTL are saved alongside the session snapshot on every save_session() call.
+  # Use /cleanup or cleanup_expired_sessions() to remove sessions past their TTL.
+  session:
+    ttl_seconds: 604800             # sessions older than 7 days are eligible for cleanup. null = no expiry
+
+# SQLite storage persists both session snapshots and actor facts in the same database.
+# File and Redis backends accept the configuration but do not store facts or session metadata.
+storage:
+  type: sqlite
+  path: ./data/cross_session.db
+
+metadata:
+  cli:
+    welcome: |
+      === Cross-Session Memory Demo ===
+      Run with --actor customer_42 in two separate sessions.
+      Session 1: tell the agent something about yourself.
+      Session 2: the agent remembers without being told again.
+    hints:
+      - "My name is Jay. I work as a data scientist in Korea."
+      - "I prefer concise answers and I use Rust for most of my work."
+      - "I decided to switch from TensorFlow to PyTorch last year."
+      - "Use /facts to see what has been extracted so far"
+      - "Use /actor facts to browse facts by category"
+      - "Use /memory to see the token budget and how much facts are using"
+      - "Exit and re-run with the same --actor flag to test persistence"
+      - "Use /cleanup to remove sessions past their TTL"
