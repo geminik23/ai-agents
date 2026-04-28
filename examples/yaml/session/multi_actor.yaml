@@ -1,0 +1,168 @@
+name: HarborGuard
+version: "1.0.0"
+description: "NPC guard that tracks facts about multiple actors independently using context-based identity"
+
+# Multi-Actor Fact Tracking (NPC Pattern)
+#
+# Each actor gets a separate fact store.
+# The agent remembers that player_1 is a merchant and player_2 is suspicious - without mixing up the two.
+#
+# Actor identity is resolved from context, not the --actor flag.
+# The hosting application sets player.id before each turn (or the --context flag sets it at CLI startup).
+# When the context value changes between turns, the runtime automatically switches to the new actor's fact store.
+#
+# This pattern is designed for game engines, multi-tenant apps, or any case where the same agent instance handles many actors in a single process.
+#
+# identification.method: from_context reads the actor ID from a dotted context path.
+# context_path: player.id resolves the nested field player -> id from ContextManager.
+# When the resolved value changes between turns, the fact cache is cleared and reloaded for the new actor before the next LLM call.
+#
+# Custom categories extend the built-in set (user_preference, user_context, decision, agreement) with domain-specific labels.
+# The extractor LLM receives your category names and descriptions so it knows what to look for.
+# Custom categories work like built-in ones: facts are stored, deduplicated, injected, and evicted exactly the same way.
+#
+# The facts budget is set to 30% of the total context window here because the NPC may carry memories about many actors and needs enough room to surface them.
+#
+# Flow: --context player.id=player_1
+#       -> agent resolves actor_id from context path player.id
+#       -> load player_1 facts from DB -> inject into {{ actor_facts }}
+#       -> chat -> extract new facts -> save under player_1
+#
+# Switch actor mid-process:
+#       -> set context player.id=player_2 (or new --context on next run)
+#       -> cache cleared -> player_2 facts loaded -> prompt updated
+#
+# Prerequisites:
+#   - OPENAI_API_KEY set in environment
+#   - SQLite storage configured below (persists in ./data/npc_sessions.db)
+#
+# Usage:
+#   # Player 1 interacts with the guard
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/multi_actor.yaml \
+#     --context player.id=player_1 --context player.name="Mira Vale"
+#
+#   # Player 2 interacts - separate fact store, guard does not mix up the two
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/multi_actor.yaml \
+#     --context player.id=player_2 --context player.name="Rowan Pike"
+#
+#   # Player 1 returns - guard still remembers Mira Vale specifically
+#   cargo run -p ai-agents-cli -- run examples/yaml/session/multi_actor.yaml \
+#     --context player.id=player_1 --context player.name="Mira Vale"
+
+system_prompt: |
+  You are Guard Elian, stationed at the harbor gate of Saltmere.
+  You are cautious but fair. You speak in short, direct sentences.
+  You remember everyone who passes through your gate.
+  {% if actor_facts %}
+  What you remember about {{ context.player.name | default("this person") }}:
+  {{ actor_facts }}
+  {% endif %}
+
+# Two LLMs: default handles the NPC conversation, router handles fact extraction.
+# The router LLM only reads and classifies text - use a fast, cheap model.
+# It does not generate dialogue.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+# Runtime context carries actor identity for this session.
+# The hosting application (or --context flag) sets player.id and player.name.
+# player.id is the stable identifier used to key the fact store.
+# player.name is display-only - it appears in the system prompt template above.
+# Defaults are provided so the agent can start without crashing if context is missing.
+context:
+  player:
+    type: runtime
+    required: true
+    default:
+      id: "unknown"
+      name: "Stranger"
+
+memory:
+  type: compacting
+  max_recent_messages: 15           # shorter window fits the NPC conversation style
+  compress_threshold: 10            # compress sooner to keep the prompt lean
+  summarizer_llm: router
+
+  # Token budget for the NPC context window.
+  # facts get 30% because the NPC tracks many actors and needs enough room for their memories.
+  # summary gets a smaller slice since NPC conversations tend to be short.
+  token_budget:
+    total: 3000
+    allocation:
+      summary: 900                  # 900 tokens for the rolling conversation summary (30% of 3000)
+      recent_messages: 1200         # 1200 tokens for recent messages (40% of 3000)
+      facts: 900                    # 900 tokens reserved for injected actor facts (30% of 3000)
+
+  # Actor identity is read from context, not the --actor flag.
+  # When player.id changes between turns, the runtime clears the cached facts
+  # and reloads the new actor's memories before the next LLM call.
+  # This lets a game engine switch actors by updating the context value.
+  actor_memory:
+    enabled: true
+    identification:
+      method: from_context          # read actor_id from a context path on every turn
+      context_path: player.id       # dot path into context: player -> id
+                                    # top-level keys also work: e.g. "actor_id"
+    injection:
+      mode: all                     # inject all stored facts for the current actor
+      max_tokens: 600               # slightly lower cap than default because budget is tighter
+
+  # Fact extraction with domain-specific custom categories.
+  # Built-in categories (user_context, decision, agreement) are listed alongside
+  # custom NPC categories (suspicion, favor, contraband).
+  # The extractor LLM receives every category name and description so it knows
+  # exactly what kind of information to surface.
+  facts:
+    enabled: true
+    extractor_llm: router
+    auto_extract: true              # extract automatically after every turn. default: true
+    categories:                     # built-in categories relevant to this NPC
+      - user_context                # who this person is, where they are from, what they carry
+      - decision                    # choices they made at the gate (let through, turned away)
+      - agreement                   # promises or deals made with the guard
+    custom_categories:
+      # Domain-specific categories the extractor should look for.
+      # The description is sent directly to the LLM - be specific about what counts.
+      - name: suspicion
+        description: "Suspicious behavior, contradictory statements, or anything the guard would flag for closer inspection"
+      - name: favor
+        description: "Favors, bribes, tips, or goodwill exchanged between the guard and this person"
+      - name: contraband
+        description: "Items, cargo, or information that may be illegal, restricted, or worth reporting"
+    max_facts: 30                   # lower per-actor limit for the NPC use case. default: 50
+                                    # keeps memory focused on the most relevant details per actor
+    dedup:
+      enabled: true                 # deduplicate new facts against existing ones. default: true
+      method: exact                 # Levenshtein similarity check - reliable for preventing literal duplicates
+
+# SQLite storage persists facts for all actors in one database.
+# Facts are keyed by (agent_id, actor_id) so player_1 and player_2 never mix.
+# File and Redis backends accept the configuration but do not store facts.
+storage:
+  type: sqlite
+  path: ./data/npc_sessions.db
+
+metadata:
+  cli:
+    welcome: |
+      === Harbor Guard (Multi-Actor) Demo ===
+      Guard Elian remembers each player separately.
+      Run with --context player.id=player_1 then player_2 to see independent fact stores.
+      Re-run with player_1 to confirm the guard still remembers Mira Vale specifically.
+    hints:
+      - "I am Mira Vale, a merchant from the coast. I carry wool and salted fish."
+      - "I have a letter of passage signed by the Harbor Master."
+      - "I was here last week and the guard waved me through without trouble."
+      - "I need to bring this crate inside. It is just tools, nothing restricted."
+      - "Use /facts to see what the guard has noted about the current player"
+      - "Use /actor to check which player_id is currently active"
+      - "Re-run with player_id=player_2 --context player.name='Rowan Pike' to see a fresh fact store"
+      - "Re-run with player_id=player_1 to confirm player_1 facts are still there"

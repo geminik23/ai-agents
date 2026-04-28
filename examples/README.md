@@ -340,6 +340,7 @@ Cross-session actor memory and key facts extraction - the agent remembers struct
 |------|-------------|
 | `facts_basic.yaml` | Minimal facts extraction setup. Shows `memory.facts` categories, `auto_extract`, `dedup`, and `{{ actor_facts }}` template injection. Run twice with the same `--actor` to verify facts survive the session. |
 | `cross_session.yaml` | Full cross-session memory with `actor_memory` + `facts` + `session` blocks. Demonstrates `injection.mode`, `privacy`, token budget allocation for facts, and session TTL. Run twice with `--actor customer_42` to see prior facts loaded on the second session. |
+| `multi_actor.yaml` | NPC guard that tracks facts about each player independently using `identification.method: from_context`. Custom categories (suspicion, favor, contraband) show how to extend the built-in category set for domain-specific extraction. |
 
 Note: Facts are extracted automatically after each turn by the router LLM and stored in English for consistent cross-language deduplication. SQLite is the only backend that persists facts and session metadata - file and Redis backends accept the configuration but use no-op storage. The `--actor` flag sets the actor ID explicitly; `identification.method: from_context` reads it from a dotted context path on every turn so a game engine or multi-tenant app can switch actors by updating the context value. Use `/facts` or `/actor facts` in the REPL to inspect extracted facts. Use `/cleanup` to remove sessions past their TTL.
 
@@ -354,6 +355,12 @@ cargo run -p ai-agents-cli -- run examples/yaml/session/facts_basic.yaml --actor
 
 # Full cross-session memory demo (run twice with the same actor)
 cargo run -p ai-agents-cli -- run examples/yaml/session/cross_session.yaml --actor customer_42
+
+# NPC with context-based actor switching (player_1 and player_2 have separate fact stores)
+cargo run -p ai-agents-cli -- run examples/yaml/session/multi_actor.yaml \
+  --context player.id=player_1 --context player.name=Aldric
+cargo run -p ai-agents-cli -- run examples/yaml/session/multi_actor.yaml \
+  --context player.id=player_2 --context player.name=Serafine
 ```
 
 ### `yaml/orchestration/`
