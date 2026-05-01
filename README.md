@@ -27,7 +27,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **built-in tools + MCP** - datetime, JSON, HTTP, file, text, template, math, calculator, random, echo; connect any MCP server for hundreds more
 - **Tool scoping & conditions** - 3-level filtering (state → spec → registry), context/state/time/semantic conditions, multi-language aliases, parallel execution
 - **Input/output process pipeline** - normalize, detect, extract, sanitize, validate, transform, format - all LLM-based, works across languages
-- **CompactingMemory** - LLM-based rolling summarization, token budgeting, SQLite/Redis/file persistence
+- **Memory stack** - CompactingMemory, token budgeting, SQLite/Redis/file persistence, actor facts, relationship memory
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
 - **Reasoning & reflection** - chain-of-thought, ReAct, plan-and-execute, auto mode; LLM self-evaluation with criteria and retry
 - **Intent disambiguation** - LLM-based ambiguity detection, clarification generation, multi-turn resolution

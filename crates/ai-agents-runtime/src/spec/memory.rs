@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use ai_agents_facts::{ActorMemoryConfig, FactsConfig, SessionConfig};
 use ai_agents_memory::{CompactingMemoryConfig, MemoryTokenBudget};
+use ai_agents_relationships::RelationshipConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -41,6 +42,10 @@ pub struct MemoryConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<SessionConfig>,
 
+    /// Actor-scoped relationship memory configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationships: Option<RelationshipConfig>,
+
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -66,6 +71,7 @@ impl Default for MemoryConfig {
             actor_memory: None,
             facts: None,
             session: None,
+            relationships: None,
             extra: HashMap::new(),
         }
     }
@@ -87,6 +93,14 @@ impl MemoryConfig {
     /// Check if facts extraction is enabled.
     pub fn has_facts(&self) -> bool {
         self.facts.as_ref().map(|f| f.enabled).unwrap_or(false)
+    }
+
+    /// Check if relationship memory is enabled.
+    pub fn has_relationships(&self) -> bool {
+        self.relationships
+            .as_ref()
+            .map(|r| r.enabled)
+            .unwrap_or(false)
     }
 
     pub fn to_compacting_config(&self) -> CompactingMemoryConfig {
@@ -170,10 +184,19 @@ facts:
 session:
   tags: [support]
   ttl_seconds: 86400
+relationships:
+  enabled: true
+  dimensions:
+    - trust
+    - sentiment
+  auto_update:
+    enabled: true
+    llm: router
 "#;
         let config: MemoryConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.has_actor_memory());
         assert!(config.has_facts());
+        assert!(config.has_relationships());
         let am = config.actor_memory.unwrap();
         assert!(am.enabled);
         assert_eq!(

@@ -313,6 +313,10 @@ impl AgentSpec {
     pub fn has_facts(&self) -> bool {
         self.memory.has_facts()
     }
+
+    pub fn has_relationships(&self) -> bool {
+        self.memory.has_relationships()
+    }
 }
 
 #[cfg(test)]

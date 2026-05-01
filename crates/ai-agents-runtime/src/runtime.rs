@@ -38,6 +38,7 @@ use ai_agents_recovery::{
     LLMFailureAction, MessageFilter, RecoveryManager, RetryConfig, SkipPatternFilter,
     ToolFailureAction,
 };
+use ai_agents_relationships::RelationshipManager;
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
 use ai_agents_state::{
     PromptMode, StateAction, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
@@ -156,6 +157,10 @@ pub struct RuntimeAgent {
     session_metadata: RwLock<ai_agents_core::SessionMetadata>,
     /// Session id currently bound to this runtime instance.
     current_session_id: RwLock<Option<String>>,
+    /// Relationship manager for actor-scoped social memory.
+    relationship_manager: Option<Arc<RelationshipManager>>,
+    /// Actor whose relationship is currently loaded and injected.
+    last_loaded_relationship_actor_id: RwLock<Option<String>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -263,6 +268,8 @@ impl RuntimeAgent {
             facts_config: None,
             session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
             current_session_id: RwLock::new(None),
+            relationship_manager: None,
+            last_loaded_relationship_actor_id: RwLock::new(None),
         }
     }
 
@@ -289,6 +296,48 @@ impl RuntimeAgent {
     pub fn with_reflection(mut self, config: ReflectionConfig) -> Self {
         self.reflection_config = config;
         self
+    }
+
+    pub fn with_relationships(mut self, manager: Arc<RelationshipManager>) -> Self {
+        self.relationship_manager = Some(manager);
+        self
+    }
+
+    pub fn relationship_manager(&self) -> Option<Arc<RelationshipManager>> {
+        self.relationship_manager.clone()
+    }
+
+    pub async fn load_actor_relationship(&self) -> Result<()> {
+        self.maybe_load_actor_relationship().await;
+        Ok(())
+    }
+
+    pub async fn update_relationship_dimension(
+        &self,
+        dimension: &str,
+        delta: f64,
+        reason: Option<&str>,
+    ) -> Result<ai_agents_relationships::DimensionChange> {
+        let manager = self
+            .relationship_manager
+            .as_ref()
+            .ok_or_else(|| AgentError::Config("Relationship memory is not configured".into()))?;
+        let actor_id = self.actor_id.read().clone().ok_or_else(|| {
+            AgentError::Config("No actor ID set. Use set_actor_id() first".into())
+        })?;
+        let change = manager.update_dimension(
+            &actor_id,
+            dimension,
+            delta,
+            1.0,
+            reason.unwrap_or("manual relationship update"),
+        )?;
+        let _ = self.inject_relationship_context(&actor_id);
+        self.persist_actor_relationship(&actor_id).await?;
+        self.hooks
+            .on_relationship_change(&actor_id, std::slice::from_ref(&change))
+            .await;
+        Ok(change)
     }
 
     pub fn reasoning_config(&self) -> &ReasoningConfig {
@@ -345,6 +394,7 @@ impl RuntimeAgent {
         if changed {
             self.actor_facts_cache.write().clear();
             *self.last_loaded_actor_id.write() = None;
+            *self.last_loaded_relationship_actor_id.write() = None;
         }
         // Record actor in session metadata roster.
         {
@@ -398,6 +448,7 @@ impl RuntimeAgent {
     async fn pre_turn_session_lifecycle(&self) {
         self.resolve_actor_id_from_context();
         self.maybe_load_actor_memory().await;
+        self.maybe_load_actor_relationship().await;
         *self.messages_since_extraction.write() += 1;
     }
 
@@ -405,6 +456,7 @@ impl RuntimeAgent {
     async fn post_turn_session_lifecycle(&self) {
         *self.messages_since_extraction.write() += 1;
         self.auto_extract_facts().await;
+        self.auto_update_relationship().await;
     }
 
     /// Get cached actor facts.
@@ -482,6 +534,7 @@ impl RuntimeAgent {
                                 // Invalidate cache on actor change so next turn reloads.
                                 self.actor_facts_cache.write().clear();
                                 *self.last_loaded_actor_id.write() = None;
+                                *self.last_loaded_relationship_actor_id.write() = None;
                                 let mut meta = self.session_metadata.write();
                                 meta.actor_id = Some(id_str.to_string());
                                 if !meta.actors.iter().any(|a| a == id_str) {
@@ -556,6 +609,147 @@ impl RuntimeAgent {
             store.format_for_context(&filtered, max_tokens)
         } else {
             String::new()
+        }
+    }
+
+    fn resolve_actor_name_from_context(&self) -> Option<String> {
+        for path in ["actor.name", "user.name", "player.name", "customer.name"] {
+            if let Some(value) = self.context_manager.get_path(path) {
+                if let Some(name) = value.as_str() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+        None
+    }
+
+    async fn maybe_load_actor_relationship(&self) {
+        let Some(manager) = self.relationship_manager.as_ref() else {
+            return;
+        };
+        let Some(actor_id) = self.actor_id.read().clone() else {
+            return;
+        };
+
+        let last = self.last_loaded_relationship_actor_id.read().clone();
+        let mut should_fire_loaded = false;
+        if last.as_deref() != Some(actor_id.as_str()) {
+            let mut loaded = false;
+            if manager.config().persistence.enabled {
+                let storage = self.storage.read().clone();
+                if let Some(storage) = storage {
+                    match storage.load_relationship(&self.info.id, &actor_id).await {
+                        Ok(Some(value)) => match manager.insert_from_value(value) {
+                            Ok(_) => loaded = true,
+                            Err(e) => {
+                                warn!(actor = %actor_id, error = %e, "failed to restore relationship")
+                            }
+                        },
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(actor = %actor_id, error = %e, "failed to load relationship")
+                        }
+                    }
+                }
+            }
+
+            if !loaded {
+                manager.get_or_create(&actor_id, self.resolve_actor_name_from_context().as_deref());
+            }
+            *self.last_loaded_relationship_actor_id.write() = Some(actor_id.clone());
+            should_fire_loaded = true;
+        }
+
+        let actor_name = self.resolve_actor_name_from_context();
+        let relationship = manager.touch_interaction(&actor_id, actor_name.as_deref());
+        let _ = self.inject_relationship_context(&actor_id);
+        if should_fire_loaded {
+            self.hooks
+                .on_relationship_loaded(&actor_id, &relationship)
+                .await;
+        }
+    }
+
+    fn inject_relationship_context(&self, actor_id: &str) -> Result<()> {
+        let Some(manager) = self.relationship_manager.as_ref() else {
+            return Ok(());
+        };
+        let Some(value) = manager.to_context_value(actor_id) else {
+            return Ok(());
+        };
+        self.context_manager
+            .update(&manager.config().injection.context_path, value)
+    }
+
+    fn format_relationship_for_context(&self) -> Option<(String, String)> {
+        let manager = self.relationship_manager.as_ref()?;
+        if !manager.config().injection.enabled {
+            return None;
+        }
+        let actor_id = self.actor_id.read().clone()?;
+        let text = manager.format_for_prompt(&actor_id);
+        if text.is_empty() {
+            None
+        } else {
+            Some((manager.config().injection.prompt_variable.clone(), text))
+        }
+    }
+
+    async fn persist_actor_relationship(&self, actor_id: &str) -> Result<()> {
+        let Some(manager) = self.relationship_manager.as_ref() else {
+            return Ok(());
+        };
+        if !manager.config().persistence.enabled {
+            return Ok(());
+        }
+        let storage = self.storage.read().clone();
+        let Some(storage) = storage else {
+            return Ok(());
+        };
+        if let Some(value) = manager.relationship_as_value(actor_id)? {
+            storage
+                .save_relationship(&self.info.id, actor_id, &value)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn auto_update_relationship(&self) {
+        let Some(manager) = self.relationship_manager.as_ref() else {
+            return;
+        };
+        let Some(actor_id) = self.actor_id.read().clone() else {
+            return;
+        };
+        if !manager.config().auto_update.enabled {
+            let _ = self.persist_actor_relationship(&actor_id).await;
+            return;
+        }
+
+        let recent_messages = manager.config().auto_update.recent_messages;
+        let messages = match self.memory.get_messages(Some(recent_messages)).await {
+            Ok(messages) => messages,
+            Err(e) => {
+                warn!(actor = %actor_id, error = %e, "failed to read messages for relationship update");
+                return;
+            }
+        };
+
+        match manager.auto_update(&actor_id, &messages).await {
+            Ok(update) => {
+                if !update.changes.is_empty() {
+                    self.hooks
+                        .on_relationship_change(&actor_id, &update.changes)
+                        .await;
+                }
+                if let Some(ref event) = update.event {
+                    self.hooks.on_notable_event(&actor_id, event).await;
+                }
+                if let Err(e) = self.persist_actor_relationship(&actor_id).await {
+                    warn!(actor = %actor_id, error = %e, "failed to persist relationship");
+                }
+            }
+            Err(e) => warn!(actor = %actor_id, error = %e, "relationship update failed"),
         }
     }
 
@@ -862,13 +1056,21 @@ impl RuntimeAgent {
                 "privacy.allow_deletion is false; actor data deletion is not permitted".into(),
             ));
         }
-        if let Some(store) = self.fact_store.read().clone() {
+        let storage = self.storage.read().clone();
+        if let Some(storage) = storage {
+            storage.delete_actor_data(&self.info.id, actor_id).await?;
+            storage.delete_relationship(&self.info.id, actor_id).await?;
+        } else if let Some(store) = self.fact_store.read().clone() {
             store.delete_actor_data(actor_id).await?;
-            // Clear cache if we just deleted the current actor.
-            if self.actor_id.read().as_deref() == Some(actor_id) {
-                self.actor_facts_cache.write().clear();
-                *self.last_loaded_actor_id.write() = None;
-            }
+        }
+        if let Some(manager) = self.relationship_manager.as_ref() {
+            manager.remove(actor_id);
+        }
+        // Clear cache if we just deleted the current actor.
+        if self.actor_id.read().as_deref() == Some(actor_id) {
+            self.actor_facts_cache.write().clear();
+            *self.last_loaded_actor_id.write() = None;
+            *self.last_loaded_relationship_actor_id.write() = None;
         }
         Ok(())
     }
@@ -931,6 +1133,10 @@ impl RuntimeAgent {
             snapshot.persona = Some(persona.snapshot_as_value()?);
         }
 
+        if let Some(ref relationships) = self.relationship_manager {
+            snapshot.relationships = Some(relationships.snapshot_as_value()?);
+        }
+
         Ok(snapshot)
     }
 
@@ -961,6 +1167,12 @@ impl RuntimeAgent {
             (snapshot.persona, &self.persona_manager)
         {
             persona_manager.restore_from_value(persona_value)?;
+        }
+
+        if let (Some(relationship_value), Some(relationship_manager)) =
+            (snapshot.relationships, &self.relationship_manager)
+        {
+            relationship_manager.restore_from_value(relationship_value)?;
         }
 
         info!(agent_id = %snapshot.agent_id, "State restored");
@@ -1193,6 +1405,10 @@ impl RuntimeAgent {
                 "actor_facts".to_string(),
                 serde_json::Value::String(facts_text),
             );
+        }
+
+        if let Some((key, text)) = self.format_relationship_for_context() {
+            context.insert(key, serde_json::Value::String(text));
         }
 
         self.template_renderer
@@ -3890,6 +4106,7 @@ Respond in JSON format:
         self.increment_turn();
         self.evaluate_transitions(processed_input, &final_response)
             .await?;
+        self.post_turn_session_lifecycle().await;
 
         let response = AgentResponse::new(final_response);
         self.hooks.on_response(&response).await;
@@ -3977,6 +4194,7 @@ Respond in JSON format:
         self.increment_turn();
         self.evaluate_transitions(processed_input, &final_content)
             .await?;
+        self.post_turn_session_lifecycle().await;
 
         let reasoning_metadata =
             ReasoningMetadata::new(ReasoningMode::PlanAndExecute).with_auto_detected(auto_detected);
@@ -4508,6 +4726,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
+        self.post_turn_session_lifecycle().await;
         self.hooks.on_response(&result).await;
         Ok(result)
     }
@@ -4636,6 +4855,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
+        self.post_turn_session_lifecycle().await;
         self.hooks.on_response(&response).await;
         Ok(response)
     }
@@ -4749,6 +4969,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
+        self.post_turn_session_lifecycle().await;
         self.hooks.on_response(&response).await;
         Ok(response)
     }
@@ -4863,6 +5084,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
+        self.post_turn_session_lifecycle().await;
         self.hooks.on_response(&response).await;
         Ok(response)
     }
@@ -4979,6 +5201,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
+        self.post_turn_session_lifecycle().await;
         self.hooks.on_response(&response).await;
         Ok(response)
     }

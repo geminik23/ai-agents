@@ -199,6 +199,36 @@ impl SqliteStorage {
         .await
         .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS actor_relationships (
+                agent_id TEXT NOT NULL,
+                actor_id TEXT NOT NULL,
+                actor_name TEXT,
+                dimensions_json TEXT NOT NULL,
+                notable_events_json TEXT NOT NULL,
+                interaction_count INTEGER NOT NULL,
+                first_interaction TEXT NOT NULL,
+                last_interaction TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                PRIMARY KEY (agent_id, actor_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_actor_relationships_last_interaction
+            ON actor_relationships(agent_id, last_interaction)
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
         Ok(())
     }
 
@@ -922,6 +952,13 @@ impl AgentStorage for SqliteStorage {
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
+        sqlx::query("DELETE FROM actor_relationships WHERE agent_id = ? AND actor_id = ?")
+            .bind(agent_id)
+            .bind(actor_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
         // Delete sessions associated with this actor.
         sqlx::query(
             "DELETE FROM sessions WHERE agent_id = ? AND json_extract(metadata, '$.actor_id') = ?",
@@ -932,6 +969,154 @@ impl AgentStorage for SqliteStorage {
         .await
         .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
+        Ok(())
+    }
+
+    async fn save_relationship(
+        &self,
+        agent_id: &str,
+        actor_id: &str,
+        relationship: &serde_json::Value,
+    ) -> Result<()> {
+        let actor_name = relationship
+            .get("actor_name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let dimensions_json = serde_json::to_string(
+            relationship
+                .get("dimensions")
+                .unwrap_or(&serde_json::Value::Object(Default::default())),
+        )
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        let notable_events_json = serde_json::to_string(
+            relationship
+                .get("notable_events")
+                .unwrap_or(&serde_json::Value::Array(vec![])),
+        )
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        let metadata_json = serde_json::to_string(
+            relationship
+                .get("metadata")
+                .unwrap_or(&serde_json::Value::Object(Default::default())),
+        )
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        let interaction_count = relationship
+            .get("interaction_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as i64;
+        let first_interaction = relationship
+            .get("first_interaction")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z")
+            .to_string();
+        let last_interaction = relationship
+            .get("last_interaction")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z")
+            .to_string();
+
+        sqlx::query(
+            r#"
+            INSERT INTO actor_relationships
+                (agent_id, actor_id, actor_name, dimensions_json, notable_events_json,
+                 interaction_count, first_interaction, last_interaction, metadata_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(agent_id, actor_id) DO UPDATE SET
+                actor_name = excluded.actor_name,
+                dimensions_json = excluded.dimensions_json,
+                notable_events_json = excluded.notable_events_json,
+                interaction_count = excluded.interaction_count,
+                first_interaction = excluded.first_interaction,
+                last_interaction = excluded.last_interaction,
+                metadata_json = excluded.metadata_json
+            "#,
+        )
+        .bind(agent_id)
+        .bind(actor_id)
+        .bind(actor_name)
+        .bind(dimensions_json)
+        .bind(notable_events_json)
+        .bind(interaction_count)
+        .bind(first_interaction)
+        .bind(last_interaction)
+        .bind(metadata_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        Ok(())
+    }
+
+    async fn load_relationship(
+        &self,
+        agent_id: &str,
+        actor_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let row: Option<(Option<String>, String, String, i64, String, String, String)> =
+            sqlx::query_as(
+                r#"
+                SELECT actor_name, dimensions_json, notable_events_json, interaction_count,
+                       first_interaction, last_interaction, metadata_json
+                FROM actor_relationships
+                WHERE agent_id = ? AND actor_id = ?
+                "#,
+            )
+            .bind(agent_id)
+            .bind(actor_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        let Some((
+            actor_name,
+            dimensions_json,
+            notable_events_json,
+            interaction_count,
+            first_interaction,
+            last_interaction,
+            metadata_json,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let dimensions: serde_json::Value =
+            serde_json::from_str(&dimensions_json).unwrap_or_else(|_| serde_json::json!({}));
+        let notable_events: serde_json::Value =
+            serde_json::from_str(&notable_events_json).unwrap_or_else(|_| serde_json::json!([]));
+        let metadata: serde_json::Value =
+            serde_json::from_str(&metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+
+        Ok(Some(serde_json::json!({
+            "actor_id": actor_id,
+            "actor_name": actor_name,
+            "dimensions": dimensions,
+            "notable_events": notable_events,
+            "interaction_count": interaction_count,
+            "first_interaction": first_interaction,
+            "last_interaction": last_interaction,
+            "metadata": metadata,
+        })))
+    }
+
+    async fn list_relationship_actors(&self, agent_id: &str) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT actor_id FROM actor_relationships WHERE agent_id = ? ORDER BY actor_id ASC",
+        )
+        .bind(agent_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        Ok(rows.into_iter().map(|(actor_id,)| actor_id).collect())
+    }
+
+    async fn delete_relationship(&self, agent_id: &str, actor_id: &str) -> Result<()> {
+        sqlx::query("DELETE FROM actor_relationships WHERE agent_id = ? AND actor_id = ?")
+            .bind(agent_id)
+            .bind(actor_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
         Ok(())
     }
 }

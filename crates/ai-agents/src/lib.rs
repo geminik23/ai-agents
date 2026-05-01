@@ -372,6 +372,18 @@ pub mod persona {
     };
 }
 
+pub mod relationships {
+    pub use ai_agents_relationships::{
+        AutoUpdateConfig, DimensionChange, EventEvictionStrategy, InjectionConfig, InjectionFormat,
+        NotableEventsConfig, PersistenceConfig, ProposedDimensionChange, ProposedRelationshipEvent,
+        Relationship, RelationshipConfig, RelationshipDimensionDefinition,
+        RelationshipDimensionsConfig, RelationshipEvaluation, RelationshipEvaluator,
+        RelationshipEvaluatorTrait, RelationshipEvent, RelationshipManager, RelationshipSnapshot,
+        RelationshipUpdate, format_relationship, relationship_from_value,
+        relationship_to_context_value, relationship_to_value,
+    };
+}
+
 pub mod reasoning {
     pub use ai_agents_reasoning::{
         CriterionResult, EvaluationResult, Plan, PlanAction, PlanAvailableActions,

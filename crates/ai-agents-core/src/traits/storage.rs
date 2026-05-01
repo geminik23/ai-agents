@@ -31,6 +31,9 @@ pub struct AgentSnapshot {
     /// Persona snapshot (serialized as Value to avoid core->persona dependency).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persona: Option<serde_json::Value>,
+    /// Relationship snapshot (serialized as Value to avoid core->relationships dependency).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationships: Option<serde_json::Value>,
 }
 
 impl AgentSnapshot {
@@ -44,6 +47,7 @@ impl AgentSnapshot {
             context: std::collections::HashMap::new(),
             spawned_agents: None,
             persona: None,
+            relationships: None,
         }
     }
 
@@ -132,6 +136,35 @@ pub trait AgentStorage: Send + Sync {
 
     /// Delete all facts and session data for an actor (privacy/GDPR compliance).
     async fn delete_actor_data(&self, _agent_id: &str, _actor_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist relationship data for an actor. Value is owned by the relationships crate.
+    async fn save_relationship(
+        &self,
+        _agent_id: &str,
+        _actor_id: &str,
+        _relationship: &serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load relationship data for a specific actor.
+    async fn load_relationship(
+        &self,
+        _agent_id: &str,
+        _actor_id: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    /// List actor IDs that have relationship data for an agent.
+    async fn list_relationship_actors(&self, _agent_id: &str) -> Result<Vec<String>> {
+        Ok(vec![])
+    }
+
+    /// Delete relationship data for a specific actor.
+    async fn delete_relationship(&self, _agent_id: &str, _actor_id: &str) -> Result<()> {
         Ok(())
     }
 }

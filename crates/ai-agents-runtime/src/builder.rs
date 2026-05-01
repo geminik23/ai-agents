@@ -15,6 +15,9 @@ use ai_agents_memory::{
 use ai_agents_process::ProcessProcessor;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use ai_agents_recovery::{MessageFilter, RecoveryManager};
+use ai_agents_relationships::{
+    RelationshipEvaluator, RelationshipEvaluatorTrait, RelationshipManager,
+};
 use ai_agents_skills::{SkillDefinition, SkillLoader};
 use ai_agents_state::{LLMTransitionEvaluator, StateMachine, TransitionEvaluator};
 use ai_agents_template::{TemplateInheritance, TemplateLoader, TemplateRenderer};
@@ -837,6 +840,10 @@ impl AgentBuilder {
             .as_ref()
             .and_then(|s| s.memory.actor_memory.clone());
         let facts_config = self.spec.as_ref().and_then(|s| s.memory.facts.clone());
+        let relationships_config = self
+            .spec
+            .as_ref()
+            .and_then(|s| s.memory.relationships.clone());
 
         let base_prompt = self
             .system_prompt
@@ -949,6 +956,36 @@ impl AgentBuilder {
                 let _ = tools.register(Arc::new(evolve_tool));
             }
         }
+
+        let relationship_manager: Option<Arc<RelationshipManager>> =
+            if let Some(ref config) = relationships_config {
+                if config.enabled {
+                    let evaluator: Option<Arc<dyn RelationshipEvaluatorTrait>> =
+                        if config.auto_update.enabled {
+                            let llm = config
+                                .auto_update
+                                .llm
+                                .as_ref()
+                                .and_then(|alias| llm_registry.get(alias).ok())
+                                .or_else(|| llm_registry.router().ok())
+                                .or_else(|| llm_registry.default().ok());
+                            llm.map(|llm| {
+                                Arc::new(RelationshipEvaluator::new(llm))
+                                    as Arc<dyn RelationshipEvaluatorTrait>
+                            })
+                        } else {
+                            None
+                        };
+                    Some(Arc::new(RelationshipManager::from_config_with_evaluator(
+                        config.clone(),
+                        evaluator,
+                    )?))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
@@ -1179,6 +1216,10 @@ impl AgentBuilder {
         // Wire persona manager into the agent (created earlier before tools_arc).
         if let Some(pm) = persona_manager {
             agent = agent.with_persona(pm);
+        }
+
+        if let Some(relationship_manager) = relationship_manager {
+            agent = agent.with_relationships(relationship_manager);
         }
 
         // Store actor memory and facts configs on the agent now.

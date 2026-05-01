@@ -92,6 +92,30 @@ pub trait AgentHooks: Send + Sync {
 
     /// Fired when sessions are cleaned up due to TTL expiry.
     async fn on_sessions_expired(&self, _count: usize) {}
+
+    /// Fired when relationship memory is loaded for an actor.
+    async fn on_relationship_loaded(
+        &self,
+        _actor_id: &str,
+        _relationship: &ai_agents_relationships::Relationship,
+    ) {
+    }
+
+    /// Fired after relationship dimensions change.
+    async fn on_relationship_change(
+        &self,
+        _actor_id: &str,
+        _changes: &[ai_agents_relationships::DimensionChange],
+    ) {
+    }
+
+    /// Fired after a notable relationship event is recorded.
+    async fn on_notable_event(
+        &self,
+        _actor_id: &str,
+        _event: &ai_agents_relationships::RelationshipEvent,
+    ) {
+    }
 }
 
 pub struct NoopHooks;
@@ -343,6 +367,43 @@ impl AgentHooks for LoggingHooks {
     async fn on_sessions_expired(&self, count: usize) {
         debug!("{}[sessions_expired] count={}", self.prefix, count);
     }
+
+    async fn on_relationship_loaded(
+        &self,
+        actor_id: &str,
+        relationship: &ai_agents_relationships::Relationship,
+    ) {
+        debug!(
+            "{}[relationship_loaded] actor={} dimensions={}",
+            self.prefix,
+            actor_id,
+            relationship.dimensions.len()
+        );
+    }
+
+    async fn on_relationship_change(
+        &self,
+        actor_id: &str,
+        changes: &[ai_agents_relationships::DimensionChange],
+    ) {
+        debug!(
+            "{}[relationship_change] actor={} changes={}",
+            self.prefix,
+            actor_id,
+            changes.len()
+        );
+    }
+
+    async fn on_notable_event(
+        &self,
+        actor_id: &str,
+        event: &ai_agents_relationships::RelationshipEvent,
+    ) {
+        debug!(
+            "{}[notable_event] actor={} significance={:.2} description={}",
+            self.prefix, actor_id, event.significance, event.description
+        );
+    }
 }
 
 pub struct CompositeHooks {
@@ -540,6 +601,36 @@ impl AgentHooks for CompositeHooks {
     async fn on_sessions_expired(&self, count: usize) {
         for hook in &self.hooks {
             hook.on_sessions_expired(count).await;
+        }
+    }
+
+    async fn on_relationship_loaded(
+        &self,
+        actor_id: &str,
+        relationship: &ai_agents_relationships::Relationship,
+    ) {
+        for hook in &self.hooks {
+            hook.on_relationship_loaded(actor_id, relationship).await;
+        }
+    }
+
+    async fn on_relationship_change(
+        &self,
+        actor_id: &str,
+        changes: &[ai_agents_relationships::DimensionChange],
+    ) {
+        for hook in &self.hooks {
+            hook.on_relationship_change(actor_id, changes).await;
+        }
+    }
+
+    async fn on_notable_event(
+        &self,
+        actor_id: &str,
+        event: &ai_agents_relationships::RelationshipEvent,
+    ) {
+        for hook in &self.hooks {
+            hook.on_notable_event(actor_id, event).await;
         }
     }
 }
