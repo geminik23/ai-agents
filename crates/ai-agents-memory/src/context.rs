@@ -5,6 +5,17 @@ use serde::{Deserialize, Serialize};
 use super::token_budget::TokenAllocation;
 use ai_agents_core::{ChatMessage, Role};
 
+fn prefix_at_char_boundary(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ConversationContext {
     pub summary: Option<String>,
@@ -63,9 +74,10 @@ impl ConversationContext {
             let summary_tokens = estimate_tokens(&summary_content);
 
             let final_content = if summary_tokens > allocation.summary {
-                let ratio = summary_content.len() as f64 / summary_tokens as f64;
+                let char_count = summary_content.chars().count() as f64;
+                let ratio = char_count / summary_tokens as f64;
                 let target_chars = (allocation.summary as f64 * ratio) as usize;
-                let truncated = &summary_content[..target_chars.min(summary_content.len())];
+                let truncated = prefix_at_char_boundary(&summary_content, target_chars);
                 format!("{}...", truncated)
             } else {
                 summary_content
@@ -357,6 +369,14 @@ mod tests {
             last.content.contains("49"),
             "Last message should be the most recent"
         );
+    }
+
+    #[test]
+    fn test_prefix_at_char_boundary_handles_unicode() {
+        let text = "제 이름은 Jay이고 계약서를 확인하고 싶어요";
+        let prefix = prefix_at_char_boundary(text, 7);
+        assert_eq!(prefix.chars().count(), 7);
+        assert!(text.starts_with(prefix));
     }
 
     #[test]

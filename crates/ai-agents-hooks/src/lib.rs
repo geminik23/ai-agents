@@ -10,6 +10,20 @@ use ai_agents_llm::{ChatMessage, LLMResponse};
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use ai_agents_tools::ToolResult;
 
+fn preview_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", preview)
+    } else {
+        text.to_string()
+    }
+}
+
 #[async_trait]
 pub trait AgentHooks: Send + Sync {
     async fn on_message_received(&self, _message: &str) {}
@@ -150,11 +164,7 @@ impl Default for LoggingHooks {
 #[async_trait]
 impl AgentHooks for LoggingHooks {
     async fn on_message_received(&self, message: &str) {
-        let preview = if message.len() > 100 {
-            format!("{}...", &message[..100])
-        } else {
-            message.to_string()
-        };
+        let preview = preview_text(message, 100);
         info!("{} Message received: {}", self.prefix, preview);
     }
 
@@ -203,11 +213,7 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_response(&self, response: &AgentResponse) {
-        let preview = if response.content.len() > 100 {
-            format!("{}...", &response.content[..100])
-        } else {
-            response.content.clone()
-        };
+        let preview = preview_text(&response.content, 100);
         debug!("{} Response: {}", self.prefix, preview);
     }
 
@@ -288,11 +294,7 @@ impl AgentHooks for LoggingHooks {
     }
 
     async fn on_group_chat_round(&self, round: u32, speaker: &str, content: &str) {
-        let preview = if content.len() > 80 {
-            format!("{}...", &content[..80])
-        } else {
-            content.to_string()
-        };
+        let preview = preview_text(content, 80);
         debug!(
             "{} Group chat round {}: {} said: {}",
             self.prefix, round, speaker, preview
@@ -750,6 +752,14 @@ mod tests {
         let hooks = LoggingHooks::new();
         hooks.on_message_received("test message").await;
         hooks.on_llm_start(&[ChatMessage::user("hello")]).await;
+    }
+
+    #[test]
+    fn test_preview_text_handles_unicode_boundaries() {
+        let text = "제 이름은 Jay이고 가족관계 관련해서 계약서 내용을 확인하고 싶어서";
+        let preview = preview_text(text, 34);
+        assert!(preview.ends_with("..."));
+        assert!(preview.starts_with("제 이름은 Jay"));
     }
 
     #[tokio::test]

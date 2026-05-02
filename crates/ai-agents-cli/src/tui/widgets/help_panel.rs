@@ -76,6 +76,10 @@ pub fn render_help_panel(area: Rect, buf: &mut Buffer, theme: &Theme) {
             Span::styled(" F8 ", theme.label_style),
             Span::styled("Agents", theme.value_style),
         ]),
+        Line::from(vec![
+            Span::styled(" F9 ", theme.label_style),
+            Span::styled("Relationship", theme.value_style),
+        ]),
         Line::from(""),
         Line::from(Span::styled("Commands:", theme.highlight_style)),
         Line::from(""),
@@ -110,6 +114,10 @@ pub fn render_help_panel(area: Rect, buf: &mut Buffer, theme: &Theme) {
         Line::from(vec![
             Span::styled(" /load     ", theme.label_style),
             Span::styled("Load session", theme.value_style),
+        ]),
+        Line::from(vec![
+            Span::styled(" /relationship", theme.label_style),
+            Span::styled("Relationship", theme.value_style),
         ]),
     ];
 

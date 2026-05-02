@@ -28,6 +28,20 @@ pub enum CommandResult {
 
 type CommandHandler = Box<dyn Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync>;
 
+fn preview_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", preview)
+    } else {
+        text.to_string()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CliReplConfig {
     pub welcome: Option<String>,
@@ -267,6 +281,10 @@ impl CliRepl {
             self.handle_facts(input).await;
             return Some(CommandAction::Continue);
         }
+        if lower.starts_with("/relationship") || lower.starts_with("/rel") {
+            self.handle_relationship(input).await;
+            return Some(CommandAction::Continue);
+        }
 
         match lower.as_str() {
             "/quit" | "/exit" => Some(CommandAction::Quit),
@@ -367,6 +385,9 @@ impl CliRepl {
         println!("  /actor facts [cat]   Show facts for current actor");
         println!("  /actor delete        Delete all actor data");
         println!("  /facts extract [n]   Extract facts from recent messages");
+        println!("  /relationship        Show current actor relationship");
+        println!("  /relationship events Show notable relationship events");
+        println!("  /relationship set <dimension> <delta> [reason]");
         println!();
     }
 
@@ -941,6 +962,100 @@ impl CliRepl {
         }
     }
 
+    async fn handle_relationship(&self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let Some(manager) = self.agent.relationship_manager() else {
+            println!("Relationship memory is not configured.");
+            return;
+        };
+        let actor_id = match self.agent.actor_id() {
+            Some(id) => id,
+            None => {
+                println!("No actor ID set. Use /actor set <id>");
+                return;
+            }
+        };
+
+        let _ = self.agent.load_actor_relationship().await;
+
+        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+            None | Some("") => {
+                let relationship = manager.get_or_create(&actor_id, None);
+                println!("Relationship for actor {}:", actor_id);
+                let mut dimensions: Vec<_> = relationship.dimensions.iter().collect();
+                dimensions.sort_by(|a, b| a.0.cmp(b.0));
+                for (name, value) in dimensions {
+                    println!("  {}: {:.2}", name, value);
+                }
+                println!("  interactions: {}", relationship.interaction_count);
+                println!("  notable events: {}", relationship.notable_events.len());
+            }
+            Some("events") => {
+                let relationship = manager.get_or_create(&actor_id, None);
+                if relationship.notable_events.is_empty() {
+                    println!("No notable relationship events for actor: {}", actor_id);
+                    return;
+                }
+                println!("Relationship events for actor {}:", actor_id);
+                for event in &relationship.notable_events {
+                    println!(
+                        "  [{}] ({:.2}) {}",
+                        event.timestamp.to_rfc3339(),
+                        event.significance,
+                        event.description
+                    );
+                }
+            }
+            Some("actors") => {
+                let actors = manager.list_actors();
+                if actors.is_empty() {
+                    println!("No loaded relationship actors.");
+                } else {
+                    println!("Relationship actors:");
+                    for actor in actors {
+                        println!("  {}", actor);
+                    }
+                }
+            }
+            Some("set") => {
+                let dimension = match parts.get(2) {
+                    Some(d) => *d,
+                    None => {
+                        println!("Usage: /relationship set <dimension> <delta> [reason]");
+                        return;
+                    }
+                };
+                let delta = match parts.get(3).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(v) => v,
+                    None => {
+                        println!("Usage: /relationship set <dimension> <delta> [reason]");
+                        return;
+                    }
+                };
+                let reason = if parts.len() > 4 {
+                    Some(parts[4..].join(" "))
+                } else {
+                    None
+                };
+                match self
+                    .agent
+                    .update_relationship_dimension(dimension, delta, reason.as_deref())
+                    .await
+                {
+                    Ok(change) => println!(
+                        "Updated {}: {:.2} -> {:.2} ({:+.2})",
+                        change.dimension, change.previous, change.current, change.delta
+                    ),
+                    Err(e) => eprintln!("[Error] Failed to update relationship: {}", e),
+                }
+            }
+            Some(other) => println!(
+                "Unknown relationship command: {}. Use: /relationship, /relationship events, /relationship actors, /relationship set",
+                other
+            ),
+        }
+    }
+
     async fn handle_facts(&self, input: &str) {
         let parts: Vec<&str> = input.split_whitespace().collect();
 
@@ -1007,11 +1122,7 @@ impl CliRepl {
         // Summary info
         if let Some(ref summary) = snapshot.memory.summary {
             let tokens = estimate_tokens(summary);
-            let preview = if summary.len() > 80 {
-                format!("{}...", &summary[..80])
-            } else {
-                summary.clone()
-            };
+            let preview = preview_text(summary, 80);
             println!("  Summary:  {} tokens", tokens);
             println!("            \"{}\"", preview);
         } else {

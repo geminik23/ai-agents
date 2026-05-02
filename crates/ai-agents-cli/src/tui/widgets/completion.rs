@@ -103,6 +103,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/facts extract",
         description: "Manually extract facts from recent messages",
     },
+    SlashCommand {
+        name: "/relationship",
+        description: "Show current actor relationship",
+    },
+    SlashCommand {
+        name: "/relationship events",
+        description: "Show relationship events",
+    },
+    SlashCommand {
+        name: "/relationship set",
+        description: "Manually update a relationship dimension",
+    },
 ];
 
 /// Tracks the current completion popup state.

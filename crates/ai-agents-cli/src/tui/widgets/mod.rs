@@ -8,6 +8,7 @@ pub mod hint_bar;
 pub mod memory_panel;
 pub mod modal;
 pub mod persona_panel;
+pub mod relationship_panel;
 pub mod state_panel;
 pub mod status_bar;
 pub mod toast;

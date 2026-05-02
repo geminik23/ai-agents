@@ -12,6 +12,17 @@ use super::Memory;
 use super::context::{CompressResult, ConversationContext, estimate_tokens};
 use super::summarizer::Summarizer;
 
+fn prefix_at_char_boundary(text: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+
+    match text.char_indices().nth(max_chars) {
+        Some((idx, _)) => &text[..idx],
+        None => text,
+    }
+}
+
 pub struct CompactingMemory {
     summary: RwLock<Option<String>>,
     messages: RwLock<Vec<ChatMessage>>,
@@ -217,8 +228,9 @@ impl Memory for CompactingMemory {
             None => new_summary,
         };
 
-        let final_summary = if combined_summary.len() > self.config.max_summary_length {
-            combined_summary[..self.config.max_summary_length].to_string()
+        let truncated = prefix_at_char_boundary(&combined_summary, self.config.max_summary_length);
+        let final_summary = if truncated.len() < combined_summary.len() {
+            truncated.to_string()
         } else {
             combined_summary
         };
@@ -461,5 +473,13 @@ mod tests {
         let remaining = memory.get_messages(None).await.unwrap();
         assert_eq!(remaining.len(), 3);
         assert_eq!(remaining[0].content, "msg2");
+    }
+
+    #[test]
+    fn test_prefix_at_char_boundary_handles_unicode() {
+        let text = "계약서 내용을 확인하고 싶어서";
+        let prefix = prefix_at_char_boundary(text, 5);
+        assert_eq!(prefix.chars().count(), 5);
+        assert!(text.starts_with(prefix));
     }
 }

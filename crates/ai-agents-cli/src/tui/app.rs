@@ -30,11 +30,29 @@ use crate::tui::widgets::{
     memory_panel::{MemoryPanelState, render_memory_panel},
     modal::{ModalState, render_modal},
     persona_panel::{PersonaPanelState, render_persona_panel},
+    relationship_panel::{
+        RelationshipDimensionEntry, RelationshipEventEntry, RelationshipPanelState,
+        render_relationship_panel,
+    },
     state_panel::{StatePanelState, render_state_panel},
     status_bar::{StatusBarState, render_status_bar},
     toast::{Toast, render_toast},
     tools_panel::{LastToolCall, ToolsPanelState, render_tools_panel},
 };
+
+fn preview_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", preview)
+    } else {
+        text.to_string()
+    }
+}
 
 /// Result from update() indicating whether the app should quit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +72,7 @@ pub enum PanelSlot {
     Persona,
     Facts,
     Agents,
+    Relationship,
 }
 
 /// Main TUI application state, owning all widgets, agent handle, and input.
@@ -310,6 +329,10 @@ impl App {
                 self.toggle_panel(PanelSlot::Agents);
                 return UpdateResult::Continue;
             }
+            KeyCode::F(9) => {
+                self.toggle_panel(PanelSlot::Relationship);
+                return UpdateResult::Continue;
+            }
             _ => {}
         }
 
@@ -522,11 +545,7 @@ impl App {
                     .chat_start
                     .map(|s| s.elapsed().as_millis() as u64)
                     .unwrap_or(0);
-                let preview = if output.len() > 30 {
-                    format!("{}...", &output[..30])
-                } else {
-                    output
-                };
+                let preview = preview_text(&output, 30);
                 self.last_tool_call = Some(LastToolCall {
                     name: name.clone(),
                     input_preview: String::new(),
@@ -658,6 +677,9 @@ impl App {
             _ if trimmed.starts_with("/facts") => {
                 self.handle_tui_facts_command(input).await;
             }
+            _ if trimmed.starts_with("/relationship") || trimmed.starts_with("/rel") => {
+                self.handle_tui_relationship_command(input).await;
+            }
             _ => {
                 self.add_system_message(&format!("Unknown command: {}", input));
             }
@@ -785,6 +807,85 @@ impl App {
                     self.add_system_message(&msg);
                 }
             }
+        }
+    }
+
+    async fn handle_tui_relationship_command(&mut self, input: &str) {
+        let parts: Vec<&str> = input.split_whitespace().collect();
+        let Some(manager) = self.agent.relationship_manager() else {
+            self.add_system_message("Relationship memory is not configured.");
+            return;
+        };
+        let actor_id = match self.agent.actor_id() {
+            Some(id) => id,
+            None => {
+                self.add_system_message("No actor ID set. Use /actor set <id>");
+                return;
+            }
+        };
+        let _ = self.agent.load_actor_relationship().await;
+
+        match parts.get(1).map(|s| s.to_lowercase()).as_deref() {
+            None | Some("") => self.toggle_panel(PanelSlot::Relationship),
+            Some("events") => {
+                let relationship = manager.get_or_create(&actor_id, None);
+                if relationship.notable_events.is_empty() {
+                    self.add_system_message(&format!(
+                        "No notable relationship events for actor: {}",
+                        actor_id
+                    ));
+                    return;
+                }
+                let mut msg = format!("Relationship events for actor {}:", actor_id);
+                for event in &relationship.notable_events {
+                    msg.push_str(&format!(
+                        "\n  [{}] ({:.2}) {}",
+                        event.timestamp.to_rfc3339(),
+                        event.significance,
+                        event.description
+                    ));
+                }
+                self.add_system_message(&msg);
+            }
+            Some("set") => {
+                let dimension = match parts.get(2) {
+                    Some(d) => *d,
+                    None => {
+                        self.add_system_message(
+                            "Usage: /relationship set <dimension> <delta> [reason]",
+                        );
+                        return;
+                    }
+                };
+                let delta = match parts.get(3).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(v) => v,
+                    None => {
+                        self.add_system_message(
+                            "Usage: /relationship set <dimension> <delta> [reason]",
+                        );
+                        return;
+                    }
+                };
+                let reason = if parts.len() > 4 {
+                    Some(parts[4..].join(" "))
+                } else {
+                    None
+                };
+                match self
+                    .agent
+                    .update_relationship_dimension(dimension, delta, reason.as_deref())
+                    .await
+                {
+                    Ok(change) => self.add_toast(&format!(
+                        "{} {:+.2} -> {:.2}",
+                        change.dimension, change.delta, change.current
+                    )),
+                    Err(e) => self.add_system_message(&format!("[Error] {}", e)),
+                }
+            }
+            _ => self.add_system_message(
+                "Usage: /relationship, /relationship events, /relationship set <dimension> <delta> [reason]",
+            ),
         }
     }
 
@@ -1116,6 +1217,10 @@ impl App {
                 let state = self.build_agents_panel();
                 render_agents_panel(area, frame.buffer_mut(), &state, &self.theme);
             }
+            PanelSlot::Relationship => {
+                let state = self.build_relationship_panel();
+                render_relationship_panel(area, frame.buffer_mut(), &state, &self.theme);
+            }
         }
     }
 
@@ -1147,6 +1252,55 @@ impl App {
         FactsPanelState {
             actor_id: self.agent.actor_id(),
             facts,
+        }
+    }
+
+    fn build_relationship_panel(&self) -> RelationshipPanelState {
+        let actor_id = self.agent.actor_id();
+        let Some(manager) = self.agent.relationship_manager() else {
+            return RelationshipPanelState {
+                actor_id,
+                configured: false,
+                dimensions: Vec::new(),
+                interaction_count: 0,
+                events: Vec::new(),
+            };
+        };
+        let relationship = actor_id.as_ref().and_then(|id| manager.get(id));
+        let mut dimensions = relationship
+            .as_ref()
+            .map(|r| {
+                r.dimensions
+                    .iter()
+                    .map(|(name, value)| RelationshipDimensionEntry {
+                        name: name.clone(),
+                        value: *value,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        dimensions.sort_by(|a, b| a.name.cmp(&b.name));
+        let events = relationship
+            .as_ref()
+            .map(|r| {
+                r.notable_events
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .map(|event| RelationshipEventEntry {
+                        description: event.description.clone(),
+                        significance: event.significance,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        RelationshipPanelState {
+            actor_id,
+            configured: true,
+            dimensions,
+            interaction_count: relationship.map(|r| r.interaction_count).unwrap_or(0),
+            events,
         }
     }
 

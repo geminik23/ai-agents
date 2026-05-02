@@ -2425,6 +2425,7 @@ impl RuntimeAgent {
             return Ok(false);
         };
 
+        let response_preview: String = response.chars().take(500).collect();
         let prompt = format!(
             r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
 
@@ -2432,8 +2433,7 @@ User query: "{}"
 Response: "{}"
 
 Answer YES or NO only."#,
-            input,
-            &response[..response.len().min(500)]
+            input, response_preview
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
@@ -3149,6 +3149,7 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
             return Ok(false);
         };
 
+        let response_preview: String = response.chars().take(500).collect();
         let prompt = format!(
             r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
 
@@ -3156,8 +3157,7 @@ User query: "{}"
 Response: "{}"
 
 Answer YES or NO only."#,
-            input,
-            &response[..response.len().min(500)]
+            input, response_preview
         );
 
         let messages = vec![ChatMessage::user(&prompt)];

@@ -16,7 +16,7 @@ pub fn render_hint_bar(area: Rect, buf: &mut Buffer, state: &HintBarState, theme
     let hints = if state.is_command_mode {
         " /help  /quit  /state  /memory  /context  Esc cancel"
     } else if state.panels_enabled {
-        " Enter send  Ctrl+C quit  Ctrl+L clear  Ctrl+T theme  F1-F8 panels  / commands"
+        " Enter send  Ctrl+C quit  Ctrl+L clear  Ctrl+T theme  F1-F9 panels  / commands"
     } else {
         " Enter send  Ctrl+C quit  Ctrl+L clear  / commands"
     };
