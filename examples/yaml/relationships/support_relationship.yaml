@@ -1,0 +1,104 @@
+name: RelationshipSupportAgent
+version: "1.0.0"
+description: "Support agent that adapts to each actor using relationship memory"
+
+# Relationship-powered support example.
+# Requires OPENAI_API_KEY and SQLite storage for cross-session persistence.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/relationships/support_relationship.yaml --actor customer_42
+#
+# Run the example twice with the same actor ID.
+# The second run loads the stored relationship before the agent answers.
+#
+# This example demonstrates the difference between facts and relationships.
+# Facts answer what the agent knows about the actor.
+# Relationships answer how the agent currently relates to the actor.
+#
+# Flow: --actor customer_42 -> load relationship by actor_id -> inject {{ relationship_memory }}
+#                          -> chat -> evaluate trust and sentiment deltas -> persist relationship
+#
+# Customize this example first by changing:
+# - the system prompt behavior rules
+# - the tracked dimensions
+# - the evaluator sensitivity
+# - the injection format
+system_prompt: |
+  You are a customer support agent for AI Agents.
+  Be concise, practical, and calm.
+  {% if relationship_memory %}
+  Current relationship context:
+  {{ relationship_memory }}
+  {% endif %}
+  If sentiment is negative, acknowledge the frustration before solving the issue.
+  If rapport is high, keep the tone warmer and more familiar.
+
+# Two LLMs are used here.
+# The default model writes the user-facing support response.
+# The router model evaluates relationship changes after each turn.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_recent_messages: 12
+  compress_threshold: 10
+  summarizer_llm: router
+
+  # Relationship memory uses the current actor ID from --actor or set_actor_id().
+  # The built-in dimensions are broad enough for support, tutoring, sales, and NPCs.
+  #
+  # The runtime loads the current actor relationship before prompt rendering.
+  # It then injects scores into context paths like relationships.current_actor.trust.
+  # The formatted summary is also available in {{ relationship_memory }}.
+  relationships:
+    enabled: true
+    dimensions:
+      - trust
+      - sentiment
+      - familiarity
+      - rapport
+    auto_update:
+      enabled: true               # evaluate after successful turns. default: true
+      llm: router                 # fast model for relationship scoring
+      min_confidence: 0.6         # ignore low-confidence changes. default: 0.6
+      max_delta_per_turn: 0.25    # cap each turn's effect on a dimension. default: 0.3
+      recent_messages: 6          # recent messages sent to the evaluator. default: 6
+    injection:
+      enabled: true               # expose context paths and prompt variable. default: true
+      format: summary             # summary (default) | scores_only | full
+      max_tokens: 300             # prompt budget for relationship text
+      prompt_variable: relationship_memory
+      context_path: relationships.current_actor
+    persistence:
+      enabled: true               # store by (agent_id, actor_id). default: true
+    notable_events:
+      enabled: true               # store meaningful relationship moments
+      max_per_actor: 20           # cap event history per actor. default: 50
+      significance_threshold: 0.6 # ignore trivial events. default: 0.5
+
+# SQLite stores one relationship row per actor for this agent.
+# Re-running with the same actor ID restores the previous relationship state.
+storage:
+  type: sqlite
+  path: ./data/relationship_support.db
+
+metadata:
+  cli:
+    welcome: |
+      === Relationship Support Demo ===
+      Start with --actor customer_42, complain about an issue, then run again with the same actor.
+    hints:
+      - "I have contacted support three times and this billing bug still is not fixed."
+      - "Thanks, that was helpful. Please remember I prefer concise updates."
+      - "Run again with --actor customer_42 and ask: do you remember how this has been going?"
+      - "Use --actor customer_99 to start a separate relationship."
+    show_timing: true

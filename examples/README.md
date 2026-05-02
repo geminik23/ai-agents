@@ -332,6 +332,24 @@ cargo run -p ai-agents-cli -- run examples/yaml/persona/persona_evolution.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/persona/persona_secrets.yaml
 ```
 
+### `yaml/relationships/`
+
+Actor-scoped relationship memory - agents track trust, sentiment, familiarity, rapport, and notable relationship events for each actor across sessions.
+
+| File | Description |
+|------|-------------|
+| `support_relationship.yaml` | General-purpose support agent that adapts to returning actors using persisted trust, sentiment, familiarity, and rapport |
+| `persona_trust_secret.yaml` | Persona secret reveal pattern where `relationships.current_actor.trust` controls whether confidential information enters the prompt |
+
+Note: Relationship memory is separate from facts. Facts capture what the agent knows about an actor. Relationships capture how the agent relates to that actor. Relationship values are injected into context at `relationships.current_actor.*` and can be used by persona secrets, state guards, tools, and prompt templates.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/relationships/support_relationship.yaml --actor customer_42
+cargo run -p ai-agents-cli -- run examples/yaml/relationships/persona_trust_secret.yaml --actor visitor_1
+```
+
 ### `yaml/session/`
 
 Cross-session actor memory and key facts extraction - the agent remembers structured facts about each actor across separate sessions without any application code.
