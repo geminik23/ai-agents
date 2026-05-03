@@ -349,6 +349,8 @@ title %} {% block content %}
     <span class="code-keyword">let</span> agent = AgentBuilder::from_yaml_file(<span class="code-string">"agent.yaml"</span>)?
         .auto_configure_llms()?
         .auto_configure_features()?
+        .auto_configure_mcp().await?
+        .auto_configure_spawner().await?
         .build()?;
 
     <span class="code-keyword">let</span> response = agent.chat(<span class="code-string">"Hello!"</span>).<span class="code-keyword">await</span>?;
