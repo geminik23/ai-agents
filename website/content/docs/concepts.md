@@ -682,6 +682,8 @@ impl AgentHooks for MyHooks {
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .hooks(Arc::new(MyHooks))
     .build()?;
 ```

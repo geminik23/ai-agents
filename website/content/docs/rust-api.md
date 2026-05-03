@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.11"
+ai-agents = "1.0.0-rc.12"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,7 +35,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0.0-rc.11", features = ["full"] }
+ai-agents = { version = "1.0.0-rc.12", features = ["full"] }
 ```
 
 ---
@@ -56,6 +56,8 @@ async fn main() -> anyhow::Result<()> {
     let agent = AgentBuilder::from_yaml_file("agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
+        .auto_configure_mcp().await?
+        .auto_configure_spawner().await?
         .build()?;
 
     let response = agent.chat("Hello!").await?;
@@ -66,31 +68,10 @@ async fn main() -> anyhow::Result<()> {
 
 - `auto_configure_llms()` reads the `llm:` and `llms:` blocks from the spec, resolves API keys from environment variables, and registers all providers automatically.
 - `auto_configure_features()` wires up error recovery, tool security, process pipeline, and built-in tools from the spec.
+- `auto_configure_mcp()` connects to MCP servers declared in the `tools` list (entries with `type: mcp`), discovers their functions, and registers them.
+- `auto_configure_spawner()` reads the `spawner:` section, creates the spawner and agent registry, resolves file-based templates, and registers the spawner tools.
 
-If your YAML uses `mcp:` tools or `spawner:` config, add the async configuration steps:
-
-```rust
-use ai_agents::{AgentBuilder, Agent};
-
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let agent = AgentBuilder::from_yaml_file("agent.yaml")?
-        .auto_configure_llms()?
-        .auto_configure_features()?
-        .auto_configure_mcp().await?        // connects to MCP servers declared in tools
-        .auto_configure_spawner().await?     // wires spawner tools if spawner: is present
-        .build()?;
-
-    let response = agent.chat("Hello!").await?;
-    println!("{}", response.content);
-    Ok(())
-}
-```
-
-- `auto_configure_mcp()` connects to MCP servers declared in the `tools` list (entries with `type: mcp`), discovers their functions, and registers them. This is async because it spawns server processes and waits for handshake.
-- `auto_configure_spawner()` reads the `spawner:` section, creates the spawner and agent registry, resolves file-based templates, and registers the four spawner tools (`generate_agent`, `send_message`, `list_agents`, `remove_agent`). This is async because it resolves template files from disk.
-
-Both methods are no-ops when the relevant config section is absent, so it is safe to always include them in the chain.
+This is the same builder chain used by the CLI. `auto_configure_mcp()` and `auto_configure_spawner()` are no-ops when the relevant YAML sections are absent, so it is safe to always include them.
 
 ### Pattern 2: From a YAML string
 
@@ -112,6 +93,8 @@ async fn main() -> anyhow::Result<()> {
     let agent = AgentBuilder::from_yaml(yaml)?
         .auto_configure_llms()?
         .auto_configure_features()?
+        .auto_configure_mcp().await?
+        .auto_configure_spawner().await?
         .build()?;
 
     let response = agent.chat("What is Rust?").await?;
@@ -171,6 +154,8 @@ use ai_agents::{Agent, AgentBuilder};
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .build()?;
 
 let response = agent.chat("Explain ownership in Rust").await?;
@@ -201,6 +186,8 @@ use futures::StreamExt;
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .build()?;
 
 let mut stream = agent.chat_stream("Tell me a story").await?;
@@ -288,6 +275,8 @@ Register it on the builder:
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .tool(Arc::new(WeatherTool))
     .build()?;
 ```
@@ -375,6 +364,8 @@ Register it:
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .memory(Arc::new(MyMemory::new()))
     .build()?;
 ```
@@ -409,6 +400,8 @@ Register it:
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .approval_handler(Arc::new(SlackApprover))
     .build()?;
 ```
@@ -470,6 +463,8 @@ Register hooks:
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .hooks(Arc::new(MetricsHooks))
     .build()?;
 ```
@@ -486,6 +481,8 @@ let hooks = CompositeHooks::new()
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .hooks(Arc::new(hooks))
     .build()?;
 ```
@@ -537,6 +534,8 @@ use serde_json::json;
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .auto_configure_llms()?
     .auto_configure_features()?
+    .auto_configure_mcp().await?
+    .auto_configure_spawner().await?
     .build()?;
 
 // Set context values
@@ -682,10 +681,10 @@ Session persistence requires a storage backend. Enable one via feature flags:
 
 ```toml
 # SQLite (file-based, good for single-server)
-ai-agents = { version = "1.0.0-rc.11", features = ["sqlite"] }
+ai-agents = { version = "1.0.0-rc.12", features = ["sqlite"] }
 
 # Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.11", features = ["redis-storage"] }
+ai-agents = { version = "1.0.0-rc.12", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -720,7 +719,7 @@ agent.load_from(storage.as_ref(), "my-session").await?;
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.11)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.12)**
 
 ---
 

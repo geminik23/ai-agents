@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.0.0-rc.12
+
+### Added
+- Relationship memory: actor-scoped trust, sentiment, familiarity, rapport, custom dimensions, and notable events with prompt and context injection
+- Relationship persistence: relationship state now survives across sessions in SQLite and full session snapshots
+- Relationship commands and panel: inspect and adjust current actor relationship state in the REPL and TUI
+- Two-sided relationship model: track agent-to-actor and perceived-actor-to-agent scores with a derived mutual view
+- Actor-aware inter-agent context: spawned agents and orchestration flows preserve the original actor identity for facts and relationship memory
+- Relationship prompt budgeting: token budgeting can reserve prompt space for relationship memory
+- Perspective-aware relationship updates: REPL and TUI can update agent-to-actor or perceived-actor-to-agent directly
+- Runtime observability: successful fact extraction and relationship updates now emit info-level logs with actor and update details
+
+### Changed
+- Two-sided relationship evaluation: automatic updates now write only the two stored perspectives while mutual remains a derived read-only view
+- Relationship prompts and displays: two-sided prompt text now shows stored perspectives without duplicating the derived mutual view
+- Actor-scoped memory isolation: facts are cached per actor and relationship context is rendered per turn to avoid leakage across actor switches and agent handoffs
+- Relationship display: REPL and TUI label mutual values as derived and provide clearer two-sided inspection
+
+### Fixed
+- Relationship evaluator parsing: missing perspective or confidence no longer silently defaults to agent-to-actor or disappears at zero confidence
+- Two-sided relationship updates: derived mutual proposals are rejected instead of being applied as stored relationship changes
+- Unicode safety: Korean and other multibyte text no longer panics logging, previews, or memory summary rendering in relationship and actor-memory flows
+- Relationship evaluator diagnostics: skipped proposals now surface clearer logs for low confidence, unknown dimensions, and invalid perspectives
+
+---
+
 ## 1.0.0-rc.11
 
 ### Added

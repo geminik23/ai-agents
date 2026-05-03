@@ -17,22 +17,22 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.11** — Under active development. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.12** — Under active development. APIs and YAML schema may change between minor versions.
 
 ## Features
 
 - **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
-- **Hierarchical state machine** - nested sub-states, LLM-evaluated transitions, guard-based short-circuiting, intent-based routing, entry/exit actions
-- **Skill system** - reusable tool + prompt workflows with LLM-based intent routing
-- **built-in tools + MCP** - datetime, JSON, HTTP, file, text, template, math, calculator, random, echo; connect any MCP server for hundreds more
+- **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
+- **Built-in tools + MCP** - datetime, JSON, HTTP, file, text, template, math, calculator, random, echo; connect any MCP server for hundreds more
 - **Tool scoping & conditions** - 3-level filtering (state → spec → registry), context/state/time/semantic conditions, multi-language aliases, parallel execution
 - **Input/output process pipeline** - normalize, detect, extract, sanitize, validate, transform, format - all LLM-based, works across languages
-- **Memory stack** - CompactingMemory, token budgeting, SQLite/Redis/file persistence, actor facts, relationship memory
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
-- **Reasoning & reflection** - chain-of-thought, ReAct, plan-and-execute, auto mode; LLM self-evaluation with criteria and retry
-- **Intent disambiguation** - LLM-based ambiguity detection, clarification generation, multi-turn resolution
-- **Safety & control** - error recovery with backoff, tool security (rate limits, domain restrictions), human-in-the-loop approvals with multi-language messages
-- **Dynamic agent spawning** - runtime agent creation from YAML/templates, agent registry, inter-agent messaging
+- **Memory stack** - CompactingMemory, token budgeting, SQLite/Redis/file persistence, session metadata, actor facts, and relationship memory
+- **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
+- **Multi-agent systems** - dynamic agent spawning, agent registry, actor-aware inter-agent messaging, and router/pipeline/concurrent/group chat/handoff orchestration
+- **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming, context injection, and actor/relationship inspection
+- **Reasoning, reflection & disambiguation** - chain-of-thought, ReAct, plan-and-execute, self-evaluation, ambiguity detection, and clarification
+- **Safety & control** - error recovery with backoff, tool security (rate limits, domain restrictions), and human-in-the-loop approvals with multi-language messages
 - **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
@@ -41,7 +41,7 @@ See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.11"
+ai-agents = "1.0.0-rc.12"
 ```
 
 ## Quick Start
@@ -91,6 +91,8 @@ async fn main() -> ai_agents::Result<()> {
     let agent = AgentBuilder::from_yaml_file("agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
+        .auto_configure_mcp().await?
+        .auto_configure_spawner().await?
         .build()?;
 
     let response = agent.chat("Hello!").await?;
@@ -98,6 +100,8 @@ async fn main() -> ai_agents::Result<()> {
     Ok(())
 }
 ```
+
+This is the same builder chain used by the CLI. `auto_configure_mcp()` and `auto_configure_spawner()` are safe to keep in the chain even when the YAML does not use MCP tools or a `spawner:` section.
 
 ### From Rust API
 
@@ -126,7 +130,7 @@ See the [examples/](examples/) directory for more.
 
 ```sh
 # Install from crates.io
-cargo install ai-agents-cli --version 1.0.0-rc.11
+cargo install ai-agents-cli --version 1.0.0-rc.12
 
 # Or run directly from source
 cargo run -p ai-agents-cli -- run agent.yaml

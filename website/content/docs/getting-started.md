@@ -17,7 +17,7 @@ Pick whichever option fits your workflow.
 ### Option 1: CLI only (fastest)
 
 ```sh
-cargo install ai-agents-cli --version 1.0.0-rc.11
+cargo install ai-agents-cli --version 1.0.0-rc.12
 ```
 
 ### Option 2: As a library
@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.11"
+ai-agents = "1.0.0-rc.12"
 ```
 
 ### Option 3: From source
@@ -81,6 +81,8 @@ async fn main() -> ai_agents::Result<()> {
     let agent = AgentBuilder::from_yaml_file("agent.yaml")?
         .auto_configure_llms()?
         .auto_configure_features()?
+        .auto_configure_mcp().await?
+        .auto_configure_spawner().await?
         .build()?;
 
     let response = agent.chat("Hello!").await?;
@@ -88,6 +90,8 @@ async fn main() -> ai_agents::Result<()> {
     Ok(())
 }
 ```
+
+This is the same builder chain used by the CLI. `auto_configure_mcp()` and `auto_configure_spawner()` are safe to keep in the chain even when the YAML does not use MCP tools or a `spawner:` section.
 
 Or build an agent entirely in code without YAML:
 

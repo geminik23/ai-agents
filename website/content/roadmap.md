@@ -24,6 +24,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.9** | Agent persona - structured identity, evolution, secrets, templates; dot-path refactor |
 | **rc.10** | CLI context injection (`--context`, `--context-file`, `--plain`) and ratatui TUI with side panels, streaming, themes |
 | **rc.11** | Session management and key facts - cross-session actor memory, key facts extraction, session metadata, and CLI/TUI actor commands |
+| **rc.12** | Relationship memory - actor-scoped trust, sentiment, rapport, two-sided relationships, actor-aware inter-agent context, and relationship inspection in the REPL/TUI |
 
 ---
 
@@ -50,7 +51,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Agent Persona** | Structured, persistent, evolvable agent identity with personality, backstory, goals, secrets | ✅ Done (rc.9) |
 | **CLI Context Injection + TUI** | Runtime context injection (--context, --context-file), ratatui-based TUI with side panels, --plain fallback, streaming render | ✅ Done (rc.10) |
 | **Session Management + Key Facts** | Cross-session actor memory, key facts extraction, and session metadata | ✅ Done (rc.11) |
-| **Relationship Memory** | Actor-scoped trust, sentiment, rapport, and notable relationship events with LLM-based auto-evaluation | Release prep (rc.12) |
+| **Relationship Memory** | Actor-scoped trust, sentiment, rapport, notable relationship events, two-sided relationships, and actor-aware inter-agent context | ✅ Done (rc.12) |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | Planned (rc.13) |
 | **Observability & Tracing** | Per-call latency, token usage, cost tracking via hooks | Planned (rc.13) |
 | **Evaluation Framework** | YAML-driven scenario runner with assertions, LLM judge, and metrics | Planned (rc.14) |
