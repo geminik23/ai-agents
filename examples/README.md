@@ -339,6 +339,7 @@ Actor-scoped relationship memory - agents track trust, sentiment, familiarity, r
 | File | Description |
 |------|-------------|
 | `support_relationship.yaml` | General-purpose support agent that adapts to returning actors using persisted trust, sentiment, familiarity, and rapport |
+| `two_sided_relationship.yaml` | Two-sided relationship model showing `agent_to_actor`, `perceived_actor_to_agent`, and derived `mutual` scores |
 | `persona_trust_secret.yaml` | Persona secret reveal pattern where `relationships.current_actor.trust` controls whether confidential information enters the prompt |
 
 Note: Relationship memory is separate from facts. Facts capture what the agent knows about an actor. Relationships capture how the agent relates to that actor. Relationship values are injected into context at `relationships.current_actor.*` and can be used by persona secrets, state guards, tools, and prompt templates.
@@ -347,6 +348,7 @@ Examples:
 
 ```sh
 cargo run -p ai-agents-cli -- run examples/yaml/relationships/support_relationship.yaml --actor customer_42
+cargo run -p ai-agents-cli -- run examples/yaml/relationships/two_sided_relationship.yaml --actor customer_42
 cargo run -p ai-agents-cli -- run examples/yaml/relationships/persona_trust_secret.yaml --actor visitor_1
 ```
 

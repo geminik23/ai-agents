@@ -113,7 +113,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/relationship set",
-        description: "Manually update a relationship dimension",
+        description: "Manually update agent_to_actor relationship",
+    },
+    SlashCommand {
+        name: "/relationship setp",
+        description: "Manually update a specific relationship perspective",
     },
 ];
 

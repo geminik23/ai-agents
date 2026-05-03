@@ -284,14 +284,16 @@ pub struct RelationshipEvaluation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposedDimensionChange {
     /// Perspective proposed by the evaluator.
-    #[serde(default)]
+    ///
+    /// This is intentionally required during deserialization so evaluator output cannot silently default to `agent_to_actor` in two-sided mode.
     pub perspective: RelationshipPerspective,
     /// Dimension name proposed by the evaluator.
     pub dimension: String,
     /// Proposed score delta before runtime clamping.
     pub delta: f64,
     /// Evaluator confidence from 0.0 to 1.0.
-    #[serde(default)]
+    ///
+    /// This is intentionally required during deserialization so missing confidence cannot silently become `0.0` and disappear during filtering.
     pub confidence: f64,
     /// Short reason for the proposed change.
     #[serde(default)]

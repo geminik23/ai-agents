@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use serde_json::Value;
+use tracing::{debug, warn};
 
 use ai_agents_core::{AgentError, ChatMessage, Result};
 
@@ -133,7 +134,9 @@ impl RelationshipManager {
 
     /// Apply a manual delta to a specific relationship perspective.
     ///
-    /// In two-sided mode this supports `agent_to_actor`, `perceived_actor_to_agent`, and `mutual`. In one-sided mode only `agent_to_actor` is accepted.
+    /// In two-sided mode this supports `agent_to_actor` and `perceived_actor_to_agent`.
+    /// `mutual` is derived, but is accepted here as a convenience for applying the same delta to both stored perspectives.
+    /// In one-sided mode only `agent_to_actor` is accepted.
     pub fn update_dimension_for_perspective(
         &self,
         actor_id: &str,
@@ -229,15 +232,54 @@ impl RelationshipManager {
         let mut changes = Vec::new();
 
         for proposed in evaluation.changes {
+            if matches!(proposed.perspective, RelationshipPerspective::Mutual) {
+                warn!(
+                    actor_id = %actor_id,
+                    dimension = %proposed.dimension,
+                    "relationship evaluator proposed derived mutual perspective; skipping"
+                );
+                continue;
+            }
+            if matches!(self.config.model, RelationshipModel::OneSided)
+                && !matches!(proposed.perspective, RelationshipPerspective::AgentToActor)
+            {
+                warn!(
+                    actor_id = %actor_id,
+                    perspective = %proposed.perspective,
+                    dimension = %proposed.dimension,
+                    "relationship evaluator proposed two-sided perspective for one-sided relationship; skipping"
+                );
+                continue;
+            }
             if proposed.confidence < self.config.auto_update.min_confidence {
+                debug!(
+                    actor_id = %actor_id,
+                    perspective = %proposed.perspective,
+                    dimension = %proposed.dimension,
+                    confidence = proposed.confidence,
+                    min_confidence = self.config.auto_update.min_confidence,
+                    "relationship evaluator proposed low-confidence change; skipping"
+                );
                 continue;
             }
             if !self.definitions.contains_key(&proposed.dimension) {
+                warn!(
+                    actor_id = %actor_id,
+                    perspective = %proposed.perspective,
+                    dimension = %proposed.dimension,
+                    "relationship evaluator proposed unknown dimension; skipping"
+                );
                 continue;
             }
             let max_delta = self.config.auto_update.max_delta_per_turn.abs();
             let delta = proposed.delta.max(-max_delta).min(max_delta);
             if delta.abs() < f64::EPSILON {
+                debug!(
+                    actor_id = %actor_id,
+                    perspective = %proposed.perspective,
+                    dimension = %proposed.dimension,
+                    "relationship evaluator proposed zero delta after clamping; skipping"
+                );
                 continue;
             }
             let change = self.update_dimension_for_perspective(
@@ -556,6 +598,71 @@ mod tests {
         let relationship = manager.get("actor_1").unwrap();
         assert!(relationship.perceived_actor_to_agent.contains_key("trust"));
         assert!(relationship.mutual_dimensions().contains_key("trust"));
+    }
+
+    #[test]
+    fn test_apply_evaluation_skips_mutual_perspective() {
+        let config = RelationshipConfig {
+            model: RelationshipModel::TwoSided,
+            ..RelationshipConfig::default()
+        };
+        let manager = RelationshipManager::from_config(config).unwrap();
+        let update = manager
+            .apply_evaluation(
+                "actor_1",
+                RelationshipEvaluation {
+                    changes: vec![ProposedDimensionChange {
+                        perspective: RelationshipPerspective::Mutual,
+                        dimension: "trust".to_string(),
+                        delta: 0.2,
+                        confidence: 1.0,
+                        reason: "mutual should be read-only".to_string(),
+                    }],
+                    notable_event: None,
+                },
+            )
+            .unwrap();
+        assert!(update.changes.is_empty());
+        let relationship = manager.get("actor_1").unwrap();
+        assert_eq!(relationship.dimensions.get("trust").copied(), Some(0.0));
+        assert_eq!(
+            relationship.perceived_actor_to_agent.get("trust").copied(),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn test_apply_evaluation_accepts_perceived_actor_to_agent() {
+        let config = RelationshipConfig {
+            model: RelationshipModel::TwoSided,
+            ..RelationshipConfig::default()
+        };
+        let manager = RelationshipManager::from_config(config).unwrap();
+        let update = manager
+            .apply_evaluation(
+                "actor_1",
+                RelationshipEvaluation {
+                    changes: vec![ProposedDimensionChange {
+                        perspective: RelationshipPerspective::PerceivedActorToAgent,
+                        dimension: "trust".to_string(),
+                        delta: 0.2,
+                        confidence: 1.0,
+                        reason: "actor expressed trust in the agent".to_string(),
+                    }],
+                    notable_event: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(update.changes.len(), 1);
+        assert_eq!(
+            update.changes[0].perspective,
+            RelationshipPerspective::PerceivedActorToAgent
+        );
+        let relationship = manager.get("actor_1").unwrap();
+        assert_eq!(
+            relationship.perceived_actor_to_agent.get("trust").copied(),
+            Some(0.2)
+        );
     }
 
     #[test]

@@ -42,11 +42,11 @@ impl RelationshipEvaluator {
         let mut prompt = if matches!(current.model, RelationshipModel::TwoSided) {
             String::from(
                 "You are a relationship memory evaluator.\n\
-                 Evaluate how relationship perspectives should change after the recent conversation.\n\
-                 Perspectives:\n\
+                 Evaluate how stored relationship perspectives should change after the recent conversation.\n\
+                 Writable perspectives:\n\
                  - agent_to_actor: the agent's stance toward the actor.\n\
                  - perceived_actor_to_agent: the agent's inferred view of the actor's stance toward the agent.\n\
-                 - mutual: a shared relationship view. Use this only when both sides clearly changed.\n\n\
+                 The mutual view is derived from those two stored perspectives and is read-only. Do not output mutual.\n\n\
                  Dimensions:\n",
             )
         } else {
@@ -68,14 +68,9 @@ impl RelationshipEvaluator {
                     .get(name)
                     .copied()
                     .unwrap_or(def.default);
-                let mutual = current
-                    .mutual_dimensions()
-                    .get(name)
-                    .copied()
-                    .unwrap_or(def.default);
                 prompt.push_str(&format!(
-                    "- {}: {}. range [{:.2}, {:.2}], agent_to_actor {:.2}, perceived_actor_to_agent {:.2}, mutual {:.2}\n",
-                    name, def.description, def.min, def.max, current_value, perceived, mutual
+                    "- {}: {}. range [{:.2}, {:.2}], agent_to_actor {:.2}, perceived_actor_to_agent {:.2}\n",
+                    name, def.description, def.min, def.max, current_value, perceived
                 ));
             } else {
                 prompt.push_str(&format!(
@@ -85,25 +80,51 @@ impl RelationshipEvaluator {
             }
         }
 
-        prompt.push_str(
-            "\nOutput JSON only in this shape:\n\
-             {\n\
-               \"changes\": [\n\
-                 {\"perspective\": \"agent_to_actor\", \"dimension\": \"trust\", \"delta\": 0.1, \"confidence\": 0.8, \"reason\": \"short reason\"}\n\
-               ],\n\
-               \"notable_event\": {\"description\": \"short event\", \"significance\": 0.7}\n\
-             }\n\n\
-             Rules:\n\
-             - Use small deltas for small signals. Use 0 changes if nothing meaningful changed.\n\
-             - Do not output dimensions that are not listed.\n\
-             - For one-sided relationships, use perspective agent_to_actor.\n\
-             - For two-sided relationships, use perspective agent_to_actor, perceived_actor_to_agent, or mutual.\n\
-             - Confidence is 0.0 to 1.0.\n\
-             - Delta may be positive or negative. Runtime will clamp values.\n\
-             - notable_event may be null if nothing notable happened.\n\
-             - Keep reasons and event descriptions short and concrete.\n\n\
-             Recent conversation:\n",
-        );
+        if matches!(current.model, RelationshipModel::TwoSided) {
+            prompt.push_str(
+                "\nOutput JSON only in this shape:\n\
+                 {\n\
+                   \"changes\": [\n\
+                     {\"perspective\": \"agent_to_actor\", \"dimension\": \"trust\", \"delta\": 0.1, \"confidence\": 0.8, \"reason\": \"agent received reliable information from the actor\"},\n\
+                     {\"perspective\": \"perceived_actor_to_agent\", \"dimension\": \"trust\", \"delta\": 0.1, \"confidence\": 0.8, \"reason\": \"actor explicitly said they trust the agent more\"}\n\
+                   ],\n\
+                   \"notable_event\": {\"description\": \"short event\", \"significance\": 0.7}\n\
+                 }\n\n\
+                 Rules:\n\
+                 - Every change must include perspective, dimension, delta, confidence, and reason.\n\
+                 - Use small deltas for small signals. Use 0 changes if nothing meaningful changed.\n\
+                 - Do not output dimensions that are not listed.\n\
+                 - For two-sided relationships, use only agent_to_actor or perceived_actor_to_agent.\n\
+                 - Do not output mutual. Mutual is derived by the runtime from the two stored perspectives.\n\
+                 - If both stored perspectives changed, output two separate changes.\n\
+                 - Update perceived_actor_to_agent only when the actor explicitly or strongly implies their stance toward the agent changed.\n\
+                 - Confidence is 0.0 to 1.0.\n\
+                 - Delta may be positive or negative. Runtime will clamp values.\n\
+                 - notable_event may be null if nothing notable happened.\n\
+                 - Keep reasons and event descriptions short and concrete.\n\n\
+                 Recent conversation:\n",
+            );
+        } else {
+            prompt.push_str(
+                "\nOutput JSON only in this shape:\n\
+                 {\n\
+                   \"changes\": [\n\
+                     {\"perspective\": \"agent_to_actor\", \"dimension\": \"trust\", \"delta\": 0.1, \"confidence\": 0.8, \"reason\": \"actor gave reliable information\"}\n\
+                   ],\n\
+                   \"notable_event\": {\"description\": \"short event\", \"significance\": 0.7}\n\
+                 }\n\n\
+                 Rules:\n\
+                 - Every change must include perspective, dimension, delta, confidence, and reason.\n\
+                 - Use small deltas for small signals. Use 0 changes if nothing meaningful changed.\n\
+                 - Do not output dimensions that are not listed.\n\
+                 - For one-sided relationships, use perspective agent_to_actor.\n\
+                 - Confidence is 0.0 to 1.0.\n\
+                 - Delta may be positive or negative. Runtime will clamp values.\n\
+                 - notable_event may be null if nothing notable happened.\n\
+                 - Keep reasons and event descriptions short and concrete.\n\n\
+                 Recent conversation:\n",
+            );
+        }
 
         for msg in messages {
             let role = match msg.role {
@@ -288,5 +309,43 @@ mod tests {
             .parse_response(r#"{"changes":[],"notable_event":null}"#)
             .unwrap();
         assert!(parsed.changes.is_empty());
+    }
+
+    #[test]
+    fn test_parse_response_requires_perspective_and_confidence() {
+        let evaluator = RelationshipEvaluator::new(Arc::new(TestLLM));
+        assert!(
+            evaluator
+                .parse_response(
+                    r#"{"changes":[{"dimension":"trust","delta":0.1,"confidence":0.8}],"notable_event":null}"#,
+                )
+                .is_err()
+        );
+        assert!(
+            evaluator
+                .parse_response(
+                    r#"{"changes":[{"perspective":"agent_to_actor","dimension":"trust","delta":0.1}],"notable_event":null}"#,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_two_sided_prompt_treats_mutual_as_read_only() {
+        let evaluator = RelationshipEvaluator::new(Arc::new(TestLLM));
+        let relationship = Relationship::new(
+            "actor_1",
+            None,
+            &crate::defaults::builtin_dimensions(),
+            RelationshipModel::TwoSided,
+        );
+        let prompt = evaluator.build_prompt(
+            &relationship,
+            &[ChatMessage::user("That answer helped me trust you more.")],
+            &crate::defaults::builtin_dimensions(),
+        );
+        assert!(prompt.contains("Do not output mutual"));
+        assert!(!prompt.contains("mutual 0.00"));
+        assert!(prompt.contains("perceived_actor_to_agent"));
     }
 }

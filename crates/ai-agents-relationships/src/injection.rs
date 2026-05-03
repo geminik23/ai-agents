@@ -86,10 +86,9 @@ fn format_scores_only(relationship: &Relationship) -> String {
 fn format_scores_for_relationship(relationship: &Relationship) -> String {
     if matches!(relationship.model, RelationshipModel::TwoSided) {
         format!(
-            "agent_to_actor [{}]; perceived_actor_to_agent [{}]; mutual [{}]",
+            "agent_to_actor [{}]; perceived_actor_to_agent [{}]",
             format_scores(&relationship.dimensions),
-            format_scores(&relationship.perceived_actor_to_agent),
-            format_scores(&relationship.mutual_dimensions())
+            format_scores(&relationship.perceived_actor_to_agent)
         )
     } else {
         format_scores(&relationship.dimensions)
@@ -121,10 +120,6 @@ fn format_full(relationship: &Relationship) -> String {
         lines.push(format!(
             "- Perceived actor to agent: {}",
             format_scores(&relationship.perceived_actor_to_agent)
-        ));
-        lines.push(format!(
-            "- Mutual: {}",
-            format_scores(&relationship.mutual_dimensions())
         ));
     }
     lines.push(format!(
@@ -200,5 +195,19 @@ mod tests {
         rel.dimensions = HashMap::from([("trust".to_string(), 0.75)]);
         let text = format_relationship(&rel, &InjectionFormat::ScoresOnly, 100);
         assert!(text.contains("trust=0.75"));
+    }
+
+    #[test]
+    fn test_two_sided_prompt_text_omits_derived_mutual() {
+        let rel = Relationship::new(
+            "actor_1",
+            None,
+            &builtin_dimensions(),
+            RelationshipModel::TwoSided,
+        );
+        let text = format_relationship(&rel, &InjectionFormat::ScoresOnly, 100);
+        assert!(text.contains("agent_to_actor"));
+        assert!(text.contains("perceived_actor_to_agent"));
+        assert!(!text.contains("mutual"));
     }
 }

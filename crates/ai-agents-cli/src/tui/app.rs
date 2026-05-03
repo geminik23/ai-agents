@@ -16,7 +16,7 @@ use tui_textarea::TextArea;
 use ai_agents::memory::estimate_tokens;
 use ai_agents::{Agent, RuntimeAgent, StreamChunk};
 
-use crate::repl::{CliReplConfig, ReplMode};
+use crate::repl::{CliReplConfig, ReplMode, parse_relationship_perspective};
 use crate::tui::event::AppMessage;
 use crate::tui::palette::{THEME_NAMES, resolve_theme, theme_bg_color};
 use crate::tui::theme::Theme;
@@ -878,14 +878,73 @@ impl App {
                     .await
                 {
                     Ok(change) => self.add_toast(&format!(
-                        "{} {:+.2} -> {:.2}",
-                        change.dimension, change.delta, change.current
+                        "{} {} {:+.2} -> {:.2}",
+                        change.perspective, change.dimension, change.delta, change.current
+                    )),
+                    Err(e) => self.add_system_message(&format!("[Error] {}", e)),
+                }
+            }
+            Some("setp") => {
+                let perspective = match parts.get(2) {
+                    Some(value) => match parse_relationship_perspective(value) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.add_system_message(&format!(
+                                "{}. Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
+                                e
+                            ));
+                            return;
+                        }
+                    },
+                    None => {
+                        self.add_system_message(
+                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
+                        );
+                        return;
+                    }
+                };
+                let dimension = match parts.get(3) {
+                    Some(d) => *d,
+                    None => {
+                        self.add_system_message(
+                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
+                        );
+                        return;
+                    }
+                };
+                let delta = match parts.get(4).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(v) => v,
+                    None => {
+                        self.add_system_message(
+                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]",
+                        );
+                        return;
+                    }
+                };
+                let reason = if parts.len() > 5 {
+                    Some(parts[5..].join(" "))
+                } else {
+                    None
+                };
+                match self
+                    .agent
+                    .update_relationship_dimension_for_perspective(
+                        perspective,
+                        dimension,
+                        delta,
+                        reason.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(change) => self.add_toast(&format!(
+                        "{} {} {:+.2} -> {:.2}",
+                        change.perspective, change.dimension, change.delta, change.current
                     )),
                     Err(e) => self.add_system_message(&format!("[Error] {}", e)),
                 }
             }
             _ => self.add_system_message(
-                "Usage: /relationship, /relationship events, /relationship set <dimension> <delta> [reason]",
+                "Usage: /relationship, /relationship events, /relationship set <dimension> <delta> [reason], /relationship setp <perspective> <dimension> <delta> [reason]",
             ),
         }
     }

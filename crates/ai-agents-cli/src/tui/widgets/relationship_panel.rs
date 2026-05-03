@@ -94,7 +94,10 @@ pub fn render_relationship_panel(
 
     if !state.mutual_dimensions.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Mutual", theme.highlight_style)));
+        lines.push(Line::from(Span::styled(
+            "Derived mutual",
+            theme.highlight_style,
+        )));
         for dim in &state.mutual_dimensions {
             lines.push(Line::from(vec![
                 Span::styled(format!(" {}", dim.name), theme.label_style),

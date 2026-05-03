@@ -28,6 +28,26 @@ pub enum CommandResult {
 
 type CommandHandler = Box<dyn Fn(&str, &RuntimeAgent) -> CommandResult + Send + Sync>;
 
+pub(crate) fn parse_relationship_perspective(
+    value: &str,
+) -> Result<ai_agents::relationships::RelationshipPerspective, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "agent_to_actor" | "agent" | "a2a" => {
+            Ok(ai_agents::relationships::RelationshipPerspective::AgentToActor)
+        }
+        "perceived_actor_to_agent" | "perceived" | "p2a" => Ok(
+            ai_agents::relationships::RelationshipPerspective::PerceivedActorToAgent,
+        ),
+        "mutual" | "derived_mutual" => Err(
+            "mutual is derived from the two stored perspectives; update agent_to_actor or perceived_actor_to_agent instead"
+                .to_string(),
+        ),
+        _ => Err(
+            "unknown perspective. Use agent_to_actor or perceived_actor_to_agent".to_string(),
+        ),
+    }
+}
+
 fn preview_text(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -388,6 +408,7 @@ impl CliRepl {
         println!("  /relationship        Show current actor relationship");
         println!("  /relationship events Show notable relationship events");
         println!("  /relationship set <dimension> <delta> [reason]");
+        println!("  /relationship setp <perspective> <dimension> <delta> [reason]");
         println!();
     }
 
@@ -996,7 +1017,7 @@ impl CliRepl {
                     for (name, value) in perceived {
                         println!("    {}: {:.2}", name, value);
                     }
-                    println!("  mutual:");
+                    println!("  derived_mutual:");
                     let mutual = relationship.mutual_dimensions();
                     let mut mutual_dims: Vec<_> = mutual.iter().collect();
                     mutual_dims.sort_by(|a, b| a.0.cmp(b.0));
@@ -1060,14 +1081,81 @@ impl CliRepl {
                     .await
                 {
                     Ok(change) => println!(
-                        "Updated {}: {:.2} -> {:.2} ({:+.2})",
-                        change.dimension, change.previous, change.current, change.delta
+                        "Updated {} {}: {:.2} -> {:.2} ({:+.2})",
+                        change.perspective,
+                        change.dimension,
+                        change.previous,
+                        change.current,
+                        change.delta
+                    ),
+                    Err(e) => eprintln!("[Error] Failed to update relationship: {}", e),
+                }
+            }
+            Some("setp") => {
+                let perspective = match parts.get(2) {
+                    Some(value) => match parse_relationship_perspective(value) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!("{}", e);
+                            println!(
+                                "Usage: /relationship setp <perspective> <dimension> <delta> [reason]"
+                            );
+                            return;
+                        }
+                    },
+                    None => {
+                        println!(
+                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]"
+                        );
+                        return;
+                    }
+                };
+                let dimension = match parts.get(3) {
+                    Some(d) => *d,
+                    None => {
+                        println!(
+                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]"
+                        );
+                        return;
+                    }
+                };
+                let delta = match parts.get(4).and_then(|s| s.parse::<f64>().ok()) {
+                    Some(v) => v,
+                    None => {
+                        println!(
+                            "Usage: /relationship setp <perspective> <dimension> <delta> [reason]"
+                        );
+                        return;
+                    }
+                };
+                let reason = if parts.len() > 5 {
+                    Some(parts[5..].join(" "))
+                } else {
+                    None
+                };
+                match self
+                    .agent
+                    .update_relationship_dimension_for_perspective(
+                        perspective,
+                        dimension,
+                        delta,
+                        reason.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(change) => println!(
+                        "Updated {} {}: {:.2} -> {:.2} ({:+.2})",
+                        change.perspective,
+                        change.dimension,
+                        change.previous,
+                        change.current,
+                        change.delta
                     ),
                     Err(e) => eprintln!("[Error] Failed to update relationship: {}", e),
                 }
             }
             Some(other) => println!(
-                "Unknown relationship command: {}. Use: /relationship, /relationship events, /relationship actors, /relationship set",
+                "Unknown relationship command: {}. Use: /relationship, /relationship events, /relationship actors, /relationship set, /relationship setp",
                 other
             ),
         }

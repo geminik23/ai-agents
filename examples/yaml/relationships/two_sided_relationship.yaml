@@ -1,0 +1,112 @@
+name: TwoSidedRelationshipAgent
+version: "1.0.0"
+description: "Support agent that tracks both agent stance and perceived actor stance"
+
+# Two-sided relationship memory example.
+# Requires OPENAI_API_KEY and SQLite storage for cross-session persistence.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/relationships/two_sided_relationship.yaml --actor customer_42
+#
+# Two-sided mode stores two writable perspectives:
+# - agent_to_actor: this agent's stance toward the actor
+# - perceived_actor_to_agent: this agent's inference of the actor's stance toward it
+#
+# The mutual view is derived from those two stored values. It is exposed in context and UI as a convenience, but the evaluator does not write to it directly.
+# Shortcut paths such as trust still refer to agent_to_actor.
+#
+# Flow: --actor customer_42 -> load relationship -> inject two-sided relationship_memory
+#                          -> chat -> evaluate stored perspective deltas -> persist relationship
+#
+# Customize this example first by changing:
+# - the relationship dimensions
+# - the evaluator sensitivity
+# - the injection format
+system_prompt: |
+  You are a customer success agent for AI Agents.
+  Be concise, practical, and emotionally aware.
+  {% if relationship_memory %}
+  Current relationship context:
+  {{ relationship_memory }}
+  {% endif %}
+  If your stance toward the actor is negative, acknowledge the issue calmly.
+  If you perceive that the actor trusts you, be slightly warmer and more direct.
+
+# Two LLMs are used here.
+# The default model writes the user-facing support response.
+# The router model evaluates relationship changes after each turn.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+memory:
+  type: compacting
+  max_recent_messages: 12
+  compress_threshold: 10
+  summarizer_llm: router
+
+  # Token budget can reserve a global cap for relationship prompt text.
+  # The local relationships.injection.max_tokens below cannot exceed this cap.
+  token_budget:
+    total: 4096
+    allocation:
+      summary: 1024
+      recent_messages: 2048
+      facts: 512
+      relationships: 300
+
+  # Two-sided mode tracks agent_to_actor and perceived_actor_to_agent.
+  # The mutual view is derived from both sides and exposed at relationships.current_actor.mutual.
+  # It is not a writable evaluator target.
+  relationships:
+    enabled: true
+    model: two_sided             # one_sided (default) | two_sided
+    dimensions:
+      - trust
+      - sentiment
+      - familiarity
+      - rapport
+    auto_update:
+      enabled: true               # evaluate after successful turns. default: true
+      llm: router                 # fast model for relationship scoring
+      min_confidence: 0.6         # ignore low-confidence changes. default: 0.6
+      max_delta_per_turn: 0.25    # cap each turn's effect on a dimension. default: 0.3
+      recent_messages: 6          # recent messages sent to the evaluator. default: 6
+    injection:
+      enabled: true               # expose context paths and prompt variable. default: true
+      format: full                # full shows stored perspectives and recent events
+      max_tokens: 300             # prompt budget for relationship text
+      prompt_variable: relationship_memory
+      context_path: relationships.current_actor
+    persistence:
+      enabled: true               # store by (agent_id, actor_id). default: true
+    notable_events:
+      enabled: true               # store meaningful relationship moments
+      max_per_actor: 20           # cap event history per actor. default: 50
+      significance_threshold: 0.6 # ignore trivial events. default: 0.5
+
+# SQLite stores one relationship row per actor for this agent.
+# Re-running with the same actor ID restores the previous relationship state.
+storage:
+  type: sqlite
+  path: ./data/two_sided_relationship.db
+
+metadata:
+  cli:
+    welcome: |
+      === Two-Sided Relationship Demo ===
+      Start with --actor customer_42 and give the agent mixed trust/frustration signals.
+    hints:
+      - "I am frustrated because this happened twice, but I appreciate that you are helping."
+      - "That answer helped. I trust you more now, so please keep updates concise."
+      - "Use /relationship to inspect agent_to_actor, perceived_actor_to_agent, and derived_mutual scores."
+      - "Use /relationship setp perceived_actor_to_agent trust 0.2 manual-test to test the second perspective directly."
+      - "Run again with --actor customer_42 and ask how the relationship has been going."
+    show_timing: true
