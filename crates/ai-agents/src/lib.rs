@@ -78,7 +78,7 @@
 pub mod agent {
     pub use ai_agents_runtime::{
         Agent, AgentBuilder, AgentInfo, AgentResponse, ParallelToolsConfig, RuntimeAgent,
-        StreamChunk, StreamingConfig, ToolCall,
+        StreamChunk, StreamingConfig, ToolCall, TurnActorContext,
     };
 }
 
@@ -378,9 +378,9 @@ pub mod relationships {
         NotableEventsConfig, PersistenceConfig, ProposedDimensionChange, ProposedRelationshipEvent,
         Relationship, RelationshipConfig, RelationshipDimensionDefinition,
         RelationshipDimensionsConfig, RelationshipEvaluation, RelationshipEvaluator,
-        RelationshipEvaluatorTrait, RelationshipEvent, RelationshipManager, RelationshipSnapshot,
-        RelationshipUpdate, format_relationship, relationship_from_value,
-        relationship_to_context_value, relationship_to_value,
+        RelationshipEvaluatorTrait, RelationshipEvent, RelationshipManager, RelationshipModel,
+        RelationshipPerspective, RelationshipSnapshot, RelationshipUpdate, format_relationship,
+        relationship_from_value, relationship_to_context_value, relationship_to_value,
     };
 }
 
@@ -468,7 +468,7 @@ pub mod orchestration {
 // Top-level re-exports (legacy interface)
 pub use agent::{
     Agent, AgentBuilder, AgentInfo, AgentResponse, ParallelToolsConfig, RuntimeAgent, StreamChunk,
-    StreamingConfig,
+    StreamingConfig, TurnActorContext,
 };
 pub use error::{AgentError, Result};
 pub use memory::{

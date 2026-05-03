@@ -6,8 +6,21 @@ use ai_agents_state::{
 };
 
 use super::types::{ChatTurn, GroupChatResult};
-use crate::Agent;
 use crate::spawner::AgentRegistry;
+use crate::turn_context::current_turn_actor_context;
+use crate::{Agent, RuntimeAgent, TurnActorContext};
+
+async fn chat_agent(
+    agent: &RuntimeAgent,
+    input: &str,
+    actor_context: Option<TurnActorContext>,
+) -> Result<AgentResponse> {
+    if let Some(context) = actor_context {
+        agent.chat_with_actor_context(input, context).await
+    } else {
+        agent.chat(input).await
+    }
+}
 
 /// Run a multi-turn multi-agent conversation.
 pub async fn group_chat(
@@ -90,7 +103,8 @@ pub async fn group_chat(
                     role_line,
                 );
 
-                let response = agent.chat(&prompt).await?;
+                let response =
+                    chat_agent(agent.as_ref(), &prompt, current_turn_actor_context()).await?;
                 let content = response.content.clone();
 
                 transcript.push(ChatTurn {
@@ -138,8 +152,13 @@ pub async fn group_chat(
                             manager_id
                         ))
                     })?;
-                    let decision =
-                        ask_manager_continue(manager_agent.as_ref(), topic, &transcript).await?;
+                    let decision = ask_manager_continue(
+                        manager_agent.as_ref(),
+                        topic,
+                        &transcript,
+                        current_turn_actor_context(),
+                    )
+                    .await?;
                     if decision.action == "end" {
                         return Ok(build_result(&transcript, rounds_completed, "manager_ended"));
                     }
@@ -298,6 +317,7 @@ async fn run_llm_directed_round(
                     &config.participants,
                     transcript,
                     topic,
+                    current_turn_actor_context(),
                 )
                 .await?
             } else {
@@ -320,7 +340,7 @@ async fn run_llm_directed_round(
             role_line,
         );
 
-        let response = agent.chat(&prompt).await?;
+        let response = chat_agent(agent.as_ref(), &prompt, current_turn_actor_context()).await?;
         let content = response.content.clone();
 
         transcript.push(ChatTurn {
@@ -388,9 +408,10 @@ struct ManagerDecision {
 
 /// Ask the manager agent whether the conversation should continue.
 async fn ask_manager_continue(
-    manager: &dyn Agent,
+    manager: &RuntimeAgent,
     topic: &str,
     transcript: &[ChatTurn],
+    actor_context: Option<TurnActorContext>,
 ) -> Result<ManagerDecision> {
     let transcript_text = format_transcript(transcript);
     let prompt = format!(
@@ -402,7 +423,7 @@ async fn ask_manager_continue(
         topic, transcript_text
     );
 
-    let response = manager.chat(&prompt).await?;
+    let response = chat_agent(manager, &prompt, actor_context).await?;
     let raw = response.content.trim().to_string();
 
     // Try JSON extraction.
@@ -454,10 +475,11 @@ async fn ask_manager_continue(
 
 /// Ask the manager agent to select the next speaker.
 async fn manager_select_speaker(
-    manager: &dyn Agent,
+    manager: &RuntimeAgent,
     participants: &[ai_agents_state::ChatParticipant],
     transcript: &[ChatTurn],
     topic: &str,
+    actor_context: Option<TurnActorContext>,
 ) -> Result<String> {
     let participant_list = participants
         .iter()
@@ -484,7 +506,7 @@ async fn manager_select_speaker(
         participant_list, topic, transcript_text
     );
 
-    let response = manager.chat(&prompt).await?;
+    let response = chat_agent(manager, &prompt, actor_context).await?;
     let raw = response.content.trim().to_lowercase();
 
     // Fuzzy match against participant IDs.
@@ -549,6 +571,7 @@ async fn run_maker_checker(
 
     let mut transcript = Vec::new();
     let mut current_draft = String::new();
+    let actor_context = current_turn_actor_context();
 
     for iteration in 0..max_iter {
         let maker_prompt = if iteration == 0 {
@@ -561,7 +584,8 @@ async fn run_maker_checker(
             )
         };
 
-        let maker_response = maker.chat(&maker_prompt).await?;
+        let maker_response =
+            chat_agent(maker.as_ref(), &maker_prompt, actor_context.clone()).await?;
         current_draft = maker_response.content.clone();
         transcript.push(ChatTurn {
             speaker: maker_id.clone(),
@@ -581,7 +605,8 @@ async fn run_maker_checker(
             criteria, current_draft
         );
 
-        let checker_response = checker.chat(&checker_prompt).await?;
+        let checker_response =
+            chat_agent(checker.as_ref(), &checker_prompt, actor_context.clone()).await?;
         let feedback = checker_response.content.clone();
         transcript.push(ChatTurn {
             speaker: checker_id.clone(),
@@ -642,6 +667,7 @@ async fn run_debate(
 
     let mut transcript = Vec::new();
     let mut debate_text = String::new();
+    let actor_context = current_turn_actor_context();
 
     for round in 0..rounds {
         for participant in &config.participants {
@@ -664,7 +690,7 @@ async fn run_debate(
                 }
             );
 
-            let response = agent.chat(&prompt).await?;
+            let response = chat_agent(agent.as_ref(), &prompt, actor_context.clone()).await?;
             let content = response.content.clone();
 
             debate_text.push_str(&format!(
@@ -693,7 +719,8 @@ async fn run_debate(
                 "Synthesize this debate into a balanced conclusion:\n\n{}",
                 debate_text
             );
-            let synth_response = synth_agent.chat(&synth_prompt).await?;
+            let synth_response =
+                chat_agent(synth_agent.as_ref(), &synth_prompt, actor_context.clone()).await?;
             synth_response.content
         } else {
             debate_text

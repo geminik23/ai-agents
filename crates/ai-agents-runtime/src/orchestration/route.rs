@@ -7,6 +7,7 @@ use tracing::{debug, info};
 use super::types::{RouteResult, RoutingMethod};
 use crate::Agent;
 use crate::spawner::AgentRegistry;
+use crate::turn_context::current_turn_actor_context;
 
 /// Route input to the best agent from candidates.
 pub async fn route(
@@ -32,7 +33,11 @@ pub async fn route(
             let agent = registry.get(selected).ok_or_else(|| {
                 AgentError::Other(format!("Agent not found in registry: {}", selected))
             })?;
-            let response = agent.chat(input).await?;
+            let response = if let Some(context) = current_turn_actor_context() {
+                agent.chat_with_actor_context(input, context).await?
+            } else {
+                agent.chat(input).await?
+            };
             Ok(RouteResult {
                 response,
                 selected_agent: selected.clone(),
@@ -86,7 +91,11 @@ async fn route_via_llm(
         AgentError::Other(format!("Routed agent not found in registry: {}", selected))
     })?;
 
-    let response = agent.chat(input).await?;
+    let response = if let Some(context) = current_turn_actor_context() {
+        agent.chat_with_actor_context(input, context).await?
+    } else {
+        agent.chat(input).await?
+    };
 
     info!(agent = %selected, "Route completed");
 

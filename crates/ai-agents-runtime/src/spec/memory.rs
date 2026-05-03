@@ -246,6 +246,7 @@ token_budget:
     summary: 2048
     recent_messages: 4096
     facts: 1024
+    relationships: 512
   overflow_strategy: summarize_more
   warn_at_percent: 75
 "#;
@@ -254,6 +255,7 @@ token_budget:
         let budget = config.token_budget.unwrap();
         assert_eq!(budget.total, 8192);
         assert_eq!(budget.allocation.summary, 2048);
+        assert_eq!(budget.allocation.relationships, 512);
         assert_eq!(budget.warn_at_percent, 75);
     }
 

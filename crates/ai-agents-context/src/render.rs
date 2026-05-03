@@ -44,7 +44,7 @@ impl TemplateRenderer {
         // templates can use {{ actor_facts }} directly instead of
         // {{ context.actor_facts }}. Any key listed here is also accessible via
         // the context. prefix, so both forms work.
-        for key in &["actor_facts"] {
+        for key in &["actor_facts", "relationship_memory"] {
             if let Some(value) = context.get(*key) {
                 ctx.insert(key, json_to_minijinja(value));
             }

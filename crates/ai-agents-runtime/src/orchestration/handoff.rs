@@ -7,6 +7,7 @@ use tracing::{debug, info};
 use super::types::{HandoffEvent, HandoffResult};
 use crate::Agent;
 use crate::spawner::AgentRegistry;
+use crate::turn_context::current_turn_actor_context;
 
 /// Structured decision from the handoff evaluator LLM.
 struct HandoffDecision {
@@ -30,6 +31,7 @@ pub async fn handoff(
     let mut current_input = input.to_string();
     let mut chain: Vec<HandoffEvent> = Vec::new();
     let mut final_response = AgentResponse::new("");
+    let mut actor_context = current_turn_actor_context();
 
     if let Some(h) = hooks {
         h.on_handoff_start(initial_agent).await;
@@ -42,7 +44,13 @@ pub async fn handoff(
 
         debug!(agent = %current_agent, "Handoff chain executing agent");
 
-        let response = agent.chat(&current_input).await?;
+        let response = if let Some(context) = actor_context.clone() {
+            agent
+                .chat_with_actor_context(&current_input, context)
+                .await?
+        } else {
+            agent.chat(&current_input).await?
+        };
         final_response = response.clone();
 
         // Build the list of agents we could hand off to (excluding current).
@@ -94,6 +102,9 @@ pub async fn handoff(
                     "Continuing conversation from another agent. Previous context: {}",
                     response.content
                 );
+                if let Some(context) = actor_context.as_mut() {
+                    *context = context.for_sender(current_agent.clone());
+                }
                 current_agent = next_agent;
                 continue;
             }

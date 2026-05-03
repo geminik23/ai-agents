@@ -18,5 +18,6 @@ pub use manager::RelationshipManager;
 pub use snapshot::{RelationshipSnapshot, relationship_from_value, relationship_to_value};
 pub use types::{
     DimensionChange, ProposedDimensionChange, ProposedRelationshipEvent, Relationship,
-    RelationshipDimensionDefinition, RelationshipEvaluation, RelationshipEvent, RelationshipUpdate,
+    RelationshipDimensionDefinition, RelationshipEvaluation, RelationshipEvent, RelationshipModel,
+    RelationshipPerspective, RelationshipUpdate,
 };

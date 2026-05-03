@@ -13,6 +13,7 @@ use ai_agents_tools::generate_schema;
 
 use super::registry::AgentRegistry;
 use super::spawner::AgentSpawner;
+use crate::turn_context::current_turn_actor_context;
 
 //
 // GenerateAgentTool
@@ -327,7 +328,14 @@ impl Tool for SendMessageTool {
             None => return ToolResult::error("missing required field: message"),
         };
 
-        match self.registry.send(&self.sender_id, to, message).await {
+        let actor_context = current_turn_actor_context()
+            .unwrap_or_default()
+            .for_sender(self.sender_id.clone());
+        match self
+            .registry
+            .send_with_actor_context(&self.sender_id, to, message, actor_context)
+            .await
+        {
             Ok(response) => {
                 ToolResult::ok(json!({"from": to, "response": response.content}).to_string())
             }

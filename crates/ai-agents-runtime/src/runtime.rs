@@ -3,11 +3,14 @@ use futures::stream::{Stream, StreamExt};
 use parking_lot::RwLock;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
+
+use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
 use ai_agents_core::{
@@ -138,15 +141,13 @@ pub struct RuntimeAgent {
     redispatch_depth: RwLock<u32>,
     /// Current actor ID for cross-session memory.
     actor_id: RwLock<Option<String>>,
-    /// Actor whose facts are currently cached. Used to trigger reload on actor change.
-    last_loaded_actor_id: RwLock<Option<String>>,
     /// Fact store for managing per-actor extracted facts.
     fact_store: RwLock<Option<Arc<ai_agents_facts::FactStore>>>,
     /// Fact extractor for LLM-based fact extraction.
     /// None when actor_memory is enabled without facts.enabled.
     fact_extractor: RwLock<Option<Arc<dyn ai_agents_facts::FactExtractor>>>,
-    /// Cached actor facts loaded from storage, injected into prompt context.
-    actor_facts_cache: RwLock<Vec<ai_agents_core::KeyFact>>,
+    /// Cached actor facts keyed by actor ID so concurrent or alternating turns do not overwrite one another.
+    actor_facts_cache: RwLock<HashMap<String, Vec<ai_agents_core::KeyFact>>>,
     /// Number of messages since last fact extraction.
     messages_since_extraction: RwLock<usize>,
     /// Actor memory configuration.
@@ -159,8 +160,6 @@ pub struct RuntimeAgent {
     current_session_id: RwLock<Option<String>>,
     /// Relationship manager for actor-scoped social memory.
     relationship_manager: Option<Arc<RelationshipManager>>,
-    /// Actor whose relationship is currently loaded and injected.
-    last_loaded_relationship_actor_id: RwLock<Option<String>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -259,17 +258,15 @@ impl RuntimeAgent {
             spawner_registry: None,
             redispatch_depth: RwLock::new(0),
             actor_id: RwLock::new(None),
-            last_loaded_actor_id: RwLock::new(None),
             fact_store: RwLock::new(None),
             fact_extractor: RwLock::new(None),
-            actor_facts_cache: RwLock::new(Vec::new()),
+            actor_facts_cache: RwLock::new(HashMap::new()),
             messages_since_extraction: RwLock::new(0),
             actor_memory_config: None,
             facts_config: None,
             session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
             current_session_id: RwLock::new(None),
             relationship_manager: None,
-            last_loaded_relationship_actor_id: RwLock::new(None),
         }
     }
 
@@ -298,22 +295,112 @@ impl RuntimeAgent {
         self
     }
 
+    /// Attach a relationship manager configured by the builder or host application.
     pub fn with_relationships(mut self, manager: Arc<RelationshipManager>) -> Self {
         self.relationship_manager = Some(manager);
         self
     }
 
+    /// Returns the configured relationship manager, if relationship memory is enabled.
     pub fn relationship_manager(&self) -> Option<Arc<RelationshipManager>> {
         self.relationship_manager.clone()
     }
 
+    fn current_turn_actor_context(&self) -> Option<crate::TurnActorContext> {
+        current_turn_actor_context()
+    }
+
+    fn effective_actor_id(&self) -> Option<String> {
+        self.current_turn_actor_context()
+            .and_then(|ctx| ctx.effective_actor_id().map(|id| id.to_string()))
+            .or_else(|| self.actor_id.read().clone())
+    }
+
+    fn effective_origin_actor_id(&self) -> Option<String> {
+        self.current_turn_actor_context()
+            .and_then(|ctx| ctx.origin_actor_id.clone())
+            .or_else(|| self.actor_id.read().clone())
+    }
+
+    fn record_session_actor_if_needed(&self) {
+        if let Some(actor_id) = self.effective_origin_actor_id() {
+            let mut meta = self.session_metadata.write();
+            meta.actor_id = Some(actor_id.clone());
+            if !meta.actors.iter().any(|a| a == &actor_id) {
+                meta.actors.push(actor_id);
+            }
+        }
+    }
+
+    fn outbound_actor_context(&self) -> crate::TurnActorContext {
+        let mut context = self.current_turn_actor_context().unwrap_or_default();
+        if context.origin_actor_id.is_none() {
+            context.origin_actor_id = self.effective_origin_actor_id();
+        }
+        context.sender_agent_id = Some(self.info.id.clone());
+        context
+    }
+
+    fn chat_with_actor_context_boxed<'a>(
+        &'a self,
+        input: &'a str,
+        actor_context: crate::TurnActorContext,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            scope_actor_context(
+                actor_context,
+                Box::pin(async move { self.run_loop(input).await }),
+            )
+            .await
+        })
+    }
+
+    /// Run one turn with turn-scoped actor context without mutating the runtime's global actor ID.
+    ///
+    /// The supplied context is available to actor-scoped facts, relationship memory, orchestration, and prompt templates only for the lifetime of this call.
+    pub async fn chat_with_actor_context(
+        &self,
+        input: &str,
+        actor_context: crate::TurnActorContext,
+    ) -> Result<AgentResponse> {
+        self.chat_with_actor_context_boxed(input, actor_context)
+            .await
+    }
+
+    /// Convenience wrapper around [`Self::chat_with_actor_context`] for a turn whose original actor is known up front.
+    pub async fn chat_as_actor(&self, actor_id: &str, input: &str) -> Result<AgentResponse> {
+        let actor_context = crate::TurnActorContext::new().with_origin_actor(actor_id);
+        self.chat_with_actor_context(input, actor_context).await
+    }
+
+    /// Ensure the effective actor's relationship is loaded from storage into the relationship manager.
     pub async fn load_actor_relationship(&self) -> Result<()> {
         self.maybe_load_actor_relationship().await;
         Ok(())
     }
 
+    /// Manually apply a delta to the effective actor's `agent_to_actor` relationship perspective and persist the updated relationship when storage is configured.
     pub async fn update_relationship_dimension(
         &self,
+        dimension: &str,
+        delta: f64,
+        reason: Option<&str>,
+    ) -> Result<ai_agents_relationships::DimensionChange> {
+        self.update_relationship_dimension_for_perspective(
+            ai_agents_relationships::RelationshipPerspective::AgentToActor,
+            dimension,
+            delta,
+            reason,
+        )
+        .await
+    }
+
+    /// Manually apply a delta to a specific relationship perspective for the effective actor.
+    ///
+    /// Use this for two-sided configurations when you need to update `agent_to_actor`, `perceived_actor_to_agent`, or `mutual` explicitly from application logic.
+    pub async fn update_relationship_dimension_for_perspective(
+        &self,
+        perspective: ai_agents_relationships::RelationshipPerspective,
         dimension: &str,
         delta: f64,
         reason: Option<&str>,
@@ -322,18 +409,26 @@ impl RuntimeAgent {
             .relationship_manager
             .as_ref()
             .ok_or_else(|| AgentError::Config("Relationship memory is not configured".into()))?;
-        let actor_id = self.actor_id.read().clone().ok_or_else(|| {
+        let actor_id = self.effective_actor_id().ok_or_else(|| {
             AgentError::Config("No actor ID set. Use set_actor_id() first".into())
         })?;
-        let change = manager.update_dimension(
+        let change = manager.update_dimension_for_perspective(
             &actor_id,
+            perspective,
             dimension,
             delta,
             1.0,
             reason.unwrap_or("manual relationship update"),
         )?;
-        let _ = self.inject_relationship_context(&actor_id);
         self.persist_actor_relationship(&actor_id).await?;
+        info!(
+            actor_id = %actor_id,
+            perspective = %change.perspective,
+            dimension = %change.dimension,
+            delta = change.delta,
+            current = change.current,
+            "relationship updated manually"
+        );
         self.hooks
             .on_relationship_change(&actor_id, std::slice::from_ref(&change))
             .await;
@@ -387,16 +482,8 @@ impl RuntimeAgent {
     }
 
     /// Set the current actor ID (player, user, another agent, etc.).
-    /// Clears the cached facts so the next turn reloads them for the new actor.
     pub fn set_actor_id(&self, actor_id: &str) -> ai_agents_core::Result<()> {
-        let changed = self.actor_id.read().as_deref() != Some(actor_id);
         *self.actor_id.write() = Some(actor_id.to_string());
-        if changed {
-            self.actor_facts_cache.write().clear();
-            *self.last_loaded_actor_id.write() = None;
-            *self.last_loaded_relationship_actor_id.write() = None;
-        }
-        // Record actor in session metadata roster.
         {
             let mut meta = self.session_metadata.write();
             meta.actor_id = Some(actor_id.to_string());
@@ -414,7 +501,7 @@ impl RuntimeAgent {
 
     /// Load facts for the current actor from storage and cache them for prompt injection.
     pub async fn load_actor_memory(&self) -> ai_agents_core::Result<()> {
-        let actor_id = match self.actor_id.read().clone() {
+        let actor_id = match self.effective_actor_id() {
             Some(id) => id,
             None => return Ok(()),
         };
@@ -423,8 +510,9 @@ impl RuntimeAgent {
         if let Some(store) = store_opt {
             let facts = store.get_facts(&actor_id).await?;
             let count = facts.len();
-            *self.actor_facts_cache.write() = facts;
-            *self.last_loaded_actor_id.write() = Some(actor_id.clone());
+            self.actor_facts_cache
+                .write()
+                .insert(actor_id.clone(), facts);
             self.hooks.on_actor_memory_loaded(&actor_id, count).await;
             tracing::debug!("loaded {} facts for actor {}", count, actor_id);
         }
@@ -432,21 +520,21 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Load actor memory only when the actor has changed or facts were never loaded.
+    /// Load actor memory only when the effective actor has no cached facts yet.
     async fn maybe_load_actor_memory(&self) {
-        let current = self.actor_id.read().clone();
-        let last = self.last_loaded_actor_id.read().clone();
-        if current.is_none() {
+        let Some(actor_id) = self.effective_actor_id() else {
+            return;
+        };
+        if self.actor_facts_cache.read().contains_key(&actor_id) {
             return;
         }
-        if current != last {
-            let _ = self.load_actor_memory().await;
-        }
+        let _ = self.load_actor_memory().await;
     }
 
     /// Pre-turn lifecycle shared by streaming and non-streaming paths.
     async fn pre_turn_session_lifecycle(&self) {
         self.resolve_actor_id_from_context();
+        self.record_session_actor_if_needed();
         self.maybe_load_actor_memory().await;
         self.maybe_load_actor_relationship().await;
         *self.messages_since_extraction.write() += 1;
@@ -459,15 +547,35 @@ impl RuntimeAgent {
         self.auto_update_relationship().await;
     }
 
-    /// Get cached actor facts.
+    /// Get cached actor facts for the effective actor.
     pub fn actor_facts(&self) -> Vec<ai_agents_core::KeyFact> {
-        self.actor_facts_cache.read().clone()
+        let Some(actor_id) = self.effective_actor_id() else {
+            return Vec::new();
+        };
+        self.actor_facts_cache
+            .read()
+            .get(&actor_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Returns the formatted relationship prompt text for the effective actor, if relationship injection produced any text for this turn.
+    pub fn relationship_memory_text(&self) -> Option<String> {
+        self.format_relationship_for_context().map(|(_, text)| text)
     }
 
     /// Manually extract facts from the last N messages.
     pub async fn extract_facts(
         &self,
         last_n: usize,
+    ) -> ai_agents_core::Result<Vec<ai_agents_core::KeyFact>> {
+        self.extract_facts_with_source(last_n, "manual").await
+    }
+
+    async fn extract_facts_with_source(
+        &self,
+        last_n: usize,
+        source: &'static str,
     ) -> ai_agents_core::Result<Vec<ai_agents_core::KeyFact>> {
         let extractor = match self.fact_extractor.read().clone() {
             Some(e) => e,
@@ -481,8 +589,11 @@ impl RuntimeAgent {
             return Ok(vec![]);
         }
 
-        let actor_id = self.actor_id.read().clone();
-        let existing = self.actor_facts_cache.read().clone();
+        let actor_id = self.effective_actor_id();
+        let existing = actor_id
+            .as_ref()
+            .and_then(|aid| self.actor_facts_cache.read().get(aid).cloned())
+            .unwrap_or_default();
 
         let categories = self
             .facts_config
@@ -494,17 +605,37 @@ impl RuntimeAgent {
             .extract(&recent, &existing, actor_id.as_deref(), &categories)
             .await?;
 
-        // Save to storage and update cache.
+        // Save to storage and update the actor-scoped cache when an actor is known.
         if !facts.is_empty() {
             let fact_store_opt = self.fact_store.read().clone();
+            let mut stored_total = 0usize;
+            let mut cache_updated = false;
             if let (Some(store), Some(aid)) = (fact_store_opt, &actor_id) {
                 // add_facts now returns the authoritative post-write set.
                 let authoritative = store.add_facts(aid, facts.clone()).await?;
-                *self.actor_facts_cache.write() = authoritative;
-            } else {
+                stored_total = authoritative.len();
+                self.actor_facts_cache
+                    .write()
+                    .insert(aid.clone(), authoritative);
+                cache_updated = true;
+            } else if let Some(aid) = &actor_id {
                 let mut cache = self.actor_facts_cache.write();
-                cache.extend(facts.clone());
+                let entry = cache.entry(aid.clone()).or_default();
+                entry.extend(facts.clone());
+                stored_total = entry.len();
+                cache_updated = true;
             }
+
+            info!(
+                actor_id = %actor_id.as_deref().unwrap_or("<none>"),
+                source = source,
+                requested_messages = last_n,
+                message_count = recent.len(),
+                extracted_count = facts.len(),
+                cache_updated = cache_updated,
+                stored_total = stored_total,
+                "facts extracted"
+            );
 
             if let Some(ref aid) = actor_id {
                 self.hooks.on_facts_extracted(aid, &facts).await;
@@ -517,6 +648,14 @@ impl RuntimeAgent {
     /// Resolve actor_id from context if method is from_context.
     /// Supports dotted paths (e.g. "player.id", "user.profile.id").
     fn resolve_actor_id_from_context(&self) {
+        if self
+            .current_turn_actor_context()
+            .and_then(|ctx| ctx.effective_actor_id().map(str::to_string))
+            .is_some()
+        {
+            return;
+        }
+
         if let Some(ref am_config) = self.actor_memory_config {
             if am_config.identification.method == ai_agents_facts::IdentificationMethod::FromContext
             {
@@ -531,10 +670,6 @@ impl RuntimeAgent {
                             let current = self.actor_id.read().clone();
                             if current.as_deref() != Some(id_str) {
                                 *self.actor_id.write() = Some(id_str.to_string());
-                                // Invalidate cache on actor change so next turn reloads.
-                                self.actor_facts_cache.write().clear();
-                                *self.last_loaded_actor_id.write() = None;
-                                *self.last_loaded_relationship_actor_id.write() = None;
                                 let mut meta = self.session_metadata.write();
                                 meta.actor_id = Some(id_str.to_string());
                                 if !meta.actors.iter().any(|a| a == id_str) {
@@ -560,7 +695,16 @@ impl RuntimeAgent {
             return String::new();
         }
 
-        let facts = self.actor_facts_cache.read();
+        let Some(actor_id) = self.effective_actor_id() else {
+            return String::new();
+        };
+
+        let facts = self
+            .actor_facts_cache
+            .read()
+            .get(&actor_id)
+            .cloned()
+            .unwrap_or_default();
         if facts.is_empty() {
             return String::new();
         }
@@ -612,6 +756,62 @@ impl RuntimeAgent {
         }
     }
 
+    fn build_context_with_overlays(&self) -> HashMap<String, Value> {
+        let mut context = self.context_manager.get_all();
+        let mut root = Value::Object(context.clone().into_iter().collect());
+
+        if let Some(turn_ctx) = self.current_turn_actor_context() {
+            if let Some(ref origin_actor_id) = turn_ctx.origin_actor_id {
+                if let Ok(updated) = ai_agents_core::set_dot_path(
+                    root.clone(),
+                    "interaction.origin_actor_id",
+                    serde_json::json!(origin_actor_id),
+                ) {
+                    root = updated;
+                }
+            }
+            if let Some(ref sender_agent_id) = turn_ctx.sender_agent_id {
+                if let Ok(updated) = ai_agents_core::set_dot_path(
+                    root.clone(),
+                    "interaction.sender_agent_id",
+                    serde_json::json!(sender_agent_id),
+                ) {
+                    root = updated;
+                }
+            }
+        }
+
+        if let Some(ref actor_id) = self.effective_actor_id() {
+            if let Ok(updated) = ai_agents_core::set_dot_path(
+                root.clone(),
+                "interaction.actor_id",
+                serde_json::json!(actor_id),
+            ) {
+                root = updated;
+            }
+        }
+
+        if let Some(manager) = self.relationship_manager.as_ref() {
+            if let Some(actor_id) = self.effective_actor_id() {
+                if let Some(value) = manager.to_context_value(&actor_id) {
+                    if let Ok(updated) = ai_agents_core::set_dot_path(
+                        root.clone(),
+                        &manager.config().injection.context_path,
+                        value,
+                    ) {
+                        root = updated;
+                    }
+                }
+            }
+        }
+
+        if let Value::Object(obj) = root {
+            context = obj.into_iter().collect();
+        }
+
+        context
+    }
+
     fn resolve_actor_name_from_context(&self) -> Option<String> {
         for path in ["actor.name", "user.name", "player.name", "customer.name"] {
             if let Some(value) = self.context_manager.get_path(path) {
@@ -627,13 +827,12 @@ impl RuntimeAgent {
         let Some(manager) = self.relationship_manager.as_ref() else {
             return;
         };
-        let Some(actor_id) = self.actor_id.read().clone() else {
+        let Some(actor_id) = self.effective_actor_id() else {
             return;
         };
 
-        let last = self.last_loaded_relationship_actor_id.read().clone();
         let mut should_fire_loaded = false;
-        if last.as_deref() != Some(actor_id.as_str()) {
+        if manager.get(&actor_id).is_none() {
             let mut loaded = false;
             if manager.config().persistence.enabled {
                 let storage = self.storage.read().clone();
@@ -656,13 +855,11 @@ impl RuntimeAgent {
             if !loaded {
                 manager.get_or_create(&actor_id, self.resolve_actor_name_from_context().as_deref());
             }
-            *self.last_loaded_relationship_actor_id.write() = Some(actor_id.clone());
             should_fire_loaded = true;
         }
 
         let actor_name = self.resolve_actor_name_from_context();
         let relationship = manager.touch_interaction(&actor_id, actor_name.as_deref());
-        let _ = self.inject_relationship_context(&actor_id);
         if should_fire_loaded {
             self.hooks
                 .on_relationship_loaded(&actor_id, &relationship)
@@ -670,24 +867,25 @@ impl RuntimeAgent {
         }
     }
 
-    fn inject_relationship_context(&self, actor_id: &str) -> Result<()> {
-        let Some(manager) = self.relationship_manager.as_ref() else {
-            return Ok(());
-        };
-        let Some(value) = manager.to_context_value(actor_id) else {
-            return Ok(());
-        };
-        self.context_manager
-            .update(&manager.config().injection.context_path, value)
-    }
-
     fn format_relationship_for_context(&self) -> Option<(String, String)> {
         let manager = self.relationship_manager.as_ref()?;
         if !manager.config().injection.enabled {
             return None;
         }
-        let actor_id = self.actor_id.read().clone()?;
-        let text = manager.format_for_prompt(&actor_id);
+        let actor_id = self.effective_actor_id()?;
+        let relationship = manager.get(&actor_id)?;
+        let local_cap = manager.config().injection.max_tokens;
+        let global_cap = self
+            .memory_token_budget
+            .as_ref()
+            .map(|b| b.allocation.relationships as usize)
+            .filter(|n| *n > 0);
+        let max_tokens = global_cap.map(|g| g.min(local_cap)).unwrap_or(local_cap);
+        let text = ai_agents_relationships::format_relationship(
+            &relationship,
+            &manager.config().injection.format,
+            max_tokens,
+        );
         if text.is_empty() {
             None
         } else {
@@ -718,7 +916,7 @@ impl RuntimeAgent {
         let Some(manager) = self.relationship_manager.as_ref() else {
             return;
         };
-        let Some(actor_id) = self.actor_id.read().clone() else {
+        let Some(actor_id) = self.effective_actor_id() else {
             return;
         };
         if !manager.config().auto_update.enabled {
@@ -745,8 +943,29 @@ impl RuntimeAgent {
                 if let Some(ref event) = update.event {
                     self.hooks.on_notable_event(&actor_id, event).await;
                 }
-                if let Err(e) = self.persist_actor_relationship(&actor_id).await {
-                    warn!(actor = %actor_id, error = %e, "failed to persist relationship");
+                let persisted = match self.persist_actor_relationship(&actor_id).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        warn!(actor = %actor_id, error = %e, "failed to persist relationship");
+                        false
+                    }
+                };
+                if !update.changes.is_empty() || update.event.is_some() {
+                    let changed_dimensions: Vec<String> = update
+                        .changes
+                        .iter()
+                        .map(|change| format!("{}:{}", change.perspective, change.dimension))
+                        .collect();
+                    info!(
+                        actor_id = %actor_id,
+                        change_count = update.changes.len(),
+                        changed_dimensions = ?changed_dimensions,
+                        event_present = update.event.is_some(),
+                        persisted = persisted,
+                        "relationship updated"
+                    );
+                } else {
+                    debug!(actor_id = %actor_id, persisted = persisted, "relationship evaluation ran but found no changes");
                 }
             }
             Err(e) => warn!(actor = %actor_id, error = %e, "relationship update failed"),
@@ -762,22 +981,22 @@ impl RuntimeAgent {
             .unwrap_or(false);
 
         if !should_extract {
+            debug!("fact extraction skipped because auto extraction is disabled");
             return;
         }
 
         let msgs_since = *self.messages_since_extraction.read();
         if msgs_since < 2 {
+            debug!(
+                messages_since_extraction = msgs_since,
+                "fact extraction skipped until threshold is reached"
+            );
             return;
         }
 
-        match self.extract_facts(msgs_since).await {
+        match self.extract_facts_with_source(msgs_since, "auto").await {
             Ok(facts) => {
                 if !facts.is_empty() {
-                    info!(
-                        count = facts.len(),
-                        actor = ?self.actor_id.read().as_deref(),
-                        "facts extracted"
-                    );
                     *self.messages_since_extraction.write() = 0;
                 } else {
                     debug!("fact extraction ran but found no new facts");
@@ -1001,7 +1220,7 @@ impl RuntimeAgent {
     }
 
     pub fn get_context(&self) -> HashMap<String, Value> {
-        self.context_manager.get_all()
+        self.build_context_with_overlays()
     }
 
     pub fn remove_context(&self, key: &str) -> Option<Value> {
@@ -1066,12 +1285,7 @@ impl RuntimeAgent {
         if let Some(manager) = self.relationship_manager.as_ref() {
             manager.remove(actor_id);
         }
-        // Clear cache if we just deleted the current actor.
-        if self.actor_id.read().as_deref() == Some(actor_id) {
-            self.actor_facts_cache.write().clear();
-            *self.last_loaded_actor_id.write() = None;
-            *self.last_loaded_relationship_actor_id.write() = None;
-        }
+        self.actor_facts_cache.write().remove(actor_id);
         Ok(())
     }
 
@@ -1396,7 +1610,7 @@ impl RuntimeAgent {
     }
 
     fn render_system_prompt(&self) -> Result<String> {
-        let mut context = self.context_manager.get_all();
+        let mut context = self.build_context_with_overlays();
 
         // Inject actor_facts for {{ actor_facts }} template variable.
         let facts_text = self.format_actor_facts_for_context();
@@ -1491,7 +1705,7 @@ impl RuntimeAgent {
     }
 
     async fn build_evaluation_context(&self) -> Result<EvaluationContext> {
-        let context = self.context_manager.get_all();
+        let context = self.build_context_with_overlays();
         let messages = self.memory.get_messages(Some(10)).await?;
         let tool_history = self.tool_call_history.read().clone();
 
@@ -1521,7 +1735,7 @@ impl RuntimeAgent {
 
         // Render persona prompt (if configured) and fire hooks for newly revealed secrets.
         let persona_prefix = if let Some(ref persona) = self.persona_manager {
-            let context = self.context_manager.get_all();
+            let context = self.build_context_with_overlays();
             let render_result = persona.render_prompt(&context)?;
 
             // Fire on_secret_revealed for each newly revealed secret.
@@ -1537,7 +1751,7 @@ impl RuntimeAgent {
         if let Some(ref sm) = self.state_machine {
             if let Some(state_def) = sm.current_definition() {
                 let state_prompt = if let Some(ref prompt) = state_def.prompt {
-                    let context = self.context_manager.get_all();
+                    let context = self.build_context_with_overlays();
                     self.template_renderer.render_with_state(
                         prompt,
                         &context,
@@ -1709,7 +1923,7 @@ impl RuntimeAgent {
 
         let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
 
-        let user_context = self.context_manager.get_all();
+        let user_context = self.build_context_with_overlays();
 
         // Extract canonical intent labels from current state's transitions
         let available_intents: Vec<String> = if let Some(ref sm) = self.state_machine {
@@ -1950,7 +2164,12 @@ impl RuntimeAgent {
             .get(&tool_call.name)
             .ok_or_else(|| AgentError::Tool(format!("Tool not found: {}", tool_call.name)))?;
 
-        let result = tool.execute(tool_call.arguments.clone()).await;
+        let actor_context = self.outbound_actor_context();
+        let result = if actor_context.is_empty() {
+            tool.execute(tool_call.arguments.clone()).await
+        } else {
+            scope_actor_context(actor_context, tool.execute(tool_call.arguments.clone())).await
+        };
 
         if result.success {
             Ok(result.output)
@@ -2675,7 +2894,7 @@ OVERALL: PASS/FAIL"#,
                 _ => return Ok(false),
             };
 
-        let context_map = self.context_manager.get_all();
+        let context_map = self.build_context_with_overlays();
         let context = TransitionContext::new(user_message, response, &current_state)
             .with_context(context_map);
 
@@ -2846,7 +3065,7 @@ OVERALL: PASS/FAIL"#,
                     match llm_result {
                         Ok(llm_provider) => {
                             // Render template variables and include conversation context
-                            let context = self.context_manager.get_all();
+                            let context = self.build_context_with_overlays();
                             let rendered_prompt = self
                                 .template_renderer
                                 .render(prompt, &context)
@@ -3018,6 +3237,24 @@ OVERALL: PASS/FAIL"#,
                 (recent_budget as f64 * budget.warn_at_percent as f64 / 100.0) as u32;
             if recent_tokens >= warn_threshold {
                 let event = MemoryBudgetEvent::new("recent_messages", recent_tokens, recent_budget);
+                self.hooks.on_memory_budget_warning(&event).await;
+            }
+        }
+
+        let relationship_budget = budget.allocation.relationships;
+        if relationship_budget > 0 {
+            let relationship_tokens = self
+                .relationship_memory_text()
+                .map(|text| ai_agents_memory::estimate_tokens(&text))
+                .unwrap_or(0);
+            let warn_threshold =
+                (relationship_budget as f64 * budget.warn_at_percent as f64 / 100.0) as u32;
+            if relationship_tokens >= warn_threshold {
+                let event = MemoryBudgetEvent::new(
+                    "relationships",
+                    relationship_tokens,
+                    relationship_budget,
+                );
                 self.hooks.on_memory_budget_warning(&event).await;
             }
         }
@@ -3867,7 +4104,7 @@ Respond in JSON format:
     ///
     /// Render template variables in state action args using the context manager.
     fn render_action_args(&self, args: &Value) -> Value {
-        let context = self.context_manager.get_all();
+        let context = self.build_context_with_overlays();
         match args {
             Value::Object(map) => {
                 let mut rendered = serde_json::Map::new();
@@ -4665,7 +4902,9 @@ Respond in JSON format:
         )
         .await?;
 
-        let response = delegate.chat(&effective_input).await?;
+        let response = delegate
+            .chat_with_actor_context(&effective_input, self.outbound_actor_context())
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         self.hooks
@@ -4759,7 +4998,7 @@ Respond in JSON format:
         .await?;
 
         let effective_input = if let Some(ref tmpl) = config.input {
-            render_concurrent_template(tmpl, &context_input, &self.context_manager.get_all())
+            render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
@@ -4774,15 +5013,18 @@ Respond in JSON format:
             .unwrap_or("router");
         let llm_provider = self.llm_registry.get(llm_name).ok();
 
-        let result = crate::orchestration::concurrent(
-            registry,
-            &effective_input,
-            &config.agents,
-            &config.aggregation,
-            llm_provider.as_deref(),
-            config.min_required,
-            config.timeout_ms,
-            config.on_partial_failure.clone(),
+        let result = scope_actor_context(
+            self.outbound_actor_context(),
+            crate::orchestration::concurrent(
+                registry,
+                &effective_input,
+                &config.agents,
+                &config.aggregation,
+                llm_provider.as_deref(),
+                config.min_required,
+                config.timeout_ms,
+                config.on_partial_failure.clone(),
+            ),
         )
         .await?;
 
@@ -4890,18 +5132,21 @@ Respond in JSON format:
 
         // Render input template if provided, otherwise use the raw user message as topic.
         let effective_topic = if let Some(ref tmpl) = config.input {
-            render_concurrent_template(tmpl, &context_input, &self.context_manager.get_all())
+            render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
 
-        let result = crate::orchestration::group_chat(
-            registry,
-            &effective_topic,
-            config,
-            llm_provider.as_deref(),
-            Some(&*self.hooks),
+        let result = scope_actor_context(
+            self.outbound_actor_context(),
+            crate::orchestration::group_chat(
+                registry,
+                &effective_topic,
+                config,
+                llm_provider.as_deref(),
+                Some(&*self.hooks),
+            ),
         )
         .await?;
 
@@ -5012,14 +5257,17 @@ Respond in JSON format:
         )
         .await?;
 
-        let context_values = self.context_manager.get_all();
-        let result = crate::orchestration::pipeline(
-            registry,
-            &context_input,
-            &stages,
-            config.timeout_ms,
-            Some(&*self.hooks),
-            Some(&context_values),
+        let context_values = self.build_context_with_overlays();
+        let result = scope_actor_context(
+            self.outbound_actor_context(),
+            crate::orchestration::pipeline(
+                registry,
+                &context_input,
+                &stages,
+                config.timeout_ms,
+                Some(&*self.hooks),
+                Some(&context_values),
+            ),
         )
         .await?;
 
@@ -5122,20 +5370,23 @@ Respond in JSON format:
 
         // Render input template if provided, otherwise forward the raw user message.
         let effective_input = if let Some(ref tmpl) = config.input {
-            render_concurrent_template(tmpl, &context_input, &self.context_manager.get_all())
+            render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
 
-        let result = crate::orchestration::handoff(
-            registry,
-            &effective_input,
-            &config.initial_agent,
-            &config.available_agents,
-            config.max_handoffs,
-            llm.as_ref(),
-            Some(&*self.hooks),
+        let result = scope_actor_context(
+            self.outbound_actor_context(),
+            crate::orchestration::handoff(
+                registry,
+                &effective_input,
+                &config.initial_agent,
+                &config.available_agents,
+                config.max_handoffs,
+                llm.as_ref(),
+                Some(&*self.hooks),
+            ),
         )
         .await?;
 

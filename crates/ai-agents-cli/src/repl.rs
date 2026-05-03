@@ -982,10 +982,27 @@ impl CliRepl {
             None | Some("") => {
                 let relationship = manager.get_or_create(&actor_id, None);
                 println!("Relationship for actor {}:", actor_id);
+                println!("  agent_to_actor:");
                 let mut dimensions: Vec<_> = relationship.dimensions.iter().collect();
                 dimensions.sort_by(|a, b| a.0.cmp(b.0));
                 for (name, value) in dimensions {
-                    println!("  {}: {:.2}", name, value);
+                    println!("    {}: {:.2}", name, value);
+                }
+                if !relationship.perceived_actor_to_agent.is_empty() {
+                    println!("  perceived_actor_to_agent:");
+                    let mut perceived: Vec<_> =
+                        relationship.perceived_actor_to_agent.iter().collect();
+                    perceived.sort_by(|a, b| a.0.cmp(b.0));
+                    for (name, value) in perceived {
+                        println!("    {}: {:.2}", name, value);
+                    }
+                    println!("  mutual:");
+                    let mutual = relationship.mutual_dimensions();
+                    let mut mutual_dims: Vec<_> = mutual.iter().collect();
+                    mutual_dims.sort_by(|a, b| a.0.cmp(b.0));
+                    for (name, value) in mutual_dims {
+                        println!("    {}: {:.2}", name, value);
+                    }
                 }
                 println!("  interactions: {}", relationship.interaction_count);
                 println!("  notable events: {}", relationship.notable_events.len());
@@ -1143,7 +1160,13 @@ impl CliRepl {
                 .as_ref()
                 .map(|s| estimate_tokens(s))
                 .unwrap_or(0);
-            let used = recent_tokens + summary_tokens;
+            let relationship_text = self.agent.relationship_memory_text().unwrap_or_default();
+            let relationship_tokens = if relationship_text.is_empty() {
+                0
+            } else {
+                estimate_tokens(&relationship_text)
+            };
+            let used = recent_tokens + summary_tokens + relationship_tokens;
             let pct = if budget.total > 0 {
                 used as f64 / budget.total as f64 * 100.0
             } else {
@@ -1194,6 +1217,16 @@ impl CliRepl {
                 facts_tokens, budget.allocation.facts, f_pct
             );
 
+            let rel_pct = if budget.allocation.relationships > 0 {
+                relationship_tokens as f64 / budget.allocation.relationships as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    Relationships:   {:>5} / {:>5} ({:.1}%)",
+                relationship_tokens, budget.allocation.relationships, rel_pct
+            );
+
             println!("    Overflow:        {:?}", budget.overflow_strategy);
             println!("    Warning at:      {}%", budget.warn_at_percent);
 
@@ -1203,6 +1236,9 @@ impl CliRepl {
                     "  Actor Facts: {} stored, {} tokens used",
                     facts_count, facts_tokens
                 );
+            }
+            if relationship_tokens > 0 {
+                println!("  Relationship Memory: {} tokens used", relationship_tokens);
             }
         }
 

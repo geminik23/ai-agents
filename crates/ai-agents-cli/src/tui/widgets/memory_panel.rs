@@ -12,10 +12,13 @@ pub struct MemoryPanelState {
     pub has_summary: bool,
     pub summary_tokens: u32,
     pub recent_tokens: u32,
+    pub facts_tokens: u32,
+    pub relationship_tokens: u32,
     pub budget_total: Option<u32>,
     pub budget_summary: Option<u32>,
     pub budget_recent: Option<u32>,
     pub budget_facts: Option<u32>,
+    pub budget_relationships: Option<u32>,
     pub overflow_strategy: Option<String>,
     pub warn_at: Option<u32>,
 }
@@ -26,7 +29,10 @@ impl MemoryPanelState {
             if total == 0 {
                 return 0.0;
             }
-            let used = self.summary_tokens + self.recent_tokens;
+            let used = self.summary_tokens
+                + self.recent_tokens
+                + self.facts_tokens
+                + self.relationship_tokens;
             used as f64 / total as f64 * 100.0
         })
     }
@@ -66,7 +72,10 @@ pub fn render_memory_panel(area: Rect, buf: &mut Buffer, state: &MemoryPanelStat
 
     // Budget section
     if let Some(total) = state.budget_total {
-        let used = state.summary_tokens + state.recent_tokens;
+        let used = state.summary_tokens
+            + state.recent_tokens
+            + state.facts_tokens
+            + state.relationship_tokens;
         let pct = if total > 0 {
             used as f64 / total as f64 * 100.0
         } else {
@@ -104,7 +113,16 @@ pub fn render_memory_panel(area: Rect, buf: &mut Buffer, state: &MemoryPanelStat
         if let Some(bf) = state.budget_facts {
             lines.push(Line::from(vec![
                 Span::styled(" fact ", theme.label_style),
-                Span::styled(format!("0/{}", bf), theme.value_style),
+                Span::styled(format!("{}/{}", state.facts_tokens, bf), theme.value_style),
+            ]));
+        }
+        if let Some(br) = state.budget_relationships {
+            lines.push(Line::from(vec![
+                Span::styled(" rel  ", theme.label_style),
+                Span::styled(
+                    format!("{}/{}", state.relationship_tokens, br),
+                    theme.value_style,
+                ),
             ]));
         }
 

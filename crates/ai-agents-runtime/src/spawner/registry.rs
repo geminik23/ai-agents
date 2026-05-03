@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::spec::AgentSpec;
-use crate::{Agent, RuntimeAgent};
+use crate::{Agent, RuntimeAgent, TurnActorContext};
 use ai_agents_core::{AgentError, AgentResponse, Result};
 
 use super::spawner::SpawnedAgent;
@@ -139,6 +139,28 @@ impl AgentRegistry {
 
     /// Send a message from one agent to another and return the response.
     pub async fn send(&self, from: &str, to: &str, message: &str) -> Result<AgentResponse> {
+        self.send_inner(from, to, message, None).await
+    }
+
+    /// Send a message with structured actor context for actor-scoped memory.
+    pub async fn send_with_actor_context(
+        &self,
+        from: &str,
+        to: &str,
+        message: &str,
+        actor_context: TurnActorContext,
+    ) -> Result<AgentResponse> {
+        self.send_inner(from, to, message, Some(actor_context))
+            .await
+    }
+
+    async fn send_inner(
+        &self,
+        from: &str,
+        to: &str,
+        message: &str,
+        actor_context: Option<TurnActorContext>,
+    ) -> Result<AgentResponse> {
         let target = {
             // The read lock is held only long enough to clone the target Arc, then released before the async `chat()` call.
             let agents = self.agents.read();
@@ -157,8 +179,12 @@ impl AgentRegistry {
             message.to_string()
         };
 
-        debug!(from = %from, to = %to, "Sending inter-agent message");
-        target.chat(&formatted).await
+        debug!(from = %from, to = %to, has_actor_context = actor_context.is_some(), "Sending inter-agent message");
+        if let Some(context) = actor_context {
+            target.chat_with_actor_context(&formatted, context).await
+        } else {
+            target.chat(&formatted).await
+        }
     }
 
     /// Broadcast a message to all agents except the sender.
@@ -168,6 +194,26 @@ impl AgentRegistry {
         &self,
         from: &str,
         message: &str,
+    ) -> Vec<(String, Result<AgentResponse>)> {
+        self.broadcast_inner(from, message, None).await
+    }
+
+    /// Broadcast a message with structured actor context for actor-scoped memory.
+    pub async fn broadcast_with_actor_context(
+        &self,
+        from: &str,
+        message: &str,
+        actor_context: TurnActorContext,
+    ) -> Vec<(String, Result<AgentResponse>)> {
+        self.broadcast_inner(from, message, Some(actor_context))
+            .await
+    }
+
+    async fn broadcast_inner(
+        &self,
+        from: &str,
+        message: &str,
+        actor_context: Option<TurnActorContext>,
     ) -> Vec<(String, Result<AgentResponse>)> {
         let targets: Vec<(String, Arc<RuntimeAgent>)> = {
             let agents = self.agents.read();
@@ -191,14 +237,20 @@ impl AgentRegistry {
         debug!(
             from = %from,
             target_count = targets.len(),
+            has_actor_context = actor_context.is_some(),
             "Broadcasting message"
         );
 
         let mut handles = Vec::with_capacity(targets.len());
         for (id, agent) in targets {
             let msg = formatted.clone();
+            let context = actor_context.clone();
             handles.push(tokio::spawn(async move {
-                let result = agent.chat(&msg).await;
+                let result = if let Some(context) = context {
+                    agent.chat_with_actor_context(&msg, context).await
+                } else {
+                    agent.chat(&msg).await
+                };
                 (id, result)
             }));
         }

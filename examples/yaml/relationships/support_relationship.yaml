@@ -53,6 +53,16 @@ memory:
   compress_threshold: 10
   summarizer_llm: router
 
+  # Token budget can reserve a global cap for relationship prompt text.
+  # The local relationships.injection.max_tokens below cannot exceed this cap.
+  token_budget:
+    total: 4096
+    allocation:
+      summary: 1024
+      recent_messages: 2048
+      facts: 512
+      relationships: 300
+
   # Relationship memory uses the current actor ID from --actor or set_actor_id().
   # The built-in dimensions are broad enough for support, tutoring, sales, and NPCs.
   #
@@ -61,6 +71,7 @@ memory:
   # The formatted summary is also available in {{ relationship_memory }}.
   relationships:
     enabled: true
+    model: one_sided             # tracks this agent's stance toward the actor. default: one_sided
     dimensions:
       - trust
       - sentiment

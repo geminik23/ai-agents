@@ -99,4 +99,3 @@ pub fn render_modal(area: Rect, buf: &mut Buffer, state: &ModalState, theme: &Th
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     paragraph.render(inner, buf);
 }
-

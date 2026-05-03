@@ -4,6 +4,35 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Relationship semantics used when storing and interpreting relationship scores.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipModel {
+    #[default]
+    OneSided,
+    TwoSided,
+}
+
+/// Which side of the relationship a change applies to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelationshipPerspective {
+    #[default]
+    AgentToActor,
+    PerceivedActorToAgent,
+    Mutual,
+}
+
+impl std::fmt::Display for RelationshipPerspective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AgentToActor => write!(f, "agent_to_actor"),
+            Self::PerceivedActorToAgent => write!(f, "perceived_actor_to_agent"),
+            Self::Mutual => write!(f, "mutual"),
+        }
+    }
+}
+
 /// Definition for one relationship dimension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationshipDimensionDefinition {
@@ -18,6 +47,7 @@ pub struct RelationshipDimensionDefinition {
 }
 
 impl RelationshipDimensionDefinition {
+    /// Create a relationship dimension definition with an explanation and numeric bounds.
     pub fn new(description: impl Into<String>, min: f64, max: f64, default: f64) -> Self {
         Self {
             description: description.into(),
@@ -27,6 +57,7 @@ impl RelationshipDimensionDefinition {
         }
     }
 
+    /// Clamp a score to the configured min/max range.
     pub fn clamp(&self, value: f64) -> f64 {
         value.max(self.min).min(self.max)
     }
@@ -37,12 +68,19 @@ impl RelationshipDimensionDefinition {
 pub struct Relationship {
     /// Stable actor identifier used for cross-session relationship lookup.
     pub actor_id: String,
+    /// One-sided or two-sided relationship semantics.
+    #[serde(default)]
+    pub model: RelationshipModel,
     /// Optional display name for the actor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_name: Option<String>,
     /// Current dimension scores keyed by dimension name.
+    /// In two-sided mode this remains the canonical `agent_to_actor` perspective.
     #[serde(default)]
     pub dimensions: HashMap<String, f64>,
+    /// In two-sided mode, the agent's inferred view of the actor's stance toward the agent.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub perceived_actor_to_agent: HashMap<String, f64>,
     /// Compact history of significant relationship-relevant events.
     #[serde(default)]
     pub notable_events: Vec<RelationshipEvent>,
@@ -59,21 +97,34 @@ pub struct Relationship {
 }
 
 impl Relationship {
+    /// Create a new relationship initialized from the provided dimension definitions
+    /// and relationship model.
     pub fn new(
         actor_id: impl Into<String>,
         actor_name: Option<String>,
         definitions: &HashMap<String, RelationshipDimensionDefinition>,
+        model: RelationshipModel,
     ) -> Self {
         let now = Utc::now();
         let dimensions = definitions
             .iter()
             .map(|(name, def)| (name.clone(), def.clamp(def.default)))
             .collect();
+        let perceived_actor_to_agent = if matches!(model, RelationshipModel::TwoSided) {
+            definitions
+                .iter()
+                .map(|(name, def)| (name.clone(), def.clamp(def.default)))
+                .collect()
+        } else {
+            HashMap::new()
+        };
 
         Self {
             actor_id: actor_id.into(),
+            model,
             actor_name,
             dimensions,
+            perceived_actor_to_agent,
             notable_events: Vec::new(),
             interaction_count: 0,
             first_interaction: now,
@@ -82,6 +133,72 @@ impl Relationship {
         }
     }
 
+    /// Return the stored values for one perspective.
+    ///
+    /// `mutual` is derived, so it returns `None` here and should be accessed through
+    /// [`Self::mutual_dimensions`].
+    pub fn perspective_values(
+        &self,
+        perspective: RelationshipPerspective,
+    ) -> Option<&HashMap<String, f64>> {
+        match perspective {
+            RelationshipPerspective::AgentToActor => Some(&self.dimensions),
+            RelationshipPerspective::PerceivedActorToAgent => {
+                if matches!(self.model, RelationshipModel::TwoSided) {
+                    Some(&self.perceived_actor_to_agent)
+                } else {
+                    None
+                }
+            }
+            RelationshipPerspective::Mutual => None,
+        }
+    }
+
+    /// Return mutable access to one stored perspective.
+    ///
+    /// `mutual` is derived, so it does not expose a mutable backing map.
+    pub fn perspective_values_mut(
+        &mut self,
+        perspective: RelationshipPerspective,
+    ) -> Option<&mut HashMap<String, f64>> {
+        match perspective {
+            RelationshipPerspective::AgentToActor => Some(&mut self.dimensions),
+            RelationshipPerspective::PerceivedActorToAgent => {
+                if matches!(self.model, RelationshipModel::TwoSided) {
+                    Some(&mut self.perceived_actor_to_agent)
+                } else {
+                    None
+                }
+            }
+            RelationshipPerspective::Mutual => None,
+        }
+    }
+
+    /// Compute the derived mutual view for this relationship.
+    ///
+    /// In one-sided mode this is equivalent to `agent_to_actor`.
+    pub fn mutual_dimensions(&self) -> HashMap<String, f64> {
+        if !matches!(self.model, RelationshipModel::TwoSided) {
+            return self.dimensions.clone();
+        }
+
+        let mut merged = HashMap::new();
+        for (name, value) in &self.dimensions {
+            let other = self
+                .perceived_actor_to_agent
+                .get(name)
+                .copied()
+                .unwrap_or(*value);
+            merged.insert(name.clone(), (value + other) / 2.0);
+        }
+        for (name, value) in &self.perceived_actor_to_agent {
+            merged.entry(name.clone()).or_insert(*value);
+        }
+        merged
+    }
+
+    /// Update timestamps, interaction count, and optional display name after an
+    /// observed interaction.
     pub fn touch(&mut self, actor_name: Option<&str>) {
         if let Some(name) = actor_name {
             self.actor_name = Some(name.to_string());
@@ -114,6 +231,7 @@ pub struct RelationshipEvent {
 }
 
 impl RelationshipEvent {
+    /// Create a new notable relationship event.
     pub fn new(
         description: impl Into<String>,
         changes: Vec<DimensionChange>,
@@ -134,6 +252,9 @@ impl RelationshipEvent {
 /// Applied change to one relationship dimension.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DimensionChange {
+    /// Perspective that changed.
+    #[serde(default)]
+    pub perspective: RelationshipPerspective,
     /// Dimension that changed.
     pub dimension: String,
     /// Score before the change.
@@ -162,6 +283,9 @@ pub struct RelationshipEvaluation {
 /// Proposed dimension change returned by the evaluator.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposedDimensionChange {
+    /// Perspective proposed by the evaluator.
+    #[serde(default)]
+    pub perspective: RelationshipPerspective,
     /// Dimension name proposed by the evaluator.
     pub dimension: String,
     /// Proposed score delta before runtime clamping.

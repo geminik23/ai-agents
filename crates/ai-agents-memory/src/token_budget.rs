@@ -29,6 +29,9 @@ pub struct TokenAllocation {
 
     #[serde(default = "default_facts_tokens")]
     pub facts: u32,
+
+    #[serde(default = "default_relationships_tokens")]
+    pub relationships: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -56,6 +59,10 @@ fn default_facts_tokens() -> u32 {
     512
 }
 
+fn default_relationships_tokens() -> u32 {
+    0
+}
+
 fn default_warn_percent() -> u8 {
     80
 }
@@ -66,6 +73,7 @@ impl Default for TokenAllocation {
             summary: default_summary_tokens(),
             recent_messages: default_recent_tokens(),
             facts: default_facts_tokens(),
+            relationships: default_relationships_tokens(),
         }
     }
 }
@@ -119,6 +127,7 @@ pub struct MemoryBudgetState {
     pub summary_tokens: u32,
     pub recent_tokens: u32,
     pub facts_tokens: u32,
+    pub relationships_tokens: u32,
     pub last_warning_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -146,6 +155,7 @@ mod tests {
         assert_eq!(budget.allocation.summary, 1024);
         assert_eq!(budget.allocation.recent_messages, 2048);
         assert_eq!(budget.allocation.facts, 512);
+        assert_eq!(budget.allocation.relationships, 0);
         assert_eq!(budget.warn_at_percent, 80);
     }
 

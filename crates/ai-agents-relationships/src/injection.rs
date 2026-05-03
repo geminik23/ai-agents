@@ -1,8 +1,9 @@
 use serde_json::{Value, json};
 
 use crate::config::InjectionFormat;
-use crate::types::Relationship;
+use crate::types::{Relationship, RelationshipModel};
 
+/// Convert a relationship into the structured context object injected at `relationships.current_actor`.
 pub fn relationship_to_context_value(relationship: &Relationship) -> Value {
     let mut root = serde_json::Map::new();
     root.insert("actor_id".to_string(), json!(relationship.actor_id));
@@ -23,7 +24,20 @@ pub fn relationship_to_context_value(relationship: &Relationship) -> Value {
         "last_interaction".to_string(),
         json!(relationship.last_interaction.to_rfc3339()),
     );
+    root.insert("model".to_string(), json!(relationship.model));
     root.insert("dimensions".to_string(), json!(relationship.dimensions));
+    root.insert("agent_to_actor".to_string(), json!(relationship.dimensions));
+
+    if matches!(relationship.model, RelationshipModel::TwoSided) {
+        root.insert(
+            "perceived_actor_to_agent".to_string(),
+            json!(relationship.perceived_actor_to_agent),
+        );
+        root.insert(
+            "mutual".to_string(),
+            json!(relationship.mutual_dimensions()),
+        );
+    }
 
     for (name, value) in &relationship.dimensions {
         root.insert(name.clone(), json!(value));
@@ -32,6 +46,7 @@ pub fn relationship_to_context_value(relationship: &Relationship) -> Value {
     Value::Object(root)
 }
 
+/// Format relationship memory for prompt injection using the requested format and token budget.
 pub fn format_relationship(
     relationship: &Relationship,
     format: &InjectionFormat,
@@ -50,14 +65,7 @@ fn format_summary(relationship: &Relationship) -> String {
         .actor_name
         .as_deref()
         .unwrap_or(&relationship.actor_id);
-    let mut scores: Vec<_> = relationship.dimensions.iter().collect();
-    scores.sort_by(|a, b| a.0.cmp(b.0));
-
-    let score_text = scores
-        .into_iter()
-        .map(|(name, value)| format!("{}={:.2}", name, value))
-        .collect::<Vec<_>>()
-        .join(", ");
+    let score_text = format_scores_for_relationship(relationship);
 
     let event_text = relationship
         .notable_events
@@ -72,7 +80,24 @@ fn format_summary(relationship: &Relationship) -> String {
 }
 
 fn format_scores_only(relationship: &Relationship) -> String {
-    let mut scores: Vec<_> = relationship.dimensions.iter().collect();
+    format_scores_for_relationship(relationship)
+}
+
+fn format_scores_for_relationship(relationship: &Relationship) -> String {
+    if matches!(relationship.model, RelationshipModel::TwoSided) {
+        format!(
+            "agent_to_actor [{}]; perceived_actor_to_agent [{}]; mutual [{}]",
+            format_scores(&relationship.dimensions),
+            format_scores(&relationship.perceived_actor_to_agent),
+            format_scores(&relationship.mutual_dimensions())
+        )
+    } else {
+        format_scores(&relationship.dimensions)
+    }
+}
+
+fn format_scores(scores: &std::collections::HashMap<String, f64>) -> String {
+    let mut scores: Vec<_> = scores.iter().collect();
     scores.sort_by(|a, b| a.0.cmp(b.0));
     scores
         .into_iter()
@@ -88,16 +113,20 @@ fn format_full(relationship: &Relationship) -> String {
         .unwrap_or(&relationship.actor_id);
     let mut lines = vec![format!("Relationship with {}:", actor)];
 
-    let mut scores: Vec<_> = relationship.dimensions.iter().collect();
-    scores.sort_by(|a, b| a.0.cmp(b.0));
     lines.push(format!(
-        "- Dimensions: {}",
-        scores
-            .into_iter()
-            .map(|(name, value)| format!("{}={:.2}", name, value))
-            .collect::<Vec<_>>()
-            .join(", ")
+        "- Agent to actor: {}",
+        format_scores(&relationship.dimensions)
     ));
+    if matches!(relationship.model, RelationshipModel::TwoSided) {
+        lines.push(format!(
+            "- Perceived actor to agent: {}",
+            format_scores(&relationship.perceived_actor_to_agent)
+        ));
+        lines.push(format!(
+            "- Mutual: {}",
+            format_scores(&relationship.mutual_dimensions())
+        ));
+    }
     lines.push(format!(
         "- Interaction count: {}",
         relationship.interaction_count
@@ -143,13 +172,18 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::defaults::builtin_dimensions;
-    use crate::types::Relationship;
+    use crate::types::{Relationship, RelationshipModel};
 
     use super::*;
 
     #[test]
     fn test_context_value_contains_shortcut_dimensions() {
-        let rel = Relationship::new("actor_1", None, &builtin_dimensions());
+        let rel = Relationship::new(
+            "actor_1",
+            None,
+            &builtin_dimensions(),
+            RelationshipModel::OneSided,
+        );
         let value = relationship_to_context_value(&rel);
         assert!(value.get("trust").is_some());
         assert!(value.get("dimensions").is_some());
@@ -157,7 +191,12 @@ mod tests {
 
     #[test]
     fn test_scores_only_format() {
-        let mut rel = Relationship::new("actor_1", None, &builtin_dimensions());
+        let mut rel = Relationship::new(
+            "actor_1",
+            None,
+            &builtin_dimensions(),
+            RelationshipModel::OneSided,
+        );
         rel.dimensions = HashMap::from([("trust".to_string(), 0.75)]);
         let text = format_relationship(&rel, &InjectionFormat::ScoresOnly, 100);
         assert!(text.contains("trust=0.75"));

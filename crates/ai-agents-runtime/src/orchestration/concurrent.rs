@@ -11,6 +11,7 @@ use super::aggregation;
 use super::types::{AgentResult, ConcurrentResult};
 use crate::Agent;
 use crate::spawner::AgentRegistry;
+use crate::turn_context::current_turn_actor_context;
 
 /// Run multiple agents in parallel and aggregate results.
 pub async fn concurrent(
@@ -39,14 +40,18 @@ pub async fn concurrent(
         })?;
         let input_owned = input.to_string();
         let timeout = timeout_ms;
+        let actor_context = current_turn_actor_context();
 
         join_set.spawn(async move {
             let agent_start = Instant::now();
             let result = if let Some(t) = timeout {
-                match tokio::time::timeout(
-                    tokio::time::Duration::from_millis(t),
-                    agent.chat(&input_owned),
-                )
+                match tokio::time::timeout(tokio::time::Duration::from_millis(t), async {
+                    if let Some(context) = actor_context.clone() {
+                        agent.chat_with_actor_context(&input_owned, context).await
+                    } else {
+                        agent.chat(&input_owned).await
+                    }
+                })
                 .await
                 {
                     Ok(r) => r,
@@ -55,6 +60,8 @@ pub async fn concurrent(
                         agent_id, t
                     ))),
                 }
+            } else if let Some(context) = actor_context {
+                agent.chat_with_actor_context(&input_owned, context).await
             } else {
                 agent.chat(&input_owned).await
             };

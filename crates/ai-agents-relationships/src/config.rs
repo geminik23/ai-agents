@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use ai_agents_core::{AgentError, Result};
 
 use crate::defaults::{builtin_dimensions, default_dimension_names, fallback_dimension};
-use crate::types::RelationshipDimensionDefinition;
+use crate::types::{RelationshipDimensionDefinition, RelationshipModel};
 
 /// Top-level configuration for actor-scoped relationship memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -13,6 +13,9 @@ pub struct RelationshipConfig {
     /// Enables relationship loading, prompt injection, evaluation, and persistence.
     #[serde(default)]
     pub enabled: bool,
+    /// Selects one-sided or two-sided relationship semantics.
+    #[serde(default)]
+    pub model: RelationshipModel,
     /// Defines which relationship dimensions are tracked for each actor.
     #[serde(default)]
     pub dimensions: RelationshipDimensionsConfig,
@@ -34,6 +37,7 @@ impl Default for RelationshipConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            model: RelationshipModel::OneSided,
             dimensions: RelationshipDimensionsConfig::default(),
             auto_update: AutoUpdateConfig::default(),
             injection: InjectionConfig::default(),
@@ -44,6 +48,7 @@ impl Default for RelationshipConfig {
 }
 
 impl RelationshipConfig {
+    /// Expand shorthand or explicit dimension config into the validated definition map used by the runtime and evaluator.
     pub fn dimension_definitions(
         &self,
     ) -> Result<HashMap<String, RelationshipDimensionDefinition>> {
@@ -310,6 +315,7 @@ mod tests {
     #[test]
     fn test_default_relationship_config_has_dimensions() {
         let config = RelationshipConfig::default();
+        assert_eq!(config.model, RelationshipModel::OneSided);
         let defs = config.dimension_definitions().unwrap();
         assert!(defs.contains_key("trust"));
         assert!(defs.contains_key("sentiment"));
@@ -345,6 +351,18 @@ dimensions:
         let config: RelationshipConfig = serde_yaml::from_str(yaml).unwrap();
         let defs = config.dimension_definitions().unwrap();
         assert_eq!(defs["motivation"].default, 0.5);
+    }
+
+    #[test]
+    fn test_parse_two_sided_model() {
+        let yaml = r#"
+enabled: true
+model: two_sided
+dimensions:
+  - trust
+"#;
+        let config: RelationshipConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.model, RelationshipModel::TwoSided);
     }
 
     #[test]

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::types::RelationshipDimensionDefinition;
 
+/// Return the built-in relationship dimensions used by shorthand configs.
 pub fn builtin_dimensions() -> HashMap<String, RelationshipDimensionDefinition> {
     let mut map = HashMap::new();
     map.insert(
@@ -33,6 +34,7 @@ pub fn builtin_dimensions() -> HashMap<String, RelationshipDimensionDefinition> 
     map
 }
 
+/// Return the default built-in dimension names used when none are specified.
 pub fn default_dimension_names() -> Vec<String> {
     vec![
         "trust".to_string(),
@@ -42,6 +44,7 @@ pub fn default_dimension_names() -> Vec<String> {
     ]
 }
 
+/// Build a fallback definition for a custom dimension that is referenced in shorthand form but has no explicit metadata.
 pub fn fallback_dimension(name: &str) -> RelationshipDimensionDefinition {
     RelationshipDimensionDefinition::new(
         format!("Custom relationship dimension named {}", name),

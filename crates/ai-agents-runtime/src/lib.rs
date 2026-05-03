@@ -3,6 +3,7 @@
 mod builder;
 mod runtime;
 mod streaming;
+mod turn_context;
 
 pub mod orchestration;
 pub mod spawner;
@@ -11,6 +12,7 @@ pub mod spec;
 pub use builder::AgentBuilder;
 pub use runtime::RuntimeAgent;
 pub use streaming::{StreamChunk, StreamingConfig};
+pub use turn_context::TurnActorContext;
 
 pub use ai_agents_core::{AgentInfo, AgentResponse, Result, ToolCall};
 

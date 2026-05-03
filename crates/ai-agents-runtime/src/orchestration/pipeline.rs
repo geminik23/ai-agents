@@ -8,6 +8,7 @@ use tracing::{debug, info, warn};
 use super::types::{PipelineResult, PipelineStage, StageOutput};
 use crate::Agent;
 use crate::spawner::AgentRegistry;
+use crate::turn_context::current_turn_actor_context;
 
 /// Chain agents sequentially.
 /// Each agent receives the previous agent's output as its input.
@@ -28,6 +29,7 @@ pub async fn pipeline(
     let mut stage_outputs = Vec::with_capacity(stages.len());
     let mut completed_stages: HashMap<String, String> = HashMap::new();
     let pipeline_start = Instant::now();
+    let mut actor_context = current_turn_actor_context();
 
     for (i, stage) in stages.iter().enumerate() {
         let agent_id = &stage.agent_id;
@@ -66,10 +68,15 @@ pub async fn pipeline(
 
         let stage_result = if let Some(timeout) = timeout_ms {
             let remaining = timeout.saturating_sub(pipeline_start.elapsed().as_millis() as u64);
-            match tokio::time::timeout(
-                tokio::time::Duration::from_millis(remaining),
-                agent.chat(&effective_input),
-            )
+            match tokio::time::timeout(tokio::time::Duration::from_millis(remaining), async {
+                if let Some(context) = actor_context.clone() {
+                    agent
+                        .chat_with_actor_context(&effective_input, context)
+                        .await
+                } else {
+                    agent.chat(&effective_input).await
+                }
+            })
             .await
             {
                 Ok(result) => result,
@@ -84,6 +91,10 @@ pub async fn pipeline(
                     break;
                 }
             }
+        } else if let Some(context) = actor_context.clone() {
+            agent
+                .chat_with_actor_context(&effective_input, context)
+                .await
         } else {
             agent.chat(&effective_input).await
         };
@@ -101,6 +112,9 @@ pub async fn pipeline(
                 });
                 completed_stages.insert(agent_id.clone(), output.clone());
                 current_input = output;
+                if let Some(context) = actor_context.as_mut() {
+                    *context = context.for_sender(agent_id.clone());
+                }
 
                 if let Some(h) = hooks {
                     h.on_pipeline_stage(i, agent_id, duration_ms).await;

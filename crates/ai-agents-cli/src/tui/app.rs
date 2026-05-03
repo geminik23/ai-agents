@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders};
 use tokio::sync::mpsc::UnboundedSender;
 use tui_textarea::TextArea;
 
+use ai_agents::memory::estimate_tokens;
 use ai_agents::{Agent, RuntimeAgent, StreamChunk};
 
 use crate::repl::{CliReplConfig, ReplMode};
@@ -1262,6 +1263,8 @@ impl App {
                 actor_id,
                 configured: false,
                 dimensions: Vec::new(),
+                perceived_dimensions: Vec::new(),
+                mutual_dimensions: Vec::new(),
                 interaction_count: 0,
                 events: Vec::new(),
             };
@@ -1280,6 +1283,36 @@ impl App {
             })
             .unwrap_or_default();
         dimensions.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut perceived_dimensions = relationship
+            .as_ref()
+            .map(|r| {
+                r.perceived_actor_to_agent
+                    .iter()
+                    .map(|(name, value)| RelationshipDimensionEntry {
+                        name: name.clone(),
+                        value: *value,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        perceived_dimensions.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut mutual_dimensions = relationship
+            .as_ref()
+            .map(|r| {
+                r.mutual_dimensions()
+                    .iter()
+                    .map(|(name, value)| RelationshipDimensionEntry {
+                        name: name.clone(),
+                        value: *value,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if perceived_dimensions.is_empty() {
+            mutual_dimensions.clear();
+        } else {
+            mutual_dimensions.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         let events = relationship
             .as_ref()
             .map(|r| {
@@ -1299,6 +1332,8 @@ impl App {
             actor_id,
             configured: true,
             dimensions,
+            perceived_dimensions,
+            mutual_dimensions,
             interaction_count: relationship.map(|r| r.interaction_count).unwrap_or(0),
             events,
         }
@@ -1332,15 +1367,29 @@ impl App {
 
     fn build_memory_panel(&self) -> MemoryPanelState {
         let budget = self.agent.memory_token_budget();
+        let facts_tokens: u32 = self
+            .agent
+            .actor_facts()
+            .iter()
+            .map(|f| (f.content.len() as u32 / 4) + 10)
+            .sum();
+        let relationship_tokens = self
+            .agent
+            .relationship_memory_text()
+            .map(|text| estimate_tokens(&text))
+            .unwrap_or(0);
         MemoryPanelState {
             message_count: 0,
             has_summary: false,
             summary_tokens: 0,
             recent_tokens: 0,
+            facts_tokens,
+            relationship_tokens,
             budget_total: budget.map(|b| b.total),
             budget_summary: budget.map(|b| b.allocation.summary),
             budget_recent: budget.map(|b| b.allocation.recent_messages),
             budget_facts: budget.map(|b| b.allocation.facts),
+            budget_relationships: budget.map(|b| b.allocation.relationships),
             overflow_strategy: budget.map(|b| format!("{:?}", b.overflow_strategy)),
             warn_at: budget.map(|b| b.warn_at_percent as u32),
         }

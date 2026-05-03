@@ -321,6 +321,7 @@ mod tests {
             summary: 100,
             recent_messages: 2048,
             facts: 512,
+            relationships: 0,
         };
 
         let result = ctx.to_llm_messages_with_allocation(&allocation);
@@ -355,6 +356,7 @@ mod tests {
             summary: 1024,
             recent_messages: 200,
             facts: 512,
+            relationships: 0,
         };
 
         let result = ctx.to_llm_messages_with_allocation(&allocation);
@@ -391,6 +393,7 @@ mod tests {
             summary: 1024,
             recent_messages: 2048,
             facts: 512,
+            relationships: 0,
         };
 
         let result = ctx.to_llm_messages_with_allocation(&allocation);

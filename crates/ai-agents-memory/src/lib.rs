@@ -11,7 +11,7 @@ use async_trait::async_trait;
 
 pub use ai_agents_core::MemorySnapshot;
 pub use compacting::{CompactingMemory, CompactingMemoryConfig, CompressionEvent};
-pub use context::{estimate_message_tokens, estimate_tokens, CompressResult, ConversationContext};
+pub use context::{CompressResult, ConversationContext, estimate_message_tokens, estimate_tokens};
 pub use events::{
     EvictionReason, FactExtractedEvent, MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent,
 };

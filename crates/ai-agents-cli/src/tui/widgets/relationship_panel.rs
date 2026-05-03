@@ -21,6 +21,8 @@ pub struct RelationshipPanelState {
     pub actor_id: Option<String>,
     pub configured: bool,
     pub dimensions: Vec<RelationshipDimensionEntry>,
+    pub perceived_dimensions: Vec<RelationshipDimensionEntry>,
+    pub mutual_dimensions: Vec<RelationshipDimensionEntry>,
     pub interaction_count: u32,
     pub events: Vec<RelationshipEventEntry>,
 }
@@ -62,13 +64,38 @@ pub fn render_relationship_panel(
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(Span::styled(
-        "Dimensions",
+        "Agent to actor",
         theme.highlight_style,
     )));
     if state.dimensions.is_empty() {
         lines.push(Line::from(Span::styled("  none", theme.hint_style)));
     } else {
         for dim in &state.dimensions {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", dim.name), theme.label_style),
+                Span::styled(format!(": {:.2}", dim.value), theme.value_style),
+            ]));
+        }
+    }
+
+    if !state.perceived_dimensions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Perceived actor to agent",
+            theme.highlight_style,
+        )));
+        for dim in &state.perceived_dimensions {
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {}", dim.name), theme.label_style),
+                Span::styled(format!(": {:.2}", dim.value), theme.value_style),
+            ]));
+        }
+    }
+
+    if !state.mutual_dimensions.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Mutual", theme.highlight_style)));
+        for dim in &state.mutual_dimensions {
             lines.push(Line::from(vec![
                 Span::styled(format!(" {}", dim.name), theme.label_style),
                 Span::styled(format!(": {:.2}", dim.value), theme.value_style),

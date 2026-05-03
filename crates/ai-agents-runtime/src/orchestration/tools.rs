@@ -12,6 +12,7 @@ use ai_agents_tools::generate_schema;
 
 use super::types::RoutingMethod;
 use crate::spawner::AgentRegistry;
+use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 
 //
 // RouteToAgentTool
@@ -84,16 +85,21 @@ impl Tool for RouteToAgentTool {
             Err(_) => return ToolResult::error("no router LLM configured"),
         };
 
-        match super::route(
+        let route_future = super::route(
             &self.registry,
             llm.as_ref(),
             input,
             &candidates,
             method,
             Some(&self.counter),
-        )
-        .await
-        {
+        );
+        let route_result = if let Some(context) = current_turn_actor_context() {
+            scope_actor_context(context, route_future).await
+        } else {
+            route_future.await
+        };
+
+        match route_result {
             Ok(result) => ToolResult::ok(
                 json!({
                     "selected_agent": result.selected_agent,
@@ -181,7 +187,15 @@ impl Tool for PipelineProcessTool {
             })
             .collect();
 
-        match super::pipeline(&self.registry, input, &pipeline_stages, None, None, None).await {
+        let pipeline_future =
+            super::pipeline(&self.registry, input, &pipeline_stages, None, None, None);
+        let pipeline_result = if let Some(context) = current_turn_actor_context() {
+            scope_actor_context(context, pipeline_future).await
+        } else {
+            pipeline_future.await
+        };
+
+        match pipeline_result {
             Ok(result) => ToolResult::ok(
                 json!({
                     "response": result.response.content,
@@ -283,7 +297,7 @@ impl Tool for ConcurrentAskTool {
 
         let llm = self.llm.get("router").ok();
 
-        match super::concurrent(
+        let concurrent_future = super::concurrent(
             &self.registry,
             question,
             &agents,
@@ -292,9 +306,14 @@ impl Tool for ConcurrentAskTool {
             None,
             None,
             ai_agents_state::PartialFailureAction::ProceedWithAvailable,
-        )
-        .await
-        {
+        );
+        let concurrent_result = if let Some(context) = current_turn_actor_context() {
+            scope_actor_context(context, concurrent_future).await
+        } else {
+            concurrent_future.await
+        };
+
+        match concurrent_result {
             Ok(result) => ToolResult::ok(
                 json!({
                     "response": result.response.content,
@@ -409,7 +428,14 @@ impl Tool for GroupDiscussionTool {
 
         let llm = self.llm.get("router").ok();
 
-        match super::group_chat(&self.registry, topic, &config, llm.as_deref(), None).await {
+        let group_future = super::group_chat(&self.registry, topic, &config, llm.as_deref(), None);
+        let group_result = if let Some(context) = current_turn_actor_context() {
+            scope_actor_context(context, group_future).await
+        } else {
+            group_future.await
+        };
+
+        match group_result {
             Ok(result) => ToolResult::ok(
                 json!({
                     "conclusion": result.response.content,
@@ -504,7 +530,7 @@ impl Tool for HandoffConversationTool {
             Err(_) => return ToolResult::error("no router LLM configured"),
         };
 
-        match super::handoff(
+        let handoff_future = super::handoff(
             &self.registry,
             input,
             initial_agent,
@@ -512,9 +538,14 @@ impl Tool for HandoffConversationTool {
             max_handoffs,
             llm.as_ref(),
             None,
-        )
-        .await
-        {
+        );
+        let handoff_result = if let Some(context) = current_turn_actor_context() {
+            scope_actor_context(context, handoff_future).await
+        } else {
+            handoff_future.await
+        };
+
+        match handoff_result {
             Ok(result) => ToolResult::ok(
                 json!({
                     "response": result.response.content,

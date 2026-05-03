@@ -6,10 +6,14 @@ use tracing::{debug, warn};
 
 use ai_agents_core::{AgentError, ChatMessage, LLMConfig, LLMProvider, Result, Role};
 
-use crate::types::{Relationship, RelationshipDimensionDefinition, RelationshipEvaluation};
+use crate::types::{
+    Relationship, RelationshipDimensionDefinition, RelationshipEvaluation, RelationshipModel,
+};
 
+/// Evaluates how a relationship should change after a turn.
 #[async_trait]
 pub trait RelationshipEvaluatorTrait: Send + Sync {
+    /// Evaluate recent messages and propose relationship changes for the current actor.
     async fn evaluate_turn(
         &self,
         current: &Relationship,
@@ -18,11 +22,13 @@ pub trait RelationshipEvaluatorTrait: Send + Sync {
     ) -> Result<RelationshipEvaluation>;
 }
 
+/// LLM-backed relationship evaluator used by automatic relationship updates.
 pub struct RelationshipEvaluator {
     llm: Arc<dyn LLMProvider>,
 }
 
 impl RelationshipEvaluator {
+    /// Create an LLM-backed relationship evaluator.
     pub fn new(llm: Arc<dyn LLMProvider>) -> Self {
         Self { llm }
     }
@@ -33,34 +39,65 @@ impl RelationshipEvaluator {
         messages: &[ChatMessage],
         dimensions: &HashMap<String, RelationshipDimensionDefinition>,
     ) -> String {
-        let mut prompt = String::from(
-            "You are a relationship memory evaluator.\n\
-             Evaluate how the agent's relationship toward the current actor should change after the recent conversation.\n\
-             The relationship describes the agent's stance toward the actor, not the actor's stance toward the agent.\n\n\
-             Dimensions:\n",
-        );
+        let mut prompt = if matches!(current.model, RelationshipModel::TwoSided) {
+            String::from(
+                "You are a relationship memory evaluator.\n\
+                 Evaluate how relationship perspectives should change after the recent conversation.\n\
+                 Perspectives:\n\
+                 - agent_to_actor: the agent's stance toward the actor.\n\
+                 - perceived_actor_to_agent: the agent's inferred view of the actor's stance toward the agent.\n\
+                 - mutual: a shared relationship view. Use this only when both sides clearly changed.\n\n\
+                 Dimensions:\n",
+            )
+        } else {
+            String::from(
+                "You are a relationship memory evaluator.\n\
+                 Evaluate how the agent's relationship toward the current actor should change after the recent conversation.\n\
+                 The relationship describes the agent's stance toward the actor, not the actor's stance toward the agent.\n\n\
+                 Dimensions:\n",
+            )
+        };
 
         let mut defs: Vec<_> = dimensions.iter().collect();
         defs.sort_by(|a, b| a.0.cmp(b.0));
         for (name, def) in defs {
             let current_value = current.dimensions.get(name).copied().unwrap_or(def.default);
-            prompt.push_str(&format!(
-                "- {}: {}. range [{:.2}, {:.2}], current {:.2}\n",
-                name, def.description, def.min, def.max, current_value
-            ));
+            if matches!(current.model, RelationshipModel::TwoSided) {
+                let perceived = current
+                    .perceived_actor_to_agent
+                    .get(name)
+                    .copied()
+                    .unwrap_or(def.default);
+                let mutual = current
+                    .mutual_dimensions()
+                    .get(name)
+                    .copied()
+                    .unwrap_or(def.default);
+                prompt.push_str(&format!(
+                    "- {}: {}. range [{:.2}, {:.2}], agent_to_actor {:.2}, perceived_actor_to_agent {:.2}, mutual {:.2}\n",
+                    name, def.description, def.min, def.max, current_value, perceived, mutual
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "- {}: {}. range [{:.2}, {:.2}], current {:.2}\n",
+                    name, def.description, def.min, def.max, current_value
+                ));
+            }
         }
 
         prompt.push_str(
             "\nOutput JSON only in this shape:\n\
              {\n\
                \"changes\": [\n\
-                 {\"dimension\": \"trust\", \"delta\": 0.1, \"confidence\": 0.8, \"reason\": \"short reason\"}\n\
+                 {\"perspective\": \"agent_to_actor\", \"dimension\": \"trust\", \"delta\": 0.1, \"confidence\": 0.8, \"reason\": \"short reason\"}\n\
                ],\n\
                \"notable_event\": {\"description\": \"short event\", \"significance\": 0.7}\n\
              }\n\n\
              Rules:\n\
              - Use small deltas for small signals. Use 0 changes if nothing meaningful changed.\n\
              - Do not output dimensions that are not listed.\n\
+             - For one-sided relationships, use perspective agent_to_actor.\n\
+             - For two-sided relationships, use perspective agent_to_actor, perceived_actor_to_agent, or mutual.\n\
              - Confidence is 0.0 to 1.0.\n\
              - Delta may be positive or negative. Runtime will clamp values.\n\
              - notable_event may be null if nothing notable happened.\n\

@@ -994,12 +994,20 @@ impl AgentStorage for SqliteStorage {
                 .unwrap_or(&serde_json::Value::Array(vec![])),
         )
         .map_err(|e| AgentError::Persistence(e.to_string()))?;
-        let metadata_json = serde_json::to_string(
-            relationship
-                .get("metadata")
-                .unwrap_or(&serde_json::Value::Object(Default::default())),
-        )
-        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        let mut metadata_value = relationship
+            .get("metadata")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        if let Some(obj) = metadata_value.as_object_mut() {
+            if let Some(model) = relationship.get("model") {
+                obj.insert("__relationship_model".to_string(), model.clone());
+            }
+            if let Some(perceived) = relationship.get("perceived_actor_to_agent") {
+                obj.insert("__perceived_actor_to_agent".to_string(), perceived.clone());
+            }
+        }
+        let metadata_json = serde_json::to_string(&metadata_value)
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
         let interaction_count = relationship
             .get("interaction_count")
             .and_then(|v| v.as_u64())
@@ -1084,13 +1092,23 @@ impl AgentStorage for SqliteStorage {
             serde_json::from_str(&dimensions_json).unwrap_or_else(|_| serde_json::json!({}));
         let notable_events: serde_json::Value =
             serde_json::from_str(&notable_events_json).unwrap_or_else(|_| serde_json::json!([]));
-        let metadata: serde_json::Value =
+        let mut metadata: serde_json::Value =
             serde_json::from_str(&metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+        let model = metadata
+            .as_object_mut()
+            .and_then(|obj| obj.remove("__relationship_model"))
+            .unwrap_or_else(|| serde_json::json!("one_sided"));
+        let perceived_actor_to_agent = metadata
+            .as_object_mut()
+            .and_then(|obj| obj.remove("__perceived_actor_to_agent"))
+            .unwrap_or_else(|| serde_json::json!({}));
 
         Ok(Some(serde_json::json!({
             "actor_id": actor_id,
+            "model": model,
             "actor_name": actor_name,
             "dimensions": dimensions,
+            "perceived_actor_to_agent": perceived_actor_to_agent,
             "notable_events": notable_events,
             "interaction_count": interaction_count,
             "first_interaction": first_interaction,
