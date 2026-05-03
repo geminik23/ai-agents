@@ -521,6 +521,9 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 | `on_actor_memory_loaded`    | Facts: actor facts were loaded from storage at session start |
 | `on_session_created`        | Session: a new session was created with metadata      |
 | `on_sessions_expired`       | Session: expired sessions were cleaned up via TTL     |
+| `on_relationship_loaded`    | Relationship: actor relationship was loaded or created |
+| `on_relationship_change`    | Relationship: one or more relationship dimensions changed |
+| `on_notable_event`          | Relationship: a notable relationship event was stored |
 
 ---
 
@@ -628,6 +631,52 @@ let summaries = agent.list_sessions_filtered(&filter).await?;
 When `auto_extract: true` (the default), extraction runs after every turn - no manual calls needed. Configure via `memory.facts` and `memory.actor_memory` in YAML. See [YAML Reference](@/docs/yaml-reference.md#facts-key-facts-extraction) for the full schema.
 
 Switching actors mid-session via `set_actor_id()` (or via `from_context` resolution when the configured context path changes) clears the cached facts and reloads on the next turn, so prompt injection always reflects the current actor.
+
+---
+
+## Relationship Memory
+
+Relationship memory tracks the agent's stance toward each actor. Use `relationship_manager()` for direct inspection or manual updates.
+
+```rust
+// Relationship memory uses the same actor ID as actor facts.
+agent.set_actor_id("customer_42")?;
+
+// For one turn, carry actor context structurally without changing global actor state.
+let response = agent
+    .chat_with_actor_context(
+        "Please help with this issue",
+        ai_agents::TurnActorContext::new()
+            .with_origin_actor("customer_42")
+            .with_sender_agent("coordinator"),
+    )
+    .await?;
+
+// Access the manager when memory.relationships is enabled in YAML.
+if let Some(manager) = agent.relationship_manager() {
+    let relationship = manager.get_or_create("customer_42", Some("Jane"));
+    println!("trust = {:?}", relationship.dimensions.get("trust"));
+
+    // Manual update for application-driven signals.
+    let change = agent
+        .update_relationship_dimension("trust", 0.1, Some("Customer verified identity successfully"))
+        .await?;
+    println!("{} changed by {}", change.dimension, change.delta);
+
+    // Two-sided configs can update a specific perspective.
+    let perceived = agent
+        .update_relationship_dimension_for_perspective(
+            ai_agents::relationships::RelationshipPerspective::PerceivedActorToAgent,
+            "trust",
+            0.1,
+            Some("Customer expressed confidence in the agent"),
+        )
+        .await?;
+    println!("{} {} changed by {}", perceived.perspective, perceived.dimension, perceived.delta);
+}
+```
+
+Automatic updates run after successful turns when `memory.relationships.auto_update.enabled` is true. Relationship context is injected at `relationships.current_actor.*`, and formatted prompt text is available as `{{ relationship_memory }}`.
 
 Session persistence requires a storage backend. Enable one via feature flags:
 

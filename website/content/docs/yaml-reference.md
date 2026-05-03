@@ -639,6 +639,14 @@ Example - using group chat metadata in a follow-up state:
 
 For group chat brainstorm and consensus styles, `response.content` contains the full formatted transcript (`[Round N] speaker: message`) rather than only the last speaker's final line. Debate and maker-checker styles are unaffected.
 
+Actor-aware turns also expose structural identity context during inter-agent calls:
+
+- `context.interaction.origin_actor_id` - original user, player, or customer actor when available
+- `context.interaction.sender_agent_id` - immediate agent that forwarded or produced the current message
+- `context.interaction.actor_id` - effective actor ID used for actor-scoped facts and relationship memory
+
+This context is forwarded by registry sends, delegate states, concurrent states, group chat, pipeline stages, handoff chains, and orchestration tools.
+
 ---
 
 ## Skills
@@ -988,6 +996,7 @@ Fine-grained control over how much memory contributes to the prompt. Used with `
 | `allocation.summary` | `u32` | - | Tokens reserved for rolling summary |
 | `allocation.recent_messages` | `u32` | - | Tokens reserved for recent messages |
 | `allocation.facts` | `u32` | - | Tokens reserved for extracted key facts |
+| `allocation.relationships` | `u32` | `0` | Optional global cap for relationship prompt text. When set, `memory.relationships.injection.max_tokens` cannot exceed this value |
 | `overflow_strategy` | `string` | - | `truncate_oldest`, `summarize_more`, or `error` |
 | `warn_at_percent` | `u32` | - | Emit warning when usage exceeds this % |
 
@@ -1004,6 +1013,7 @@ memory:
       summary: 1024
       recent_messages: 2048
       facts: 512
+      relationships: 256
     overflow_strategy: truncate_oldest
     warn_at_percent: 70
 ```
@@ -1078,6 +1088,113 @@ memory:
 
 When `token_budget.allocation.facts` is set on the surrounding `memory:` block, that value is used as the effective cap for fact injection and overrides `actor_memory.injection.max_tokens`.
 
+### `relationships` (Relationship Memory)
+
+Track how the agent relates to each actor across sessions. Relationship memory is separate from facts: facts describe what the agent knows about an actor, while relationships describe the agent's stance toward that actor.
+
+```yaml
+memory:
+  relationships:
+    enabled: true
+    model: one_sided               # one_sided (default) | two_sided
+    dimensions:
+      - trust
+      - sentiment
+      - familiarity
+      - rapport
+    auto_update:
+      enabled: true
+      llm: router
+      min_confidence: 0.6
+      max_delta_per_turn: 0.3
+      recent_messages: 6
+    injection:
+      enabled: true
+      format: summary              # summary | scores_only | full
+      max_tokens: 400
+      prompt_variable: relationship_memory
+      context_path: relationships.current_actor
+    persistence:
+      enabled: true
+    notable_events:
+      enabled: true
+      max_per_actor: 50
+      significance_threshold: 0.5
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `false` | Enable actor-scoped relationship memory |
+| `model` | string | `one_sided` | Relationship semantics. `one_sided` tracks the agent's stance toward the actor. `two_sided` also tracks `perceived_actor_to_agent` and derives read-only `mutual` scores |
+| `dimensions` | list or map | `[trust, sentiment, familiarity, rapport]` | Dimensions to track. List form uses built-in definitions. Map form lets you specify `description`, `min`, `max`, and `default` |
+| `auto_update.enabled` | bool | `true` | Run relationship evaluation after successful turns |
+| `auto_update.llm` | string | router | Named LLM used for evaluation |
+| `auto_update.min_confidence` | number | `0.6` | Ignore proposed changes below this confidence |
+| `auto_update.max_delta_per_turn` | number | `0.3` | Clamp per-turn dimension changes |
+| `auto_update.recent_messages` | int | `6` | Number of recent messages sent to the evaluator |
+| `injection.enabled` | bool | `true` | Inject relationship context and prompt variable |
+| `injection.format` | string | `summary` | Prompt format: `summary`, `scores_only`, or `full` |
+| `injection.max_tokens` | int | `400` | Prompt budget for relationship text |
+| `injection.prompt_variable` | string | `relationship_memory` | Template variable for formatted relationship text |
+| `injection.context_path` | string | `relationships.current_actor` | Context path where relationship scores are injected |
+| `persistence.enabled` | bool | `true` | Persist by `(agent_id, actor_id)` when storage supports it |
+| `notable_events.max_per_actor` | int | `50` | Max relationship events kept per actor |
+| `notable_events.significance_threshold` | number | `0.5` | Minimum event significance to store |
+
+Use full dimension objects when you need domain-specific scores:
+
+```yaml
+memory:
+  relationships:
+    enabled: true
+    dimensions:
+      trust:
+        description: "How much the agent trusts the actor"
+        min: -1.0
+        max: 1.0
+        default: 0.0
+      motivation:
+        description: "How motivated the student seems"
+        min: 0.0
+        max: 1.0
+        default: 0.5
+```
+
+When an actor is active, values are available at `relationships.current_actor.*`:
+
+- `relationships.current_actor.trust`
+- `relationships.current_actor.sentiment`
+- `relationships.current_actor.dimensions.trust`
+- `relationships.current_actor.agent_to_actor.trust`
+- `relationships.current_actor.perceived_actor_to_agent.trust` (two-sided mode)
+- `relationships.current_actor.mutual.trust` (two-sided mode, derived/read-only)
+- `relationships.current_actor.interaction_count`
+
+The shortcut paths such as `relationships.current_actor.trust` stay compatible and refer to `agent_to_actor` scores.
+In two-sided mode, automatic evaluator updates only write `agent_to_actor` and `perceived_actor_to_agent`; `mutual` is derived by the runtime from those two stored perspectives.
+This makes relationship scores usable by persona secrets, state guards, tool conditions, and templates.
+
+```yaml
+persona:
+  secrets:
+    - content: "Confidential detail"
+      reveal_conditions:
+        context:
+          relationships.current_actor.trust:
+            gte: 0.8
+```
+
+Prompt templates can use `{{ relationship_memory }}`:
+
+```yaml
+system_prompt: |
+  You are a helpful assistant.
+  {% if relationship_memory %}
+  Relationship context:
+  {{ relationship_memory }}
+  {% endif %}
+```
+
 ### `session` (Session Metadata)
 
 Static metadata and TTL for the agent's sessions.
@@ -1102,9 +1219,10 @@ memory:
   token_budget:
     total: 4000
     allocation:
-      summary: 0.3
-      recent_messages: 0.5
-      facts: 0.2
+      summary: 1200
+      recent_messages: 2000
+      facts: 800
+      relationships: 400
   actor_memory:
     enabled: true
     identification:
@@ -1122,6 +1240,16 @@ memory:
       - user_context
       - decision
     max_facts: 50
+  relationships:
+    enabled: true
+    dimensions:
+      - trust
+      - sentiment
+      - familiarity
+      - rapport
+    injection:
+      format: summary
+      prompt_variable: relationship_memory
   session:
     ttl_seconds: 604800
 ```
@@ -1134,6 +1262,10 @@ system_prompt: |
   {% if actor_facts %}
   What you know about this person:
   {{ actor_facts }}
+  {% endif %}
+  {% if relationship_memory %}
+  Your relationship with this person:
+  {{ relationship_memory }}
   {% endif %}
 ```
 

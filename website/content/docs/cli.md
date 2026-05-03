@@ -176,6 +176,11 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 | `/actor delete`      | Delete all data for the current actor (GDPR)                         |
 | `/facts`             | Show all facts for the current actor                                 |
 | `/facts extract [n]` | Manually extract facts from the last N messages (default: 10)        |
+| `/relationship`, `/rel` | Show current actor relationship dimensions                       |
+| `/relationship events` | Show notable relationship events for the current actor             |
+| `/relationship actors` | Show actors with loaded relationship state                         |
+| `/relationship set <dimension> <delta> [reason]` | Manually update `agent_to_actor` relationship dimension |
+| `/relationship setp <perspective> <dimension> <delta> [reason]` | Manually update `agent_to_actor` or `perceived_actor_to_agent` |
 | `/quit`, `/exit`     | Exit the REPL                                                        |
 
 `/quit` and `/exit` always work, even when builtins are disabled.
@@ -210,6 +215,7 @@ Toggle side panels with function keys:
 | `F6` | Persona | Agent persona identity, traits, goals |
 | `F7` | Facts   | Live actor facts when `memory.facts` is enabled and an actor is set |
 | `F8` | Agents  | Spawned agents and orchestration status |
+| `F9` | Relationship | Current actor relationship dimensions and notable events |
 
 Press the same key again to close a panel. Press `Esc` to close all panels.
 
@@ -223,7 +229,7 @@ Press the same key again to close a panel. Press `Esc` to close all panels.
 | `Ctrl+S`        | Quick save session |
 | `PageUp/Down`   | Scroll chat history |
 | `Esc`           | Cancel streaming or close panels |
-| `F1` - `F8`     | Toggle side panels |
+| `F1` - `F9`     | Toggle side panels |
 | `Ctrl+T`        | Cycle color theme |
 | `/`             | Start a slash command (opens completion popup) |
 

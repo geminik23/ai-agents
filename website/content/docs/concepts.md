@@ -456,6 +456,49 @@ The `/actor` and `/facts` REPL commands let you inspect and manage facts interac
 
 ---
 
+## Relationship Memory
+
+Relationship memory tracks how an agent relates to each actor over time. It is actor-scoped and general-purpose: an actor can be a customer, student, patient, player, NPC, or another agent.
+
+Relationship memory is separate from key facts. Facts answer "what does the agent know about this actor?" Relationships answer "how does this agent currently relate to this actor?" Default dimensions are `trust`, `sentiment`, `familiarity`, and `rapport`, and applications can define custom dimensions such as `motivation`, `suspicion`, `reliability`, or `openness`.
+
+After each successful turn, a router LLM evaluates recent messages and proposes small dimension deltas. The runtime validates confidence, clamps deltas, clamps final scores to each dimension range, stores notable relationship events, and persists the relationship by `(agent_id, actor_id)` when storage supports it.
+
+Relationship values are injected into context under `relationships.current_actor.*`, making them available to persona secrets, state guards, tool conditions, and templates. The formatted prompt text is available as `{{ relationship_memory }}`. By default the model is one-sided (`agent_to_actor`), but `model: two_sided` also tracks `perceived_actor_to_agent` and derives read-only `mutual` scores while keeping shortcut paths such as `relationships.current_actor.trust` compatible. Automatic evaluator updates only write the two stored perspectives: `agent_to_actor` and `perceived_actor_to_agent`.
+
+```yaml
+memory:
+  relationships:
+    enabled: true
+    model: one_sided
+    dimensions:
+      - trust
+      - sentiment
+      - familiarity
+      - rapport
+    auto_update:
+      enabled: true
+      llm: router
+    injection:
+      enabled: true
+      format: summary
+      prompt_variable: relationship_memory
+```
+
+Persona secrets can use relationship scores directly:
+
+```yaml
+persona:
+  secrets:
+    - content: "Confidential context"
+      reveal_conditions:
+        context:
+          relationships.current_actor.trust:
+            gte: 0.8
+```
+
+---
+
 ## Dynamic Agent Spawning
 
 A parent agent can create and manage child agents at runtime using the spawner system. This enables patterns like a game master that spawns NPC agents on demand, or a team manager that creates specialist agents for different tasks.
@@ -545,6 +588,8 @@ Delegate states support a `delegate_context` mode (`input_only`, `summary`, `ful
 The same context enrichment is available for all orchestration patterns via the `context_mode` field. Set `context_mode: summary` or `context_mode: full` on any `concurrent`, `group_chat`, `pipeline`, or `handoff` block to forward parent conversation history to sub-agents. The enrichment runs before `input` template rendering, so `{{ user_input }}` in templates contains the history-enriched text. When omitted, the default is `input_only` which preserves the original behavior.
 
 Because orchestration runs through the normal `RuntimeAgent` loop, all existing features work automatically: HITL approvals on state transitions, error recovery per delegate, hooks for observability, memory for the parent conversation, and streaming.
+
+Actor context is forwarded structurally through registry sends and orchestration calls. When a parent turn has an actor, sub-agents receive `interaction.origin_actor_id` and `interaction.sender_agent_id` in prompt context, and actor-scoped facts and relationship memory use the original actor by default. This avoids relying on text prefixes such as `[From agent]` for memory identity.
 
 When a state transition fires mid-turn and the target state is an orchestration state (`concurrent`, `group_chat`, `pipeline`, `handoff`, or `delegate`), the runtime detects this and re-enters the full dispatch path for the new state in the same turn. The correct orchestration handler activates immediately - the user does not need to send another message to trigger it. Up to three chained transitions are resolved this way before the runtime stops and returns the last available response.
 
