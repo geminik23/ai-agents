@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.12** — Under active development. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.12** — Under active development. Stable `v1.0.0` is planned for release by mid-July 2026 at the latest. APIs and YAML schema may change between minor versions.
 
 ## Features
 
