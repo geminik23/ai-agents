@@ -76,6 +76,8 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **A2A Protocol** | Cross-service agent collaboration protocol | Planned - needs Multi-Agent Orchestration |
 | **Custom Reasoning Prompts** | Domain and language-specific CoT/ReAct instruction templates | Planned |
 | **Reasoning Depth Control** | Auto shallow/standard/deep reasoning with resource limits | Planned - needs Custom Reasoning Prompts |
+| **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned after v1 |
+| **Desktop Agent Studio** | Desktop workbench for authoring YAML agents, validating configs, running local Ollama agents, and inspecting state, memory, tools, sessions, and observability | Planned after v1 |
 
 ---
 
