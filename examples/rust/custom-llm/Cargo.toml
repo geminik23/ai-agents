@@ -8,7 +8,6 @@ license.workspace = true
 [dependencies]
 ai-agents = { workspace = true }
 ai-agents-cli = { workspace = true }
-ai-agents-llm = { path = "../../../crates/ai-agents-llm" }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }

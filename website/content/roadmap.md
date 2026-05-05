@@ -53,8 +53,8 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Session Management + Key Facts** | Cross-session actor memory, key facts extraction, and session metadata | ✅ Done (rc.11) |
 | **Relationship Memory** | Actor-scoped trust, sentiment, rapport, notable relationship events, two-sided relationships, and actor-aware inter-agent context | ✅ Done (rc.12) |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | Planned (rc.13) |
-| **Observability & Tracing** | Per-call latency, token usage, cost tracking via hooks | Planned (rc.13) |
-| **Evaluation Framework** | YAML-driven scenario runner with assertions, LLM judge, and metrics | Planned (rc.14) |
+| **Observability & Tracing** | Per-call latency, token usage, cost tracking via hooks | Planned (rc.14) |
+| **Evaluation Framework** | YAML-driven scenario runner with assertions, LLM judge, and metrics | Planned (rc.15) |
 | **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, and release hardening | Planned |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
 | **Conversation Style Modifiers** | LLM-based dynamic tone, formality, and style adaptation | Planned |

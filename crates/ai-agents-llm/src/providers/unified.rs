@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use futures::stream::StreamExt;
 use llm::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 
@@ -121,6 +121,7 @@ pub struct UnifiedLLMProvider {
     api_key: Option<String>,
     base_url: Option<String>,
     default_config: LLMConfig,
+    feature_overrides: HashMap<LLMFeature, bool>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
 }
 
@@ -132,6 +133,7 @@ impl std::fmt::Debug for UnifiedLLMProvider {
             .field("api_key", &self.api_key.as_ref().map(|_| "***"))
             .field("base_url", &self.base_url)
             .field("default_config", &self.default_config)
+            .field("feature_overrides", &self.feature_overrides)
             .field("client", &"<cached>")
             .finish()
     }
@@ -183,6 +185,9 @@ fn compute_config_hash(config: &LLMConfig, system_prompt: Option<&str>) -> u64 {
         "xai_max_search_results",
         "xai_search_from_date",
         "xai_search_to_date",
+        "num_ctx",
+        "num_gpu",
+        "keep_alive",
     ];
     for key in FORWARDED_EXTRA_KEYS {
         if let Some(v) = config.extra.get(*key) {
@@ -217,6 +222,102 @@ fn extract_system_and_messages(messages: &[ChatMessage]) -> (Option<String>, Vec
     };
 
     (system_prompt, non_system)
+}
+
+fn merged_ollama_extra_body(config: &LLMConfig) -> Result<Option<serde_json::Value>, LLMError> {
+    let has_named_fields = config.extra.contains_key("num_ctx")
+        || config.extra.contains_key("num_gpu")
+        || config.extra.contains_key("keep_alive");
+
+    let extra_body = config.extra.get("extra_body").cloned();
+
+    if !has_named_fields {
+        return Ok(extra_body);
+    }
+
+    let mut body = match extra_body {
+        Some(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
+        Some(_) => {
+            return Err(LLMError::Config(
+                "Ollama extra_body must be a JSON object when merging num_ctx, num_gpu, or keep_alive"
+                    .to_string(),
+            ));
+        }
+        None => serde_json::json!({}),
+    };
+
+    let body_map = body
+        .as_object_mut()
+        .ok_or_else(|| LLMError::Config("Ollama extra_body must be a JSON object".to_string()))?;
+
+    if let Some(keep_alive) = config.extra.get("keep_alive") {
+        body_map.insert("keep_alive".to_string(), keep_alive.clone());
+    }
+
+    if config.extra.contains_key("num_ctx") || config.extra.contains_key("num_gpu") {
+        let options = body_map
+            .entry("options".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        let options_map = options.as_object_mut().ok_or_else(|| {
+            LLMError::Config(
+                "Ollama extra_body.options must be a JSON object when merging num_ctx or num_gpu"
+                    .to_string(),
+            )
+        })?;
+
+        if let Some(num_ctx) = config.extra.get("num_ctx") {
+            options_map.insert("num_ctx".to_string(), num_ctx.clone());
+        }
+        if let Some(num_gpu) = config.extra.get("num_gpu") {
+            options_map.insert("num_gpu".to_string(), num_gpu.clone());
+        }
+    }
+
+    Ok(Some(body))
+}
+
+fn map_provider_error(
+    provider_type: ProviderType,
+    model: &str,
+    base_url: Option<&str>,
+    err: impl std::fmt::Display,
+) -> LLMError {
+    if provider_type != ProviderType::Ollama {
+        return LLMError::API {
+            message: format!("LLM provider error: {}", err),
+            status: None,
+        };
+    }
+
+    let base = base_url.unwrap_or("http://localhost:11434");
+    let msg = err.to_string();
+    let lower = msg.to_ascii_lowercase();
+
+    if lower.contains("connection refused")
+        || lower.contains("failed to connect")
+        || lower.contains("error sending request")
+        || lower.contains("os error 111")
+    {
+        return LLMError::Network(format!(
+            "Cannot connect to Ollama at {}. Is Ollama running? Start it with: ollama serve",
+            base
+        ));
+    }
+
+    if lower.contains("model") && lower.contains("not found") {
+        return LLMError::API {
+            message: format!(
+                "Model '{}' not found in Ollama. Pull it with: ollama pull {}",
+                model, model
+            ),
+            status: None,
+        };
+    }
+
+    LLMError::API {
+        message: format!("Ollama provider error: {}", msg),
+        status: None,
+    }
 }
 
 impl UnifiedLLMProvider {
@@ -272,6 +373,7 @@ impl UnifiedLLMProvider {
             api_key: Some(actual_api_key),
             base_url: actual_base_url,
             default_config,
+            feature_overrides: HashMap::new(),
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
@@ -293,6 +395,25 @@ impl UnifiedLLMProvider {
 
     pub fn base_url(&self) -> Option<&str> {
         self.base_url.as_deref()
+    }
+
+    pub fn with_feature_override(mut self, feature: LLMFeature, enabled: bool) -> Self {
+        self.feature_overrides.insert(feature, enabled);
+        self
+    }
+
+    pub fn with_feature_overrides(mut self, overrides: HashMap<LLMFeature, bool>) -> Self {
+        self.feature_overrides.extend(overrides);
+        self
+    }
+
+    fn map_llm_crate_error(&self, err: impl std::fmt::Display) -> LLMError {
+        map_provider_error(
+            self.provider_type,
+            &self.model,
+            self.base_url.as_deref(),
+            err,
+        )
     }
 
     /// Convert a non-system ChatMessage to llm::chat::ChatMessage.
@@ -504,8 +625,13 @@ impl UnifiedLLMProvider {
         }
 
         // --- Extra body (universal escape hatch for arbitrary provider JSON) ---
-        if let Some(extra_body) = config.extra.get("extra_body") {
-            builder = builder.extra_body(extra_body.clone());
+        let extra_body = if self.provider_type == ProviderType::Ollama {
+            merged_ollama_extra_body(config)?
+        } else {
+            config.extra.get("extra_body").cloned()
+        };
+        if let Some(body) = extra_body {
+            builder = builder.extra_body(body);
         }
 
         // --- Provider-specific: OpenAI web search ---
@@ -625,10 +751,7 @@ impl LLMProvider for UnifiedLLMProvider {
             .llm
             .chat(&llm_messages)
             .await
-            .map_err(|e| LLMError::API {
-                message: format!("LLM provider error: {}", e),
-                status: None,
-            })?;
+            .map_err(|e| self.map_llm_crate_error(e))?;
 
         let content = response.text().unwrap_or_else(|| "".to_string());
 
@@ -674,20 +797,17 @@ impl LLMProvider for UnifiedLLMProvider {
                 .llm
                 .chat_stream(&llm_messages)
                 .await
-                .map_err(|e| LLMError::API {
-                    message: format!("LLM provider error: {}", e),
-                    status: None,
-                })?
+                .map_err(|e| self.map_llm_crate_error(e))?
             // lock is dropped here at end of block
         };
 
-        let converted_stream = stream.map(|result| {
+        let provider_type = self.provider_type;
+        let model = self.model.clone();
+        let base_url = self.base_url.clone();
+        let converted_stream = stream.map(move |result| {
             result
                 .map(|token| LLMChunk::new(token, false))
-                .map_err(|e| LLMError::API {
-                    message: format!("Stream error: {}", e),
-                    status: None,
-                })
+                .map_err(|e| map_provider_error(provider_type, &model, base_url.as_deref(), e))
         });
 
         // Chain a final sentinel chunk so consumers know the stream is done
@@ -716,6 +836,10 @@ impl LLMProvider for UnifiedLLMProvider {
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
+        if let Some(enabled) = self.feature_overrides.get(&feature) {
+            return *enabled;
+        }
+
         match feature {
             LLMFeature::Streaming => true,
             LLMFeature::SystemMessages => true,
@@ -1080,6 +1204,164 @@ mod tests {
         assert_ne!(ha, hb);
         assert_ne!(ha, hc);
         assert_ne!(hb, hc);
+    }
+
+    #[test]
+    fn test_feature_override_enables_function_calling() {
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::OpenAICompatible,
+            "local-model",
+            None,
+            Some("http://localhost:1234/v1".to_string()),
+            LLMConfig::default(),
+        )
+        .unwrap()
+        .with_feature_override(LLMFeature::FunctionCalling, true);
+
+        assert!(provider.supports(LLMFeature::FunctionCalling));
+    }
+
+    #[test]
+    fn test_feature_override_disables_vision() {
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::OpenAI,
+            "gpt-4o-mini",
+            Some("XXXXXXXXXX".to_string()),
+            None,
+            LLMConfig::default(),
+        )
+        .unwrap()
+        .with_feature_override(LLMFeature::Vision, false);
+
+        assert!(!provider.supports(LLMFeature::Vision));
+    }
+
+    #[test]
+    fn test_ollama_num_ctx_in_extra_body() {
+        let config = LLMConfig::default().with_extra("num_ctx", serde_json::json!(8192));
+        let body = merged_ollama_extra_body(&config).unwrap().unwrap();
+
+        assert_eq!(body["options"]["num_ctx"], serde_json::json!(8192));
+    }
+
+    #[test]
+    fn test_ollama_build_llm_includes_num_ctx() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::Ollama)
+            .model("llama3.1")
+            .build()
+            .unwrap();
+
+        let config = LLMConfig::default().with_extra("num_ctx", serde_json::json!(8192));
+        let result = provider.build_llm(Some(&config));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_ollama_extra_body_merge_preserves_user_fields() {
+        let config = LLMConfig::default()
+            .with_extra(
+                "extra_body",
+                serde_json::json!({
+                    "format": "json",
+                    "options": { "temperature": 0.2 }
+                }),
+            )
+            .with_extra("num_ctx", serde_json::json!(8192));
+
+        let body = merged_ollama_extra_body(&config).unwrap().unwrap();
+        assert_eq!(body["format"], serde_json::json!("json"));
+        assert_eq!(body["options"]["temperature"], serde_json::json!(0.2));
+        assert_eq!(body["options"]["num_ctx"], serde_json::json!(8192));
+    }
+
+    #[test]
+    fn test_ollama_extra_body_named_fields_win() {
+        let config = LLMConfig::default()
+            .with_extra(
+                "extra_body",
+                serde_json::json!({
+                    "keep_alive": "1m",
+                    "options": { "num_ctx": 2048, "num_gpu": 0 }
+                }),
+            )
+            .with_extra("num_ctx", serde_json::json!(8192))
+            .with_extra("num_gpu", serde_json::json!(-1))
+            .with_extra("keep_alive", serde_json::json!("5m"));
+
+        let body = merged_ollama_extra_body(&config).unwrap().unwrap();
+        assert_eq!(body["keep_alive"], serde_json::json!("5m"));
+        assert_eq!(body["options"]["num_ctx"], serde_json::json!(8192));
+        assert_eq!(body["options"]["num_gpu"], serde_json::json!(-1));
+    }
+
+    #[test]
+    fn test_ollama_extra_body_rejects_non_object_when_merging() {
+        let config = LLMConfig::default()
+            .with_extra("extra_body", serde_json::json!(true))
+            .with_extra("num_ctx", serde_json::json!(8192));
+
+        let result = merged_ollama_extra_body(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("extra_body"));
+    }
+
+    #[test]
+    fn test_ollama_extra_body_rejects_non_object_options() {
+        let config = LLMConfig::default()
+            .with_extra("extra_body", serde_json::json!({ "options": true }))
+            .with_extra("num_ctx", serde_json::json!(8192));
+
+        let result = merged_ollama_extra_body(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("options"));
+    }
+
+    #[test]
+    fn test_ollama_config_hash_changes_with_named_fields() {
+        let config_a = LLMConfig::default();
+        let config_b = LLMConfig::default().with_extra("num_ctx", serde_json::json!(8192));
+        let config_c = LLMConfig::default().with_extra("keep_alive", serde_json::json!("5m"));
+
+        let hash_a = compute_config_hash(&config_a, None);
+        let hash_b = compute_config_hash(&config_b, None);
+        let hash_c = compute_config_hash(&config_c, None);
+
+        assert_ne!(hash_a, hash_b);
+        assert_ne!(hash_a, hash_c);
+        assert_ne!(hash_b, hash_c);
+    }
+
+    #[test]
+    fn test_ollama_error_connection_refused() {
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::Ollama,
+            "llama3.1",
+            None,
+            None,
+            LLMConfig::default(),
+        )
+        .unwrap();
+
+        let err = provider.map_llm_crate_error("connection refused");
+        assert!(err.to_string().contains("ollama serve"));
+    }
+
+    #[test]
+    fn test_ollama_error_model_not_found() {
+        let provider = UnifiedLLMProvider::from_spec_config(
+            ProviderType::Ollama,
+            "llama3.1",
+            None,
+            None,
+            LLMConfig::default(),
+        )
+        .unwrap();
+
+        let err = provider.map_llm_crate_error("model not found");
+        let msg = err.to_string();
+        assert!(msg.contains("ollama pull"));
+        assert!(msg.contains("llama3.1"));
     }
 
     #[test]

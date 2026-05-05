@@ -320,7 +320,7 @@ impl LLMProvider for MyProvider {
     fn provider_name(&self) -> &str { "my-provider" }
 
     fn supports(&self, feature: LLMFeature) -> bool {
-        matches!(feature, LLMFeature::Chat | LLMFeature::Streaming)
+        matches!(feature, LLMFeature::SystemMessages | LLMFeature::Streaming)
     }
 }
 ```

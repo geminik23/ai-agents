@@ -116,10 +116,10 @@ llm:
 
 ## Ollama
 
-Ollama runs locally - no API key needed. Just make sure the [Ollama](https://ollama.com) server is running on the default port (`http://localhost:11434`).
+Ollama runs locally - no API key needed. Start the [Ollama](https://ollama.com) server and pull a model before running your agent.
 
 ```sh
-# Pull a model first
+ollama serve
 ollama pull llama3.1
 ```
 
@@ -129,13 +129,35 @@ llm:
   model: llama3.1
 ```
 
-If Ollama runs on a different host or port, set `base_url`:
+If Ollama runs on a different host or port, set `base_url`. Native Ollama uses the server root URL, without a `/v1` suffix:
 
 ```yaml
 llm:
   provider: ollama
   model: llama3.1
   base_url: "http://192.168.1.100:11434"
+```
+
+For agent workloads, set the context window explicitly. Ollama defaults can vary by server, model, and version.
+
+```yaml
+llm:
+  provider: ollama
+  model: llama3.1
+  num_ctx: 8192       # context window passed under Ollama options
+  keep_alive: 5m      # keep the model loaded after the request
+  num_gpu: -1         # optional GPU layers; -1 means all supported layers
+```
+
+These named fields are merged into the Ollama request body: `num_ctx` and `num_gpu` go under `options`, while `keep_alive` stays at the top level. If you also use `extra_body`, the framework merges the values and the named fields win on conflict.
+
+To access Ollama through its OpenAI-compatible endpoint instead, use `provider: openai-compatible` and include `/v1` in the URL:
+
+```yaml
+llm:
+  provider: openai-compatible
+  model: llama3.1
+  base_url: "http://localhost:11434/v1"
 ```
 
 ---
@@ -268,6 +290,19 @@ llm:
   base_url: "http://localhost:1234/v1"
 ```
 
+Some OpenAI-compatible servers support tool calls, vision, or JSON mode, but the framework cannot know that from the URL. Declare capabilities in YAML when you want framework checks to treat the server as capable:
+
+```yaml
+llm:
+  provider: openai-compatible
+  model: qwen3:8b
+  base_url: "http://localhost:11434/v1"
+  function_calling: true
+  json_mode: true
+```
+
+These flags affect `supports()` checks only. They are not sent in the provider request body.
+
 If your server needs an API key:
 
 ```yaml
@@ -324,6 +359,21 @@ llm:
   model: meta-llama/Llama-3.1-8b-chat-hf
   base_url: "http://localhost:8080/v1"
 ```
+
+### Capability Overrides
+
+Capability overrides are available for any provider, not only OpenAI-compatible servers:
+
+```yaml
+llm:
+  provider: ollama
+  model: llama3.1
+  function_calling: true
+  vision: false
+  json_mode: true
+```
+
+Use them when you know a model/server supports more or less than the provider default. They are declarations for framework routing and validation; they do not enable native tool calling or structured output by themselves.
 
 ---
 

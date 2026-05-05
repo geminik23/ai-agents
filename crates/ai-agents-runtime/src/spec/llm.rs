@@ -108,6 +108,18 @@ pub struct LLMConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_budget_tokens: Option<u32>,
 
+    /// Override whether the provider supports function/tool calling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_calling: Option<bool>,
+
+    /// Override whether the provider supports vision inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+
+    /// Override whether the provider supports JSON mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_mode: Option<bool>,
+
     /// Additional provider-specific configuration
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -135,6 +147,9 @@ impl Default for LLMConfig {
             reasoning: None,
             reasoning_effort: None,
             reasoning_budget_tokens: None,
+            function_calling: None,
+            vision: None,
+            json_mode: None,
             extra: HashMap::new(),
         }
     }
@@ -369,5 +384,42 @@ reasoning_budget_tokens: 16384
         assert!(!config.extra.contains_key("reasoning"));
         assert!(!config.extra.contains_key("reasoning_effort"));
         assert!(!config.extra.contains_key("reasoning_budget_tokens"));
+    }
+
+    #[test]
+    fn test_ollama_named_fields_land_in_extra() {
+        let yaml = r#"
+provider: ollama
+model: llama3.1
+num_ctx: 8192
+num_gpu: -1
+keep_alive: 5m
+"#;
+        let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.extra.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(config.extra.get("num_gpu"), Some(&serde_json::json!(-1)));
+        assert_eq!(
+            config.extra.get("keep_alive"),
+            Some(&serde_json::json!("5m"))
+        );
+    }
+
+    #[test]
+    fn test_llm_config_feature_override_fields_deser() {
+        let yaml = r#"
+provider: openai-compatible
+model: qwen3:8b
+base_url: http://localhost:11434/v1
+function_calling: true
+vision: false
+json_mode: true
+"#;
+        let config: LLMConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.function_calling, Some(true));
+        assert_eq!(config.vision, Some(false));
+        assert_eq!(config.json_mode, Some(true));
+        assert!(!config.extra.contains_key("function_calling"));
+        assert!(!config.extra.contains_key("vision"));
+        assert!(!config.extra.contains_key("json_mode"));
     }
 }

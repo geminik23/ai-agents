@@ -51,6 +51,8 @@ Minimal getting-started examples.
 | `simple_chat.yaml` | Smallest YAML-first chat agent |
 | `simple_chat_stream.yaml` | Minimal streaming chat example |
 | `simple_tools.yaml` | Minimal built-in tools example |
+| `openai_compatible.yaml` | Connect to any OpenAI-compatible server such as LM Studio, vLLM, TGI, LocalAI, or Ollama `/v1` |
+| `ollama_chat.yaml` | Local Ollama chat with explicit context window and keep-alive settings |
 
 Examples:
 
@@ -58,6 +60,8 @@ Examples:
 cargo run -p ai-agents-cli -- run examples/yaml/basic/simple_chat.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/basic/simple_chat_stream.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/basic/simple_tools.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/basic/openai_compatible.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/basic/ollama_chat.yaml
 ```
 
 ### `yaml/skills/`
@@ -174,8 +178,8 @@ Dynamic context injection examples - from runtime values to environment variable
 | `template_context.yaml` | Jinja2 conditionals, defaults, and filters for tier-based behavior |
 | `context_with_state.yaml` | Context + state machine - personalized multi-step support flow |
 
-Note: The CLI does not currently support injecting runtime context values at startup.
-All `runtime` context sources in these examples include `default:` blocks so they work out of the box.
+Note: The CLI supports runtime context at startup with `--context key=value` and `--context-file path.json`.
+Most `runtime` context sources in these examples still include `default:` blocks so they work out of the box.
 In a Rust host, use `agent.set_context("user", json!({...}))` to override defaults.
 For a full Rust context injection example, see `rust/context/` below.
 

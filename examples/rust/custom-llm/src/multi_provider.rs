@@ -9,11 +9,11 @@
 
 use ai_agents::llm::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
-    LLMResponse, TokenUsage,
+    LLMResponse, MultiLLMRouter, TokenUsage,
 };
 use ai_agents::{AgentBuilder, LLMRegistry, ProviderType, Result, UnifiedLLMProvider};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
-use ai_agents_llm::multi::MultiLLMRouter;
+
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;

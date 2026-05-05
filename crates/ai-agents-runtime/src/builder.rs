@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use ai_agents_context::ContextManager;
-use ai_agents_core::{AgentError, AgentStorage, LLMProvider, Result, Tool};
+use ai_agents_core::{AgentError, AgentStorage, LLMFeature, LLMProvider, Result, Tool};
 use ai_agents_hitl::{ApprovalHandler, HITLEngine, RejectAllHandler};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_llm::LLMRegistry;
@@ -29,6 +29,20 @@ use super::AgentInfo;
 use super::StreamingConfig;
 use super::runtime::RuntimeAgent;
 use crate::spec::{AgentSpec, StorageConfig};
+
+fn feature_overrides_from_config(config: &crate::spec::LLMConfig) -> HashMap<LLMFeature, bool> {
+    let mut overrides = HashMap::new();
+    if let Some(enabled) = config.function_calling {
+        overrides.insert(LLMFeature::FunctionCalling, enabled);
+    }
+    if let Some(enabled) = config.vision {
+        overrides.insert(LLMFeature::Vision, enabled);
+    }
+    if let Some(enabled) = config.json_mode {
+        overrides.insert(LLMFeature::JsonMode, enabled);
+    }
+    overrides
+}
 
 pub struct AgentBuilder {
     spec: Option<AgentSpec>,
@@ -232,7 +246,8 @@ impl AgentBuilder {
                     base_url,
                     core_config,
                 )
-                .map_err(|e| AgentError::LLM(e.to_string()))?;
+                .map_err(|e| AgentError::LLM(e.to_string()))?
+                .with_feature_overrides(feature_overrides_from_config(config));
 
                 registry.register(alias, Arc::new(provider));
             }
@@ -286,7 +301,8 @@ impl AgentBuilder {
                 base_url,
                 core_config,
             )
-            .map_err(|e| AgentError::LLM(e.to_string()))?;
+            .map_err(|e| AgentError::LLM(e.to_string()))?
+            .with_feature_overrides(feature_overrides_from_config(config));
 
             self.llm = Some(Arc::new(provider));
         }
@@ -1305,6 +1321,49 @@ llm:
         let builder = AgentBuilder::from_yaml(yaml).unwrap();
         assert!(builder.spec.is_some());
         assert_eq!(builder.spec.as_ref().unwrap().name, "TestAgent");
+    }
+
+    #[test]
+    fn test_feature_override_single_llm_builder_path() {
+        let yaml = r#"
+name: LocalAgent
+system_prompt: "You are helpful."
+llm:
+  provider: ollama
+  model: llama3.1
+  function_calling: true
+"#;
+        let builder = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .auto_configure_llms()
+            .unwrap();
+
+        let llm = builder.llm.as_ref().unwrap();
+        assert!(llm.supports(LLMFeature::FunctionCalling));
+    }
+
+    #[test]
+    fn test_feature_override_named_llms_builder_path() {
+        let yaml = r#"
+name: LocalAgent
+system_prompt: "You are helpful."
+llms:
+  default:
+    provider: openai-compatible
+    model: qwen3:8b
+    base_url: http://localhost:11434/v1
+    json_mode: true
+llm:
+  default: default
+"#;
+        let builder = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .auto_configure_llms()
+            .unwrap();
+
+        let registry = builder.llm_registry.as_ref().unwrap();
+        let llm = registry.get("default").unwrap();
+        assert!(llm.supports(LLMFeature::JsonMode));
     }
 
     #[test]

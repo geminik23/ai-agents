@@ -152,6 +152,12 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
 | `reasoning_effort` | `string` | `null` | Reasoning effort: `low`, `medium`, or `high` |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
+| `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)` for this provider |
+| `vision` | `bool` | `null` | Override `supports(Vision)` for this provider |
+| `json_mode` | `bool` | `null` | Override `supports(JsonMode)` for this provider |
+| `num_ctx` | `u32` | `null` | Ollama context window; merged under request `options` |
+| `keep_alive` | `string` or `number` | `null` | Ollama keep-alive duration; top-level request body field |
+| `num_gpu` | `i32` | `null` | Ollama GPU layer count; merged under request `options` |
 | *(any other key)* | | | Passed through as provider-specific extra parameter |
 
 ```yaml
@@ -161,6 +167,8 @@ llm:
   temperature: 0.5
   max_tokens: 4000
 ```
+
+Capability override fields (`function_calling`, `vision`, `json_mode`) affect provider `supports()` checks only and are not sent to the model API. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body.
 
 Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-specific search (`openai_enable_web_search`, `xai_search_mode`, etc.). See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
 
@@ -173,6 +181,26 @@ llm:
   reasoning_effort: high
   reasoning_budget_tokens: 16384
   timeout_seconds: 120
+```
+
+```yaml
+# Local Ollama with explicit context window
+llm:
+  provider: ollama
+  model: llama3.1
+  num_ctx: 8192
+  keep_alive: 5m
+  num_gpu: -1
+```
+
+```yaml
+# Declare capabilities for a compatible local server
+llm:
+  provider: openai-compatible
+  model: qwen3:8b
+  base_url: http://localhost:11434/v1
+  function_calling: true
+  json_mode: true
 ```
 
 ### Named LLMs - `llms`
@@ -233,6 +261,8 @@ llm:
   provider: openai-compatible
   model: qwen3:8b
   base_url: http://localhost:11434/v1
+  function_calling: true
+  json_mode: true
 
 # With authentication:
 llm:

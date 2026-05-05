@@ -118,6 +118,7 @@ pub mod llm {
         LLMProvider, LLMResponse, Role, TaskContext, TokenUsage, ToolSelection,
     };
     pub use ai_agents_llm::LLMRegistry;
+    pub use ai_agents_llm::multi::MultiLLMRouter;
 
     pub mod providers {
         pub use ai_agents_llm::providers::{ProviderBuilder, ProviderType, UnifiedLLMProvider};
@@ -494,7 +495,7 @@ pub use tools::{
 };
 
 pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
-pub use llm::{ChatMessage, LLMProvider, LLMRegistry, LLMResponse, Role};
+pub use llm::{ChatMessage, LLMProvider, LLMRegistry, LLMResponse, MultiLLMRouter, Role};
 
 pub use process::{ProcessConfig, ProcessData, ProcessProcessor};
 pub use recovery::{
@@ -537,6 +538,16 @@ pub use hitl::{
     ToolApprovalConfig, create_handler, create_localized_handler, resolve_best_language,
     resolve_tool_message,
 };
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_facade_reexports_multi_llm_router() {
+        fn assert_type<T>() {}
+        assert_type::<crate::llm::MultiLLMRouter>();
+        assert_type::<crate::MultiLLMRouter>();
+    }
+}
 
 // Tool Provider System (v0.5.1 - Simplified)
 pub use tools::{

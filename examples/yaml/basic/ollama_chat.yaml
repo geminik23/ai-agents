@@ -1,0 +1,45 @@
+name: OllamaChat
+version: "1.0"
+description: "Chat using a local Ollama model."
+
+# Ollama local chat example.
+# Requires a running local Ollama server and a pulled model.
+#
+# Prerequisites:
+#   - Start Ollama: ollama serve
+#   - Pull the model: ollama pull llama3.2
+#
+# Native Ollama uses http://localhost:11434.
+# OpenAI-compatible Ollama uses http://localhost:11434/v1 with provider: openai-compatible.
+#
+# Flow: user input -> Ollama local model -> response
+
+system_prompt: |
+  You are a helpful assistant running on a local Ollama server.
+  Keep answers concise and practical.
+
+llm:
+  provider: ollama
+  model: llama3.2
+  # Set context explicitly for agent prompts; server/model defaults vary.
+  num_ctx: 4096
+  keep_alive: 5m             # keep model loaded after a request
+  num_gpu: -1                # GPU layers; -1 means all supported layers
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+max_iterations: 10
+
+tools: []
+skills: []
+
+metadata:
+  cli:
+    welcome: "=== Local Ollama Chat ==="
+    hints:
+      - "Make sure Ollama is running: ollama serve"
+      - "Pull the model first: ollama pull llama3.2"
+      - "num_ctx controls the context window size"
+      - "Native Ollama uses http://localhost:11434; openai-compatible uses /v1"
