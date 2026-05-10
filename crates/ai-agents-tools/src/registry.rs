@@ -122,6 +122,64 @@ impl ToolRegistry {
         self.tool_index.read().is_empty()
     }
 
+    pub fn map_tools<F>(&self, mut f: F) -> ToolRegistry
+    where
+        F: FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>,
+    {
+        let mapped = ToolRegistry::new();
+
+        {
+            let providers = self.providers.read();
+            let mut mapped_providers = mapped.providers.write();
+            for (id, provider) in providers.iter() {
+                mapped_providers.insert(id.clone(), provider.clone());
+            }
+        }
+
+        {
+            let aliases = self.alias_index.read();
+            let mut mapped_aliases = mapped.alias_index.write();
+            for (alias, tool_id) in aliases.iter() {
+                mapped_aliases.insert(alias.clone(), tool_id.clone());
+            }
+        }
+
+        {
+            let builtin_aliases = self.builtin_aliases.read();
+            let mut mapped_builtin_aliases = mapped.builtin_aliases.write();
+            for (id, aliases) in builtin_aliases.iter() {
+                mapped_builtin_aliases.insert(id.clone(), aliases.clone());
+            }
+        }
+
+        let tool_index = self.tool_index.read();
+        let mut mapped_tool_index = mapped.tool_index.write();
+        let mut mapped_builtin_tools = mapped.builtin_tools.write();
+        for (id, tool_ref) in tool_index.iter() {
+            match tool_ref {
+                ToolRef::Builtin(tool) => {
+                    let wrapped = f(tool.clone());
+                    mapped_tool_index.insert(id.clone(), ToolRef::Builtin(wrapped.clone()));
+                    mapped_builtin_tools.insert(id.clone(), wrapped);
+                }
+                ToolRef::Provider { provider_id, tool } => {
+                    let wrapped = f(tool.clone());
+                    mapped_tool_index.insert(
+                        id.clone(),
+                        ToolRef::Provider {
+                            provider_id: provider_id.clone(),
+                            tool: wrapped,
+                        },
+                    );
+                }
+            }
+        }
+
+        drop(mapped_builtin_tools);
+        drop(mapped_tool_index);
+        mapped
+    }
+
     pub async fn register_provider(
         &self,
         provider: Arc<dyn ToolProvider>,

@@ -24,6 +24,7 @@ use ai_agents_context::ContextSource;
 use ai_agents_core::{AgentError, Result};
 use ai_agents_disambiguation::DisambiguationConfig;
 use ai_agents_hitl::HITLConfig;
+use ai_agents_observability::ObservabilityConfig;
 use ai_agents_persona::PersonaConfig;
 use ai_agents_process::ProcessConfig;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
@@ -102,6 +103,9 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub disambiguation: DisambiguationConfig,
+
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -205,6 +209,7 @@ impl Default for AgentSpec {
             reasoning: ReasoningConfig::default(),
             reflection: ReflectionConfig::default(),
             disambiguation: DisambiguationConfig::default(),
+            observability: ObservabilityConfig::default(),
             providers: ProvidersConfig::default(),
             provider_security: ProviderSecurityConfig::default(),
             tool_aliases: ToolAliasesConfig::default(),
@@ -300,6 +305,10 @@ impl AgentSpec {
 
     pub fn has_disambiguation(&self) -> bool {
         self.disambiguation.is_enabled()
+    }
+
+    pub fn has_observability(&self) -> bool {
+        self.observability.enabled
     }
 
     pub fn has_persona(&self) -> bool {

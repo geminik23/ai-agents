@@ -64,6 +64,7 @@
 //! | [`spec`] | YAML agent specification types |
 //! | [`template`] | Template loading with Jinja2 rendering and inheritance |
 //! | [`spawner`] | Dynamic agent spawning, registry, and inter-agent messaging |
+//! | [`observability`] | Latency, token, cost, trace, and export metrics |
 //!
 //! # Feature Flags
 //!
@@ -248,6 +249,7 @@ pub mod skill {
 }
 
 pub mod spec {
+    pub use ai_agents_observability::ObservabilityConfig;
     pub use ai_agents_runtime::spec::{
         AgentSpec, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle, CliMetadata,
         CliPromptStyle, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
@@ -385,6 +387,21 @@ pub mod relationships {
     };
 }
 
+pub mod observability {
+    pub use ai_agents_observability::{
+        AggregatedMetrics, AggregationConfig, AggregationDimension, BufferConfig, CostBreakdown,
+        CostConfig, CostEstimate, CostEstimator, CostSource, CostStats, EventStatus, EventType,
+        ExportConfig, ExportFormat, ExportResult, LanguageConfig, LatencyConfig, LatencyStats,
+        ModelPricing, ObservabilityConfig, ObservabilityHooks, ObservabilityManager,
+        ObservabilityReport, ObservationError, ObservationEvent, ObservationPurpose,
+        ObservationTokenUsage, ObservedLLMProvider, ObservedTool, PrivacyConfig, RawEventsFormat,
+        Redactor, ReportSummary, SpanContext, SpanGuard, TokenBreakdown, TokenConfig, TokenStats,
+        TokenUsageSource, UnknownPricePolicy, current_observation_context,
+        resolve_language_from_context, stable_hash, truncate_chars, with_observation_context,
+        with_observation_purpose,
+    };
+}
+
 pub mod reasoning {
     pub use ai_agents_reasoning::{
         CriterionResult, EvaluationResult, Plan, PlanAction, PlanAvailableActions,
@@ -505,6 +522,8 @@ pub use recovery::{
 pub use tool_security::{
     SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
 };
+
+pub use observability::{ObservabilityConfig, ObservabilityManager, ObservabilityReport};
 
 pub use context::{
     BuiltinSource, ContextManager, ContextProvider, ContextSource, RefreshPolicy, TemplateRenderer,

@@ -6,11 +6,14 @@ use std::sync::Arc;
 use ai_agents_context::ContextManager;
 use ai_agents_core::{AgentError, AgentStorage, LLMFeature, LLMProvider, Result, Tool};
 use ai_agents_hitl::{ApprovalHandler, HITLEngine, RejectAllHandler};
-use ai_agents_hooks::AgentHooks;
+use ai_agents_hooks::{AgentHooks, CompositeHooks};
 use ai_agents_llm::LLMRegistry;
 use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
 use ai_agents_memory::{
     CompactingMemory, InMemoryStore, LLMSummarizer, Memory, NoopSummarizer, Summarizer,
+};
+use ai_agents_observability::{
+    ObservabilityHooks, ObservabilityManager, ObservedLLMProvider, ObservedTool,
 };
 use ai_agents_process::ProcessProcessor;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
@@ -77,6 +80,7 @@ pub struct AgentBuilder {
     spawner_registry: Option<Arc<crate::spawner::AgentRegistry>>,
     persona_manager: Option<Arc<ai_agents_persona::PersonaManager>>,
     persona_templates: Option<Arc<ai_agents_persona::PersonaTemplateRegistry>>,
+    observability_manager: Option<Arc<ObservabilityManager>>,
 }
 
 impl AgentBuilder {
@@ -114,6 +118,7 @@ impl AgentBuilder {
             spawner_registry: None,
             persona_manager: None,
             persona_templates: None,
+            observability_manager: None,
         }
     }
 
@@ -157,6 +162,7 @@ impl AgentBuilder {
             spawner_registry: None,
             persona_manager: None,
             persona_templates: None,
+            observability_manager: None,
         }
     }
 
@@ -639,6 +645,11 @@ impl AgentBuilder {
         self
     }
 
+    pub fn observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
+        self.observability_manager = Some(manager);
+        self
+    }
+
     pub fn streaming(mut self, enabled: bool) -> Self {
         let mut config = self.streaming.unwrap_or_default();
         config.enabled = enabled;
@@ -915,6 +926,53 @@ impl AgentBuilder {
             ));
         }
 
+        let observability_manager = if let Some(manager) = self.observability_manager.take() {
+            Some(manager)
+        } else if let Some(ref spec) = self.spec {
+            if spec.observability.enabled {
+                spec.observability
+                    .validate()
+                    .map_err(|e| AgentError::Config(e.to_string()))?;
+                Some(ObservabilityManager::new(spec.observability.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(ref manager) = observability_manager {
+            let model_by_alias: HashMap<String, String> = self
+                .spec
+                .as_ref()
+                .map(|spec| {
+                    let mut models: HashMap<String, String> = spec
+                        .llms
+                        .iter()
+                        .map(|(alias, config)| (alias.clone(), config.model.clone()))
+                        .collect();
+                    if let Some(config) = spec.llm.as_config() {
+                        models.insert("default".to_string(), config.model.clone());
+                    }
+                    models
+                })
+                .unwrap_or_default();
+            llm_registry = llm_registry.map_providers(|alias, provider| {
+                let provider_name = provider.provider_name().to_string();
+                let model = model_by_alias
+                    .get(alias)
+                    .cloned()
+                    .unwrap_or_else(|| alias.to_string());
+                Arc::new(ObservedLLMProvider::new(
+                    provider,
+                    Arc::clone(manager),
+                    Some(alias.to_string()),
+                    provider_name,
+                    model,
+                )) as Arc<dyn LLMProvider>
+            });
+        }
+
         // Create memory after LLM registry is ready (needed for CompactingMemory summarizer)
         let memory = self.memory.unwrap_or_else(|| {
             if let Some(ref spec) = self.spec {
@@ -971,6 +1029,12 @@ impl AgentBuilder {
                 let evolve_tool = ai_agents_persona::PersonaEvolveTool::new(pm.clone());
                 let _ = tools.register(Arc::new(evolve_tool));
             }
+        }
+
+        if let Some(ref manager) = observability_manager {
+            tools = tools.map_tools(|tool| {
+                Arc::new(ObservedTool::new(tool, Arc::clone(manager))) as Arc<dyn Tool>
+            });
         }
 
         let relationship_manager: Option<Arc<RelationshipManager>> =
@@ -1190,7 +1254,21 @@ impl AgentBuilder {
         }
 
         // Configure hooks
-        if let Some(hooks) = self.hooks {
+        if let Some(manager) = observability_manager {
+            agent = agent.with_observability(Arc::clone(&manager));
+            let observability_hooks: Arc<dyn AgentHooks> =
+                Arc::new(ObservabilityHooks::new(manager));
+            let hooks: Arc<dyn AgentHooks> = if let Some(user_hooks) = self.hooks {
+                Arc::new(
+                    CompositeHooks::new()
+                        .add(user_hooks)
+                        .add(observability_hooks),
+                )
+            } else {
+                observability_hooks
+            };
+            agent = agent.with_hooks(hooks);
+        } else if let Some(hooks) = self.hooks {
             agent = agent.with_hooks(hooks);
         }
 

@@ -28,6 +28,7 @@ ai-agents-reasoning = { workspace = true }
 ai-agents-disambiguation = { workspace = true }
 ai-agents-persona = { workspace = true }
 ai-agents-relationships = { workspace = true }
+ai-agents-observability = { workspace = true }
 ai-agents-facts = { workspace = true }
 ai-agents-template = { workspace = true }
 ai-agents-runtime = { workspace = true }

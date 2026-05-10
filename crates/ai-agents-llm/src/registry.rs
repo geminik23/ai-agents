@@ -67,6 +67,29 @@ impl LLMRegistry {
         self.providers.keys().cloned().collect()
     }
 
+    pub fn default_alias(&self) -> &str {
+        &self.default_alias
+    }
+
+    pub fn router_alias(&self) -> Option<&str> {
+        self.router_alias.as_deref()
+    }
+
+    pub fn map_providers<F>(&self, mut f: F) -> LLMRegistry
+    where
+        F: FnMut(&str, Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider>,
+    {
+        let mut mapped = LLMRegistry::new();
+        for (alias, provider) in &self.providers {
+            mapped.register(alias.clone(), f(alias, provider.clone()));
+        }
+        mapped.set_default(self.default_alias.clone());
+        if let Some(router) = &self.router_alias {
+            mapped.set_router(router.clone());
+        }
+        mapped
+    }
+
     pub fn len(&self) -> usize {
         self.providers.len()
     }

@@ -30,6 +30,11 @@ use ai_agents_memory::{
     CompressResult, EvictionReason, Memory, MemoryBudgetEvent, MemoryCompressEvent,
     MemoryEvictEvent, MemoryTokenBudget, OverflowStrategy,
 };
+use ai_agents_observability::{
+    ObservabilityManager, ObservationPurpose, SpanContext,
+    new_session_id as new_observation_session_id, resolve_language_from_context,
+    with_observation_context, with_observation_purpose,
+};
 use ai_agents_process::{ProcessData, ProcessProcessor};
 use ai_agents_reasoning::{
     CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
@@ -160,6 +165,8 @@ pub struct RuntimeAgent {
     current_session_id: RwLock<Option<String>>,
     /// Relationship manager for actor-scoped social memory.
     relationship_manager: Option<Arc<RelationshipManager>>,
+    /// Observability manager for traces, metrics, reports, and exports.
+    observability_manager: Option<Arc<ObservabilityManager>>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -180,6 +187,7 @@ impl std::fmt::Debug for RuntimeAgent {
             .field("reflection_enabled", &self.reflection_config.enabled)
             .field("declared_tool_ids", &self.declared_tool_ids)
             .field("has_persona", &self.persona_manager.is_some())
+            .field("has_observability", &self.observability_manager.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -267,6 +275,7 @@ impl RuntimeAgent {
             session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
             current_session_id: RwLock::new(None),
             relationship_manager: None,
+            observability_manager: None,
         }
     }
 
@@ -299,6 +308,28 @@ impl RuntimeAgent {
     pub fn with_relationships(mut self, manager: Arc<RelationshipManager>) -> Self {
         self.relationship_manager = Some(manager);
         self
+    }
+
+    pub fn with_observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
+        self.observability_manager = Some(manager);
+        self
+    }
+
+    pub fn observability(&self) -> Option<Arc<ObservabilityManager>> {
+        self.observability_manager.clone()
+    }
+
+    async fn export_observability_if_configured(&self) {
+        let Some(manager) = self.observability_manager.as_ref() else {
+            return;
+        };
+        let export = &manager.config().export;
+        if !export.write_report && !export.write_raw_events {
+            return;
+        }
+        if let Err(error) = manager.export().await {
+            warn!(error = %error, "Observability export failed");
+        }
     }
 
     /// Returns the configured relationship manager, if relationship memory is enabled.
@@ -341,17 +372,47 @@ impl RuntimeAgent {
         context
     }
 
+    fn build_observation_context(&self, actor_id: Option<String>) -> Option<SpanContext> {
+        let manager = self.observability_manager.as_ref()?;
+        let session_id = {
+            let mut current = self.current_session_id.write();
+            if current.is_none() {
+                *current = Some(new_observation_session_id());
+            }
+            current.clone()
+        };
+        let context = self.build_context_with_overlays();
+        let language = resolve_language_from_context(manager.config(), &context);
+        Some(
+            SpanContext::new_root(self.info.id.clone())
+                .with_actor(actor_id.or_else(|| self.effective_actor_id()))
+                .with_session(session_id)
+                .with_state(self.current_state())
+                .with_language(Some(language)),
+        )
+    }
+
     fn chat_with_actor_context_boxed<'a>(
         &'a self,
         input: &'a str,
         actor_context: crate::TurnActorContext,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
         Box::pin(async move {
-            scope_actor_context(
-                actor_context,
-                Box::pin(async move { self.run_loop(input).await }),
-            )
-            .await
+            let actor_id = actor_context.effective_actor_id().map(str::to_string);
+            let run = async move {
+                scope_actor_context(
+                    actor_context,
+                    Box::pin(async move { self.run_loop(input).await }),
+                )
+                .await
+            };
+            let result = if let Some(context) = self.build_observation_context(actor_id) {
+                with_observation_context(context, run).await
+            } else {
+                run.await
+            };
+            self.export_observability_if_configured().await;
+            result
         })
     }
 
@@ -2442,7 +2503,12 @@ impl RuntimeAgent {
             let available_skills = self.get_available_skills();
             let skill_ids: Vec<&str> = available_skills.iter().map(|s| s.id.as_str()).collect();
 
-            if let Some(skill_id) = router.select_skill_filtered(input, &skill_ids).await? {
+            if let Some(skill_id) = with_observation_purpose(
+                ObservationPurpose::SkillRouting,
+                router.select_skill_filtered(input, &skill_ids),
+            )
+            .await?
+            {
                 info!(skill_id = %skill_id, "Skill selected");
 
                 let skill = router
@@ -2585,9 +2651,11 @@ impl RuntimeAgent {
                 "Skill reasoning/reflection config"
             );
 
-            let response = executor
-                .execute(skill, input, serde_json::json!({}))
-                .await?;
+            let response = with_observation_purpose(
+                ObservationPurpose::SkillPrompt,
+                executor.execute(skill, input, serde_json::json!({})),
+            )
+            .await?;
 
             if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
                 let should_reflect = self
@@ -5614,16 +5682,22 @@ Respond in JSON format:
                 let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
                     self.recovery_manager
                         .with_retry("llm_call", None, || async {
-                            llm.complete(&messages, None)
-                                .await
-                                .map_err(|e| e.classify())
+                            with_observation_purpose(
+                                ObservationPurpose::MainResponse,
+                                llm.complete(&messages, None),
+                            )
+                            .await
+                            .map_err(|e| e.classify())
                         })
                         .await
                         .map_err(|e| AgentError::LLM(e.to_string()))
                 } else {
-                    llm.complete(&messages, None)
-                        .await
-                        .map_err(|e| AgentError::LLM(e.to_string()))
+                    with_observation_purpose(
+                        ObservationPurpose::MainResponse,
+                        llm.complete(&messages, None),
+                    )
+                    .await
+                    .map_err(|e| AgentError::LLM(e.to_string()))
                 };
 
                 match primary_result {
@@ -5641,9 +5715,12 @@ Respond in JSON format:
                                     fallback_llm, e
                                 ))
                             })?;
-                            fb.complete(&messages, None)
-                                .await
-                                .map_err(|e| AgentError::LLM(e.to_string()))?
+                            with_observation_purpose(
+                                ObservationPurpose::MainResponse,
+                                fb.complete(&messages, None),
+                            )
+                            .await
+                            .map_err(|e| AgentError::LLM(e.to_string()))?
                         }
                         LLMFailureAction::FallbackResponse { message } => {
                             warn!(
@@ -5938,7 +6015,12 @@ Respond in JSON format:
 
                 let content = if reflection_active {
                     // Use blocking call so reflection can retry without partial output
-                    let response = match llm.complete(&messages, None).await {
+                    let response = match with_observation_purpose(
+                        ObservationPurpose::MainResponse,
+                        llm.complete(&messages, None),
+                    )
+                    .await
+                    {
                         Ok(r) => r,
                         Err(e) => {
                             yield StreamChunk::error(e.to_string());
@@ -5950,7 +6032,12 @@ Respond in JSON format:
                     response.content.trim().to_string()
                 } else {
                     // Streaming LLM call
-                    let llm_stream = match llm.complete_stream(&messages, None).await {
+                    let llm_stream = match with_observation_purpose(
+                        ObservationPurpose::MainResponse,
+                        llm.complete_stream(&messages, None),
+                    )
+                    .await
+                    {
                         Ok(s) => s,
                         Err(e) => {
                             yield StreamChunk::error(e.to_string());
@@ -6638,14 +6725,37 @@ Respond in JSON format:
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>> {
         info!(input_len = input.len(), "Starting streaming chat");
-        Ok(self.run_loop_stream(input))
+        let inner = self.run_loop_stream(input);
+        if let Some(context) = self.build_observation_context(None) {
+            let stream: Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> =
+                Box::pin(async_stream::stream! {
+                    let mut inner = inner;
+                    loop {
+                        let next = with_observation_context(context.clone(), inner.next()).await;
+                        match next {
+                            Some(chunk) => yield chunk,
+                            None => break,
+                        }
+                    }
+                    self.export_observability_if_configured().await;
+                });
+            Ok(stream)
+        } else {
+            Ok(inner)
+        }
     }
 }
 
 #[async_trait]
 impl Agent for RuntimeAgent {
     async fn chat(&self, input: &str) -> Result<AgentResponse> {
-        self.run_loop(input).await
+        let result = if let Some(context) = self.build_observation_context(None) {
+            with_observation_context(context, self.run_loop(input)).await
+        } else {
+            self.run_loop(input).await
+        };
+        self.export_observability_if_configured().await;
+        result
     }
 
     fn info(&self) -> AgentInfo {
