@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.0.0-rc.13
+
+### Added
+- LLM capability overrides: YAML can declare function calling, vision, and JSON mode support for providers and OpenAI-compatible servers, and those overrides now drive capability checks
+- Ollama provider options: YAML can pass context window, GPU layer, and keep-alive settings through native Ollama provider config, with named values merged into request bodies
+- Multi-provider routing facade: multi-LLM routing is available through the main crate without a direct provider-crate dependency
+- Observability and tracing: YAML can collect privacy-safe latency, token, cost, trace, report, CSV, raw event, and Prometheus text metrics across chat, skills, process stages, facts, relationships, HITL, reasoning, and orchestration
+- Observability pricing files: JSON and YAML pricing tables can be shared across agents with inline overrides
+
+### Changed
+- Observability privacy: approval metadata, tags, and errors are stored as safe labels or redacted summaries instead of debug strings
+- Observability reporting: reports and exports drain pending events before metrics are read
+
+### Fixed
+- Ollama errors: invalid extra body shapes are rejected and connection or model failures show actionable serve and pull hints
+- Observability provider coverage: process, spawner, and auto-spawned agent paths no longer bypass observed providers
+- Observability attribution and trace continuity: process stages, clarification calls, delegation, registry broadcast, and concurrent orchestration now keep distinct purpose labels and connected traces
+- Observability config and export: token count flags, pricing files, unknown-price error tagging, JSON raw events, Prometheus labels, and JSON export path collisions now behave as documented
+- Observability privacy leaks: errors, tags, approval triggers, and approval results no longer expose raw details by default
+
+---
+
 ## 1.0.0-rc.12
 
 ### Added

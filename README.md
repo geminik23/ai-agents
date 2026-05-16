@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.12** — Under active development. Stable `v1.0.0` is planned for release by mid-July 2026 at the latest. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.13** — Under active development. Stable `v1.0.0` is planned for release by mid-July 2026 at the latest. APIs and YAML schema may change between minor versions.
 
 ## Features
 
@@ -32,7 +32,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Multi-agent systems** - dynamic agent spawning, agent registry, actor-aware inter-agent messaging, and router/pipeline/concurrent/group chat/handoff orchestration
 - **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming, context injection, and actor/relationship inspection
 - **Reasoning, reflection & disambiguation** - chain-of-thought, ReAct, plan-and-execute, self-evaluation, ambiguity detection, and clarification
-- **Safety & control** - error recovery with backoff, tool security (rate limits, domain restrictions), and human-in-the-loop approvals with multi-language messages
+- **Safety, control & observability** - error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
 - **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
@@ -41,7 +41,7 @@ See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.12"
+ai-agents = "1.0.0-rc.13"
 ```
 
 ## Quick Start
@@ -130,7 +130,7 @@ See the [examples/](examples/) directory for more.
 
 ```sh
 # Install from crates.io
-cargo install ai-agents-cli --version 1.0.0-rc.12
+cargo install ai-agents-cli --version 1.0.0-rc.13
 
 # Or run directly from source
 cargo run -p ai-agents-cli -- run agent.yaml

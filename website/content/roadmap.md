@@ -25,7 +25,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.10** | CLI context injection (`--context`, `--context-file`, `--plain`) and ratatui TUI with side panels, streaming, themes |
 | **rc.11** | Session management and key facts - cross-session actor memory, key facts extraction, session metadata, and CLI/TUI actor commands |
 | **rc.12** | Relationship memory - actor-scoped trust, sentiment, rapport, two-sided relationships, actor-aware inter-agent context, and relationship inspection in the REPL/TUI |
-| **Unreleased** | Observability and tracing - privacy-safe latency, token, cost, trace, report, CSV, JSONL, and Prometheus text export |
+| **rc.13** | LLM provider enhancements and observability - capability overrides, Ollama options, privacy-safe tracing, cost metrics, reports, raw events, and Prometheus text export |
 
 ---
 
@@ -54,7 +54,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Session Management + Key Facts** | Cross-session actor memory, key facts extraction, and session metadata | ✅ Done (rc.11) |
 | **Relationship Memory** | Actor-scoped trust, sentiment, rapport, notable relationship events, two-sided relationships, and actor-aware inter-agent context | ✅ Done (rc.12) |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | ✅ Done (rc.13) |
-| **Observability & Tracing** | Privacy-safe per-call latency, token usage, cost estimates, trace context, reports, and exporters | Planned (rc.13) |
+| **Observability & Tracing** | Privacy-safe per-call latency, token usage, cost estimates, trace context, reports, and exporters | ✅ Done (rc.13) |
 | **Evaluation Framework** | YAML-driven scenario runner with assertions, LLM judge, and metrics | Planned (rc.14) |
 | **Runtime Latency Optimization** | Safe speculative LLM scheduling, pre-response transitions, parallel post-turn memory updates, and orchestration aggregation speedups | Planned (rc.15) |
 | **Built-in Tool Expansion** | Safe search tools, split file read/write/edit tools, interactive questions, session todos, bounded waits, and web retrieval primitives | Planned (rc.16) |

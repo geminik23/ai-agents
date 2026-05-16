@@ -2057,6 +2057,135 @@ disambiguation:
 
 ---
 
+## Observability & Tracing
+
+The `observability` block enables privacy-safe latency, token, cost, and trace metrics. It is disabled by default and wraps LLM providers and tools when enabled, so normal chat, skills, process stages, disambiguation detection and clarification, facts, relationships, state transitions, HITL localization, reasoning, and orchestration calls are measured without application code.
+
+```yaml
+observability:
+  enabled: true
+  latency:
+    track_llm: true
+    track_tools: true
+    track_skills: true
+    track_orchestration: true
+    track_hitl: true
+    detailed_breakdown: false
+  tokens:
+    count_input: true
+    count_output: true
+    estimate_when_missing: true
+    breakdown_by_component: false
+  cost:
+    enabled: true
+    unknown_price_policy: omit
+    pricing_file: ./pricing.yaml
+    pricing:
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+  language:
+    paths: [detected_language, input.language, user.language]
+    fallback: unknown
+  aggregation:
+    dimensions: [model, purpose, language, state]
+    percentiles: [0.5, 0.9, 0.95, 0.99]
+    window_size: 1000
+  privacy:
+    include_prompts: false
+    include_responses: false
+    include_tool_args: false
+    include_tool_outputs: false
+    max_text_chars: 0
+    hash_inputs: true
+    redact_keys: [api_key, authorization, token, password, secret]
+    redact_paths: [actor_facts, relationship_memory, persona.secrets]
+  export:
+    formats: [json, csv]
+    path: ./observability_data/
+    write_report: true
+    write_raw_events: false
+    raw_events_format: jsonl
+  buffer:
+    event_buffer: 4096
+    raw_event_limit: 10000
+    drop_on_full: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Enable telemetry collection |
+| `latency.track_llm` | `bool` | `true` | Record LLM call duration |
+| `latency.track_tools` | `bool` | `true` | Record tool call duration |
+| `latency.track_skills` | `bool` | `true` | Record skill lifecycle events |
+| `latency.track_orchestration` | `bool` | `true` | Record multi-agent orchestration lifecycle events |
+| `latency.track_hitl` | `bool` | `true` | Record human approval lifecycle events |
+| `tokens.count_input` | `bool` | `true` | Include input tokens in token totals |
+| `tokens.count_output` | `bool` | `true` | Include output tokens in token totals |
+| `tokens.estimate_when_missing` | `bool` | `true` | Estimate token usage when provider usage is absent and mark the source as estimated |
+| `tokens.breakdown_by_component` | `bool` | `false` | Reserved for finer component tables; current reports group by configured dimensions |
+| `cost.enabled` | `bool` | `true` | Estimate cost from token usage and configured pricing |
+| `cost.unknown_price_policy` | `enum` | `omit` | `omit`, `zero`, or `error`; `error` records a cost error tag but does not fail the turn |
+| `cost.pricing_file` | `string?` | `null` | Optional JSON/YAML pricing map resolved relative to the agent YAML file |
+| `cost.pricing` | `map` | `{}` | Provider/model pricing keyed as `provider/model`; inline values override `pricing_file` |
+| `language.paths` | `list` | common language paths | Dotted context paths used for the `language` dimension |
+| `aggregation.dimensions` | `list` | `[model, purpose]` | Dimensions for aggregate tables; supports `agent`, `actor`, `model`, `provider`, `alias`, `purpose`, `language`, `state`, `tool`, `skill`, `orchestration_pattern`, and `status` |
+| `aggregation.percentiles` | `list` | `[0.5, 0.9, 0.95, 0.99]` | Percentiles reported for latency |
+| `aggregation.window_size` | `usize` | `1000` | Rolling event window used for aggregate metrics |
+| `privacy.include_prompts` | `bool` | `false` | Retain redacted prompt text in raw event payloads |
+| `privacy.include_responses` | `bool` | `false` | Retain redacted response text in raw event payloads |
+| `privacy.include_tool_args` | `bool` | `false` | Retain redacted tool arguments |
+| `privacy.include_tool_outputs` | `bool` | `false` | Retain redacted tool output |
+| `privacy.max_text_chars` | `usize` | `0` | Maximum retained characters for text fields; `0` means no raw text retention |
+| `privacy.hash_inputs` | `bool` | `true` | Store stable text hashes for correlation without raw text |
+| `export.formats` | `list` | `[json]` | Output formats: `json`, `csv`, `jsonl`, `prometheus` |
+| `export.path` | `string` | `./observability_data/` | Directory or file path for exported reports and events |
+| `export.write_report` | `bool` | `true` | Write aggregate reports after each chat turn when observability is enabled |
+| `export.write_raw_events` | `bool` | `false` | Write raw event files; use with privacy settings carefully |
+| `export.raw_events_format` | `enum` | `jsonl` | Raw event export format: `jsonl` or `json` |
+| `buffer.event_buffer` | `usize` | `4096` | Bounded in-memory event channel capacity |
+| `buffer.raw_event_limit` | `usize` | `10000` | Maximum raw events retained for raw export |
+| `buffer.drop_on_full` | `bool` | `true` | Drop and count events when buffers are full instead of blocking |
+
+### Pricing file example
+
+Use `cost.pricing_file` when several agents should share one pricing table. Relative paths are resolved from the agent YAML file directory. Inline `cost.pricing` entries override file-loaded entries with the same key.
+
+Agent YAML:
+
+```yaml
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    pricing_file: ./pricing.yaml
+    unknown_price_policy: omit
+    pricing:
+      # Inline override for this agent. This wins over pricing.yaml.
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+```
+
+`pricing.yaml`:
+
+```yaml
+openai/gpt-5.4-mini:
+  input_per_1k: 0.00075
+  output_per_1k: 0.0045
+openai/gpt-5.4-nano:
+  input_per_1k: 0.00025
+  output_per_1k: 0.0015
+```
+
+Raw prompts, responses, tool arguments, tool outputs, context values, actor facts, relationship memory, persona secrets, approval details, tags, and error text are not retained by default. If raw payloads are enabled, configured keys and dotted paths are redacted recursively, text values are truncated on Unicode character boundaries, and stable hashes can be retained for correlation.
+
+Common `purpose` labels include `main_response`, `skill_routing`, `skill_prompt`, `process_detect`, `process_extract`, `process_validate`, `process_transform`, `disambiguation_detection`, `disambiguation_clarification`, `state_transition_evaluation`, `context_extraction`, `summarization`, `reflection_decision`, `reflection_evaluation`, `plan_generation`, `plan_step`, `facts_extraction`, `relationship_update`, `hitl_localization`, `orchestration_routing`, `orchestration_aggregation`, and `orchestration_conversation`.
+
+Prometheus support currently renders text exposition output and writes it to a `.prom` file when `export.formats` includes `prometheus`. There is no built-in scrape server in YAML or CLI mode yet. To connect Prometheus today, either export a `.prom` file for the node_exporter textfile collector or expose `agent.observability().render_prometheus()` from your own Rust HTTP endpoint.
+
+---
+
 ## Streaming & Parallel Tools
 
 ### `streaming`

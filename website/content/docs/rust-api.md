@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.12"
+ai-agents = "1.0.0-rc.13"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,7 +35,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0.0-rc.12", features = ["full"] }
+ai-agents = { version = "1.0.0-rc.13", features = ["full"] }
 ```
 
 ---
@@ -681,10 +681,10 @@ Session persistence requires a storage backend. Enable one via feature flags:
 
 ```toml
 # SQLite (file-based, good for single-server)
-ai-agents = { version = "1.0.0-rc.12", features = ["sqlite"] }
+ai-agents = { version = "1.0.0-rc.13", features = ["sqlite"] }
 
 # Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.12", features = ["redis-storage"] }
+ai-agents = { version = "1.0.0-rc.13", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -715,11 +715,88 @@ agent.load_from(storage.as_ref(), "my-session").await?;
 
 ---
 
+## Observability
+
+When `observability.enabled: true` is present in YAML, the builder attaches an `ObservabilityManager` to the runtime. You can read aggregate reports, inspect metrics, export configured files from Rust, or provide your own shared manager when multiple agents should report into one trace and metrics window.
+
+```rust
+use ai_agents::{Agent, AgentBuilder, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = AgentBuilder::from_yaml_file("agent.yaml")?
+        .auto_configure_llms()?
+        .auto_configure_features()?
+        .auto_configure_mcp().await?
+        .auto_configure_spawner().await?
+        .build()?;
+
+    agent.chat("Hello").await?;
+
+    if let Some(obs) = agent.observability() {
+        let report = obs.generate_report();
+        println!("LLM calls: {}", report.summary.total_llm_calls);
+        println!("Tokens: {}", report.summary.total_tokens);
+        println!("Cost: ${:.6}", report.summary.total_cost_usd);
+        obs.export().await?;
+    }
+
+    Ok(())
+}
+```
+
+You can also provide a manager programmatically when building an agent:
+
+```rust
+use ai_agents::observability::{ObservabilityConfig, ObservabilityManager};
+use std::path::Path;
+use std::sync::Arc;
+
+let mut config = ObservabilityConfig::default();
+config.enabled = true;
+config.export.write_report = true;
+
+// YAML-loaded agents resolve observability.cost.pricing_file automatically.
+// Rust-provided configs should call this helper when pricing_file is set.
+let config = config.with_pricing_file_loaded(Some(Path::new(".")))?;
+let manager = ObservabilityManager::new(config);
+
+let agent = AgentBuilder::new()
+    .system_prompt("You are helpful.")
+    .llm(llm)
+    .observability(Arc::clone(&manager))
+    .build()?;
+```
+
+`ObservabilityConfig::with_pricing_file_loaded()` accepts JSON or YAML maps shaped like `cost.pricing`. Inline `cost.pricing` values override entries loaded from the file. When `base_dir` is `Some`, relative paths are resolved from that directory; when it is `None`, they resolve from the process working directory.
+
+`ObservabilityManager::generate_report()` drains pending events before returning an `ObservabilityReport`. Use `report.by_purpose` to compare operation costs such as `main_response`, `process_detect`, `disambiguation_clarification`, `facts_extraction`, or `orchestration_aggregation`. `ObservabilityManager::export()` writes the configured report, CSV aggregate, JSONL or JSON raw events, and Prometheus text files.
+
+`ObservabilityManager::render_prometheus()` returns Prometheus text exposition format as a string. The framework does not start a scrape server for you yet. To connect Prometheus in a Rust host, expose that string from your own `/metrics` HTTP route or write it to a `.prom` file for the node_exporter textfile collector.
+
+Key exported types live under `ai_agents::observability`: `ObservabilityConfig`, `ObservabilityManager`, `ObservabilityReport`, `AggregatedMetrics`, `ObservationEvent`, `ObservationPurpose`, `SpanContext`, `ObservedLLMProvider`, `ObservedTool`, `ObservabilityHooks`, `with_observation_context`, `with_observation_purpose`, and `with_updated_observation_context()`.
+
+### Extending Observability
+
+Rust hosts can extend observability at a few different layers:
+
+| Layer | Use when | Types |
+|-------|----------|-------|
+| LLM wrapper | You want an LLM provider measured outside the normal builder path | `ObservedLLMProvider` |
+| Tool wrapper | You want a tool measured outside the normal builder path | `ObservedTool` |
+| Lifecycle hooks | You want state, HITL, memory, persona, facts, relationship, or orchestration events | `ObservabilityHooks` with `CompositeHooks` |
+| Task-local context | You spawn tasks or run nested work and need trace continuity | `with_observation_context`, `with_observation_purpose`, `SpanContext` |
+| Shared manager | You want multiple agents to report into one metrics window | `AgentBuilder::observability(manager)` |
+
+Some internal feature crates avoid depending on `ai-agents-observability` directly to prevent dependency cycles. For those cases, the runtime uses small observer adapter traits, such as process-stage and clarification observers, then implements those observers with observability in `ai-agents-runtime`.
+
+---
+
 ## Full API Reference
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.12)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.13)**
 
 ---
 

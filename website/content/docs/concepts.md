@@ -649,6 +649,44 @@ hitl:
 
 ---
 
+## Observability & Tracing
+
+Observability turns agent execution into structured metrics and traces. When `observability.enabled: true`, the builder creates an `ObservabilityManager`, wraps registered LLM providers and tools, and composes `ObservabilityHooks` with any user hooks already configured in Rust.
+
+The result is broader than hook-only logging. LLM and tool wrappers see calls from normal chat, skill routing, skill prompt steps, process stages, disambiguation detection and clarification, reflection, planning, facts extraction, relationship updates, HITL localization, state actions, context extraction, and multi-agent orchestration. Lifecycle hooks add state transitions, approval events, memory compression, persona events, facts events, relationship events, and orchestration milestones.
+
+Trace context is task-local and actor-aware. A parent agent turn creates the root trace, child agents derive child contexts with the same trace ID, and concurrent registry calls clone the context into spawned tasks. Process output can update language context before downstream main LLM events are recorded, so language aggregations reflect the current turn when detection is configured.
+
+Purpose labels are designed for cost and latency attribution. For example, process stages can appear as `process_detect`, `process_extract`, `process_validate`, or `process_transform`, while ambiguity flows separate `disambiguation_detection` from `disambiguation_clarification`.
+
+Privacy is safe by default. Raw prompts, responses, tool arguments, tool outputs, context values, actor facts, relationship memory, persona secrets, approval details, tags, and error text are not stored unless explicitly enabled. When raw payloads are enabled, configured keys and dotted paths are redacted recursively and text is truncated on Unicode character boundaries.
+
+```yaml
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [agent, model, purpose, language, state, status]
+  privacy:
+    include_prompts: false
+    include_responses: false
+    hash_inputs: true
+  export:
+    formats: [json, csv]
+    path: ./observability_data/
+    write_report: true
+```
+
+A Rust host can also read reports directly:
+
+```rust
+if let Some(obs) = agent.observability() {
+    let report = obs.generate_report();
+    println!("LLM calls: {}", report.summary.total_llm_calls);
+}
+```
+
+---
+
 ## Hooks & Extensibility
 
 The `AgentHooks` trait gives you lifecycle callbacks: before/after chat, before/after tool calls, on state transitions, on errors, and more. Implement the trait and pass your hooks when building the agent to add logging, metrics, custom routing, or any side-effect you need.
