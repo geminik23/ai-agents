@@ -1,6 +1,7 @@
 use ai_agents_core::{AgentError, AgentResponse, Result};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_llm::{ChatMessage, LLMProvider};
+use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use ai_agents_state::{
     ChatStyle, GroupChatStateConfig, MaxIterationsAction, TerminationMethod, TurnMethod,
 };
@@ -267,10 +268,12 @@ async fn select_next_speaker(
         )),
     ];
 
-    let response = llm
-        .complete(&messages, None)
-        .await
-        .map_err(|e| AgentError::LLM(format!("Speaker selection failed: {}", e)))?;
+    let response = with_observation_purpose(
+        ObservationPurpose::OrchestrationConversation,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Speaker selection failed: {}", e)))?;
 
     let raw = response.content.trim().to_lowercase();
 
@@ -391,10 +394,12 @@ async fn check_consensus(llm: &dyn LLMProvider, transcript: &[ChatTurn]) -> Resu
         ChatMessage::user(&transcript_text),
     ];
 
-    let response = llm
-        .complete(&messages, None)
-        .await
-        .map_err(|e| AgentError::LLM(format!("Consensus check failed: {}", e)))?;
+    let response = with_observation_purpose(
+        ObservationPurpose::OrchestrationConversation,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Consensus check failed: {}", e)))?;
 
     Ok(response.content.trim().to_lowercase().starts_with("yes"))
 }

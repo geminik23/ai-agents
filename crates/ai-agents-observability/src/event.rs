@@ -2,22 +2,33 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Completed observation record that can be aggregated, reported, or exported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationEvent {
+    /// Trace ID shared by all spans in the same operation.
     pub trace_id: String,
+    /// Unique ID for this event span.
     pub span_id: String,
+    /// Parent span ID when this event is nested under another span.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_span_id: Option<String>,
+    /// Chat turn ID for the agent call that produced this event.
     pub turn_id: String,
+    /// Agent that produced this event.
     pub agent_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// What kind of operation produced this event.
     pub event_type: EventType,
+    /// Why the operation was executed.
     pub purpose: ObservationPurpose,
+    /// Success, error, cancellation, or skipped state.
     pub status: EventStatus,
+    /// UTC timestamp when the event was recorded.
     pub timestamp: DateTime<Utc>,
+    /// Duration of the measured operation in milliseconds.
     pub duration_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<ObservationTokenUsage>,
@@ -25,14 +36,17 @@ pub struct ObservationEvent {
     pub cost: Option<CostEstimate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ObservationError>,
+    /// Safe grouping fields used by aggregators and exporters.
     #[serde(default)]
     pub dimensions: HashMap<String, String>,
+    /// Extra safe labels that survived redaction.
     #[serde(default)]
     pub tags: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
 }
 
+/// Operation category for an observation event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
@@ -78,6 +92,7 @@ pub enum EventType {
     Error,
 }
 
+/// Reason an observed operation ran, used for cost and latency attribution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationPurpose {
@@ -110,6 +125,7 @@ pub enum ObservationPurpose {
 }
 
 impl ObservationPurpose {
+    /// Converts the purpose to the stable snake_case label used in reports.
     pub fn as_label(&self) -> String {
         match self {
             Self::MainResponse => "main_response".to_string(),
@@ -148,6 +164,7 @@ impl Default for ObservationPurpose {
     }
 }
 
+/// Final state of the observed operation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum EventStatus {
@@ -157,15 +174,21 @@ pub enum EventStatus {
     Skipped,
 }
 
+/// Token usage attached to an LLM event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationTokenUsage {
+    /// Input or prompt tokens after token config filters are applied.
     pub input_tokens: u64,
+    /// Output or completion tokens after token config filters are applied.
     pub output_tokens: u64,
+    /// Sum of input and output tokens.
     pub total_tokens: u64,
+    /// Where the token numbers came from.
     pub source: TokenUsageSource,
 }
 
 impl ObservationTokenUsage {
+    /// Creates usage and calculates total_tokens.
     pub fn new(input_tokens: u64, output_tokens: u64, source: TokenUsageSource) -> Self {
         Self {
             input_tokens,
@@ -176,6 +199,7 @@ impl ObservationTokenUsage {
     }
 }
 
+/// Source of token usage for an LLM event.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TokenUsageSource {
@@ -185,6 +209,7 @@ pub enum TokenUsageSource {
     Missing,
 }
 
+/// Estimated USD cost for one observed LLM event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostEstimate {
     pub input_usd: f64,
@@ -193,6 +218,7 @@ pub struct CostEstimate {
     pub source: CostSource,
 }
 
+/// Source of the cost estimate.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CostSource {
@@ -202,13 +228,17 @@ pub enum CostSource {
     Estimated,
 }
 
+/// Redacted error metadata attached to failed observation events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservationError {
+    /// Stable error class used for grouping.
     pub kind: String,
+    /// Redacted or truncated error message.
     pub message: String,
 }
 
 impl ObservationError {
+    /// Creates error metadata before manager-level redaction is applied.
     pub fn new(kind: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),

@@ -4,6 +4,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
+/// Metrics for one group of events with the same dimension values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatedMetrics {
     pub dimensions: HashMap<String, String>,
@@ -14,6 +15,7 @@ pub struct AggregatedMetrics {
     pub cost: CostStats,
 }
 
+/// Latency summary for a group of events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LatencyStats {
     pub min_ms: u64,
@@ -25,6 +27,7 @@ pub struct LatencyStats {
     pub p99_ms: u64,
 }
 
+/// Token totals and averages for a group of events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenStats {
     pub total_input: u64,
@@ -36,6 +39,7 @@ pub struct TokenStats {
     pub missing_events: u64,
 }
 
+/// Cost totals and priced-event counters for a group of events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostStats {
     pub total_usd: f64,
@@ -44,6 +48,7 @@ pub struct CostStats {
     pub unpriced_events: u64,
 }
 
+/// Rolling event window that can aggregate metrics by configured dimensions.
 #[derive(Debug)]
 pub struct MetricsAggregator {
     config: AggregationConfig,
@@ -51,6 +56,7 @@ pub struct MetricsAggregator {
 }
 
 impl MetricsAggregator {
+    /// Creates an aggregator with the configured rolling window size.
     pub fn new(config: AggregationConfig) -> Self {
         Self {
             config,
@@ -58,6 +64,7 @@ impl MetricsAggregator {
         }
     }
 
+    /// Adds one event and evicts oldest events beyond the window size.
     pub fn record(&self, event: ObservationEvent) {
         let mut events = self.events.write();
         events.push_back(event);
@@ -70,6 +77,7 @@ impl MetricsAggregator {
         self.events.read().iter().cloned().collect()
     }
 
+    /// Aggregates using the dimensions from AggregationConfig.
     pub fn aggregate_configured(&self) -> Vec<AggregatedMetrics> {
         self.aggregate_by(&self.config.dimensions)
     }
@@ -80,6 +88,7 @@ impl MetricsAggregator {
     }
 }
 
+/// Aggregates an event slice by an explicit dimension list.
 pub fn aggregate_events(
     events: &[ObservationEvent],
     dimensions: &[AggregationDimension],
@@ -164,6 +173,7 @@ fn build_metrics(
     }
 }
 
+/// Computes deterministic latency percentiles with nearest-rank behavior.
 pub fn latency_stats(values: &[u64]) -> LatencyStats {
     if values.is_empty() {
         return LatencyStats::default();
@@ -197,6 +207,7 @@ pub fn percentile(sorted_values: &[u64], percentile: f64) -> u64 {
     sorted_values[index]
 }
 
+/// Extracts one dimension value from an event.
 pub fn dimension_value(
     event: &ObservationEvent,
     dimension: &AggregationDimension,
@@ -222,6 +233,7 @@ pub fn dimension_value(
     }
 }
 
+/// Adds standard dimensions derived from event type and context fields.
 pub fn enrich_dimensions(event: &mut ObservationEvent) {
     event
         .dimensions

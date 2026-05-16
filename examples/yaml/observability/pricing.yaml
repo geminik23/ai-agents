@@ -1,0 +1,10 @@
+# Shared model pricing for observability examples.
+#
+# Keys are provider/model. Values are USD per 1,000 tokens.
+# Inline observability.cost.pricing entries in an agent YAML override these values.
+openai/gpt-5.4-mini:
+  input_per_1k: 0.00075
+  output_per_1k: 0.0045
+openai/gpt-5.4-nano:
+  input_per_1k: 0.0002
+  output_per_1k: 0.00125

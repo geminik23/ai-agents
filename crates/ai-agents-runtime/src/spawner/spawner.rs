@@ -13,6 +13,7 @@ use crate::RuntimeAgent;
 use crate::spec::AgentSpec;
 use ai_agents_core::{AgentError, AgentStorage, Result};
 use ai_agents_llm::LLMRegistry;
+use ai_agents_observability::ObservabilityManager;
 
 use super::storage::NamespacedStorage;
 
@@ -64,6 +65,9 @@ pub struct AgentSpawner {
     /// Shared LLM regstry - spawned agents reuse these connections.
     llm_registry: Option<LLMRegistry>,
 
+    /// Whether shared LLM providers are already observability-wrapped.
+    llm_registry_observed: bool,
+
     /// Shared storage backend with per-gaent `NamespacedStorage` warpping.
     storage: Option<Arc<dyn AgentStorage>>,
 
@@ -82,6 +86,9 @@ pub struct AgentSpawner {
     /// Tool names that spawned agents are allowed to declare.
     allowed_tools: Option<Vec<String>>,
 
+    /// Shared observability manager for spawned child agents.
+    observability_manager: Option<Arc<ObservabilityManager>>,
+
     /// Monotonic counter for auto-naming.
     counter: AtomicU32,
 
@@ -93,12 +100,14 @@ impl AgentSpawner {
     pub fn new() -> Self {
         Self {
             llm_registry: None,
+            llm_registry_observed: false,
             storage: None,
             shared_context: HashMap::new(),
             max_agents: None,
             name_prefix: None,
             templates: HashMap::new(),
             allowed_tools: None,
+            observability_manager: None,
             counter: AtomicU32::new(1),
             agent_count: AtomicU32::new(0),
         }
@@ -107,6 +116,14 @@ impl AgentSpawner {
     /// Share LLM connections across all spawned agents.
     pub fn with_shared_llms(mut self, registry: LLMRegistry) -> Self {
         self.llm_registry = Some(registry);
+        self.llm_registry_observed = false;
+        self
+    }
+
+    /// Share an LLM registry that is already wrapped by observed providers.
+    pub fn with_shared_observed_llms(mut self, registry: LLMRegistry) -> Self {
+        self.llm_registry = Some(registry);
+        self.llm_registry_observed = true;
         self
     }
 
@@ -163,6 +180,12 @@ impl AgentSpawner {
         self
     }
 
+    /// Share the parent's observability manager with spawned agents.
+    pub fn with_observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
+        self.observability_manager = Some(manager);
+        self
+    }
+
     /// Spawn an agent from a YAML string.
     pub async fn spawn_from_yaml(&self, yaml: &str) -> Result<SpawnedAgent> {
         let mut spec: AgentSpec = serde_yaml::from_str(yaml)?;
@@ -191,7 +214,11 @@ impl AgentSpawner {
 
         // Inject shared LLM registry as a base; spec-specific LLMs override it.
         if let Some(ref shared_reg) = self.llm_registry {
-            builder = builder.llm_registry(shared_reg.clone());
+            builder = if self.llm_registry_observed {
+                builder.observed_llm_registry(shared_reg.clone())
+            } else {
+                builder.llm_registry(shared_reg.clone())
+            };
         }
 
         // Auto-configure spec-specific LLMs only when the spec declares providers.
@@ -201,6 +228,10 @@ impl AgentSpawner {
 
         // Wire up recovery, tool security, process pipeline, and built-in tools.
         builder = builder.auto_configure_features()?;
+
+        if let Some(ref manager) = self.observability_manager {
+            builder = builder.observability(Arc::clone(manager));
+        }
 
         // Shared storage with per-agent namespacing.
         if let Some(ref shared_storage) = self.storage {

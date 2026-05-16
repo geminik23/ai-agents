@@ -398,7 +398,7 @@ pub mod observability {
         Redactor, ReportSummary, SpanContext, SpanGuard, TokenBreakdown, TokenConfig, TokenStats,
         TokenUsageSource, UnknownPricePolicy, current_observation_context,
         resolve_language_from_context, stable_hash, truncate_chars, with_observation_context,
-        with_observation_purpose,
+        with_observation_purpose, with_updated_observation_context,
     };
 }
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use ai_agents_core::{AgentError, AgentResponse, Result};
 use ai_agents_llm::{ChatMessage, LLMProvider};
+use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use ai_agents_state::{
     AggregationConfig, AggregationStrategy, TiebreakerStrategy, VoteConfig, VoteMethod,
 };
@@ -93,10 +94,12 @@ async fn synthesize_with_llm(
         )),
     ];
 
-    let response = llm
-        .complete(&messages, None)
-        .await
-        .map_err(|e| AgentError::LLM(format!("Synthesis LLM failed: {}", e)))?;
+    let response = with_observation_purpose(
+        ObservationPurpose::OrchestrationAggregation,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Synthesis LLM failed: {}", e)))?;
 
     Ok(AgentResponse::new(response.content))
 }
@@ -130,10 +133,12 @@ async fn vote_with_llm(
                 ChatMessage::user(&resp.content),
             ];
 
-            let extraction = llm
-                .complete(&messages, None)
-                .await
-                .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
+            let extraction = with_observation_purpose(
+                ObservationPurpose::OrchestrationAggregation,
+                llm.complete(&messages, None),
+            )
+            .await
+            .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
 
             let weight = match method {
                 VoteMethod::Weighted => agent_weights.get(&result.agent_id).copied().unwrap_or(1.0),
@@ -243,10 +248,12 @@ async fn resolve_tie_with_llm(llm: &dyn LLMProvider, tied_choices: &[String]) ->
         )),
     ];
 
-    let response = llm
-        .complete(&messages, None)
-        .await
-        .map_err(|e| AgentError::LLM(format!("Tiebreaker LLM failed: {}", e)))?;
+    let response = with_observation_purpose(
+        ObservationPurpose::OrchestrationAggregation,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Tiebreaker LLM failed: {}", e)))?;
 
     let raw = response.content.trim().to_string();
 

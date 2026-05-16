@@ -3,6 +3,7 @@ use std::time::Instant;
 
 use ai_agents_core::{AgentError, Result};
 use ai_agents_llm::LLMProvider;
+use ai_agents_observability::{current_observation_context, with_observation_context};
 use ai_agents_state::{AggregationConfig, ConcurrentAgentRef, PartialFailureAction};
 use tokio::task::JoinSet;
 use tracing::{info, warn};
@@ -41,15 +42,23 @@ pub async fn concurrent(
         let input_owned = input.to_string();
         let timeout = timeout_ms;
         let actor_context = current_turn_actor_context();
+        let observation_context = current_observation_context();
 
         join_set.spawn(async move {
             let agent_start = Instant::now();
+            let run = async {
+                if let Some(context) = actor_context {
+                    agent.chat_with_actor_context(&input_owned, context).await
+                } else {
+                    agent.chat(&input_owned).await
+                }
+            };
             let result = if let Some(t) = timeout {
                 match tokio::time::timeout(tokio::time::Duration::from_millis(t), async {
-                    if let Some(context) = actor_context.clone() {
-                        agent.chat_with_actor_context(&input_owned, context).await
+                    if let Some(context) = observation_context.clone() {
+                        with_observation_context(context, run).await
                     } else {
-                        agent.chat(&input_owned).await
+                        run.await
                     }
                 })
                 .await
@@ -60,10 +69,10 @@ pub async fn concurrent(
                         agent_id, t
                     ))),
                 }
-            } else if let Some(context) = actor_context {
-                agent.chat_with_actor_context(&input_owned, context).await
+            } else if let Some(context) = observation_context {
+                with_observation_context(context, run).await
             } else {
-                agent.chat(&input_owned).await
+                run.await
             };
 
             let duration_ms = agent_start.elapsed().as_millis() as u64;

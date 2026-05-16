@@ -8,7 +8,7 @@ use tracing::{debug, info, warn};
 use ai_agents_core::Result;
 use ai_agents_llm::LLMRegistry;
 
-use super::clarifier::{ClarificationGenerator, ClarificationParseResult};
+use super::clarifier::{ClarificationGenerator, ClarificationObserver, ClarificationParseResult};
 use super::config::{
     DisambiguationConfig, MaxAttemptsAction, SkillDisambiguationOverride,
     StateDisambiguationOverride,
@@ -64,6 +64,11 @@ impl DisambiguationManager {
     /// Get the configuration
     pub fn config(&self) -> &DisambiguationConfig {
         &self.config
+    }
+
+    pub fn with_clarification_observer(mut self, observer: Arc<dyn ClarificationObserver>) -> Self {
+        self.clarifier = self.clarifier.with_observer(observer);
+        self
     }
 
     /// Check if there's a pending clarification

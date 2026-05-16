@@ -1,0 +1,87 @@
+name: CostByModelAssistant
+version: "1.0.0"
+description: "Break down router and main LLM cost by model and purpose"
+
+# Model-cost observability example.
+#
+# Use this pattern when one cheap router model handles meta work and one main model answers users.
+# The report can then show whether cost comes from skill routing, skill execution, or main chat.
+#
+# Flow: user input -> skill router (router LLM) -> selected skill -> router skill prompt -> report by model
+#                  -> no skill match -> main LLM -> report by purpose
+#
+# Inspect:
+#   target/observability/cost_by_model/report.json
+#   target/observability/cost_by_model/aggregates.csv
+system_prompt: |
+  You are a practical assistant.
+  Give clear answers and mention when a calculation was handled by the math skill.
+
+# Two aliases let metrics separate the main answer model from cheaper meta calls.
+# The skill router uses router, while normal chat uses default.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router
+
+# The skill router compares the trigger against user input with the router LLM.
+# When the skill matches, the skill step also uses router, so by_purpose shows both paths.
+skills:
+  - id: quick_math
+    description: "Answer simple arithmetic requests."
+    trigger: "User asks for arithmetic, percentages, totals, or unit math."
+    steps:
+      # Step 0: Ask the router model for a concise calculation answer.
+      # This keeps simple arithmetic off the larger default model.
+      - prompt: |
+          Solve this request accurately and show the final answer:
+          {{ user_input }}
+        llm: router
+
+# Pricing keys use provider/model rather than aliases.
+# This makes costs stable even if you rename aliases such as default or router.
+observability:
+  enabled: true
+  cost:
+    enabled: true                # estimate cost from token usage and pricing. default: true
+    unknown_price_policy: omit   # missing prices are excluded from totals. default: omit
+    pricing:
+      openai/gpt-5.4-mini:
+        input_per_1k: 0.00075
+        output_per_1k: 0.0045
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+
+  # Group by model and purpose to answer: which model did what, and how often?
+  # Common purpose labels here are skill_routing, skill_prompt, and main_response.
+  aggregation:
+    dimensions: [model, purpose, status]
+
+  # Keep raw content out of reports while still allowing hash-based correlation.
+  privacy:
+    include_prompts: false    # do not retain raw prompt text. default: false
+    include_responses: false  # do not retain raw response text. default: false
+    hash_inputs: true         # retain stable hashes for correlation. default: true
+
+  # CSV is useful for spreadsheets or quick diffs between runs.
+  export:
+    formats: [json, csv]
+    path: ./target/observability/cost_by_model/
+    write_report: true
+
+metadata:
+  cli:
+    welcome: "=== Observability Cost by Model Demo ==="
+    hints:
+      - "Try: What is 18% of 245?"
+      - "Try: Summarize why router models are cheaper"
+      - "Inspect target/observability/cost_by_model/report.json and aggregates.csv"
+    show_timing: true

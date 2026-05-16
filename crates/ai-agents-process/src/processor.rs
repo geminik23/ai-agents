@@ -1,6 +1,8 @@
 //! Process processor for executing input/output transformations
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,10 +45,44 @@ impl ProcessData {
     }
 }
 
-#[derive(Debug)]
+/// Observability hint that describes the kind of process stage being executed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessPurposeHint {
+    Detect,
+    Extract,
+    Validate,
+    Transform,
+    Other,
+}
+
+/// Boxed future used by process observers to wrap stage execution.
+pub type ProcessStageFuture<'a> = Pin<Box<dyn Future<Output = Result<ProcessData>> + Send + 'a>>;
+
+/// Runtime-provided hook for observing stages without adding an observability dependency.
+pub trait ProcessStageObserver: Send + Sync {
+    /// Wraps one process stage future with external instrumentation.
+    fn observe<'a>(
+        &'a self,
+        hint: ProcessPurposeHint,
+        future: ProcessStageFuture<'a>,
+    ) -> ProcessStageFuture<'a>;
+}
+
+/// Executes configured input and output process stages.
 pub struct ProcessProcessor {
     config: ProcessConfig,
     llm_registry: Option<Arc<LLMRegistry>>,
+    stage_observer: Option<Arc<dyn ProcessStageObserver>>,
+}
+
+impl std::fmt::Debug for ProcessProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessProcessor")
+            .field("config", &self.config)
+            .field("has_llm_registry", &self.llm_registry.is_some())
+            .field("has_stage_observer", &self.stage_observer.is_some())
+            .finish()
+    }
 }
 
 impl Default for ProcessProcessor {
@@ -60,12 +96,29 @@ impl ProcessProcessor {
         Self {
             config,
             llm_registry: None,
+            stage_observer: None,
         }
     }
 
     pub fn with_llm_registry(mut self, registry: Arc<LLMRegistry>) -> Self {
         self.llm_registry = Some(registry);
         self
+    }
+
+    /// Attaches a runtime observer used to instrument each process stage.
+    pub fn with_stage_observer(mut self, observer: Arc<dyn ProcessStageObserver>) -> Self {
+        self.stage_observer = Some(observer);
+        self
+    }
+
+    /// Returns the first meaningful purpose hint for the input pipeline.
+    pub fn input_purpose_hint(&self) -> ProcessPurposeHint {
+        purpose_hint_for_stages(&self.config.input)
+    }
+
+    /// Returns the first meaningful purpose hint for the output pipeline.
+    pub fn output_purpose_hint(&self) -> ProcessPurposeHint {
+        purpose_hint_for_stages(&self.config.output)
     }
 
     pub async fn process_input(&self, input: &str) -> Result<ProcessData> {
@@ -129,16 +182,24 @@ impl ProcessProcessor {
             }
 
             let data_clone = data.clone();
-            let result = match stage {
-                ProcessStage::Normalize(s) => self.execute_normalize(&s.config, data).await,
-                ProcessStage::Detect(s) => self.execute_detect(&s.config, data).await,
-                ProcessStage::Extract(s) => self.execute_extract(&s.config, data).await,
-                ProcessStage::Sanitize(s) => self.execute_sanitize(&s.config, data).await,
-                ProcessStage::Transform(s) => self.execute_transform(&s.config, data).await,
-                ProcessStage::Validate(s) => self.execute_validate(&s.config, data).await,
-                ProcessStage::Format(s) => self.execute_format(&s.config, data).await,
-                ProcessStage::Enrich(s) => self.execute_enrich(&s.config, data).await,
-                ProcessStage::Conditional(s) => self.execute_conditional(&s.config, data).await,
+            let hint = process_purpose_hint_for_stage(stage);
+            let run_stage: ProcessStageFuture<'a> = Box::pin(async move {
+                match stage {
+                    ProcessStage::Normalize(s) => self.execute_normalize(&s.config, data).await,
+                    ProcessStage::Detect(s) => self.execute_detect(&s.config, data).await,
+                    ProcessStage::Extract(s) => self.execute_extract(&s.config, data).await,
+                    ProcessStage::Sanitize(s) => self.execute_sanitize(&s.config, data).await,
+                    ProcessStage::Transform(s) => self.execute_transform(&s.config, data).await,
+                    ProcessStage::Validate(s) => self.execute_validate(&s.config, data).await,
+                    ProcessStage::Format(s) => self.execute_format(&s.config, data).await,
+                    ProcessStage::Enrich(s) => self.execute_enrich(&s.config, data).await,
+                    ProcessStage::Conditional(s) => self.execute_conditional(&s.config, data).await,
+                }
+            });
+            let result = if let Some(observer) = self.stage_observer.as_ref() {
+                observer.observe(hint, run_stage).await
+            } else {
+                run_stage.await
             };
 
             match result {
@@ -794,6 +855,34 @@ impl ProcessProcessor {
                 .or_else(|_| registry.default())
                 .map_err(|e| AgentError::LLM(e.to_string())),
         }
+    }
+}
+
+fn purpose_hint_for_stages(stages: &[ProcessStage]) -> ProcessPurposeHint {
+    for stage in stages {
+        let hint = process_purpose_hint_for_stage(stage);
+        if hint != ProcessPurposeHint::Other {
+            return hint;
+        }
+    }
+    ProcessPurposeHint::Other
+}
+
+fn process_purpose_hint_for_stage(stage: &ProcessStage) -> ProcessPurposeHint {
+    match stage {
+        ProcessStage::Detect(_) => ProcessPurposeHint::Detect,
+        ProcessStage::Extract(_) => ProcessPurposeHint::Extract,
+        ProcessStage::Validate(_) => ProcessPurposeHint::Validate,
+        ProcessStage::Sanitize(_) | ProcessStage::Transform(_) => ProcessPurposeHint::Transform,
+        ProcessStage::Conditional(config) => {
+            let then_hint = purpose_hint_for_stages(&config.config.then_stages);
+            if then_hint != ProcessPurposeHint::Other {
+                then_hint
+            } else {
+                purpose_hint_for_stages(&config.config.else_stages)
+            }
+        }
+        _ => ProcessPurposeHint::Other,
     }
 }
 

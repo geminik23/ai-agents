@@ -1,26 +1,37 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::ObservabilityError;
 
+/// Top-level YAML and Rust configuration for metrics, privacy, aggregation, cost, and export behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
+    /// Enables all observability collection when true.
     #[serde(default)]
     pub enabled: bool,
+    /// Controls which latency events are recorded.
     #[serde(default)]
     pub latency: LatencyConfig,
+    /// Controls token counting and estimation behavior.
     #[serde(default)]
     pub tokens: TokenConfig,
+    /// Controls cost estimation and pricing lookup behavior.
     #[serde(default)]
     pub cost: CostConfig,
+    /// Controls how the language dimension is resolved from runtime context.
     #[serde(default)]
     pub language: LanguageConfig,
+    /// Controls the configured aggregate metrics table.
     #[serde(default)]
     pub aggregation: AggregationConfig,
+    /// Controls raw text retention, hashing, truncation, and redaction.
     #[serde(default)]
     pub privacy: PrivacyConfig,
+    /// Controls file export formats and paths.
     #[serde(default)]
     pub export: ExportConfig,
+    /// Controls event queue and raw event buffer limits.
     #[serde(default)]
     pub buffer: BufferConfig,
 }
@@ -42,10 +53,16 @@ impl Default for ObservabilityConfig {
 }
 
 impl ObservabilityConfig {
+    /// Validates bounds that would otherwise make aggregation or buffering unusable.
     pub fn validate(&self) -> Result<(), ObservabilityError> {
         if self.aggregation.window_size == 0 {
             return Err(ObservabilityError::Config(
                 "observability.aggregation.window_size must be greater than zero".to_string(),
+            ));
+        }
+        if self.buffer.event_buffer == 0 {
+            return Err(ObservabilityError::Config(
+                "observability.buffer.event_buffer must be greater than zero".to_string(),
             ));
         }
         for percentile in &self.aggregation.percentiles {
@@ -58,8 +75,28 @@ impl ObservabilityConfig {
         }
         Ok(())
     }
+
+    /// Loads cost.pricing_file and merges it with inline pricing.
+    pub fn with_pricing_file_loaded(
+        mut self,
+        base_dir: Option<&Path>,
+    ) -> Result<Self, ObservabilityError> {
+        let Some(path) = self.cost.pricing_file.clone() else {
+            return Ok(self);
+        };
+        let resolved = resolve_pricing_path(&path, base_dir);
+        let content = std::fs::read_to_string(&resolved).map_err(ObservabilityError::Io)?;
+        let mut file_pricing = parse_pricing_file(&resolved, &content)?;
+        let inline_pricing = std::mem::take(&mut self.cost.pricing);
+        for (key, value) in inline_pricing {
+            file_pricing.insert(key.to_lowercase(), value);
+        }
+        self.cost.pricing = file_pricing;
+        Ok(self)
+    }
 }
 
+/// Latency switches for categories that can produce duration events.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LatencyConfig {
     #[serde(default = "default_true")]
@@ -89,6 +126,7 @@ impl Default for LatencyConfig {
     }
 }
 
+/// Token counting settings for provider usage and fallback estimation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenConfig {
     #[serde(default = "default_true")]
@@ -112,14 +150,19 @@ impl Default for TokenConfig {
     }
 }
 
+/// Cost estimation settings and model pricing sources.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostConfig {
+    /// Enables cost estimation when token usage is available.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Inline pricing keyed by model or provider/model.
     #[serde(default)]
     pub pricing: HashMap<String, ModelPricing>,
+    /// Optional JSON or YAML pricing file loaded by the runtime builder or Rust helper.
     #[serde(default)]
     pub pricing_file: Option<String>,
+    /// Controls how unknown model prices are represented.
     #[serde(default)]
     pub unknown_price_policy: UnknownPricePolicy,
 }
@@ -135,12 +178,16 @@ impl Default for CostConfig {
     }
 }
 
+/// Per-thousand-token price for one model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ModelPricing {
+    /// Price for one thousand input tokens in USD.
     pub input_per_1k: f64,
+    /// Price for one thousand output tokens in USD.
     pub output_per_1k: f64,
 }
 
+/// Behavior when token usage exists but no configured price matches the model.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum UnknownPricePolicy {
@@ -150,6 +197,7 @@ pub enum UnknownPricePolicy {
     Error,
 }
 
+/// Language dimension lookup rules for reports and aggregations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LanguageConfig {
     #[serde(default = "default_language_paths")]
@@ -167,6 +215,7 @@ impl Default for LanguageConfig {
     }
 }
 
+/// Grouping and rolling-window settings for aggregate metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregationConfig {
     #[serde(default = "default_dimensions")]
@@ -187,6 +236,7 @@ impl Default for AggregationConfig {
     }
 }
 
+/// Supported fields that can be used as aggregation dimensions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AggregationDimension {
@@ -206,6 +256,7 @@ pub enum AggregationDimension {
 }
 
 impl AggregationDimension {
+    /// Returns the stable dimension key used in reports and CSV output.
     pub fn key(&self) -> String {
         match self {
             Self::Agent => "agent".to_string(),
@@ -225,6 +276,7 @@ impl AggregationDimension {
     }
 }
 
+/// Privacy controls for raw payload retention, hashes, truncation, and redaction.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivacyConfig {
     #[serde(default)]
@@ -260,6 +312,7 @@ impl Default for PrivacyConfig {
     }
 }
 
+/// File export settings for reports, aggregates, raw events, and Prometheus metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportConfig {
     #[serde(default = "default_export_formats")]
@@ -286,6 +339,7 @@ impl Default for ExportConfig {
     }
 }
 
+/// Export formats supported by ObservabilityManager::export.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ExportFormat {
@@ -296,6 +350,7 @@ pub enum ExportFormat {
     Prometheus,
 }
 
+/// Raw event file shape used when raw event export is enabled.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RawEventsFormat {
@@ -304,6 +359,7 @@ pub enum RawEventsFormat {
     Json,
 }
 
+/// Bounded queue and raw event retention limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferConfig {
     #[serde(default = "default_event_buffer")]
@@ -387,6 +443,45 @@ fn default_raw_event_limit() -> usize {
     10_000
 }
 
+fn resolve_pricing_path(path: &str, base_dir: Option<&Path>) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else if let Some(base_dir) = base_dir {
+        base_dir.join(path)
+    } else {
+        path
+    }
+}
+
+fn parse_pricing_file(
+    path: &Path,
+    content: &str,
+) -> Result<HashMap<String, ModelPricing>, ObservabilityError> {
+    let parsed: HashMap<String, ModelPricing> = match path.extension().and_then(|ext| ext.to_str())
+    {
+        Some("json") => serde_json::from_str(content).map_err(ObservabilityError::Serialization)?,
+        Some("yaml") | Some("yml") | None => serde_yaml::from_str(content).map_err(|error| {
+            ObservabilityError::Config(format!(
+                "failed to parse observability.cost.pricing_file '{}': {}",
+                path.display(),
+                error
+            ))
+        })?,
+        Some(other) => {
+            return Err(ObservabilityError::Config(format!(
+                "unsupported observability.cost.pricing_file extension '{}': {}",
+                other,
+                path.display()
+            )));
+        }
+    };
+    Ok(parsed
+        .into_iter()
+        .map(|(key, value)| (key.to_lowercase(), value))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,5 +518,37 @@ observability:
         let mut config = ObservabilityConfig::default();
         config.aggregation.percentiles = vec![1.2];
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn pricing_file_loads_and_inline_overrides() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_observability_pricing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("pricing.yaml"),
+            "openai/test:\n  input_per_1k: 0.1\n  output_per_1k: 0.2\nopenai/other:\n  input_per_1k: 1.0\n  output_per_1k: 2.0\n",
+        )
+        .unwrap();
+
+        let mut config = ObservabilityConfig::default();
+        config.cost.pricing_file = Some("pricing.yaml".to_string());
+        config.cost.pricing.insert(
+            "openai/test".to_string(),
+            ModelPricing {
+                input_per_1k: 0.3,
+                output_per_1k: 0.4,
+            },
+        );
+
+        let loaded = config.with_pricing_file_loaded(Some(&dir)).unwrap();
+        let overridden = loaded.cost.pricing.get("openai/test").unwrap();
+        assert_eq!(overridden.input_per_1k, 0.3);
+        assert_eq!(overridden.output_per_1k, 0.4);
+        assert!(loaded.cost.pricing.contains_key("openai/other"));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

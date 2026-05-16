@@ -33,7 +33,10 @@ mod manager;
 mod types;
 mod util;
 
-pub use clarifier::{ClarificationGenerator, ClarificationParseResult};
+pub use clarifier::{
+    ClarificationGenerator, ClarificationObserver, ClarificationParseFuture,
+    ClarificationParseResult, ClarificationQuestionFuture,
+};
 pub use config::{
     AmbiguityAspect, CacheConfig, ClarificationConfig, ClarificationStyle, ContextConfig,
     DetectionConfig, DisambiguationConfig, MaxAttemptsAction, SkillDisambiguationOverride,

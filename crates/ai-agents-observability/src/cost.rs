@@ -1,16 +1,24 @@
 use crate::config::{CostConfig, ModelPricing, UnknownPricePolicy};
 use crate::event::{CostEstimate, CostSource, ObservationTokenUsage};
 
+/// Converts token usage into USD estimates using configured model pricing.
 #[derive(Debug, Clone)]
 pub struct CostEstimator {
     config: CostConfig,
 }
 
 impl CostEstimator {
-    pub fn new(config: CostConfig) -> Self {
+    /// Creates an estimator and normalizes pricing keys for lookup.
+    pub fn new(mut config: CostConfig) -> Self {
+        config.pricing = config
+            .pricing
+            .into_iter()
+            .map(|(key, value)| (key.to_lowercase(), value))
+            .collect();
         Self { config }
     }
 
+    /// Estimates cost for one LLM event or returns None when pricing is omitted.
     pub fn estimate(
         &self,
         provider: Option<&str>,

@@ -1,24 +1,33 @@
-use crate::aggregator::{AggregatedMetrics, MetricsAggregator, enrich_dimensions};
-use crate::config::{ExportFormat, ObservabilityConfig};
+use crate::aggregator::{
+    AggregatedMetrics, MetricsAggregator, aggregate_events, enrich_dimensions,
+};
+use crate::config::{AggregationDimension, ExportFormat, ObservabilityConfig, UnknownPricePolicy};
 use crate::context::{SpanContext, current_observation_context};
 use crate::cost::CostEstimator;
-use crate::event::{CostEstimate, EventStatus, EventType, ObservationEvent, ObservationPurpose};
+use crate::event::{
+    CostEstimate, EventStatus, EventType, ObservationEvent, ObservationPurpose,
+    ObservationTokenUsage,
+};
 use crate::export::{ExportResult, export_observability};
 use crate::redaction::Redactor;
 use crate::report::{ObservabilityReport, generate_report};
 use crate::span::SpanGuard;
 use crate::{ObservabilityError, Result};
 use chrono::Utc;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Central collector that receives events, applies privacy rules, aggregates metrics, and exports reports.
 pub struct ObservabilityManager {
     config: ObservabilityConfig,
+    sender: mpsc::Sender<ObservationEvent>,
+    receiver: Mutex<mpsc::Receiver<ObservationEvent>>,
     raw_events: RwLock<VecDeque<ObservationEvent>>,
     aggregator: MetricsAggregator,
     cost_estimator: CostEstimator,
@@ -27,22 +36,28 @@ pub struct ObservabilityManager {
 }
 
 impl ObservabilityManager {
+    /// Creates a shared manager with bounded event buffering.
     pub fn new(config: ObservabilityConfig) -> Arc<Self> {
         let _ = config.validate();
+        let (sender, receiver) = mpsc::channel(config.buffer.event_buffer.max(1));
         Arc::new(Self {
             cost_estimator: CostEstimator::new(config.cost.clone()),
             redactor: Redactor::new(config.privacy.clone()),
             aggregator: MetricsAggregator::new(config.aggregation.clone()),
+            sender,
+            receiver: Mutex::new(receiver),
             raw_events: RwLock::new(VecDeque::new()),
             dropped_events: AtomicU64::new(0),
             config,
         })
     }
 
+    /// Returns the immutable configuration used by this manager.
     pub fn config(&self) -> &ObservabilityConfig {
         &self.config
     }
 
+    /// Starts a measured span for an LLM or tool wrapper.
     pub fn start_span(
         self: &Arc<Self>,
         event_type: EventType,
@@ -55,6 +70,7 @@ impl ObservabilityManager {
         SpanGuard::new(Arc::clone(self), context, event_type)
     }
 
+    /// Records hook-style lifecycle events that are not LLM or tool wrapper calls.
     pub fn record_lifecycle_event(
         &self,
         event_type: EventType,
@@ -91,43 +107,47 @@ impl ObservabilityManager {
         self.record_event(event);
     }
 
-    pub fn record_event(&self, mut event: ObservationEvent) {
+    /// Queues a completed event without blocking the observed call path.
+    pub fn record_event(&self, event: ObservationEvent) {
         if !self.config.enabled {
             return;
         }
-        enrich_dimensions(&mut event);
-        if event.cost.is_none() {
-            let (provider, model) = match &event.event_type {
-                EventType::LlmCall {
-                    provider, model, ..
-                } => (Some(provider.as_str()), Some(model.as_str())),
-                _ => (None, None),
-            };
-            event.cost = self
-                .cost_estimator
-                .estimate(provider, model, event.tokens.as_ref());
+        match self.sender.try_send(event) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                if self.config.buffer.drop_on_full {
+                    self.dropped_events.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.ingest_event(event);
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(event)) => {
+                self.ingest_event(event);
+            }
         }
-        if let Some(payload) = &event.payload {
-            event.payload = Some(self.redactor.redact_value(payload));
-        }
-
-        self.aggregator.record(event.clone());
-        self.store_raw_event(event);
     }
 
+    /// Drains pending queued events into aggregation and raw buffers.
     pub async fn flush(&self) -> Result<()> {
+        self.drain_pending();
         Ok(())
     }
 
+    /// Returns configured aggregate metrics after draining pending events.
     pub fn get_metrics(&self) -> Vec<AggregatedMetrics> {
+        self.drain_pending();
         self.aggregator.aggregate_configured()
     }
 
+    /// Returns retained raw events after redaction and queue draining.
     pub fn raw_events(&self) -> Vec<ObservationEvent> {
+        self.drain_pending();
         self.raw_events.read().iter().cloned().collect()
     }
 
+    /// Builds the user-facing report from the current rolling event window.
     pub fn generate_report(&self) -> ObservabilityReport {
+        self.drain_pending();
         let events = self.aggregator.events();
         generate_report(
             &events,
@@ -136,18 +156,22 @@ impl ObservabilityManager {
         )
     }
 
+    /// Writes configured report, aggregate, raw event, and Prometheus files.
     pub async fn export(&self) -> Result<ExportResult> {
         export_observability(self).map_err(ObservabilityError::Io)
     }
 
+    /// Returns the total number of events dropped by bounded buffers.
     pub fn dropped_events(&self) -> u64 {
         self.dropped_events.load(Ordering::Relaxed)
     }
 
+    /// Returns the redactor used by wrappers for safe payload summaries.
     pub fn redactor(&self) -> &Redactor {
         &self.redactor
     }
 
+    /// Converts a completed SpanGuard into an ObservationEvent.
     pub fn build_event_from_span(
         &self,
         context: SpanContext,
@@ -182,8 +206,71 @@ impl ObservabilityManager {
         }
     }
 
+    /// Drains queued events into the synchronous aggregation path.
+    fn drain_pending(&self) {
+        let mut receiver = self.receiver.lock();
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => self.ingest_event(event),
+                Err(mpsc::error::TryRecvError::Empty)
+                | Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
+
+    /// Enriches, costs, redacts, aggregates, and optionally stores one event.
+    fn ingest_event(&self, mut event: ObservationEvent) {
+        enrich_dimensions(&mut event);
+        event.tokens = event
+            .tokens
+            .take()
+            .map(|tokens| self.apply_token_config(tokens));
+        if event.cost.is_none() {
+            let (provider, model) = match &event.event_type {
+                EventType::LlmCall {
+                    provider, model, ..
+                } => (Some(provider.as_str()), Some(model.as_str())),
+                _ => (None, None),
+            };
+            event.cost = self
+                .cost_estimator
+                .estimate(provider, model, event.tokens.as_ref());
+            if matches!(
+                self.config.cost.unknown_price_policy,
+                UnknownPricePolicy::Error
+            ) && event.tokens.is_some()
+                && event.cost.is_none()
+                && matches!(&event.event_type, EventType::LlmCall { .. })
+            {
+                event
+                    .tags
+                    .insert("cost_error".to_string(), "unknown_price".to_string());
+            }
+        }
+        let event = self.redactor.redact_event(event);
+        self.aggregator.record(event.clone());
+        self.store_raw_event(event);
+    }
+
+    /// Applies token count switches before reports and cost estimates read usage.
+    fn apply_token_config(&self, mut tokens: ObservationTokenUsage) -> ObservationTokenUsage {
+        if !self.config.tokens.count_input {
+            tokens.input_tokens = 0;
+        }
+        if !self.config.tokens.count_output {
+            tokens.output_tokens = 0;
+        }
+        tokens.total_tokens = tokens.input_tokens + tokens.output_tokens;
+        tokens
+    }
+
+    /// Retains a redacted raw event when raw event export is enabled.
     fn store_raw_event(&self, event: ObservationEvent) {
         if !self.config.export.write_raw_events {
+            return;
+        }
+        if self.config.buffer.raw_event_limit == 0 {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
             return;
         }
         let mut raw_events = self.raw_events.write();
@@ -197,8 +284,25 @@ impl ObservabilityManager {
         raw_events.push_back(event);
     }
 
+    /// Renders current aggregate metrics in Prometheus text exposition format.
     pub fn render_prometheus(&self) -> String {
         let report = self.generate_report();
+        let events = self.aggregator.events();
+        let llm_events: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(&event.event_type, EventType::LlmCall { .. }))
+            .cloned()
+            .collect();
+        let tool_events: Vec<_> = events
+            .iter()
+            .filter(|event| matches!(&event.event_type, EventType::ToolCall { .. }))
+            .cloned()
+            .collect();
+        let by_model_purpose = aggregate_events(
+            &llm_events,
+            &[AggregationDimension::Model, AggregationDimension::Purpose],
+        );
+        let by_tool = aggregate_events(&tool_events, &[AggregationDimension::Tool]);
         let mut output = String::new();
         output.push_str(
             "# HELP ai_agents_observation_events_total Total recorded observation events\n",
@@ -222,14 +326,71 @@ impl ObservabilityManager {
             "ai_agents_observation_cost_usd_total {:.8}\n",
             report.summary.total_cost_usd
         ));
+        output.push_str("# HELP ai_agents_observation_tokens_total Total observed LLM tokens\n");
+        output.push_str("# TYPE ai_agents_observation_tokens_total counter\n");
+        output.push_str(&format!(
+            "ai_agents_observation_tokens_total {}\n",
+            report.summary.total_tokens
+        ));
+        output.push_str("# HELP ai_agents_llm_calls_total LLM calls grouped by safe labels\n");
+        output.push_str("# TYPE ai_agents_llm_calls_total counter\n");
+        for metric in by_model_purpose {
+            let model = metric
+                .dimensions
+                .get("model")
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            let purpose = metric
+                .dimensions
+                .get("purpose")
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            output.push_str(&format!(
+                "ai_agents_llm_calls_total{{model=\"{}\",purpose=\"{}\"}} {}\n",
+                prometheus_label(model),
+                prometheus_label(purpose),
+                metric.count
+            ));
+        }
+        output.push_str("# HELP ai_agents_tool_calls_total Tool calls grouped by tool ID\n");
+        output.push_str("# TYPE ai_agents_tool_calls_total counter\n");
+        for metric in by_tool {
+            let tool = metric
+                .dimensions
+                .get("tool")
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            if tool != "unknown" {
+                output.push_str(&format!(
+                    "ai_agents_tool_calls_total{{tool=\"{}\"}} {}\n",
+                    prometheus_label(tool),
+                    metric.count
+                ));
+            }
+        }
         output
     }
 
+    /// Returns true when a format is enabled in export.formats.
     pub fn wants_format(&self, format: ExportFormat) -> bool {
         self.config.export.formats.contains(&format)
     }
 }
 
+/// Escapes label values for Prometheus text output.
+fn prometheus_label(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\n' | '\r' | '\t' => "_".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
+}
+
+/// Builds the base event dimensions from the current span context.
 fn context_dimension_map(context: &SpanContext) -> HashMap<String, String> {
     let mut dimensions = HashMap::new();
     dimensions.insert("agent".to_string(), context.agent_id.clone());
@@ -247,6 +408,7 @@ fn context_dimension_map(context: &SpanContext) -> HashMap<String, String> {
     dimensions
 }
 
+/// Resolves the language dimension by checking configured context paths in order.
 pub fn resolve_language_from_context(
     config: &ObservabilityConfig,
     context: &HashMap<String, Value>,
@@ -263,6 +425,7 @@ pub fn resolve_language_from_context(
     config.language.fallback.clone()
 }
 
+/// Looks up a top-level or dotted path in a JSON context map.
 fn get_dotted<'a>(context: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
     if let Some(value) = context.get(path) {
         return Some(value);
@@ -276,6 +439,58 @@ fn get_dotted<'a>(context: &'a HashMap<String, Value>, path: &str) -> Option<&'a
     Some(current)
 }
 
+/// Generates a session ID for observed runtime sessions that do not have one yet.
 pub fn new_session_id() -> String {
     Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event::{ObservationTokenUsage, TokenUsageSource};
+
+    #[test]
+    fn token_count_flags_are_applied_before_report() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.tokens.count_input = false;
+        config.tokens.count_output = true;
+        config.cost.enabled = false;
+        let manager = ObservabilityManager::new(config);
+        let event = ObservationEvent {
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            parent_span_id: None,
+            turn_id: "turn".to_string(),
+            agent_id: "agent".to_string(),
+            actor_id: None,
+            session_id: None,
+            event_type: EventType::LlmCall {
+                provider: "openai".to_string(),
+                model: "test".to_string(),
+                alias: Some("default".to_string()),
+                streaming: false,
+            },
+            purpose: ObservationPurpose::MainResponse,
+            status: EventStatus::Success,
+            timestamp: Utc::now(),
+            duration_ms: 10,
+            tokens: Some(ObservationTokenUsage::new(
+                100,
+                25,
+                TokenUsageSource::Provider,
+            )),
+            cost: None,
+            error: None,
+            dimensions: HashMap::new(),
+            tags: HashMap::new(),
+            payload: None,
+        };
+
+        manager.record_event(event);
+        let report = manager.generate_report();
+        assert_eq!(report.token_breakdown.total_input, 0);
+        assert_eq!(report.token_breakdown.total_output, 25);
+        assert_eq!(report.token_breakdown.total_tokens, 25);
+    }
 }

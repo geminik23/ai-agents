@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 use crate::spec::AgentSpec;
 use crate::{Agent, RuntimeAgent, TurnActorContext};
 use ai_agents_core::{AgentError, AgentResponse, Result};
+use ai_agents_observability::{current_observation_context, with_observation_context};
 
 use super::spawner::SpawnedAgent;
 
@@ -242,14 +243,23 @@ impl AgentRegistry {
         );
 
         let mut handles = Vec::with_capacity(targets.len());
+        let observation_context = current_observation_context();
         for (id, agent) in targets {
             let msg = formatted.clone();
             let context = actor_context.clone();
+            let observation_context = observation_context.clone();
             handles.push(tokio::spawn(async move {
-                let result = if let Some(context) = context {
-                    agent.chat_with_actor_context(&msg, context).await
+                let run = async move {
+                    if let Some(context) = context {
+                        agent.chat_with_actor_context(&msg, context).await
+                    } else {
+                        agent.chat(&msg).await
+                    }
+                };
+                let result = if let Some(context) = observation_context {
+                    with_observation_context(context, run).await
                 } else {
-                    agent.chat(&msg).await
+                    run.await
                 };
                 (id, result)
             }));

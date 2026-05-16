@@ -19,6 +19,7 @@ pub use config::{
 };
 pub use context::{
     SpanContext, current_observation_context, with_observation_context, with_observation_purpose,
+    with_updated_observation_context,
 };
 pub use cost::CostEstimator;
 pub use event::{
@@ -33,8 +34,10 @@ pub use report::{CostBreakdown, ObservabilityReport, ReportSummary, TokenBreakdo
 pub use span::SpanGuard;
 pub use wrappers::{ObservedLLMProvider, ObservedTool};
 
+/// Crate-local result type for observability operations.
 pub type Result<T> = std::result::Result<T, ObservabilityError>;
 
+/// Errors returned by observability config, export, and serialization helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum ObservabilityError {
     #[error("observability config error: {0}")]

@@ -237,6 +237,32 @@ cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/llm_fallback.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/error-recovery/context_overflow.yaml
 ```
 
+### `yaml/observability/`
+
+Observability and tracing examples - latency, token usage, cost estimates, privacy-safe reports, and metric breakdowns.
+
+| File | Description |
+|------|-------------|
+| `basic_metrics.yaml` | Safe default metrics with JSON report export and no raw prompt or response retention |
+| `cost_by_model.yaml` | Router/main model split with cost grouped by model and purpose |
+| `pricing_file.yaml` | Load shared model prices from `pricing.yaml`, with inline override behavior |
+| `language_breakdown.yaml` | Process pipeline language detection with metrics grouped by detected language |
+| `tools_and_skills_metrics.yaml` | Skill routing, skill prompt, and tool-call telemetry in one run |
+| `orchestration_metrics.yaml` | Parent and delegated child agent traces in a multi-agent support flow |
+
+Note: Observability is disabled by default. These examples write reports under `target/observability/` after each turn. Raw prompts, responses, tool args, and tool outputs stay off unless a `privacy.include_*` field explicitly enables them.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/observability/basic_metrics.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/observability/cost_by_model.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/observability/pricing_file.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/observability/language_breakdown.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/observability/tools_and_skills_metrics.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/observability/orchestration_metrics.yaml --plain
+```
+
 ### `yaml/hitl/`
 
 Declarative human-in-the-loop approval - from a single tool requiring sign-off to localized multi-language approval messages.
@@ -471,6 +497,21 @@ cd examples/rust/storage
 cargo run --bin save-restore-session
 cargo run --bin memory-agent
 cargo run --bin sqlite-persistence
+```
+
+### `rust/observability/`
+
+Programmatic observability access from a Rust host.
+
+| Binary | Description |
+|--------|-------------|
+| `report` | Loads an observed YAML agent, runs a few turns, prints `ObservabilityReport`, and exports files |
+
+Run from:
+
+```sh
+cd examples/rust/observability
+cargo run --bin report
 ```
 
 ### `rust/context/`

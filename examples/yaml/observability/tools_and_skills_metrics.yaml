@@ -1,0 +1,104 @@
+name: ToolSkillMetricsAssistant
+version: "1.0.0"
+description: "Observe skill routing, skill prompt steps, and tool calls"
+
+# Tool and skill observability example.
+#
+# Use this pattern when a feature path includes both skills and tools.
+# Observability wraps tools at the registry level, so tool calls are measured even when a skill invokes them.
+#
+# Flow: user input -> skill router -> expression extraction -> calculator tool -> skill prompt -> response
+#                  -> no skill match -> main LLM -> response
+#
+# Inspect:
+#   target/observability/tools_skills/report.json
+#   target/observability/tools_skills/aggregates.csv
+system_prompt: |
+  You are a helpful assistant with a metrics-friendly math skill.
+  Use natural language for final answers.
+
+# The default model answers normal chat.
+# The router model handles skill routing and the explanatory skill prompt.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router
+
+# A skill is useful here because it creates a predictable measured path:
+# routing LLM -> extraction prompt -> calculator tool -> explanation prompt.
+skills:
+  - id: measured_math
+    description: "Calculate arithmetic and explain the result."
+    trigger: "User asks to calculate a number, total, percentage, or expression."
+    steps:
+      # Step 0: Extract only the mathematical expression.
+      # Do not pass the full user sentence to calculator because words like "math" are invalid identifiers.
+      - prompt: |
+          Extract ONLY the mathematical expression from the user's message.
+          Output only the expression using +, -, *, /, ^, decimal numbers, and parentheses.
+          Do not include words, labels, markdown, or explanation.
+
+          User message: {{ user_input }}
+        llm: router
+
+      # Step 1: Evaluate the extracted expression with the built-in calculator.
+      # Observability records this as a tool_call event with the calculator tool ID.
+      - tool: calculator
+        args:
+          expression: "{{ steps[0].result }}"
+
+      # Step 2: The router LLM turns the raw tool result into a friendly answer.
+      # {{ steps[1].result }} references the calculator output from Step 1.
+      - prompt: |
+          User request: {{ user_input }}
+          Extracted expression: {{ steps[0].result }}
+          Calculator result: {{ steps[1].result }}
+          Explain the result in one short sentence.
+        llm: router
+
+# The calculator must be listed because the skill uses it.
+# Tool details are injected into the LLM prompt automatically by the framework.
+tools:
+  - name: calculator
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true     # record skill router and skill prompt LLM calls. default: true
+    track_tools: true   # record calculator execution duration. default: true
+    track_skills: true  # record skill lifecycle metadata. default: true
+
+  # Purpose shows the path stage, while tool identifies the specific tool.
+  # Expected purposes include skill_routing, skill_prompt, main_response, and calculator tool_call events.
+  aggregation:
+    dimensions: [purpose, tool, status]
+
+  # Tool args and outputs may contain user or business data.
+  # Keep them off unless you are debugging locally and have redaction configured.
+  privacy:
+    include_tool_args: false     # do not retain tool arguments. default: false
+    include_tool_outputs: false  # do not retain tool output. default: false
+    hash_inputs: true            # retain hashes for correlation. default: true
+
+  export:
+    formats: [json, csv]
+    path: ./target/observability/tools_skills/
+    write_report: true
+
+metadata:
+  cli:
+    welcome: "=== Observability Tools and Skills Demo ==="
+    hints:
+      - "Try: Calculate 42 * 17"
+      - "Try: do the math 21.2/0.3+4.2"
+      - "Try: What is 12.5% of 880?"
+      - "Inspect target/observability/tools_skills/report.json"
+    show_tools: true
+    show_timing: true

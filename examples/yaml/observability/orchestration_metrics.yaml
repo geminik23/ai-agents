@@ -1,0 +1,98 @@
+name: ObservableSupportRouter
+version: "1.0.0"
+description: "Trace parent and child agent calls in a delegated support flow"
+
+# Orchestration observability example.
+#
+# Use this pattern when a parent agent delegates work to child agents and you want one trace.
+# Child calls inherit the parent trace ID, while their spans use each child agent's ID.
+#
+# Prerequisites:
+#   - Sub-agent files under examples/yaml/orchestration/agents/
+#
+# Flow: parent input -> transition evaluator -> delegated child agent -> parent response -> report
+#                  -> routing state receives next request -> repeats with same export path
+#
+# Inspect:
+#   target/observability/orchestration/report.json
+#   target/observability/orchestration/aggregates.csv
+system_prompt: |
+  You are a support router.
+  Route each request to the right specialist and summarize the specialist answer.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+
+# Pre-spawn specialist agents from the orchestration examples folder.
+# shared_llms lets child agents reuse the parent's observed providers.
+# That keeps parent and child LLM calls in the same ObservabilityManager.
+spawner:
+  shared_llms: true                # child agents reuse parent LLM connections. default: false
+  auto_spawn:
+    - id: billing
+      agent: ../orchestration/agents/billing_agent.yaml
+    - id: technical
+      agent: ../orchestration/agents/technical_agent.yaml
+
+# The first user message lands in routing.
+# Transition evaluation chooses a delegate state, then the delegate state calls a child agent.
+states:
+  initial: routing
+  states:
+    routing:
+      prompt: "Decide whether this is billing or technical support."
+      transitions:
+        - to: billing_help
+          when: "User has a billing, payment, refund, or invoice question"
+        - to: technical_help
+          when: "User reports an error, bug, outage, setup issue, or technical problem"
+    billing_help:
+      delegate: billing
+      delegate_context: summary    # summarize parent history before calling child. default: input_only
+      transitions:
+        - to: routing
+          when: "The billing issue is resolved or the user asks a different question"
+    technical_help:
+      delegate: technical
+      delegate_context: summary    # summary uses an LLM call with purpose = summarization
+      transitions:
+        - to: routing
+          when: "The technical issue is resolved or the user asks a different question"
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true            # record parent, transition, summary, and child LLM calls. default: true
+    track_tools: true          # record tool calls if any child agent uses tools. default: true
+    track_orchestration: true  # record delegate lifecycle events. default: true
+
+  # Agent grouping separates parent and child spans.
+  # orchestration_pattern groups lifecycle events such as delegate.
+  aggregation:
+    dimensions: [agent, purpose, state, orchestration_pattern, status]
+
+  # Delegation can include user support details, so raw text stays off.
+  privacy:
+    include_prompts: false    # do not retain raw prompts. default: false
+    include_responses: false  # do not retain raw responses. default: false
+    hash_inputs: true         # keep hashes for correlation. default: true
+
+  export:
+    formats: [json, csv]
+    path: ./target/observability/orchestration/
+    write_report: true
+
+metadata:
+  cli:
+    welcome: "=== Observability Orchestration Demo ==="
+    hints:
+      - "Try: I need help with my invoice"
+      - "Try: The app crashes when I sign in"
+      - "Inspect target/observability/orchestration/report.json"
+    show_state: true
+    show_timing: true

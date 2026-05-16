@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ai_agents_core::{AgentError, Result};
 use ai_agents_llm::{ChatMessage, LLMProvider};
+use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use tracing::{debug, info};
 
 use super::types::{RouteResult, RoutingMethod};
@@ -71,10 +72,12 @@ async fn route_via_llm(
 
     let messages = vec![ChatMessage::system(&system_msg), ChatMessage::user(input)];
 
-    let llm_response = llm
-        .complete(&messages, None)
-        .await
-        .map_err(|e| AgentError::LLM(format!("Routing LLM failed: {}", e)))?;
+    let llm_response = with_observation_purpose(
+        ObservationPurpose::OrchestrationRouting,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Routing LLM failed: {}", e)))?;
 
     let selected_raw = llm_response.content.trim().to_string();
 

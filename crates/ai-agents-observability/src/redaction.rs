@@ -1,7 +1,9 @@
 use crate::config::PrivacyConfig;
+use crate::event::{EventType, ObservationError, ObservationEvent};
 use serde_json::Value;
 use std::collections::HashSet;
 
+/// Privacy helper that redacts keys, paths, errors, tags, and raw text.
 #[derive(Debug, Clone)]
 pub struct Redactor {
     config: PrivacyConfig,
@@ -9,6 +11,7 @@ pub struct Redactor {
 }
 
 impl Redactor {
+    /// Creates a redactor with lowercase key lookup for configured redact keys.
     pub fn new(config: PrivacyConfig) -> Self {
         let keys = config
             .redact_keys
@@ -18,6 +21,7 @@ impl Redactor {
         Self { config, keys }
     }
 
+    /// Redacts a JSON value by configured keys, dotted paths, and text rules.
     pub fn redact_value(&self, value: &Value) -> Value {
         let mut value = value.clone();
         self.redact_recursive(&mut value);
@@ -27,6 +31,46 @@ impl Redactor {
         value
     }
 
+    /// Redacts every event surface that can carry user or domain text.
+    pub fn redact_event(&self, mut event: ObservationEvent) -> ObservationEvent {
+        if let Some(payload) = event.payload.take() {
+            event.payload = Some(self.redact_value(&payload));
+        }
+        if let Some(error) = event.error.take() {
+            event.error = Some(self.redact_error(error));
+        }
+        for value in event.tags.values_mut() {
+            *value = self.redact_text_to_string(value);
+        }
+        for (key, value) in event.dimensions.iter_mut() {
+            if !is_safe_dimension(key) {
+                *value = self.redact_text_to_string(value);
+            }
+        }
+        if let EventType::HitlApproval { trigger } = &mut event.event_type {
+            *trigger = self.redact_text_to_string(trigger);
+        }
+        event
+    }
+
+    /// Redacts the error message while preserving the error kind.
+    pub fn redact_error(&self, mut error: ObservationError) -> ObservationError {
+        error.message = self.redact_text_to_string(&error.message);
+        error
+    }
+
+    /// Converts text into a safe string summary for tags and errors.
+    pub fn redact_text_to_string(&self, text: &str) -> String {
+        if self.config.max_text_chars > 0 {
+            truncate_chars(text, self.config.max_text_chars)
+        } else if self.config.hash_inputs {
+            format!("length:{} hash:{}", text.chars().count(), stable_hash(text))
+        } else {
+            format!("length:{}", text.chars().count())
+        }
+    }
+
+    /// Converts text into a structured safe summary with length and optional hash.
     pub fn redact_text(&self, text: &str) -> Value {
         let mut map = serde_json::Map::new();
         map.insert(
@@ -50,8 +94,14 @@ impl Redactor {
             Value::Object(map) => {
                 let keys: Vec<String> = map.keys().cloned().collect();
                 for key in keys {
-                    if self.keys.contains(&key.to_lowercase()) {
+                    let key_lower = key.to_lowercase();
+                    if self.keys.contains(&key_lower) {
                         map.insert(key, redacted_marker());
+                    } else if key_lower == "hash"
+                        || key_lower == "length"
+                        || key_lower == "redacted"
+                    {
+                        continue;
                     } else if let Some(child) = map.get_mut(&key) {
                         self.redact_recursive(child);
                     }
@@ -64,14 +114,15 @@ impl Redactor {
             }
             Value::String(text) => {
                 if self.config.max_text_chars == 0 {
-                    *value = Value::Object(
-                        [(
-                            "length".to_string(),
-                            Value::from(text.chars().count() as u64),
-                        )]
-                        .into_iter()
-                        .collect(),
+                    let mut map = serde_json::Map::new();
+                    map.insert(
+                        "length".to_string(),
+                        Value::from(text.chars().count() as u64),
                     );
+                    if self.config.hash_inputs {
+                        map.insert("hash".to_string(), Value::from(stable_hash(text)));
+                    }
+                    *value = Value::Object(map);
                 } else {
                     *text = truncate_chars(text, self.config.max_text_chars);
                 }
@@ -83,6 +134,25 @@ impl Redactor {
 
 fn redacted_marker() -> Value {
     serde_json::json!({"redacted": true})
+}
+
+fn is_safe_dimension(key: &str) -> bool {
+    matches!(
+        key,
+        "agent"
+            | "actor"
+            | "session"
+            | "purpose"
+            | "status"
+            | "provider"
+            | "model"
+            | "alias"
+            | "language"
+            | "state"
+            | "tool"
+            | "skill"
+            | "orchestration_pattern"
+    )
 }
 
 fn redact_path(value: &mut Value, path: &str) {
@@ -113,6 +183,7 @@ fn redact_path_parts(value: &mut Value, parts: &[&str]) {
     }
 }
 
+/// Truncates by Unicode scalar values rather than byte offsets.
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();
@@ -126,6 +197,7 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Produces a stable non-cryptographic hash for correlation.
 pub fn stable_hash(text: &str) -> String {
     let mut hash: u64 = 0xcbf29ce484222325;
     for byte in text.as_bytes() {
@@ -152,7 +224,7 @@ mod tests {
 
     #[test]
     fn truncates_on_char_boundaries() {
-        let text = "안녕하세요🙂world";
+        let text = "안녕하세요 world";
         let truncated = truncate_chars(text, 3);
         assert_eq!(truncated, "안녕하...");
     }
@@ -161,5 +233,48 @@ mod tests {
     fn hash_is_stable() {
         assert_eq!(stable_hash("abc"), stable_hash("abc"));
         assert_ne!(stable_hash("abc"), stable_hash("abd"));
+    }
+
+    #[test]
+    fn redacts_event_tags_errors_and_payloads() {
+        use crate::event::{EventStatus, ObservationPurpose};
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let redactor = Redactor::new(PrivacyConfig::default());
+        let mut tags = HashMap::new();
+        tags.insert("reason".to_string(), "사용자 secret token 값".to_string());
+        let event = ObservationEvent {
+            trace_id: "trace".to_string(),
+            span_id: "span".to_string(),
+            parent_span_id: None,
+            turn_id: "turn".to_string(),
+            agent_id: "agent".to_string(),
+            actor_id: None,
+            session_id: None,
+            event_type: EventType::HitlApproval {
+                trigger: "tool with private args".to_string(),
+            },
+            purpose: ObservationPurpose::HitlLocalization,
+            status: EventStatus::Error,
+            timestamp: Utc::now(),
+            duration_ms: 1,
+            tokens: None,
+            cost: None,
+            error: Some(ObservationError::new("tool", "비밀 응답 secret")),
+            dimensions: HashMap::new(),
+            tags,
+            payload: Some(
+                serde_json::json!({"authorization": "Bearer secret", "text": "こんにちはsecret"}),
+            ),
+        };
+
+        let redacted = redactor.redact_event(event);
+        assert!(!redacted.error.unwrap().message.contains("비밀"));
+        assert!(!redacted.tags["reason"].contains("사용자"));
+        assert_eq!(
+            redacted.payload.unwrap()["authorization"],
+            serde_json::json!({"redacted": true})
+        );
     }
 }

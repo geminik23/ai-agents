@@ -1,5 +1,6 @@
 use ai_agents_core::{Memory, Result};
 use ai_agents_llm::LLMProvider;
+use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use ai_agents_state::DelegateContextMode;
 
 /// Prepare the input for a delegated agent based on the context mode.
@@ -50,7 +51,12 @@ pub async fn prepare_delegate_input(
                     ),
                     ai_agents_llm::ChatMessage::user(&prompt),
                 ];
-                match llm.complete(&summary_messages, None).await {
+                match with_observation_purpose(
+                    ObservationPurpose::Summarization,
+                    llm.complete(&summary_messages, None),
+                )
+                .await
+                {
                     Ok(response) => Ok(format!(
                         "Context summary: {}\n\nCurrent message: {}",
                         response.content.trim(),

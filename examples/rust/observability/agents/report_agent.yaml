@@ -1,0 +1,51 @@
+name: ReportObservableAgent
+version: "1.0.0"
+description: "Agent used by the Rust observability report example"
+
+# Rust report example agent.
+#
+# The Rust host runs chat turns, reads ObservabilityManager, prints report fields, and exports files.
+# Use this when your application wants programmatic metrics instead of only CLI-generated files.
+#
+# Flow: Rust host -> chat turns -> manager.generate_report() -> stdout summary -> export files
+#
+# Inspect:
+#   target/observability/rust_report/report.json
+system_prompt: |
+  You are a concise assistant for observability demos.
+  Answer in one or two short sentences.
+
+llm:
+  provider: openai
+  model: gpt-5.4-nano
+
+# The Rust example uses the same YAML config as a CLI agent would.
+# Programmatic access comes from agent.observability() in src/report.rs.
+observability:
+  enabled: true
+  cost:
+    enabled: true                # estimate cost from token usage and pricing. default: true
+    unknown_price_policy: omit   # do not count unknown prices as zero. default: omit
+    pricing:
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+
+  # The Rust example iterates report.by_purpose, so purpose must be part of the grouping.
+  aggregation:
+    dimensions: [model, purpose, status]
+
+  # Keep raw text private even though the Rust host can inspect raw_events() if enabled.
+  privacy:
+    include_prompts: false    # do not retain raw prompt text. default: false
+    include_responses: false  # do not retain raw response text. default: false
+    hash_inputs: true         # keep hashes for correlation. default: true
+
+  export:
+    formats: [json]
+    path: ./target/observability/rust_report/
+    write_report: true
+
+memory:
+  type: in-memory
+  max_messages: 20

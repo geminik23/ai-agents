@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use ai_agents_core::{ChatMessage, LLMProvider, Tool, ToolResult};
 use ai_agents_llm::LLMRegistry;
+use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use ai_agents_tools::generate_schema;
 
 use super::registry::AgentRegistry;
@@ -173,7 +174,12 @@ impl Tool for GenerateAgentTool {
         let prompt = build_generation_prompt(name, description);
         let messages = vec![ChatMessage::user(prompt)];
 
-        let yaml = match llm.complete(&messages, None).await {
+        let yaml = match with_observation_purpose(
+            ObservationPurpose::OrchestrationRouting,
+            llm.complete(&messages, None),
+        )
+        .await
+        {
             Ok(resp) => strip_code_fences(&resp.content),
             Err(e) => return ToolResult::error(format!("LLM generation failed: {}", e)),
         };
@@ -202,7 +208,12 @@ impl Tool for GenerateAgentTool {
                     ChatMessage::user(retry_prompt),
                 ];
 
-                let retry_yaml = match llm.complete(&retry_messages, None).await {
+                let retry_yaml = match with_observation_purpose(
+                    ObservationPurpose::OrchestrationRouting,
+                    llm.complete(&retry_messages, None),
+                )
+                .await
+                {
                     Ok(resp) => strip_code_fences(&resp.content),
                     Err(e) => {
                         return ToolResult::error(format!(

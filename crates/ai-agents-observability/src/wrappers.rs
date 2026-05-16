@@ -14,6 +14,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+/// LLMProvider wrapper that measures calls while preserving the inner provider API.
 pub struct ObservedLLMProvider {
     inner: Arc<dyn LLMProvider>,
     manager: Arc<ObservabilityManager>,
@@ -23,6 +24,7 @@ pub struct ObservedLLMProvider {
 }
 
 impl ObservedLLMProvider {
+    /// Creates a wrapper for one registry alias and model identity.
     pub fn new(
         inner: Arc<dyn LLMProvider>,
         manager: Arc<ObservabilityManager>,
@@ -143,12 +145,14 @@ impl LLMProvider for ObservedLLMProvider {
     }
 }
 
+/// Tool wrapper that measures execution without changing tool identity or schema.
 pub struct ObservedTool {
     inner: Arc<dyn Tool>,
     manager: Arc<ObservabilityManager>,
 }
 
 impl ObservedTool {
+    /// Creates a wrapper around an already registered tool.
     pub fn new(inner: Arc<dyn Tool>, manager: Arc<ObservabilityManager>) -> Self {
         Self { inner, manager }
     }
@@ -196,6 +200,7 @@ impl Tool for ObservedTool {
     }
 }
 
+/// Streaming wrapper that records a span when the stream ends or is dropped.
 struct ObservedLLMStream {
     inner: Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
     span: Option<SpanGuard>,

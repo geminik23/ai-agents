@@ -1,7 +1,7 @@
 use crate::event::{EventStatus, EventType, ObservationPurpose};
 use crate::manager::ObservabilityManager;
 use ai_agents_core::{AgentError, AgentResponse, KeyFact};
-use ai_agents_hitl::{ApprovalRequest, ApprovalResult};
+use ai_agents_hitl::{ApprovalRequest, ApprovalResult, ApprovalTrigger};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use ai_agents_relationships::{DimensionChange, Relationship, RelationshipEvent};
@@ -10,11 +10,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// AgentHooks implementation that records lifecycle events not covered by wrappers.
 pub struct ObservabilityHooks {
     manager: Arc<ObservabilityManager>,
 }
 
 impl ObservabilityHooks {
+    /// Creates lifecycle hooks backed by a shared manager.
     pub fn new(manager: Arc<ObservabilityManager>) -> Self {
         Self { manager }
     }
@@ -33,6 +35,23 @@ impl ObservabilityHooks {
             tags,
             None,
         );
+    }
+}
+
+fn approval_trigger_label(trigger: &ApprovalTrigger) -> (&'static str, Option<String>) {
+    match trigger {
+        ApprovalTrigger::Tool { name, .. } => ("tool", Some(name.clone())),
+        ApprovalTrigger::Condition { name, .. } => ("condition", Some(name.clone())),
+        ApprovalTrigger::State { to, .. } => ("state", Some(to.clone())),
+    }
+}
+
+fn approval_result_label(result: &ApprovalResult) -> &'static str {
+    match result {
+        ApprovalResult::Approved => "approved",
+        ApprovalResult::Rejected { .. } => "rejected",
+        ApprovalResult::Modified { .. } => "modified",
+        ApprovalResult::Timeout => "timeout",
     }
 }
 
@@ -63,11 +82,18 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_approval_requested(&self, request: &ApprovalRequest) {
+        if !self.manager.config().latency.track_hitl {
+            return;
+        }
+        let (trigger, detail) = approval_trigger_label(&request.trigger);
         let mut tags = HashMap::new();
         tags.insert("request_id".to_string(), request.id.clone());
+        if let Some(detail) = detail {
+            tags.insert("trigger_id".to_string(), detail);
+        }
         self.record(
             EventType::HitlApproval {
-                trigger: format!("{:?}", request.trigger),
+                trigger: trigger.to_string(),
             },
             ObservationPurpose::HitlLocalization,
             tags,
@@ -75,9 +101,15 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
+        if !self.manager.config().latency.track_hitl {
+            return;
+        }
         let mut tags = HashMap::new();
         tags.insert("request_id".to_string(), request_id.to_string());
-        tags.insert("result".to_string(), format!("{:?}", result));
+        tags.insert(
+            "result".to_string(),
+            approval_result_label(result).to_string(),
+        );
         self.record(
             EventType::HitlApproval {
                 trigger: "result".to_string(),
@@ -140,6 +172,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_delegate_start(&self, agent_id: &str, state: &str) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         let mut tags = HashMap::new();
         tags.insert("agent_id".to_string(), agent_id.to_string());
         tags.insert("state".to_string(), state.to_string());
@@ -153,6 +188,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_delegate_complete(&self, agent_id: &str, state: &str, duration_ms: u64) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         let mut tags = HashMap::new();
         tags.insert("agent_id".to_string(), agent_id.to_string());
         tags.insert("state".to_string(), state.to_string());
@@ -169,6 +207,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_concurrent_complete(&self, agent_ids: &[String], strategy: &str, duration_ms: u64) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         self.manager.record_lifecycle_event(
             EventType::Orchestration {
                 pattern: "concurrent".to_string(),
@@ -182,6 +223,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_group_chat_round(&self, round: u32, speaker: &str, _content: &str) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         self.manager.record_lifecycle_event(
             EventType::Orchestration {
                 pattern: "group_chat".to_string(),
@@ -195,6 +239,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_pipeline_stage(&self, stage: usize, agent_id: &str, duration_ms: u64) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         self.manager.record_lifecycle_event(
             EventType::Orchestration {
                 pattern: "pipeline".to_string(),
@@ -208,6 +255,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_pipeline_complete(&self, stages: usize, duration_ms: u64) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         self.manager.record_lifecycle_event(
             EventType::Orchestration {
                 pattern: "pipeline".to_string(),
@@ -221,6 +271,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_handoff_start(&self, initial_agent: &str) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         self.manager.record_lifecycle_event(
             EventType::Orchestration {
                 pattern: "handoff".to_string(),
@@ -234,6 +287,9 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_handoff(&self, from: &str, to: &str, reason: &str) {
+        if !self.manager.config().latency.track_orchestration {
+            return;
+        }
         self.manager.record_lifecycle_event(
             EventType::Orchestration {
                 pattern: "handoff".to_string(),

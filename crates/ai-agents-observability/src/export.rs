@@ -1,12 +1,15 @@
-use crate::config::ExportFormat;
+use crate::config::{ExportFormat, RawEventsFormat};
 use crate::manager::ObservabilityManager;
 use std::path::{Path, PathBuf};
 
+/// Result returned after writing configured observability export files.
 #[derive(Debug, Clone, Default)]
 pub struct ExportResult {
+    /// Paths written by this export call.
     pub paths: Vec<PathBuf>,
 }
 
+/// Writes report, aggregate, raw event, and Prometheus files requested by config.
 pub fn export_observability(manager: &ObservabilityManager) -> std::io::Result<ExportResult> {
     let mut result = ExportResult::default();
     let base = PathBuf::from(&manager.config().export.path);
@@ -27,11 +30,22 @@ pub fn export_observability(manager: &ObservabilityManager) -> std::io::Result<E
         result.paths.push(path);
     }
 
-    if manager.config().export.write_raw_events && manager.wants_format(ExportFormat::Jsonl) {
-        let path = output_path(&base, "events.jsonl", "jsonl");
-        ensure_parent(&path)?;
-        std::fs::write(&path, render_jsonl(manager)?)?;
-        result.paths.push(path);
+    if manager.config().export.write_raw_events {
+        match manager.config().export.raw_events_format {
+            RawEventsFormat::Jsonl if manager.wants_format(ExportFormat::Jsonl) => {
+                let path = output_path(&base, "events.jsonl", "jsonl");
+                ensure_parent(&path)?;
+                std::fs::write(&path, render_jsonl(manager)?)?;
+                result.paths.push(path);
+            }
+            RawEventsFormat::Json if manager.wants_format(ExportFormat::Json) => {
+                let path = raw_json_output_path(&base, manager.config().export.write_report);
+                ensure_parent(&path)?;
+                std::fs::write(&path, render_json_events(manager)?)?;
+                result.paths.push(path);
+            }
+            _ => {}
+        }
     }
 
     if manager.wants_format(ExportFormat::Prometheus) {
@@ -54,6 +68,17 @@ fn output_path(base: &Path, default_file: &str, extension: &str) -> PathBuf {
     }
 }
 
+fn raw_json_output_path(base: &Path, report_enabled: bool) -> PathBuf {
+    if report_enabled && base.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        base.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.join("events.json"))
+            .unwrap_or_else(|| PathBuf::from("events.json"))
+    } else {
+        output_path(base, "events.json", "json")
+    }
+}
+
 fn ensure_parent(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -70,6 +95,10 @@ fn render_jsonl(manager: &ObservabilityManager) -> std::io::Result<String> {
         output.push('\n');
     }
     Ok(output)
+}
+
+fn render_json_events(manager: &ObservabilityManager) -> std::io::Result<String> {
+    serde_json::to_string_pretty(&manager.raw_events()).map_err(std::io::Error::other)
 }
 
 fn render_csv(manager: &ObservabilityManager) -> String {

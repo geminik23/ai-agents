@@ -1,5 +1,7 @@
 //! LLM-based clarification question generator
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tracing::debug;
 
@@ -12,10 +14,34 @@ use super::types::{
 };
 use super::util::extract_json;
 
-/// LLM-based generator for clarification questions
+/// Boxed future used when observing clarification question generation.
+pub type ClarificationQuestionFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ClarificationQuestion>> + Send + 'a>>;
+
+/// Boxed future used when observing clarification response parsing.
+pub type ClarificationParseFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ClarificationParseResult>> + Send + 'a>>;
+
+/// Runtime-provided hook for observing clarification calls without adding an observability dependency.
+pub trait ClarificationObserver: Send + Sync {
+    /// Wraps clarification question generation with external instrumentation.
+    fn observe_question<'a>(
+        &'a self,
+        future: ClarificationQuestionFuture<'a>,
+    ) -> ClarificationQuestionFuture<'a>;
+
+    /// Wraps clarification response parsing with external instrumentation.
+    fn observe_parse<'a>(
+        &'a self,
+        future: ClarificationParseFuture<'a>,
+    ) -> ClarificationParseFuture<'a>;
+}
+
+/// LLM-based generator for clarification questions.
 pub struct ClarificationGenerator {
     config: ClarificationConfig,
     llm_registry: Arc<LLMRegistry>,
+    observer: Option<Arc<dyn ClarificationObserver>>,
 }
 
 impl ClarificationGenerator {
@@ -23,7 +49,14 @@ impl ClarificationGenerator {
         Self {
             config,
             llm_registry,
+            observer: None,
         }
+    }
+
+    /// Attaches an observer used to instrument clarification generation and parsing.
+    pub fn with_observer(mut self, observer: Arc<dyn ClarificationObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Generate a clarification question based on detection result
@@ -59,12 +92,20 @@ impl ClarificationGenerator {
             ChatMessage::user(&prompt),
         ];
 
-        let response = llm
-            .complete(&messages, None)
-            .await
-            .map_err(|e| AgentError::LLM(format!("Clarification generation failed: {}", e)))?;
+        let run: ClarificationQuestionFuture<'_> = Box::pin(async move {
+            let response = llm
+                .complete(&messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(format!("Clarification generation failed: {}", e)))?;
 
-        self.parse_generation_response(&response.content, &style, &detection.what_is_unclear)
+            self.parse_generation_response(&response.content, &style, &detection.what_is_unclear)
+        });
+
+        if let Some(observer) = self.observer.as_ref() {
+            observer.observe_question(run).await
+        } else {
+            run.await
+        }
     }
 
     /// Parse user's response to clarification question
@@ -90,12 +131,20 @@ impl ClarificationGenerator {
             ChatMessage::user(&prompt),
         ];
 
-        let response = llm
-            .complete(&messages, None)
-            .await
-            .map_err(|e| AgentError::LLM(format!("Clarification parsing failed: {}", e)))?;
+        let run: ClarificationParseFuture<'_> = Box::pin(async move {
+            let response = llm
+                .complete(&messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(format!("Clarification parsing failed: {}", e)))?;
 
-        self.parse_response_result(&response.content, original_input)
+            self.parse_response_result(&response.content, original_input)
+        });
+
+        if let Some(observer) = self.observer.as_ref() {
+            observer.observe_parse(run).await
+        } else {
+            run.await
+        }
     }
 
     fn determine_style(&self, detection: &AmbiguityDetectionResult) -> ClarificationStyle {

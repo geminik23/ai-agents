@@ -18,6 +18,7 @@ use ai_agents_core::{
     Result, ToolResult,
 };
 use ai_agents_disambiguation::{
+    ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
     DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
 };
 use ai_agents_hitl::{
@@ -31,11 +32,13 @@ use ai_agents_memory::{
     MemoryEvictEvent, MemoryTokenBudget, OverflowStrategy,
 };
 use ai_agents_observability::{
-    ObservabilityManager, ObservationPurpose, SpanContext,
+    ObservabilityManager, ObservationPurpose, SpanContext, current_observation_context,
     new_session_id as new_observation_session_id, resolve_language_from_context,
     with_observation_context, with_observation_purpose,
 };
-use ai_agents_process::{ProcessData, ProcessProcessor};
+use ai_agents_process::{
+    ProcessData, ProcessProcessor, ProcessPurposeHint, ProcessStageFuture, ProcessStageObserver,
+};
 use ai_agents_reasoning::{
     CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
     ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
@@ -192,6 +195,45 @@ impl std::fmt::Debug for RuntimeAgent {
     }
 }
 
+struct ObservabilityClarificationObserver;
+
+impl ClarificationObserver for ObservabilityClarificationObserver {
+    /// Scopes clarification question generation as disambiguation_clarification.
+    fn observe_question<'a>(
+        &'a self,
+        future: ClarificationQuestionFuture<'a>,
+    ) -> ClarificationQuestionFuture<'a> {
+        Box::pin(async move {
+            with_observation_purpose(ObservationPurpose::DisambiguationClarification, future).await
+        })
+    }
+
+    /// Scopes clarification response parsing as disambiguation_clarification.
+    fn observe_parse<'a>(
+        &'a self,
+        future: ClarificationParseFuture<'a>,
+    ) -> ClarificationParseFuture<'a> {
+        Box::pin(async move {
+            with_observation_purpose(ObservationPurpose::DisambiguationClarification, future).await
+        })
+    }
+}
+
+struct ObservabilityProcessStageObserver;
+
+impl ProcessStageObserver for ObservabilityProcessStageObserver {
+    /// Scopes one process stage using the purpose implied by its stage type.
+    fn observe<'a>(
+        &'a self,
+        hint: ProcessPurposeHint,
+        future: ProcessStageFuture<'a>,
+    ) -> ProcessStageFuture<'a> {
+        Box::pin(async move {
+            with_observation_purpose(observation_purpose_for_process(hint), future).await
+        })
+    }
+}
+
 struct RegistryLLMGetter {
     registry: Arc<LLMRegistry>,
 }
@@ -310,15 +352,18 @@ impl RuntimeAgent {
         self
     }
 
+    /// Attach a shared observability manager for traces, metrics, reports, and exports.
     pub fn with_observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
         self.observability_manager = Some(manager);
         self
     }
 
+    /// Returns the configured observability manager for report and export access.
     pub fn observability(&self) -> Option<Arc<ObservabilityManager>> {
         self.observability_manager.clone()
     }
 
+    /// Exports observability files after a turn when export settings request it.
     async fn export_observability_if_configured(&self) {
         let Some(manager) = self.observability_manager.as_ref() else {
             return;
@@ -372,26 +417,64 @@ impl RuntimeAgent {
         context
     }
 
+    /// Returns the current session ID or creates one for unsaved observed turns.
+    fn observation_session_id(&self) -> Option<String> {
+        let mut current = self.current_session_id.write();
+        if current.is_none() {
+            *current = Some(new_observation_session_id());
+        }
+        current.clone()
+    }
+
+    /// Builds the root or child observation context for a chat entry point.
     fn build_observation_context(&self, actor_id: Option<String>) -> Option<SpanContext> {
         let manager = self.observability_manager.as_ref()?;
-        let session_id = {
-            let mut current = self.current_session_id.write();
-            if current.is_none() {
-                *current = Some(new_observation_session_id());
-            }
-            current.clone()
-        };
         let context = self.build_context_with_overlays();
         let language = resolve_language_from_context(manager.config(), &context);
+        let context = current_observation_context()
+            .map(|parent| parent.child_for_agent(self.info.id.clone()).with_new_turn())
+            .unwrap_or_else(|| SpanContext::new_root(self.info.id.clone()));
         Some(
-            SpanContext::new_root(self.info.id.clone())
+            context
                 .with_actor(actor_id.or_else(|| self.effective_actor_id()))
-                .with_session(session_id)
+                .with_session(self.observation_session_id())
                 .with_state(self.current_state())
                 .with_language(Some(language)),
         )
     }
 
+    /// Refreshes task-local context with current runtime labels and a purpose.
+    fn current_runtime_observation_context(
+        &self,
+        purpose: ObservationPurpose,
+    ) -> Option<SpanContext> {
+        let manager = self.observability_manager.as_ref()?;
+        let context = self.build_context_with_overlays();
+        let language = resolve_language_from_context(manager.config(), &context);
+        let mut observation = current_observation_context()
+            .unwrap_or_else(|| SpanContext::new_root(self.info.id.clone()));
+        observation.agent_id = self.info.id.clone();
+        observation.actor_id = self.effective_actor_id();
+        observation.session_id = self.observation_session_id();
+        observation.state = self.current_state();
+        observation.language = Some(language);
+        observation.purpose = purpose;
+        Some(observation)
+    }
+
+    /// Runs a future under a purpose while preserving current trace context.
+    async fn observe_purpose<F, T>(&self, purpose: ObservationPurpose, future: F) -> T
+    where
+        F: Future<Output = T>,
+    {
+        if let Some(context) = self.current_runtime_observation_context(purpose) {
+            with_observation_context(context, future).await
+        } else {
+            future.await
+        }
+    }
+
+    /// Runs chat with actor and observation context while avoiding recursive async types.
     fn chat_with_actor_context_boxed<'a>(
         &'a self,
         input: &'a str,
@@ -662,8 +745,11 @@ impl RuntimeAgent {
             .map(|c| c.custom_categories.clone())
             .unwrap_or_default();
 
-        let facts = extractor
-            .extract(&recent, &existing, actor_id.as_deref(), &categories)
+        let facts = self
+            .observe_purpose(
+                ObservationPurpose::FactsExtraction,
+                extractor.extract(&recent, &existing, actor_id.as_deref(), &categories),
+            )
             .await?;
 
         // Save to storage and update the actor-scoped cache when an actor is known.
@@ -994,7 +1080,13 @@ impl RuntimeAgent {
             }
         };
 
-        match manager.auto_update(&actor_id, &messages).await {
+        match self
+            .observe_purpose(
+                ObservationPurpose::RelationshipUpdate,
+                manager.auto_update(&actor_id, &messages),
+            )
+            .await
+        {
             Ok(update) => {
                 if !update.changes.is_empty() {
                     self.hooks
@@ -1080,10 +1172,9 @@ impl RuntimeAgent {
 
     pub fn with_disambiguation(mut self, config: DisambiguationConfig) -> Self {
         if config.is_enabled() {
-            self.disambiguation_manager = Some(DisambiguationManager::new(
-                config,
-                Arc::clone(&self.llm_registry),
-            ));
+            let manager = DisambiguationManager::new(config, Arc::clone(&self.llm_registry))
+                .with_clarification_observer(Arc::new(ObservabilityClarificationObserver));
+            self.disambiguation_manager = Some(manager);
         }
         self
     }
@@ -1249,6 +1340,7 @@ impl RuntimeAgent {
     }
 
     pub fn with_process_processor(mut self, processor: ProcessProcessor) -> Self {
+        let processor = processor.with_stage_observer(Arc::new(ObservabilityProcessStageObserver));
         self.process_processor = Some(processor);
         self
     }
@@ -1651,7 +1743,12 @@ impl RuntimeAgent {
         };
 
         let summary_msgs = vec![ChatMessage::user(&summary_prompt)];
-        let response = summarizer.complete(&summary_msgs, None).await?;
+        let response = self
+            .observe_purpose(
+                ObservationPurpose::Summarization,
+                summarizer.complete(&summary_msgs, None),
+            )
+            .await?;
 
         let summary_message = ChatMessage::system(&format!(
             "[Previous conversation summary]\n{}",
@@ -2297,13 +2394,16 @@ impl RuntimeAgent {
                 SecurityCheckResult::RequireConfirmation { message } => {
                     // Route through HITL if available, otherwise error
                     if let Some(ref hitl_engine) = self.hitl_engine {
-                        let check_result = hitl_engine
-                            .check_tool_with_localization(
-                                hitl_tool_id,
-                                &tool_call.arguments,
-                                &hitl_lang_ctx,
-                                self.approval_handler.as_ref(),
-                                Some(&self.llm_registry),
+                        let check_result = self
+                            .observe_purpose(
+                                ObservationPurpose::HitlLocalization,
+                                hitl_engine.check_tool_with_localization(
+                                    hitl_tool_id,
+                                    &tool_call.arguments,
+                                    &hitl_lang_ctx,
+                                    self.approval_handler.as_ref(),
+                                    Some(&self.llm_registry),
+                                ),
                             )
                             .await?;
                         let result = self.request_hitl_approval(check_result).await?;
@@ -2335,13 +2435,16 @@ impl RuntimeAgent {
 
         // Check HITL approval for tool (after security passes)
         if let Some(ref hitl_engine) = self.hitl_engine {
-            let check_result = hitl_engine
-                .check_tool_with_localization(
-                    hitl_tool_id,
-                    &tool_call.arguments,
-                    &hitl_lang_ctx,
-                    self.approval_handler.as_ref(),
-                    Some(&self.llm_registry),
+            let check_result = self
+                .observe_purpose(
+                    ObservationPurpose::HitlLocalization,
+                    hitl_engine.check_tool_with_localization(
+                        hitl_tool_id,
+                        &tool_call.arguments,
+                        &hitl_lang_ctx,
+                        self.approval_handler.as_ref(),
+                        Some(&self.llm_registry),
+                    ),
                 )
                 .await?;
             if check_result.is_required() {
@@ -2368,12 +2471,15 @@ impl RuntimeAgent {
             }
 
             // Check conditions (e.g., amount > 1000)
-            let condition_check = hitl_engine
-                .check_conditions_with_localization(
-                    &tool_call.arguments,
-                    &hitl_lang_ctx,
-                    self.approval_handler.as_ref(),
-                    Some(&self.llm_registry),
+            let condition_check = self
+                .observe_purpose(
+                    ObservationPurpose::HitlLocalization,
+                    hitl_engine.check_conditions_with_localization(
+                        &tool_call.arguments,
+                        &hitl_lang_ctx,
+                        self.approval_handler.as_ref(),
+                        Some(&self.llm_registry),
+                    ),
                 )
                 .await?;
             if condition_check.is_required() {
@@ -2503,11 +2609,12 @@ impl RuntimeAgent {
             let available_skills = self.get_available_skills();
             let skill_ids: Vec<&str> = available_skills.iter().map(|s| s.id.as_str()).collect();
 
-            if let Some(skill_id) = with_observation_purpose(
-                ObservationPurpose::SkillRouting,
-                router.select_skill_filtered(input, &skill_ids),
-            )
-            .await?
+            if let Some(skill_id) = self
+                .observe_purpose(
+                    ObservationPurpose::SkillRouting,
+                    router.select_skill_filtered(input, &skill_ids),
+                )
+                .await?
             {
                 info!(skill_id = %skill_id, "Skill selected");
 
@@ -2529,12 +2636,15 @@ impl RuntimeAgent {
                                 .and_then(|sm| sm.current_definition())
                                 .and_then(|def| def.disambiguation.clone());
 
-                            match disambiguator
-                                .process_input_with_override(
-                                    input,
-                                    &context,
-                                    state_override.as_ref(),
-                                    Some(skill_disambig),
+                            match self
+                                .observe_purpose(
+                                    ObservationPurpose::DisambiguationDetection,
+                                    disambiguator.process_input_with_override(
+                                        input,
+                                        &context,
+                                        state_override.as_ref(),
+                                        Some(skill_disambig),
+                                    ),
                                 )
                                 .await?
                             {
@@ -2651,11 +2761,12 @@ impl RuntimeAgent {
                 "Skill reasoning/reflection config"
             );
 
-            let response = with_observation_purpose(
-                ObservationPurpose::SkillPrompt,
-                executor.execute(skill, input, serde_json::json!({})),
-            )
-            .await?;
+            let response = self
+                .observe_purpose(
+                    ObservationPurpose::SkillPrompt,
+                    executor.execute(skill, input, serde_json::json!({})),
+                )
+                .await?;
 
             if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
                 let should_reflect = self
@@ -2724,7 +2835,12 @@ Answer YES or NO only."#,
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
-        let result = llm.complete(&messages, None).await;
+        let result = self
+            .observe_purpose(
+                ObservationPurpose::ReflectionDecision,
+                llm.complete(&messages, None),
+            )
+            .await;
 
         match result {
             Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
@@ -2775,8 +2891,11 @@ Answer YES or NO only."#,
             );
 
             let messages = vec![ChatMessage::user(&retry_prompt)];
-            let retry_response = llm
-                .complete(&messages, None)
+            let retry_response = self
+                .observe_purpose(
+                    ObservationPurpose::ReflectionEvaluation,
+                    llm.complete(&messages, None),
+                )
                 .await
                 .map_err(|e| AgentError::LLM(e.to_string()))?;
 
@@ -2834,8 +2953,11 @@ OVERALL: PASS/FAIL"#,
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
-        let eval_response = evaluator_llm
-            .complete(&messages, None)
+        let eval_response = self
+            .observe_purpose(
+                ObservationPurpose::ReflectionEvaluation,
+                evaluator_llm.complete(&messages, None),
+            )
             .await
             .map_err(|e| AgentError::LLM(format!("Evaluation failed: {}", e)))?;
 
@@ -2879,10 +3001,15 @@ OVERALL: PASS/FAIL"#,
     /// Process input through the pipeline (state-level override or agent-level).
     async fn process_input(&self, input: &str) -> Result<ProcessData> {
         if let Some(processor) = self.get_state_process_processor() {
-            return processor.process_input(input).await;
+            let purpose = observation_purpose_for_process(processor.input_purpose_hint());
+            return self
+                .observe_purpose(purpose, processor.process_input(input))
+                .await;
         }
         if let Some(ref processor) = self.process_processor {
-            processor.process_input(input).await
+            let purpose = observation_purpose_for_process(processor.input_purpose_hint());
+            self.observe_purpose(purpose, processor.process_input(input))
+                .await
         } else {
             Ok(ProcessData::new(input))
         }
@@ -2895,10 +3022,15 @@ OVERALL: PASS/FAIL"#,
         input_context: &std::collections::HashMap<String, serde_json::Value>,
     ) -> Result<ProcessData> {
         if let Some(processor) = self.get_state_process_processor() {
-            return processor.process_output(output, input_context).await;
+            let purpose = observation_purpose_for_process(processor.output_purpose_hint());
+            return self
+                .observe_purpose(purpose, processor.process_output(output, input_context))
+                .await;
         }
         if let Some(ref processor) = self.process_processor {
-            processor.process_output(output, input_context).await
+            let purpose = observation_purpose_for_process(processor.output_purpose_hint());
+            self.observe_purpose(purpose, processor.process_output(output, input_context))
+                .await
         } else {
             Ok(ProcessData::new(output))
         }
@@ -2913,6 +3045,7 @@ OVERALL: PASS/FAIL"#,
         if let Some(ref registry) = Some(self.llm_registry.clone()) {
             processor = processor.with_llm_registry(registry.clone());
         }
+        processor = processor.with_stage_observer(Arc::new(ObservabilityProcessStageObserver));
         Some(processor)
     }
 
@@ -2966,7 +3099,13 @@ OVERALL: PASS/FAIL"#,
         let context = TransitionContext::new(user_message, response, &current_state)
             .with_context(context_map);
 
-        if let Some(index) = evaluator.select_transition(&transitions, &context).await? {
+        if let Some(index) = self
+            .observe_purpose(
+                ObservationPurpose::StateTransitionEvaluation,
+                evaluator.select_transition(&transitions, &context),
+            )
+            .await?
+        {
             let target = transitions[index].to.clone();
             let reason = if transitions[index].when.is_empty() {
                 "guard condition met".to_string()
@@ -3142,7 +3281,13 @@ OVERALL: PASS/FAIL"#,
                                 self.memory.get_messages(Some(5)).await.unwrap_or_default();
                             let mut messages: Vec<ChatMessage> = recent;
                             messages.push(ChatMessage::user(&rendered_prompt));
-                            match llm_provider.complete(&messages, None).await {
+                            match self
+                                .observe_purpose(
+                                    ObservationPurpose::StateAction,
+                                    llm_provider.complete(&messages, None),
+                                )
+                                .await
+                            {
                                 Ok(response) => {
                                     if let Some(key) = store_as {
                                         let _ = self
@@ -3207,7 +3352,13 @@ OVERALL: PASS/FAIL"#,
             };
 
             let messages = vec![ChatMessage::user(&prompt)];
-            match llm.complete(&messages, None).await {
+            match self
+                .observe_purpose(
+                    ObservationPurpose::ContextExtraction,
+                    llm.complete(&messages, None),
+                )
+                .await
+            {
                 Ok(response) => {
                     let value = response.content.trim().to_string();
                     if value != "__NONE__" && !value.is_empty() {
@@ -3416,7 +3567,12 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
-        let response = llm.complete(&messages, None).await;
+        let response = self
+            .observe_purpose(
+                ObservationPurpose::ReflectionDecision,
+                llm.complete(&messages, None),
+            )
+            .await;
 
         match response {
             Ok(resp) => {
@@ -3466,7 +3622,12 @@ Answer YES or NO only."#,
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
-        let result = llm.complete(&messages, None).await;
+        let result = self
+            .observe_purpose(
+                ObservationPurpose::ReflectionDecision,
+                llm.complete(&messages, None),
+            )
+            .await;
 
         match result {
             Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
@@ -3576,8 +3737,11 @@ Respond in JSON format:
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
-        let response = planner_llm
-            .complete(&messages, None)
+        let response = self
+            .observe_purpose(
+                ObservationPurpose::PlanGeneration,
+                planner_llm.complete(&messages, None),
+            )
             .await
             .map_err(|e| AgentError::LLM(format!("Planning failed: {}", e)))?;
 
@@ -3728,7 +3892,13 @@ Respond in JSON format:
                             serde_json::to_string(args).unwrap_or_default()
                         );
                         let messages = vec![ChatMessage::user(&arg_prompt)];
-                        match llm.complete(&messages, None).await {
+                        match self
+                            .observe_purpose(
+                                ObservationPurpose::PlanStep,
+                                llm.complete(&messages, None),
+                            )
+                            .await
+                        {
                             Ok(resp) => {
                                 let content = resp.content.trim();
                                 // Parse the LLM's JSON response, fall back to planner args.
@@ -3788,7 +3958,13 @@ Respond in JSON format:
                     let think_prompt = format!("Context:\n{}\n\nTask: {}", context, prompt);
                     let messages = vec![ChatMessage::user(&think_prompt)];
 
-                    match llm.complete(&messages, None).await {
+                    match self
+                        .observe_purpose(
+                            ObservationPurpose::PlanStep,
+                            llm.complete(&messages, None),
+                        )
+                        .await
+                    {
                         Ok(resp) => serde_json::json!({ "output": resp.content }),
                         Err(e) => {
                             plan.steps[step_idx].mark_failed(e.to_string());
@@ -3809,7 +3985,13 @@ Respond in JSON format:
                     );
                     let messages = vec![ChatMessage::user(&respond_prompt)];
 
-                    match llm.complete(&messages, None).await {
+                    match self
+                        .observe_purpose(
+                            ObservationPurpose::PlanStep,
+                            llm.complete(&messages, None),
+                        )
+                        .await
+                    {
                         Ok(resp) => serde_json::json!({ "output": resp.content }),
                         Err(e) => {
                             plan.steps[step_idx].mark_failed(e.to_string());
@@ -3868,7 +4050,10 @@ Respond in JSON format:
             plan.goal, context
         );
         let messages = vec![ChatMessage::user(&prompt)];
-        match llm.complete(&messages, None).await {
+        match self
+            .observe_purpose(ObservationPurpose::PlanStep, llm.complete(&messages, None))
+            .await
+        {
             Ok(resp) => Ok(resp.content.trim().to_string()),
             Err(_) => Ok(context),
         }
@@ -3942,12 +4127,15 @@ Respond in JSON format:
                 .and_then(|sm| sm.current_definition())
                 .and_then(|def| def.disambiguation.clone());
 
-            match disambiguator
-                .process_input_with_override(
-                    input,
-                    &disambiguation_context,
-                    state_override.as_ref(),
-                    None,
+            match self
+                .observe_purpose(
+                    ObservationPurpose::DisambiguationDetection,
+                    disambiguator.process_input_with_override(
+                        input,
+                        &disambiguation_context,
+                        state_override.as_ref(),
+                        None,
+                    ),
                 )
                 .await?
             {
@@ -4160,8 +4348,11 @@ Respond in JSON format:
         );
 
         let messages = vec![ChatMessage::user(&prompt)];
-        let response = llm
-            .complete(&messages, None)
+        let response = self
+            .observe_purpose(
+                ObservationPurpose::DisambiguationClarification,
+                llm.complete(&messages, None),
+            )
             .await
             .map_err(|e| AgentError::LLM(format!("Localized response generation failed: {}", e)))?;
 
@@ -4240,12 +4431,15 @@ Respond in JSON format:
                             .and_then(|sm| sm.current_definition())
                             .and_then(|def| def.disambiguation.clone());
 
-                        match disambiguator
-                            .process_input_with_override(
-                                enriched_input,
-                                &context,
-                                state_override.as_ref(),
-                                Some(skill_disambig),
+                        match self
+                            .observe_purpose(
+                                ObservationPurpose::DisambiguationDetection,
+                                disambiguator.process_input_with_override(
+                                    enriched_input,
+                                    &context,
+                                    state_override.as_ref(),
+                                    Some(skill_disambig),
+                                ),
                             )
                             .await?
                         {
@@ -4669,8 +4863,11 @@ Respond in JSON format:
                 .await?;
 
             let retry_messages = self.build_messages().await?;
-            let retry_response = llm
-                .complete(&retry_messages, None)
+            let retry_response = self
+                .observe_purpose(
+                    ObservationPurpose::ReflectionEvaluation,
+                    llm.complete(&retry_messages, None),
+                )
                 .await
                 .map_err(|e| AgentError::LLM(e.to_string()))?;
 
@@ -4753,8 +4950,11 @@ Respond in JSON format:
                 }
             }
 
-            let new_response = new_llm
-                .complete(&new_messages, None)
+            let new_response = self
+                .observe_purpose(
+                    ObservationPurpose::MainResponse,
+                    new_llm.complete(&new_messages, None),
+                )
                 .await
                 .map_err(|e| AgentError::LLM(e.to_string()))?;
             final_content = new_response.content.trim().to_string();
@@ -4962,13 +5162,17 @@ Respond in JSON format:
 
         // Prepare input based on delegate_context mode.
         let context_mode = state_def.delegate_context.clone().unwrap_or_default();
-        let effective_input = crate::orchestration::context::prepare_delegate_input(
-            input,
-            &context_mode,
-            &*self.memory,
-            self.llm_registry.get("router").ok().as_deref(),
-        )
-        .await?;
+        let effective_input = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                crate::orchestration::context::prepare_delegate_input(
+                    input,
+                    &context_mode,
+                    &*self.memory,
+                    self.llm_registry.get("router").ok().as_deref(),
+                ),
+            )
+            .await?;
 
         let response = delegate
             .chat_with_actor_context(&effective_input, self.outbound_actor_context())
@@ -5057,13 +5261,17 @@ Respond in JSON format:
         // are top-level: {{ user_input }}, not {{ context.user_input }}.
         // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = crate::orchestration::context::prepare_delegate_input(
-            input,
-            &context_mode,
-            &*self.memory,
-            self.llm_registry.get("router").ok().as_deref(),
-        )
-        .await?;
+        let context_input = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                crate::orchestration::context::prepare_delegate_input(
+                    input,
+                    &context_mode,
+                    &*self.memory,
+                    self.llm_registry.get("router").ok().as_deref(),
+                ),
+            )
+            .await?;
 
         let effective_input = if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
@@ -5081,20 +5289,24 @@ Respond in JSON format:
             .unwrap_or("router");
         let llm_provider = self.llm_registry.get(llm_name).ok();
 
-        let result = scope_actor_context(
-            self.outbound_actor_context(),
-            crate::orchestration::concurrent(
-                registry,
-                &effective_input,
-                &config.agents,
-                &config.aggregation,
-                llm_provider.as_deref(),
-                config.min_required,
-                config.timeout_ms,
-                config.on_partial_failure.clone(),
-            ),
-        )
-        .await?;
+        let result = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationAggregation,
+                scope_actor_context(
+                    self.outbound_actor_context(),
+                    crate::orchestration::concurrent(
+                        registry,
+                        &effective_input,
+                        &config.agents,
+                        &config.aggregation,
+                        llm_provider.as_deref(),
+                        config.min_required,
+                        config.timeout_ms,
+                        config.on_partial_failure.clone(),
+                    ),
+                ),
+            )
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let agent_ids: Vec<String> = config.agents.iter().map(|a| a.id().to_string()).collect();
@@ -5190,13 +5402,17 @@ Respond in JSON format:
 
         // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = crate::orchestration::context::prepare_delegate_input(
-            input,
-            &context_mode,
-            &*self.memory,
-            self.llm_registry.get("router").ok().as_deref(),
-        )
-        .await?;
+        let context_input = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                crate::orchestration::context::prepare_delegate_input(
+                    input,
+                    &context_mode,
+                    &*self.memory,
+                    self.llm_registry.get("router").ok().as_deref(),
+                ),
+            )
+            .await?;
 
         // Render input template if provided, otherwise use the raw user message as topic.
         let effective_topic = if let Some(ref tmpl) = config.input {
@@ -5206,17 +5422,21 @@ Respond in JSON format:
             context_input
         };
 
-        let result = scope_actor_context(
-            self.outbound_actor_context(),
-            crate::orchestration::group_chat(
-                registry,
-                &effective_topic,
-                config,
-                llm_provider.as_deref(),
-                Some(&*self.hooks),
-            ),
-        )
-        .await?;
+        let result = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationConversation,
+                scope_actor_context(
+                    self.outbound_actor_context(),
+                    crate::orchestration::group_chat(
+                        registry,
+                        &effective_topic,
+                        config,
+                        llm_provider.as_deref(),
+                        Some(&*self.hooks),
+                    ),
+                ),
+            )
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -5317,27 +5537,35 @@ Respond in JSON format:
 
         // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = crate::orchestration::context::prepare_delegate_input(
-            input,
-            &context_mode,
-            &*self.memory,
-            self.llm_registry.get("router").ok().as_deref(),
-        )
-        .await?;
+        let context_input = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                crate::orchestration::context::prepare_delegate_input(
+                    input,
+                    &context_mode,
+                    &*self.memory,
+                    self.llm_registry.get("router").ok().as_deref(),
+                ),
+            )
+            .await?;
 
         let context_values = self.build_context_with_overlays();
-        let result = scope_actor_context(
-            self.outbound_actor_context(),
-            crate::orchestration::pipeline(
-                registry,
-                &context_input,
-                &stages,
-                config.timeout_ms,
-                Some(&*self.hooks),
-                Some(&context_values),
-            ),
-        )
-        .await?;
+        let result = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                scope_actor_context(
+                    self.outbound_actor_context(),
+                    crate::orchestration::pipeline(
+                        registry,
+                        &context_input,
+                        &stages,
+                        config.timeout_ms,
+                        Some(&*self.hooks),
+                        Some(&context_values),
+                    ),
+                ),
+            )
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -5428,13 +5656,17 @@ Respond in JSON format:
 
         // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = crate::orchestration::context::prepare_delegate_input(
-            input,
-            &context_mode,
-            &*self.memory,
-            self.llm_registry.get("router").ok().as_deref(),
-        )
-        .await?;
+        let context_input = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                crate::orchestration::context::prepare_delegate_input(
+                    input,
+                    &context_mode,
+                    &*self.memory,
+                    self.llm_registry.get("router").ok().as_deref(),
+                ),
+            )
+            .await?;
 
         // Render input template if provided, otherwise forward the raw user message.
         let effective_input = if let Some(ref tmpl) = config.input {
@@ -5444,19 +5676,23 @@ Respond in JSON format:
             context_input
         };
 
-        let result = scope_actor_context(
-            self.outbound_actor_context(),
-            crate::orchestration::handoff(
-                registry,
-                &effective_input,
-                &config.initial_agent,
-                &config.available_agents,
-                config.max_handoffs,
-                llm.as_ref(),
-                Some(&*self.hooks),
-            ),
-        )
-        .await?;
+        let result = self
+            .observe_purpose(
+                ObservationPurpose::OrchestrationRouting,
+                scope_actor_context(
+                    self.outbound_actor_context(),
+                    crate::orchestration::handoff(
+                        registry,
+                        &effective_input,
+                        &config.initial_agent,
+                        &config.available_agents,
+                        config.max_handoffs,
+                        llm.as_ref(),
+                        Some(&*self.hooks),
+                    ),
+                ),
+            )
+            .await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -5682,7 +5918,7 @@ Respond in JSON format:
                 let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
                     self.recovery_manager
                         .with_retry("llm_call", None, || async {
-                            with_observation_purpose(
+                            self.observe_purpose(
                                 ObservationPurpose::MainResponse,
                                 llm.complete(&messages, None),
                             )
@@ -5692,7 +5928,7 @@ Respond in JSON format:
                         .await
                         .map_err(|e| AgentError::LLM(e.to_string()))
                 } else {
-                    with_observation_purpose(
+                    self.observe_purpose(
                         ObservationPurpose::MainResponse,
                         llm.complete(&messages, None),
                     )
@@ -5715,7 +5951,7 @@ Respond in JSON format:
                                     fallback_llm, e
                                 ))
                             })?;
-                            with_observation_purpose(
+                            self.observe_purpose(
                                 ObservationPurpose::MainResponse,
                                 fb.complete(&messages, None),
                             )
@@ -6015,11 +6251,12 @@ Respond in JSON format:
 
                 let content = if reflection_active {
                     // Use blocking call so reflection can retry without partial output
-                    let response = match with_observation_purpose(
-                        ObservationPurpose::MainResponse,
-                        llm.complete(&messages, None),
-                    )
-                    .await
+                    let response = match self
+                        .observe_purpose(
+                            ObservationPurpose::MainResponse,
+                            llm.complete(&messages, None),
+                        )
+                        .await
                     {
                         Ok(r) => r,
                         Err(e) => {
@@ -6032,11 +6269,12 @@ Respond in JSON format:
                     response.content.trim().to_string()
                 } else {
                     // Streaming LLM call
-                    let llm_stream = match with_observation_purpose(
-                        ObservationPurpose::MainResponse,
-                        llm.complete_stream(&messages, None),
-                    )
-                    .await
+                    let llm_stream = match self
+                        .observe_purpose(
+                            ObservationPurpose::MainResponse,
+                            llm.complete_stream(&messages, None),
+                        )
+                        .await
                     {
                         Ok(s) => s,
                         Err(e) => {
@@ -6309,12 +6547,15 @@ Respond in JSON format:
                     .and_then(|sm| sm.current_definition())
                     .and_then(|def| def.disambiguation.clone());
 
-                let result = match disambiguator
-                    .process_input_with_override(
-                        input,
-                        &disambiguation_context,
-                        state_override.as_ref(),
-                        None,
+                let result = match self
+                    .observe_purpose(
+                        ObservationPurpose::DisambiguationDetection,
+                        disambiguator.process_input_with_override(
+                            input,
+                            &disambiguation_context,
+                            state_override.as_ref(),
+                            None,
+                        ),
                     )
                     .await
                 {
@@ -6660,13 +6901,16 @@ Respond in JSON format:
     pub async fn check_state_hitl(&self, from: Option<&str>, to: &str) -> Result<bool> {
         if let Some(ref hitl_engine) = self.hitl_engine {
             let hitl_lang_ctx = self.build_hitl_language_context();
-            let check_result = hitl_engine
-                .check_state_transition_with_localization(
-                    from,
-                    to,
-                    &hitl_lang_ctx,
-                    self.approval_handler.as_ref(),
-                    Some(&self.llm_registry),
+            let check_result = self
+                .observe_purpose(
+                    ObservationPurpose::HitlLocalization,
+                    hitl_engine.check_state_transition_with_localization(
+                        from,
+                        to,
+                        &hitl_lang_ctx,
+                        self.approval_handler.as_ref(),
+                        Some(&self.llm_registry),
+                    ),
                 )
                 .await?;
             if check_result.is_required() {
@@ -6688,7 +6932,14 @@ Respond in JSON format:
         if !self.parallel_tools.enabled || tool_calls.len() <= 1 {
             let mut results = Vec::new();
             for tc in tool_calls {
-                let result = self.execute_tool_smart(tc).await;
+                let result = self
+                    .observe_purpose(
+                        current_observation_context()
+                            .map(|context| context.purpose)
+                            .unwrap_or_default(),
+                        self.execute_tool_smart(tc),
+                    )
+                    .await;
                 results.push((tc.id.clone(), result));
             }
             return results;
@@ -6781,6 +7032,17 @@ impl Agent for RuntimeAgent {
 //   {{ user_input }}    - the user's actual message
 //   {{ context.<key> }} - values from the context manager
 //
+fn observation_purpose_for_process(hint: ProcessPurposeHint) -> ObservationPurpose {
+    match hint {
+        ProcessPurposeHint::Detect => ObservationPurpose::ProcessDetect,
+        ProcessPurposeHint::Extract => ObservationPurpose::ProcessExtract,
+        ProcessPurposeHint::Validate => ObservationPurpose::ProcessValidate,
+        ProcessPurposeHint::Transform | ProcessPurposeHint::Other => {
+            ObservationPurpose::ProcessTransform
+        }
+    }
+}
+
 fn render_concurrent_template(
     template: &str,
     user_input: &str,

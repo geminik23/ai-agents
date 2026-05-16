@@ -1,0 +1,88 @@
+name: ObservableAssistant
+version: "1.0.0"
+description: "Latency, token, cost, and safe report export"
+
+# Basic observability example.
+#
+# Use this file when you want the smallest safe metrics setup for a YAML agent.
+# It shows how to enable reports without retaining raw prompts, responses, tool args, or tool output.
+#
+# Flow: user input -> main LLM -> response -> report.json export
+#
+# Inspect:
+#   target/observability/basic/report.json
+system_prompt: |
+  You are a concise assistant.
+  Help the user directly and keep answers short.
+
+llm:
+  provider: openai
+  model: gpt-5.4-nano
+
+# Observability is disabled by default in normal agents.
+# When enabled, the builder wraps LLM providers and tools before the agent runs.
+# This means YAML-only users get metrics without writing Rust instrumentation.
+observability:
+  enabled: true
+
+  # Latency controls which duration events are recorded.
+  # The main LLM call is recorded with purpose = main_response.
+  latency:
+    track_llm: true          # record LLM call duration. default: true
+    track_tools: true        # record tool call duration. default: true
+    track_skills: true       # record skill lifecycle events. default: true
+    track_orchestration: true # record orchestration lifecycle events. default: true
+    track_hitl: true         # record approval lifecycle events. default: true
+
+  # Token usage comes from provider usage when available.
+  # If a provider does not return usage, the wrapper can estimate it.
+  tokens:
+    count_input: true            # include prompt/input tokens. default: true
+    count_output: true           # include completion/output tokens. default: true
+    estimate_when_missing: true  # estimate tokens when provider usage is absent. default: true
+
+  # Cost is only meaningful when pricing is known.
+  # Unknown prices are omitted by default so they do not look like free calls.
+  cost:
+    enabled: true                # estimate cost from token usage and pricing. default: true
+    unknown_price_policy: omit   # omit unknown prices. omit (default) | zero | error
+    pricing:
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+
+  # Aggregation controls the main configured table in report.json and aggregates.csv.
+  # Fixed report tables such as by_model and by_purpose are also generated.
+  aggregation:
+    dimensions: [model, purpose, status]  # group by model, operation purpose, and success/error
+    percentiles: [0.5, 0.9, 0.95, 0.99]  # p50, p90, p95, p99 latency. default: same
+
+  # Privacy-safe defaults are the main point of this example.
+  # With max_text_chars omitted, raw text is not retained, but hashes can correlate calls.
+  privacy:
+    include_prompts: false       # do not retain raw prompts. default: false
+    include_responses: false     # do not retain raw responses. default: false
+    include_tool_args: false     # do not retain tool args. default: false
+    include_tool_outputs: false  # do not retain tool output. default: false
+    hash_inputs: true            # keep stable hashes for correlation. default: true
+
+  # Export writes files after each completed turn.
+  # A directory path uses standard file names such as report.json.
+  export:
+    formats: [json]
+    path: ./target/observability/basic/
+    write_report: true       # write report.json after each turn. default: true
+    write_raw_events: false  # raw event files are opt-in. default: false
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+metadata:
+  cli:
+    welcome: "=== Observability Basic Metrics Demo ==="
+    hints:
+      - "Try conversation"
+      - "After a response, inspect target/observability/basic/report.json"
+      - "Raw prompts and responses are not stored by default"
+    show_timing: true

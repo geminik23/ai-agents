@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Stopwatch for one observed span that records on explicit finish or Drop.
 pub struct SpanGuard {
     manager: Arc<ObservabilityManager>,
     context: SpanContext,
@@ -20,6 +21,7 @@ pub struct SpanGuard {
 }
 
 impl SpanGuard {
+    /// Creates a span guard with success status and an immediate start time.
     pub fn new(
         manager: Arc<ObservabilityManager>,
         context: SpanContext,
@@ -39,27 +41,33 @@ impl SpanGuard {
         }
     }
 
+    /// Attaches token usage collected from provider output or estimation.
     pub fn set_tokens(&mut self, tokens: ObservationTokenUsage) {
         self.tokens = Some(tokens);
     }
 
+    /// Overrides the final status before recording.
     pub fn set_status(&mut self, status: EventStatus) {
         self.status = status;
     }
 
+    /// Marks the span as failed and attaches error metadata.
     pub fn set_error(&mut self, error: ObservationError) {
         self.status = EventStatus::Error;
         self.error = Some(error);
     }
 
+    /// Attaches optional payload data that will be redacted by the manager.
     pub fn set_payload(&mut self, payload: Value) {
         self.payload = Some(payload);
     }
 
+    /// Adds a safe tag to the event before recording.
     pub fn add_tag(&mut self, key: impl Into<String>, value: impl Into<String>) {
         self.tags.insert(key.into(), value.into());
     }
 
+    /// Records the span immediately and prevents duplicate Drop recording.
     pub fn record_now(&mut self) {
         if self.recorded {
             return;

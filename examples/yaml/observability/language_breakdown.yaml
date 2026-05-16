@@ -1,0 +1,82 @@
+name: LanguageMetricsAssistant
+version: "1.0.0"
+description: "Group observability metrics by detected user language"
+
+# Language-breakdown observability example.
+#
+# Use this pattern when you need to compare latency, token use, or errors by user language.
+# The input process pipeline detects language first, then observability refreshes the
+# current turn context before downstream main LLM spans are recorded.
+#
+# Flow: input -> process detect language -> store detected_language -> main LLM -> by_language report
+#                  -> detection unavailable -> language fallback = unknown
+#
+# Inspect:
+#   target/observability/language/report.json
+system_prompt: |
+  You answer in the same language as the user.
+  Keep responses concise and friendly.
+
+# The router model handles language detection.
+# The default model handles the final user-facing answer.
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+
+llm:
+  default: default
+  router: router
+
+# LLM-based detection keeps the example language-agnostic.
+# The detected language is stored at detected_language, which observability reads below.
+process:
+  input:
+    - type: detect
+      id: detect_language
+      config:
+        llm: router              # use a cheap model for metadata detection
+        detect: [language]       # supported detect fields include language, sentiment, intent, topic
+        store_in_context:
+          language: detected_language
+
+observability:
+  enabled: true
+
+  # Observability tries each path in order and uses the first non-empty value.
+  # Because process runs before the main LLM, detected_language is available for the main response event.
+  language:
+    paths:
+      - detected_language
+      - user.language
+    fallback: unknown            # label used when no configured path is present. default: unknown
+
+  # Grouping by language shows whether one language path is slower or more expensive.
+  # Grouping by purpose separates process_detect from main_response.
+  aggregation:
+    dimensions: [language, model, purpose]
+
+  # Raw multilingual text is not retained.
+  # If max_text_chars is later enabled, truncation is Unicode-safe.
+  privacy:
+    include_prompts: false       # do not retain raw prompts. default: false
+    include_responses: false     # do not retain raw responses. default: false
+    hash_inputs: true            # keep stable hashes for correlation. default: true
+
+  export:
+    formats: [json]
+    path: ./target/observability/language/
+    write_report: true
+
+metadata:
+  cli:
+    welcome: "=== Observability Language Breakdown Demo ==="
+    hints:
+      - "Try: Hello, can you help me?"
+      - "Try: 안녕하세요, 오늘 일정 정리해 주세요"
+      - "Try: こんにちは、短く自己紹介してください"
+      - "Inspect target/observability/language/report.json for by_language metrics"
+    show_timing: true

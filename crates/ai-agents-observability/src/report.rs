@@ -3,6 +3,7 @@ use crate::config::AggregationDimension;
 use crate::event::{EventStatus, EventType, ObservationEvent, TokenUsageSource};
 use serde::{Deserialize, Serialize};
 
+/// Cost totals across the current report window.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CostBreakdown {
     pub total_usd: f64,
@@ -10,6 +11,7 @@ pub struct CostBreakdown {
     pub unpriced_events: u64,
 }
 
+/// Token totals across the current report window.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenBreakdown {
     pub total_input: u64,
@@ -19,6 +21,7 @@ pub struct TokenBreakdown {
     pub missing_events: u64,
 }
 
+/// User-facing report built from the rolling observation window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ObservabilityReport {
     pub summary: ReportSummary,
@@ -34,6 +37,7 @@ pub struct ObservabilityReport {
     pub dropped_events: u64,
 }
 
+/// Top-level totals for quick inspection.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReportSummary {
     pub total_events: u64,
@@ -54,6 +58,7 @@ pub struct ReportSummary {
     pub estimated_token_events: u64,
 }
 
+/// Builds fixed and configured report tables from already redacted events.
 pub fn generate_report(
     events: &[ObservationEvent],
     configured: Vec<AggregatedMetrics>,

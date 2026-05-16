@@ -1,6 +1,7 @@
 use ai_agents_core::{AgentError, AgentResponse, Result};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_llm::{ChatMessage, LLMProvider};
+use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use serde_json::Value;
 use tracing::{debug, info};
 
@@ -158,10 +159,12 @@ async fn evaluate_handoff(
         )),
     ];
 
-    let response = llm
-        .complete(&messages, None)
-        .await
-        .map_err(|e| AgentError::LLM(format!("Handoff decision failed: {}", e)))?;
+    let response = with_observation_purpose(
+        ObservationPurpose::OrchestrationRouting,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Handoff decision failed: {}", e)))?;
 
     let raw = response.content.trim();
 

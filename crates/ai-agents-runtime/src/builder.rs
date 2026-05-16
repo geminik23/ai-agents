@@ -13,7 +13,8 @@ use ai_agents_memory::{
     CompactingMemory, InMemoryStore, LLMSummarizer, Memory, NoopSummarizer, Summarizer,
 };
 use ai_agents_observability::{
-    ObservabilityHooks, ObservabilityManager, ObservedLLMProvider, ObservedTool,
+    ObservabilityConfig, ObservabilityHooks, ObservabilityManager, ObservedLLMProvider,
+    ObservedTool,
 };
 use ai_agents_process::ProcessProcessor;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
@@ -45,6 +46,44 @@ fn feature_overrides_from_config(config: &crate::spec::LLMConfig) -> HashMap<LLM
         overrides.insert(LLMFeature::JsonMode, enabled);
     }
     overrides
+}
+
+/// Builds alias-to-model metadata used by observed LLM wrappers.
+fn model_by_alias_from_spec(spec: Option<&AgentSpec>) -> HashMap<String, String> {
+    spec.map(|spec| {
+        let mut models: HashMap<String, String> = spec
+            .llms
+            .iter()
+            .map(|(alias, config)| (alias.clone(), config.model.clone()))
+            .collect();
+        if let Some(config) = spec.llm.as_config() {
+            models.insert("default".to_string(), config.model.clone());
+        }
+        models
+    })
+    .unwrap_or_default()
+}
+
+/// Wraps every provider in a registry while preserving aliases and router/default settings.
+fn wrap_registry_with_observability(
+    registry: LLMRegistry,
+    manager: Arc<ObservabilityManager>,
+    model_by_alias: &HashMap<String, String>,
+) -> LLMRegistry {
+    registry.map_providers(|alias, provider| {
+        let provider_name = provider.provider_name().to_string();
+        let model = model_by_alias
+            .get(alias)
+            .cloned()
+            .unwrap_or_else(|| alias.to_string());
+        Arc::new(ObservedLLMProvider::new(
+            provider,
+            Arc::clone(&manager),
+            Some(alias.to_string()),
+            provider_name,
+            model,
+        )) as Arc<dyn LLMProvider>
+    })
 }
 
 pub struct AgentBuilder {
@@ -81,6 +120,7 @@ pub struct AgentBuilder {
     persona_manager: Option<Arc<ai_agents_persona::PersonaManager>>,
     persona_templates: Option<Arc<ai_agents_persona::PersonaTemplateRegistry>>,
     observability_manager: Option<Arc<ObservabilityManager>>,
+    llm_registry_observed: bool,
 }
 
 impl AgentBuilder {
@@ -119,6 +159,7 @@ impl AgentBuilder {
             persona_manager: None,
             persona_templates: None,
             observability_manager: None,
+            llm_registry_observed: false,
         }
     }
 
@@ -163,6 +204,7 @@ impl AgentBuilder {
             persona_manager: None,
             persona_templates: None,
             observability_manager: None,
+            llm_registry_observed: false,
         }
     }
 
@@ -267,6 +309,7 @@ impl AgentBuilder {
             }
 
             self.llm_registry = Some(registry);
+            self.llm_registry_observed = false;
         } else if let Some(config) = spec.llm.as_config() {
             let provider_type = ProviderType::from_str(&config.provider)
                 .map_err(|e| AgentError::Config(e.to_string()))?;
@@ -311,6 +354,7 @@ impl AgentBuilder {
             .with_feature_overrides(feature_overrides_from_config(config));
 
             self.llm = Some(Arc::new(provider));
+            self.llm_registry_observed = false;
         }
 
         Ok(self)
@@ -471,8 +515,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Set a raw LLM registry that may still need observability wrapping.
     pub fn llm_registry(mut self, registry: LLMRegistry) -> Self {
         self.llm_registry = Some(registry);
+        self.llm_registry_observed = false;
+        self
+    }
+
+    /// Set an LLM registry that has already been wrapped for observability.
+    pub(crate) fn observed_llm_registry(mut self, registry: LLMRegistry) -> Self {
+        self.llm_registry = Some(registry);
+        self.llm_registry_observed = true;
         self
     }
 
@@ -645,9 +698,63 @@ impl AgentBuilder {
         self
     }
 
+    /// Provide a shared observability manager instead of creating one from YAML.
     pub fn observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
         self.observability_manager = Some(manager);
         self
+    }
+
+    /// Creates or reuses the manager before components retain provider handles.
+    fn ensure_observability_manager(&mut self) -> Result<Option<Arc<ObservabilityManager>>> {
+        if let Some(manager) = self.observability_manager.as_ref() {
+            return Ok(Some(Arc::clone(manager)));
+        }
+        let Some(ref spec) = self.spec else {
+            return Ok(None);
+        };
+        if !spec.observability.enabled {
+            return Ok(None);
+        }
+        let config = self.observability_config_with_pricing(&spec.observability)?;
+        config
+            .validate()
+            .map_err(|e| AgentError::Config(e.to_string()))?;
+        let manager = ObservabilityManager::new(config);
+        self.observability_manager = Some(Arc::clone(&manager));
+        Ok(Some(manager))
+    }
+
+    /// Loads pricing_file relative to the YAML directory before manager creation.
+    fn observability_config_with_pricing(
+        &self,
+        config: &ObservabilityConfig,
+    ) -> Result<ObservabilityConfig> {
+        config
+            .clone()
+            .with_pricing_file_loaded(self.yaml_dir.as_deref())
+            .map_err(|e| AgentError::Config(e.to_string()))
+    }
+
+    /// Wraps the builder registry once and refreshes any stored process processor registry.
+    fn wrap_llm_registry_for_observability(&mut self) -> Result<()> {
+        if self.llm_registry_observed {
+            return Ok(());
+        }
+        let Some(manager) = self.ensure_observability_manager()? else {
+            return Ok(());
+        };
+        let Some(registry) = self.llm_registry.take() else {
+            return Ok(());
+        };
+        let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+        let wrapped = wrap_registry_with_observability(registry, manager, &model_by_alias);
+        let wrapped_arc = Arc::new(wrapped.clone());
+        if let Some(processor) = self.process_processor.take() {
+            self.process_processor = Some(processor.with_llm_registry(wrapped_arc));
+        }
+        self.llm_registry = Some(wrapped);
+        self.llm_registry_observed = true;
+        Ok(())
     }
 
     pub fn streaming(mut self, enabled: bool) -> Self {
@@ -665,6 +772,9 @@ impl AgentBuilder {
             None => return Ok(self),
         };
 
+        self.wrap_llm_registry_for_observability()?;
+        let observability_manager = self.observability_manager.clone();
+
         use crate::spawner::{
             AgentRegistry, AgentSpawner,
             config::{configure_spawner_tools, resolve_templates},
@@ -672,9 +782,17 @@ impl AgentBuilder {
 
         let mut spawner = AgentSpawner::new();
 
+        if let Some(ref manager) = observability_manager {
+            spawner = spawner.with_observability(Arc::clone(manager));
+        }
+
         if spawner_config.shared_llms {
             if let Some(ref reg) = self.llm_registry {
-                spawner = spawner.with_shared_llms(reg.clone());
+                spawner = if self.llm_registry_observed {
+                    spawner.with_shared_observed_llms(reg.clone())
+                } else {
+                    spawner.with_shared_llms(reg.clone())
+                };
             }
         }
 
@@ -770,8 +888,15 @@ impl AgentBuilder {
                 Ok(mut sub_builder) => {
                     if spawner_config.shared_llms {
                         if let Some(ref reg) = self.llm_registry {
-                            sub_builder = sub_builder.llm_registry(reg.clone());
+                            sub_builder = if self.llm_registry_observed {
+                                sub_builder.observed_llm_registry(reg.clone())
+                            } else {
+                                sub_builder.llm_registry(reg.clone())
+                            };
                         }
+                    }
+                    if let Some(ref manager) = observability_manager {
+                        sub_builder = sub_builder.observability(Arc::clone(manager));
                     }
                     match sub_builder
                         .auto_configure_llms()
@@ -872,6 +997,8 @@ impl AgentBuilder {
             .as_ref()
             .and_then(|s| s.memory.relationships.clone());
 
+        let observability_manager = self.ensure_observability_manager()?;
+
         let base_prompt = self
             .system_prompt
             .ok_or_else(|| AgentError::Config("System prompt is required".into()))?;
@@ -906,7 +1033,25 @@ impl AgentBuilder {
 
         if let Some(llm) = self.llm {
             if !llm_registry.has("default") {
-                llm_registry.register("default", llm.clone());
+                let provider = if self.llm_registry_observed {
+                    if let Some(ref manager) = observability_manager {
+                        Arc::new(ObservedLLMProvider::new(
+                            llm.clone(),
+                            Arc::clone(manager),
+                            Some("default".to_string()),
+                            llm.provider_name().to_string(),
+                            model_by_alias_from_spec(self.spec.as_ref())
+                                .get("default")
+                                .cloned()
+                                .unwrap_or_else(|| "default".to_string()),
+                        )) as Arc<dyn LLMProvider>
+                    } else {
+                        llm.clone()
+                    }
+                } else {
+                    llm.clone()
+                };
+                llm_registry.register("default", provider);
             }
         }
 
@@ -926,51 +1071,16 @@ impl AgentBuilder {
             ));
         }
 
-        let observability_manager = if let Some(manager) = self.observability_manager.take() {
-            Some(manager)
-        } else if let Some(ref spec) = self.spec {
-            if spec.observability.enabled {
-                spec.observability
-                    .validate()
-                    .map_err(|e| AgentError::Config(e.to_string()))?;
-                Some(ObservabilityManager::new(spec.observability.clone()))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         if let Some(ref manager) = observability_manager {
-            let model_by_alias: HashMap<String, String> = self
-                .spec
-                .as_ref()
-                .map(|spec| {
-                    let mut models: HashMap<String, String> = spec
-                        .llms
-                        .iter()
-                        .map(|(alias, config)| (alias.clone(), config.model.clone()))
-                        .collect();
-                    if let Some(config) = spec.llm.as_config() {
-                        models.insert("default".to_string(), config.model.clone());
-                    }
-                    models
-                })
-                .unwrap_or_default();
-            llm_registry = llm_registry.map_providers(|alias, provider| {
-                let provider_name = provider.provider_name().to_string();
-                let model = model_by_alias
-                    .get(alias)
-                    .cloned()
-                    .unwrap_or_else(|| alias.to_string());
-                Arc::new(ObservedLLMProvider::new(
-                    provider,
+            if !self.llm_registry_observed {
+                let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+                llm_registry = wrap_registry_with_observability(
+                    llm_registry,
                     Arc::clone(manager),
-                    Some(alias.to_string()),
-                    provider_name,
-                    model,
-                )) as Arc<dyn LLMProvider>
-            });
+                    &model_by_alias,
+                );
+                self.llm_registry_observed = true;
+            }
         }
 
         // Create memory after LLM registry is ready (needed for CompactingMemory summarizer)
@@ -1167,7 +1277,8 @@ impl AgentBuilder {
         }
 
         if let Some(processor) = self.process_processor {
-            agent = agent.with_process_processor(processor);
+            agent =
+                agent.with_process_processor(processor.with_llm_registry(llm_registry_arc.clone()));
         } else if let Some(ref spec) = self.spec {
             if spec.has_process() {
                 let processor = ProcessProcessor::new(spec.process.clone())
