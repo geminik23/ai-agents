@@ -30,6 +30,7 @@ ai-agents-persona = { workspace = true }
 ai-agents-relationships = { workspace = true }
 ai-agents-observability = { workspace = true }
 ai-agents-facts = { workspace = true }
+ai-agents-eval = { workspace = true }
 ai-agents-template = { workspace = true }
 ai-agents-runtime = { workspace = true }
 serde_yaml = { workspace = true }

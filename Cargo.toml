@@ -20,6 +20,7 @@ members = [
     "crates/ai-agents-observability",
     "crates/ai-agents-template",
     "crates/ai-agents-facts",
+    "crates/ai-agents-eval",
     "crates/ai-agents-runtime",
     "crates/ai-agents",
     "crates/ai-agents-cli",
@@ -81,6 +82,7 @@ ai-agents-relationships = { path = "crates/ai-agents-relationships", version = "
 ai-agents-observability = { path = "crates/ai-agents-observability", version = "1.0.0-rc.13" }
 ai-agents-template = { path = "crates/ai-agents-template", version = "1.0.0-rc.13" }
 ai-agents-facts = { path = "crates/ai-agents-facts", version = "1.0.0-rc.13" }
+ai-agents-eval = { path = "crates/ai-agents-eval", version = "1.0.0-rc.13" }
 ai-agents-runtime = { path = "crates/ai-agents-runtime", version = "1.0.0-rc.13" }
 ai-agents = { path = "crates/ai-agents", version = "1.0.0-rc.13" }
 

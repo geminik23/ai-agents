@@ -73,6 +73,7 @@ impl RunOptions {
 pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         CliCommand::Run(args) => run_agent(RunOptions::from_run_args(&args)).await,
+        CliCommand::Eval(args) => crate::eval::run_eval(args).await,
         CliCommand::Validate(args) => {
             crate::init_tracing();
             validate_agent(&args.agent).await

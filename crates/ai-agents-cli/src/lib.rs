@@ -1,12 +1,13 @@
 pub mod approval;
 pub mod cli;
+pub mod eval;
 pub mod metadata;
 pub mod repl;
 pub mod run;
 pub mod tui;
 
 pub use approval::CliApprovalHandler;
-pub use cli::{Cli, Command, RunArgs, ValidateArgs};
+pub use cli::{Cli, Command, EvalArgs, RunArgs, ValidateArgs};
 pub use metadata::{CliOverrides, ResolvedCliMetadata};
 pub use repl::{CliRepl, CliReplConfig, CommandResult, PromptStyle, ReplMode};
 pub use run::{

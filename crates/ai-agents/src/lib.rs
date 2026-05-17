@@ -470,6 +470,10 @@ pub mod facts {
     pub use ai_agents_facts::{FactCategory, FactFilter, KeyFact};
 }
 
+pub mod eval {
+    pub use ai_agents_eval::*;
+}
+
 pub mod orchestration {
     pub use ai_agents_runtime::orchestration::context::prepare_delegate_input;
     pub use ai_agents_runtime::orchestration::tools::{
@@ -523,6 +527,7 @@ pub use tool_security::{
     SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
 };
 
+pub use eval::{EvalResult, EvalRunner, EvalRunnerOptions, EvalSettings, EvalSuite};
 pub use observability::{ObservabilityConfig, ObservabilityManager, ObservabilityReport};
 
 pub use context::{

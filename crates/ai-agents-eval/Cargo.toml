@@ -1,0 +1,42 @@
+[package]
+name = "ai-agents-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "Evaluation runner for YAML-defined AI agents"
+keywords = ["AI", "Agent", "LLM", "Evaluation", "YAML"]
+categories = ["development-tools::testing", "asynchronous"]
+
+[dependencies]
+ai-agents-core = { workspace = true }
+ai-agents-llm = { workspace = true }
+ai-agents-runtime = { workspace = true }
+ai-agents-tools = { workspace = true }
+ai-agents-storage = { workspace = true }
+ai-agents-observability = { workspace = true }
+ai-agents-relationships = { workspace = true }
+ai-agents-persona = { workspace = true }
+ai-agents-facts = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+parking_lot = { workspace = true }
+
+[features]
+default = []
+sqlite = ["ai-agents-runtime/sqlite", "ai-agents-storage/sqlite"]
+redis-storage = ["ai-agents-runtime/redis-storage", "ai-agents-storage/redis-storage"]
+full-storage = ["sqlite", "redis-storage"]
+full = ["full-storage"]
