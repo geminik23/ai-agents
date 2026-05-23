@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.13** — Under active development. Stable `v1.0.0` is planned for release by mid-July 2026 at the latest. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.14** — Under active development. Stable `v1.0.0` is planned for release by mid-July 2026 at the latest. APIs and YAML schema may change between minor versions.
 
 ## Features
 
@@ -32,7 +32,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Multi-agent systems** - dynamic agent spawning, agent registry, actor-aware inter-agent messaging, and router/pipeline/concurrent/group chat/handoff orchestration
 - **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming, context injection, and actor/relationship inspection
 - **Reasoning, reflection & disambiguation** - chain-of-thought, ReAct, plan-and-execute, self-evaluation, ambiguity detection, and clarification
-- **Safety, control & observability** - error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
+- **Evaluation, safety, control & observability** - YAML scenario evals with assertions/judges, error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
 - **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
@@ -41,7 +41,7 @@ See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.13"
+ai-agents = "1.0.0-rc.14"
 ```
 
 ## Quick Start
@@ -130,7 +130,7 @@ See the [examples/](examples/) directory for more.
 
 ```sh
 # Install from crates.io
-cargo install ai-agents-cli --version 1.0.0-rc.13
+cargo install ai-agents-cli --version 1.0.0-rc.14
 
 # Or run directly from source
 cargo run -p ai-agents-cli -- run agent.yaml
@@ -141,9 +141,12 @@ ai-agents-cli run agent.yaml                          # interactive REPL
 ai-agents-cli run agent.yaml --stream --show-tools     # stream tokens, show tool calls
 ai-agents-cli run agent.yaml --show-state --show-timing # show state transitions and timing
 ai-agents-cli validate agent.yaml                      # check YAML without starting
+ai-agents-cli eval --agent agent.yaml --scenarios eval/suite.yaml --output eval_results/
 ```
 
-See the [CLI Guide](https://ai-agents.rs/docs/cli/) for REPL commands, metadata configuration, and full reference.
+Use `eval` to run YAML or JSONL scenario suites with mock/replay/record fixtures, rule-based assertions, optional LLM judge checks, retries, strict default redaction, JSON/Markdown/JUnit outputs, and observability reports when enabled.
+
+See the [CLI Guide](https://ai-agents.rs/docs/cli/) for REPL commands, evaluation options, metadata configuration, and full reference.
 
 ## Roadmap
 

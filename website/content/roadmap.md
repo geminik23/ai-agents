@@ -26,6 +26,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.11** | Session management and key facts - cross-session actor memory, key facts extraction, session metadata, and CLI/TUI actor commands |
 | **rc.12** | Relationship memory - actor-scoped trust, sentiment, rapport, two-sided relationships, actor-aware inter-agent context, and relationship inspection in the REPL/TUI |
 | **rc.13** | LLM provider enhancements and observability - capability overrides, Ollama options, privacy-safe tracing, cost metrics, reports, raw events, and Prometheus text export |
+| **rc.14** | Evaluation framework - YAML and JSONL scenario suites, fixtures, assertions, judges, strict redaction, observability overlay, and CI reports |
 
 ---
 
@@ -55,7 +56,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Relationship Memory** | Actor-scoped trust, sentiment, rapport, notable relationship events, two-sided relationships, and actor-aware inter-agent context | ✅ Done (rc.12) |
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | ✅ Done (rc.13) |
 | **Observability & Tracing** | Privacy-safe per-call latency, token usage, cost estimates, trace context, reports, and exporters | ✅ Done (rc.13) |
-| **Evaluation Framework** | YAML-driven scenario runner with assertions, LLM judge, and metrics | Planned (rc.14) |
+| **Evaluation Framework** | YAML/JSONL scenario runner with assertions, LLM judge, fixtures, strict redaction, parallel execution, observability overlay, and CI reports | ✅ Done (rc.14) |
 | **Runtime Latency Optimization** | Safe speculative LLM scheduling, pre-response transitions, parallel post-turn memory updates, and orchestration aggregation speedups | Planned (rc.15) |
 | **Built-in Tool Expansion** | Safe search tools, split file read/write/edit tools, interactive questions, session todos, bounded waits, and web retrieval primitives | Planned (rc.16) |
 | **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | Planned (v1.0.0) |

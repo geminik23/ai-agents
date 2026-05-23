@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.0.0-rc.14
+
+### Added
+- Evaluation framework: YAML and JSONL suites can test agents through the normal runtime path with assertions and CI reports
+- Evaluation fixtures: mock tools, context overlays, local HTTP routes, and mock, replay, record, or real LLM modes are available for suites
+- Evaluation judge: optional semantic scoring can use a configured LLM while deterministic assertions remain rule-based
+- Evaluation examples: no-key suites cover basic chat, multi-turn, streaming, and observability, with a live real-LLM suite for explicit smoke tests
+
+### Changed
+- Evaluation output privacy: default reports redact inputs and responses and omit raw turn evidence from machine-readable artifacts
+- Evaluation execution: suites now validate configuration before running and can run scenario-isolated cases concurrently
+- Evaluation storage: file and SQLite eval runs use isolated temporary storage before spawned agents are configured
+
+### Fixed
+- Evaluation no-op fields: metadata, facts, relationships, orchestration, observability, judge aliases, streaming, mock server, and scenario timeout settings now have explicit behavior
+- Evaluation CLI validation: invalid tag modes, incompatible LLM fixture overrides, and output write failures now exit with configuration errors
+
+---
+
 ## 1.0.0-rc.13
 
 ### Added
