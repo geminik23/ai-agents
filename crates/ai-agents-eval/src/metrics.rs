@@ -4,34 +4,56 @@ use serde::{Deserialize, Serialize};
 
 use crate::suite::{FailureCategory, ScenarioResult, ScenarioStatus};
 
+/// Aggregate metrics computed after an eval suite run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EvalMetrics {
+    /// Fraction of scenarios that passed.
     pub pass_rate: f64,
+    /// Total evaluated turns across all attempts.
     pub total_turns: usize,
+    /// Number of scenarios ending in error.
     pub errors: usize,
+    /// Number of scenarios that passed after retry.
     pub flaky: usize,
+    /// Average turn latency in milliseconds.
     pub avg_latency_ms: f64,
+    /// Median turn latency in milliseconds.
     pub p50_latency_ms: u64,
+    /// P90 turn latency in milliseconds.
     pub p90_latency_ms: u64,
+    /// P99 turn latency in milliseconds.
     pub p99_latency_ms: u64,
+    /// Scenario counts grouped by tag.
     pub by_tag: HashMap<String, CountMetrics>,
+    /// Scenario counts grouped by language.
     pub by_language: HashMap<String, CountMetrics>,
+    /// Assertion counts grouped by assertion name.
     pub by_assertion: HashMap<String, AssertionMetrics>,
+    /// Scenario counts grouped by failure category.
     pub by_failure_category: HashMap<String, usize>,
 }
 
+/// Pass, fail, and skip counts for one grouping key.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CountMetrics {
+    /// Total count for this result or group.
     pub total: usize,
+    /// Passed count or boolean result.
     pub passed: usize,
+    /// Failed or errored count for this result or group.
     pub failed: usize,
+    /// Skipped count for this result or group.
     pub skipped: usize,
 }
 
+/// Aggregate pass and fail counts for one assertion name.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AssertionMetrics {
+    /// Total count for this result or group.
     pub total: usize,
+    /// Passed count or boolean result.
     pub passed: usize,
+    /// Failed or errored count for this result or group.
     pub failed: usize,
 }
 
@@ -126,4 +148,81 @@ fn category_key(category: &FailureCategory) -> String {
         FailureCategory::FlakyPass => "flaky_pass",
     }
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::suite::{AttemptResult, ScenarioResult, TurnResult};
+    use crate::{redaction::RedactedString, suite::ScenarioStatus};
+
+    fn scenario(id: &str, status: ScenarioStatus, latency: u64) -> ScenarioResult {
+        ScenarioResult {
+            id: id.to_string(),
+            name: None,
+            tags: vec!["smoke".to_string()],
+            language: Some("en".to_string()),
+            status,
+            failure_category: None,
+            flaky: false,
+            attempts: vec![AttemptResult {
+                attempt: 0,
+                turns: vec![TurnResult {
+                    index: 0,
+                    input: RedactedString::redacted("[redacted]"),
+                    response: RedactedString::redacted("[redacted]"),
+                    state: None,
+                    metadata: None,
+                    evidence: crate::evidence::TurnEvidence {
+                        response_metadata: None,
+                        state: None,
+                        state_history: Vec::new(),
+                        context: serde_json::Value::Null,
+                        tool_executions: Vec::new(),
+                        skill: None,
+                        disambiguation: None,
+                        facts: None,
+                        relationship: None,
+                        persona: None,
+                        orchestration: None,
+                        observability: None,
+                    },
+                    assertion_results: vec![crate::assertion::AssertionResultDetail {
+                        assertion: "response_not_empty".to_string(),
+                        passed: true,
+                        actual: serde_json::json!(true),
+                        expected: serde_json::json!(true),
+                        message: None,
+                    }],
+                    latency_ms: latency,
+                    observability_span_id: None,
+                }],
+                status: ScenarioStatus::Passed,
+                duration_ms: latency,
+            }],
+            duration_ms: latency,
+            retries_used: 0,
+        }
+    }
+
+    #[test]
+    fn computes_counts_and_latency() {
+        let results = vec![
+            scenario("pass", ScenarioStatus::Passed, 10),
+            scenario(
+                "fail",
+                ScenarioStatus::Failed {
+                    reason: "assertion".to_string(),
+                },
+                30,
+            ),
+        ];
+        let metrics = compute_metrics(&results);
+        assert_eq!(metrics.pass_rate, 0.5);
+        assert_eq!(metrics.total_turns, 2);
+        assert_eq!(metrics.avg_latency_ms, 20.0);
+        assert_eq!(metrics.by_tag["smoke"].total, 2);
+        assert_eq!(metrics.by_language["en"].total, 2);
+        assert_eq!(metrics.by_assertion["response_not_empty"].passed, 2);
+    }
 }

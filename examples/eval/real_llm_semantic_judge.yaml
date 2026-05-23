@@ -1,0 +1,75 @@
+name: Real LLM Semantic Eval
+agent: ../yaml/basic/simple_chat.yaml
+
+# Real LLM semantic evaluation suite.
+# This is the live-provider companion to the mocked eval examples.
+# It intentionally calls the provider declared by the agent YAML for both the response and judge.
+#
+# Usage is kept as comments so this file stays safe to open, copy, and inspect.
+# Run it explicitly only when you want a live smoke test:
+#   cargo run -p ai-agents-cli -- eval \
+#     --agent examples/yaml/basic/simple_chat.yaml \
+#     --scenarios examples/eval/real_llm_semantic_judge.yaml \
+#     --output target/eval/real_llm_semantic_judge \
+#     --real-llm
+#
+# Prerequisites:
+#   - OPENAI_API_KEY or the key required by the agent's configured provider
+#   - network access to the provider
+#   - acceptance of normal provider cost, latency, and nondeterminism
+#
+# Flow: scenario input -> real LLM response -> real LLM judge -> reports
+#
+# NOTE: Keep this suite out of default CI unless you explicitly select the `live` tag.
+settings:
+  timeout_per_turn_ms: 60000  # live providers can be slower than mock fixtures. default: 30000
+  retries: 1                  # retry once to reduce transient provider failures. default: 0
+  retry_delay_ms: 1000        # wait between attempts. default: 1000
+  isolation: scenario         # fresh runtime per attempt. default: scenario
+
+# LLM fixture modes control how eval replaces or uses model providers.
+#
+# mode: mock
+#   Uses fixed responses from fixtures.llm.responses. Best for default CI.
+#
+# mode: replay
+#   Loads previous responses from a cassette JSONL file. Good for stable regression suites.
+#
+# mode: record
+#   Calls the real provider and appends responses to a cassette file for later replay.
+#
+# mode: real
+#   Uses the agent YAML provider exactly as configured. This example uses real mode.
+#
+# CLI overrides:
+#   --real-llm forces real mode.
+#   --replay <file> forces replay mode with a cassette.
+#   --record <file> forces record mode and writes a cassette.
+fixtures:
+  llm:
+    mode: real
+
+# Tag live examples so CI can exclude them unless explicitly selected.
+# The same real provider path is used for the assistant response and the judge unless `llm` is set below.
+# The judge assertion is semantic, so it allows natural wording variation instead of exact text.
+scenarios:
+  - id: live-eval-suite-explanation
+    name: Real model explains what an eval suite does
+    tags: [live, real-llm, semantic-judge]
+    language: en
+    turns:
+      - input: "In one short sentence, explain what an AI agent evaluation suite does."
+        assert:
+          all:
+            - response_not_empty: true
+            - judge:
+                # Optional: set `llm: router` when the agent defines named LLM aliases.
+                # This file uses the default router/default fallback from the agent.
+                pass_threshold: 0.7
+                criteria:
+                  - name: relevance
+                    description: "The response says that an evaluation suite tests, checks, or validates an agent's behavior."
+                    weight: 1.0
+                  - name: concision
+                    description: "The response is short and focused, not a long essay."
+                    weight: 0.4

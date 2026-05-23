@@ -155,3 +155,82 @@ fn escape_xml(input: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::redaction::RedactedString;
+    use crate::suite::{AttemptResult, EvalResult, ScenarioResult, ScenarioStatus, TurnResult};
+
+    fn result() -> EvalResult {
+        EvalResult {
+            schema_version: 1,
+            suite: "suite".to_string(),
+            agent: "agent.yaml".to_string(),
+            total: 1,
+            passed: 1,
+            failed: 0,
+            skipped: 0,
+            duration_ms: 1,
+            scenarios: vec![ScenarioResult {
+                id: "scenario".to_string(),
+                name: None,
+                tags: Vec::new(),
+                language: None,
+                status: ScenarioStatus::Passed,
+                failure_category: None,
+                flaky: false,
+                attempts: vec![AttemptResult {
+                    attempt: 0,
+                    turns: vec![TurnResult {
+                        index: 0,
+                        input: RedactedString::redacted("[redacted]"),
+                        response: RedactedString::redacted("[redacted]"),
+                        state: None,
+                        metadata: None,
+                        evidence: crate::evidence::TurnEvidence {
+                            response_metadata: Some(
+                                serde_json::json!({"secret":"should-not-serialize"}),
+                            ),
+                            state: None,
+                            state_history: Vec::new(),
+                            context: serde_json::json!({"secret":"should-not-serialize"}),
+                            tool_executions: Vec::new(),
+                            skill: None,
+                            disambiguation: None,
+                            facts: None,
+                            relationship: None,
+                            persona: None,
+                            orchestration: None,
+                            observability: None,
+                        },
+                        assertion_results: Vec::new(),
+                        latency_ms: 1,
+                        observability_span_id: None,
+                    }],
+                    status: ScenarioStatus::Passed,
+                    duration_ms: 1,
+                }],
+                duration_ms: 1,
+                retries_used: 0,
+            }],
+            metrics: crate::metrics::EvalMetrics::default(),
+            observability: None,
+        }
+    }
+
+    #[test]
+    fn json_outputs_omit_raw_evidence() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_output_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        write_outputs(&result(), &dir, true).unwrap();
+        let summary = std::fs::read_to_string(dir.join("summary.json")).unwrap();
+        let per_scenario = std::fs::read_to_string(dir.join("per_scenario.jsonl")).unwrap();
+        assert!(!summary.contains("should-not-serialize"));
+        assert!(!per_scenario.contains("should-not-serialize"));
+        assert!(dir.join("junit.xml").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+/// Preset reset strategies for eval reset steps.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResetProfile {
@@ -10,20 +11,28 @@ pub enum ResetProfile {
     Persistence,
 }
 
+/// Options controlling an eval reset step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResetOptions {
+    /// Reset profile applied by the reset step.
     #[serde(default = "default_profile")]
     pub profile: ResetProfile,
+    /// Reapply fixture and scenario context after reset.
     #[serde(default)]
     pub preserve_host_context: bool,
+    /// Preserve the active actor ID after reset.
     #[serde(default)]
     pub preserve_actor_id: bool,
+    /// Keep the temp storage path across rebuilds.
     #[serde(default = "default_true")]
     pub preserve_storage: bool,
+    /// Whether spawner registry state should be rebuilt.
     #[serde(default = "default_true")]
     pub reset_spawner_registry: bool,
+    /// Whether observability state should be recreated.
     #[serde(default = "default_true")]
     pub reset_observability: bool,
+    /// Delete temp persistence before rebuilding.
     #[serde(default)]
     pub delete_persistence: bool,
 }

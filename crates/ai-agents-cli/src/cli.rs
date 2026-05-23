@@ -135,6 +135,18 @@ pub struct EvalArgs {
     /// Enable default observability overlay if suite does not specify it
     #[arg(long, action = ArgAction::SetTrue)]
     pub observability: bool,
+
+    /// Record real LLM responses to a cassette JSONL file
+    #[arg(long, value_name = "FILE")]
+    pub record: Option<PathBuf>,
+
+    /// Replay LLM responses from a cassette JSONL file
+    #[arg(long, value_name = "FILE")]
+    pub replay: Option<PathBuf>,
+
+    /// Force real LLM calls even when the suite config declares a fixture mode
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub real_llm: bool,
 }
 
 #[derive(Debug, Clone, Parser)]

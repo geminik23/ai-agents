@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+/// String value that records whether redaction was applied.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedactedString {
+    /// Stored value, redacted when requested by settings.
     pub value: String,
+    /// Whether the value was redacted for output.
     #[serde(default)]
     pub redacted: bool,
 }
@@ -36,5 +40,26 @@ pub fn redact_text(text: &str, enabled: bool, max_chars: usize) -> RedactedStrin
         RedactedString::redacted(format!("{}...", preview))
     } else {
         RedactedString::redacted(preview)
+    }
+}
+
+pub fn redact_value(value: Value, enabled: bool, max_chars: usize) -> Value {
+    if !enabled {
+        return value;
+    }
+    match value {
+        Value::String(text) => Value::String(redact_text(&text, true, max_chars).value),
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|value| redact_value(value, true, max_chars))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, redact_value(value, true, max_chars)))
+                .collect(),
+        ),
+        other => other,
     }
 }

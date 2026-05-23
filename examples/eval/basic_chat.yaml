@@ -1,0 +1,45 @@
+name: Basic Chat Eval
+agent: ../yaml/basic/simple_chat.yaml
+
+# Basic mocked evaluation suite.
+# This is the smallest no-key smoke test for the eval runner.
+# It verifies that a YAML agent can be built, receive one turn, and write reports.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --agent examples/yaml/basic/simple_chat.yaml \
+#     --scenarios examples/eval/basic_chat.yaml \
+#     --output target/eval/basic_chat
+#
+# Outputs:
+#   target/eval/basic_chat/summary.md
+#   target/eval/basic_chat/summary.json
+#   target/eval/basic_chat/per_scenario.jsonl
+#   target/eval/basic_chat/failures.md
+#
+# Flow: scenario input -> mocked LLM response -> assertions -> reports
+settings:
+  timeout_per_turn_ms: 5000  # milliseconds to wait for a turn. default: 30000
+  retries: 0                 # retry failed scenarios. default: 0
+  isolation: scenario        # fresh runtime per attempt. default: scenario
+
+# Mock the LLM so this suite is deterministic and does not need an API key.
+# Responses are consumed in order inside a scenario attempt.
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Hello! I can help with that."
+
+# Each scenario has one or more turns.
+# Assertions are rule-based unless a judge assertion is configured explicitly.
+scenarios:
+  - id: hello-smoke
+    name: Basic response is returned
+    tags: [basic, smoke]
+    language: en
+    turns:
+      - input: Hello
+        assert:
+          response_not_empty: true
+          response_contains: "Hello"

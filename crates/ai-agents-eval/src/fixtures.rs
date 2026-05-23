@@ -6,6 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::task::JoinHandle;
+
 use ai_agents_core::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
     ToolResult,
@@ -23,24 +27,33 @@ use serde_json::Value;
 use crate::evidence::{ToolExecutionRecord, ToolExecutionSource};
 use crate::{EvalError, Result};
 
+/// Fixture configuration used to replace external dependencies during eval.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FixturesConfig {
+    /// Runtime or fixture context value.
     #[serde(default)]
     pub context: Option<Value>,
+    /// JSON context file resolved relative to the suite file.
     #[serde(default)]
     pub context_file: Option<PathBuf>,
+    /// Mock tool definitions keyed by tool ID.
     #[serde(default)]
     pub tools: HashMap<String, ToolMockConfig>,
+    /// Optional LLM alias or provider used for judge calls.
     #[serde(default)]
     pub llm: LlmFixtureConfig,
+    /// Optional local HTTP mock server configuration.
     #[serde(default)]
     pub mock_server: Option<MockServerConfig>,
 }
 
+/// Static output configuration for an eval mock tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMockConfig {
+    /// Whether the operation succeeded.
     #[serde(default = "default_true")]
     pub success: bool,
+    /// Directory where output artifacts are written.
     #[serde(default)]
     pub output: Value,
 }
@@ -54,16 +67,21 @@ impl Default for ToolMockConfig {
     }
 }
 
+/// LLM fixture mode and data used by the eval runner.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlmFixtureConfig {
+    /// LLM fixture mode used for configured aliases.
     #[serde(default)]
     pub mode: LlmFixtureMode,
+    /// Optional cassette JSONL file for replay or record mode.
     #[serde(default)]
     pub cassette: Option<PathBuf>,
+    /// Ordered text responses used by mock mode and fallback replay.
     #[serde(default)]
     pub responses: Vec<String>,
 }
 
+/// LLM fixture strategy used while building eval providers.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LlmFixtureMode {
@@ -74,18 +92,67 @@ pub enum LlmFixtureMode {
     Record,
 }
 
+/// Local HTTP mock server configuration for eval scenarios.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MockServerConfig {
+    /// Whether this feature is enabled.
     #[serde(default)]
     pub enabled: bool,
+    /// Optional fixed port. Zero or none requests a dynamic port.
     #[serde(default)]
     pub port: Option<u16>,
+    /// Route definitions served by the mock server.
     #[serde(default)]
     pub routes: Vec<Value>,
 }
 
+/// One route served by the lightweight eval mock server.
+#[derive(Debug, Clone, Deserialize)]
+struct MockRoute {
+    /// HTTP method matched by this route.
+    method: String,
+    /// Path used for file lookup, HTTP routing, or dot-path checks.
+    path: String,
+    /// Final or normalized status value.
+    #[serde(default = "default_status")]
+    status: u16,
+    /// Extra response headers returned by this route.
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    /// JSON or string body returned by this route.
+    #[serde(default)]
+    body: Value,
+}
+
+/// Running mock server handle that stops the server on drop.
+pub struct MockServerHandle {
+    /// Base URL injected into eval context.
+    base_url: String,
+    /// Background accept loop for the mock server.
+    task: JoinHandle<()>,
+}
+
+impl MockServerHandle {
+    pub fn context(&self) -> HashMap<String, Value> {
+        let mut context = HashMap::new();
+        context.insert(
+            "mock_server".to_string(),
+            serde_json::json!({"base_url": self.base_url}),
+        );
+        context
+    }
+}
+
+impl Drop for MockServerHandle {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Shared in-memory log of tool executions for one attempt.
 #[derive(Clone, Default)]
 pub struct RecordingToolLog {
+    /// Wrapped implementation or shared storage.
     inner: Arc<Mutex<Vec<ToolExecutionRecord>>>,
 }
 
@@ -156,6 +223,104 @@ fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
     }
 }
 
+pub async fn start_mock_server(
+    config: Option<&MockServerConfig>,
+) -> Result<Option<MockServerHandle>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if !config.enabled {
+        return Ok(None);
+    }
+    let routes = config
+        .routes
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<MockRoute>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let port = config.port.unwrap_or(0);
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .await
+        .map_err(|error| EvalError::Runtime(format!("failed to start mock server: {}", error)))?;
+    let addr = listener.local_addr().map_err(|error| {
+        EvalError::Runtime(format!("failed to read mock server addr: {}", error))
+    })?;
+    let base_url = format!("http://{}", addr);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let routes = routes.clone();
+            tokio::spawn(async move {
+                let _ = handle_mock_connection(stream, routes).await;
+            });
+        }
+    });
+    Ok(Some(MockServerHandle { base_url, task }))
+}
+
+async fn handle_mock_connection(
+    mut stream: tokio::net::TcpStream,
+    routes: Vec<MockRoute>,
+) -> std::io::Result<()> {
+    let mut buffer = vec![0_u8; 8192];
+    let read = stream.read(&mut buffer).await?;
+    let request = String::from_utf8_lossy(&buffer[..read]);
+    let first_line = request.lines().next().unwrap_or_default();
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    let route = routes
+        .iter()
+        .find(|route| route.method.eq_ignore_ascii_case(method) && route.path == path);
+    let (status, headers, body) = if let Some(route) = route {
+        (
+            route.status,
+            route.headers.clone(),
+            mock_body_to_string(&route.body),
+        )
+    } else {
+        (
+            404,
+            HashMap::new(),
+            serde_json::json!({"error":"not found"}).to_string(),
+        )
+    };
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "OK",
+    };
+    let mut response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n",
+        status,
+        reason,
+        body.len()
+    );
+    for (key, value) in headers {
+        response.push_str(&format!("{}: {}\r\n", key, value));
+    }
+    response.push_str("\r\n");
+    response.push_str(&body);
+    stream.write_all(response.as_bytes()).await?;
+    Ok(())
+}
+
+fn mock_body_to_string(body: &Value) -> String {
+    if let Some(text) = body.as_str() {
+        text.to_string()
+    } else {
+        serde_json::to_string(body).unwrap_or_else(|_| "null".to_string())
+    }
+}
+
 pub fn build_tool_registry(
     fixtures: &FixturesConfig,
     log: RecordingToolLog,
@@ -191,8 +356,11 @@ pub fn build_tool_registry(
     Ok(registry)
 }
 
+/// Tool implementation returning a configured eval fixture result.
 struct MockTool {
+    /// Stable identifier for this item.
     id: String,
+    /// Configuration used by this component.
     config: ToolMockConfig,
 }
 
@@ -234,9 +402,13 @@ impl Tool for MockTool {
     }
 }
 
+/// Tool wrapper that records calls before returning the inner result.
 struct RecordingTool {
+    /// Wrapped implementation or shared storage.
     inner: Arc<dyn Tool>,
+    /// Shared log receiving execution records.
     log: RecordingToolLog,
+    /// Source category assigned to this execution.
     source: ToolExecutionSource,
 }
 
@@ -314,12 +486,19 @@ pub fn build_llm_registry(
     };
 
     let fixture_responses = load_fixture_responses(fixtures, base_dir)?;
+    let cassette_records = load_cassette_records(fixtures, base_dir)?;
     let mut judge_provider = None;
 
     for (alias, config) in aliases {
         let provider = match fixtures.mode {
-            LlmFixtureMode::Mock | LlmFixtureMode::Replay => Arc::new(SequenceLLMProvider::new(
+            LlmFixtureMode::Mock => Arc::new(SequenceLLMProvider::new(
                 alias.clone(),
+                fixture_responses.clone(),
+            )) as Arc<dyn LLMProvider>,
+            LlmFixtureMode::Replay => Arc::new(ReplayLLMProvider::new(
+                alias.clone(),
+                config.model.clone(),
+                cassette_records.clone(),
                 fixture_responses.clone(),
             )) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Real => build_real_provider(&config)?,
@@ -409,15 +588,8 @@ fn load_fixture_responses(config: &LlmFixtureConfig, base_dir: &Path) -> Result<
     for content in &config.responses {
         responses.push(LLMResponse::new(content.clone(), FinishReason::Stop));
     }
-    if let Some(path) = &config.cassette {
-        let resolved = resolve_path(base_dir, path);
-        if resolved.exists() {
-            let content = std::fs::read_to_string(&resolved)?;
-            for line in content.lines().filter(|line| !line.trim().is_empty()) {
-                let record: CassetteRecord = serde_json::from_str(line)?;
-                responses.push(record.response);
-            }
-        }
+    for record in load_cassette_records(config, base_dir)? {
+        responses.push(record.response);
     }
     if responses.is_empty() {
         responses.push(LLMResponse::new("Mock response", FinishReason::Stop));
@@ -425,17 +597,54 @@ fn load_fixture_responses(config: &LlmFixtureConfig, base_dir: &Path) -> Result<
     Ok(responses)
 }
 
+fn load_cassette_records(
+    config: &LlmFixtureConfig,
+    base_dir: &Path,
+) -> Result<Vec<CassetteRecord>> {
+    let mut records = Vec::new();
+    if let Some(path) = &config.cassette {
+        let resolved = resolve_path(base_dir, path);
+        if resolved.exists() {
+            let content = std::fs::read_to_string(&resolved)?;
+            for line in content.lines().filter(|line| !line.trim().is_empty()) {
+                records.push(serde_json::from_str(line)?);
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// One recorded LLM response used by replay and record modes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CassetteRecord {
+    /// LLM alias used for this provider or cassette record.
     alias: String,
+    /// Model or relationship model name.
     model: String,
+    /// Stable hash of messages and request config.
     request_hash: String,
+    /// Assistant response text or redacted output value.
     response: LLMResponse,
 }
 
+/// Deterministic LLM provider returning fixture responses in order.
 struct SequenceLLMProvider {
+    /// Ordered text responses used by mock mode and fallback replay.
     responses: Arc<Mutex<Vec<LLMResponse>>>,
+    /// Zero-based turn index within the scenario.
     index: Arc<Mutex<usize>>,
+}
+
+/// LLM provider replaying cassette records by request hash.
+struct ReplayLLMProvider {
+    /// LLM alias used for this provider or cassette record.
+    alias: String,
+    /// Model or relationship model name.
+    model: String,
+    /// Cassette records available for hash matching.
+    records: Arc<Vec<CassetteRecord>>,
+    /// Ordered text responses used by mock mode and fallback replay.
+    responses: SequenceLLMProvider,
 }
 
 impl SequenceLLMProvider {
@@ -461,6 +670,67 @@ impl SequenceLLMProvider {
     }
 }
 
+impl ReplayLLMProvider {
+    fn new(
+        alias: String,
+        model: String,
+        records: Vec<CassetteRecord>,
+        fallback: Vec<LLMResponse>,
+    ) -> Self {
+        Self {
+            alias,
+            model,
+            records: Arc::new(records),
+            responses: SequenceLLMProvider::new("replay-fallback".to_string(), fallback),
+        }
+    }
+
+    fn response_for(&self, messages: &[ChatMessage], config: Option<&LLMConfig>) -> LLMResponse {
+        let request_hash = hash_request(messages, config);
+        if let Some(record) = self.records.iter().find(|record| {
+            record.alias == self.alias
+                && record.request_hash == request_hash
+                && (record.model == self.model || record.model.is_empty())
+        }) {
+            return record.response.clone();
+        }
+        self.responses.next_response()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for ReplayLLMProvider {
+    async fn complete(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        Ok(self.response_for(messages, config))
+    }
+
+    async fn complete_stream(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+    ) -> std::result::Result<
+        Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+        LLMError,
+    > {
+        let response = self.response_for(messages, config);
+        Ok(Box::new(futures::stream::iter(chunks_from_response(
+            response,
+        ))))
+    }
+
+    fn provider_name(&self) -> &str {
+        "eval-replay"
+    }
+
+    fn supports(&self, feature: LLMFeature) -> bool {
+        matches!(feature, LLMFeature::Streaming | LLMFeature::SystemMessages)
+    }
+}
+
 #[async_trait]
 impl LLMProvider for SequenceLLMProvider {
     async fn complete(
@@ -480,8 +750,9 @@ impl LLMProvider for SequenceLLMProvider {
         LLMError,
     > {
         let response = self.next_response();
-        let chunk = LLMChunk::final_chunk(response.content, response.finish_reason, response.usage);
-        Ok(Box::new(futures::stream::iter(vec![Ok(chunk)])))
+        Ok(Box::new(futures::stream::iter(chunks_from_response(
+            response,
+        ))))
     }
 
     fn provider_name(&self) -> &str {
@@ -493,10 +764,71 @@ impl LLMProvider for SequenceLLMProvider {
     }
 }
 
+fn chunks_from_response(response: LLMResponse) -> Vec<std::result::Result<LLMChunk, LLMError>> {
+    let deltas = split_stream_content(&response.content);
+    if deltas.is_empty() {
+        return vec![Ok(LLMChunk::final_chunk(
+            "",
+            response.finish_reason,
+            response.usage,
+        ))];
+    }
+    let last_index = deltas.len() - 1;
+    deltas
+        .into_iter()
+        .enumerate()
+        .map(|(index, delta)| {
+            if index == last_index {
+                Ok(LLMChunk::final_chunk(
+                    delta,
+                    response.finish_reason.clone(),
+                    response.usage.clone(),
+                ))
+            } else {
+                Ok(LLMChunk::new(delta, false))
+            }
+        })
+        .collect()
+}
+
+fn split_stream_content(content: &str) -> Vec<String> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    let words: Vec<&str> = content.split_whitespace().collect();
+    if words.len() > 1 {
+        return words
+            .into_iter()
+            .enumerate()
+            .map(|(index, word)| {
+                if index == 0 {
+                    word.to_string()
+                } else {
+                    format!(" {}", word)
+                }
+            })
+            .collect();
+    }
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= 1 {
+        return vec![content.to_string()];
+    }
+    let chunk_size = 4.min(chars.len().div_ceil(2));
+    chars
+        .chunks(chunk_size)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
+/// LLM provider wrapper appending responses to a cassette file.
 struct RecordingLLMProvider {
+    /// Wrapped implementation or shared storage.
     inner: Arc<dyn LLMProvider>,
+    /// LLM alias used for this provider or cassette record.
     alias: String,
+    /// Model or relationship model name.
     model: String,
+    /// Path used for file lookup, HTTP routing, or dot-path checks.
     path: PathBuf,
 }
 
@@ -576,6 +908,101 @@ fn hash_request(messages: &[ChatMessage], config: Option<&LLMConfig>) -> String 
     format!("{:016x}", hasher.finish())
 }
 
+fn default_status() -> u16 {
+    200
+}
+
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_file_and_inline_context_merge() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_fixture_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let context_path = dir.join("context.json");
+        std::fs::write(
+            &context_path,
+            r#"{"user":{"tier":"basic"},"channel":"file"}"#,
+        )
+        .unwrap();
+        let config = FixturesConfig {
+            context: Some(serde_json::json!({"channel":"inline","feature":true})),
+            context_file: Some(PathBuf::from("context.json")),
+            ..Default::default()
+        };
+        let context = resolve_fixture_context(&config, &dir).unwrap();
+        assert_eq!(context.get("channel"), Some(&serde_json::json!("inline")));
+        assert_eq!(context.get("feature"), Some(&serde_json::json!(true)));
+        assert!(context.get("user").is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mock_streaming_splits_response_into_multiple_chunks() {
+        let response = LLMResponse::new(
+            "Streaming hello from the mocked provider.".to_string(),
+            FinishReason::Stop,
+        );
+        let chunks = chunks_from_response(response);
+        assert!(chunks.len() > 1);
+        let mut reconstructed = String::new();
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let chunk = chunk.unwrap();
+            if index == 0 {
+                assert!(!chunk.is_final);
+            }
+            reconstructed.push_str(&chunk.delta);
+            if chunk.is_final {
+                assert!(chunk.finish_reason.is_some());
+            }
+        }
+        assert_eq!(reconstructed, "Streaming hello from the mocked provider.");
+    }
+
+    #[test]
+    fn mock_streaming_splits_single_word_response() {
+        let chunks = split_stream_content("Hello");
+        assert!(chunks.len() > 1);
+        assert_eq!(chunks.join(""), "Hello");
+    }
+
+    #[tokio::test]
+    async fn mock_server_serves_configured_route() {
+        let config = MockServerConfig {
+            enabled: true,
+            port: None,
+            routes: vec![serde_json::json!({
+                "method":"GET",
+                "path":"/ok",
+                "status":200,
+                "body":{"ok":true}
+            })],
+        };
+        let server = start_mock_server(Some(&config)).await.unwrap().unwrap();
+        let context = server.context();
+        let base_url = context
+            .get("mock_server")
+            .and_then(|value| value.get("base_url"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .trim_start_matches("http://")
+            .to_string();
+        let mut stream = tokio::net::TcpStream::connect(base_url).await.unwrap();
+        stream
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.contains("200 OK"));
+        assert!(response.contains("{\"ok\":true}"));
+    }
 }

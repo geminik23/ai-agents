@@ -15,7 +15,7 @@ pub mod suite;
 pub use assertion::{AssertionOutcome, AssertionResultDetail, evaluate_assertion};
 pub use evidence::{DisambiguationStatus, ToolExecutionRecord, ToolExecutionSource, TurnEvidence};
 pub use fixtures::{FixturesConfig, LlmFixtureMode, RecordingToolLog};
-pub use judge::{JudgeConfig, JudgeResult, LLMJudge};
+pub use judge::{JudgeConfig, JudgeInput, JudgeResolver, JudgeResult, LLMJudge};
 pub use output::write_outputs;
 pub use redaction::RedactedString;
 pub use reset::{ResetOptions, ResetProfile};
@@ -24,6 +24,7 @@ pub use suite::{EvalResult, EvalSettings, EvalSuite, ScenarioResult, ScenarioSta
 
 pub type Result<T> = std::result::Result<T, EvalError>;
 
+/// Error type used by the evaluation crate.
 #[derive(Debug, thiserror::Error)]
 pub enum EvalError {
     #[error("configuration error: {0}")]

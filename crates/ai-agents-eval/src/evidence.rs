@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::fixtures::RecordingToolLog;
 
+/// Source category for a recorded tool execution.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionSource {
@@ -22,39 +23,61 @@ pub enum ToolExecutionSource {
     Mock,
 }
 
+/// Structured record for one tool execution observed during eval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRecord {
+    /// Unique ID for this recorded tool call.
     pub call_id: String,
+    /// Canonical tool ID executed by the registry.
     pub tool_id: String,
+    /// Tool name requested by the model or runtime.
     pub requested_name: String,
+    /// Source category assigned to this execution.
     pub source: ToolExecutionSource,
+    /// Current or expected state name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
+    /// Actor ID associated with this evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_id: Option<String>,
+    /// Original tool arguments before execution.
     pub arguments_original: Value,
+    /// Arguments passed to the wrapped tool.
     pub arguments_executed: Value,
+    /// Whether the operation succeeded.
     pub success: bool,
+    /// Directory where output artifacts are written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
+    /// Error text for failed execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Optional response or tool metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<Value>,
+    /// UTC timestamp when execution started.
     pub started_at: DateTime<Utc>,
+    /// Duration in milliseconds.
     pub duration_ms: u64,
+    /// Optional observability span ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability_span_id: Option<String>,
 }
 
+/// Skill routing evidence inferred or reported for a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillEvidence {
+    /// Skill ID selected by routing, if available.
     pub selected_skill_id: Option<String>,
+    /// Skill ID actually executed, if available.
     pub executed_skill_id: Option<String>,
+    /// Whether routing found no matching skill.
     pub no_match: bool,
+    /// Whether clarification was requested.
     pub clarification_requested: bool,
 }
 
+/// Normalized status values for disambiguation evidence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DisambiguationStatus {
@@ -68,63 +91,102 @@ pub enum DisambiguationStatus {
     Escalated,
 }
 
+/// Disambiguation evidence inferred or reported for a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DisambiguationEvidence {
+    /// Final or normalized status value.
     pub status: DisambiguationStatus,
+    /// Ambiguity type reported by detection, if available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ambiguity_type: Option<String>,
+    /// Detection confidence reported by the system.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// Resolved payload when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved: Option<Value>,
 }
 
+/// Actor fact evidence captured around one turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FactsEvidence {
+    /// Actor ID associated with this evidence.
     pub actor_id: Option<String>,
+    /// Serialized fact records visible after the turn.
     pub facts: Vec<Value>,
+    /// Number of facts before the turn when known.
     pub before_count: Option<usize>,
+    /// Number of facts after the turn when known.
     pub after_count: Option<usize>,
 }
 
+/// Relationship memory evidence captured around one turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelationshipEvidence {
+    /// Actor ID associated with this evidence.
     pub actor_id: Option<String>,
+    /// Model or relationship model name.
     pub model: Option<String>,
+    /// Perspectives available for assertions.
     pub available_perspectives: Vec<String>,
+    /// Current serialized relationship state.
     pub current: Option<Value>,
+    /// State before the turn when available.
     pub before: Option<Value>,
+    /// State after the turn when available.
     pub after: Option<Value>,
 }
 
+/// Persona reveal and evolution evidence for one turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersonaEvidence {
+    /// Whether any persona secret is currently revealed.
     pub secret_revealed: bool,
+    /// IDs of revealed secrets when stable IDs are available.
     pub revealed_secret_ids: Vec<String>,
+    /// Number of revealed secrets.
     pub revealed_secret_count: usize,
+    /// Number of persona evolution events recorded.
     pub evolution_events: usize,
 }
 
+/// Observability evidence attached to one evaluated turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnObservabilityEvidence {
+    /// Trace ID associated with the turn when available.
     pub trace_id: Option<String>,
+    /// Span IDs observed during the turn.
     pub span_ids: Vec<String>,
+    /// Observability report snapshot generated after the turn.
     pub report: Option<ObservabilityReport>,
 }
 
+/// Full assertion-time evidence collected after a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEvidence {
+    /// Response metadata produced by the runtime.
     pub response_metadata: Option<Value>,
+    /// Current or expected state name.
     pub state: Option<String>,
+    /// State transition history observed by the runtime.
     pub state_history: Vec<ai_agents_core::StateTransitionEvent>,
+    /// Runtime or fixture context value.
     pub context: Value,
+    /// Tool calls recorded during this turn.
     pub tool_executions: Vec<ToolExecutionRecord>,
+    /// Skill evidence for this turn, if available.
     pub skill: Option<SkillEvidence>,
+    /// Expected disambiguation status or evidence.
     pub disambiguation: Option<DisambiguationEvidence>,
+    /// Serialized fact records visible after the turn.
     pub facts: Option<FactsEvidence>,
+    /// Relationship memory assertion or evidence.
     pub relationship: Option<RelationshipEvidence>,
+    /// persona value for TurnEvidence.
     pub persona: Option<PersonaEvidence>,
+    /// Orchestration metadata assertion or evidence.
     pub orchestration: Option<Value>,
+    /// Observability assertion, setting, or report value.
     pub observability: Option<TurnObservabilityEvidence>,
 }
 

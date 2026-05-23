@@ -32,6 +32,49 @@ cargo run --bin simple-chat
 ```
 
 
+## Evaluation Examples
+
+Evaluation suites run an agent against declarative scenarios and write reports for CI, debugging, and release checks. These examples use mocked LLM responses, so they do not require API keys.
+
+| File | Description |
+|------|-------------|
+| `eval/basic_chat.yaml` | Minimal mocked-LLM smoke test that verifies one basic response and report generation |
+| `eval/multiturn_mocked.yaml` | Deterministic two-turn conversation suite showing ordered mock responses and composite assertions |
+| `eval/streaming_mocked.yaml` | Streaming eval smoke test that collects `chat_stream()` output before assertions |
+| `eval/observability_mocked.yaml` | No-key observability eval suite that checks LLM telemetry assertions |
+| `eval/real_llm_semantic_judge.yaml` | Live provider suite using real LLM calls and an LLM judge; tagged `live` and requires an API key |
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/basic_chat.yaml \
+  --output target/eval/basic_chat
+
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/multiturn_mocked.yaml \
+  --output target/eval/multiturn_mocked
+
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/streaming_mocked.yaml \
+  --output target/eval/streaming_mocked
+
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/observability_mocked.yaml \
+  --output target/eval/observability_mocked
+
+# Live provider example. Requires an API key and may incur provider cost.
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/real_llm_semantic_judge.yaml \
+  --output target/eval/real_llm_semantic_judge \
+  --real-llm
+```
+
 ## YAML Examples
 
 Run YAML examples with:

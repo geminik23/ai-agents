@@ -1,0 +1,52 @@
+name: Observability Mocked Eval
+agent: ../yaml/basic/simple_chat.yaml
+
+# Observability evaluation suite.
+# Use this pattern when you need a no-key check that telemetry is attached to eval results.
+# The suite enables observability directly; the CLI can also enable a default overlay with --observability.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --agent examples/yaml/basic/simple_chat.yaml \
+#     --scenarios examples/eval/observability_mocked.yaml \
+#     --output target/eval/observability_mocked
+#
+# Flow: scenario input -> mocked LLM response -> observability report -> assertions -> reports
+settings:
+  timeout_per_turn_ms: 5000  # milliseconds to wait for the turn. default: 30000
+  retries: 0                 # keep telemetry smoke tests deterministic. default: 0
+  isolation: scenario        # fresh runtime per attempt. default: scenario
+
+# Enable a safe report in the eval output area.
+observability:
+  enabled: true
+  export:
+    formats: [json]
+    path: ./target/eval/observability_mocked/observability
+    write_report: true
+
+# Mock the LLM so observability can be tested without API keys.
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Observable hello from the mocked provider."
+
+# Observability assertions inspect the generated report summary.
+scenarios:
+  - id: observability-smoke
+    name: LLM call telemetry is captured
+    tags: [observability, smoke]
+    language: en
+    turns:
+      - input: Hello with telemetry
+        assert:
+          all:
+            - response_not_empty: true
+            - observability:
+                total_llm_calls_lte: 1
+                total_tool_calls_lte: 0
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
