@@ -1,6 +1,6 @@
 +++
 title = "Rust API"
-weight = 4
+weight = 5
 template = "docs.html"
 description = "Embedding AI Agents in your Rust application."
 +++
@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.13"
+ai-agents = "1.0.0-rc.14"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,7 +35,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0.0-rc.13", features = ["full"] }
+ai-agents = { version = "1.0.0-rc.14", features = ["full"] }
 ```
 
 ---
@@ -681,10 +681,10 @@ Session persistence requires a storage backend. Enable one via feature flags:
 
 ```toml
 # SQLite (file-based, good for single-server)
-ai-agents = { version = "1.0.0-rc.13", features = ["sqlite"] }
+ai-agents = { version = "1.0.0-rc.14", features = ["sqlite"] }
 
 # Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.13", features = ["redis-storage"] }
+ai-agents = { version = "1.0.0-rc.14", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -712,6 +712,40 @@ let storage = create_storage(&storage_config).await?;
 agent.save_to(storage.as_ref(), "my-session").await?;
 agent.load_from(storage.as_ref(), "my-session").await?;
 ```
+
+---
+
+## Evaluation Runner
+
+Rust hosts can invoke the same evaluation runner used by `ai-agents-cli eval`. This is useful for embedding scenario checks into custom CI tools or release checks.
+
+```rust
+use ai_agents::eval::{EvalRunner, EvalRunnerOptions, write_outputs};
+use std::path::PathBuf;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let output = PathBuf::from("target/eval/basic_chat");
+    let options = EvalRunnerOptions {
+        agent: Some(PathBuf::from("examples/yaml/basic/simple_chat.yaml")),
+        output: output.clone(),
+        ..Default::default()
+    };
+
+    let runner = EvalRunner::from_file("examples/eval/basic_chat.yaml", options)?;
+    let result = runner.run().await?;
+    write_outputs(&result, &output, true)?;
+
+    assert_eq!(result.failed, 0);
+    Ok(())
+}
+```
+
+Core types are re-exported under `ai_agents::eval`: `EvalSuite`, `EvalSettings`, `EvalRunner`, `EvalRunnerOptions`, `EvalResult`, `ScenarioResult`, `ScenarioStatus`, `FixturesConfig`, `TurnEvidence`, `ToolExecutionRecord`, `LLMJudge`, `JudgeConfig`, `ResetOptions`, and `ResetProfile`.
+
+The runner builds agents through `AgentBuilder`, so the same YAML features used by the CLI are available. Eval fixtures can replace LLMs and tools for deterministic tests, and reports can be written with `write_outputs()`.
+
+Rust options mirror the CLI: `parallel` enables scenario-concurrent runs when isolation allows it, `observability` attaches a safe default overlay, `llm_mode` and `cassette` can force record/replay/real LLM behavior, and streaming turns are collected before assertions run. Default JSON outputs redact input, response, and string assertion details while omitting raw turn evidence and response metadata.
 
 ---
 
@@ -796,7 +830,7 @@ Some internal feature crates avoid depending on `ai-agents-observability` direct
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.13)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.14)**
 
 ---
 

@@ -1,6 +1,6 @@
 +++
 title = "LLM Providers"
-weight = 5
+weight = 6
 template = "docs.html"
 description = "Setup guide for all supported LLM providers."
 +++

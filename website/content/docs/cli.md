@@ -36,11 +36,12 @@ cargo run -p ai-agents-cli -- run agent.yaml
 
 ## Commands
 
-The CLI has two subcommands:
+The CLI has three subcommands:
 
 | Command    | Description                                      |
 | ---------- | ------------------------------------------------ |
 | `run`      | Load an agent YAML and start an interactive REPL |
+| `eval`     | Run declarative scenario suites against an agent |
 | `validate` | Check a YAML file for errors without starting    |
 
 ### `run`
@@ -49,6 +50,14 @@ The CLI has two subcommands:
 ai-agents-cli run <agent.yaml> [OPTIONS]
 ```
 
+### `eval`
+
+```sh
+ai-agents-cli eval --agent <agent.yaml> --scenarios <suite.yaml> [OPTIONS]
+```
+
+Runs YAML or JSONL scenario suites, evaluates assertions from structured turn evidence, and writes `summary.md`, schema-versioned `summary.json`, `per_scenario.jsonl`, `failures.md`, and optionally `junit.xml`.
+
 ### `validate`
 
 ```sh
@@ -56,6 +65,78 @@ ai-agents-cli validate <agent.yaml>
 ```
 
 Parses and validates the YAML spec. Returns exit code `0` on success, `1` on failure. Useful in CI pipelines.
+
+---
+
+## Eval Options
+
+| Flag | Description |
+| ---- | ----------- |
+| `-a, --agent <YAML>` | Agent config YAML. Overrides suite `agent`. |
+| `-s, --scenarios <FILE>` | Scenario suite YAML or JSONL file. |
+| `-o, --output <DIR>` | Output directory. Default: `./eval_results`. |
+| `-i, --id <ID>` | Run one scenario ID. Repeatable. |
+| `-t, --tags <TAG>` | Run scenarios matching tags. Repeatable. |
+| `--tag-mode <all|any>` | Tag match behavior. Default: `any`. |
+| `--language <LANG>` | Run only scenarios for a language. Repeatable. |
+| `--retries <N>` | Override retry count. |
+| `--timeout <MS>` | Override per-turn timeout in milliseconds. |
+| `--parallel <N>` | Run up to N scenarios concurrently. Requires `isolation: scenario` and no `env` overlays. |
+| `--fail-fast` | Stop after first failed or errored scenario. Runs serially. |
+| `--junit` | Write `junit.xml`. |
+| `--json` | Print `summary.json` to stdout. |
+| `--observability` | Attach a safe default observability overlay when the suite does not define `observability:`. |
+| `--record <FILE>` | Force real LLM calls and append cassette JSONL records. |
+| `--replay <FILE>` | Replay LLM responses from a cassette JSONL file. |
+| `--real-llm` | Force real LLM calls even when the suite declares a fixture mode. |
+
+Example:
+
+```sh
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/basic_chat.yaml \
+  --output target/eval/basic_chat
+```
+
+Exit codes: `0` all non-skipped scenarios passed, `1` one or more scenario assertions failed or errored, `2` suite parsing, fixture setup, or runtime setup failed before a useful result was produced.
+
+### Eval suite shape
+
+A suite can be a YAML file with `name`, optional `agent`, `settings`, `fixtures`, and `scenarios`, or a JSONL file where each row becomes one one-turn scenario. The YAML format is the most expressive form:
+
+```yaml
+name: Basic Chat Eval
+agent: ../yaml/basic/simple_chat.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Hello! I can help with that."
+scenarios:
+  - id: hello-smoke
+    tags: [basic, smoke]
+    turns:
+      - input: Hello
+        assert:
+          response_not_empty: true
+          response_contains: "Hello"
+```
+
+The runner supports mocked, replayed, recorded, and real LLM modes, mock tools, a lightweight HTTP mock server, context fixtures, blocking and streaming turns, response/state/context/metadata/tool/facts/relationship/persona/orchestration/observability assertions, composite `all`/`any`/`not` assertions, optional judge assertions, retries, filtering, fail-fast, and report output. See [Evaluation](@/docs/evaluation.md) for use-case guides such as record/replay cassettes and live LLM checks.
+
+Implementation notes:
+
+- `settings.parallel` and `--parallel` run scenario-isolated suites concurrently. `fail_fast`, `env` overlays, and unsupported isolation modes force serial execution or configuration errors.
+- Suite-level `observability:` is honored. CLI `--observability` creates a safe default overlay under the eval output directory.
+- `turn.stream: true` uses `chat_stream()` and collects streamed content before assertions run.
+- `fixtures.mock_server.enabled: true` starts a local HTTP server and injects `mock_server.base_url` into runtime context.
+- `settings.redact_outputs: true` stores `[redacted]` for input, response, and string assertion details, and default JSON/JSONL reports omit raw `TurnEvidence` and response metadata.
+- `--tag-mode` must be `any` or `all`; invalid values exit with code `2`.
 
 ---
 

@@ -1,6 +1,6 @@
 +++
 title = "Concepts"
-weight = 6
+weight = 7
 template = "docs.html"
 description = "Core concepts and architecture of AI Agents Framework."
 +++
@@ -606,6 +606,35 @@ Handoff decisions use structured JSON. The evaluator LLM returns `{"action": "ag
 When `auto_spawn` is configured, the builder validates that every agent referenced by an orchestration state (`delegate`, `concurrent`, `group_chat`, `pipeline`, `handoff`) was successfully spawned. Missing agents produce a clear build-time error listing each unresolved reference, the state that needs it, and the orchestration pattern involved.
 
 See [YAML Reference - Orchestration States](@/docs/yaml-reference.md#orchestration-states) for the complete field reference.
+
+---
+
+## Evaluation as a Regression Testing
+
+Evaluation runs YAML agents through the normal runtime path and checks declared assertions against structured evidence. This makes it useful for CI smoke tests, release checks, and regression suites for state machines, tools, memory, orchestration, and safety behavior.
+
+A suite is separate from the agent YAML. The suite chooses fixtures, scenarios, turns, assertions, retries, filters, and output directory. Mocked LLM fixtures make deterministic no-key tests possible, while optional judge assertions use an LLM only for semantic quality checks.
+
+```yaml
+name: Basic Chat Eval
+agent: ../yaml/basic/simple_chat.yaml
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Hello! I can help with that."
+scenarios:
+  - id: hello-smoke
+    turns:
+      - input: Hello
+        assert:
+          response_not_empty: true
+          response_contains: "Hello"
+```
+
+The key design is rule-based first: state, response text, context, metadata, tools, facts, relationships, persona state, orchestration metadata, and observability summaries should be checked deterministically where possible. Use `judge` or `response_semantic` only when the expected behavior is semantic and cannot be expressed as structured evidence.
+
+Reports include Markdown, JSON, per-scenario JSONL, failure-focused Markdown, and optional JUnit XML. By default, JSON artifacts redact inputs, responses, and string assertion details, and omit raw turn evidence and response metadata. Use `redact_outputs: false` only for trusted local debugging.
 
 ---
 

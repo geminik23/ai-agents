@@ -13,6 +13,7 @@ Here's what you'll find:
 - **Concepts** - Understand the architecture, agent lifecycle, state machine, tools, memory, and other core ideas.
 - **YAML Reference** - The complete spec for agent definition files: prompts, tools, LLM config, state, handoffs, and more.
 - **CLI Guide** - All commands, flags, and REPL features available in `ai-agents-cli`.
+- **Evaluation** - Run scenario suites with fixtures, assertions, LLM modes, judges, and CI reports.
 - **Rust API** - Use the framework as a library with `AgentBuilder`, runtime hooks, and custom tool functions.
 - **Provider Setup** - Configuration details for all 12 supported LLM providers, including local options like Ollama.
 

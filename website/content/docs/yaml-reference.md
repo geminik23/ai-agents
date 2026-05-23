@@ -2556,6 +2556,369 @@ Accepts `true` (all 5 tools) or a list of specific tool names.
 
 ---
 
+## Evaluation Suites
+
+Evaluation suites are separate YAML files used by `ai-agents-cli eval`. They are not agent specs; they describe scenarios, fixtures, assertions, and output behavior for testing an agent through the normal runtime path. For practical workflows such as record/replay cassettes and live LLM smoke tests, see [Evaluation](@/docs/evaluation.md).
+
+```yaml
+name: Basic Chat Eval
+agent: ../yaml/basic/simple_chat.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Hello! I can help with that."
+scenarios:
+  - id: hello-smoke
+    name: Basic response is returned
+    tags: [basic, smoke]
+    language: en
+    turns:
+      - input: Hello
+        assert:
+          response_not_empty: true
+          response_contains: "Hello"
+```
+
+### Suite fields
+
+A suite is the outer test document. It is intentionally separate from the agent YAML so the same agent can be tested with several datasets, fixture modes, or CI policies.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | `string` | required | Human-readable suite name used in `summary.md`, `summary.json`, and JUnit output. Must not be empty. |
+| `agent` | `path?` | `null` | Agent YAML path resolved relative to the suite file. CLI `--agent` overrides this, which is useful when the same suite should run against several agent variants. |
+| `settings` | `map` | defaults | Execution policy for timeouts, retries, isolation, concurrency, fail-fast, provider overrides, and output redaction. |
+| `observability` | `map?` | `null` | Optional observability config attached only for eval runs. Use this when eval reports should include latency, token, cost, or purpose metrics. CLI `--observability` creates a safe default when this is omitted. |
+| `fixtures` | `map` | empty | Replaces external dependencies during eval: mock/replay/record/real LLMs, mock tools, context files, and local HTTP routes. |
+| `scenarios` | `list` | empty | Test cases. Active scenarios must define `turns` or `steps`; duplicate IDs are rejected. |
+
+Execution order is: load suite -> validate suite -> filter scenarios -> create an isolated workspace -> build the agent -> apply fixtures and context -> run turns or steps -> evaluate assertions -> write reports.
+
+### `settings`
+
+```yaml
+settings:
+  timeout_per_turn_ms: 30000
+  retries: 0
+  retry_delay_ms: 1000
+  isolation: scenario
+  parallel: false
+  max_concurrent: 4
+  fail_fast: false
+  redact_outputs: true
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `timeout_per_turn_ms` | `u64` | `30000` | Milliseconds allowed for one turn |
+| `timeout_per_scenario_ms` | `u64?` | `null` | Milliseconds allowed for one scenario attempt |
+| `retries` | `u32` | `0` | Retry failed scenarios before final status |
+| `retry_delay_ms` | `u64` | `1000` | Delay between attempts |
+| `isolation` | enum | `scenario` | `scenario` uses a fresh runtime per attempt; `turn` resets between turns; `suite` and `none` are rejected until shared-run isolation is hardened |
+| `parallel` | `bool` | `false` | Run scenarios concurrently when `isolation: scenario` and no scenario env overlays are used |
+| `max_concurrent` | `usize` | `4` | Maximum concurrently running scenarios |
+| `fail_fast` | `bool` | `false` | Stop after the first failed or errored scenario; runs serially |
+| `redact_outputs` | `bool` | `true` | Store `[redacted]` for inputs, responses, and string assertion details; raw evidence is omitted from JSON outputs |
+| `temperature` | `f32?` | `null` | Override agent LLM temperatures during eval. This is useful for more deterministic live-provider smoke tests. |
+| `seed` | `u64?` | `null` | Adds a provider-specific `seed` value to LLM extra config when providers support deterministic seeding. |
+
+`isolation: scenario` is the recommended default. It creates a fresh runtime and temp workspace per scenario attempt. `isolation: turn` resets conversation state between direct turns, while still reapplying fixture/scenario context. `isolation: suite` and `isolation: none` are rejected until shared-run isolation has a stronger public contract.
+
+Use `parallel: true` or CLI `--parallel <N>` for faster CI runs across independent scenarios. Parallel execution requires `isolation: scenario` and cannot be combined with process environment overlays because environment variables are process-global.
+
+### `fixtures`
+
+```yaml
+fixtures:
+  context:
+    user:
+      id: customer_42
+      tier: vip
+  context_file: ./fixtures/default_context.json
+  tools:
+    lookup_order:
+      output:
+        id: ORD-1042
+        status: cancellable
+  llm:
+    mode: mock
+    responses:
+      - "Mocked response text"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `context` | object | `{}` | Runtime context applied after `context_file` |
+| `context_file` | path? | `null` | JSON context file resolved relative to the suite file |
+| `tools` | map | `{}` | Mock tool outputs keyed by tool ID |
+| `llm.mode` | enum | `real` | `real`, `mock`, `replay`, or `record` |
+| `llm.responses` | list | `[]` | Ordered mock responses for `mock` mode |
+| `llm.cassette` | path? | `null` | JSONL cassette path for `replay` or `record` mode |
+| `mock_server` | map | disabled | Start a lightweight local HTTP server and inject `mock_server.base_url` into runtime context |
+
+LLM fixture modes:
+
+| Mode | Behavior |
+|------|----------|
+| `mock` | Uses `llm.responses` in order. When responses are exhausted, the last response repeats. In streamed turns, mock responses are split into multiple chunks before the eval runner joins them again. Best for default CI. |
+| `replay` | Loads cassette JSONL records and matches by alias, model, and request hash, with ordered fallback. Best for stable regression tests from recorded traffic. |
+| `record` | Calls the real provider and appends cassette JSONL records. Records request hashes and responses, not separate raw prompt fields. |
+| `real` | Calls the provider configured by the agent YAML. Use for live smoke tests only because it needs credentials and may incur cost. |
+
+Mock tools are keyed by tool ID. A mock with the same ID as a built-in replaces that built-in for the eval run.
+
+```yaml
+fixtures:
+  tools:
+    lookup_order:
+      success: true
+      output:
+        id: ORD-1042
+        status: cancellable
+```
+
+`mock_server.routes` entries accept `method`, `path`, `status`, optional `headers`, and `body`. The runner chooses a dynamic port when `port` is omitted.
+
+```yaml
+fixtures:
+  mock_server:
+    enabled: true
+    routes:
+      - method: GET
+        path: /orders/ORD-1042
+        status: 200
+        body:
+          id: ORD-1042
+          status: cancellable
+```
+
+### Scenario and turn fields
+
+```yaml
+scenarios:
+  - id: two-turn-conversation
+    name: Two deterministic mocked turns pass
+    tags: [basic, smoke]
+    language: en
+    actor: customer_42
+    context:
+      user:
+        id: customer_42
+    turns:
+      - input: Hello
+        context:
+          channel: cli
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Hello"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `id` | `string` | required | Stable scenario ID for filtering and reports |
+| `name` | `string?` | `null` | Human-readable name |
+| `tags` | list | `[]` | Filter with CLI `--tags` |
+| `language` | `string?` | `null` | Filter with CLI `--language` and group metrics |
+| `actor` | `string?` | `null` | Sets `actor_id` before scenario turns |
+| `context` | object | `null` | Scenario-level context overlay |
+| `skip` | bool/string | `false` | Skip the scenario. A string value is treated as the skip reason and appears in reports. |
+| `env` | map | `{}` | Serial-only process environment overlay for one scenario attempt. Values are restored after the attempt. Parallel suites that use `env` are rejected. |
+| `turns` | list | `[]` | Direct conversation turns. Each turn uses the same runtime unless `isolation: turn` is configured. |
+| `steps` | list | `[]` | Advanced sequence with run/reset/save/load/context/actor steps. Use this for persistence, actor switching, or multi-session checks. |
+| `turn.input` | `string` | required | User input for a turn |
+| `turn.actor` | `string?` | `null` | Actor override for a single turn |
+| `turn.context` | object | `null` | Turn-level context overlay |
+| `turn.stream` | `bool?` | `null` | Use `chat_stream()`, collect all content chunks into a final response string, then run assertions against that final text |
+| `turn.assert` | object | `null` | Assertions evaluated after the turn |
+
+Context overlay order is: `fixtures.context_file` -> `fixtures.context` -> `mock_server.base_url` -> `scenario.context` -> `turn.context`. Later values replace earlier values at the same top-level key.
+
+Advanced step example:
+
+```yaml
+steps:
+  - run:
+      turns:
+        - input: My preferred language is Korean.
+      save_session: first
+  - reset_agent:
+      profile: full_runtime
+      preserve_storage: true
+      preserve_host_context: true
+      preserve_actor_id: true
+  - load_session: first
+  - set_actor:
+      actor: customer_42
+  - run:
+      turns:
+        - input: What do you remember?
+          assert:
+            response_not_empty: true
+```
+
+`reset_agent: true` uses the default full-runtime reset behavior. Object form lets you choose a profile and preservation flags. `profile: conversation` calls the runtime conversation reset without rebuilding the agent; other profiles rebuild the eval runtime. `preserve_storage` keeps the temp persistence path, `preserve_host_context` reapplies fixture and scenario context, `preserve_actor_id` reapplies the active actor, and `delete_persistence` removes temp persistence before rebuilding.
+
+### Common assertions
+
+Assertions are an implicit `all` when several simple keys appear in one object. Use `all`, `any`, and `not` for explicit composition.
+
+```yaml
+assert:
+  all:
+    - response_not_empty: true
+    - response_contains_any: ["Hello", "Hi"]
+    - state_in: [greeting, helping]
+```
+
+| Assertion | Purpose |
+|-----------|---------|
+| `state`, `state_in`, `state_not`, `state_history_contains` | Check state-machine evidence |
+| `response_contains`, `response_contains_any`, `response_not_contains`, `response_not_empty` | Literal response checks |
+| `metadata_contains` | Top-level response metadata key/value checks. Use path assertions for nested values. |
+| `metadata_path`, `context_path` | Dot-path checks with `eq`, `neq`, `in`, `contains`, `exists`, `gte`, `lte`, `gt`, `lt`. |
+| `tool_called`, `tool_not_called` | Tool execution evidence, including count, success, source, args, and result paths. |
+| `skill_triggered` | Skill metadata when available. Useful for skill router regression tests. |
+| `disambiguation`, `no_disambiguation` | Ambiguity flow evidence when available. Checks statuses such as `triggered`, `clarified`, `best_guess`, or `skipped`. |
+| `facts_include` | Actor fact evidence. Can check actor, category, and semantic support via judge. |
+| `relationship` | Relationship existence, actor, perspective, interaction counts, event counts, and dimension comparisons. |
+| `persona_secret_revealed` | Persona secret reveal state. Boolean form checks if any secret is revealed. String form checks revealed secret IDs when available. |
+| `orchestration` | Orchestration metadata such as pattern, final agent, included agents, and stage count. |
+| `observability` | Observability report limits and counts for LLM calls, tool calls, tokens, cost, purpose counts, and status counts. |
+| `judge`, `response_semantic` | Optional LLM judge checks for semantic quality. Supports `llm`, `pass_threshold`, and weighted criteria. |
+
+Path assertion fields:
+
+| Field | Meaning |
+|-------|---------|
+| `path` | Dot path to read from metadata, context, tool args, tool result, or a generated metrics object. Empty path means the root object. |
+| `eq` / `neq` | Exact JSON equality or inequality. |
+| `in` | Passes when the actual JSON value is one of the provided JSON values. |
+| `contains` | String substring check for strings, or element membership for arrays. |
+| `exists` | `true` requires the path to exist; `false` requires it to be absent. |
+| `gte`, `lte`, `gt`, `lt` | Numeric comparisons. Non-numeric actual values fail. |
+
+Example metadata and context assertions:
+
+```yaml
+assert:
+  metadata_contains:
+    intent: greeting
+  context_path:
+    path: user.tier
+    eq: vip
+```
+
+Example tool assertion:
+
+```yaml
+assert:
+  tool_called:
+    id: lookup_order
+    count_gte: 1
+    success: true
+    source_in: [mock]
+    args_executed:
+      path: id
+      eq: ORD-1042
+    result_path:
+      path: status
+      eq: cancellable
+```
+
+Tool assertion object fields:
+
+| Field | Description |
+|-------|-------------|
+| `id` | Tool ID or requested tool name to match. String form `tool_called: lookup_order` is shorthand for this. |
+| `count` | Exact number of matching calls. |
+| `count_gte` | Minimum number of matching calls. |
+| `success` | Filter to successful or failed calls before counting. |
+| `source_in` | Allowed source labels such as `llm`, `skill`, `state_action`, `on_enter`, `on_exit`, `post_transition`, `spawner`, `orchestration`, or `mock`. |
+| `args` / `args_executed` | Path assertion against the arguments actually executed. |
+| `args_original` | Path assertion against original arguments before any wrapper or normalization behavior. |
+| `result_path` | Path assertion against parsed tool output. String outputs are treated as strings; JSON outputs are parsed when possible. |
+
+Example facts, relationship, orchestration, and observability assertions:
+
+```yaml
+assert:
+  all:
+    - facts_include:
+        actor: customer_42
+        category: user_preference
+    - relationship:
+        actor: customer_42
+        perspective: agent_to_actor
+        dimension: trust
+        gte: 0.5
+    - orchestration:
+        pattern: pipeline
+        agents_include: [writer, editor]
+        stages: 2
+    - observability:
+        total_llm_calls_lte: 4
+        total_tool_calls_lte: 1
+        purpose_counts:
+          main_response:
+            path: count
+            gte: 1
+```
+
+Assertion-specific fields:
+
+| Assertion | Fields |
+|-----------|--------|
+| `facts_include` | `actor`, `category`, `semantic`. `semantic` uses a judge LLM to check whether the selected fact set supports the claim. |
+| `relationship` | `actor`, `exists`, `perspective`, `dimension`, `gte`, `lte`, `gt`, `lt`, `eq`, `interaction_count_gte`, `notable_event_count_gte`. |
+| `orchestration` | `pattern`, `type`, `final_agent_in`, `agents_include`, `stages`. Agent matching checks common metadata shapes such as agents arrays, stage agent IDs, participants, and handoff events. |
+| `observability` | `total_llm_calls_lte`, `total_tool_calls_lte`, `total_tokens_lte`, `total_cost_usd_lte`, `purpose_counts`, `status_counts`. Count maps use path assertion syntax over `{ count: N }`. |
+
+Example judge assertion:
+
+```yaml
+assert:
+  judge:
+    llm: router
+    pass_threshold: 0.8
+    criteria:
+      - name: relevance
+        description: Response directly addresses the user's request.
+        weight: 1.0
+      - name: safety
+        description: Response avoids irreversible action without confirmation.
+        weight: 0.5
+```
+
+Judge fields:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `llm` | `string?` | router/default | Optional LLM alias from the agent's `llms` map. Use a cheap router model for judge checks when possible. |
+| `pass_threshold` | `f32` | `0.75` | Minimum overall judge score required to pass. |
+| `criteria` | list | required unless defaults are configured in Rust | Text criteria or objects with `name`, `description`, and `weight`. The judge must return strict JSON. |
+
+`response_semantic` uses the same object shape as `judge`; it is just a more descriptive alias for response-quality checks.
+
+### Output files
+
+`ai-agents-cli eval` writes these files to the configured output directory:
+
+| File | Purpose |
+|------|---------|
+| `summary.md` | Human-readable pass/fail summary |
+| `summary.json` | Machine-readable result with `schema_version: 1` |
+| `per_scenario.jsonl` | One scenario result per line |
+| `failures.md` | Failure-focused report |
+| `junit.xml` | Optional CI report when `--junit` is used |
+
+Privacy note: `redact_outputs: true` stores `[redacted]` for input, response, and string assertion details. Default JSON and JSONL outputs omit raw `TurnEvidence` and response metadata. Set `redact_outputs: false` only for trusted local debugging.
+
 ## Complete Minimal Example
 
 The smallest valid agent YAML:
