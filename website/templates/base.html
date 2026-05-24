@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en" data-theme="dark">
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,51 +8,36 @@
         <title>{% block title %}{{ config.title }}{% endblock title %}</title>
         <link rel="stylesheet" href="{{ get_url(path='style.css') }}" />
         <link id="giallo-dark" rel="stylesheet" href="/giallo-dark.css" />
-        <link
-            id="giallo-light"
-            rel="stylesheet"
-            href="/giallo-light.css"
-            disabled
-        />
-        <!--<link
-            rel="icon"
-            href="{{ get_url(path='favicon.svg') }}"
-            type="image/svg+xml"
-        />-->
+        <link id="giallo-light" rel="stylesheet" href="/giallo-light.css" disabled />
+        <link rel="icon" href="{{ get_url(path='favicon.svg') }}" type="image/svg+xml" />
     </head>
     <body>
         <!-- ── Header ──────────────────────────────────────────── -->
         <header class="site-header">
             <div class="header-inner container">
-                <a
-                    href="{{ config.base_url }}"
-                    class="site-logo"
-                    aria-label="Home"
-                >
+                <a href="{{ config.base_url }}" class="site-logo" aria-label="Home">
+                    <img
+                        class="logo-icon"
+                        src="{{ get_url(path='img/ai-agents-logo.svg') }}"
+                        alt=""
+                        aria-hidden="true"
+                    />
                     <span class="logo-text">AI Agents</span>
                 </a>
 
                 <nav class="site-nav" aria-label="Main navigation">
                     <ul class="nav-links">
                         <li>
-                            <a href="{{ get_url(path='@/docs/_index.md') }}"
-                                >Docs</a
-                            >
+                            <a href="{{ get_url(path='@/docs/_index.md') }}">Docs</a>
                         </li>
                         <li>
-                            <a href="{{ get_url(path='@/examples/_index.md') }}"
-                                >Examples</a
-                            >
+                            <a href="{{ get_url(path='@/examples/_index.md') }}">Examples</a>
                         </li>
                         <li>
-                            <a href="{{ get_url(path='@/roadmap.md') }}"
-                                >Roadmap</a
-                            >
+                            <a href="{{ get_url(path='@/roadmap.md') }}">Roadmap</a>
                         </li>
                         <li>
-                            <a href="{{ get_url(path='@/blog/_index.md') }}"
-                                >Blog</a
-                            >
+                            <a href="{{ get_url(path='@/blog/_index.md') }}">Blog</a>
                         </li>
                         <li>
                             <a
@@ -122,9 +107,7 @@
                         stroke-linejoin="round"
                         aria-hidden="true"
                     >
-                        <path
-                            d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"
-                        />
+                        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
                     </svg>
                 </button>
 
@@ -161,9 +144,7 @@
             <div class="footer-inner container">
                 <div class="footer-brand">
                     <span class="footer-name">AI Agents Framework</span>
-                    <span class="footer-version"
-                        >v{{ config.extra.version }}</span
-                    >
+                    <span class="footer-version">v{{ config.extra.version }}</span>
                 </div>
 
                 <div class="footer-license">
@@ -175,31 +156,19 @@
                         >Apache-2.0</a
                     >
                     /
-                    <a
-                        href="https://opensource.org/licenses/MIT"
-                        target="_blank"
-                        rel="noopener"
+                    <a href="https://opensource.org/licenses/MIT" target="_blank" rel="noopener"
                         >MIT</a
                     >
                 </div>
 
                 <nav class="footer-links" aria-label="Footer navigation">
-                    <a
-                        href="{{ config.extra.github }}"
-                        target="_blank"
-                        rel="noopener noreferrer"
+                    <a href="{{ config.extra.github }}" target="_blank" rel="noopener noreferrer"
                         >GitHub</a
                     >
-                    <a
-                        href="{{ config.extra.crates_io }}"
-                        target="_blank"
-                        rel="noopener noreferrer"
+                    <a href="{{ config.extra.crates_io }}" target="_blank" rel="noopener noreferrer"
                         >crates.io</a
                     >
-                    <a
-                        href="{{ config.extra.docs_rs }}"
-                        target="_blank"
-                        rel="noopener noreferrer"
+                    <a href="{{ config.extra.docs_rs }}" target="_blank" rel="noopener noreferrer"
                         >docs.rs</a
                     >
                 </nav>
@@ -211,8 +180,7 @@
             (function () {
                 var root = document.documentElement;
                 var toggle = document.getElementById("theme-toggle");
-                var mobileToggle =
-                    document.getElementById("mobile-menu-toggle");
+                var mobileToggle = document.getElementById("mobile-menu-toggle");
                 var nav = document.querySelector(".site-nav");
                 var STORAGE_KEY = "ai-agents-theme";
 
@@ -229,9 +197,8 @@
 
                 // Restore saved theme or default to dark
                 var saved = localStorage.getItem(STORAGE_KEY);
-                if (saved === "light" || saved === "dark") {
-                    applyTheme(saved);
-                }
+                var initialTheme = saved === "light" || saved === "dark" ? saved : "dark";
+                applyTheme(initialTheme);
 
                 toggle.addEventListener("click", function () {
                     var current = root.getAttribute("data-theme") || "dark";
@@ -243,13 +210,8 @@
                 // Mobile nav toggle
                 if (mobileToggle && nav) {
                     mobileToggle.addEventListener("click", function () {
-                        var expanded =
-                            mobileToggle.getAttribute("aria-expanded") ===
-                            "true";
-                        mobileToggle.setAttribute(
-                            "aria-expanded",
-                            String(!expanded),
-                        );
+                        var expanded = mobileToggle.getAttribute("aria-expanded") === "true";
+                        mobileToggle.setAttribute("aria-expanded", String(!expanded));
                         nav.classList.toggle("is-open");
                     });
                 }

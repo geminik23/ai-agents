@@ -3,101 +3,145 @@ title %} {% block content %}
 <!--HERO-->
 <section class="hero">
     <div class="hero-inner container">
-        <h1 class="hero-heading">One YAML = Any Agent.</h1>
-        <p class="hero-subtitle">
-            A Rust framework for building AI agents from a single YAML specification.<br />
-            No code required.
-        </p>
+        <div class="hero-copy">
+            <p class="hero-kicker">Rust-native agent runtime</p>
+            <h1 class="hero-heading">One YAML = Any Agent.</h1>
+            <p class="hero-subtitle">
+                Define providers, tools, memory, states, approvals, evaluation, and observability in
+                YAML. Run them with a safe, extensible Rust runtime.
+            </p>
 
-        <div class="hero-badges">
-            <a href="{{ config.extra.crates_io }}" target="_blank" rel="noopener noreferrer">
-                <img
-                    src="https://img.shields.io/crates/v/ai-agents?style=flat-square&color=e11d48"
-                    alt="crates.io version"
-                    loading="lazy"
-                />
-            </a>
-            <a href="{{ config.extra.docs_rs }}" target="_blank" rel="noopener noreferrer">
-                <img
-                    src="https://img.shields.io/docsrs/ai-agents?style=flat-square&label=docs.rs"
-                    alt="docs.rs"
-                    loading="lazy"
-                />
-            </a>
-            <a
-                href="{{ config.extra.github }}/blob/main/LICENSE-MIT"
-                target="_blank"
-                rel="noopener noreferrer"
-            >
-                <img
-                    src="https://img.shields.io/crates/l/ai-agents?style=flat-square"
-                    alt="license"
-                    loading="lazy"
-                />
-            </a>
-            <a href="{{ config.extra.github }}" target="_blank" rel="noopener noreferrer">
-                <img
-                    src="https://img.shields.io/github/stars/geminik23/ai-agents?style=flat-square&color=b4b4bd"
-                    alt="GitHub stars"
-                    loading="lazy"
-                />
-            </a>
-        </div>
-
-        <div class="hero-actions">
-            <a href="{{ get_url(path='@/docs/getting-started.md') }}" class="btn btn-primary"
-                >Get Started</a
-            >
-            <a
-                href="{{ config.extra.github }}"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="btn btn-outline"
-            >
-                <svg
-                    class="btn-icon"
-                    width="18"
-                    height="18"
-                    viewBox="0 0 24 24"
-                    fill="currentColor"
-                    aria-hidden="true"
-                >
-                    <path
-                        d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"
+            <div class="hero-badges">
+                <a href="{{ config.extra.crates_io }}" target="_blank" rel="noopener noreferrer">
+                    <img
+                        src="https://img.shields.io/crates/v/ai-agents?style=flat-square&color=e53935"
+                        alt="crates.io version"
+                        loading="lazy"
                     />
-                </svg>
-                View on GitHub
-            </a>
-        </div>
-
-        <div class="hero-code">
-            <div class="code-window">
-                <div class="code-window-header">
-                    <span class="code-window-dot"></span>
-                    <span class="code-window-dot"></span>
-                    <span class="code-window-dot"></span>
-                    <span class="code-window-title">agent.yaml</span>
-                </div>
-                <pre
-                    class="code-block"
-                ><code class="language-yaml"><span class="code-key">name</span>: <span class="code-string">MyAgent</span>
-<span class="code-key">system_prompt</span>: <span class="code-string">"You are a helpful assistant."</span>
-<span class="code-key">llm</span>:
-  <span class="code-key">provider</span>: <span class="code-string">openai</span>
-  <span class="code-key">model</span>: <span class="code-string">gpt-4.1-nano</span></code></pre>
+                </a>
+                <a href="{{ config.extra.docs_rs }}" target="_blank" rel="noopener noreferrer">
+                    <img
+                        src="https://img.shields.io/docsrs/ai-agents?style=flat-square&label=docs.rs"
+                        alt="docs.rs"
+                        loading="lazy"
+                    />
+                </a>
+                <a
+                    href="{{ config.extra.github }}/blob/main/LICENSE-MIT"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                >
+                    <img
+                        src="https://img.shields.io/crates/l/ai-agents?style=flat-square"
+                        alt="license"
+                        loading="lazy"
+                    />
+                </a>
+                <a href="{{ config.extra.github }}" target="_blank" rel="noopener noreferrer">
+                    <img
+                        src="https://img.shields.io/github/stars/geminik23/ai-agents?style=flat-square&color=9aa0a6"
+                        alt="GitHub stars"
+                        loading="lazy"
+                    />
+                </a>
             </div>
 
-            <div class="hero-terminal">
+            <div class="hero-actions">
+                <a href="{{ get_url(path='@/docs/getting-started.md') }}" class="btn btn-primary"
+                    >Get Started</a
+                >
+                <a
+                    href="{{ config.extra.github }}"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="btn btn-outline"
+                >
+                    <svg
+                        class="btn-icon"
+                        width="18"
+                        height="18"
+                        viewBox="0 0 24 24"
+                        fill="currentColor"
+                        aria-hidden="true"
+                    >
+                        <path
+                            d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"
+                        />
+                    </svg>
+                    View on GitHub
+                </a>
+            </div>
+        </div>
+
+        <div class="hero-demo" aria-label="Install, define, and run an agent">
+            <div class="hero-step-card hero-install-card">
+                <div class="demo-step"><span class="demo-step-number">1</span> install</div>
                 <div class="code-window">
                     <div class="code-window-header">
                         <span class="code-window-dot"></span>
                         <span class="code-window-dot"></span>
                         <span class="code-window-dot"></span>
-                        <span class="code-window-title">Terminal</span>
+                        <span class="code-window-title">terminal</span>
                     </div>
                     <pre
                         class="code-block code-block--terminal"
-                    ><code><span class="code-prompt">$</span> cargo run -p ai-agents-cli -- run agent.yaml</code></pre>
+                    ><code><span class="code-prompt">$</span> cargo install ai-agents-cli --version {{ config.extra.version }}</code></pre>
+                </div>
+            </div>
+
+            <div class="flow-arrow flow-arrow-down" aria-hidden="true">↓</div>
+
+            <div class="hero-run-flow">
+                <div class="hero-step-card">
+                    <div class="demo-step"><span class="demo-step-number">2</span> define</div>
+                    <div class="code-window">
+                        <div class="code-window-header">
+                            <span class="code-window-dot"></span>
+                            <span class="code-window-dot"></span>
+                            <span class="code-window-dot"></span>
+                            <span class="code-window-title">agent.yaml</span>
+                        </div>
+                        <pre
+                            class="code-block"
+                        ><code class="language-yaml"><span class="code-key">name</span>: <span class="code-string">SupportAgent</span>
+<span class="code-key">system_prompt</span>: <span class="code-string">"You help customers safely."</span>
+<span class="code-key">llm</span>:
+  <span class="code-key">provider</span>: <span class="code-string">openai</span>
+  <span class="code-key">model</span>: <span class="code-string">gpt-4.1-nano</span>
+<span class="code-key">tools</span>:
+  - <span class="code-string">calculator</span></code></pre>
+                    </div>
+                </div>
+
+                <div class="flow-arrow" aria-hidden="true">→</div>
+
+                <div class="hero-step-card">
+                    <div class="demo-step"><span class="demo-step-number">3</span> run</div>
+                    <div class="code-window">
+                        <div class="code-window-header">
+                            <span class="code-window-dot"></span>
+                            <span class="code-window-dot"></span>
+                            <span class="code-window-dot"></span>
+                            <span class="code-window-title">terminal</span>
+                        </div>
+                        <pre
+                            class="code-block code-block--terminal"
+                        ><code><span class="code-prompt">$</span> ai-agents-cli run agent.yaml</code></pre>
+                        <div class="status-lines">
+                            <div class="status-line">
+                                <span class="status-ok">✓</span
+                                ><span><strong>provider</strong> openai ready</span>
+                            </div>
+                            <div class="status-line">
+                                <span class="status-ok">✓</span
+                                ><span><strong>memory</strong> in-memory session</span>
+                            </div>
+                            <div class="status-line">
+                                <span class="status-ready">→</span
+                                ><span><strong>agent</strong> waiting for input</span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
             </div>
         </div>

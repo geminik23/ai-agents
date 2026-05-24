@@ -251,13 +251,13 @@ get_section(path="docs/_index.md") %}
     }
 
     .docs-body a {
-        color: var(--accent);
+        color: var(--link);
         text-decoration: underline;
         text-underline-offset: 2px;
     }
 
     .docs-body a:hover {
-        color: var(--accent-hover);
+        color: var(--link-hover);
     }
 
     .docs-body ul,
@@ -274,7 +274,7 @@ get_section(path="docs/_index.md") %}
     .docs-body blockquote {
         margin: 1.5rem 0;
         padding: 0.75rem 1.25rem;
-        border-left: 3px solid var(--accent);
+        border-left: 3px solid var(--info);
         color: var(--text-muted);
         font-style: italic;
         background: var(--bg-surface);
@@ -369,7 +369,7 @@ get_section(path="docs/_index.md") %}
     }
 
     .docs-toc-item a:hover {
-        color: var(--accent);
+        color: var(--link-hover);
     }
 
     /* ── Prev / Next pager ───────────────────────────────────── */
@@ -384,6 +384,7 @@ get_section(path="docs/_index.md") %}
 
     .docs-pager-link {
         display: flex;
+        flex: 1 1 0;
         flex-direction: column;
         padding: 0.75rem 1rem;
         border: 1px solid var(--border);
@@ -392,12 +393,12 @@ get_section(path="docs/_index.md") %}
         transition:
             border-color 0.15s,
             box-shadow 0.15s;
-        max-width: 48%;
+        min-width: 0;
     }
 
     .docs-pager-link:hover {
-        border-color: var(--accent);
-        box-shadow: 0 0 0 3px var(--accent-muted);
+        border-color: var(--border-strong);
+        box-shadow: 0 0 0 3px var(--info-muted);
     }
 
     .docs-pager-link--next {
@@ -407,6 +408,7 @@ get_section(path="docs/_index.md") %}
 
     .docs-pager-link--placeholder {
         border: none;
+        visibility: hidden;
     }
 
     .docs-pager-direction {
@@ -417,7 +419,7 @@ get_section(path="docs/_index.md") %}
     .docs-pager-title {
         font-size: 0.95rem;
         font-weight: 600;
-        color: var(--accent);
+        color: var(--link);
     }
 
     /* ── Mobile toggle ───────────────────────────────────────── */
@@ -529,7 +531,8 @@ get_section(path="docs/_index.md") %}
         }
 
         .docs-pager-link {
-            max-width: 100%;
+            flex-basis: auto;
+            width: 100%;
         }
     }
 </style>

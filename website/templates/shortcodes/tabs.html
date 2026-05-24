@@ -26,7 +26,7 @@
   <input type="radio" name="tabs-{{ uid }}" id="tab-{{ uid }}-{{ loop.index0 }}"{% if loop.first %} checked{% endif %}>
   {% endfor %}
 
-  <div class="tab-nav" style="display: flex; gap: 0; border-bottom: 1px solid #ddd; margin-bottom: 1rem;">
+  <div class="tab-nav" style="display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 1rem;">
     {% for label in tab_labels %}
     <label for="tab-{{ uid }}-{{ loop.index0 }}" style="padding: 0.5rem 1rem; cursor: pointer; border-bottom: 2px solid transparent; margin-bottom: -1px; user-select: none;">
       {{ label | trim }}
