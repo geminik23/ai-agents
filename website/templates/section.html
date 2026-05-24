@@ -1,13 +1,17 @@
-{% extends "base.html" %} {% block title %}{{ section.title }} | {{ config.title
-}}{% endblock title %} {% block content %}
-<div class="container section-padding">
-    <h1>{{ section.title }}</h1>
+{% extends "base.html" %} {% block title %}{{ section.title }} | {{ config.title }}{% endblock title
+%} {% block content %}
+<div class="container section-padding section-shell">
+    <div class="section-header">
+        <h1>{{ section.title }}</h1>
 
-    {% if section.description %}
-    <p class="text-muted">{{ section.description }}</p>
-    {% endif %} {% if section.content %}
-    <div class="docs-content">{{ section.content | safe }}</div>
-    {% endif %} {% if section.pages %}
+        {% if section.description %}
+        <p class="text-muted section-description">{{ section.description }}</p>
+        {% endif %} {% if section.content %}
+        <div class="section-intro">{{ section.content | safe }}</div>
+        {% endif %}
+    </div>
+
+    {% if section.pages %}
     <div class="section-list">
         {% for page in section.pages %}
         <a href="{{ page.permalink }}" class="section-card">
@@ -21,7 +25,9 @@
         {% endfor %}
     </div>
     {% endif %} {% if section.subsections %}
-    <h2>Sections</h2>
+    <div class="section-subsections-header">
+        <h2>Sections</h2>
+    </div>
     <div class="section-list">
         {% for subsection_path in section.subsections %} {% set subsection =
         get_section(path=subsection_path) %}

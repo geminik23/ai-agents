@@ -1,7 +1,7 @@
-{% extends "base.html" %} {% block title %}{{ page.title }} | Blog — {{
-config.title }}{% endblock title %} {% block content %}
-<div class="container section-padding">
-    <article>
+{% extends "base.html" %} {% block title %}{{ page.title }} | Blog — {{ config.title }}{% endblock
+title %} {% block content %}
+<div class="container section-padding page-shell blog-shell">
+    <article class="page-article blog-article">
         <h1>{{ page.title }}</h1>
 
         <div class="blog-meta">
@@ -17,22 +17,17 @@ config.title }}{% endblock title %} {% block content %}
         {% if page.taxonomies.tags %}
         <div style="margin-bottom: 2rem">
             {% for tag in page.taxonomies.tags %}
-            <a
-                class="badge-tag"
-                href="{{ get_taxonomy_url(kind='tags', name=tag) }}"
-            >
+            <a class="badge-tag" href="{{ get_taxonomy_url(kind='tags', name=tag) }}">
                 {{ tag }}
             </a>
             {% endfor %}
         </div>
         {% endif %}
 
-        <div class="docs-content">{{ page.content | safe }}</div>
+        <div class="page-content blog-page-content">{{ page.content | safe }}</div>
 
         <div class="back-link">
-            <a href="{{ get_url(path='@/blog/_index.md') }}"
-                >&larr; Back to Blog</a
-            >
+            <a href="{{ get_url(path='@/blog/_index.md') }}">&larr; Back to Blog</a>
         </div>
     </article>
 </div>

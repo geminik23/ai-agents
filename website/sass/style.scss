@@ -254,7 +254,7 @@ p { margin: 0 0 1.25em; }
   color: var(--text-muted);
   line-height: 1;
   transition: color 0.2s, border-color 0.2s, background 0.2s;
-  margin-left: auto;
+  margin-left: 0.9rem;
   display: flex;
   align-items: center;
   &:hover { color: var(--text-heading); border-color: var(--border-strong); background: var(--bg-surface-2); }
@@ -945,8 +945,70 @@ pre {
 
 .docs-content {
   min-width: 0;
-  max-width: 800px;
+  max-width: 100%;
   width: 100%;
+}
+
+.page-shell {
+  min-width: 0;
+}
+
+.page-article {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+}
+
+.page-content {
+  min-width: 0;
+  max-width: none;
+  width: 100%;
+}
+
+.section-shell {
+  min-width: 0;
+}
+
+.section-header {
+  width: 100%;
+  max-width: none;
+  margin: 0 0 2rem;
+}
+
+.section-description {
+  max-width: none;
+}
+
+.section-intro {
+  min-width: 0;
+  max-width: none;
+  width: 100%;
+}
+
+.blog-shell {
+  min-width: 0;
+}
+
+.blog-header {
+  width: 100%;
+  max-width: none;
+  margin: 0 0 2rem;
+}
+
+.blog-article {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+}
+
+.blog-page-content {
+  min-width: 0;
+  max-width: none;
+  width: 100%;
+}
+
+.section-subsections-header {
+  margin-top: 2.5rem;
 }
 
 .docs-toc {
@@ -995,6 +1057,8 @@ pre {
   flex-direction: column;
   gap: 1.25rem;
   padding: 2rem 0;
+  max-width: none;
+  width: 100%;
 }
 
 .blog-card {
@@ -1152,7 +1216,7 @@ table {
 // ══════════════════════════════════════════════
 // PROSE CONTENT
 // ══════════════════════════════════════════════
-.docs-content, .blog-content, article {
+.docs-content, .blog-content, .page-content, .section-intro, article {
   line-height: 1.7;
 
   h2 { margin-top: 2.5rem; }
