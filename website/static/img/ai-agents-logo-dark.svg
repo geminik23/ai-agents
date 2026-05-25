@@ -3,7 +3,7 @@
 <svg width="100%" height="100%" viewBox="0 0 256 256" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;stroke-linecap:round;stroke-linejoin:round;">
     <g transform="matrix(0.5,0,0,0.5,0,0)">
         <g transform="matrix(0.94509,0,0,1.32384,-155.954,52.3571)">
-            <path d="M323.73,64.533C339.73,34.533 373.73,36 415.73,36L585.146,36C640.146,36 673.146,69 673.146,124L673.146,174.588C673.146,229.588 640.146,262.588 585.146,262.588L417.73,262.588C373.73,262.588 341.73,264.055 325.73,236.055" style="fill:none;fill-rule:nonzero;stroke:rgb(15,23,42);stroke-width:17.39px;"/>
+            <path d="M323.73,64.533C339.73,34.533 373.73,36 415.73,36L585.146,36C640.146,36 673.146,69 673.146,124L673.146,174.588C673.146,229.588 640.146,262.588 585.146,262.588L417.73,262.588C373.73,262.588 341.73,264.055 325.73,236.055" style="fill:none;fill-rule:nonzero;stroke:rgb(248,250,236);stroke-width:17.39px;"/>
         </g>
         <g transform="matrix(0.728729,0,0,1.07307,177.315,149.348)">
             <g transform="matrix(1.49068,0,0,1.49068,-211.218,-147.834)">

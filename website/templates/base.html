@@ -17,8 +17,14 @@
             <div class="header-inner container">
                 <a href="{{ config.base_url }}" class="site-logo" aria-label="Home">
                     <img
-                        class="logo-icon"
+                        class="logo-icon logo-icon--light"
                         src="{{ get_url(path='img/ai-agents-logo.svg') }}"
+                        alt=""
+                        aria-hidden="true"
+                    />
+                    <img
+                        class="logo-icon logo-icon--dark"
+                        src="{{ get_url(path='img/ai-agents-logo-dark.svg') }}"
                         alt=""
                         aria-hidden="true"
                     />

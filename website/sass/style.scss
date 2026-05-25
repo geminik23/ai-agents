@@ -199,11 +199,18 @@ p { margin: 0 0 1.25em; }
   height: 29px;
   flex-shrink: 0;
   object-fit: contain;
-  filter: invert(1);
 }
 
-[data-theme="light"] .logo-icon {
-  filter: none;
+.logo-icon--dark {
+  display: none;
+}
+
+[data-theme="dark"] .logo-icon--light {
+  display: none;
+}
+
+[data-theme="dark"] .logo-icon--dark {
+  display: block;
 }
 
 .logo-text {
