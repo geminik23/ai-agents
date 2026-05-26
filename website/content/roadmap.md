@@ -27,6 +27,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.12** | Relationship memory - actor-scoped trust, sentiment, rapport, two-sided relationships, actor-aware inter-agent context, and relationship inspection in the REPL/TUI |
 | **rc.13** | LLM provider enhancements and observability - capability overrides, Ollama options, privacy-safe tracing, cost metrics, reports, raw events, and Prometheus text export |
 | **rc.14** | Evaluation framework - YAML and JSONL scenario suites, fixtures, assertions, judges, strict redaction, observability overlay, and CI reports |
+| **rc.15** | Runtime latency optimization + speculative branch execution - pre-response routing, background actor-memory maintenance, stable orchestration ordering, parallel transition decisions, speculative skill and reasoning branches, buffered streaming, branch observability, and eval flush support |
 
 ---
 
@@ -57,9 +58,13 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | ✅ Done (rc.13) |
 | **Observability & Tracing** | Privacy-safe per-call latency, token usage, cost estimates, trace context, reports, and exporters | ✅ Done (rc.13) |
 | **Evaluation Framework** | YAML/JSONL scenario runner with assertions, LLM judge, fixtures, strict redaction, parallel execution, observability overlay, and CI reports | ✅ Done (rc.14) |
-| **Runtime Latency Optimization** | Safe speculative LLM scheduling, pre-response transitions, parallel post-turn memory updates, and orchestration aggregation speedups | Planned (rc.15) |
-| **Built-in Tool Expansion** | Safe search tools, split file read/write/edit tools, interactive questions, session todos, bounded waits, and web retrieval primitives | Planned (rc.16) |
-| **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | Planned (v1.0.0) |
+| **Runtime Latency Optimization** | Pre-response deterministic transitions, background actor-memory maintenance, stable orchestration ordering, branch-aware observability foundations, and eval flushing | In progress (rc.15) |
+| **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | Planned (rc.15) |
+| **Built-in Tool Expansion** | Safe discovery, split file read/write/edit tools, patch review, repository inspection, diagnostics, controlled validation commands, interactive questions, session todos, bounded waits, and web retrieval primitives | Planned (rc.16) |
+| **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned (rc.17) |
+| **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, autonomy, and release hardening | Planned (v1.0.0) |
+| **Desktop Agent Studio** | Desktop workbench for authoring YAML agents, validating configs, running local Ollama agents, and inspecting state, memory, tools, sessions, task runs, and observability | Planned after v1 |
+| **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, task runs, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned after v1 |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
 | **Conversation Style Modifiers** | LLM-based dynamic tone, formality, and style adaptation | Planned |
 | **Background Tasks & Scheduling** | Async job execution with cron, interval, event triggers, and DAG dependencies | Planned |
@@ -77,8 +82,6 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **A2A Protocol** | Cross-service agent collaboration protocol | Planned - needs Multi-Agent Orchestration |
 | **Custom Reasoning Prompts** | Domain and language-specific CoT/ReAct instruction templates | Planned |
 | **Reasoning Depth Control** | Auto shallow/standard/deep reasoning with resource limits | Planned - needs Custom Reasoning Prompts |
-| **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned after v1 |
-| **Desktop Agent Studio** | Desktop workbench for authoring YAML agents, validating configs, running local Ollama agents, and inspecting state, memory, tools, sessions, and observability | Planned after v1 |
 
 ---
 
