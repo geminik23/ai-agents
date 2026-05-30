@@ -1340,6 +1340,8 @@ impl AgentBuilder {
                 .unwrap_or_else(|| spec.streaming.clone());
             agent = agent.with_streaming(streaming_config);
 
+            agent = agent.with_runtime_config(spec.runtime.clone());
+
             // Configure memory token budget if specified
             if let Some(ref budget) = spec.memory.token_budget {
                 agent = agent.with_memory_token_budget(budget.clone());

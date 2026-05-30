@@ -24,6 +24,7 @@ pub async fn concurrent(
     min_required: Option<usize>,
     timeout_ms: Option<u64>,
     on_partial_failure: PartialFailureAction,
+    vote_parallelism: Option<usize>,
 ) -> Result<ConcurrentResult> {
     if agents.is_empty() {
         return Err(AgentError::Config(
@@ -34,7 +35,7 @@ pub async fn concurrent(
     let start = Instant::now();
     let mut join_set = JoinSet::new();
 
-    for agent_ref in agents {
+    for (agent_index, agent_ref) in agents.iter().enumerate() {
         let agent_id = agent_ref.id().to_string();
         let agent = registry.get(&agent_id).ok_or_else(|| {
             AgentError::Other(format!("Agent not found in registry: {}", agent_id))
@@ -78,6 +79,7 @@ pub async fn concurrent(
             let duration_ms = agent_start.elapsed().as_millis() as u64;
             match result {
                 Ok(response) => AgentResult {
+                    agent_index,
                     agent_id,
                     response: Some(response),
                     duration_ms,
@@ -85,6 +87,7 @@ pub async fn concurrent(
                     error: None,
                 },
                 Err(e) => AgentResult {
+                    agent_index,
                     agent_id,
                     response: None,
                     duration_ms,
@@ -104,6 +107,8 @@ pub async fn concurrent(
             }
         }
     }
+
+    results.sort_by_key(|result| result.agent_index);
 
     let success_count = results.iter().filter(|r| r.success).count();
     let failed_count = results.len() - success_count;
@@ -139,8 +144,14 @@ pub async fn concurrent(
         .collect();
 
     let strategy_name = format!("{:?}", aggregation_config.strategy);
-    let response =
-        aggregation::aggregate(&results, aggregation_config, llm, &agent_weights).await?;
+    let response = aggregation::aggregate(
+        &results,
+        aggregation_config,
+        llm,
+        &agent_weights,
+        vote_parallelism,
+    )
+    .await?;
 
     info!(
         agents = results.len(),

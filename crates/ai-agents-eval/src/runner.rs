@@ -607,6 +607,7 @@ impl EvalRunner {
                 })??;
             (response.content, response.metadata)
         };
+        agent.flush_background_tasks().await?;
         let latency_ms = start.elapsed().as_millis() as u64;
         let evidence = collect_turn_evidence(
             agent,

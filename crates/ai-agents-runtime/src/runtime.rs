@@ -32,9 +32,9 @@ use ai_agents_memory::{
     MemoryEvictEvent, MemoryTokenBudget, OverflowStrategy,
 };
 use ai_agents_observability::{
-    ObservabilityManager, ObservationPurpose, SpanContext, current_observation_context,
-    new_session_id as new_observation_session_id, resolve_language_from_context,
-    with_observation_context, with_observation_purpose,
+    EventStatus, EventType, ObservabilityManager, ObservationPurpose, SpanContext,
+    current_observation_context, new_session_id as new_observation_session_id,
+    resolve_language_from_context, with_observation_context, with_observation_purpose,
 };
 use ai_agents_process::{
     ProcessData, ProcessProcessor, ProcessPurposeHint, ProcessStageFuture, ProcessStageObserver,
@@ -53,7 +53,7 @@ use ai_agents_relationships::RelationshipManager;
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
 use ai_agents_state::{
     PromptMode, StateAction, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
-    TransitionContext, TransitionEvaluator,
+    Transition, TransitionContext, TransitionEvaluator, TransitionTiming, evaluate_guard,
 };
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
 use ai_agents_tools::{
@@ -63,6 +63,10 @@ use ai_agents_tools::{
 
 use super::{
     Agent, AgentInfo, AgentResponse, ParallelToolsConfig, StreamChunk, StreamingConfig, ToolCall,
+};
+use crate::optimization::{
+    AwaitBeforeNextTurn, BackgroundMaintenanceQueue, BackgroundOverflowPolicy, MaintenanceMode,
+    MaintenanceSequenceKey, RuntimeConfig, RuntimeTaskPurpose, TransitionCandidate,
 };
 use crate::spec::StorageConfig;
 
@@ -147,6 +151,8 @@ pub struct RuntimeAgent {
     /// Re-dispatch depth for post-transition full dispatch.
     /// 0 = not re-dispatching. > 0 = user message already in memory, skip re-adding.
     redispatch_depth: RwLock<u32>,
+    /// Tracks whether the root turn already wrote the processed user message.
+    root_user_message_committed: AtomicBool,
     /// Current actor ID for cross-session memory.
     actor_id: RwLock<Option<String>>,
     /// Fact store for managing per-actor extracted facts.
@@ -155,9 +161,9 @@ pub struct RuntimeAgent {
     /// None when actor_memory is enabled without facts.enabled.
     fact_extractor: RwLock<Option<Arc<dyn ai_agents_facts::FactExtractor>>>,
     /// Cached actor facts keyed by actor ID so concurrent or alternating turns do not overwrite one another.
-    actor_facts_cache: RwLock<HashMap<String, Vec<ai_agents_core::KeyFact>>>,
+    actor_facts_cache: Arc<RwLock<HashMap<String, Vec<ai_agents_core::KeyFact>>>>,
     /// Number of messages since last fact extraction.
-    messages_since_extraction: RwLock<usize>,
+    messages_since_extraction: Arc<RwLock<usize>>,
     /// Actor memory configuration.
     actor_memory_config: Option<ai_agents_facts::ActorMemoryConfig>,
     /// Facts configuration.
@@ -170,6 +176,10 @@ pub struct RuntimeAgent {
     relationship_manager: Option<Arc<RelationshipManager>>,
     /// Observability manager for traces, metrics, reports, and exports.
     observability_manager: Option<Arc<ObservabilityManager>>,
+    /// Runtime optimization and maintenance policy.
+    runtime_config: RuntimeConfig,
+    /// Queue for background maintenance tasks.
+    background_maintenance: Arc<BackgroundMaintenanceQueue>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -307,17 +317,20 @@ impl RuntimeAgent {
             spawner: None,
             spawner_registry: None,
             redispatch_depth: RwLock::new(0),
+            root_user_message_committed: AtomicBool::new(false),
             actor_id: RwLock::new(None),
             fact_store: RwLock::new(None),
             fact_extractor: RwLock::new(None),
-            actor_facts_cache: RwLock::new(HashMap::new()),
-            messages_since_extraction: RwLock::new(0),
+            actor_facts_cache: Arc::new(RwLock::new(HashMap::new())),
+            messages_since_extraction: Arc::new(RwLock::new(0)),
             actor_memory_config: None,
             facts_config: None,
             session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
             current_session_id: RwLock::new(None),
             relationship_manager: None,
             observability_manager: None,
+            runtime_config: RuntimeConfig::default(),
+            background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
         }
     }
 
@@ -356,6 +369,53 @@ impl RuntimeAgent {
     pub fn with_observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
         self.observability_manager = Some(manager);
         self
+    }
+
+    /// Attach runtime optimization policy and resize the background queue.
+    pub fn with_runtime_config(mut self, config: RuntimeConfig) -> Self {
+        let max_tasks = config.optimization.post_turn.max_background_tasks;
+        self.background_maintenance = Arc::new(BackgroundMaintenanceQueue::new(max_tasks));
+        self.runtime_config = config;
+        self
+    }
+
+    /// Returns the runtime optimization policy.
+    pub fn runtime_config(&self) -> &RuntimeConfig {
+        &self.runtime_config
+    }
+
+    /// Wait for all background maintenance tasks to finish.
+    pub async fn flush_background_tasks(&self) -> Result<()> {
+        self.background_maintenance.flush_all().await
+    }
+
+    /// Wait for background maintenance associated with one actor to finish.
+    pub async fn flush_background_tasks_for_actor(&self, actor_id: &str) -> Result<()> {
+        self.background_maintenance.flush_scope(actor_id).await
+    }
+
+    /// Wait for background maintenance associated with one task kind to finish.
+    pub async fn flush_background_tasks_for_purpose(
+        &self,
+        purpose: RuntimeTaskPurpose,
+    ) -> Result<()> {
+        self.background_maintenance.flush_purpose(purpose).await
+    }
+
+    /// Wait for background maintenance associated with one actor and task kind to finish.
+    pub async fn flush_background_tasks_for_actor_purpose(
+        &self,
+        actor_id: &str,
+        purpose: RuntimeTaskPurpose,
+    ) -> Result<()> {
+        self.background_maintenance
+            .flush_scope_purpose(actor_id, purpose)
+            .await
+    }
+
+    /// Flush background maintenance before a host shuts down the runtime.
+    pub async fn shutdown_background_tasks(&self) -> Result<()> {
+        self.flush_background_tasks().await
     }
 
     /// Returns the configured observability manager for report and export access.
@@ -677,7 +737,11 @@ impl RuntimeAgent {
 
     /// Pre-turn lifecycle shared by streaming and non-streaming paths.
     async fn pre_turn_session_lifecycle(&self) {
+        if *self.redispatch_depth.read() > 0 {
+            return;
+        }
         self.resolve_actor_id_from_context();
+        self.await_background_before_next_turn().await;
         self.record_session_actor_if_needed();
         self.maybe_load_actor_memory().await;
         self.maybe_load_actor_relationship().await;
@@ -685,10 +749,487 @@ impl RuntimeAgent {
     }
 
     /// Post-turn lifecycle shared by streaming and non-streaming paths.
-    async fn post_turn_session_lifecycle(&self) {
+    async fn post_turn_session_lifecycle(&self) -> Result<()> {
+        if *self.redispatch_depth.read() > 0 {
+            return Ok(());
+        }
         *self.messages_since_extraction.write() += 1;
-        self.auto_extract_facts().await;
-        self.auto_update_relationship().await;
+        self.run_post_turn_maintenance().await
+    }
+
+    /// Starts root-turn bookkeeping for user-message commit tracking.
+    fn begin_root_turn(&self) {
+        if *self.redispatch_depth.read() == 0 {
+            self.root_user_message_committed
+                .store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Writes the processed user message once for the root turn.
+    async fn commit_root_user_message(&self, processed_input: &str) -> Result<()> {
+        if *self.redispatch_depth.read() > 0 {
+            return Ok(());
+        }
+        if !self
+            .root_user_message_committed
+            .swap(true, Ordering::SeqCst)
+        {
+            self.memory
+                .add_message(ChatMessage::user(processed_input))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Clears root-turn bookkeeping after final response handling.
+    fn end_root_turn(&self) {
+        if *self.redispatch_depth.read() == 0 {
+            self.root_user_message_committed
+                .store(false, Ordering::SeqCst);
+        }
+    }
+
+    /// Applies freshness policy before rendering the next prompt.
+    async fn await_background_before_next_turn(&self) {
+        let optimization = &self.runtime_config.optimization;
+        if !optimization.enabled {
+            return;
+        }
+        let actor_id = self.effective_actor_id();
+        let post = &optimization.post_turn;
+        self.await_background_task(
+            post.facts.await_before_next_turn,
+            RuntimeTaskPurpose::PostTurnFacts,
+            actor_id.as_deref(),
+            "facts",
+        )
+        .await;
+        self.await_background_task(
+            post.relationships.await_before_next_turn,
+            RuntimeTaskPurpose::PostTurnRelationship,
+            actor_id.as_deref(),
+            "relationships",
+        )
+        .await;
+    }
+
+    async fn await_background_task(
+        &self,
+        policy: AwaitBeforeNextTurn,
+        purpose: RuntimeTaskPurpose,
+        actor_id: Option<&str>,
+        label: &str,
+    ) {
+        match policy {
+            AwaitBeforeNextTurn::Never => {}
+            AwaitBeforeNextTurn::Always => {
+                if let Err(error) = self.flush_background_tasks_for_purpose(purpose).await {
+                    warn!(label = label, error = %error, "background maintenance flush failed");
+                }
+            }
+            AwaitBeforeNextTurn::SameActor => {
+                if let Some(actor_id) = actor_id {
+                    if let Err(error) = self
+                        .flush_background_tasks_for_actor_purpose(actor_id, purpose)
+                        .await
+                    {
+                        warn!(label = label, actor_id = %actor_id, error = %error, "actor background maintenance flush failed");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs post-turn facts and relationship maintenance according to runtime policy.
+    async fn run_post_turn_maintenance(&self) -> Result<()> {
+        let optimization = &self.runtime_config.optimization;
+        if !optimization.enabled {
+            self.auto_extract_facts().await;
+            self.auto_update_relationship().await;
+            return Ok(());
+        }
+
+        let facts_mode = effective_maintenance_mode(
+            optimization.post_turn.facts.mode,
+            optimization.parallel_post_turn_memory,
+        );
+        let relationships_mode = effective_maintenance_mode(
+            optimization.post_turn.relationships.mode,
+            optimization.parallel_post_turn_memory,
+        );
+
+        match (facts_mode, relationships_mode) {
+            (MaintenanceMode::InlineSerial, MaintenanceMode::InlineSerial) => {
+                self.auto_extract_facts().await;
+                self.auto_update_relationship().await;
+            }
+            (MaintenanceMode::InlineParallel, MaintenanceMode::InlineParallel) => {
+                let facts = self.auto_extract_facts();
+                let relationships = self.auto_update_relationship();
+                tokio::join!(facts, relationships);
+            }
+            (MaintenanceMode::Background, MaintenanceMode::Background) => {
+                self.schedule_facts_background().await?;
+                self.schedule_relationship_background().await?;
+            }
+            (MaintenanceMode::Background, MaintenanceMode::InlineParallel)
+            | (MaintenanceMode::Background, MaintenanceMode::InlineSerial) => {
+                self.schedule_facts_background().await?;
+                self.auto_update_relationship().await;
+            }
+            (MaintenanceMode::InlineParallel, MaintenanceMode::Background)
+            | (MaintenanceMode::InlineSerial, MaintenanceMode::Background) => {
+                self.auto_extract_facts().await;
+                self.schedule_relationship_background().await?;
+            }
+            _ => {
+                self.auto_extract_facts().await;
+                self.auto_update_relationship().await;
+            }
+        }
+        Ok(())
+    }
+
+    async fn schedule_facts_background(&self) -> Result<()> {
+        let policy = self.runtime_config.optimization.post_turn.facts.clone();
+        let should_extract = self
+            .facts_config
+            .as_ref()
+            .map(|c| c.enabled && c.auto_extract)
+            .unwrap_or(false);
+        if !should_extract {
+            return Ok(());
+        }
+        let msgs_since = *self.messages_since_extraction.read();
+        if msgs_since < 2 {
+            return Ok(());
+        }
+        let Some(actor_id) = self.effective_actor_id() else {
+            self.record_skipped_maintenance(
+                "facts",
+                ObservationPurpose::FactsExtraction,
+                "missing_actor",
+                Some(&policy),
+            );
+            return Ok(());
+        };
+        let Some(extractor) = self.fact_extractor.read().clone() else {
+            return Ok(());
+        };
+        let messages = match self.memory.get_messages(None).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                warn!(error = %error, "failed to snapshot messages for fact extraction");
+                return Ok(());
+            }
+        };
+        let recent: Vec<_> = messages
+            .iter()
+            .rev()
+            .take(msgs_since)
+            .rev()
+            .cloned()
+            .collect();
+        if recent.is_empty() {
+            return Ok(());
+        }
+        let existing = self
+            .actor_facts_cache
+            .read()
+            .get(&actor_id)
+            .cloned()
+            .unwrap_or_default();
+        let categories = self
+            .facts_config
+            .as_ref()
+            .map(|c| c.custom_categories.clone())
+            .unwrap_or_default();
+        let store = self.fact_store.read().clone();
+        let cache = Arc::clone(&self.actor_facts_cache);
+        let counter = Arc::clone(&self.messages_since_extraction);
+        let hooks = Arc::clone(&self.hooks);
+        let agent_id = self.info.id.clone();
+        let observation = current_observation_context();
+        let key = MaintenanceSequenceKey::actor(
+            agent_id,
+            actor_id.clone(),
+            RuntimeTaskPurpose::PostTurnFacts,
+        );
+        let actor_for_task = actor_id.clone();
+        let task = async move {
+            let run = async move {
+                let facts = extractor
+                    .extract(&recent, &existing, Some(&actor_for_task), &categories)
+                    .await?;
+                if !facts.is_empty() {
+                    if let Some(store) = store {
+                        let authoritative = store.add_facts(&actor_for_task, facts.clone()).await?;
+                        cache.write().insert(actor_for_task.clone(), authoritative);
+                    } else {
+                        cache
+                            .write()
+                            .entry(actor_for_task.clone())
+                            .or_default()
+                            .extend(facts.clone());
+                    }
+                    {
+                        let mut count = counter.write();
+                        if *count <= msgs_since {
+                            *count = 0;
+                        } else {
+                            *count -= msgs_since;
+                        }
+                    }
+                    hooks.on_facts_extracted(&actor_for_task, &facts).await;
+                }
+                Ok(())
+            };
+            if let Some(context) = observation {
+                with_observation_context(
+                    context.with_purpose(ObservationPurpose::FactsExtraction),
+                    run,
+                )
+                .await
+            } else {
+                run.await
+            }
+        };
+        self.spawn_or_handle_background(Some(key), task, "facts", &policy)
+            .await
+    }
+
+    async fn schedule_relationship_background(&self) -> Result<()> {
+        let policy = self
+            .runtime_config
+            .optimization
+            .post_turn
+            .relationships
+            .clone();
+        let Some(manager) = self.relationship_manager.as_ref().cloned() else {
+            return Ok(());
+        };
+        let Some(actor_id) = self.effective_actor_id() else {
+            self.record_skipped_maintenance(
+                "relationships",
+                ObservationPurpose::RelationshipUpdate,
+                "missing_actor",
+                Some(&policy),
+            );
+            return Ok(());
+        };
+        let recent_messages = manager.config().auto_update.recent_messages;
+        let messages = match self.memory.get_messages(Some(recent_messages)).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                warn!(actor = %actor_id, error = %error, "failed to snapshot messages for relationship update");
+                return Ok(());
+            }
+        };
+        let storage = self.storage.read().clone();
+        let hooks = Arc::clone(&self.hooks);
+        let agent_id = self.info.id.clone();
+        let observation = current_observation_context();
+        let key = MaintenanceSequenceKey::actor(
+            agent_id.clone(),
+            actor_id.clone(),
+            RuntimeTaskPurpose::PostTurnRelationship,
+        );
+        let actor_for_task = actor_id.clone();
+        let task = async move {
+            let run = async move {
+                if manager.config().auto_update.enabled {
+                    let update = manager.auto_update(&actor_for_task, &messages).await?;
+                    if !update.changes.is_empty() {
+                        hooks
+                            .on_relationship_change(&actor_for_task, &update.changes)
+                            .await;
+                    }
+                    if let Some(ref event) = update.event {
+                        hooks.on_notable_event(&actor_for_task, event).await;
+                    }
+                }
+                if manager.config().persistence.enabled {
+                    if let (Some(storage), Some(value)) =
+                        (storage, manager.relationship_as_value(&actor_for_task)?)
+                    {
+                        storage
+                            .save_relationship(&agent_id, &actor_for_task, &value)
+                            .await?;
+                    }
+                }
+                Ok(())
+            };
+            if let Some(context) = observation {
+                with_observation_context(
+                    context.with_purpose(ObservationPurpose::RelationshipUpdate),
+                    run,
+                )
+                .await
+            } else {
+                run.await
+            }
+        };
+        self.spawn_or_handle_background(Some(key), task, "relationships", &policy)
+            .await
+    }
+
+    /// Queues background maintenance or applies the configured overflow behavior.
+    async fn spawn_or_handle_background<F>(
+        &self,
+        key: Option<MaintenanceSequenceKey>,
+        task: F,
+        label: &'static str,
+        policy: &crate::optimization::config::MaintenanceTaskPolicy,
+    ) -> Result<()>
+    where
+        F: Future<Output = Result<()>> + Send + 'static,
+    {
+        if self.background_maintenance.is_full() {
+            match self
+                .runtime_config
+                .optimization
+                .post_turn
+                .on_background_overflow
+            {
+                BackgroundOverflowPolicy::RunInline => {
+                    record_background_maintenance_event(
+                        self.observability_manager.as_ref(),
+                        label,
+                        EventStatus::Success,
+                        0,
+                        "inline_overflow",
+                        None,
+                        Some(policy),
+                    );
+                    let start = Instant::now();
+                    match task.await {
+                        Ok(()) => record_background_maintenance_event(
+                            self.observability_manager.as_ref(),
+                            label,
+                            EventStatus::Success,
+                            start.elapsed().as_millis() as u64,
+                            "inline_completed",
+                            None,
+                            Some(policy),
+                        ),
+                        Err(error) => {
+                            warn!(label = label, error = %error, "inline maintenance fallback failed");
+                            record_background_maintenance_event(
+                                self.observability_manager.as_ref(),
+                                label,
+                                EventStatus::Error,
+                                start.elapsed().as_millis() as u64,
+                                "inline_failed",
+                                Some(error.to_string()),
+                                Some(policy),
+                            );
+                            return Err(error);
+                        }
+                    }
+                }
+                BackgroundOverflowPolicy::Drop => {
+                    self.record_skipped_maintenance(
+                        label,
+                        ObservationPurpose::Other(label.to_string()),
+                        "queue_full",
+                        Some(policy),
+                    );
+                }
+                BackgroundOverflowPolicy::Error => {
+                    record_background_maintenance_event(
+                        self.observability_manager.as_ref(),
+                        label,
+                        EventStatus::Error,
+                        0,
+                        "queue_full",
+                        None,
+                        Some(policy),
+                    );
+                    warn!(label = label, "background maintenance queue full");
+                    return Err(AgentError::Other(format!(
+                        "background maintenance queue is full for {}",
+                        label
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        record_background_maintenance_event(
+            self.observability_manager.as_ref(),
+            label,
+            EventStatus::Success,
+            0,
+            "scheduled",
+            None,
+            Some(policy),
+        );
+        let manager = self.observability_manager.clone();
+        let policy_for_task = policy.clone();
+        let observed_task = async move {
+            let start = Instant::now();
+            let result = task.await;
+            match &result {
+                Ok(()) => record_background_maintenance_event(
+                    manager.as_ref(),
+                    label,
+                    EventStatus::Success,
+                    start.elapsed().as_millis() as u64,
+                    "completed",
+                    None,
+                    Some(&policy_for_task),
+                ),
+                Err(error) => record_background_maintenance_event(
+                    manager.as_ref(),
+                    label,
+                    EventStatus::Error,
+                    start.elapsed().as_millis() as u64,
+                    "failed",
+                    Some(error.to_string()),
+                    Some(&policy_for_task),
+                ),
+            }
+            result
+        };
+
+        if let Err(error) = self.background_maintenance.spawn(key, observed_task) {
+            record_background_maintenance_event(
+                self.observability_manager.as_ref(),
+                label,
+                EventStatus::Error,
+                0,
+                "spawn_failed",
+                Some(error.to_string()),
+                Some(policy),
+            );
+            warn!(label = label, error = %error, "background maintenance spawn failed");
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Records a skipped background maintenance event when work cannot run.
+    fn record_skipped_maintenance(
+        &self,
+        label: &str,
+        purpose: ObservationPurpose,
+        reason: &str,
+        policy: Option<&crate::optimization::config::MaintenanceTaskPolicy>,
+    ) {
+        if let Some(manager) = self.observability_manager.as_ref() {
+            let mut tags = background_maintenance_tags(label, "skipped", Some(reason), policy);
+            tags.insert("runtime.skip_reason".to_string(), reason.to_string());
+            manager.record_lifecycle_event(
+                EventType::MemoryOperation {
+                    operation: format!("{}_maintenance", label),
+                },
+                purpose,
+                EventStatus::Skipped,
+                0,
+                tags,
+                None,
+            );
+        }
     }
 
     /// Get cached actor facts for the effective actor.
@@ -900,6 +1441,20 @@ impl RuntimeAgent {
             store.format_for_context(&filtered, max_tokens)
         } else {
             String::new()
+        }
+    }
+
+    fn build_context_with_staged(&self, staged: &HashMap<String, Value>) -> HashMap<String, Value> {
+        let context = self.build_context_with_overlays();
+        let mut root = Value::Object(context.into_iter().collect());
+        for (path, value) in staged {
+            if let Ok(updated) = ai_agents_core::set_dot_path(root.clone(), path, value.clone()) {
+                root = updated;
+            }
+        }
+        match root {
+            Value::Object(obj) => obj.into_iter().collect(),
+            _ => HashMap::new(),
         }
     }
 
@@ -3068,112 +3623,322 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
-    async fn evaluate_transitions(&self, user_message: &str, response: &str) -> Result<bool> {
-        let (transitions, evaluator, current_state) =
-            match (&self.state_machine, &self.transition_evaluator) {
-                (Some(sm), Some(eval)) => {
-                    let auto_transitions: Vec<_> = sm
-                        .auto_transitions()
-                        .into_iter()
-                        .filter(|t| {
-                            // S7: skip transitions on cooldown
-                            match t.cooldown_turns {
-                                Some(cd) if cd > 0 => {
-                                    let resolved =
-                                        sm.config().resolve_full_path(&sm.current(), &t.to);
-                                    !sm.is_on_cooldown(&resolved, cd)
-                                }
-                                _ => true,
-                            }
-                        })
-                        .collect();
-                    if auto_transitions.is_empty() {
-                        return Ok(false);
-                    }
-                    (auto_transitions, eval, sm.current())
+    fn transitions_available_for_commit(&self) -> Option<(Vec<Transition>, String)> {
+        let sm = self.state_machine.as_ref()?;
+        let current = sm.current();
+        let transitions: Vec<_> = sm
+            .auto_transitions()
+            .into_iter()
+            .filter(|t| match t.cooldown_turns {
+                Some(cd) if cd > 0 => {
+                    let resolved = sm.config().resolve_full_path(&current, &t.to);
+                    !sm.is_on_cooldown(&resolved, cd)
                 }
-                _ => return Ok(false),
-            };
+                _ => true,
+            })
+            .collect();
+        Some((transitions, current))
+    }
 
-        let context_map = self.build_context_with_overlays();
-        let context = TransitionContext::new(user_message, response, &current_state)
-            .with_context(context_map);
+    fn transition_reason(transition: &Transition) -> String {
+        if transition.when.is_empty() {
+            "guard condition met".to_string()
+        } else {
+            transition.when.clone()
+        }
+    }
 
-        if let Some(index) = self
+    /// Builds transition context with optional staged writes overlaid.
+    fn build_transition_context(
+        &self,
+        user_message: &str,
+        response: &str,
+        current_state: &str,
+        staged: Option<&HashMap<String, Value>>,
+    ) -> TransitionContext {
+        let context_map = staged
+            .map(|writes| self.build_context_with_staged(writes))
+            .unwrap_or_else(|| self.build_context_with_overlays());
+        TransitionContext::new(user_message, response, current_state).with_context(context_map)
+    }
+
+    /// Selects a post-response transition without committing side effects.
+    async fn select_transition_candidate(
+        &self,
+        user_message: &str,
+        response: &str,
+    ) -> Result<Option<TransitionCandidate>> {
+        let Some((transitions, current_state)) = self.transitions_available_for_commit() else {
+            return Ok(None);
+        };
+        if transitions.is_empty() {
+            return Ok(None);
+        }
+        let Some(evaluator) = self.transition_evaluator.as_ref() else {
+            return Ok(None);
+        };
+        let context = self.build_transition_context(user_message, response, &current_state, None);
+        let selected = self
             .observe_purpose(
                 ObservationPurpose::StateTransitionEvaluation,
                 evaluator.select_transition(&transitions, &context),
             )
+            .await?;
+        Ok(selected.map(|index| {
+            let transition = transitions[index].clone();
+            TransitionCandidate::new(
+                current_state,
+                transition.clone(),
+                Self::transition_reason(&transition),
+            )
+        }))
+    }
+
+    /// Selects a guard or resolved-intent transition without an LLM call.
+    fn select_deterministic_transition_candidate(
+        &self,
+        user_message: &str,
+        current_state: &str,
+        transitions: &[Transition],
+        staged: &HashMap<String, Value>,
+    ) -> Option<TransitionCandidate> {
+        let context = self.build_transition_context(user_message, "", current_state, Some(staged));
+
+        for transition in transitions {
+            if let Some(guard) = transition.guard.as_ref() {
+                if evaluate_guard(guard, &context) {
+                    return Some(TransitionCandidate::new(
+                        current_state,
+                        transition.clone(),
+                        Self::transition_reason(transition),
+                    ));
+                }
+            }
+        }
+
+        let resolved_intent = context
+            .context
+            .get("resolved_intent")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
+        if let Some(resolved_intent) = resolved_intent {
+            for transition in transitions {
+                if transition.intent.as_deref() == Some(resolved_intent) {
+                    return Some(TransitionCandidate::new(
+                        current_state,
+                        transition.clone(),
+                        Self::transition_reason(transition),
+                    ));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Commits a selected transition through the shared post-response path.
+    async fn commit_transition_candidate(&self, candidate: &TransitionCandidate) -> Result<bool> {
+        self.commit_transition_target(&candidate.from_state, candidate.target(), &candidate.reason)
+            .await
+    }
+
+    /// Runs state transition approval before any transition side effects.
+    async fn approve_transition_target(&self, from_state: &str, target: &str) -> Result<bool> {
+        let approved = self.check_state_hitl(Some(from_state), target).await?;
+        if !approved {
+            info!(to = %target, "State transition rejected by HITL");
+        }
+        Ok(approved)
+    }
+
+    /// Applies transition side effects after approval has succeeded.
+    async fn apply_transition_target(
+        &self,
+        from_state: &str,
+        target: &str,
+        reason: &str,
+        staged: Option<&HashMap<String, Value>>,
+    ) -> Result<bool> {
+        let Some(ref sm) = self.state_machine else {
+            return Ok(false);
+        };
+
+        self.execute_state_exit_actions(from_state).await;
+        sm.transition_to(target, reason)?;
+        sm.reset_no_transition();
+        if let Some(staged) = staged {
+            self.commit_staged_context_writes(staged).await;
+        }
+        let entered = sm.current();
+        self.execute_state_enter_actions(&entered).await;
+        self.hooks
+            .on_state_transition(Some(from_state), &entered, reason)
+            .await;
+        info!(from = %from_state, to = %entered, "State transition");
+        Ok(true)
+    }
+
+    /// Approves and applies a transition without staged context writes.
+    async fn commit_transition_target(
+        &self,
+        from_state: &str,
+        target: &str,
+        reason: &str,
+    ) -> Result<bool> {
+        if !self.approve_transition_target(from_state, target).await? {
+            return Ok(false);
+        }
+        self.apply_transition_target(from_state, target, reason, None)
+            .await
+    }
+
+    /// Commits a pre-response transition after approval and before redispatch.
+    async fn commit_pre_response_transition_candidate(
+        &self,
+        candidate: &TransitionCandidate,
+        staged: &HashMap<String, Value>,
+        processed_input: &str,
+    ) -> Result<bool> {
+        if !self
+            .approve_transition_target(&candidate.from_state, candidate.target())
             .await?
         {
-            let target = transitions[index].to.clone();
-            let reason = if transitions[index].when.is_empty() {
-                "guard condition met".to_string()
+            return Ok(false);
+        }
+        self.commit_root_user_message(processed_input).await?;
+        self.apply_transition_target(
+            &candidate.from_state,
+            candidate.target(),
+            &candidate.reason,
+            Some(staged),
+        )
+        .await
+    }
+
+    /// Handles post-response transition misses with fallback counters.
+    async fn handle_transition_miss(&self, current_state: &str) -> Result<bool> {
+        let Some(ref sm) = self.state_machine else {
+            return Ok(false);
+        };
+        sm.increment_no_transition();
+        let Some(fallback) = sm.check_fallback() else {
+            return Ok(false);
+        };
+        self.commit_transition_target(current_state, &fallback, "fallback after no transitions")
+            .await
+    }
+
+    /// Evaluates and commits post-response transitions for the committed response path.
+    async fn evaluate_transitions(&self, user_message: &str, response: &str) -> Result<bool> {
+        let Some((transitions, current_state)) = self.transitions_available_for_commit() else {
+            return Ok(false);
+        };
+        if transitions.is_empty() {
+            return Ok(false);
+        }
+        if let Some(candidate) = self
+            .select_transition_candidate(user_message, response)
+            .await?
+        {
+            return self.commit_transition_candidate(&candidate).await;
+        }
+        self.handle_transition_miss(&current_state).await
+    }
+
+    /// Attempts deterministic pre-response routing before old-state response generation.
+    async fn try_pre_response_transition(
+        &self,
+        processed_input: &str,
+    ) -> Result<Option<AgentResponse>> {
+        let optimization = &self.runtime_config.optimization;
+        if !optimization.enabled || !optimization.pre_response_deterministic_transitions {
+            return Ok(None);
+        }
+        let Some((transitions, current_state)) = self.transitions_available_for_commit() else {
+            return Ok(None);
+        };
+        let eligible: Vec<Transition> = transitions
+            .into_iter()
+            .filter(|transition| !transition.requires_response)
+            .filter(|transition| matches!(transition.timing, TransitionTiming::PreResponse))
+            .collect();
+        if eligible.is_empty() {
+            return Ok(None);
+        }
+
+        let empty_staged = HashMap::new();
+        let mut extracted_staged: Option<HashMap<String, Value>> = None;
+        let mut selected: Option<(TransitionCandidate, HashMap<String, Value>)> = None;
+
+        for transition in &eligible {
+            let use_extractors = optimization.pre_response_extractors || transition.run_extractors;
+            let staged_for_eval = if use_extractors {
+                if extracted_staged.is_none() {
+                    extracted_staged =
+                        Some(self.run_context_extractors_staged(processed_input).await);
+                }
+                extracted_staged.as_ref().unwrap_or(&empty_staged)
             } else {
-                transitions[index].when.clone()
+                &empty_staged
             };
 
-            if let Some(ref sm) = self.state_machine {
-                // Check HITL approval for state transition
-                let approved = self
-                    .check_state_hitl(Some(&context.current_state), &target)
-                    .await?;
-                if !approved {
-                    info!(to = %target, "State transition rejected by HITL");
-                    return Ok(false);
-                }
-
-                // Execute on_exit actions for the current state
-                self.execute_state_exit_actions(&context.current_state)
-                    .await;
-
-                sm.transition_to(&target, &reason)?;
-                sm.reset_no_transition();
-
-                // Execute on_enter actions for the new state
-                self.execute_state_enter_actions(&target).await;
-
-                self.hooks
-                    .on_state_transition(Some(&context.current_state), &target, &reason)
-                    .await;
-                info!(from = %context.current_state, to = %target, "State transition");
-            }
-            return Ok(true);
-        }
-
-        if let Some(ref sm) = self.state_machine {
-            sm.increment_no_transition();
-            if let Some(fallback) = sm.check_fallback() {
-                let from_state = current_state.clone();
-
-                // Check HITL approval for fallback transition
-                let approved = self.check_state_hitl(Some(&from_state), &fallback).await?;
-                if !approved {
-                    info!(to = %fallback, "Fallback transition rejected by HITL");
-                    return Ok(false);
-                }
-
-                // Execute on_exit actions for the current state
-                self.execute_state_exit_actions(&from_state).await;
-
-                sm.transition_to(&fallback, "fallback after no transitions")?;
-
-                // Execute on_enter actions for the fallback state
-                self.execute_state_enter_actions(&fallback).await;
-
-                self.hooks
-                    .on_state_transition(
-                        Some(&from_state),
-                        &fallback,
-                        "fallback after no transitions",
-                    )
-                    .await;
-                info!(to = %fallback, "Fallback transition");
-                return Ok(true);
+            if let Some(candidate) = self.select_deterministic_transition_candidate(
+                processed_input,
+                &current_state,
+                std::slice::from_ref(transition),
+                staged_for_eval,
+            ) {
+                let staged_for_commit = if use_extractors {
+                    staged_for_eval.clone()
+                } else {
+                    HashMap::new()
+                };
+                selected = Some((candidate, staged_for_commit));
+                break;
             }
         }
 
-        Ok(false)
+        let Some((candidate, staged)) = selected else {
+            return Ok(None);
+        };
+
+        if !self
+            .commit_pre_response_transition_candidate(&candidate, &staged, processed_input)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.redispatch_current_state(processed_input)
+            .await
+            .map(Some)
+    }
+
+    /// Re-enters the runtime loop after an optimized transition commits.
+    async fn redispatch_current_state(&self, processed_input: &str) -> Result<AgentResponse> {
+        const MAX_REDISPATCH_DEPTH: u32 = 3;
+        let current_depth = *self.redispatch_depth.read();
+        if current_depth >= MAX_REDISPATCH_DEPTH {
+            warn!(depth = current_depth, "Re-dispatch depth limit reached");
+            let response = AgentResponse::new("");
+            self.finish_turn_if_root(&response).await?;
+            return Ok(response);
+        }
+        *self.redispatch_depth.write() += 1;
+        let result = Box::pin(self.run_loop_internal(processed_input)).await;
+        *self.redispatch_depth.write() -= 1;
+        let response = result?;
+        self.finish_turn_if_root(&response).await?;
+        Ok(response)
+    }
+
+    /// Runs final response hooks and maintenance only for the root dispatch.
+    async fn finish_turn_if_root(&self, response: &AgentResponse) -> Result<()> {
+        if *self.redispatch_depth.read() == 0 {
+            self.post_turn_session_lifecycle().await?;
+            self.hooks.on_response(response).await;
+            self.end_root_turn();
+        }
+        Ok(())
     }
 
     /// Execute on_exit actions for a state being left.
@@ -3310,16 +4075,16 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
-    /// Run context extractors for the current state on the user's input.
-    async fn run_context_extractors(&self, user_message: &str) {
+    async fn run_context_extractors_staged(&self, user_message: &str) -> HashMap<String, Value> {
         let extractors = match &self.state_machine {
             Some(sm) => match sm.current_definition() {
                 Some(def) if !def.extract.is_empty() => def.extract.clone(),
-                _ => return,
+                _ => return HashMap::new(),
             },
-            None => return,
+            None => return HashMap::new(),
         };
 
+        let mut staged = HashMap::new();
         for extractor in &extractors {
             let prompt = if let Some(ref custom) = extractor.llm_extract {
                 format!(
@@ -3362,9 +4127,10 @@ OVERALL: PASS/FAIL"#,
                 Ok(response) => {
                     let value = response.content.trim().to_string();
                     if value != "__NONE__" && !value.is_empty() {
-                        let _ = self
-                            .context_manager
-                            .update(&extractor.key, serde_json::Value::String(value.clone()));
+                        staged.insert(
+                            extractor.key.clone(),
+                            serde_json::Value::String(value.clone()),
+                        );
                         debug!(key = %extractor.key, value = %value, "Context extracted");
                     } else if extractor.required {
                         warn!(key = %extractor.key, "Required extraction returned no value");
@@ -3375,6 +4141,21 @@ OVERALL: PASS/FAIL"#,
                 }
             }
         }
+        staged
+    }
+
+    async fn commit_staged_context_writes(&self, staged: &HashMap<String, Value>) {
+        for (key, value) in staged {
+            if let Err(error) = self.context_manager.update(key, value.clone()) {
+                warn!(key = %key, error = %error, "staged context write failed");
+            }
+        }
+    }
+
+    /// Run context extractors for the current state on the user's input.
+    async fn run_context_extractors(&self, user_message: &str) {
+        let staged = self.run_context_extractors_staged(user_message).await;
+        self.commit_staged_context_writes(&staged).await;
     }
 
     async fn check_memory_compression(&self) -> Result<()> {
@@ -4157,7 +4938,7 @@ Respond in JSON format:
                         .add_message(ChatMessage::assistant(&question.question))
                         .await?;
 
-                    return Ok(AgentResponse::new(&question.question).with_metadata(
+                    let response = AgentResponse::new(&question.question).with_metadata(
                         "disambiguation",
                         serde_json::json!({
                             "status": "awaiting_clarification",
@@ -4169,7 +4950,9 @@ Respond in JSON format:
                                 "what_is_unclear": detection.what_is_unclear,
                             }
                         }),
-                    ));
+                    );
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
                 }
                 DisambiguationResult::Clarified {
                     enriched_input,
@@ -4236,7 +5019,9 @@ Respond in JSON format:
                         .unwrap_or_else(|_| {
                             format!("I'm sorry, I couldn't understand your request: {}", reason)
                         });
-                    return Ok(AgentResponse::new(&apology));
+                    let response = AgentResponse::new(&apology);
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
                 }
                 DisambiguationResult::Escalate { reason } => {
                     *self.pending_skill_id.write() = None;
@@ -4270,7 +5055,9 @@ Respond in JSON format:
                         .unwrap_or_else(|_| {
                             format!("I need human assistance to help with your request: {}", reason)
                         });
-                    return Ok(AgentResponse::new(&apology));
+                    let response = AgentResponse::new(&apology);
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
                 }
                 DisambiguationResult::Abandoned { new_input } => {
                     *self.pending_skill_id.write() = None;
@@ -4306,7 +5093,9 @@ Respond in JSON format:
                                 .add_message(ChatMessage::assistant(&ack))
                                 .await?;
 
-                            return Ok(AgentResponse::new(&ack));
+                            let response = AgentResponse::new(&ack);
+                            self.finish_turn_if_root(&response).await?;
+                            return Ok(response);
                         }
                     }
                 }
@@ -4466,20 +5255,23 @@ Respond in JSON format:
                                     .add_message(ChatMessage::assistant(&question.question))
                                     .await?;
 
-                                return Ok(AgentResponse::new(&question.question).with_metadata(
-                                    "disambiguation",
-                                    serde_json::json!({
-                                        "status": "awaiting_clarification",
-                                        "skill_id": skill_id,
-                                        "options": question.options,
-                                        "clarifying": question.clarifying,
-                                        "detection": {
-                                            "type": detection.ambiguity_type,
-                                            "confidence": detection.confidence,
-                                            "what_is_unclear": detection.what_is_unclear,
-                                        }
-                                    }),
-                                ));
+                                let response = AgentResponse::new(&question.question)
+                                    .with_metadata(
+                                        "disambiguation",
+                                        serde_json::json!({
+                                            "status": "awaiting_clarification",
+                                            "skill_id": skill_id,
+                                            "options": question.options,
+                                            "clarifying": question.clarifying,
+                                            "detection": {
+                                                "type": detection.ambiguity_type,
+                                                "confidence": detection.confidence,
+                                                "what_is_unclear": detection.what_is_unclear,
+                                            }
+                                        }),
+                                    );
+                                self.finish_turn_if_root(&response).await?;
+                                return Ok(response);
                             }
                             DisambiguationResult::Clarified {
                                 enriched_input: re_enriched,
@@ -4530,7 +5322,9 @@ Respond in JSON format:
                                     .unwrap_or_else(|_| {
                                         format!("I'm sorry, I couldn't understand your request: {}", reason)
                                     });
-                                return Ok(AgentResponse::new(&apology));
+                                let response = AgentResponse::new(&apology);
+                                self.finish_turn_if_root(&response).await?;
+                                return Ok(response);
                             }
                             DisambiguationResult::Escalate { reason } => {
                                 *self.pending_skill_id.write() = None;
@@ -4543,7 +5337,9 @@ Respond in JSON format:
                                     .unwrap_or_else(|_| {
                                         format!("I need human assistance to help with your request: {}", reason)
                                     });
-                                return Ok(AgentResponse::new(&apology));
+                                let response = AgentResponse::new(&apology);
+                                self.finish_turn_if_root(&response).await?;
+                                return Ok(response);
                             }
                             DisambiguationResult::Abandoned { new_input } => {
                                 // User abandoned during skill re-check.
@@ -4567,7 +5363,9 @@ Respond in JSON format:
                                 self.memory
                                     .add_message(ChatMessage::assistant(&ack))
                                     .await?;
-                                return Ok(AgentResponse::new(&ack));
+                                let response = AgentResponse::new(&ack);
+                                self.finish_turn_if_root(&response).await?;
+                                return Ok(response);
                             }
                         }
                     }
@@ -4605,10 +5403,9 @@ Respond in JSON format:
         self.increment_turn();
         self.evaluate_transitions(processed_input, &final_response)
             .await?;
-        self.post_turn_session_lifecycle().await;
 
         let response = AgentResponse::new(final_response);
-        self.hooks.on_response(&response).await;
+        self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
@@ -4693,7 +5490,6 @@ Respond in JSON format:
         self.increment_turn();
         self.evaluate_transitions(processed_input, &final_content)
             .await?;
-        self.post_turn_session_lifecycle().await;
 
         let reasoning_metadata =
             ReasoningMetadata::new(ReasoningMode::PlanAndExecute).with_auto_detected(auto_detected);
@@ -4703,7 +5499,7 @@ Respond in JSON format:
             serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
         );
 
-        self.hooks.on_response(&response).await;
+        self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
@@ -5202,12 +5998,7 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking (skip on redispatch - already present).
-        if *self.redispatch_depth.read() == 0 {
-            self.memory
-                .add_message(ai_agents_llm::ChatMessage::user(input))
-                .await?;
-        }
+        self.commit_root_user_message(input).await?;
 
         // post_loop_processing records the assistant turn and evaluates transitions.
         // apply_post_loop_result handles NeedsRedispatch by re-entering run_loop_internal.
@@ -5237,8 +6028,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
-        self.post_turn_session_lifecycle().await;
-        self.hooks.on_response(&result).await;
+        self.finish_turn_if_root(&result).await?;
         Ok(result)
     }
 
@@ -5289,6 +6079,17 @@ Respond in JSON format:
             .unwrap_or("router");
         let llm_provider = self.llm_registry.get(llm_name).ok();
 
+        let vote_parallelism = if self.runtime_config.optimization.enabled
+            && self
+                .runtime_config
+                .optimization
+                .parallel_orchestration_vote_extraction
+        {
+            Some(self.runtime_config.optimization.max_parallel_runtime_tasks)
+        } else {
+            None
+        };
+
         let result = self
             .observe_purpose(
                 ObservationPurpose::OrchestrationAggregation,
@@ -5303,6 +6104,7 @@ Respond in JSON format:
                         config.min_required,
                         config.timeout_ms,
                         config.on_partial_failure.clone(),
+                        vote_parallelism,
                     ),
                 ),
             )
@@ -5348,12 +6150,7 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking (skip on redispatch - already present).
-        if *self.redispatch_depth.read() == 0 {
-            self.memory
-                .add_message(ai_agents_llm::ChatMessage::user(input))
-                .await?;
-        }
+        self.commit_root_user_message(input).await?;
 
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
@@ -5377,8 +6174,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
-        self.post_turn_session_lifecycle().await;
-        self.hooks.on_response(&response).await;
+        self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
@@ -5472,12 +6268,7 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking (skip on redispatch - already present).
-        if *self.redispatch_depth.read() == 0 {
-            self.memory
-                .add_message(ai_agents_llm::ChatMessage::user(input))
-                .await?;
-        }
+        self.commit_root_user_message(input).await?;
 
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
@@ -5502,8 +6293,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
-        self.post_turn_session_lifecycle().await;
-        self.hooks.on_response(&response).await;
+        self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
@@ -5600,12 +6390,7 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking (skip on redispatch - already present).
-        if *self.redispatch_depth.read() == 0 {
-            self.memory
-                .add_message(ai_agents_llm::ChatMessage::user(input))
-                .await?;
-        }
+        self.commit_root_user_message(input).await?;
 
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
@@ -5628,8 +6413,7 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
-        self.post_turn_session_lifecycle().await;
-        self.hooks.on_response(&response).await;
+        self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
@@ -5727,12 +6511,7 @@ Respond in JSON format:
             }),
         );
 
-        // Add user message to parent memory for tracking (skip on redispatch - already present).
-        if *self.redispatch_depth.read() == 0 {
-            self.memory
-                .add_message(ai_agents_llm::ChatMessage::user(input))
-                .await?;
-        }
+        self.commit_root_user_message(input).await?;
 
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
@@ -5756,13 +6535,13 @@ Respond in JSON format:
             .unwrap_or_default(),
         );
 
-        self.post_turn_session_lifecycle().await;
-        self.hooks.on_response(&response).await;
+        self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
 
     // run_loop_internal: blocking (non-streaming) agent pipeline.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
+        self.begin_root_turn();
         // Resolve actor_id from context, reload facts if actor changed, bump counter.
         self.pre_turn_session_lifecycle().await;
 
@@ -5780,10 +6559,16 @@ Respond in JSON format:
                 .rejection_reason
                 .unwrap_or_else(|| "Input rejected".to_string());
             warn!(reason = %reason, "Input rejected");
-            return Ok(AgentResponse::new(reason));
+            let response = AgentResponse::new(reason);
+            self.finish_turn_if_root(&response).await?;
+            return Ok(response);
         }
 
         let processed_input = &input_data.content;
+
+        if let Some(response) = self.try_pre_response_transition(processed_input).await? {
+            return Ok(response);
+        }
 
         // Handle orchestration states (delegate, concurrent, group_chat, pipeline, handoff).
         if let Some(ref sm) = self.state_machine {
@@ -5818,21 +6603,13 @@ Respond in JSON format:
 
         match self.try_skill_route(processed_input).await? {
             SkillRouteResult::Response(skill_response) => {
-                if *self.redispatch_depth.read() == 0 {
-                    self.memory
-                        .add_message(ChatMessage::user(processed_input))
-                        .await?;
-                }
+                self.commit_root_user_message(processed_input).await?;
                 return self
                     .handle_skill_response(processed_input, skill_response, &input_data.context)
                     .await;
             }
             SkillRouteResult::NeedsClarification(response) => {
-                if *self.redispatch_depth.read() == 0 {
-                    self.memory
-                        .add_message(ChatMessage::user(processed_input))
-                        .await?;
-                }
+                self.commit_root_user_message(processed_input).await?;
                 if let Some(q) = response
                     .metadata
                     .as_ref()
@@ -5848,6 +6625,7 @@ Respond in JSON format:
                             .await?;
                     }
                 }
+                self.finish_turn_if_root(&response).await?;
                 return Ok(response);
             }
             SkillRouteResult::NoMatch => {} // continue to normal LLM chat
@@ -5865,21 +6643,13 @@ Respond in JSON format:
         );
 
         if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
-            if *self.redispatch_depth.read() == 0 {
-                self.memory
-                    .add_message(ChatMessage::user(processed_input))
-                    .await?;
-            }
+            self.commit_root_user_message(processed_input).await?;
             return self
                 .handle_plan_and_execute(processed_input, &input_data.context, auto_detected)
                 .await;
         }
 
-        if *self.redispatch_depth.read() == 0 {
-            self.memory
-                .add_message(ChatMessage::user(processed_input))
-                .await?;
-        }
+        self.commit_root_user_message(processed_input).await?;
 
         let mut iterations = 0u32;
         let mut all_tool_calls: Vec<ToolCall> = Vec::new();
@@ -5983,7 +6753,10 @@ Respond in JSON format:
                     .await?
                 {
                     ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
-                    ToolCallOutcome::Rejected(resp) => return Ok(resp),
+                    ToolCallOutcome::Rejected(resp) => {
+                        self.finish_turn_if_root(&resp).await?;
+                        return Ok(resp);
+                    }
                 }
             }
 
@@ -6035,10 +6808,7 @@ Respond in JSON format:
                 reflection_metadata,
             );
 
-            self.hooks.on_response(&response).await;
-
-            // Bump counter for assistant message and run auto-extraction.
-            self.post_turn_session_lifecycle().await;
+            self.finish_turn_if_root(&response).await?;
 
             let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
             info!(
@@ -6063,6 +6833,7 @@ Respond in JSON format:
         let include_state_events = self.streaming.include_state_events;
 
         Box::pin(async_stream::stream! {
+            self.begin_root_turn();
             // Parity with non-stream: resolve actor from context and load facts if changed.
             self.pre_turn_session_lifecycle().await;
 
@@ -6090,6 +6861,26 @@ Respond in JSON format:
             }
 
             let processed_input = &input_data.content;
+
+            if self.runtime_config.optimization.enabled
+                && matches!(
+                    self.runtime_config.optimization.streaming_policy,
+                    crate::optimization::StreamingOptimizationPolicy::PreflightOnly
+                )
+            {
+                match self.try_pre_response_transition(processed_input).await {
+                    Ok(Some(response)) => {
+                        yield StreamChunk::content(&response.content);
+                        yield StreamChunk::Done {};
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                }
+            }
 
             // Handle orchestration states in streaming mode.
             if let Some(ref sm) = self.state_machine {
@@ -6126,8 +6917,9 @@ Respond in JSON format:
             // Skill routing
             match self.try_skill_route(processed_input).await {
                 Ok(SkillRouteResult::Response(skill_response)) => {
-                    if *self.redispatch_depth.read() == 0 {
-                        let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    if let Err(e) = self.commit_root_user_message(processed_input).await {
+                        yield StreamChunk::error(e.to_string());
+                        return;
                     }
                     match self.handle_skill_response(processed_input, skill_response, &input_data.context).await {
                         Ok(resp) => {
@@ -6142,10 +6934,15 @@ Respond in JSON format:
                     }
                 }
                 Ok(SkillRouteResult::NeedsClarification(response)) => {
-                    if *self.redispatch_depth.read() == 0 {
-                        let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                    if let Err(e) = self.commit_root_user_message(processed_input).await {
+                        yield StreamChunk::error(e.to_string());
+                        return;
                     }
                     let _ = self.memory.add_message(ChatMessage::assistant(&response.content)).await;
+                    if let Err(e) = self.finish_turn_if_root(&response).await {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
                     yield StreamChunk::content(&response.content);
                     yield StreamChunk::Done {};
                     return;
@@ -6176,8 +6973,9 @@ Respond in JSON format:
 
             // Plan-and-Execute: yield final result as single chunk (not token-by-token)
             if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
-                if *self.redispatch_depth.read() == 0 {
-                    let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+                if let Err(e) = self.commit_root_user_message(processed_input).await {
+                    yield StreamChunk::error(e.to_string());
+                    return;
                 }
                 match self.handle_plan_and_execute(processed_input, &input_data.context, auto_detected).await {
                     Ok(resp) => {
@@ -6192,8 +6990,9 @@ Respond in JSON format:
                 }
             }
 
-            if *self.redispatch_depth.read() == 0 {
-                let _ = self.memory.add_message(ChatMessage::user(processed_input)).await;
+            if let Err(e) = self.commit_root_user_message(processed_input).await {
+                yield StreamChunk::error(e.to_string());
+                return;
             }
 
             let llm = match self.get_state_llm() {
@@ -6360,7 +7159,16 @@ Respond in JSON format:
                                     let _ = self.memory.add_message(ChatMessage::assistant(
                                         &format!("The operation was rejected by the approver: {}", e),
                                     )).await;
-                                    yield StreamChunk::error(format!("Operation cancelled: {}", e));
+                                    let response = AgentResponse {
+                                        content: format!("Operation cancelled: {}", e),
+                                        metadata: None,
+                                        tool_calls: Some(all_tool_calls.clone()),
+                                    };
+                                    if let Err(finalize_error) = self.finish_turn_if_root(&response).await {
+                                        yield StreamChunk::error(finalize_error.to_string());
+                                        return;
+                                    }
+                                    yield StreamChunk::error(response.content);
                                     yield StreamChunk::Done {};
                                     return;
                                 }
@@ -6492,8 +7300,12 @@ Respond in JSON format:
                     yield StreamChunk::content(&final_content);
                 }
 
-                // Parity with non-stream: bump counter and run auto-extraction.
-                self.post_turn_session_lifecycle().await;
+                // Parity with non-stream: finalize the committed response once.
+                let final_response = AgentResponse::new(&final_content);
+                if let Err(e) = self.finish_turn_if_root(&final_response).await {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
 
                 yield StreamChunk::Done {};
                 return;
@@ -6584,6 +7396,11 @@ Respond in JSON format:
                             .memory
                             .add_message(ChatMessage::assistant(&question.question))
                             .await;
+                        let response = AgentResponse::new(&question.question);
+                        if let Err(e) = self.finish_turn_if_root(&response).await {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
                         yield StreamChunk::content(&question.question);
                         yield StreamChunk::Done {};
                         return;
@@ -6673,6 +7490,11 @@ Respond in JSON format:
                             .unwrap_or_else(|_| {
                                 format!("I'm sorry, I couldn't understand your request: {}", reason)
                             });
+                        let response = AgentResponse::new(&apology);
+                        if let Err(e) = self.finish_turn_if_root(&response).await {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
                         yield StreamChunk::content(&apology);
                         yield StreamChunk::Done {};
                         return;
@@ -6716,6 +7538,11 @@ Respond in JSON format:
                             .unwrap_or_else(|_| {
                                 format!("I need human assistance to help with your request: {}", reason)
                             });
+                        let response = AgentResponse::new(&apology);
+                        if let Err(e) = self.finish_turn_if_root(&response).await {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
                         yield StreamChunk::content(&apology);
                         yield StreamChunk::Done {};
                         return;
@@ -6758,6 +7585,11 @@ Respond in JSON format:
                                     .add_message(ChatMessage::assistant(&ack))
                                     .await;
 
+                                let response = AgentResponse::new(&ack);
+                                if let Err(e) = self.finish_turn_if_root(&response).await {
+                                    yield StreamChunk::error(e.to_string());
+                                    return;
+                                }
                                 yield StreamChunk::content(&ack);
                                 yield StreamChunk::Done {};
                                 return;
@@ -7032,6 +7864,81 @@ impl Agent for RuntimeAgent {
 //   {{ user_input }}    - the user's actual message
 //   {{ context.<key> }} - values from the context manager
 //
+/// Builds safe runtime tags for background maintenance lifecycle events.
+fn background_maintenance_tags(
+    label: &str,
+    stage: &str,
+    reason: Option<&str>,
+    policy: Option<&crate::optimization::config::MaintenanceTaskPolicy>,
+) -> HashMap<String, String> {
+    let mut tags = HashMap::new();
+    tags.insert("runtime.background".to_string(), "true".to_string());
+    tags.insert("runtime.maintenance".to_string(), label.to_string());
+    tags.insert("runtime.maintenance_stage".to_string(), stage.to_string());
+    if let Some(policy) = policy {
+        tags.insert(
+            "runtime.await_before_next_turn".to_string(),
+            await_before_next_turn_label(policy.await_before_next_turn).to_string(),
+        );
+        tags.insert(
+            "runtime.maintenance_mode".to_string(),
+            maintenance_mode_label(policy.mode).to_string(),
+        );
+    }
+    if let Some(reason) = reason {
+        tags.insert("runtime.reason".to_string(), reason.to_string());
+    }
+    tags
+}
+
+fn await_before_next_turn_label(policy: AwaitBeforeNextTurn) -> &'static str {
+    match policy {
+        AwaitBeforeNextTurn::Never => "never",
+        AwaitBeforeNextTurn::SameActor => "same_actor",
+        AwaitBeforeNextTurn::Always => "always",
+    }
+}
+
+fn maintenance_mode_label(mode: MaintenanceMode) -> &'static str {
+    match mode {
+        MaintenanceMode::InlineSerial => "inline_serial",
+        MaintenanceMode::InlineParallel => "inline_parallel",
+        MaintenanceMode::Background => "background",
+    }
+}
+
+/// Records a background maintenance lifecycle event when observability is enabled.
+fn record_background_maintenance_event(
+    manager: Option<&Arc<ObservabilityManager>>,
+    label: &str,
+    status: EventStatus,
+    duration_ms: u64,
+    stage: &str,
+    reason: Option<String>,
+    policy: Option<&crate::optimization::config::MaintenanceTaskPolicy>,
+) {
+    if let Some(manager) = manager {
+        manager.record_lifecycle_event(
+            EventType::MemoryOperation {
+                operation: format!("{}_background_{}", label, stage),
+            },
+            ObservationPurpose::Other(format!("{}_maintenance", label)),
+            status,
+            duration_ms,
+            background_maintenance_tags(label, stage, reason.as_deref(), policy),
+            None,
+        );
+    }
+}
+
+fn effective_maintenance_mode(mode: MaintenanceMode, force_parallel: bool) -> MaintenanceMode {
+    if force_parallel && matches!(mode, MaintenanceMode::InlineSerial) {
+        MaintenanceMode::InlineParallel
+    } else {
+        mode
+    }
+}
+
 fn observation_purpose_for_process(hint: ProcessPurposeHint) -> ObservationPurpose {
     match hint {
         ProcessPurposeHint::Detect => ObservationPurpose::ProcessDetect,
@@ -7083,6 +7990,17 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
+    }
+
+    struct ResponseCountingHooks {
+        responses: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentHooks for ResponseCountingHooks {
+        async fn on_response(&self, _response: &AgentResponse) {
+            self.responses.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     // Basic YAML → Build → Chat flow
@@ -7155,6 +8073,539 @@ mod tests {
         let response = agent.chat("What is 2+2?").await.unwrap();
         // The agent should eventually produce a response
         assert!(!response.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_tool_hitl_rejection_finalizes_blocking_turn() {
+        let responses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ResponseCountingHooks {
+            responses: Arc::clone(&responses),
+        });
+        let mock = mock_with_response(r#"{"tool":"echo","arguments":{"message":"hello"}}"#);
+        let yaml = r#"
+name: ToolRejectAgent
+system_prompt: "You use tools when requested."
+hitl:
+  tools:
+    echo:
+      require_approval: true
+      approval_message: "Approve echo?"
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .hooks(hooks)
+            .build()
+            .unwrap();
+
+        let response = agent.chat("echo hello").await.unwrap();
+
+        assert!(
+            response.content.contains("Operation cancelled"),
+            "unexpected response: {}",
+            response.content
+        );
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "echo hello");
+        assert!(messages[1].content.contains("\"tool\":\"echo\""));
+        assert!(messages[2].content.contains("rejected by the approver"));
+    }
+
+    #[tokio::test]
+    async fn test_tool_hitl_rejection_finalizes_streaming_turn() {
+        use futures::StreamExt;
+
+        let responses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ResponseCountingHooks {
+            responses: Arc::clone(&responses),
+        });
+        let mock = mock_with_response(r#"{"tool":"echo","arguments":{"message":"hello"}}"#);
+        let yaml = r#"
+name: ToolRejectStreamingAgent
+system_prompt: "You use tools when requested."
+streaming:
+  enabled: true
+hitl:
+  tools:
+    echo:
+      require_approval: true
+      approval_message: "Approve echo?"
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .hooks(hooks)
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("echo hello").await.unwrap();
+        let mut terminal_error = String::new();
+        let mut done = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Error { message } => terminal_error = message,
+                StreamChunk::Done {} => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(done);
+        assert!(
+            terminal_error.contains("Operation cancelled"),
+            "unexpected terminal error: {}",
+            terminal_error
+        );
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].content, "echo hello");
+        assert!(messages[1].content.contains("\"tool\":\"echo\""));
+        assert!(messages[2].content.contains("rejected by the approver"));
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_guard_transition_skips_old_state_llm() {
+        let mock = mock_with_response("Billing state response");
+        let call_counter = mock.clone();
+        let yaml = r#"
+name: OptimizedStateAgent
+system_prompt: "You route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt that should be skipped."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+    billing:
+      prompt: "Answer from the billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+
+        let response = agent.chat("I need billing help").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing state response");
+        assert_eq!(call_counter.call_count(), 1);
+        assert_eq!(agent.actor_facts().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_rejection_does_not_commit_staged_context_or_user() {
+        let mock = mock_with_response("billing");
+        let yaml = r#"
+name: OptimizedStateAgent
+system_prompt: "You route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+hitl:
+  states:
+    billing:
+      on_enter: require_approval
+      approval_message: "Approve billing route?"
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      extract:
+        - key: topic
+          description: "Support topic"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+          run_extractors: true
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent
+            .try_pre_response_transition("billing please")
+            .await
+            .unwrap();
+
+        assert!(response.is_none());
+        assert_eq!(agent.current_state().as_deref(), Some("greeting"));
+        assert!(!agent.get_context().contains_key("topic"));
+        assert_eq!(agent.memory.get_messages(None).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_extractor_commits_context_on_winning_path() {
+        let mock = mock_with_responses(vec!["billing", "Billing response"]);
+        let yaml = r#"
+name: OptimizedStateAgent
+system_prompt: "You route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      extract:
+        - key: topic
+          description: "Support topic"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+          run_extractors: true
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("billing please").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing response");
+        assert_eq!(
+            agent.get_context().get("topic"),
+            Some(&serde_json::json!("billing"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_extractor_miss_does_not_mutate_context() {
+        let mock = mock_with_response("__NONE__");
+        let yaml = r#"
+name: OptimizedStateAgent
+system_prompt: "You route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      extract:
+        - key: topic
+          description: "Support topic"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+          run_extractors: true
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.try_pre_response_transition("hello").await.unwrap();
+
+        assert!(response.is_none());
+        assert_eq!(agent.current_state().as_deref(), Some("greeting"));
+        assert!(!agent.get_context().contains_key("topic"));
+    }
+
+    #[tokio::test]
+    async fn test_default_guard_transition_stays_post_response() {
+        let mock = mock_with_responses(vec!["Greeting response", "Billing response"]);
+        let call_counter = mock.clone();
+        let yaml = r#"
+name: TimingAgent
+system_prompt: "You route carefully."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+
+        let response = agent.chat("billing please").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing response");
+        assert_eq!(call_counter.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_explicit_post_response_guard_transition_stays_post_response() {
+        let mock = mock_with_responses(vec!["Greeting response", "Billing response"]);
+        let call_counter = mock.clone();
+        let yaml = r#"
+name: TimingAgent
+system_prompt: "You route carefully."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: post_response
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+
+        let response = agent.chat("billing please").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing response");
+        assert_eq!(call_counter.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_extractors_are_transition_scoped() {
+        let mock = mock_with_responses(vec!["billing", "Billing response"]);
+        let yaml = r#"
+name: ScopedExtractorAgent
+system_prompt: "You route carefully."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      extract:
+        - key: topic
+          description: "Support topic"
+      transitions:
+        - to: wrong
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+          run_extractors: true
+    wrong:
+      prompt: "Wrong state."
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("billing please").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing response");
+    }
+
+    #[tokio::test]
+    async fn test_pre_response_resolved_intent_routes_early() {
+        let mock = mock_with_response("Billing response");
+        let yaml = r#"
+name: IntentAgent
+system_prompt: "You route carefully."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt."
+      transitions:
+        - to: billing
+          intent: billing
+          timing: pre_response
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("resolved_intent", serde_json::json!("billing"))
+            .unwrap();
+
+        let response = agent
+            .try_pre_response_transition("I need billing help")
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing response");
+    }
+
+    #[tokio::test]
+    async fn test_background_overflow_error_surfaces() {
+        let mut config = RuntimeConfig::default();
+        config.optimization.enabled = true;
+        config.optimization.post_turn.max_background_tasks = 1;
+        config.optimization.post_turn.on_background_overflow = BackgroundOverflowPolicy::Error;
+        let policy = crate::optimization::MaintenanceTaskPolicy {
+            mode: MaintenanceMode::Background,
+            await_before_next_turn: AwaitBeforeNextTurn::Always,
+        };
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock_with_response("ok")))
+            .build()
+            .unwrap()
+            .with_runtime_config(config);
+        agent
+            .background_maintenance
+            .spawn(None, async { std::future::pending::<Result<()>>().await })
+            .unwrap();
+
+        let result = agent
+            .spawn_or_handle_background(None, async { Ok(()) }, "facts", &policy)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_streaming_preflight_does_not_emit_old_state_content() {
+        use futures::StreamExt;
+
+        let mock = mock_with_response("Billing streamed response");
+        let yaml = r#"
+name: StreamingOptimizedAgent
+system_prompt: "You route before streaming."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+streaming:
+  enabled: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "OLD_STATE_SENTINEL"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+
+        let mut stream = agent.chat_stream("billing please").await.unwrap();
+        let mut content = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => content.push_str(&text),
+                StreamChunk::Error { message } => panic!("stream error: {}", message),
+                StreamChunk::Done {} => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert!(content.contains("Billing streamed response"));
+        assert!(!content.contains("OLD_STATE_SENTINEL"));
     }
 
     // State machine transitions

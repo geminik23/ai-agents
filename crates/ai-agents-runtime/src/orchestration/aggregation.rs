@@ -6,6 +6,7 @@ use ai_agents_observability::{ObservationPurpose, with_observation_purpose};
 use ai_agents_state::{
     AggregationConfig, AggregationStrategy, TiebreakerStrategy, VoteConfig, VoteMethod,
 };
+use futures::future::join_all;
 use rand::seq::SliceRandom;
 use tracing::debug;
 
@@ -17,6 +18,7 @@ pub async fn aggregate(
     config: &AggregationConfig,
     llm: Option<&dyn LLMProvider>,
     agent_weights: &HashMap<String, f64>,
+    vote_parallelism: Option<usize>,
 ) -> Result<AgentResponse> {
     let successful: Vec<&AgentResult> = results.iter().filter(|r| r.success).collect();
 
@@ -58,7 +60,7 @@ pub async fn aggregate(
             let llm = llm
                 .ok_or_else(|| AgentError::Config("LLM required for voting aggregation".into()))?;
             let vote_config = config.vote.as_ref();
-            vote_with_llm(llm, results, vote_config, agent_weights).await
+            vote_with_llm(llm, results, vote_config, agent_weights, vote_parallelism).await
         }
     }
 }
@@ -104,12 +106,49 @@ async fn synthesize_with_llm(
     Ok(AgentResponse::new(response.content))
 }
 
+async fn extract_vote(
+    llm: &dyn LLMProvider,
+    result: &AgentResult,
+    vote_prompt: &str,
+    method: &VoteMethod,
+    agent_weights: &HashMap<String, f64>,
+) -> Result<(usize, String, String, f64)> {
+    let response = result
+        .response
+        .as_ref()
+        .ok_or_else(|| AgentError::Other(format!("Agent {} has no response", result.agent_id)))?;
+    let messages = vec![
+        ChatMessage::system(vote_prompt),
+        ChatMessage::user(&response.content),
+    ];
+
+    let extraction = with_observation_purpose(
+        ObservationPurpose::OrchestrationAggregation,
+        llm.complete(&messages, None),
+    )
+    .await
+    .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
+
+    let weight = match method {
+        VoteMethod::Weighted => agent_weights.get(&result.agent_id).copied().unwrap_or(1.0),
+        _ => 1.0,
+    };
+
+    Ok((
+        result.agent_index,
+        result.agent_id.clone(),
+        extraction.content.trim().to_string(),
+        weight,
+    ))
+}
+
 /// Extract votes from agent responses via LLM and tally them.
 async fn vote_with_llm(
     llm: &dyn LLMProvider,
     results: &[AgentResult],
     vote_config: Option<&VoteConfig>,
     agent_weights: &HashMap<String, f64>,
+    vote_parallelism: Option<usize>,
 ) -> Result<AgentResponse> {
     let vote_prompt = vote_config
         .and_then(|v| v.vote_prompt.as_deref())
@@ -123,35 +162,57 @@ async fn vote_with_llm(
         .map(|v| v.tiebreaker.clone())
         .unwrap_or_default();
 
-    // Phase 1: Extract votes from each agent response.
-    let mut votes: Vec<(String, String, f64)> = Vec::new();
+    let successful: Vec<&AgentResult> = results
+        .iter()
+        .filter(|result| result.success && result.response.is_some())
+        .collect();
 
-    for result in results.iter().filter(|r| r.success) {
-        if let Some(ref resp) = result.response {
-            let messages = vec![
-                ChatMessage::system(vote_prompt),
-                ChatMessage::user(&resp.content),
-            ];
+    let mut votes: Vec<(usize, String, String, f64)> = Vec::new();
+    if let Some(limit) = vote_parallelism.filter(|limit| *limit > 1) {
+        for chunk in successful.chunks(limit) {
+            let extraction_futures = chunk.iter().copied().map(|result| {
+                let method_for_task = method.clone();
+                async move {
+                    let response = result.response.as_ref().ok_or_else(|| {
+                        AgentError::Other(format!("Agent {} has no response", result.agent_id))
+                    })?;
+                    let messages = vec![
+                        ChatMessage::system(vote_prompt),
+                        ChatMessage::user(&response.content),
+                    ];
 
-            let extraction = with_observation_purpose(
-                ObservationPurpose::OrchestrationAggregation,
-                llm.complete(&messages, None),
-            )
-            .await
-            .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
+                    let extraction = with_observation_purpose(
+                        ObservationPurpose::OrchestrationAggregation,
+                        llm.complete(&messages, None),
+                    )
+                    .await
+                    .map_err(|e| AgentError::LLM(format!("Vote extraction failed: {}", e)))?;
 
-            let weight = match method {
-                VoteMethod::Weighted => agent_weights.get(&result.agent_id).copied().unwrap_or(1.0),
-                _ => 1.0,
-            };
+                    let weight = match method_for_task {
+                        VoteMethod::Weighted => {
+                            agent_weights.get(&result.agent_id).copied().unwrap_or(1.0)
+                        }
+                        _ => 1.0,
+                    };
 
-            votes.push((
-                result.agent_id.clone(),
-                extraction.content.trim().to_string(),
-                weight,
-            ));
+                    Ok::<(usize, String, String, f64), AgentError>((
+                        result.agent_index,
+                        result.agent_id.clone(),
+                        extraction.content.trim().to_string(),
+                        weight,
+                    ))
+                }
+            });
+            for extraction in join_all(extraction_futures).await {
+                votes.push(extraction?);
+            }
+        }
+    } else {
+        for result in successful {
+            votes.push(extract_vote(llm, result, vote_prompt, &method, agent_weights).await?);
         }
     }
+    votes.sort_by_key(|(agent_index, _, _, _)| *agent_index);
 
     if votes.is_empty() {
         return Err(AgentError::Other("No votes extracted".into()));
@@ -159,12 +220,14 @@ async fn vote_with_llm(
 
     // Phase 2: Check unanimous agreement if required.
     if matches!(method, VoteMethod::Unanimous) {
-        let first_vote = votes[0].1.to_lowercase();
-        let all_agree = votes.iter().all(|(_, v, _)| v.to_lowercase() == first_vote);
+        let first_vote = votes[0].2.to_lowercase();
+        let all_agree = votes
+            .iter()
+            .all(|(_, _, v, _)| v.to_lowercase() == first_vote);
         if !all_agree {
             let vote_lines = votes
                 .iter()
-                .map(|(id, v, _)| format!("- {}: {}", id, v))
+                .map(|(_, id, v, _)| format!("- {}: {}", id, v))
                 .collect::<Vec<_>>()
                 .join("\n");
             return Err(AgentError::Other(format!(
@@ -174,13 +237,13 @@ async fn vote_with_llm(
         }
         return Ok(AgentResponse::new(format!(
             "Unanimous decision: {}",
-            votes[0].1
+            votes[0].2
         )));
     }
 
     // Phase 3: Tally votes.
     let mut tally: HashMap<String, f64> = HashMap::new();
-    for (_, vote, weight) in &votes {
+    for (_, _, vote, weight) in &votes {
         *tally.entry(vote.clone()).or_default() += weight;
     }
 
@@ -198,11 +261,11 @@ async fn vote_with_llm(
     } else {
         match tiebreaker {
             TiebreakerStrategy::First => {
-                // Pick the choice cast by the earliest agent in results order.
+                // Pick the choice cast by the earliest agent in declaration order.
                 votes
                     .iter()
-                    .find(|(_, choice, _)| tied.contains(choice))
-                    .map(|(_, choice, _)| choice.clone())
+                    .find(|(_, _, choice, _)| tied.contains(choice))
+                    .map(|(_, _, choice, _)| choice.clone())
                     .unwrap_or_else(|| tied[0].clone())
             }
             TiebreakerStrategy::Random => {
@@ -217,7 +280,7 @@ async fn vote_with_llm(
 
     let vote_lines = votes
         .iter()
-        .map(|(id, v, _)| format!("- {}: {}", id, v))
+        .map(|(_, id, v, _)| format!("- {}: {}", id, v))
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -266,4 +329,104 @@ async fn resolve_tie_with_llm(llm: &dyn LLMProvider, tied_choices: &[String]) ->
 
     // Fallback: return the first tied choice.
     Ok(tied_choices[0].clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_agents_core::AgentResponse;
+    use ai_agents_llm::mock::MockLLMProvider;
+    use ai_agents_state::AggregationStrategy;
+    use std::time::Instant;
+
+    fn agent_result(index: usize, id: &str, content: &str) -> AgentResult {
+        AgentResult {
+            agent_index: index,
+            agent_id: id.to_string(),
+            response: Some(AgentResponse::new(content)),
+            duration_ms: 0,
+            success: true,
+            error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn vote_extraction_is_serial_without_parallelism() {
+        let mut llm = MockLLMProvider::new("votes");
+        llm.set_responses(
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            false,
+        );
+        llm.set_latency(25);
+        let results = vec![
+            agent_result(0, "a", "first"),
+            agent_result(1, "b", "second"),
+            agent_result(2, "c", "third"),
+        ];
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::Voting,
+            synthesizer_llm: None,
+            synthesizer_prompt: None,
+            vote: None,
+        };
+        let started = Instant::now();
+        let _ = aggregate(&results, &config, Some(&llm), &HashMap::new(), None)
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
+        assert_eq!(llm.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn vote_extraction_uses_bounded_parallelism_when_enabled() {
+        let mut llm = MockLLMProvider::new("votes");
+        llm.set_responses(
+            vec!["A".to_string(), "B".to_string(), "C".to_string()],
+            false,
+        );
+        llm.set_latency(50);
+        let results = vec![
+            agent_result(0, "a", "first"),
+            agent_result(1, "b", "second"),
+            agent_result(2, "c", "third"),
+        ];
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::Voting,
+            synthesizer_llm: None,
+            synthesizer_prompt: None,
+            vote: None,
+        };
+        let started = Instant::now();
+        let _ = aggregate(&results, &config, Some(&llm), &HashMap::new(), Some(2))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(140));
+        assert_eq!(llm.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn vote_tiebreaker_first_uses_declaration_order() {
+        let mut llm = MockLLMProvider::new("votes");
+        llm.set_responses(vec!["B".to_string(), "A".to_string()], false);
+        let results = vec![
+            agent_result(1, "b", "second"),
+            agent_result(0, "a", "first"),
+        ];
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::Voting,
+            synthesizer_llm: None,
+            synthesizer_prompt: None,
+            vote: Some(VoteConfig {
+                method: VoteMethod::Majority,
+                tiebreaker: TiebreakerStrategy::First,
+                vote_prompt: None,
+            }),
+        };
+
+        let response = aggregate(&results, &config, Some(&llm), &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        assert!(response.content.starts_with("Vote result: A"));
+    }
 }

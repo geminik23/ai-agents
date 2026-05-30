@@ -306,6 +306,7 @@ impl Tool for ConcurrentAskTool {
             None,
             None,
             ai_agents_state::PartialFailureAction::ProceedWithAvailable,
+            None,
         );
         let concurrent_result = if let Some(context) = current_turn_actor_context() {
             scope_actor_context(context, concurrent_future).await

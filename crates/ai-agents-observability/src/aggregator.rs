@@ -227,6 +227,26 @@ pub fn dimension_value(
             event.dimensions.get("orchestration_pattern").cloned()
         }
         AggregationDimension::Status => Some(format!("{:?}", event.status).to_lowercase()),
+        AggregationDimension::BranchStatus => event
+            .dimensions
+            .get("branch_status")
+            .or_else(|| event.dimensions.get("runtime.branch_status"))
+            .cloned(),
+        AggregationDimension::RuntimeOptimization => event
+            .dimensions
+            .get("optimization")
+            .or_else(|| event.dimensions.get("runtime.optimization"))
+            .cloned(),
+        AggregationDimension::CommitBehavior => event
+            .dimensions
+            .get("commit_behavior")
+            .or_else(|| event.dimensions.get("runtime.commit_behavior"))
+            .cloned(),
+        AggregationDimension::Background => event
+            .dimensions
+            .get("background")
+            .or_else(|| event.dimensions.get("runtime.background"))
+            .cloned(),
         AggregationDimension::Custom(name) => {
             event.dimensions.get(&format!("custom:{}", name)).cloned()
         }

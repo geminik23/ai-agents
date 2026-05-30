@@ -33,6 +33,7 @@ use ai_agents_skills::SkillRef;
 use ai_agents_state::StateConfig;
 use ai_agents_tools::ToolSecurityConfig;
 
+pub use super::RuntimeConfig;
 use super::{ParallelToolsConfig, StreamingConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +107,9 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub observability: ObservabilityConfig,
+
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
 
     #[serde(default)]
     pub providers: ProvidersConfig,
@@ -210,6 +214,7 @@ impl Default for AgentSpec {
             reflection: ReflectionConfig::default(),
             disambiguation: DisambiguationConfig::default(),
             observability: ObservabilityConfig::default(),
+            runtime: RuntimeConfig::default(),
             providers: ProvidersConfig::default(),
             provider_security: ProviderSecurityConfig::default(),
             tool_aliases: ToolAliasesConfig::default(),
@@ -243,6 +248,8 @@ impl AgentSpec {
         if let Some(ref states) = self.states {
             states.validate()?;
         }
+
+        self.runtime.optimization.validate()?;
 
         Ok(())
     }
@@ -309,6 +316,10 @@ impl AgentSpec {
 
     pub fn has_observability(&self) -> bool {
         self.observability.enabled
+    }
+
+    pub fn has_runtime_optimization(&self) -> bool {
+        self.runtime.optimization.enabled
     }
 
     pub fn has_persona(&self) -> bool {

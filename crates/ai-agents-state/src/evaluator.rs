@@ -425,6 +425,7 @@ impl Default for GuardOnlyEvaluator {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::TransitionTiming;
     use super::*;
     use ai_agents_core::{FinishReason, LLMResponse};
     use ai_agents_llm::mock::MockLLMProvider;
@@ -443,6 +444,9 @@ mod tests {
             auto: true,
             priority: 0,
             cooldown_turns: None,
+            timing: TransitionTiming::PostResponse,
+            requires_response: false,
+            run_extractors: false,
         }];
 
         let context = TransitionContext::new("hello", "hi there", "greeting");
@@ -467,6 +471,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "sales".into(),
@@ -476,6 +483,9 @@ mod tests {
                 auto: true,
                 priority: 5,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
         ];
 
@@ -609,6 +619,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "guard_based".into(),
@@ -618,6 +631,9 @@ mod tests {
                 auto: true,
                 priority: 5,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
         ];
 
@@ -643,6 +659,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "with_guard".into(),
@@ -652,6 +671,9 @@ mod tests {
                 auto: true,
                 priority: 5,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
         ];
 
@@ -738,6 +760,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "cancel_reservation".into(),
@@ -747,6 +772,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "cancel_subscription".into(),
@@ -756,6 +784,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
         ];
 
@@ -794,6 +825,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "cancel_reservation".into(),
@@ -803,6 +837,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
         ];
 
@@ -835,6 +872,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
             Transition {
                 to: "cancel_reservation".into(),
@@ -844,6 +884,9 @@ mod tests {
                 auto: true,
                 priority: 10,
                 cooldown_turns: None,
+                timing: TransitionTiming::PostResponse,
+                requires_response: false,
+                run_extractors: false,
             },
         ];
 
@@ -879,6 +922,9 @@ mod tests {
             auto: true,
             priority: 10,
             cooldown_turns: None,
+            timing: TransitionTiming::PostResponse,
+            requires_response: false,
+            run_extractors: false,
         }];
 
         // resolved_intent is Null (simulating clear_disambiguation_context)

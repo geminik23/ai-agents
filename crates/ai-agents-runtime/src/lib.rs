@@ -1,6 +1,7 @@
 //! Runtime agent and builder for AI Agents framework
 
 mod builder;
+pub mod optimization;
 mod runtime;
 mod streaming;
 mod turn_context;
@@ -10,6 +11,11 @@ pub mod spawner;
 pub mod spec;
 
 pub use builder::AgentBuilder;
+pub use optimization::{
+    AwaitBeforeNextTurn, BackgroundOverflowPolicy, MaintenanceMode, MaintenanceTaskPolicy,
+    PostTurnOptimizationConfig, RuntimeConfig, RuntimeOptimizationConfig, RuntimeTaskPurpose,
+    StreamingOptimizationPolicy,
+};
 pub use runtime::RuntimeAgent;
 pub use streaming::{StreamChunk, StreamingConfig};
 pub use turn_context::TurnActorContext;

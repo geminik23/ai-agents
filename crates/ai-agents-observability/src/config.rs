@@ -65,6 +65,12 @@ impl ObservabilityConfig {
                 "observability.buffer.event_buffer must be greater than zero".to_string(),
             ));
         }
+        if self.buffer.pending_branch_event_limit == 0 {
+            return Err(ObservabilityError::Config(
+                "observability.buffer.pending_branch_event_limit must be greater than zero"
+                    .to_string(),
+            ));
+        }
         for percentile in &self.aggregation.percentiles {
             if !(0.0..=1.0).contains(percentile) {
                 return Err(ObservabilityError::Config(format!(
@@ -252,6 +258,10 @@ pub enum AggregationDimension {
     Skill,
     OrchestrationPattern,
     Status,
+    BranchStatus,
+    RuntimeOptimization,
+    CommitBehavior,
+    Background,
     Custom(String),
 }
 
@@ -271,6 +281,10 @@ impl AggregationDimension {
             Self::Skill => "skill".to_string(),
             Self::OrchestrationPattern => "orchestration_pattern".to_string(),
             Self::Status => "status".to_string(),
+            Self::BranchStatus => "branch_status".to_string(),
+            Self::RuntimeOptimization => "optimization".to_string(),
+            Self::CommitBehavior => "commit_behavior".to_string(),
+            Self::Background => "background".to_string(),
             Self::Custom(name) => format!("custom:{}", name),
         }
     }
@@ -366,6 +380,8 @@ pub struct BufferConfig {
     pub event_buffer: usize,
     #[serde(default = "default_raw_event_limit")]
     pub raw_event_limit: usize,
+    #[serde(default = "default_pending_branch_event_limit")]
+    pub pending_branch_event_limit: usize,
     #[serde(default = "default_true")]
     pub drop_on_full: bool,
 }
@@ -375,6 +391,7 @@ impl Default for BufferConfig {
         Self {
             event_buffer: default_event_buffer(),
             raw_event_limit: default_raw_event_limit(),
+            pending_branch_event_limit: default_pending_branch_event_limit(),
             drop_on_full: true,
         }
     }
@@ -441,6 +458,10 @@ fn default_event_buffer() -> usize {
 
 fn default_raw_event_limit() -> usize {
     10_000
+}
+
+fn default_pending_branch_event_limit() -> usize {
+    1024
 }
 
 fn resolve_pricing_path(path: &str, base_dir: Option<&Path>) -> PathBuf {

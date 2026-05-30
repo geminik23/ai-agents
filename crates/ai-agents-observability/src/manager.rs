@@ -29,6 +29,7 @@ pub struct ObservabilityManager {
     sender: mpsc::Sender<ObservationEvent>,
     receiver: Mutex<mpsc::Receiver<ObservationEvent>>,
     raw_events: RwLock<VecDeque<ObservationEvent>>,
+    pending_branch_events: RwLock<HashMap<String, Vec<ObservationEvent>>>,
     aggregator: MetricsAggregator,
     cost_estimator: CostEstimator,
     redactor: Redactor,
@@ -47,6 +48,7 @@ impl ObservabilityManager {
             sender,
             receiver: Mutex::new(receiver),
             raw_events: RwLock::new(VecDeque::new()),
+            pending_branch_events: RwLock::new(HashMap::new()),
             dropped_events: AtomicU64::new(0),
             config,
         })
@@ -83,7 +85,15 @@ impl ObservabilityManager {
         let context = current_observation_context()
             .map(|ctx| ctx.child())
             .unwrap_or_else(|| SpanContext::new_root("unknown"));
-        let dimensions = context_dimension_map(&context);
+        let mut dimensions = context_dimension_map(&context);
+        for (key, value) in &tags {
+            if key.starts_with("runtime.") {
+                dimensions.insert(key.clone(), value.clone());
+                if let Some(short_key) = key.strip_prefix("runtime.") {
+                    dimensions.insert(short_key.to_string(), value.clone());
+                }
+            }
+        }
         let event = ObservationEvent {
             trace_id: context.trace_id,
             span_id: context.span_id,
@@ -105,6 +115,58 @@ impl ObservabilityManager {
             payload,
         };
         self.record_event(event);
+    }
+
+    /// Records an event that should be finalized when its runtime branch resolves.
+    pub fn record_pending_event(&self, branch_id: impl Into<String>, event: ObservationEvent) {
+        if !self.config.enabled {
+            return;
+        }
+        let mut pending = self.pending_branch_events.write();
+        let pending_count: usize = pending.values().map(Vec::len).sum();
+        if pending_count >= self.config.buffer.pending_branch_event_limit {
+            self.dropped_events.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        pending.entry(branch_id.into()).or_default().push(event);
+    }
+
+    /// Finalizes all pending events for a runtime branch and ingests them normally.
+    pub fn finalize_pending_branch(
+        &self,
+        branch_id: &str,
+        branch_status: impl Into<String>,
+        winner: bool,
+        extra_tags: HashMap<String, String>,
+    ) {
+        let mut events = self
+            .pending_branch_events
+            .write()
+            .remove(branch_id)
+            .unwrap_or_default();
+        let status = branch_status.into();
+        for event in &mut events {
+            event
+                .tags
+                .insert("runtime.branch_status".to_string(), status.clone());
+            event
+                .tags
+                .insert("runtime.winner".to_string(), winner.to_string());
+            event
+                .dimensions
+                .insert("branch_status".to_string(), status.clone());
+            event
+                .dimensions
+                .insert("runtime.branch_status".to_string(), status.clone());
+            event
+                .dimensions
+                .insert("runtime.winner".to_string(), winner.to_string());
+            for (key, value) in &extra_tags {
+                event.tags.insert(key.clone(), value.clone());
+                event.dimensions.insert(key.clone(), value.clone());
+            }
+            self.record_event(event.clone());
+        }
     }
 
     /// Queues a completed event without blocking the observed call path.
@@ -449,17 +511,10 @@ mod tests {
     use super::*;
     use crate::event::{ObservationTokenUsage, TokenUsageSource};
 
-    #[test]
-    fn token_count_flags_are_applied_before_report() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.tokens.count_input = false;
-        config.tokens.count_output = true;
-        config.cost.enabled = false;
-        let manager = ObservabilityManager::new(config);
-        let event = ObservationEvent {
+    fn test_event() -> ObservationEvent {
+        ObservationEvent {
             trace_id: "trace".to_string(),
-            span_id: "span".to_string(),
+            span_id: Uuid::new_v4().to_string(),
             parent_span_id: None,
             turn_id: "turn".to_string(),
             agent_id: "agent".to_string(),
@@ -485,12 +540,60 @@ mod tests {
             dimensions: HashMap::new(),
             tags: HashMap::new(),
             payload: None,
-        };
+        }
+    }
 
-        manager.record_event(event);
+    #[test]
+    fn token_count_flags_are_applied_before_report() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.tokens.count_input = false;
+        config.tokens.count_output = true;
+        config.cost.enabled = false;
+        let manager = ObservabilityManager::new(config);
+        manager.record_event(test_event());
+
         let report = manager.generate_report();
         assert_eq!(report.token_breakdown.total_input, 0);
         assert_eq!(report.token_breakdown.total_output, 25);
         assert_eq!(report.token_breakdown.total_tokens, 25);
+    }
+
+    #[test]
+    fn pending_branch_event_is_hidden_until_finalized() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.export.write_raw_events = true;
+        let manager = ObservabilityManager::new(config);
+        manager.record_pending_event("branch", test_event());
+
+        assert_eq!(manager.generate_report().summary.total_events, 0);
+        manager.finalize_pending_branch("branch", "discarded", false, HashMap::new());
+        let report = manager.generate_report();
+        assert_eq!(report.summary.total_events, 1);
+        assert_eq!(
+            manager.raw_events()[0].dimensions.get("branch_status"),
+            Some(&"discarded".to_string())
+        );
+        assert_eq!(
+            manager.raw_events()[0].dimensions.get("runtime.winner"),
+            Some(&"false".to_string())
+        );
+    }
+
+    #[test]
+    fn pending_branch_events_are_bounded() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.buffer.pending_branch_event_limit = 1;
+        let manager = ObservabilityManager::new(config);
+        manager.record_pending_event("branch-a", test_event());
+        manager.record_pending_event("branch-b", test_event());
+
+        manager.finalize_pending_branch("branch-a", "committed", true, HashMap::new());
+        manager.finalize_pending_branch("branch-b", "committed", true, HashMap::new());
+        let report = manager.generate_report();
+        assert_eq!(report.summary.total_events, 1);
+        assert_eq!(report.dropped_events, 1);
     }
 }

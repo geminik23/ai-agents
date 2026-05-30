@@ -12,7 +12,8 @@ pub use config::{
     HandoffStateConfig, MakerCheckerConfig, MaxIterationsAction, PartialFailureAction,
     PipelineStageEntry, PipelineStateConfig, PromptMode, StateAction, StateConfig, StateDefinition,
     StateMatcher, TerminationConfig, TerminationMethod, TiebreakerStrategy, TimeMatcher,
-    ToolCondition, ToolRef, Transition, TransitionGuard, TurnMethod, VoteConfig, VoteMethod,
+    ToolCondition, ToolRef, Transition, TransitionGuard, TransitionTiming, TurnMethod, VoteConfig,
+    VoteMethod,
 };
 pub use evaluator::{
     GuardOnlyEvaluator, LLMTransitionEvaluator, TransitionContext, TransitionEvaluator,

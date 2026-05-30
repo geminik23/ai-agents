@@ -78,8 +78,11 @@
 
 pub mod agent {
     pub use ai_agents_runtime::{
-        Agent, AgentBuilder, AgentInfo, AgentResponse, ParallelToolsConfig, RuntimeAgent,
-        StreamChunk, StreamingConfig, ToolCall, TurnActorContext,
+        Agent, AgentBuilder, AgentInfo, AgentResponse, AwaitBeforeNextTurn,
+        BackgroundOverflowPolicy, MaintenanceMode, MaintenanceTaskPolicy, ParallelToolsConfig,
+        PostTurnOptimizationConfig, RuntimeAgent, RuntimeConfig, RuntimeOptimizationConfig,
+        RuntimeTaskPurpose, StreamChunk, StreamingConfig, StreamingOptimizationPolicy, ToolCall,
+        TurnActorContext,
     };
 }
 
@@ -254,8 +257,9 @@ pub mod spec {
         AgentSpec, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle, CliMetadata,
         CliPromptStyle, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
         ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
-        SpawnerConfig, SqliteStorageConfig, StorageConfig, StructuredToolEntry, ToolAliasesConfig,
-        ToolConfig, ToolEntry, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+        RuntimeConfig, SpawnerConfig, SqliteStorageConfig, StorageConfig, StructuredToolEntry,
+        ToolAliasesConfig, ToolConfig, ToolEntry, ToolPolicyConfig, YamlProviderConfig,
+        YamlToolConfig,
     };
 }
 
@@ -266,6 +270,7 @@ pub mod state {
         PipelineStateConfig, PromptMode, StateAction, StateConfig, StateDefinition, StateMachine,
         StateMachineSnapshot, StateMatcher, StateTransitionEvent, TimeMatcher, ToolCondition,
         ToolRef, Transition, TransitionContext, TransitionEvaluator, TransitionGuard,
+        TransitionTiming,
     };
 }
 
@@ -489,8 +494,10 @@ pub mod orchestration {
 
 // Top-level re-exports (legacy interface)
 pub use agent::{
-    Agent, AgentBuilder, AgentInfo, AgentResponse, ParallelToolsConfig, RuntimeAgent, StreamChunk,
-    StreamingConfig, TurnActorContext,
+    Agent, AgentBuilder, AgentInfo, AgentResponse, AwaitBeforeNextTurn, BackgroundOverflowPolicy,
+    MaintenanceMode, MaintenanceTaskPolicy, ParallelToolsConfig, PostTurnOptimizationConfig,
+    RuntimeAgent, RuntimeConfig, RuntimeOptimizationConfig, RuntimeTaskPurpose, StreamChunk,
+    StreamingConfig, StreamingOptimizationPolicy, TurnActorContext,
 };
 pub use error::{AgentError, Result};
 pub use memory::{
@@ -505,8 +512,8 @@ pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRout
 pub use spec::{
     AgentSpec, BuiltinProviderConfig, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
     ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
-    SqliteStorageConfig, StorageConfig, ToolAliasesConfig, ToolConfig,
-    ToolPolicyConfig as SpecToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+    RuntimeConfig as SpecRuntimeConfig, SqliteStorageConfig, StorageConfig, ToolAliasesConfig,
+    ToolConfig, ToolPolicyConfig as SpecToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
 pub use template::TemplateLoader;
 pub use tools::HttpTool;
@@ -546,7 +553,7 @@ pub use state::{
     CompareOp, ContextExtractor, ContextMatcher, GuardConditions, GuardOnlyEvaluator,
     LLMTransitionEvaluator, PromptMode, StateAction, StateConfig, StateDefinition, StateMachine,
     StateMachineSnapshot, StateMatcher, StateTransitionEvent, TimeMatcher, ToolCondition, ToolRef,
-    Transition, TransitionContext, TransitionEvaluator, TransitionGuard,
+    Transition, TransitionContext, TransitionEvaluator, TransitionGuard, TransitionTiming,
 };
 pub use tools::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,

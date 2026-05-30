@@ -78,6 +78,7 @@ pub struct ConcurrentResult {
 /// Result from a single agent in a concurrent execution.
 #[derive(Debug, Clone)]
 pub struct AgentResult {
+    pub agent_index: usize,
     pub agent_id: String,
     pub response: Option<AgentResponse>,
     pub duration_ms: u64,

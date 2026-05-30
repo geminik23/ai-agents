@@ -241,6 +241,23 @@ pub struct TimeMatcher {
     pub timezone: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionTiming {
+    /// Evaluate after the assistant response is available.
+    PostResponse,
+    /// Evaluate before main response generation when the route is response independent.
+    PreResponse,
+    /// Evaluate in parallel with a draft response when explicitly enabled.
+    Parallel,
+}
+
+impl Default for TransitionTiming {
+    fn default() -> Self {
+        Self::PostResponse
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transition {
     pub to: String,
@@ -259,6 +276,18 @@ pub struct Transition {
     /// Minimum turns before this transition can fire again after last use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_turns: Option<u32>,
+
+    /// Controls whether the transition can be selected before a response exists.
+    #[serde(default)]
+    pub timing: TransitionTiming,
+
+    /// Marks transitions whose condition needs the assistant response text.
+    #[serde(default)]
+    pub requires_response: bool,
+
+    /// Allows this transition to run current-state extractors before pre-response selection.
+    #[serde(default)]
+    pub run_extractors: bool,
 }
 
 fn default_auto() -> bool {
@@ -661,6 +690,44 @@ fn default_max_handoffs() -> u32 {
     5
 }
 
+fn validate_transition_timing(
+    transition: &Transition,
+    scope: &str,
+    state_path: Option<&str>,
+) -> Result<()> {
+    if transition.requires_response && !matches!(transition.timing, TransitionTiming::PostResponse)
+    {
+        let location = state_path
+            .map(|path| format!("State '{}'", path))
+            .unwrap_or_else(|| "Global transition".to_string());
+        return Err(AgentError::InvalidSpec(format!(
+            "{} has response-dependent transition '{}' with non-post-response timing",
+            location, transition.to
+        )));
+    }
+    if matches!(transition.timing, TransitionTiming::Parallel) {
+        return Err(AgentError::InvalidSpec(format!(
+            "{} transition '{}' uses reserved parallel timing",
+            scope, transition.to
+        )));
+    }
+    if matches!(transition.timing, TransitionTiming::PreResponse) {
+        if transition.guard.is_none() && transition.intent.is_none() {
+            return Err(AgentError::InvalidSpec(format!(
+                "{} transition '{}' uses pre-response timing without a guard or intent",
+                scope, transition.to
+            )));
+        }
+        if !transition.when.trim().is_empty() {
+            return Err(AgentError::InvalidSpec(format!(
+                "{} transition '{}' uses pre-response timing with response-dependent when text",
+                scope, transition.to
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl StateConfig {
     pub fn validate(&self) -> Result<()> {
         if self.initial.is_empty() {
@@ -674,6 +741,16 @@ impl StateConfig {
                 self.initial
             )));
         }
+        for transition in &self.global_transitions {
+            validate_transition_timing(transition, "Global", None)?;
+            if !self.is_valid_transition_target(&transition.to, &[], &self.states) {
+                return Err(AgentError::InvalidSpec(format!(
+                    "Global transition targets unknown state '{}'",
+                    transition.to
+                )));
+            }
+        }
+
         self.validate_states(&self.states, &[])?;
 
         // Warn about unreachable states (non-fatal)
@@ -697,6 +774,9 @@ impl StateConfig {
                 .collect();
 
             for transition in &def.transitions {
+                let path = current_path.join(".");
+                validate_transition_timing(transition, "State", Some(&path))?;
+
                 if !self.is_valid_transition_target(&transition.to, &current_path, states) {
                     return Err(AgentError::InvalidSpec(format!(
                         "State '{}' has transition to unknown state '{}'",
@@ -945,6 +1025,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_transition_timing_defaults_to_post_response() {
+        let yaml = r#"
+to: next
+when: "ready"
+"#;
+        let transition: Transition = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(transition.timing, TransitionTiming::PostResponse);
+        assert!(!transition.requires_response);
+        assert!(!transition.run_extractors);
+    }
+
+    #[test]
     fn test_state_config_deserialize() {
         let yaml = r#"
 initial: greeting
@@ -974,6 +1066,79 @@ states:
     }
 
     #[test]
+    fn test_response_dependent_pre_response_transition_is_invalid() {
+        let yaml = r#"
+initial: greeting
+states:
+  greeting:
+    transitions:
+      - to: done
+        when: "after answer"
+        timing: pre_response
+        requires_response: true
+  done:
+    prompt: "Done"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_parallel_transition_timing_is_reserved() {
+        let yaml = r#"
+initial: greeting
+states:
+  greeting:
+    transitions:
+      - to: done
+        when: "ready"
+        timing: parallel
+  done:
+    prompt: "Done"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_pre_response_when_without_guard_or_intent_is_invalid() {
+        let yaml = r#"
+initial: greeting
+states:
+  greeting:
+    transitions:
+      - to: done
+        when: "ready"
+        timing: pre_response
+  done:
+    prompt: "Done"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_pre_response_with_when_text_is_invalid() {
+        let yaml = r#"
+initial: greeting
+states:
+  greeting:
+    transitions:
+      - to: done
+        when: "ready"
+        guard:
+          context:
+            ready:
+              eq: true
+        timing: pre_response
+  done:
+    prompt: "Done"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn test_invalid_initial_state() {
         let config = StateConfig {
             initial: "nonexistent".into(),
@@ -1000,6 +1165,9 @@ states:
                     auto: true,
                     priority: 0,
                     cooldown_turns: None,
+                    timing: TransitionTiming::PostResponse,
+                    requires_response: false,
+                    run_extractors: false,
                 }],
                 ..Default::default()
             },

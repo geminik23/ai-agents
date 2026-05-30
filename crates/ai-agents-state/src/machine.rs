@@ -269,6 +269,7 @@ impl StateMachine {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::TransitionTiming;
     use super::*;
     use std::collections::HashMap;
 
@@ -286,6 +287,9 @@ mod tests {
                     auto: true,
                     priority: 10,
                     cooldown_turns: None,
+                    timing: TransitionTiming::PostResponse,
+                    requires_response: false,
+                    run_extractors: false,
                 }],
                 ..Default::default()
             },
@@ -330,6 +334,9 @@ mod tests {
                     auto: true,
                     priority: 0,
                     cooldown_turns: None,
+                    timing: TransitionTiming::PostResponse,
+                    requires_response: false,
+                    run_extractors: false,
                 }],
                 ..Default::default()
             },
@@ -346,6 +353,9 @@ mod tests {
                     auto: true,
                     priority: 0,
                     cooldown_turns: None,
+                    timing: TransitionTiming::PostResponse,
+                    requires_response: false,
+                    run_extractors: false,
                 }],
                 ..Default::default()
             },
@@ -550,6 +560,9 @@ mod tests {
             auto: true,
             priority: 100,
             cooldown_turns: None,
+            timing: TransitionTiming::PostResponse,
+            requires_response: false,
+            run_extractors: false,
         }];
 
         let sm = StateMachine::new(config).unwrap();

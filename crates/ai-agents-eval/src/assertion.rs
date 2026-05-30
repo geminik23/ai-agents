@@ -294,6 +294,18 @@ pub struct ObservabilityAssertion {
     /// Path assertions over counts grouped by status.
     #[serde(default)]
     pub status_counts: HashMap<String, PathAssertion>,
+    /// Path assertions over counts matching configured dimensions.
+    #[serde(default)]
+    pub dimension_counts: Vec<ObservabilityDimensionAssertion>,
+}
+
+/// Assertion over observability metrics matching all listed dimensions.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ObservabilityDimensionAssertion {
+    #[serde(default)]
+    pub match_dimensions: HashMap<String, String>,
+    #[serde(rename = "assert")]
+    pub assertion: PathAssertion,
 }
 
 /// Result detail for one evaluated assertion clause.
@@ -1263,6 +1275,20 @@ fn evaluate_observability(
             .unwrap_or(0);
         passed &= path_matches(&json!({"count": count}), path_assertion);
     }
+    for dimension_assertion in &assertion.dimension_counts {
+        let count: u64 = report
+            .configured
+            .iter()
+            .filter(|metric| {
+                dimension_assertion
+                    .match_dimensions
+                    .iter()
+                    .all(|(key, value)| metric.dimensions.get(key) == Some(value))
+            })
+            .map(|metric| metric.count)
+            .sum();
+        passed &= path_matches(&json!({"count": count}), &dimension_assertion.assertion);
+    }
     push_bool(
         "observability",
         passed,
@@ -1275,7 +1301,11 @@ fn evaluate_observability(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evidence::{FactsEvidence, ToolExecutionSource};
+    use crate::evidence::{FactsEvidence, ToolExecutionSource, TurnObservabilityEvidence};
+    use ai_agents_observability::{
+        AggregatedMetrics, CostBreakdown, CostStats, LatencyStats, ObservabilityReport,
+        ReportSummary, TokenBreakdown, TokenStats,
+    };
 
     fn evidence() -> TurnEvidence {
         TurnEvidence {
@@ -1403,5 +1433,69 @@ mod tests {
         )
         .await;
         assert!(matches!(result, AssertionOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn observability_dimension_counts_match_configured_metrics() {
+        let mut evidence = evidence();
+        let mut dimensions = HashMap::new();
+        dimensions.insert("background".to_string(), "true".to_string());
+        dimensions.insert("maintenance".to_string(), "facts".to_string());
+        let metric = AggregatedMetrics {
+            dimensions,
+            count: 2,
+            errors: 0,
+            latency: LatencyStats::default(),
+            tokens: TokenStats::default(),
+            cost: CostStats::default(),
+        };
+        evidence.observability = Some(TurnObservabilityEvidence {
+            trace_id: Some("trace".to_string()),
+            span_ids: vec!["span".to_string()],
+            report: Some(ObservabilityReport {
+                summary: ReportSummary::default(),
+                configured: vec![metric],
+                by_model: vec![],
+                by_purpose: vec![],
+                by_language: vec![],
+                by_state: vec![],
+                by_agent: vec![],
+                by_orchestration_pattern: vec![],
+                cost_breakdown: CostBreakdown::default(),
+                token_breakdown: TokenBreakdown::default(),
+                dropped_events: 0,
+            }),
+        });
+        let mut match_dimensions = HashMap::new();
+        match_dimensions.insert("background".to_string(), "true".to_string());
+        let assertion = Assertion {
+            observability: Some(ObservabilityAssertion {
+                dimension_counts: vec![ObservabilityDimensionAssertion {
+                    match_dimensions,
+                    assertion: PathAssertion {
+                        path: "count".to_string(),
+                        gte: Some(2.0),
+                        ..Default::default()
+                    },
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "ok",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, AssertionOutcome::Passed(_)));
     }
 }

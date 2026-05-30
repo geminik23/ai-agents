@@ -83,6 +83,18 @@ impl SpanGuard {
             self.tags.clone(),
             self.payload.clone(),
         );
+        let deferred = self
+            .context
+            .tags
+            .get("runtime.defer_observation")
+            .map(|value| value == "true")
+            .unwrap_or(false);
+        if deferred {
+            if let Some(branch_id) = self.context.tags.get("runtime.branch_id") {
+                self.manager.record_pending_event(branch_id.clone(), event);
+                return;
+            }
+        }
         self.manager.record_event(event);
     }
 }
