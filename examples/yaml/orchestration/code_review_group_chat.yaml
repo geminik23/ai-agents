@@ -20,7 +20,7 @@ system_prompt: |
   (architect, security, performance) will discuss it automatically.
   Present whatever the reviewers produce.
 
-max_context_tokens: 128000         # group chat transcripts can grow large. default: 4096
+max_context_tokens: 128000         # group chat transcripts can grow large. default: 128000
 
 llms:
   default:

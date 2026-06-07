@@ -309,7 +309,7 @@ impl RuntimeAgent {
             base_system_prompt: system_prompt,
             max_iterations,
             iteration_count: RwLock::new(0),
-            max_context_tokens: 4096,
+            max_context_tokens: 128000,
             memory_token_budget: None,
             recovery_manager: RecoveryManager::default(),
             tool_security: ToolSecurityEngine::default(),

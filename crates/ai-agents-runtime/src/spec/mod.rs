@@ -184,7 +184,7 @@ fn default_max_iterations() -> u32 {
 }
 
 fn default_max_context_tokens() -> u32 {
-    4096
+    128000
 }
 
 fn state_config_has_parallel_transitions(config: &StateConfig) -> bool {
