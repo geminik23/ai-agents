@@ -112,7 +112,7 @@ fn default_true() -> bool {
 }
 
 fn default_buffer_size() -> usize {
-    32
+    256
 }
 
 impl Default for StreamingConfig {
@@ -168,7 +168,7 @@ mod tests {
     fn test_streaming_config_defaults() {
         let config = StreamingConfig::default();
         assert!(config.enabled);
-        assert_eq!(config.buffer_size, 32);
+        assert_eq!(config.buffer_size, 256);
         assert!(config.include_tool_events);
         assert!(config.include_state_events);
     }
