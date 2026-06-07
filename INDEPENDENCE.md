@@ -10,4 +10,4 @@ All technical decisions, roadmap, and project governance are determined solely b
 
 ## License
 
-This project is dual-licensed under Apache License 2.0 and MIT. See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT) for details.
+This project is licensed under the Apache License 2.0. See [LICENSE-APACHE](LICENSE-APACHE) for details.

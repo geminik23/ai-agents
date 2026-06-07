@@ -15,7 +15,7 @@ members = [
 [workspace.package]
 edition = "2024"
 publish = false
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 ai-agents = { path = "../crates/ai-agents", features = ["full"] }

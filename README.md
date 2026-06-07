@@ -186,7 +186,6 @@ See [INDEPENDENCE.md](./INDEPENDENCE.md) for details.
 
 ## License
 
-Licensed under either of
+Licensed under the Apache License, Version 2.0.
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+See [LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0.
