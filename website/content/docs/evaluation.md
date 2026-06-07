@@ -224,7 +224,48 @@ assert:
         gte: 1
 ```
 
-This is best for regression gates around call count, token use, and cost, not for judging response quality.
+This is best for regression gates around call count, token use, cost, and configured dimensions such as `background`, not for judging response quality.
+
+Dimension-count assertions use the aggregate dimensions configured on the agent or eval observability overlay:
+
+```yaml
+assert:
+  observability:
+    dimension_counts:
+      - match_dimensions:
+          background: "true"
+        assert:
+          path: count
+          gte: 1
+```
+
+For speculative branch checks, configure branch dimensions and assert the committed and losing outcomes:
+
+```yaml
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+scenarios:
+  - id: branch-status-smoke
+    turns:
+      - input: I was charged twice
+        assert:
+          observability:
+            dimension_counts:
+              - match_dimensions:
+                  branch_status: committed
+                  commit_behavior: final_response
+                  speculative: "true"
+                assert:
+                  path: count
+                  gte: 1
+```
+
+Branch raw events also carry both `speculative` and `runtime.speculative` dimensions for export and debugging. Dimension-count assertions operate on configured aggregate dimensions, so include `speculative` when you want to match speculative branch metrics. Branch telemetry is the stable way to inspect speculative LLM work because losing branches do not fire final response hooks.
+
+Runtime optimization can schedule background actor memory maintenance. The eval runner flushes background runtime tasks before collecting turn evidence, so facts, relationships, and observability assertions see the completed post-turn state. The example suite `examples/eval/runtime_optimization_mocked.yaml` shows a no-key regression check for pre-response guard routing, and `examples/eval/speculative_parallel_transition_mocked.yaml` checks that a parallel transition can discard a stale draft and expose branch status dimensions.
 
 ---
 
@@ -564,6 +605,19 @@ Rules:
 | `examples/eval/multiturn_mocked.yaml` | Ordered mock responses across multiple turns. |
 | `examples/eval/streaming_mocked.yaml` | Streaming turn collection. |
 | `examples/eval/observability_mocked.yaml` | Observability assertions without API keys. |
+| `examples/eval/runtime_optimization_mocked.yaml` | Pre-response guard routing without API keys. |
+| `examples/eval/speculative_parallel_transition_mocked.yaml` | Parallel transition winner with stale draft discard. |
+| `examples/eval/speculative_parallel_transition_miss_mocked.yaml` | Parallel transition miss with main draft commit. |
+| `examples/eval/speculative_losing_tool_draft_mocked.yaml` | Losing draft tool call stays inert. |
+| `examples/eval/speculative_skill_routing_mocked.yaml` | Skill selection branch commit before skill execution. |
+| `examples/eval/speculative_skill_no_match_mocked.yaml` | Skill no-match branch with main draft commit. |
+| `examples/eval/speculative_reasoning_auto_mocked.yaml` | Auto reasoning none decision with plain draft commit. |
+| `examples/eval/speculative_reasoning_cot_mocked.yaml` | Auto reasoning deeper decision with plain draft discard. |
+| `examples/eval/speculative_reasoning_react_mocked.yaml` | Auto reasoning ReAct decision with plain draft discard. |
+| `examples/eval/speculative_reasoning_plan_mocked.yaml` | Auto reasoning plan-and-execute decision with committed plan path. |
+| `examples/eval/speculative_reasoning_judge_failure_mocked.yaml` | Auto reasoning judge failure with plain draft fallback and failed branch status. |
+| `examples/eval/buffered_streaming_mocked.yaml` | Buffered streaming route winner. |
+| `examples/eval/buffered_streaming_main_win_mocked.yaml` | Buffered streaming main draft winner. |
 | `examples/eval/real_llm_semantic_judge.yaml` | Live provider response and live judge. |
 
 See [Examples](@/examples/_index.md) for the full examples catalog.

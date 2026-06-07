@@ -1,0 +1,95 @@
+name: BufferedStreamingRouter
+version: "1.0.0"
+description: "Buffered streaming while speculative routing resolves"
+
+# Buffered streaming example.
+#
+# Use this pattern when streaming is enabled but a parallel state-transition route may discard the old-state draft.
+# The runtime keeps output hidden until routing is resolved, so stale branch text is never shown to the user.
+#
+# Cost warning: routing and draft branches can both consume tokens. Use a low cap and inspect branch observability dimensions.
+#
+# Flow: user input -> buffered main branch + parallel transition branch
+#                  -> main wins -> flush committed content
+#                  -> transition wins -> discard buffered draft -> emit committed route response
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/buffered_streaming.yaml --stream --plain
+system_prompt: |
+  You are a streaming support router. Answer from the committed state only.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+streaming:
+  enabled: true
+  buffer_size: 256  # maximum hidden chunks while routing resolves. default: 256
+
+context:
+  request:
+    type: runtime
+    default:
+      topic: general
+
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done  # hide state-routing branch output until safe. default: preflight_only
+    max_parallel_runtime_tasks: 2
+
+# Branch telemetry shows whether buffered output committed, failed, or was discarded by a route.
+# Inspect target/observability/buffered_streaming/report.json after a turn.
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+  export:
+    formats: [json]
+    path: ./target/observability/buffered_streaming/
+    write_report: true
+
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: |
+        Ask which support area the user needs.
+      transitions:
+        - to: technical
+          guard:
+            context:
+              request.topic:
+                eq: technical
+          when: "User asks about bugs, errors, login failures, or technical troubleshooting"
+          timing: parallel
+          requires_response: false
+
+    technical:
+      prompt: |
+        You are in technical support. Ask for the error message, environment, and reproduction steps.
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Buffered Streaming ==="
+    hints:
+      - "Try: I cannot log in because I get an error"
+      - "The old-state stream is not shown if the route wins"
+      - "Use observability branch dimensions to inspect routing outcomes"
+    show_state: true
+    show_timing: true

@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.0.0-rc.15
+
+### Added
+- Runtime optimization: disabled-by-default policy block for pre-response routing, background maintenance, bounded runtime work, and speculative branches
+- Transition timing: pre-response and parallel transition timing with response-dependency safety checks
+- Pre-response routing: deterministic guard and resolved-intent routes can skip stale old-state responses
+- Background maintenance: facts and relationship updates can run inline parallel or background with task-aware freshness waits
+- Speculative branches: bounded main drafts, parallel transition decisions, skill routing, auto reasoning, and buffered streaming routing
+- Branch observability: committed, discarded, failed, and cancelled branch outcomes expose status, winner, optimization, commit behavior, and speculative dimensions
+- Evaluation coverage: no-key runtime optimization suites cover pre-response routing, speculative branches, losing tool drafts, reasoning decisions, and buffered streaming
+- Rust API: runtime optimization policy types and TransitionTiming are re-exported for host configuration
+
+### Changed
+- State transitions: selection, approval, commit, and fallback are separated so side effects happen only after the winning path is known
+- Turn lifecycle: user-message commit, response finalization, post-turn maintenance, and redispatch cleanup share one root-turn path
+- Speculative scheduling: branch task capacity and speculative LLM budgets are bounded and support partial scheduling under low caps
+- Streaming optimization: buffered routing is scoped to response-independent parallel state transitions and emits committed output only
+- Speculative scheduling: plain drafts commit only when they preserve the equivalent serial reasoning path
+- Runtime optimization examples: speculative examples now enable branch observability reports for committed, discarded, failed, and cancelled outcomes
+- Orchestration voting: vote extraction can run with bounded concurrency while preserving declaration-order tie breaking
+- Documentation: roadmap, website docs, examples, and guides describe runtime optimization and speculative branch behavior as one release
+
+### Fixed
+- Pre-response safety: staged extractor context and user memory are not committed when route approval rejects
+- Background maintenance: completed task errors are preserved until flush and overflow errors surface according to policy
+- Transition timing: post-response guard or intent transitions no longer run as pre-response routes
+- Tool approval lifecycle: rejected tool terminal outcomes run shared finalization in blocking and streaming paths
+- Losing branches: discarded drafts cannot write memory, execute parsed tool calls, mutate context, fire response hooks, or leak streaming output
+- Branch telemetry: failed, cancelled, and discarded branches preserve exact safe dimensions including speculative labels
+- Auto reasoning: judge failures and reservation exhaustion no longer appear as committed none decisions
+- Reasoning preservation: forced reasoning modes skip plain speculative drafts, and low-cap auto reasoning falls back to the serial judge path
+- Skill routing: low-cap speculative skill routing falls back to serial skill routing instead of reporting no match
+- Root-turn cleanup: blocking and streaming errors reset root-turn state before the next turn
+- Buffered streaming: main branch failures finalize telemetry before stream errors are returned
+- Buffered streaming: buffer capacity is enforced only while routing is unresolved
+
 ## 1.0.0-rc.14
 
 ### Added

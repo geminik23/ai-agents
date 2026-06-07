@@ -20,6 +20,8 @@ settings:
 # Enable a safe report in the eval output area.
 observability:
   enabled: true
+  aggregation:
+    dimensions: [purpose, status]
   export:
     formats: [json]
     path: ./target/eval/observability_mocked/observability
@@ -50,3 +52,9 @@ scenarios:
                   main_response:
                     path: count
                     gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

@@ -1,0 +1,45 @@
+name: Speculative Skill Routing Mocked Eval
+agent: ../yaml/runtime-optimization/speculative_skill_routing.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a skill branch can win and return a committed response.
+#
+# Flow: user input -> draft branch + skill selection -> skill commit -> skill response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Draft stale response."
+        - "Skill committed response."
+      router:
+        - "simplify_explanation"
+
+scenarios:
+  - id: skill-routing-match
+    name: Skill branch wins and returns a committed response
+    tags: [runtime, optimization, branch, skill]
+    language: en
+    turns:
+      - input: Explain vectors simply
+        assert:
+          all:
+            - response_contains: "Skill committed"
+            - response_not_contains: "Draft stale"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1

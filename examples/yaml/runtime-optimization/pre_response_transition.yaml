@@ -1,0 +1,75 @@
+name: RuntimeOptimizedRouter
+version: "1.0.0"
+description: "Pre-response deterministic transition routing"
+
+# Runtime optimization example.
+#
+# Use this pattern when a state transition can be decided from context or resolved intent before the current state's LLM response is generated.
+# The old state response is skipped, so the user only waits for the response from the committed state.
+#
+# Flow: user input -> pre-response guard check -> billing state -> billing response
+#                  -> no guard match -> greeting state -> normal response
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/pre_response_transition.yaml --context request.topic=billing --plain
+system_prompt: |
+  You are a support router. Answer from the current state only.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Runtime optimization is opt-in.
+# Existing agents keep post-response transitions unless this block enables earlier routing.
+runtime:
+  optimization:
+    enabled: true
+    # Check guard and intent transitions before the old-state LLM call.
+    # default: false
+    pre_response_deterministic_transitions: true
+    max_parallel_runtime_tasks: 4  # maximum internal runtime work. default: 4
+
+# Runtime context default keeps the example runnable without flags.
+# Override it with --context request.topic=billing to force the optimized route.
+context:
+  request:
+    type: runtime
+    default:
+      topic: general
+
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: |
+        Greet the user and ask what kind of support they need.
+      transitions:
+        # Guard-only transitions are deterministic.
+        # With runtime optimization enabled, this can fire before a greeting response is generated.
+        - to: billing
+          guard:
+            context:
+              request.topic:
+                eq: billing
+          timing: pre_response      # select before response. default: post_response
+          requires_response: false  # does not inspect assistant text. default: false
+
+    billing:
+      prompt: |
+        Help with billing. Say that you are already in the billing flow and ask for the invoice or payment question.
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Pre-response Transition ==="
+    hints:
+      - "Run with --context request.topic=billing to skip the greeting state response"
+      - "Try: I need billing help"
+      - "The first visible answer should come from the billing state"
+    show_state: true
+    show_timing: true

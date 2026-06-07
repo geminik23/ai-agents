@@ -1,0 +1,43 @@
+name: Speculative Auto Reasoning Mocked Eval
+agent: ../yaml/runtime-optimization/speculative_reasoning_auto.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a none reasoning decision commits the plain draft.
+#
+# Flow: user input -> plain draft + reasoning judge -> judge says none -> plain response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Plain committed response."
+      router:
+        - "none"
+
+scenarios:
+  - id: reasoning-none
+    name: Auto reasoning none commits plain draft
+    tags: [runtime, optimization, branch, reasoning]
+    language: en
+    turns:
+      - input: Hello
+        assert:
+          all:
+            - response_contains: "Plain committed"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1

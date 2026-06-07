@@ -17,7 +17,7 @@ This page explains how the framework is organized and how its pieces fit togethe
 The dependency layers flow in one direction:
 
 1. **Core** (`ai-agents-core`) - shared types, specs, error types, and trait definitions used everywhere.
-2. **Feature crates** - each layer builds on core: `ai-agents-llm`, `ai-agents-memory`, `ai-agents-tools`, `ai-agents-state`, `ai-agents-skills`, `ai-agents-context`, `ai-agents-process`, `ai-agents-reasoning`, `ai-agents-recovery`, `ai-agents-hitl`, `ai-agents-hooks`, `ai-agents-disambiguation`, `ai-agents-storage`, `ai-agents-template`.
+2. **Feature crates** - each layer builds on core: `ai-agents-llm`, `ai-agents-memory`, `ai-agents-tools`, `ai-agents-state`, `ai-agents-skills`, `ai-agents-context`, `ai-agents-process`, `ai-agents-reasoning`, `ai-agents-recovery`, `ai-agents-hitl`, `ai-agents-hooks`, `ai-agents-disambiguation`, `ai-agents-storage`, `ai-agents-template`, `ai-agents-persona`, `ai-agents-facts`, `ai-agents-relationships`, `ai-agents-observability`, and `ai-agents-eval`.
 3. **Runtime** (`ai-agents-runtime`) - wires every feature crate together into a running agent loop. Also contains the dynamic agent spawner module.
 4. **Facade** (`ai-agents`) - re-exports everything behind a single dependency so library users only add one crate.
 5. **CLI** (`ai-agents-cli`) - a binary crate providing the `ai-agents-cli` command.
@@ -44,6 +44,11 @@ layers:
     - ai-agents-disambiguation
     - ai-agents-storage
     - ai-agents-template
+    - ai-agents-persona
+    - ai-agents-facts
+    - ai-agents-relationships
+    - ai-agents-observability
+    - ai-agents-eval
   core: ai-agents-core         # traits, types, specs
 ```
 
@@ -609,7 +614,7 @@ See [YAML Reference - Orchestration States](@/docs/yaml-reference.md#orchestrati
 
 ---
 
-## Evaluation as a Regression Testing
+## Evaluation as Regression Testing
 
 Evaluation runs YAML agents through the normal runtime path and checks declared assertions against structured evidence. This makes it useful for CI smoke tests, release checks, and regression suites for state machines, tools, memory, orchestration, and safety behavior.
 
@@ -713,6 +718,71 @@ if let Some(obs) = agent.observability() {
     println!("LLM calls: {}", report.summary.total_llm_calls);
 }
 ```
+
+---
+
+## Runtime Optimization
+
+Runtime optimization reduces avoidable response latency without changing behavior by default. The main rule is that the runtime can select a route early, but it can only commit side effects after the winning path is known.
+
+```text
+user input
+  -> process input
+  -> optional pre-response guard or intent transition
+  -> committed state response
+  -> post-turn facts and relationship maintenance
+```
+
+The lowest-risk optimization is pre-response deterministic transitions. A transition must opt in with `timing: pre_response`, and then a guard or resolved intent can prove that the current user input belongs in another state before the old state asks the LLM for a response. When that happens, the runtime commits the transition first and generates the visible answer from the new state. Pre-response transitions with natural-language `when` text remain invalid because pre-response routing must be deterministic; use `timing: parallel` for response-independent LLM transition prompts.
+
+```yaml
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+
+states:
+  initial: greeting
+  states:
+    greeting:
+      transitions:
+        - to: billing
+          guard:
+            context:
+              request.topic:
+                eq: billing
+          timing: pre_response
+          requires_response: false
+```
+
+Post-turn facts and relationship updates are future-turn maintenance. They can run inline in the existing serial path, inline in parallel, or in the background. Background mode is eventually consistent, so actor memory tasks support `await_before_next_turn: same_actor` to wait only when the same actor continues immediately. Freshness is task-aware: fact freshness waits for fact tasks, and relationship freshness waits for relationship tasks.
+
+```yaml
+runtime:
+  optimization:
+    enabled: true
+    post_turn:
+      facts:
+        mode: background
+        await_before_next_turn: same_actor
+      relationships:
+        mode: background
+        await_before_next_turn: same_actor
+```
+
+Speculative branch execution extends this safety model to independent LLM work. The runtime can overlap a main response draft with response-independent transition evaluation, pure skill selection, or auto reasoning decisions. The main draft is data until it wins. If a transition, skill, or deeper reasoning branch wins, the draft is finalized as discarded and its parsed tool calls remain inert. Plain drafts commit only when they preserve the equivalent serial path: forced reasoning modes use the serial path, and auto reasoning speculation requires enough capacity for both the draft and judge branch. If a required branch cannot reserve safely, the draft is discarded and the runtime falls back to the serial committed path instead of reporting a false no-match or no-reasoning decision.
+
+```text
+user input
+  -> main draft branch + routing branch
+  -> choose winner
+  -> commit exactly one path
+  -> finalize losing branch telemetry
+```
+
+Speculative execution is opt-in and bounded by `max_speculative_llm_calls_per_turn`. This is important because discarded branches can still consume tokens and cost. When the cap is lower than the number of eligible branches, the runtime schedules only behavior-preserving branches and falls back to the serial committed path for skipped branch families. Observability reports expose `branch_status`, `optimization`, `commit_behavior`, `winner`, and `speculative` dimensions so eval suites and dashboards can track the cost of discarded work. Branch telemetry is the supported way to inspect speculative LLM work; final response hooks still fire once for the committed response.
+
+Streaming supports a buffered routing policy for response-independent parallel state-transition routing. With `streaming_policy: buffer_until_routing_done`, output from the unresolved main branch is hidden until routing is safe. The buffer limit applies while routing is unresolved. After the transition branch misses or fails, later chunks are no longer counted against that unresolved-routing buffer. The runtime emits chunks only after the committed content is known: if the main branch wins and the raw draft still matches the committed response, buffered chunks are emitted in order; otherwise the committed content is emitted. If the transition branch wins, stale branch output is discarded and the committed route response is emitted instead. If the buffered main branch fails, branch telemetry is finalized as failed before the stream error is returned.
 
 ---
 

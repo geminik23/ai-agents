@@ -1,0 +1,82 @@
+name: SpeculativeParallelRouter
+version: "1.0.0"
+description: "Parallel state transition branch with draft discard safety"
+
+# Speculative transition routing example.
+#
+# Use this pattern when a natural-language route can be evaluated from the user input without waiting for the current state's response.
+# The runtime starts a main draft and a transition decision together, then commits only the winning branch.
+#
+# Cost warning: the losing branch can still consume tokens and cost. Keep the speculative call cap low and inspect observability reports.
+#
+# Flow: user input -> main draft branch + transition branch
+#                  -> transition wins -> discard draft -> billing state response
+#                  -> transition misses -> commit draft -> normal post-response transitions
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/parallel_transition.yaml --plain
+system_prompt: |
+  You are a support router. Answer from the committed state only.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2  # one draft call plus one transition decision call. default: 0
+    speculative_state_transitions: true    # enable timing: parallel transitions. default: false
+    max_parallel_runtime_tasks: 2          # bound branch work for this turn. default: 4
+
+# Branch telemetry shows which path committed and which path was discarded.
+# Inspect target/observability/parallel_transition/report.json after a turn.
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+  export:
+    formats: [json]
+    path: ./target/observability/parallel_transition/
+    write_report: true
+
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: |
+        Ask one short question to understand the support category.
+      transitions:
+        # Parallel transitions are response-independent.
+        # The prompt must be answerable from the user input and current context only.
+        - to: billing
+          when: "User asks about billing, invoices, refunds, payment, or charges"
+          timing: parallel        # evaluate beside a draft response. default: post_response
+          requires_response: false
+
+    billing:
+      prompt: |
+        You are in the billing support state. Ask for the invoice, payment, refund, or charge details.
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Parallel Transition ==="
+    hints:
+      - "Try: I was charged twice for my invoice"
+      - "The transition branch can discard a stale triage draft"
+      - "Use observability dimensions to inspect committed and discarded branches"
+    show_state: true
+    show_timing: true

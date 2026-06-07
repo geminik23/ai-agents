@@ -1,0 +1,61 @@
+name: RuntimeBaselineRouter
+version: "1.0.0"
+description: "Baseline post-response guard transition routing"
+
+# Runtime optimization baseline example.
+#
+# Use this next to pre_response_transition.yaml when you want to compare the
+# default post-response route with the optimized pre-response route.
+#
+# Flow: user input -> greeting response -> post-response guard check -> billing state
+#                  -> next response generated from billing state
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/pre_response_transition_disabled.yaml --context request.topic=billing --plain
+system_prompt: |
+  You are a support router. Answer from the current state only.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# No runtime optimization block is needed for the baseline.
+# The transition below keeps its default post_response timing.
+context:
+  request:
+    type: runtime
+    default:
+      topic: general
+
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: |
+        Greet the user and ask what kind of support they need.
+      transitions:
+        # This guard still routes to billing, but only after the greeting response exists.
+        - to: billing
+          guard:
+            context:
+              request.topic:
+                eq: billing
+
+    billing:
+      prompt: |
+        Help with billing. Say that you are now in the billing flow and ask for the invoice or payment question.
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Baseline Post-response Transition ==="
+    hints:
+      - "Run with --context request.topic=billing to route after the greeting response"
+      - "Compare with pre_response_transition.yaml to see the old-state response skipped"
+    show_state: true
+    show_timing: true

@@ -15,7 +15,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **Pre-RC** | Core framework: YAML agents, tools, skills, states, hooks, HITL, streaming, error recovery, process pipeline |
 | **rc.1** | CompactingMemory, token budgeting, SQLite/Redis storage |
 | **rc.2** | Tool provider system, multi-language aliases, TrustLevel |
-| **rc.3** | Workspace refactoring - 18 modular crates for parallel compilation |
+| **rc.3** | Workspace refactoring - modular crates for parallel compilation and feature isolation |
 | **rc.4** | Reasoning & reflection - Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation |
 | **rc.5** | Intent disambiguation - LLM-based ambiguity detection and clarification |
 | **rc.6** | MCP integration, tool scoping, intent-based routing, `openai-compatible` provider |
@@ -33,7 +33,12 @@ This page tracks what has shipped in each release candidate, what we are working
 
 ## Up Next
 
-Once the current foundation line is fully released, the roadmap focus shifts toward deeper persistent memory, autonomous behavior, knowledge boundaries, and richer multi-agent ecosystems.
+The next release-candidate focus is safe built-in capability expansion before the stable foundation release. Generalized autonomous task runs move to v1.1.0.
+
+- **rc.16** - Built-in Tool Expansion: safe discovery, file editing, patch review, repository inspection, diagnostics, controlled validation commands, interaction, task state, and web retrieval.
+- **v1.1.0** - Generalized Autonomy Runner: YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events.
+
+Once the current foundation line is fully released, the roadmap focus shifts toward autonomous task runs, deeper persistent memory, knowledge boundaries, and richer multi-agent ecosystems.
 
 ---
 
@@ -45,7 +50,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 |---------|-------------|--------|
 | **Advanced Memory** | CompactingMemory, token budgeting, SQLite/Redis storage | ✅ Done (rc.1) |
 | **Tool Provider System** | ToolProvider trait, multi-language aliases, extensibility | ✅ Done (rc.2) |
-| **Workspace Refactoring** | 18 modular crates for parallel compilation | ✅ Done (rc.3) |
+| **Workspace Refactoring** | Modular crates for parallel compilation and feature isolation | ✅ Done (rc.3) |
 | **Reasoning & Reflection** | Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation | ✅ Done (rc.4) |
 | **Intent Disambiguation** | LLM-based ambiguity detection and clarification | ✅ Done (rc.5) |
 | **MCP Integration** | Connect to any MCP server for instant tool access | ✅ Done (rc.6) |
@@ -58,11 +63,11 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **LLM Provider Enhancement** | Provider factory, stable token counting, client caching, config passthrough | ✅ Done (rc.13) |
 | **Observability & Tracing** | Privacy-safe per-call latency, token usage, cost estimates, trace context, reports, and exporters | ✅ Done (rc.13) |
 | **Evaluation Framework** | YAML/JSONL scenario runner with assertions, LLM judge, fixtures, strict redaction, parallel execution, observability overlay, and CI reports | ✅ Done (rc.14) |
-| **Runtime Latency Optimization** | Pre-response deterministic transitions, background actor-memory maintenance, stable orchestration ordering, branch-aware observability foundations, and eval flushing | In progress (rc.15) |
-| **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | Planned (rc.15) |
+| **Runtime Latency Optimization** | Pre-response deterministic transitions, background actor-memory maintenance, stable orchestration ordering, branch-aware observability foundations, and eval flushing | ✅ Done (rc.15) |
+| **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | ✅ Done (rc.15) |
 | **Built-in Tool Expansion** | Safe discovery, split file read/write/edit tools, patch review, repository inspection, diagnostics, controlled validation commands, interactive questions, session todos, bounded waits, and web retrieval primitives | Planned (rc.16) |
-| **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned (rc.17) |
-| **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, autonomy, and release hardening | Planned (v1.0.0) |
+| **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | Planned (v1.0.0) |
+| **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned (v1.1.0) |
 | **Desktop Agent Studio** | Desktop workbench for authoring YAML agents, validating configs, running local Ollama agents, and inspecting state, memory, tools, sessions, task runs, and observability | Planned after v1 |
 | **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, task runs, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned after v1 |
 | **Episodic Memory** | Structured event records with participants, significance, and source tracking | Planned |
@@ -82,6 +87,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **A2A Protocol** | Cross-service agent collaboration protocol | Planned - needs Multi-Agent Orchestration |
 | **Custom Reasoning Prompts** | Domain and language-specific CoT/ReAct instruction templates | Planned |
 | **Reasoning Depth Control** | Auto shallow/standard/deep reasoning with resource limits | Planned - needs Custom Reasoning Prompts |
+
 
 ---
 

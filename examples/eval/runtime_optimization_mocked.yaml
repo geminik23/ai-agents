@@ -1,0 +1,41 @@
+name: Runtime Optimization Mocked Eval
+agent: ../yaml/runtime-optimization/pre_response_transition.yaml
+
+# Runtime optimization evaluation suite.
+# Use this no-key suite to verify that deterministic pre-response routing commits the target state before response generation.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --agent examples/yaml/runtime-optimization/pre_response_transition.yaml \
+#     --scenarios examples/eval/runtime_optimization_mocked.yaml \
+#     --output target/eval/runtime_optimization_mocked
+#
+# Flow: fixture context -> pre-response guard -> billing state -> mocked billing response -> assertions
+settings:
+  timeout_per_turn_ms: 5000  # milliseconds to wait for each turn. default: 30000
+  retries: 0                 # keep optimization checks deterministic. default: 0
+  isolation: scenario        # fresh runtime per attempt. default: scenario
+
+# The context fixture makes the guard true before the old greeting state can respond.
+fixtures:
+  context:
+    request:
+      topic: billing
+  llm:
+    mode: mock
+    responses:
+      - "Billing state mocked response."
+
+# This scenario checks behavior, not just telemetry.
+scenarios:
+  - id: pre-response-guard-routing
+    name: Guard route skips stale greeting response
+    tags: [runtime, optimization, state]
+    language: en
+    turns:
+      - input: I need billing help
+        assert:
+          all:
+            - state: billing
+            - response_contains: "Billing state"
+            - response_not_contains: "greeting"

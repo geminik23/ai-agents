@@ -27,7 +27,7 @@ title %} {% block content %}
                     />
                 </a>
                 <a
-                    href="{{ config.extra.github }}/blob/main/LICENSE-MIT"
+                    href="{{ config.extra.github }}/blob/main/LICENSE-APACHE"
                     target="_blank"
                     rel="noopener noreferrer"
                 >
@@ -360,7 +360,7 @@ title %} {% block content %}
                 <pre
                     class="code-block code-block--terminal"
                 ><code><span class="code-comment"># Install the CLI</span>
-<span class="code-prompt">$</span> cargo install ai-agents-cli --version 1.0.0-rc.14
+<span class="code-prompt">$</span> cargo install ai-agents-cli --version {{ config.extra.version }}
 
 <span class="code-comment"># Create agent.yaml</span>
 <span class="code-prompt">$</span> cat agent.yaml

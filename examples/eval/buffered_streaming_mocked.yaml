@@ -1,0 +1,49 @@
+name: Buffered Streaming Mocked Eval
+agent: ../yaml/runtime-optimization/buffered_streaming.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that buffered streaming emits the committed routed response.
+# The route can win before the old-state draft consumes a mocked response, so both default fixtures use the committed response.
+#
+# Flow: streaming input -> buffered branch routing -> technical state response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  context:
+    request:
+      topic: technical
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Technical committed response."
+        - "Technical committed response."
+
+scenarios:
+  - id: buffered-route-win
+    name: Buffered route emits committed state response
+    tags: [runtime, optimization, branch, streaming]
+    language: en
+    turns:
+      - input: I cannot log in because I get an error
+        stream: true
+        assert:
+          all:
+            - state: technical
+            - response_contains: "Technical committed"
+            - response_not_contains: "Buffered stale"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1

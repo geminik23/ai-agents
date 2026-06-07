@@ -1,0 +1,48 @@
+name: Speculative Auto Reasoning ReAct Mocked Eval
+agent: ../yaml/runtime-optimization/speculative_reasoning_auto.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a ReAct reasoning decision discards the plain draft.
+#
+# Flow: user input -> plain draft + reasoning judge -> judge says react -> committed ReAct response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "React committed response."
+      router:
+        - "react"
+
+scenarios:
+  - id: reasoning-react
+    name: ReAct decision discards the plain draft
+    tags: [runtime, optimization, branch, reasoning]
+    language: en
+    turns:
+      - input: Use observations to decide the next step
+        assert:
+          all:
+            - response_contains: "React committed"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: discarded
+                    assert:
+                      path: count
+                      gte: 1

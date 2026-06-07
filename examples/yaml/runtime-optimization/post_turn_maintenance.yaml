@@ -1,0 +1,101 @@
+name: RuntimeMaintenanceAgent
+version: "1.0.0"
+description: "Parallel and background post-turn actor memory maintenance"
+
+# Post-turn maintenance optimization example.
+#
+# Facts and relationship updates affect future turns, not the current response.
+# This example shows how to move those updates out of a fully serial tail path while keeping same-actor freshness safe.
+#
+# Flow: user input -> main response -> facts and relationships scheduled
+#                  -> next same actor turn waits for pending actor maintenance
+#
+# Prerequisites:
+#   - OPENAI_API_KEY set in environment
+#   - Run with --actor so actor-scoped memory has a persistence key
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/post_turn_maintenance.yaml --actor user_1 --plain
+system_prompt: |
+  You are a helpful assistant with actor memory.
+  {% if actor_facts %}
+  Known facts:
+  {{ actor_facts }}
+  {% endif %}
+  {% if relationship_memory %}
+  Relationship memory:
+  {{ relationship_memory }}
+  {% endif %}
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+runtime:
+  optimization:
+    enabled: true
+    # Run inline maintenance concurrently when task mode is inline_serial.
+    # default: false
+    parallel_post_turn_memory: true
+    post_turn:
+      facts:
+        # schedule facts after response. inline_serial (default) | inline_parallel | background
+        mode: background
+        # wait only if same actor sends the next turn. default: always
+        await_before_next_turn: same_actor
+      relationships:
+        mode: background  # schedule relationship update after response. default: inline_serial
+        await_before_next_turn: same_actor
+      max_background_tasks: 16          # queued maintenance task limit. default: 16
+      on_background_overflow: run_inline # run inline rather than drop work. default: run_inline
+
+memory:
+  type: compacting
+  max_recent_messages: 20
+  compress_threshold: 15
+  summarizer_llm: router
+  facts:
+    enabled: true
+    extractor_llm: router
+    auto_extract: true
+    categories:
+      - user_preference
+      - user_context
+    max_facts: 50
+  relationships:
+    enabled: true
+    dimensions:
+      - trust
+      - sentiment
+      - familiarity
+      - rapport
+    auto_update:
+      enabled: true
+      llm: router
+      recent_messages: 6
+    injection:
+      enabled: true
+      format: summary
+      prompt_variable: relationship_memory
+
+storage:
+  type: sqlite
+  path: ./data/runtime_maintenance.db
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Post-turn Maintenance ==="
+    hints:
+      - "Tell the agent your name or preference, then ask what it remembers on the next turn"
+      - "Same-actor freshness waits for pending background facts and relationships"
+      - "Use /facts and /relationship to inspect actor memory"
+    show_timing: true

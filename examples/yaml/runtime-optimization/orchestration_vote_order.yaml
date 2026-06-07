@@ -1,0 +1,82 @@
+name: RuntimeVoteOrderAgent
+version: "1.0.0"
+description: "Bounded parallel vote extraction with declaration-order tie breaking"
+
+# Runtime optimization orchestration example.
+#
+# Use this pattern when concurrent child agents can vote in parallel but the final
+# tie breaker must still follow the YAML declaration order.
+#
+# Flow: user input -> child agents run concurrently -> votes extract in bounded batches
+#                  -> declaration-order sorting -> first tie breaker -> response
+#
+# Prerequisites:
+#   - OPENAI_API_KEY set in environment
+#   - Child agent files in examples/yaml/orchestration/agents/
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/orchestration_vote_order.yaml --plain
+system_prompt: |
+  You coordinate a small review panel. Forward the user's request to each reviewer and report the vote result.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+runtime:
+  optimization:
+    enabled: true
+    # Vote extraction is serial unless this flag is enabled.
+    # When enabled, the bound below limits concurrent extraction calls.
+    parallel_orchestration_vote_extraction: true  # default: false
+    max_parallel_runtime_tasks: 2                 # maximum vote extractions per batch. default: 4
+
+spawner:
+  shared_llms: true  # child agents reuse parent providers. default: false
+  auto_spawn:
+    - id: writer
+      agent: ../orchestration/agents/writer.yaml
+    - id: editor
+      agent: ../orchestration/agents/editor.yaml
+    - id: reviewer
+      agent: ../orchestration/agents/reviewer.yaml
+
+states:
+  initial: vote
+  states:
+    vote:
+      concurrent:
+        agents: [writer, editor, reviewer]
+        input: "Review this request and give one short recommendation: {{ user_input }}"
+        timeout_ms: 30000  # per-child timeout in milliseconds. default: none
+        aggregation:
+          strategy: voting
+          synthesizer_llm: router
+          vote:
+            method: majority        # majority (default) | weighted | unanimous
+            tiebreaker: first       # first uses declaration order after results are sorted. default: first
+            vote_prompt: |
+              Extract one short recommendation from this response.
+              Return only the recommendation text.
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Vote Order ==="
+    hints:
+      - "Try: Should we ship this draft?"
+      - "Vote extraction runs in bounded parallel batches"
+      - "Tie-breaking still follows writer, editor, reviewer declaration order"
+    show_timing: true

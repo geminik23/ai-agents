@@ -1,0 +1,77 @@
+name: RuntimeExtractorRouter
+version: "1.0.0"
+description: "Pre-response extractor routing with staged context"
+
+# Runtime optimization extractor example.
+#
+# Use this pattern when a transition guard needs a value that must be extracted from the current user input.
+# Extracted values are staged first and are committed only if the transition commits.
+#
+# Flow: user input -> staged extractor -> guard match -> lookup state -> lookup response
+#                  -> extractor miss -> current state -> normal response
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/pre_response_extractor.yaml --plain
+system_prompt: |
+  You are an order support assistant. Answer from the current state only.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+# Runtime optimization is opt-in.
+# This example keeps extractor work explicit on the transition through run_extractors.
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true  # check safe routes before old-state response. default: false
+    pre_response_extractors: false                # only transitions with run_extractors run extractors. default: false
+    max_parallel_runtime_tasks: 4                 # maximum internal runtime work. default: 4
+
+states:
+  initial: collect_order
+  states:
+    collect_order:
+      prompt: |
+        Ask the user for an order number before looking anything up.
+      # The extractor uses the router LLM and writes to a staged context map during pre-response selection.
+      extract:
+        - key: order.id
+          description: "Order number mentioned by the user"
+      transitions:
+        # run_extractors lets this guard see staged order.id before the old-state response is generated.
+        - to: order_lookup
+          guard:
+            context:
+              order.id:
+                exists: true
+          timing: pre_response      # select before response when the guard proves the route. default: post_response
+          requires_response: false  # does not inspect assistant text. default: false
+          run_extractors: true      # run current-state extractors for this route. default: false
+
+    order_lookup:
+      prompt: |
+        Confirm that the order lookup flow is active. Mention the extracted order ID if it is available in context.
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Pre-response Extractor ==="
+    hints:
+      - "Try: My order number is A-12345"
+      - "The old collect_order response is skipped when order.id is extracted"
+      - "Extractor values are staged and committed only after the route commits"
+    show_state: true
+    show_timing: true

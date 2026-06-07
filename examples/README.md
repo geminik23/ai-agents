@@ -42,6 +42,20 @@ Evaluation suites run an agent against declarative scenarios and write reports f
 | `eval/multiturn_mocked.yaml` | Deterministic two-turn conversation suite showing ordered mock responses and composite assertions |
 | `eval/streaming_mocked.yaml` | Streaming eval smoke test that collects `chat_stream()` output before assertions |
 | `eval/observability_mocked.yaml` | No-key observability eval suite that checks LLM telemetry assertions |
+| `eval/runtime_optimization_mocked.yaml` | No-key runtime optimization suite that verifies pre-response guard routing |
+| `eval/runtime_optimization_disabled_mocked.yaml` | No-key baseline suite that verifies default post-response guard routing for comparison |
+| `eval/speculative_parallel_transition_mocked.yaml` | No-key speculative branch suite that verifies a parallel transition can discard a stale draft |
+| `eval/speculative_parallel_transition_miss_mocked.yaml` | No-key speculative branch suite that verifies a transition miss commits the main draft |
+| `eval/speculative_losing_tool_draft_mocked.yaml` | No-key speculative branch suite that verifies tool calls from losing drafts stay inert |
+| `eval/speculative_skill_routing_mocked.yaml` | No-key speculative branch suite that verifies skill selection commits before execution |
+| `eval/speculative_skill_no_match_mocked.yaml` | No-key speculative branch suite that verifies skill no-match commits the main draft |
+| `eval/speculative_reasoning_auto_mocked.yaml` | No-key speculative branch suite that verifies auto reasoning none commits a plain draft |
+| `eval/speculative_reasoning_cot_mocked.yaml` | No-key speculative branch suite that verifies a deeper reasoning decision discards the plain draft |
+| `eval/speculative_reasoning_react_mocked.yaml` | No-key speculative branch suite that verifies ReAct selection discards the plain draft |
+| `eval/speculative_reasoning_plan_mocked.yaml` | No-key speculative branch suite that verifies plan-and-execute selection runs the committed plan path |
+| `eval/speculative_reasoning_judge_failure_mocked.yaml` | No-key speculative branch suite that verifies judge failure commits the plain draft and records a failed branch |
+| `eval/buffered_streaming_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming emits the committed route |
+| `eval/buffered_streaming_main_win_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming can commit the main draft |
 | `eval/real_llm_semantic_judge.yaml` | Live provider suite using real LLM calls and an LLM judge; tagged `live` and requires an API key |
 
 Examples:
@@ -66,6 +80,11 @@ cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
   --scenarios examples/eval/observability_mocked.yaml \
   --output target/eval/observability_mocked
+
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/runtime-optimization/pre_response_transition.yaml \
+  --scenarios examples/eval/runtime_optimization_mocked.yaml \
+  --output target/eval/runtime_optimization_mocked
 
 # Live provider example. Requires an API key and may incur provider cost.
 cargo run -p ai-agents-cli -- eval \
@@ -304,6 +323,40 @@ cargo run -p ai-agents-cli -- run examples/yaml/observability/pricing_file.yaml 
 cargo run -p ai-agents-cli -- run examples/yaml/observability/language_breakdown.yaml --plain
 cargo run -p ai-agents-cli -- run examples/yaml/observability/tools_and_skills_metrics.yaml --plain
 cargo run -p ai-agents-cli -- run examples/yaml/observability/orchestration_metrics.yaml --plain
+```
+
+### `yaml/runtime-optimization/`
+
+Runtime latency optimization examples - safe opt-in routing, speculative branch execution, and post-turn maintenance policies.
+
+| File | Description |
+|------|-------------|
+| `pre_response_transition.yaml` | Pre-response deterministic state transition that skips a stale old-state LLM response when a guard already proves the next state |
+| `pre_response_transition_disabled.yaml` | Baseline post-response guard transition for comparing optimized and default routing |
+| `pre_response_extractor.yaml` | Pre-response extractor routing with staged context writes that commit only after the route wins |
+| `parallel_transition.yaml` | Speculative main draft plus response-independent transition decision with losing branch discard |
+| `speculative_skill_routing.yaml` | Speculative skill selection that executes skill steps only after the skill branch wins |
+| `speculative_reasoning_auto.yaml` | Speculative auto reasoning that commits a plain draft when the judge selects no reasoning |
+| `buffered_streaming.yaml` | Streaming-safe parallel transition routing that hides stale branch output until routing is resolved |
+| `losing_tool_draft.yaml` | Speculative transition winner that proves parsed tool calls in a losing draft remain inert |
+| `post_turn_maintenance.yaml` | Background facts and relationship maintenance with same-actor freshness for the next turn |
+| `orchestration_vote_order.yaml` | Bounded parallel vote extraction that keeps declaration-order tie-breaking stable |
+
+Note: Runtime optimization is disabled by default. Pre-response transitions must be explicitly marked with `timing: pre_response` and only work for response-independent routes such as guards or resolved intents. Speculative branches require a positive `max_speculative_llm_calls_per_turn` and can increase token use because losing branches are still observed and discarded. The speculative examples enable branch observability reports under `target/observability/` so committed, discarded, failed, and cancelled outcomes are inspectable. Background actor memory is eventually consistent unless the relevant task policy waits for the same actor or all turns.
+
+Examples:
+
+```sh
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/pre_response_transition.yaml --context request.topic=billing --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/pre_response_transition_disabled.yaml --context request.topic=billing --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/pre_response_extractor.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/parallel_transition.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/speculative_skill_routing.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/speculative_reasoning_auto.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/buffered_streaming.yaml --stream --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/losing_tool_draft.yaml --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/post_turn_maintenance.yaml --actor user_1 --plain
+cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/orchestration_vote_order.yaml --plain
 ```
 
 ### `yaml/hitl/`

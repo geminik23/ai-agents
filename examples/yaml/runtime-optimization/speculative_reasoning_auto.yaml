@@ -1,0 +1,69 @@
+name: SpeculativeReasoningAuto
+version: "1.0.0"
+description: "Speculative auto reasoning with plain draft fallback"
+
+# Speculative auto reasoning example.
+#
+# Use this pattern when reasoning mode is auto and many requests are simple.
+# The runtime starts a plain draft and an auto-reasoning judge together. If the judge says none, the plain draft commits.
+#
+# Cost warning: when the judge selects deeper reasoning, the plain draft is discarded but still counted in telemetry.
+#
+# Flow: user input -> plain draft branch + reasoning judge branch
+#                  -> judge says none -> commit plain draft
+#                  -> judge selects reasoning -> discard draft -> run committed reasoning path
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/runtime-optimization/speculative_reasoning_auto.yaml --plain
+system_prompt: |
+  You are a concise reasoning assistant.
+
+llms:
+  default:
+    provider: openai
+    model: gpt-5.4-mini
+  router:
+    provider: openai
+    model: gpt-5.4-nano
+llm:
+  default: default
+  router: router
+
+reasoning:
+  mode: auto
+  judge_llm: router
+  output: hidden
+  max_iterations: 4
+
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2  # one plain draft plus one judge call. default: 0
+    speculative_reasoning_auto: true       # overlap auto reasoning decision with a plain draft. default: false
+    max_parallel_runtime_tasks: 2          # bound branch work. default: 4
+
+# Branch telemetry shows whether the judge committed none or discarded the draft for deeper reasoning.
+# Inspect target/observability/speculative_reasoning_auto/report.json after a turn.
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+  export:
+    formats: [json]
+    path: ./target/observability/speculative_reasoning_auto/
+    write_report: true
+
+memory:
+  type: in-memory
+  max_messages: 20
+
+tools: []
+
+metadata:
+  cli:
+    welcome: "=== Runtime Optimization: Speculative Auto Reasoning ==="
+    hints:
+      - "Try: hello"
+      - "Try: compare two approaches with tradeoffs"
+      - "Simple turns can commit the plain draft when the judge selects none"
+    show_timing: true

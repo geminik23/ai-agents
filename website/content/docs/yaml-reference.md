@@ -95,7 +95,7 @@ Maximum tokens the conversation history can contribute to the prompt. When excee
 | Detail | Value |
 |--------|-------|
 | **Type** | `u32` |
-| **Default** | `4096` |
+| **Default** | `128000` |
 
 ```yaml
 max_context_tokens: 128000
@@ -349,9 +349,12 @@ Each transition defines a rule for moving between states.
 | `to` | `string` | - | Target state name. Prefix with `^` to escape to a root-level state from a sub-state |
 | `when` | `string` | `null` | Natural-language condition evaluated by the router LLM |
 | `guard` | `object` | `null` | Deterministic context check - fires instantly, no LLM call needed |
-| `auto` | `bool` | `false` | Transition without re-evaluating (used when `when` is structural) |
+| `auto` | `bool` | `true` | Transition participates in automatic transition evaluation |
 | `priority` | `u32` | `0` | Higher priority transitions are evaluated first |
 | `cooldown_turns` | `u32` | `null` | Minimum turns before this transition can fire again |
+| `timing` | enum | `post_response` | `post_response`, `pre_response`, or `parallel`; `parallel` requires speculative state transitions and response-independent conditions |
+| `requires_response` | `bool` | `false` | Set true when the condition needs the assistant response text; rejected with non-post-response timing |
+| `run_extractors` | `bool` | `false` | Run current-state extractors for this pre-response transition and stage their values until the transition commits |
 
 ```yaml
 transitions:
@@ -370,6 +373,16 @@ transitions:
   # Escape to root-level state from inside a sub-state
   - to: "^escalation"
     when: "Problem is too complex or user is frustrated"
+
+  # Optional runtime-optimized transition. This is safe only because the guard
+  # reads context and does not need the assistant response.
+  - to: billing
+    guard:
+      context:
+        request.topic:
+          eq: billing
+    timing: pre_response
+    requires_response: false
 ```
 
 Guard expressions support:
@@ -2088,7 +2101,7 @@ observability:
     paths: [detected_language, input.language, user.language]
     fallback: unknown
   aggregation:
-    dimensions: [model, purpose, language, state]
+    dimensions: [model, purpose, language, state, background]
     percentiles: [0.5, 0.9, 0.95, 0.99]
     window_size: 1000
   privacy:
@@ -2109,6 +2122,7 @@ observability:
   buffer:
     event_buffer: 4096
     raw_event_limit: 10000
+    pending_branch_event_limit: 1024
     drop_on_full: true
 ```
 
@@ -2129,7 +2143,7 @@ observability:
 | `cost.pricing_file` | `string?` | `null` | Optional JSON/YAML pricing map resolved relative to the agent YAML file |
 | `cost.pricing` | `map` | `{}` | Provider/model pricing keyed as `provider/model`; inline values override `pricing_file` |
 | `language.paths` | `list` | common language paths | Dotted context paths used for the `language` dimension |
-| `aggregation.dimensions` | `list` | `[model, purpose]` | Dimensions for aggregate tables; supports `agent`, `actor`, `model`, `provider`, `alias`, `purpose`, `language`, `state`, `tool`, `skill`, `orchestration_pattern`, and `status` |
+| `aggregation.dimensions` | `list` | `[model, purpose]` | Dimensions for aggregate tables; supports `agent`, `actor`, `model`, `provider`, `alias`, `purpose`, `language`, `state`, `tool`, `skill`, `orchestration_pattern`, `status`, `branch_status`, `runtime_optimization`, `commit_behavior`, `speculative`, and `background`; `runtime_optimization` is reported with the output key `optimization` |
 | `aggregation.percentiles` | `list` | `[0.5, 0.9, 0.95, 0.99]` | Percentiles reported for latency |
 | `aggregation.window_size` | `usize` | `1000` | Rolling event window used for aggregate metrics |
 | `privacy.include_prompts` | `bool` | `false` | Retain redacted prompt text in raw event payloads |
@@ -2145,6 +2159,7 @@ observability:
 | `export.raw_events_format` | `enum` | `jsonl` | Raw event export format: `jsonl` or `json` |
 | `buffer.event_buffer` | `usize` | `4096` | Bounded in-memory event channel capacity |
 | `buffer.raw_event_limit` | `usize` | `10000` | Maximum raw events retained for raw export |
+| `buffer.pending_branch_event_limit` | `usize` | `1024` | Maximum delayed branch events retained before unfinalized branch events are counted as dropped |
 | `buffer.drop_on_full` | `bool` | `true` | Drop and count events when buffers are full instead of blocking |
 
 ### Pricing file example
@@ -2186,6 +2201,142 @@ Prometheus support currently renders text exposition output and writes it to a `
 
 ---
 
+## Runtime Optimization
+
+The `runtime.optimization` block enables opt-in latency optimizations. It is disabled by default, so existing agents keep the same serial response behavior unless this block is explicitly enabled.
+
+```yaml
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 0
+    pre_response_deterministic_transitions: true
+    pre_response_extractors: false
+    speculative_state_transitions: false
+    speculative_skill_routing: false
+    speculative_reasoning_auto: false
+    parallel_post_turn_memory: true
+    parallel_orchestration_vote_extraction: true
+    background_observability_export: false
+    streaming_policy: preflight_only
+    max_parallel_runtime_tasks: 4
+    post_turn:
+      facts:
+        mode: background
+        await_before_next_turn: same_actor
+      relationships:
+        mode: background
+        await_before_next_turn: same_actor
+      sessions:
+        mode: inline_serial
+        await_before_next_turn: always
+      memory_compression:
+        mode: inline_serial
+        await_before_next_turn: always
+      max_background_tasks: 16
+      on_background_overflow: run_inline
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `bool` | `false` | Enable runtime optimization behavior |
+| `max_speculative_llm_calls_per_turn` | `u32` | `0` | Per-turn cap for branch-managed speculative LLM calls; must be greater than zero when speculative flags are enabled and no larger than `max_parallel_runtime_tasks` |
+| `pre_response_deterministic_transitions` | `bool` | `false` | Check transitions explicitly marked `timing: pre_response` before old-state response generation |
+| `pre_response_extractors` | `bool` | `false` | Run current-state extractors before pre-response selection for all pre-response candidates; transition-level `run_extractors` keeps extraction scoped to that route |
+| `speculative_state_transitions` | `bool` | `false` | Enables `timing: parallel` response-independent transition branches beside a main response draft |
+| `speculative_skill_routing` | `bool` | `false` | Runs pure skill selection beside a main response draft; skill execution happens only after the skill branch wins |
+| `speculative_reasoning_auto` | `bool` | `false` | Runs the auto reasoning judge beside a plain draft; non-`none` decisions discard the draft and run the committed reasoning path. Auto speculation requires capacity for both draft and judge calls |
+| `parallel_post_turn_memory` | `bool` | `false` | Run inline facts and relationship maintenance concurrently when possible |
+| `parallel_orchestration_vote_extraction` | `bool` | `false` | Run voting extraction concurrently while preserving declaration order; bounded by `max_parallel_runtime_tasks` |
+| `background_observability_export` | `bool` | `false` | Reserved and rejected until immutable export snapshots are available |
+| `streaming_policy` | enum | `preflight_only` | `preflight_only`, `buffer_until_routing_done`, or `disabled`; buffered routing requires `streaming.enabled: true` and positive `streaming.buffer_size`. Buffered speculative streaming currently applies to response-independent parallel state-transition routing, and the buffer limit applies while routing is unresolved |
+| `max_parallel_runtime_tasks` | `usize` | `4` | Bounds optimized internal work such as vote extraction; must be greater than zero |
+| `post_turn.facts.mode` | enum | `inline_serial` | `inline_serial`, `inline_parallel`, or `background` |
+| `post_turn.facts.await_before_next_turn` | enum | `always` | `never`, `same_actor`, or `always` |
+| `post_turn.relationships.mode` | enum | `inline_serial` | `inline_serial`, `inline_parallel`, or `background` |
+| `post_turn.relationships.await_before_next_turn` | enum | `always` | `never`, `same_actor`, or `always` |
+| `post_turn.sessions` | object | `inline_serial` / `always` | Reserved unless left at the default policy |
+| `post_turn.memory_compression` | object | `inline_serial` / `always` | Reserved unless left at the default policy |
+| `post_turn.max_background_tasks` | `usize` | `16` | Background maintenance queue limit |
+| `post_turn.on_background_overflow` | enum | `run_inline` | `run_inline`, `drop`, or `error` |
+
+### How to choose runtime optimization fields
+
+Use the smallest flag that matches the latency problem you are solving. These settings are independent, but speculative settings share the same per-turn caps.
+
+| Goal | Enable | Also configure | What happens |
+|------|--------|----------------|--------------|
+| Skip an old-state response when a guard or resolved intent already proves the next state | `pre_response_deterministic_transitions` | Mark the transition with `timing: pre_response`; use `guard` or `intent` | The runtime commits the transition before the main LLM call and answers from the new state. No speculative LLM branch is needed. |
+| Let a response-independent natural-language route race a main draft | `speculative_state_transitions` | Mark the transition with `timing: parallel`; set `max_speculative_llm_calls_per_turn >= 2` and `max_parallel_runtime_tasks >= 2` | The runtime starts a main draft and a transition branch. If the transition wins, the draft is discarded before it can write memory or run tools. |
+| Let skill selection race a normal response | `speculative_skill_routing` | Define skills and leave no pending skill clarification; set enough speculative call capacity for draft + router | The branch performs pure selection only. Skill disambiguation and skill steps run after the skill branch wins. Low caps fall back to serial skill routing. |
+| Avoid waiting for auto reasoning on simple turns | `speculative_reasoning_auto` | Set `reasoning.mode: auto`; set capacity for both draft and judge calls | The plain draft and judge branch run together. `none` commits the draft; deeper modes discard the draft and run the committed reasoning path. Low caps fall back to the serial judge path. |
+| Hide stale stream chunks while a parallel transition is unresolved | `streaming_policy: buffer_until_routing_done` plus `speculative_state_transitions` | Set `streaming.enabled: true`; set positive `streaming.buffer_size`; use a response-independent `timing: parallel` transition | Main-stream chunks are hidden while routing is unresolved. If the route wins, stale chunks are discarded. The buffer limit applies only while routing is unresolved. |
+| Move future-turn actor memory work out of the response tail | `parallel_post_turn_memory` and/or `post_turn.*.mode: background` | Configure facts or relationships memory and choose `await_before_next_turn` freshness | Facts and relationship updates can run inline in parallel or in the background. Same-actor freshness can wait only when the same actor continues. |
+| Speed up vote extraction in concurrent orchestration | `parallel_orchestration_vote_extraction` | Set `max_parallel_runtime_tasks` for the extraction batch size | Vote extraction runs in bounded parallel, then results are restored to declaration order before tie-breaking. |
+
+Speculative settings should normally start with a small cap:
+
+```yaml
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    max_parallel_runtime_tasks: 2
+```
+
+Use observability when enabling speculative settings so discarded token and cost exposure is visible:
+
+```yaml
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+```
+
+See [Concepts](@/docs/concepts.md#runtime-optimization) for the branch commit/discard model and [Evaluation](@/docs/evaluation.md#observability-results) for branch metric assertions.
+
+Pre-response transitions are only safe when they do not need assistant response text. They must be deterministic, so `timing: pre_response` requires a `guard` or `intent` and must not include natural-language `when` text.
+
+Parallel transitions are speculative and response-independent. They are accepted only when `runtime.optimization.enabled: true`, `speculative_state_transitions: true`, and `max_speculative_llm_calls_per_turn > 0`. A parallel transition may use a natural-language `when`, but the evaluation prompt uses only the current user input and context, not assistant response text.
+
+```yaml
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Ask what the user needs."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              request.topic:
+                eq: billing
+          timing: pre_response
+          requires_response: false
+    billing:
+      prompt: "Help with billing."
+```
+
+A speculative main draft is inert until it wins. Losing drafts are discarded without writing assistant memory, executing parsed tool calls, mutating context, or firing final response hooks. Plain drafts commit only when they preserve the equivalent serial path. Forced reasoning modes use the serial path, and auto reasoning speculation runs only when both the draft and judge branch fit the configured caps. Branch-managed LLM calls are finalized in observability with `branch_status`, `optimization`, `commit_behavior`, `winner`, and `speculative` dimensions. Low speculative caps schedule only behavior-preserving branches; skipped branch families fall back to the serial committed path.
+
+```yaml
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 4
+    speculative_state_transitions: true
+    speculative_skill_routing: true
+    speculative_reasoning_auto: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 4
+```
+
+Buffered streaming with `buffer_until_routing_done` hides unresolved main-stream text while a parallel state-transition branch can still discard it. The buffer limit applies while routing is unresolved. Once the transition branch misses or fails, later chunks are not counted against that unresolved-route buffer. If the route wins, stale buffered text is dropped and the committed route response is emitted. If the main branch wins, buffered chunks are emitted only when they still match the committed response; otherwise the committed response content is emitted.
+
+Background facts and relationship updates use actor-scoped ordering. Freshness waits are task-aware: `facts.await_before_next_turn` flushes pending fact tasks, and `relationships.await_before_next_turn` flushes pending relationship tasks. Use `same_actor` when low response tail latency is acceptable but the next turn from the same actor must see fresh memory.
+
+---
+
 ## Streaming & Parallel Tools
 
 ### `streaming`
@@ -2195,7 +2346,7 @@ Stream LLM tokens to the user in real time instead of waiting for the full respo
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | `bool` | `true` | Enable streaming mode |
-| `buffer_size` | `usize` | `32` | Token buffer size |
+| `buffer_size` | `usize` | `256` | Stream chunk buffer size. For `buffer_until_routing_done`, this limits hidden chunks while routing is unresolved |
 | `include_tool_events` | `bool` | `true` | Stream tool call events |
 | `include_state_events` | `bool` | `true` | Stream state transition events |
 
@@ -2789,7 +2940,7 @@ assert:
 | `relationship` | Relationship existence, actor, perspective, interaction counts, event counts, and dimension comparisons. |
 | `persona_secret_revealed` | Persona secret reveal state. Boolean form checks if any secret is revealed. String form checks revealed secret IDs when available. |
 | `orchestration` | Orchestration metadata such as pattern, final agent, included agents, and stage count. |
-| `observability` | Observability report limits and counts for LLM calls, tool calls, tokens, cost, purpose counts, and status counts. |
+| `observability` | Observability report limits and counts for LLM calls, tool calls, tokens, cost, purpose counts, status counts, and configured dimension counts. |
 | `judge`, `response_semantic` | Optional LLM judge checks for semantic quality. Supports `llm`, `pass_threshold`, and weighted criteria. |
 
 Path assertion fields:
@@ -2868,6 +3019,12 @@ assert:
           main_response:
             path: count
             gte: 1
+        dimension_counts:
+          - match_dimensions:
+              background: "true"
+            assert:
+              path: count
+              gte: 1
 ```
 
 Assertion-specific fields:
@@ -2877,7 +3034,7 @@ Assertion-specific fields:
 | `facts_include` | `actor`, `category`, `semantic`. `semantic` uses a judge LLM to check whether the selected fact set supports the claim. |
 | `relationship` | `actor`, `exists`, `perspective`, `dimension`, `gte`, `lte`, `gt`, `lt`, `eq`, `interaction_count_gte`, `notable_event_count_gte`. |
 | `orchestration` | `pattern`, `type`, `final_agent_in`, `agents_include`, `stages`. Agent matching checks common metadata shapes such as agents arrays, stage agent IDs, participants, and handoff events. |
-| `observability` | `total_llm_calls_lte`, `total_tool_calls_lte`, `total_tokens_lte`, `total_cost_usd_lte`, `purpose_counts`, `status_counts`. Count maps use path assertion syntax over `{ count: N }`. |
+| `observability` | `total_llm_calls_lte`, `total_tool_calls_lte`, `total_tokens_lte`, `total_cost_usd_lte`, `purpose_counts`, `status_counts`, `dimension_counts`. Count assertions use path assertion syntax over `{ count: N }`. |
 
 Example judge assertion:
 

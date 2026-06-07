@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.14"
+ai-agents = "1.0.0-rc.15"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,7 +35,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0.0-rc.14", features = ["full"] }
+ai-agents = { version = "1.0.0-rc.15", features = ["full"] }
 ```
 
 ---
@@ -228,6 +228,28 @@ while let Some(chunk) = stream.next().await {
 | `StateTransition`  | State machine moved to a new state         |
 | `Done`             | Stream is complete                         |
 | `Error`            | Something went wrong                       |
+
+---
+
+## Runtime Optimization Types
+
+Most runtime optimization behavior is configured in YAML, but policy types are re-exported for Rust hosts that build specs or inspect configuration programmatically.
+
+```rust
+use ai_agents::{
+    RuntimeConfig, RuntimeOptimizationConfig, RuntimeOptimizationKind,
+    RuntimeBranchResult, RuntimeCommitBehavior, RuntimeTaskPurpose,
+    StreamingOptimizationPolicy, TransitionTiming,
+};
+
+let mut runtime = RuntimeConfig::default();
+runtime.optimization.enabled = true;
+runtime.optimization.max_speculative_llm_calls_per_turn = 4;
+runtime.optimization.speculative_state_transitions = true;
+runtime.optimization.streaming_policy = StreamingOptimizationPolicy::BufferUntilRoutingDone;
+```
+
+Branch observability labels use `RuntimeOptimizationKind` and `RuntimeCommitBehavior` internally. Public users normally read those labels from observability reports rather than constructing branches directly. `RuntimeBranchResult` covers scheduler-managed blocking branch outputs, while buffered streaming uses `StreamingDraftResult` through its streaming-specific safety path. Buffered streaming with `BufferUntilRoutingDone` currently applies to response-independent parallel state-transition routing. Its buffer limit protects unresolved routing; after routing misses or fails, later chunks are collected for the committed output without consuming that unresolved-route buffer.
 
 ---
 
@@ -681,10 +703,10 @@ Session persistence requires a storage backend. Enable one via feature flags:
 
 ```toml
 # SQLite (file-based, good for single-server)
-ai-agents = { version = "1.0.0-rc.14", features = ["sqlite"] }
+ai-agents = { version = "1.0.0-rc.15", features = ["sqlite"] }
 
 # Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.14", features = ["redis-storage"] }
+ai-agents = { version = "1.0.0-rc.15", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -830,7 +852,7 @@ Some internal feature crates avoid depending on `ai-agents-observability` direct
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.14)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.15)**
 
 ---
 
