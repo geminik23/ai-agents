@@ -79,10 +79,13 @@
 pub mod agent {
     pub use ai_agents_runtime::{
         Agent, AgentBuilder, AgentInfo, AgentResponse, AwaitBeforeNextTurn,
-        BackgroundOverflowPolicy, MaintenanceMode, MaintenanceTaskPolicy, ParallelToolsConfig,
-        PostTurnOptimizationConfig, RuntimeAgent, RuntimeConfig, RuntimeOptimizationConfig,
-        RuntimeTaskPurpose, StreamChunk, StreamingConfig, StreamingOptimizationPolicy, ToolCall,
-        TurnActorContext,
+        BackgroundOverflowPolicy, MainResponseDraft, MaintenanceMode, MaintenanceTaskPolicy,
+        ParallelToolsConfig, PostTurnOptimizationConfig, RuntimeAgent, RuntimeBranch,
+        RuntimeBranchOutcome, RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior,
+        RuntimeConfig, RuntimeOptimizationConfig, RuntimeOptimizationKind, RuntimeTaskPriority,
+        RuntimeTaskPurpose, ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamChunk,
+        StreamingConfig, StreamingDraftResult, StreamingOptimizationPolicy, ToolCall,
+        TurnActorContext, TurnBranchScheduler, TurnOptimizationContext,
     };
 }
 
@@ -495,9 +498,13 @@ pub mod orchestration {
 // Top-level re-exports (legacy interface)
 pub use agent::{
     Agent, AgentBuilder, AgentInfo, AgentResponse, AwaitBeforeNextTurn, BackgroundOverflowPolicy,
-    MaintenanceMode, MaintenanceTaskPolicy, ParallelToolsConfig, PostTurnOptimizationConfig,
-    RuntimeAgent, RuntimeConfig, RuntimeOptimizationConfig, RuntimeTaskPurpose, StreamChunk,
-    StreamingConfig, StreamingOptimizationPolicy, TurnActorContext,
+    MainResponseDraft, MaintenanceMode, MaintenanceTaskPolicy, ParallelToolsConfig,
+    PostTurnOptimizationConfig, RuntimeAgent, RuntimeBranch, RuntimeBranchOutcome,
+    RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior, RuntimeConfig,
+    RuntimeOptimizationConfig, RuntimeOptimizationKind, RuntimeTaskPriority, RuntimeTaskPurpose,
+    ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamChunk, StreamingConfig,
+    StreamingDraftResult, StreamingOptimizationPolicy, TurnActorContext, TurnBranchScheduler,
+    TurnOptimizationContext,
 };
 pub use error::{AgentError, Result};
 pub use memory::{

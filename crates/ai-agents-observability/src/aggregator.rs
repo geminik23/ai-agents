@@ -242,6 +242,11 @@ pub fn dimension_value(
             .get("commit_behavior")
             .or_else(|| event.dimensions.get("runtime.commit_behavior"))
             .cloned(),
+        AggregationDimension::Speculative => event
+            .dimensions
+            .get("speculative")
+            .or_else(|| event.dimensions.get("runtime.speculative"))
+            .cloned(),
         AggregationDimension::Background => event
             .dimensions
             .get("background")

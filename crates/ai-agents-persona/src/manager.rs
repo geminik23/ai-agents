@@ -95,34 +95,48 @@ impl PersonaManager {
         // Render the base prompt (identity + traits + goals).
         let base_prompt = prompt::render_full_prompt(&config, context, &self.renderer)?;
 
-        // Evaluate secrets and find newly revealed ones.
         let (revealed_contents, newly_revealed) = self.evaluate_and_track_secrets(&config, context);
-
-        // Append secrets section if any are revealed.
-        let secrets_section = prompt::render_secrets_section(&revealed_contents);
-        let full_prompt = if secrets_section.is_empty() {
-            base_prompt.clone()
-        } else {
-            format!("{}\n\n{}", base_prompt, secrets_section)
-        };
-
-        // Check token budget and use condensed format if needed.
-        let final_prompt = if let Some(max_tokens) = config.max_prompt_tokens {
-            let estimated = prompt::estimate_tokens(&full_prompt);
-            if estimated > max_tokens {
-                let condensed = prompt::render_condensed_prompt(&config, context, &self.renderer)?;
-                condensed
-            } else {
-                full_prompt
-            }
-        } else {
-            full_prompt
-        };
+        let final_prompt =
+            self.render_prompt_with_revealed(&config, context, base_prompt, &revealed_contents)?;
 
         Ok(PersonaRenderResult {
             prompt: final_prompt,
             newly_revealed,
         })
+    }
+
+    /// Render the persona prompt without updating reveal tracking.
+    pub fn render_prompt_preview(&self, context: &HashMap<String, Value>) -> Result<String> {
+        let config = self
+            .config
+            .read()
+            .map_err(|e| AgentError::Config(format!("Persona config lock poisoned: {}", e)))?;
+        let base_prompt = prompt::render_full_prompt(&config, context, &self.renderer)?;
+        let revealed_contents = self.revealed_secrets(context);
+        self.render_prompt_with_revealed(&config, context, base_prompt, &revealed_contents)
+    }
+
+    fn render_prompt_with_revealed(
+        &self,
+        config: &PersonaConfig,
+        context: &HashMap<String, Value>,
+        base_prompt: String,
+        revealed_contents: &[String],
+    ) -> Result<String> {
+        let secrets_section = prompt::render_secrets_section(revealed_contents);
+        let full_prompt = if secrets_section.is_empty() {
+            base_prompt
+        } else {
+            format!("{}\n\n{}", base_prompt, secrets_section)
+        };
+
+        if let Some(max_tokens) = config.max_prompt_tokens {
+            let estimated = prompt::estimate_tokens(&full_prompt);
+            if estimated > max_tokens {
+                return prompt::render_condensed_prompt(config, context, &self.renderer);
+            }
+        }
+        Ok(full_prompt)
     }
 
     /// Get structured identity for programmatic access.

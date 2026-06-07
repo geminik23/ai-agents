@@ -138,13 +138,14 @@ impl ObservabilityManager {
         branch_status: impl Into<String>,
         winner: bool,
         extra_tags: HashMap<String, String>,
-    ) {
+    ) -> usize {
         let mut events = self
             .pending_branch_events
             .write()
             .remove(branch_id)
             .unwrap_or_default();
         let status = branch_status.into();
+        let count = events.len();
         for event in &mut events {
             event
                 .tags
@@ -152,6 +153,7 @@ impl ObservabilityManager {
             event
                 .tags
                 .insert("runtime.winner".to_string(), winner.to_string());
+            event.tags.insert("winner".to_string(), winner.to_string());
             event
                 .dimensions
                 .insert("branch_status".to_string(), status.clone());
@@ -161,12 +163,16 @@ impl ObservabilityManager {
             event
                 .dimensions
                 .insert("runtime.winner".to_string(), winner.to_string());
+            event
+                .dimensions
+                .insert("winner".to_string(), winner.to_string());
             for (key, value) in &extra_tags {
                 event.tags.insert(key.clone(), value.clone());
                 event.dimensions.insert(key.clone(), value.clone());
             }
             self.record_event(event.clone());
         }
+        count
     }
 
     /// Queues a completed event without blocking the observed call path.
@@ -567,8 +573,12 @@ mod tests {
         let manager = ObservabilityManager::new(config);
         manager.record_pending_event("branch", test_event());
 
+        let mut tags = HashMap::new();
+        tags.insert("runtime.speculative".to_string(), "true".to_string());
+        tags.insert("speculative".to_string(), "true".to_string());
+
         assert_eq!(manager.generate_report().summary.total_events, 0);
-        manager.finalize_pending_branch("branch", "discarded", false, HashMap::new());
+        manager.finalize_pending_branch("branch", "discarded", false, tags);
         let report = manager.generate_report();
         assert_eq!(report.summary.total_events, 1);
         assert_eq!(
@@ -578,6 +588,16 @@ mod tests {
         assert_eq!(
             manager.raw_events()[0].dimensions.get("runtime.winner"),
             Some(&"false".to_string())
+        );
+        assert_eq!(
+            manager.raw_events()[0].dimensions.get("speculative"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            manager.raw_events()[0]
+                .dimensions
+                .get("runtime.speculative"),
+            Some(&"true".to_string())
         );
     }
 

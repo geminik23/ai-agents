@@ -65,8 +65,11 @@ use super::{
     Agent, AgentInfo, AgentResponse, ParallelToolsConfig, StreamChunk, StreamingConfig, ToolCall,
 };
 use crate::optimization::{
-    AwaitBeforeNextTurn, BackgroundMaintenanceQueue, BackgroundOverflowPolicy, MaintenanceMode,
-    MaintenanceSequenceKey, RuntimeConfig, RuntimeTaskPurpose, TransitionCandidate,
+    AwaitBeforeNextTurn, BackgroundMaintenanceQueue, BackgroundOverflowPolicy, MainResponseDraft,
+    MaintenanceMode, MaintenanceSequenceKey, RuntimeBranch, RuntimeBranchResult,
+    RuntimeBranchStatus, RuntimeCommitBehavior, RuntimeConfig, RuntimeOptimizationKind,
+    RuntimeTaskPriority, RuntimeTaskPurpose, ScheduledBranchSet, SkillCandidate,
+    StreamingDraftResult, TransitionCandidate, TurnBranchScheduler, TurnOptimizationContext,
 };
 use crate::spec::StorageConfig;
 
@@ -99,6 +102,22 @@ enum PostLoopResult {
     /// Transition fired into a state that requires full dispatch.
     /// Caller re-enters run_loop_internal to apply the correct handler.
     NeedsRedispatch,
+}
+
+struct RootTurnCleanup<'a> {
+    agent: &'a RuntimeAgent,
+}
+
+impl<'a> RootTurnCleanup<'a> {
+    fn new(agent: &'a RuntimeAgent) -> Self {
+        Self { agent }
+    }
+}
+
+impl Drop for RootTurnCleanup<'_> {
+    fn drop(&mut self) {
+        self.agent.end_root_turn();
+    }
 }
 
 pub struct RuntimeAgent {
@@ -151,6 +170,8 @@ pub struct RuntimeAgent {
     /// Re-dispatch depth for post-transition full dispatch.
     /// 0 = not re-dispatching. > 0 = user message already in memory, skip re-adding.
     redispatch_depth: RwLock<u32>,
+    /// Active optimized turn context used to keep root lifecycle state in one place.
+    active_turn_context: RwLock<Option<TurnOptimizationContext>>,
     /// Tracks whether the root turn already wrote the processed user message.
     root_user_message_committed: AtomicBool,
     /// Current actor ID for cross-session memory.
@@ -317,6 +338,7 @@ impl RuntimeAgent {
             spawner: None,
             spawner_registry: None,
             redispatch_depth: RwLock::new(0),
+            active_turn_context: RwLock::new(None),
             root_user_message_committed: AtomicBool::new(false),
             actor_id: RwLock::new(None),
             fact_store: RwLock::new(None),
@@ -760,8 +782,49 @@ impl RuntimeAgent {
     /// Starts root-turn bookkeeping for user-message commit tracking.
     fn begin_root_turn(&self) {
         if *self.redispatch_depth.read() == 0 {
-            self.root_user_message_committed
-                .store(false, Ordering::SeqCst);
+            let mut guard = self.active_turn_context.write();
+            if guard.is_none() {
+                self.root_user_message_committed
+                    .store(false, Ordering::SeqCst);
+                let max_calls = self
+                    .runtime_config
+                    .optimization
+                    .max_speculative_llm_calls_per_turn;
+                *guard = Some(TurnOptimizationContext::new(
+                    String::new(),
+                    HashMap::new(),
+                    max_calls,
+                ));
+            }
+        }
+    }
+
+    fn update_active_turn_context(
+        &self,
+        processed_input: &str,
+        input_context: HashMap<String, Value>,
+    ) {
+        if *self.redispatch_depth.read() > 0 {
+            return;
+        }
+        let max_calls = self
+            .runtime_config
+            .optimization
+            .max_speculative_llm_calls_per_turn;
+        let mut guard = self.active_turn_context.write();
+        match guard.as_mut() {
+            Some(context) => {
+                context.processed_input = processed_input.to_string();
+                context.input_context = input_context;
+                context.max_speculative_llm_calls = max_calls;
+            }
+            None => {
+                *guard = Some(TurnOptimizationContext::new(
+                    processed_input,
+                    input_context,
+                    max_calls,
+                ));
+            }
         }
     }
 
@@ -777,6 +840,9 @@ impl RuntimeAgent {
             self.memory
                 .add_message(ChatMessage::user(processed_input))
                 .await?;
+            if let Some(context) = self.active_turn_context.write().as_mut() {
+                context.mark_user_message_committed();
+            }
         }
         Ok(())
     }
@@ -786,7 +852,31 @@ impl RuntimeAgent {
         if *self.redispatch_depth.read() == 0 {
             self.root_user_message_committed
                 .store(false, Ordering::SeqCst);
+            *self.active_turn_context.write() = None;
         }
+    }
+
+    fn reserve_active_speculative_llm_call(&self, kind: RuntimeOptimizationKind) -> bool {
+        self.begin_root_turn();
+        let mut guard = self.active_turn_context.write();
+        let Some(context) = guard.as_mut() else {
+            return false;
+        };
+        context.reserve_speculative_llm_call_for(kind)
+    }
+
+    fn branch_context_preview(&self) -> String {
+        let context = self.build_context_with_overlays();
+        let mut value = serde_json::to_string_pretty(&context).unwrap_or_else(|_| "{}".to_string());
+        const MAX_CONTEXT_PREVIEW_CHARS: usize = 2048;
+        if value.chars().count() > MAX_CONTEXT_PREVIEW_CHARS {
+            value = value
+                .chars()
+                .take(MAX_CONTEXT_PREVIEW_CHARS)
+                .collect::<String>();
+            value.push_str("...");
+        }
+        value
     }
 
     /// Applies freshness policy before rendering the next prompt.
@@ -1920,7 +2010,7 @@ impl RuntimeAgent {
     }
 
     pub fn set_context(&self, key: &str, value: Value) -> Result<()> {
-        self.context_manager.set(key, value)
+        self.context_manager.update(key, value)
     }
 
     pub fn update_context(&self, path: &str, value: Value) -> Result<()> {
@@ -2443,20 +2533,23 @@ impl RuntimeAgent {
         });
     }
 
-    async fn get_effective_system_prompt(&self) -> Result<String> {
+    async fn get_effective_system_prompt_with_persona_hooks(
+        &self,
+        fire_persona_hooks: bool,
+    ) -> Result<String> {
         let rendered_base = self.render_system_prompt()?;
 
-        // Render persona prompt (if configured) and fire hooks for newly revealed secrets.
         let persona_prefix = if let Some(ref persona) = self.persona_manager {
             let context = self.build_context_with_overlays();
-            let render_result = persona.render_prompt(&context)?;
-
-            // Fire on_secret_revealed for each newly revealed secret.
-            for content in &render_result.newly_revealed {
-                self.hooks.on_secret_revealed(content).await;
+            if fire_persona_hooks {
+                let render_result = persona.render_prompt(&context)?;
+                for content in &render_result.newly_revealed {
+                    self.hooks.on_secret_revealed(content).await;
+                }
+                render_result.prompt
+            } else {
+                persona.render_prompt_preview(&context)?
             }
-
-            render_result.prompt
         } else {
             String::new()
         };
@@ -2681,22 +2774,34 @@ impl RuntimeAgent {
     }
 
     async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
-        let system_prompt = self.get_effective_system_prompt().await?;
+        self.build_messages_internal(true, None).await
+    }
+
+    async fn build_messages_for_draft(&self, user_message: &str) -> Result<Vec<ChatMessage>> {
+        self.build_messages_internal(false, Some(user_message))
+            .await
+    }
+
+    async fn build_messages_internal(
+        &self,
+        fire_persona_hooks: bool,
+        ephemeral_user_message: Option<&str>,
+    ) -> Result<Vec<ChatMessage>> {
+        let system_prompt = self
+            .get_effective_system_prompt_with_persona_hooks(fire_persona_hooks)
+            .await?;
         let mut messages = vec![ChatMessage::system(&system_prompt)];
 
-        // Use get_context() instead of get_messages() so that the conversation
-        // summary produced by CompactingMemory is included in the prompt.
-        // Token budget controls what's stored in memory (via handle_memory_overflow)
-        // max_context_tokens + ContextOverflowAction handles LLM context limits
         let context = self.memory.get_context().await?;
         let history = if let Some(ref budget) = self.memory_token_budget {
-            // Use per-component allocation so summary and recent messages
-            // are each capped to their declared token budgets.
             context.to_llm_messages_with_allocation(&budget.allocation)
         } else {
             context.to_llm_messages()
         };
         messages.extend(history);
+        if let Some(user_message) = ephemeral_user_message {
+            messages.push(ChatMessage::user(user_message));
+        }
 
         let total_tokens = self.estimate_total_tokens(&messages);
 
@@ -3155,152 +3260,164 @@ impl RuntimeAgent {
         result
     }
 
-    /// Result of skill routing — three possible outcomes.
-    /// NoMatch: no skill matched, continue to normal LLM chat.
-    /// Response: skill executed successfully, here is the response string.
-    /// NeedsClarification: skill matched but needs disambiguation first.
-    async fn try_skill_route(&self, input: &str) -> Result<SkillRouteResult> {
-        if let Some(ref router) = self.skill_router {
-            let available_skills = self.get_available_skills();
-            let skill_ids: Vec<&str> = available_skills.iter().map(|s| s.id.as_str()).collect();
+    //
+    // This method is branch-safe because it only asks the router which skill matches.
+    // Do not add disambiguation, pending-skill writes, or skill execution here.
+    //
+    /// Selects a skill without executing it.
+    async fn select_skill_candidate(&self, input: &str) -> Result<Option<SkillCandidate>> {
+        let Some(ref router) = self.skill_router else {
+            return Ok(None);
+        };
+        let available_skills = self.get_available_skills();
+        if available_skills.is_empty() {
+            return Ok(None);
+        }
+        let skill_ids: Vec<&str> = available_skills.iter().map(|s| s.id.as_str()).collect();
+        let Some(skill_id) = self
+            .observe_purpose(
+                ObservationPurpose::SkillRouting,
+                router.select_skill_filtered(input, &skill_ids),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let skill = router
+            .get_skill(&skill_id)
+            .cloned()
+            .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
+        info!(skill_id = %skill_id, "Skill selected");
+        Ok(Some(SkillCandidate::new(skill_id, skill)))
+    }
 
-            if let Some(skill_id) = self
-                .observe_purpose(
-                    ObservationPurpose::SkillRouting,
-                    router.select_skill_filtered(input, &skill_ids),
-                )
-                .await?
-            {
-                info!(skill_id = %skill_id, "Skill selected");
+    //
+    // This is the commit half of skill routing.
+    // It may mutate pending skill state, run clarification, and execute skill steps.
+    //
+    async fn commit_skill_candidate_route_result(
+        &self,
+        candidate: SkillCandidate,
+        input: &str,
+    ) -> Result<SkillRouteResult> {
+        let skill_id = candidate.skill_id;
+        let skill = candidate.skill;
+        if let Some(ref skill_disambig) = skill.disambiguation {
+            if skill_disambig.enabled.unwrap_or(false) {
+                if let Some(ref disambiguator) = self.disambiguation_manager {
+                    let context = self.build_disambiguation_context().await?;
+                    let state_override = self
+                        .state_machine
+                        .as_ref()
+                        .and_then(|sm| sm.current_definition())
+                        .and_then(|def| def.disambiguation.clone());
 
-                let skill = router
-                    .get_skill(&skill_id)
-                    .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
-
-                // Skill-level disambiguation check: if the skill has a disambiguation
-                // override and it's enabled, run a second disambiguation pass before
-                // executing. This lets skills enforce stricter thresholds and
-                // required_clarity fields (e.g. transfer_money requiring recipient + amount).
-                if let Some(ref skill_disambig) = skill.disambiguation {
-                    if skill_disambig.enabled.unwrap_or(false) {
-                        if let Some(ref disambiguator) = self.disambiguation_manager {
-                            let context = self.build_disambiguation_context().await?;
-                            let state_override = self
-                                .state_machine
-                                .as_ref()
-                                .and_then(|sm| sm.current_definition())
-                                .and_then(|def| def.disambiguation.clone());
-
-                            match self
-                                .observe_purpose(
-                                    ObservationPurpose::DisambiguationDetection,
-                                    disambiguator.process_input_with_override(
-                                        input,
-                                        &context,
-                                        state_override.as_ref(),
-                                        Some(skill_disambig),
-                                    ),
+                    match self
+                        .observe_purpose(
+                            ObservationPurpose::DisambiguationDetection,
+                            disambiguator.process_input_with_override(
+                                input,
+                                &context,
+                                state_override.as_ref(),
+                                Some(skill_disambig),
+                            ),
+                        )
+                        .await?
+                    {
+                        DisambiguationResult::Clear => {
+                            debug!(skill_id = %skill_id, "Skill disambiguation: clear");
+                        }
+                        DisambiguationResult::NeedsClarification {
+                            question,
+                            detection,
+                        } => {
+                            info!(
+                                skill_id = %skill_id,
+                                ambiguity_type = ?detection.ambiguity_type,
+                                confidence = detection.confidence,
+                                "Skill requires clarification before execution"
+                            );
+                            *self.pending_skill_id.write() = Some(skill_id.clone());
+                            return Ok(SkillRouteResult::NeedsClarification(
+                                AgentResponse::new(&question.question).with_metadata(
+                                    "disambiguation",
+                                    serde_json::json!({
+                                        "status": "awaiting_clarification",
+                                        "skill_id": skill_id,
+                                        "options": question.options,
+                                        "clarifying": question.clarifying,
+                                        "detection": {
+                                            "type": detection.ambiguity_type,
+                                            "confidence": detection.confidence,
+                                            "what_is_unclear": detection.what_is_unclear,
+                                        }
+                                    }),
+                                ),
+                            ));
+                        }
+                        DisambiguationResult::Clarified { enriched_input, .. } => {
+                            info!(skill_id = %skill_id, enriched = %enriched_input, "Skill disambiguation clarified");
+                            return Ok(SkillRouteResult::Response(
+                                self.execute_skill(&skill, &enriched_input).await?,
+                            ));
+                        }
+                        DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                            info!(skill_id = %skill_id, "Skill disambiguation best guess");
+                            return Ok(SkillRouteResult::Response(
+                                self.execute_skill(&skill, &enriched_input).await?,
+                            ));
+                        }
+                        DisambiguationResult::GiveUp { reason } => {
+                            warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
+                            let apology = self
+                                .generate_localized_apology(
+                                    "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                                    &reason,
                                 )
-                                .await?
-                            {
-                                DisambiguationResult::Clear => {
-                                    debug!(skill_id = %skill_id, "Skill disambiguation: clear");
-                                    // Fall through to execute_skill below
-                                }
-                                DisambiguationResult::NeedsClarification {
-                                    question,
-                                    detection,
-                                } => {
-                                    info!(
-                                        skill_id = %skill_id,
-                                        ambiguity_type = ?detection.ambiguity_type,
-                                        confidence = detection.confidence,
-                                        "Skill requires clarification before execution"
-                                    );
-                                    // Tag the runtime with the skill ID so the next turn
-                                    // routes directly to this skill after clarification resolves.
-                                    *self.pending_skill_id.write() = Some(skill_id.clone());
-
-                                    return Ok(SkillRouteResult::NeedsClarification(
-                                        AgentResponse::new(&question.question).with_metadata(
-                                            "disambiguation",
-                                            serde_json::json!({
-                                                "status": "awaiting_clarification",
-                                                "skill_id": skill_id,
-                                                "options": question.options,
-                                                "clarifying": question.clarifying,
-                                                "detection": {
-                                                    "type": detection.ambiguity_type,
-                                                    "confidence": detection.confidence,
-                                                    "what_is_unclear": detection.what_is_unclear,
-                                                }
-                                            }),
-                                        ),
-                                    ));
-                                }
-                                DisambiguationResult::Clarified { enriched_input, .. } => {
-                                    info!(
-                                        skill_id = %skill_id,
-                                        enriched = %enriched_input,
-                                        "Skill disambiguation clarified, executing with enriched input"
-                                    );
-                                    return Ok(SkillRouteResult::Response(
-                                        self.execute_skill(skill, &enriched_input).await?,
-                                    ));
-                                }
-                                DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
-                                    info!(skill_id = %skill_id, "Skill disambiguation: proceeding with best guess");
-                                    return Ok(SkillRouteResult::Response(
-                                        self.execute_skill(skill, &enriched_input).await?,
-                                    ));
-                                }
-                                DisambiguationResult::GiveUp { reason } => {
-                                    warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
-                                    let apology = self
-                                        .generate_localized_apology(
-                                            "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
-                                            &reason,
-                                        )
-                                        .await
-                                        .unwrap_or_else(|_| {
-                                            format!("I'm sorry, I couldn't understand your request: {}", reason)
-                                        });
-                                    return Ok(SkillRouteResult::NeedsClarification(
-                                        AgentResponse::new(&apology),
-                                    ));
-                                }
-                                DisambiguationResult::Escalate { reason } => {
-                                    info!(skill_id = %skill_id, reason = %reason, "Skill disambiguation escalating");
-                                    let apology = self
-                                        .generate_localized_apology(
-                                            "Explain briefly that you're transferring the user to a human agent for help.",
-                                            &reason,
-                                        )
-                                        .await
-                                        .unwrap_or_else(|_| {
-                                            format!("I need human assistance to help with your request: {}", reason)
-                                        });
-                                    return Ok(SkillRouteResult::NeedsClarification(
-                                        AgentResponse::new(&apology),
-                                    ));
-                                }
-                                DisambiguationResult::Abandoned { .. } => {
-                                    // User abandoned during skill-level disambiguation.
-                                    // Return NoMatch so run_loop falls through to normal processing.
-                                    debug!(skill_id = %skill_id, "Skill disambiguation abandoned");
-                                    return Ok(SkillRouteResult::NoMatch);
-                                }
-                            }
+                                .await
+                                .unwrap_or_else(|_| {
+                                    format!("I'm sorry, I couldn't understand your request: {}", reason)
+                                });
+                            return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
+                                &apology,
+                            )));
+                        }
+                        DisambiguationResult::Escalate { reason } => {
+                            info!(skill_id = %skill_id, reason = %reason, "Skill disambiguation escalating");
+                            let apology = self
+                                .generate_localized_apology(
+                                    "Explain briefly that you're transferring the user to a human agent for help.",
+                                    &reason,
+                                )
+                                .await
+                                .unwrap_or_else(|_| {
+                                    format!("I need human assistance to help with your request: {}", reason)
+                                });
+                            return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
+                                &apology,
+                            )));
+                        }
+                        DisambiguationResult::Abandoned { .. } => {
+                            debug!(skill_id = %skill_id, "Skill disambiguation abandoned");
+                            return Ok(SkillRouteResult::NoMatch);
                         }
                     }
                 }
-
-                return Ok(SkillRouteResult::Response(
-                    self.execute_skill(skill, input).await?,
-                ));
             }
         }
-        Ok(SkillRouteResult::NoMatch)
+        Ok(SkillRouteResult::Response(
+            self.execute_skill(&skill, input).await?,
+        ))
+    }
+
+    /// Result of skill routing.
+    async fn try_skill_route(&self, input: &str) -> Result<SkillRouteResult> {
+        if let Some(candidate) = self.select_skill_candidate(input).await? {
+            self.commit_skill_candidate_route_result(candidate, input)
+                .await
+        } else {
+            Ok(SkillRouteResult::NoMatch)
+        }
     }
 
     /// Execute a skill with reasoning and reflection, returning the response string.
@@ -3671,6 +3788,10 @@ OVERALL: PASS/FAIL"#,
         let Some((transitions, current_state)) = self.transitions_available_for_commit() else {
             return Ok(None);
         };
+        let transitions: Vec<Transition> = transitions
+            .into_iter()
+            .filter(|transition| matches!(transition.timing, TransitionTiming::PostResponse))
+            .collect();
         if transitions.is_empty() {
             return Ok(None);
         }
@@ -3913,6 +4034,709 @@ OVERALL: PASS/FAIL"#,
             .map(Some)
     }
 
+    //
+    // Speculative branches overlap independent decisions but still commit exactly one path.
+    // Losing branches must remain data only and must not write memory, run tools, or emit output.
+    //
+    async fn try_speculative_branches(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+    ) -> Result<Option<AgentResponse>> {
+        let optimization = &self.runtime_config.optimization;
+        if !optimization.enabled {
+            return Ok(None);
+        }
+
+        let effective_reasoning_mode = self.get_effective_reasoning_config().mode.clone();
+        if !matches!(
+            effective_reasoning_mode,
+            ReasoningMode::None | ReasoningMode::Auto
+        ) {
+            return Ok(None);
+        }
+
+        let mut transition_enabled =
+            optimization.speculative_state_transitions && self.has_parallel_transition_candidates();
+        let mut skill_enabled = optimization.speculative_skill_routing
+            && self.skill_router.is_some()
+            && self.pending_skill_id.read().is_none();
+        let mut reasoning_enabled = optimization.speculative_reasoning_auto
+            && matches!(effective_reasoning_mode, ReasoningMode::Auto);
+
+        if matches!(effective_reasoning_mode, ReasoningMode::Auto) {
+            if !reasoning_enabled || optimization.max_speculative_llm_calls_per_turn < 2 {
+                return Ok(None);
+            }
+        }
+
+        if !transition_enabled && !skill_enabled && !reasoning_enabled {
+            return Ok(None);
+        }
+
+        let mut optional_slots = optimization.max_parallel_runtime_tasks.saturating_sub(1);
+        let mut speculative_call_slots = optimization
+            .max_speculative_llm_calls_per_turn
+            .saturating_sub(1);
+        if reasoning_enabled {
+            if optional_slots == 0 || speculative_call_slots == 0 {
+                return Ok(None);
+            }
+            optional_slots -= 1;
+            speculative_call_slots -= 1;
+        }
+        if transition_enabled {
+            if optional_slots == 0 || speculative_call_slots == 0 {
+                transition_enabled = false;
+            } else {
+                optional_slots -= 1;
+                speculative_call_slots -= 1;
+            }
+        }
+        if skill_enabled && (optional_slots == 0 || speculative_call_slots == 0) {
+            skill_enabled = false;
+        }
+
+        if !transition_enabled && !skill_enabled && !reasoning_enabled {
+            return Ok(None);
+        }
+
+        let main_kind = if transition_enabled {
+            RuntimeOptimizationKind::ParallelStateTransition
+        } else if skill_enabled {
+            RuntimeOptimizationKind::SpeculativeSkillRouting
+        } else {
+            RuntimeOptimizationKind::SpeculativeReasoningAuto
+        };
+        if !self.reserve_active_speculative_llm_call(main_kind) {
+            return Ok(None);
+        }
+
+        let mut branch_set = ScheduledBranchSet::new(optimization.max_parallel_runtime_tasks)?;
+        let main_branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::MainResponse,
+            main_kind,
+            RuntimeTaskPriority::Normal,
+            RuntimeCommitBehavior::FinalResponse,
+        );
+        let transition_branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::StateTransition,
+            RuntimeOptimizationKind::ParallelStateTransition,
+            RuntimeTaskPriority::Critical,
+            RuntimeCommitBehavior::TransitionDecision,
+        );
+        let skill_branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::SkillRouting,
+            RuntimeOptimizationKind::SpeculativeSkillRouting,
+            RuntimeTaskPriority::High,
+            RuntimeCommitBehavior::SkillSelection,
+        );
+        let reasoning_branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::ReasoningJudge,
+            RuntimeOptimizationKind::SpeculativeReasoningAuto,
+            RuntimeTaskPriority::Normal,
+            RuntimeCommitBehavior::ReasoningDecision,
+        );
+        let main_id = main_branch.branch_id();
+        let transition_id = transition_branch.branch_id();
+        let skill_id = skill_branch.branch_id();
+        let reasoning_id = reasoning_branch.branch_id();
+
+        let main_id_for_future = main_id.clone();
+        if !branch_set.schedule(
+            main_branch,
+            Box::pin(async move {
+                match crate::optimization::observability::with_branch_observation(
+                    &main_id_for_future,
+                    main_kind,
+                    RuntimeCommitBehavior::FinalResponse,
+                    self.generate_main_response_draft(processed_input, &ReasoningMode::None),
+                )
+                .await
+                {
+                    Ok(draft) => RuntimeBranchResult::MainDraft(draft),
+                    Err(error) => RuntimeBranchResult::Failed(error),
+                }
+            }),
+        ) {
+            return Ok(None);
+        }
+
+        if transition_enabled {
+            let transition_id_for_future = transition_id.clone();
+            if !branch_set.schedule(
+                transition_branch,
+                Box::pin(async move {
+                    match crate::optimization::observability::with_branch_observation(
+                        &transition_id_for_future,
+                        RuntimeOptimizationKind::ParallelStateTransition,
+                        RuntimeCommitBehavior::TransitionDecision,
+                        self.select_parallel_transition_candidate(processed_input),
+                    )
+                    .await
+                    {
+                        Ok(candidate) => RuntimeBranchResult::Transition(candidate),
+                        Err(error) => RuntimeBranchResult::Failed(error),
+                    }
+                }),
+            ) {
+                transition_enabled = false;
+            }
+        }
+
+        if skill_enabled {
+            let skill_id_for_future = skill_id.clone();
+            if !branch_set.schedule(
+                skill_branch,
+                Box::pin(async move {
+                    if !self.reserve_active_speculative_llm_call(
+                        RuntimeOptimizationKind::SpeculativeSkillRouting,
+                    ) {
+                        return RuntimeBranchResult::Cancelled;
+                    }
+                    match crate::optimization::observability::with_branch_observation(
+                        &skill_id_for_future,
+                        RuntimeOptimizationKind::SpeculativeSkillRouting,
+                        RuntimeCommitBehavior::SkillSelection,
+                        self.select_skill_candidate(processed_input),
+                    )
+                    .await
+                    {
+                        Ok(candidate) => RuntimeBranchResult::Skill(candidate),
+                        Err(error) => RuntimeBranchResult::Failed(error),
+                    }
+                }),
+            ) {
+                skill_enabled = false;
+            }
+        }
+
+        if reasoning_enabled {
+            let reasoning_id_for_future = reasoning_id.clone();
+            if !branch_set.schedule(
+                reasoning_branch,
+                Box::pin(async move {
+                    if !self.reserve_active_speculative_llm_call(
+                        RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                    ) {
+                        return RuntimeBranchResult::Cancelled;
+                    }
+                    match crate::optimization::observability::with_branch_observation(
+                        &reasoning_id_for_future,
+                        RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                        RuntimeCommitBehavior::ReasoningDecision,
+                        self.determine_reasoning_mode_strict(processed_input),
+                    )
+                    .await
+                    {
+                        Ok(mode) => RuntimeBranchResult::Reasoning(mode),
+                        Err(error) => RuntimeBranchResult::Failed(error),
+                    }
+                }),
+            ) {
+                reasoning_enabled = false;
+            }
+        }
+
+        if matches!(effective_reasoning_mode, ReasoningMode::Auto) && !reasoning_enabled {
+            self.finalize_pending_branches(branch_set.cancel_pending());
+            return Ok(None);
+        }
+
+        if !transition_enabled && !skill_enabled && !reasoning_enabled {
+            self.finalize_pending_branches(branch_set.cancel_pending());
+            return Ok(None);
+        }
+
+        let mut main_pending = true;
+        let mut skill_pending = skill_enabled;
+        let mut reasoning_pending = reasoning_enabled;
+        let mut transition_finalized = !transition_enabled;
+        let mut skill_finalized = !skill_enabled;
+        let mut reasoning_finalized = !reasoning_enabled;
+        let mut main_result: Option<Result<MainResponseDraft>> = None;
+        let mut transition_candidate: Option<TransitionCandidate> = None;
+        let mut skill_candidate: Option<SkillCandidate> = None;
+        let mut reasoning_decision: Option<ReasoningMode> = None;
+        let mut skill_fallback_required = false;
+        let mut reasoning_fallback_required = false;
+
+        loop {
+            if let Some(candidate) = transition_candidate.take() {
+                if self
+                    .commit_pre_response_transition_candidate(
+                        &candidate,
+                        &HashMap::new(),
+                        processed_input,
+                    )
+                    .await?
+                {
+                    self.finalize_optional_branch(
+                        &transition_id,
+                        RuntimeOptimizationKind::ParallelStateTransition,
+                        RuntimeCommitBehavior::TransitionDecision,
+                        "committed",
+                        true,
+                    );
+                    if !main_pending {
+                        self.finalize_branch_loss(
+                            &main_id,
+                            main_kind,
+                            RuntimeCommitBehavior::FinalResponse,
+                            false,
+                            main_result.as_ref().map(|result| result.is_err()),
+                        );
+                    }
+                    if skill_enabled && !skill_pending {
+                        self.finalize_branch_loss(
+                            &skill_id,
+                            RuntimeOptimizationKind::SpeculativeSkillRouting,
+                            RuntimeCommitBehavior::SkillSelection,
+                            false,
+                            Some(false),
+                        );
+                    }
+                    if reasoning_enabled && !reasoning_pending {
+                        self.finalize_branch_loss(
+                            &reasoning_id,
+                            RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                            RuntimeCommitBehavior::ReasoningDecision,
+                            false,
+                            Some(false),
+                        );
+                    }
+                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    return self
+                        .redispatch_current_state(processed_input)
+                        .await
+                        .map(Some);
+                }
+                self.finalize_optional_branch(
+                    &transition_id,
+                    RuntimeOptimizationKind::ParallelStateTransition,
+                    RuntimeCommitBehavior::TransitionDecision,
+                    "discarded",
+                    false,
+                );
+                transition_finalized = true;
+            }
+
+            if transition_finalized && skill_candidate.is_some() {
+                let candidate = skill_candidate.take().unwrap();
+                self.finalize_optional_branch(
+                    &skill_id,
+                    RuntimeOptimizationKind::SpeculativeSkillRouting,
+                    RuntimeCommitBehavior::SkillSelection,
+                    "committed",
+                    true,
+                );
+                if !main_pending {
+                    self.finalize_branch_loss(
+                        &main_id,
+                        main_kind,
+                        RuntimeCommitBehavior::FinalResponse,
+                        false,
+                        main_result.as_ref().map(|result| result.is_err()),
+                    );
+                }
+                if reasoning_enabled && !reasoning_pending {
+                    self.finalize_branch_loss(
+                        &reasoning_id,
+                        RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                        RuntimeCommitBehavior::ReasoningDecision,
+                        false,
+                        Some(false),
+                    );
+                }
+                self.finalize_pending_branches(branch_set.cancel_pending());
+                self.commit_root_user_message(processed_input).await?;
+                return match self
+                    .commit_skill_candidate_route_result(candidate, processed_input)
+                    .await?
+                {
+                    SkillRouteResult::Response(skill_response) => self
+                        .handle_skill_response(processed_input, skill_response, input_context)
+                        .await
+                        .map(Some),
+                    SkillRouteResult::NeedsClarification(response) => {
+                        if response
+                            .metadata
+                            .as_ref()
+                            .and_then(|m| m.get("disambiguation"))
+                            .and_then(|d| d.get("status"))
+                            .and_then(|s| s.as_str())
+                            == Some("awaiting_clarification")
+                        {
+                            self.memory
+                                .add_message(ChatMessage::assistant(&response.content))
+                                .await?;
+                        }
+                        self.finish_turn_if_root(&response).await?;
+                        Ok(Some(response))
+                    }
+                    SkillRouteResult::NoMatch => Ok(None),
+                };
+            }
+
+            if transition_finalized && skill_finalized {
+                if let Some(reasoning_mode) = reasoning_decision.take() {
+                    if !matches!(reasoning_mode, ReasoningMode::None) {
+                        self.finalize_optional_branch(
+                            &reasoning_id,
+                            RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                            RuntimeCommitBehavior::ReasoningDecision,
+                            "committed",
+                            true,
+                        );
+                        if !main_pending {
+                            self.finalize_branch_loss(
+                                &main_id,
+                                main_kind,
+                                RuntimeCommitBehavior::FinalResponse,
+                                false,
+                                main_result.as_ref().map(|result| result.is_err()),
+                            );
+                        }
+                        self.finalize_pending_branches(branch_set.cancel_pending());
+                        self.commit_root_user_message(processed_input).await?;
+                        return if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
+                            self.handle_plan_and_execute(processed_input, input_context, true)
+                                .await
+                                .map(Some)
+                        } else {
+                            self.run_committed_response_loop_with_reasoning(
+                                processed_input,
+                                input_context,
+                                reasoning_mode,
+                                true,
+                            )
+                            .await
+                            .map(Some)
+                        };
+                    }
+                    self.finalize_optional_branch(
+                        &reasoning_id,
+                        RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                        RuntimeCommitBehavior::ReasoningDecision,
+                        "committed",
+                        true,
+                    );
+                    reasoning_finalized = true;
+                }
+            }
+
+            if transition_finalized && skill_finalized && reasoning_finalized {
+                if skill_fallback_required || reasoning_fallback_required {
+                    if !main_pending {
+                        self.finalize_branch_loss(
+                            &main_id,
+                            main_kind,
+                            RuntimeCommitBehavior::FinalResponse,
+                            false,
+                            main_result.as_ref().map(|result| result.is_err()),
+                        );
+                    }
+                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    return Ok(None);
+                }
+
+                if let Some(result) = main_result.take() {
+                    let draft = match result {
+                        Ok(draft) => draft,
+                        Err(error) => {
+                            self.finalize_optional_branch(
+                                &main_id,
+                                main_kind,
+                                RuntimeCommitBehavior::FinalResponse,
+                                "failed",
+                                false,
+                            );
+                            self.finalize_pending_branches(branch_set.cancel_pending());
+                            return Err(error);
+                        }
+                    };
+                    self.finalize_optional_branch(
+                        &main_id,
+                        main_kind,
+                        RuntimeCommitBehavior::FinalResponse,
+                        "committed",
+                        true,
+                    );
+                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    return self
+                        .commit_main_response_draft(
+                            processed_input,
+                            input_context,
+                            draft,
+                            ReasoningMode::None,
+                            reasoning_enabled,
+                        )
+                        .await
+                        .map(Some);
+                }
+            }
+
+            if branch_set.is_empty() {
+                return Ok(None);
+            }
+
+            let Some(outcome) = branch_set.next_completed().await else {
+                return Ok(None);
+            };
+            let branch_id = outcome.branch.branch_id();
+            match outcome.result {
+                RuntimeBranchResult::MainDraft(draft) => {
+                    main_pending = false;
+                    main_result = Some(Ok(draft));
+                }
+                RuntimeBranchResult::Transition(candidate) => {
+                    if let Some(candidate) = candidate {
+                        transition_candidate = Some(candidate);
+                    } else {
+                        self.finalize_optional_branch(
+                            &transition_id,
+                            RuntimeOptimizationKind::ParallelStateTransition,
+                            RuntimeCommitBehavior::TransitionDecision,
+                            "discarded",
+                            false,
+                        );
+                        transition_finalized = true;
+                    }
+                }
+                RuntimeBranchResult::Skill(candidate) => {
+                    skill_pending = false;
+                    if let Some(candidate) = candidate {
+                        skill_candidate = Some(candidate);
+                    } else {
+                        self.finalize_optional_branch(
+                            &skill_id,
+                            RuntimeOptimizationKind::SpeculativeSkillRouting,
+                            RuntimeCommitBehavior::SkillSelection,
+                            "discarded",
+                            false,
+                        );
+                        skill_finalized = true;
+                    }
+                }
+                RuntimeBranchResult::Reasoning(mode) => {
+                    reasoning_pending = false;
+                    reasoning_decision = Some(mode);
+                }
+                RuntimeBranchResult::Failed(error) => {
+                    if branch_id == main_id {
+                        main_pending = false;
+                        main_result = Some(Err(error));
+                    } else if branch_id == transition_id {
+                        self.finalize_optional_branch(
+                            &transition_id,
+                            RuntimeOptimizationKind::ParallelStateTransition,
+                            RuntimeCommitBehavior::TransitionDecision,
+                            "failed",
+                            false,
+                        );
+                        transition_finalized = true;
+                    } else if branch_id == skill_id {
+                        skill_pending = false;
+                        self.finalize_optional_branch(
+                            &skill_id,
+                            RuntimeOptimizationKind::SpeculativeSkillRouting,
+                            RuntimeCommitBehavior::SkillSelection,
+                            "failed",
+                            false,
+                        );
+                        skill_finalized = true;
+                    } else if branch_id == reasoning_id {
+                        reasoning_pending = false;
+                        self.finalize_optional_branch(
+                            &reasoning_id,
+                            RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                            RuntimeCommitBehavior::ReasoningDecision,
+                            "failed",
+                            false,
+                        );
+                        reasoning_finalized = true;
+                    }
+                }
+                RuntimeBranchResult::Cancelled => {
+                    self.finalize_optional_branch(
+                        &branch_id,
+                        outcome.branch.optimization,
+                        outcome.branch.commit_behavior,
+                        "cancelled",
+                        false,
+                    );
+                    if branch_id == main_id {
+                        main_pending = false;
+                        main_result =
+                            Some(Err(AgentError::Other("main branch cancelled".to_string())));
+                    } else if branch_id == transition_id {
+                        transition_finalized = true;
+                    } else if branch_id == skill_id {
+                        skill_pending = false;
+                        skill_finalized = true;
+                        skill_fallback_required = true;
+                    } else if branch_id == reasoning_id {
+                        reasoning_pending = false;
+                        reasoning_finalized = true;
+                        reasoning_fallback_required = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finalize_pending_branches(&self, branches: Vec<RuntimeBranch>) {
+        for branch in branches {
+            self.finalize_optional_branch(
+                &branch.branch_id(),
+                branch.optimization,
+                branch.commit_behavior,
+                "cancelled",
+                false,
+            );
+        }
+    }
+
+    //
+    // Pending losers are reported as cancelled because their futures are dropped before completion.
+    // Completed losers keep failed or discarded status based on their recorded result.
+    //
+    fn finalize_branch_loss(
+        &self,
+        branch_id: &str,
+        optimization: RuntimeOptimizationKind,
+        commit_behavior: RuntimeCommitBehavior,
+        pending: bool,
+        completed_failed: Option<bool>,
+    ) {
+        let status = if pending {
+            "cancelled"
+        } else if completed_failed.unwrap_or(false) {
+            "failed"
+        } else {
+            "discarded"
+        };
+        self.finalize_optional_branch(branch_id, optimization, commit_behavior, status, false);
+    }
+
+    //
+    // Finalization is separated from commit so losing branches remain observable.
+    // This helper must not mutate runtime state other than observability.
+    //
+    fn finalize_optional_branch(
+        &self,
+        branch_id: &str,
+        optimization: RuntimeOptimizationKind,
+        commit_behavior: RuntimeCommitBehavior,
+        status: &str,
+        winner: bool,
+    ) {
+        crate::optimization::observability::finalize_branch(
+            self.observability_manager.as_ref(),
+            branch_id,
+            status,
+            winner,
+            optimization,
+            commit_behavior,
+        );
+    }
+
+    //
+    // This is only an eligibility check.
+    // Actual transition selection happens in select_parallel_transition_candidate.
+    //
+    fn has_parallel_transition_candidates(&self) -> bool {
+        self.transitions_available_for_commit()
+            .map(|(transitions, _)| {
+                transitions
+                    .iter()
+                    .any(|transition| matches!(transition.timing, TransitionTiming::Parallel))
+            })
+            .unwrap_or(false)
+    }
+
+    //
+    // Parallel transition prompts must not depend on assistant response text.
+    // Keep this branch response-independent or it can race against invalid context.
+    //
+    async fn select_parallel_transition_candidate(
+        &self,
+        processed_input: &str,
+    ) -> Result<Option<TransitionCandidate>> {
+        let Some((transitions, current_state)) = self.transitions_available_for_commit() else {
+            return Ok(None);
+        };
+        let parallel: Vec<Transition> = transitions
+            .into_iter()
+            .filter(|transition| matches!(transition.timing, TransitionTiming::Parallel))
+            .filter(|transition| !transition.requires_response)
+            .collect();
+        if parallel.is_empty() {
+            return Ok(None);
+        }
+        let empty_staged = HashMap::new();
+        if let Some(candidate) = self.select_deterministic_transition_candidate(
+            processed_input,
+            &current_state,
+            &parallel,
+            &empty_staged,
+        ) {
+            return Ok(Some(candidate));
+        }
+        let when_transitions: Vec<(usize, &Transition)> = parallel
+            .iter()
+            .enumerate()
+            .filter(|(_, transition)| !transition.when.trim().is_empty())
+            .collect();
+        if when_transitions.is_empty() {
+            return Ok(None);
+        }
+        let llm = self
+            .llm_registry
+            .router()
+            .or_else(|_| self.llm_registry.default())
+            .map_err(|e| AgentError::Config(e.to_string()))?;
+        let conditions = when_transitions
+            .iter()
+            .enumerate()
+            .map(|(display_idx, (_, transition))| {
+                format!("{}. {}", display_idx + 1, transition.when)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !self
+            .reserve_active_speculative_llm_call(RuntimeOptimizationKind::ParallelStateTransition)
+        {
+            return Ok(None);
+        }
+        let context_preview = self.branch_context_preview();
+        let prompt = format!(
+            "Based only on the current user message and context, which transition condition is met?\n\nCurrent state: {}\nUser message: {}\nContext:\n{}\n\nConditions:\n{}\n0. None of the above\n\nReply with ONLY the number (0-{}).",
+            current_state,
+            processed_input,
+            context_preview,
+            conditions,
+            when_transitions.len()
+        );
+        let response = self
+            .observe_purpose(
+                ObservationPurpose::StateTransitionEvaluation,
+                llm.complete(&[ChatMessage::user(prompt)], None),
+            )
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
+        let choice = response.content.trim().parse::<usize>().unwrap_or(0);
+        if choice == 0 || choice > when_transitions.len() {
+            return Ok(None);
+        }
+        let transition = when_transitions[choice - 1].1.clone();
+        Ok(Some(TransitionCandidate::new(
+            current_state,
+            transition.clone(),
+            Self::transition_reason(&transition),
+        )))
+    }
+
     /// Re-enters the runtime loop after an optimized transition commits.
     async fn redispatch_current_state(&self, processed_input: &str) -> Result<AgentResponse> {
         const MAX_REDISPATCH_DEPTH: u32 = 3;
@@ -3924,8 +4748,14 @@ OVERALL: PASS/FAIL"#,
             return Ok(response);
         }
         *self.redispatch_depth.write() += 1;
+        if let Some(context) = self.active_turn_context.write().as_mut() {
+            context.enter_redispatch();
+        }
         let result = Box::pin(self.run_loop_internal(processed_input)).await;
         *self.redispatch_depth.write() -= 1;
+        if let Some(context) = self.active_turn_context.write().as_mut() {
+            context.exit_redispatch();
+        }
         let response = result?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
@@ -3935,6 +4765,9 @@ OVERALL: PASS/FAIL"#,
     async fn finish_turn_if_root(&self, response: &AgentResponse) -> Result<()> {
         if *self.redispatch_depth.read() == 0 {
             self.post_turn_session_lifecycle().await?;
+            if let Some(context) = self.active_turn_context.write().as_mut() {
+                context.mark_post_turn_lifecycle_completed();
+            }
             self.hooks.on_response(response).await;
             self.end_root_turn();
         }
@@ -4315,6 +5148,13 @@ OVERALL: PASS/FAIL"#,
 
     #[instrument(skip(self, input), fields(agent = %self.info.name))]
     async fn determine_reasoning_mode(&self, input: &str) -> Result<ReasoningMode> {
+        match self.determine_reasoning_mode_strict(input).await {
+            Ok(mode) => Ok(mode),
+            Err(_) => Ok(ReasoningMode::None),
+        }
+    }
+
+    async fn determine_reasoning_mode_strict(&self, input: &str) -> Result<ReasoningMode> {
         let effective_config = self.get_effective_reasoning_config();
 
         if !matches!(effective_config.mode, ReasoningMode::Auto) {
@@ -4353,20 +5193,16 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
                 ObservationPurpose::ReflectionDecision,
                 llm.complete(&messages, None),
             )
-            .await;
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
 
-        match response {
-            Ok(resp) => {
-                let mode_str = resp.content.trim().to_lowercase();
-                Ok(match mode_str.as_str() {
-                    "cot" => ReasoningMode::CoT,
-                    "react" => ReasoningMode::React,
-                    "plan_and_execute" => ReasoningMode::PlanAndExecute,
-                    _ => ReasoningMode::None,
-                })
-            }
-            Err(_) => Ok(ReasoningMode::None),
-        }
+        let mode_str = response.content.trim().to_lowercase();
+        Ok(match mode_str.as_str() {
+            "cot" => ReasoningMode::CoT,
+            "react" => ReasoningMode::React,
+            "plan_and_execute" => ReasoningMode::PlanAndExecute,
+            _ => ReasoningMode::None,
+        })
     }
 
     async fn should_reflect(&self, input: &str, response: &str) -> Result<bool> {
@@ -4878,6 +5714,8 @@ Respond in JSON format:
     }
 
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
+        self.begin_root_turn();
+        let _root_cleanup = RootTurnCleanup::new(self);
         info!(input_len = input.len(), "Starting chat");
 
         self.hooks.on_message_received(input).await;
@@ -4933,7 +5771,7 @@ Respond in JSON format:
                         "Input requires clarification"
                     );
 
-                    self.memory.add_message(ChatMessage::user(input)).await?;
+                    self.commit_root_user_message(input).await?;
                     self.memory
                         .add_message(ChatMessage::assistant(&question.question))
                         .await?;
@@ -5067,7 +5905,7 @@ Respond in JSON format:
                         "Clarification abandoned by user"
                     );
 
-                    self.memory.add_message(ChatMessage::user(input)).await?;
+                    self.commit_root_user_message(input).await?;
 
                     match new_input {
                         Some(fresh_input) => {
@@ -5534,6 +6372,286 @@ Respond in JSON format:
         }
     }
 
+    async fn complete_llm_with_recovery(
+        &self,
+        llm: Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+    ) -> Result<LLMResponse> {
+        let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
+            self.recovery_manager
+                .with_retry("llm_call", None, || async {
+                    self.observe_purpose(
+                        ObservationPurpose::MainResponse,
+                        llm.complete(messages, None),
+                    )
+                    .await
+                    .map_err(|e| e.classify())
+                })
+                .await
+                .map_err(|e| AgentError::LLM(e.to_string()))
+        } else {
+            self.observe_purpose(
+                ObservationPurpose::MainResponse,
+                llm.complete(messages, None),
+            )
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))
+        };
+
+        match primary_result {
+            Ok(resp) => Ok(resp),
+            Err(primary_err) => match &self.recovery_manager.config().llm.on_failure {
+                LLMFailureAction::FallbackLlm { fallback_llm } => {
+                    let fb = self.llm_registry.get(fallback_llm).map_err(|e| {
+                        AgentError::Config(format!(
+                            "Fallback LLM '{}' not found: {}",
+                            fallback_llm, e
+                        ))
+                    })?;
+                    self.observe_purpose(
+                        ObservationPurpose::MainResponse,
+                        fb.complete(messages, None),
+                    )
+                    .await
+                    .map_err(|e| AgentError::LLM(e.to_string()))
+                }
+                LLMFailureAction::FallbackResponse { message } => {
+                    Ok(LLMResponse::new(message.clone(), FinishReason::Stop))
+                }
+                LLMFailureAction::Error => Err(primary_err),
+            },
+        }
+    }
+
+    //
+    // Draft generation must not commit user memory or run tools.
+    // The current user input is added only as an ephemeral message for this LLM call.
+    //
+    async fn generate_main_response_draft(
+        &self,
+        processed_input: &str,
+        reasoning_mode: &ReasoningMode,
+    ) -> Result<MainResponseDraft> {
+        let llm = self.get_state_llm()?;
+        let mut messages = self.build_messages_for_draft(processed_input).await?;
+        self.inject_reasoning_prompt(&mut messages, reasoning_mode, true);
+        let response = self.complete_llm_with_recovery(llm, &messages).await?;
+        let content = response.content.trim().to_string();
+        let (thinking, answer) = self.extract_thinking(&content);
+        if let Some(calls) = self.parse_tool_calls(&content) {
+            return Ok(MainResponseDraft::ToolCalls {
+                raw_content: content,
+                calls,
+                thinking,
+            });
+        }
+        Ok(MainResponseDraft::Text {
+            raw_content: answer,
+            thinking,
+        })
+    }
+
+    //
+    // This is the only place where a winning draft is allowed to become runtime state.
+    // Parsed tool calls become executable only after this method commits the draft.
+    //
+    async fn commit_main_response_draft(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        draft: MainResponseDraft,
+        reasoning_mode: ReasoningMode,
+        auto_detected: bool,
+    ) -> Result<AgentResponse> {
+        self.commit_root_user_message(processed_input).await?;
+        match draft {
+            MainResponseDraft::Text {
+                raw_content,
+                thinking,
+            } => {
+                self.finish_text_response_from_model(
+                    processed_input,
+                    input_context,
+                    raw_content,
+                    reasoning_mode,
+                    auto_detected,
+                    1,
+                    thinking,
+                    Vec::new(),
+                )
+                .await
+            }
+            MainResponseDraft::ToolCalls {
+                raw_content,
+                calls,
+                thinking: _,
+            } => {
+                let mut all_tool_calls = Vec::new();
+                match self
+                    .handle_tool_calls(processed_input, &raw_content, calls, &mut all_tool_calls)
+                    .await?
+                {
+                    ToolCallOutcome::Rejected(response) => {
+                        self.finish_turn_if_root(&response).await?;
+                        Ok(response)
+                    }
+                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => {
+                        self.continue_after_committed_tool_draft(processed_input)
+                            .await
+                    }
+                }
+            }
+        }
+    }
+
+    //
+    // Tool drafts need a committed continuation after function results are written.
+    // Redispatch depth suppresses duplicate root lifecycle work during that continuation.
+    //
+    async fn continue_after_committed_tool_draft(
+        &self,
+        processed_input: &str,
+    ) -> Result<AgentResponse> {
+        *self.redispatch_depth.write() += 1;
+        if let Some(context) = self.active_turn_context.write().as_mut() {
+            context.enter_redispatch();
+        }
+        let result = Box::pin(self.run_loop_internal(processed_input)).await;
+        *self.redispatch_depth.write() -= 1;
+        if let Some(context) = self.active_turn_context.write().as_mut() {
+            context.exit_redispatch();
+        }
+        let response = result?;
+        self.finish_turn_if_root(&response).await?;
+        Ok(response)
+    }
+
+    //
+    // Shared committed text finalization for normal responses and winning text drafts.
+    // Keep output processing, reflection, transitions, hooks, and maintenance behind this commit boundary.
+    //
+    async fn finish_text_response_from_model(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        answer: String,
+        reasoning_mode: ReasoningMode,
+        auto_detected: bool,
+        iterations: u32,
+        thinking_content: Option<String>,
+        all_tool_calls: Vec<ToolCall>,
+    ) -> Result<AgentResponse> {
+        let output_data = self.process_output(&answer, input_context).await?;
+        let mut final_content = if output_data.metadata.rejected {
+            output_data
+                .metadata
+                .rejection_reason
+                .unwrap_or_else(|| answer.to_string())
+        } else {
+            output_data.content
+        };
+        let llm = self.get_state_llm()?;
+        let reflection_metadata;
+        (final_content, reflection_metadata) = self
+            .run_reflection(&*llm, processed_input, final_content)
+            .await?;
+        final_content =
+            self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
+        let final_content = {
+            let result = self
+                .post_loop_processing(processed_input, final_content)
+                .await?;
+            self.apply_post_loop_result(processed_input, result).await?
+        };
+        let response = self.build_agent_response(
+            final_content,
+            all_tool_calls,
+            reasoning_mode,
+            auto_detected,
+            iterations,
+            thinking_content,
+            reflection_metadata,
+        );
+        self.finish_turn_if_root(&response).await?;
+        Ok(response)
+    }
+
+    //
+    // Auto reasoning uses this path after the judge wins with a deeper mode.
+    // It intentionally uses committed message building instead of the draft overlay.
+    //
+    async fn run_committed_response_loop_with_reasoning(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        reasoning_mode: ReasoningMode,
+        auto_detected: bool,
+    ) -> Result<AgentResponse> {
+        self.commit_root_user_message(processed_input).await?;
+        let llm = self.get_state_llm()?;
+        let mut iterations = 0u32;
+        let mut all_tool_calls = Vec::new();
+        let mut thinking_content = None;
+        loop {
+            let effective_max = if reasoning_mode != ReasoningMode::None {
+                let rc = self.get_effective_reasoning_config();
+                self.max_iterations.min(rc.max_iterations)
+            } else {
+                self.max_iterations
+            };
+            if iterations >= effective_max {
+                return Err(AgentError::Other(format!(
+                    "Max iterations ({}) exceeded",
+                    effective_max
+                )));
+            }
+            iterations += 1;
+            *self.iteration_count.write() = iterations;
+            let mut messages = self.build_messages().await?;
+            self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
+            self.hooks.on_llm_start(&messages).await;
+            let llm_start = Instant::now();
+            let response = self
+                .observe_purpose(
+                    ObservationPurpose::MainResponse,
+                    llm.complete(&messages, None),
+                )
+                .await
+                .map_err(|e| AgentError::LLM(e.to_string()))?;
+            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
+            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
+            let content = response.content.trim();
+            if let Some(tool_calls) = self.parse_tool_calls(content) {
+                match self
+                    .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
+                    .await?
+                {
+                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
+                    ToolCallOutcome::Rejected(resp) => {
+                        self.finish_turn_if_root(&resp).await?;
+                        return Ok(resp);
+                    }
+                }
+            }
+            let (extracted_thinking, answer) = self.extract_thinking(content);
+            if extracted_thinking.is_some() {
+                thinking_content = extracted_thinking;
+            }
+            return self
+                .finish_text_response_from_model(
+                    processed_input,
+                    input_context,
+                    answer,
+                    reasoning_mode,
+                    auto_detected,
+                    iterations,
+                    thinking_content,
+                    all_tool_calls,
+                )
+                .await;
+        }
+    }
+
     /// Handle tool calls: check transitions, execute tools in parallel, handle HITL rejection.
     async fn handle_tool_calls(
         &self,
@@ -5873,12 +6991,18 @@ Respond in JSON format:
                     return Ok(content);
                 }
                 *self.redispatch_depth.write() += 1;
+                if let Some(context) = self.active_turn_context.write().as_mut() {
+                    context.enter_redispatch();
+                }
                 info!(
                     depth = current_depth + 1,
                     "Re-dispatching for new state after transition"
                 );
                 let resp = Box::pin(self.run_loop_internal(processed_input)).await;
                 *self.redispatch_depth.write() -= 1;
+                if let Some(context) = self.active_turn_context.write().as_mut() {
+                    context.exit_redispatch();
+                }
                 resp.map(|r| r.content)
             }
         }
@@ -6546,6 +7670,7 @@ Respond in JSON format:
         self.pre_turn_session_lifecycle().await;
 
         let input_data = self.process_input(input).await?;
+        self.update_active_turn_context(&input_data.content, input_data.context.clone());
 
         // Inject process context (detect/extract results) into agent context
         // so system prompt templates can use {{ context.detected_language }} etc.
@@ -6599,6 +7724,16 @@ Respond in JSON format:
                         .await;
                 }
             }
+        }
+
+        //
+        // The speculative future is boxed to keep the runtime future size manageable.
+        // Removing the box can overflow small test stacks because this function is recursive through redispatch.
+        //
+        if let Some(response) =
+            Box::pin(self.try_speculative_branches(processed_input, &input_data.context)).await?
+        {
+            return Ok(response);
         }
 
         match self.try_skill_route(processed_input).await? {
@@ -6822,6 +7957,236 @@ Respond in JSON format:
         }
     }
 
+    async fn generate_buffered_streaming_draft(
+        &self,
+        processed_input: &str,
+        routing_resolved: Arc<AtomicBool>,
+    ) -> Result<StreamingDraftResult> {
+        let llm = self.get_state_llm()?;
+        let messages = self.build_messages_for_draft(processed_input).await?;
+        let mut stream = self
+            .observe_purpose(
+                ObservationPurpose::MainResponse,
+                llm.complete_stream(&messages, None),
+            )
+            .await
+            .map_err(|e| AgentError::LLM(e.to_string()))?;
+        let mut buffer = crate::optimization::StreamBranchBuffer::new(self.streaming.buffer_size)?;
+        let mut chunks = Vec::new();
+        let mut accumulated = String::new();
+        while let Some(chunk_result) = stream.next().await {
+            let chunk = chunk_result.map_err(|e| AgentError::LLM(e.to_string()))?;
+            accumulated.push_str(&chunk.delta);
+            let stream_chunk = StreamChunk::content(chunk.delta);
+            if routing_resolved.load(Ordering::SeqCst) {
+                chunks.push(stream_chunk);
+            } else {
+                buffer.push(stream_chunk)?;
+            }
+        }
+        chunks.splice(0..0, buffer.drain());
+        let content = accumulated.trim().to_string();
+        let draft = if let Some(calls) = self.parse_tool_calls(&content) {
+            MainResponseDraft::ToolCalls {
+                raw_content: content,
+                calls,
+                thinking: None,
+            }
+        } else {
+            MainResponseDraft::Text {
+                raw_content: content,
+                thinking: None,
+            }
+        };
+        Ok(StreamingDraftResult::new(draft, chunks))
+    }
+
+    async fn try_buffered_streaming_branches(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+    ) -> Result<Option<(AgentResponse, Vec<StreamChunk>)>> {
+        let optimization = &self.runtime_config.optimization;
+        if !optimization.enabled {
+            return Ok(None);
+        }
+        let transition_enabled =
+            optimization.speculative_state_transitions && self.has_parallel_transition_candidates();
+        if !transition_enabled {
+            return Ok(None);
+        }
+        let mut branch_scheduler =
+            TurnBranchScheduler::new(optimization.max_parallel_runtime_tasks)?;
+        if !branch_scheduler.reserve_task() {
+            return Ok(None);
+        }
+        if !self
+            .reserve_active_speculative_llm_call(RuntimeOptimizationKind::BufferedStreamingRouting)
+        {
+            branch_scheduler.release_task();
+            return Ok(None);
+        }
+        if !branch_scheduler.reserve_task() {
+            branch_scheduler.release_task();
+            return Ok(None);
+        }
+        let mut main_branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::MainResponse,
+            RuntimeOptimizationKind::BufferedStreamingRouting,
+            RuntimeTaskPriority::Normal,
+            RuntimeCommitBehavior::FinalResponse,
+        );
+        let mut transition_branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::StateTransition,
+            RuntimeOptimizationKind::ParallelStateTransition,
+            RuntimeTaskPriority::Critical,
+            RuntimeCommitBehavior::TransitionDecision,
+        );
+        let main_id = main_branch.branch_id();
+        let transition_id = transition_branch.branch_id();
+        let routing_resolved = Arc::new(AtomicBool::new(false));
+        let mut main_future =
+            Box::pin(crate::optimization::observability::with_branch_observation(
+                &main_id,
+                RuntimeOptimizationKind::BufferedStreamingRouting,
+                RuntimeCommitBehavior::FinalResponse,
+                self.generate_buffered_streaming_draft(
+                    processed_input,
+                    Arc::clone(&routing_resolved),
+                ),
+            ));
+        let mut transition_future =
+            Box::pin(crate::optimization::observability::with_branch_observation(
+                &transition_id,
+                RuntimeOptimizationKind::ParallelStateTransition,
+                RuntimeCommitBehavior::TransitionDecision,
+                self.select_parallel_transition_candidate(processed_input),
+            ));
+        let mut main_pending = true;
+        let mut transition_pending = true;
+        let mut main_result: Option<Result<StreamingDraftResult>> = None;
+        let mut transition_finalized = false;
+        let mut transition_candidate: Option<TransitionCandidate> = None;
+        loop {
+            if let Some(candidate) = transition_candidate.take() {
+                if self
+                    .commit_pre_response_transition_candidate(
+                        &candidate,
+                        &HashMap::new(),
+                        processed_input,
+                    )
+                    .await?
+                {
+                    self.finalize_optional_branch(
+                        &transition_id,
+                        RuntimeOptimizationKind::ParallelStateTransition,
+                        RuntimeCommitBehavior::TransitionDecision,
+                        "committed",
+                        true,
+                    );
+                    self.finalize_branch_loss(
+                        &main_id,
+                        RuntimeOptimizationKind::BufferedStreamingRouting,
+                        RuntimeCommitBehavior::FinalResponse,
+                        main_pending,
+                        main_result.as_ref().map(|result| result.is_err()),
+                    );
+                    let response = self.redispatch_current_state(processed_input).await?;
+                    return Ok(Some((
+                        response.clone(),
+                        vec![StreamChunk::content(response.content)],
+                    )));
+                }
+                self.finalize_optional_branch(
+                    &transition_id,
+                    RuntimeOptimizationKind::ParallelStateTransition,
+                    RuntimeCommitBehavior::TransitionDecision,
+                    "discarded",
+                    false,
+                );
+                routing_resolved.store(true, Ordering::SeqCst);
+                transition_finalized = true;
+            }
+            if transition_finalized {
+                if let Some(result) = main_result.take() {
+                    let stream_draft = match result {
+                        Ok(stream_draft) => stream_draft,
+                        Err(error) => {
+                            self.finalize_optional_branch(
+                                &main_id,
+                                RuntimeOptimizationKind::BufferedStreamingRouting,
+                                RuntimeCommitBehavior::FinalResponse,
+                                "failed",
+                                false,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let raw_draft_content = stream_draft.draft.raw_content().to_string();
+                    let buffered_chunks = stream_draft.chunks;
+                    self.finalize_optional_branch(
+                        &main_id,
+                        RuntimeOptimizationKind::BufferedStreamingRouting,
+                        RuntimeCommitBehavior::FinalResponse,
+                        "committed",
+                        true,
+                    );
+                    let response = self
+                        .commit_main_response_draft(
+                            processed_input,
+                            input_context,
+                            stream_draft.draft,
+                            ReasoningMode::None,
+                            false,
+                        )
+                        .await?;
+                    let chunks = if response.content == raw_draft_content {
+                        buffered_chunks
+                    } else {
+                        vec![StreamChunk::content(response.content.clone())]
+                    };
+                    return Ok(Some((response, chunks)));
+                }
+            }
+            tokio::select! {
+                result = &mut main_future, if main_pending => {
+                    main_pending = false;
+                    main_branch.transition_to(RuntimeBranchStatus::Completed)?;
+                    main_result = Some(result);
+                }
+                result = &mut transition_future, if transition_pending => {
+                    transition_pending = false;
+                    transition_branch.transition_to(RuntimeBranchStatus::Completed)?;
+                    match result {
+                        Ok(Some(candidate)) => transition_candidate = Some(candidate),
+                        Ok(None) => {
+                            self.finalize_optional_branch(
+                                &transition_id,
+                                RuntimeOptimizationKind::ParallelStateTransition,
+                                RuntimeCommitBehavior::TransitionDecision,
+                                "discarded",
+                                false,
+                            );
+                            routing_resolved.store(true, Ordering::SeqCst);
+                            transition_finalized = true;
+                        }
+                        Err(_) => {
+                            self.finalize_optional_branch(
+                                &transition_id,
+                                RuntimeOptimizationKind::ParallelStateTransition,
+                                RuntimeCommitBehavior::TransitionDecision,
+                                "failed",
+                                false,
+                            );
+                            routing_resolved.store(true, Ordering::SeqCst);
+                            transition_finalized = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Streaming agent pipeline
     /// Uses all the same shared helpers as run_loop_internal.
     /// The ONLY difference: LLM calls use complete_stream() + yield deltas.
@@ -6844,6 +8209,7 @@ Respond in JSON format:
                     return;
                 }
             };
+            self.update_active_turn_context(&input_data.content, input_data.context.clone());
 
             // Inject process context (detect/extract results) into agent context
             for (key, value) in &input_data.context {
@@ -6861,6 +8227,32 @@ Respond in JSON format:
             }
 
             let processed_input = &input_data.content;
+
+            if self.runtime_config.optimization.enabled
+                && matches!(
+                    self.runtime_config.optimization.streaming_policy,
+                    crate::optimization::StreamingOptimizationPolicy::BufferUntilRoutingDone
+                )
+            {
+                //
+                // Buffered routing keeps stale stream output hidden until a branch winner is known.
+                // The boxed future prevents this stream state machine from becoming too large.
+                //
+                match Box::pin(self.try_buffered_streaming_branches(processed_input, &input_data.context)).await {
+                    Ok(Some((_response, chunks))) => {
+                        for chunk in chunks {
+                            yield chunk;
+                        }
+                        yield StreamChunk::Done {};
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                }
+            }
 
             if self.runtime_config.optimization.enabled
                 && matches!(
@@ -7272,12 +8664,18 @@ Respond in JSON format:
                             c
                         } else {
                             *self.redispatch_depth.write() += 1;
+                            if let Some(context) = self.active_turn_context.write().as_mut() {
+                                context.enter_redispatch();
+                            }
                             info!(
                                 depth = current_depth + 1,
                                 "Re-dispatching for new state after transition (stream)"
                             );
                             let result = self.run_loop_internal(processed_input).await;
                             *self.redispatch_depth.write() -= 1;
+                            if let Some(context) = self.active_turn_context.write().as_mut() {
+                                context.exit_redispatch();
+                            }
                             match result {
                                 Ok(resp) => resp.content,
                                 Err(e) => {
@@ -7320,6 +8718,8 @@ Respond in JSON format:
         input: &'a str,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
         Box::pin(async_stream::stream! {
+            self.begin_root_turn();
+            let _root_cleanup = RootTurnCleanup::new(self);
             self.hooks.on_message_received(input).await;
 
             // One-shot context initialization (mirrors run_loop)
@@ -7391,7 +8791,10 @@ Respond in JSON format:
                             confidence = detection.confidence,
                             "Input requires clarification (stream)"
                         );
-                        let _ = self.memory.add_message(ChatMessage::user(input)).await;
+                        if let Err(e) = self.commit_root_user_message(input).await {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
                         let _ = self
                             .memory
                             .add_message(ChatMessage::assistant(&question.question))
@@ -7555,7 +8958,10 @@ Respond in JSON format:
                             "Clarification abandoned by user (stream)"
                         );
 
-                        let _ = self.memory.add_message(ChatMessage::user(input)).await;
+                        if let Err(e) = self.commit_root_user_message(input).await {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
 
                         match new_input {
                             Some(fresh_input) => {
@@ -8216,6 +9622,57 @@ states:
     }
 
     #[tokio::test]
+    async fn test_set_context_supports_dotted_paths_for_pre_response_guards() {
+        let mock = mock_with_response("Billing state response");
+        let call_counter = mock.clone();
+        let yaml = r#"
+name: OptimizedStateAgent
+system_prompt: "You route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+context:
+  request:
+    type: runtime
+    default:
+      topic: general
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Old state prompt that should be skipped."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              request.topic:
+                eq: billing
+          timing: pre_response
+    billing:
+      prompt: "Answer from the billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("request.topic", serde_json::json!("billing"))
+            .unwrap();
+
+        let response = agent.chat("I need billing help").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing state response");
+        assert_eq!(call_counter.call_count(), 1);
+        assert_eq!(
+            agent.get_context().get("request"),
+            Some(&serde_json::json!({"topic": "billing"}))
+        );
+    }
+
+    #[tokio::test]
     async fn test_pre_response_rejection_does_not_commit_staged_context_or_user() {
         let mock = mock_with_response("billing");
         let yaml = r#"
@@ -8552,6 +10009,329 @@ states:
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_speculative_reasoning_low_cap_uses_serial_reasoning() {
+        let default_mock = mock_with_response("Plain draft response");
+        let router_mock = mock_with_response("cot");
+        let router_counter = router_mock.clone();
+        let yaml = r#"
+name: ReasoningReservationAgent
+system_prompt: "You answer plainly unless reasoning wins."
+llm:
+  default: default
+  router: router
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+reasoning:
+  mode: auto
+  judge_llm: router
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 1
+    speculative_reasoning_auto: true
+    max_parallel_runtime_tasks: 2
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(default_mock))
+            .llm_alias("router", Arc::new(router_mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("hello").await.unwrap();
+
+        assert_eq!(response.content, "Plain draft response");
+        assert_eq!(router_counter.call_count(), 1);
+        let events = agent.observability().unwrap().raw_events();
+        assert!(!events.iter().any(|event| {
+            event.dimensions.get("commit_behavior") == Some(&"reasoning_decision".to_string())
+        }));
+    }
+
+    #[tokio::test]
+    async fn test_forced_reasoning_skips_plain_speculative_draft() {
+        let mock = mock_with_response("Reasoned response");
+        let yaml = r#"
+name: ForcedReasoningAgent
+system_prompt: "You reason before answering."
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+reasoning:
+  mode: cot
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Answer from triage."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("hello").await.unwrap();
+
+        assert_eq!(response.content, "Reasoned response");
+        let events = agent.observability().unwrap().raw_events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.dimensions.contains_key("branch_status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_speculative_skill_low_cap_uses_serial_skill_route() {
+        let default_mock = mock_with_response("Skill committed response");
+        let router_mock = mock_with_response("helper");
+        let router_counter = router_mock.clone();
+        let yaml = r#"
+name: SkillReservationAgent
+system_prompt: "Use skills when they match."
+llm:
+  default: default
+  router: router
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 1
+    speculative_skill_routing: true
+    max_parallel_runtime_tasks: 2
+skills:
+  - id: helper
+    description: "Answer helper requests"
+    trigger: "User asks for helper"
+    steps:
+      - prompt: "Answer the helper request: {{ user_input }}"
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(default_mock))
+            .llm_alias("router", Arc::new(router_mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("please use helper").await.unwrap();
+
+        assert_eq!(response.content, "Skill committed response");
+        assert_eq!(router_counter.call_count(), 1);
+        let events = agent.observability().unwrap().raw_events();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.dimensions.contains_key("branch_status"))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_blocking_error_cleanup_resets_root_turn_for_next_chat() {
+        let mut mock = mock_with_response("Recovered response");
+        mock.set_error("boom");
+        let mut handle = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        assert!(agent.chat("first").await.is_err());
+        handle.clear_error();
+        let response = agent.chat("second").await.unwrap();
+
+        assert_eq!(response.content, "Recovered response");
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        let user_count = messages
+            .iter()
+            .filter(|message| message.role == ai_agents_core::Role::User)
+            .count();
+        assert_eq!(user_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_streaming_error_cleanup_resets_root_turn_for_next_chat() {
+        use futures::StreamExt;
+
+        let mut mock = mock_with_response("Recovered response");
+        mock.set_error("stream boom");
+        let mut handle = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("first").await.unwrap();
+        let mut saw_error = false;
+        while let Some(chunk) = stream.next().await {
+            if matches!(chunk, StreamChunk::Error { .. }) {
+                saw_error = true;
+            }
+        }
+        assert!(saw_error);
+
+        handle.clear_error();
+        let response = agent.chat("second").await.unwrap();
+
+        assert_eq!(response.content, "Recovered response");
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        let user_count = messages
+            .iter()
+            .filter(|message| message.role == ai_agents_core::Role::User)
+            .count();
+        assert_eq!(user_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_buffered_streaming_route_miss_releases_buffer_limit() {
+        use futures::StreamExt;
+
+        let mut mock = mock_with_response("one two three");
+        mock.set_latency(10);
+        let yaml = r#"
+name: BufferedMissAgent
+system_prompt: "You stream safely."
+llm:
+  default: default
+streaming:
+  enabled: true
+  buffer_size: 1
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Answer from triage."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("hello").await.unwrap();
+        let mut content = String::new();
+        let mut error = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => content.push_str(&text),
+                StreamChunk::Error { message } => error = Some(message),
+                StreamChunk::Done {} => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(error, None);
+        assert_eq!(content, "one two three");
+    }
+
+    #[tokio::test]
+    async fn test_buffered_streaming_main_failure_finalizes_branch() {
+        use futures::StreamExt;
+
+        let mock = mock_with_response("one two");
+        let mut router_mock = mock_with_response("0");
+        router_mock.set_latency(50);
+        let yaml = r#"
+name: BufferedFailureAgent
+system_prompt: "You stream safely."
+llm:
+  default: default
+  router: router
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+streaming:
+  enabled: true
+  buffer_size: 1
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Ask for the category."
+      transitions:
+        - to: billing
+          when: "User asks about billing"
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(mock))
+            .llm_alias("router", Arc::new(router_mock))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("hello").await.unwrap();
+        let mut error = String::new();
+        while let Some(chunk) = stream.next().await {
+            if let StreamChunk::Error { message } = chunk {
+                error = message;
+            }
+        }
+
+        assert!(
+            error.contains("stream buffer filled"),
+            "unexpected stream error: {}",
+            error
+        );
+        let events = agent.observability().unwrap().raw_events();
+        assert!(events.iter().any(|event| {
+            event.dimensions.get("branch_status") == Some(&"failed".to_string())
+                && event.dimensions.get("commit_behavior") == Some(&"final_response".to_string())
+                && event.dimensions.get("optimization")
+                    == Some(&"buffered_streaming_routing".to_string())
+        }));
     }
 
     #[tokio::test]

@@ -1,6 +1,7 @@
 **/target
 debug
 data
+**/observability_data
 **/.env
 **/temp
 **/.cargo

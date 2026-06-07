@@ -12,9 +12,12 @@ pub mod spec;
 
 pub use builder::AgentBuilder;
 pub use optimization::{
-    AwaitBeforeNextTurn, BackgroundOverflowPolicy, MaintenanceMode, MaintenanceTaskPolicy,
-    PostTurnOptimizationConfig, RuntimeConfig, RuntimeOptimizationConfig, RuntimeTaskPurpose,
-    StreamingOptimizationPolicy,
+    AwaitBeforeNextTurn, BackgroundOverflowPolicy, MainResponseDraft, MaintenanceMode,
+    MaintenanceTaskPolicy, PostTurnOptimizationConfig, RuntimeBranch, RuntimeBranchOutcome,
+    RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior, RuntimeConfig,
+    RuntimeOptimizationConfig, RuntimeOptimizationKind, RuntimeTaskPriority, RuntimeTaskPurpose,
+    ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamingDraftResult,
+    StreamingOptimizationPolicy, TurnBranchScheduler, TurnOptimizationContext,
 };
 pub use runtime::RuntimeAgent;
 pub use streaming::{StreamChunk, StreamingConfig};

@@ -261,6 +261,7 @@ pub enum AggregationDimension {
     BranchStatus,
     RuntimeOptimization,
     CommitBehavior,
+    Speculative,
     Background,
     Custom(String),
 }
@@ -284,6 +285,7 @@ impl AggregationDimension {
             Self::BranchStatus => "branch_status".to_string(),
             Self::RuntimeOptimization => "optimization".to_string(),
             Self::CommitBehavior => "commit_behavior".to_string(),
+            Self::Speculative => "speculative".to_string(),
             Self::Background => "background".to_string(),
             Self::Custom(name) => format!("custom:{}", name),
         }

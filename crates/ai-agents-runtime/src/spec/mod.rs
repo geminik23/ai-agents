@@ -30,7 +30,7 @@ use ai_agents_process::ProcessConfig;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use ai_agents_recovery::ErrorRecoveryConfig;
 use ai_agents_skills::SkillRef;
-use ai_agents_state::StateConfig;
+use ai_agents_state::{StateConfig, StateDefinition, Transition, TransitionTiming};
 use ai_agents_tools::ToolSecurityConfig;
 
 pub use super::RuntimeConfig;
@@ -187,6 +187,26 @@ fn default_max_context_tokens() -> u32 {
     4096
 }
 
+fn state_config_has_parallel_transitions(config: &StateConfig) -> bool {
+    config.global_transitions.iter().any(transition_is_parallel)
+        || definitions_have_parallel_transitions(&config.states)
+}
+
+fn definitions_have_parallel_transitions(states: &HashMap<String, StateDefinition>) -> bool {
+    states.values().any(|definition| {
+        definition.transitions.iter().any(transition_is_parallel)
+            || definition
+                .states
+                .as_ref()
+                .map(definitions_have_parallel_transitions)
+                .unwrap_or(false)
+    })
+}
+
+fn transition_is_parallel(transition: &Transition) -> bool {
+    matches!(transition.timing, TransitionTiming::Parallel)
+}
+
 impl Default for AgentSpec {
     fn default() -> Self {
         Self {
@@ -250,7 +270,45 @@ impl AgentSpec {
         }
 
         self.runtime.optimization.validate()?;
+        self.validate_runtime_optimization_cross_fields()?;
 
+        Ok(())
+    }
+
+    fn validate_runtime_optimization_cross_fields(&self) -> Result<()> {
+        let optimization = &self.runtime.optimization;
+        if matches!(
+            optimization.streaming_policy,
+            super::StreamingOptimizationPolicy::BufferUntilRoutingDone
+        ) {
+            if !optimization.enabled || !self.streaming.enabled {
+                return Err(AgentError::InvalidSpec(
+                    "runtime.optimization.streaming_policy=buffer_until_routing_done requires runtime optimization and streaming.enabled=true".into(),
+                ));
+            }
+            if self.streaming.buffer_size == 0 {
+                return Err(AgentError::InvalidSpec(
+                    "streaming.buffer_size must be greater than 0 with buffer_until_routing_done"
+                        .into(),
+                ));
+            }
+        }
+
+        if let Some(states) = &self.states {
+            let has_parallel = state_config_has_parallel_transitions(states);
+            if has_parallel
+                && (!optimization.enabled || !optimization.speculative_state_transitions)
+            {
+                return Err(AgentError::InvalidSpec(
+                    "transition timing parallel requires runtime.optimization.enabled=true and speculative_state_transitions=true".into(),
+                ));
+            }
+            if has_parallel && optimization.max_speculative_llm_calls_per_turn == 0 {
+                return Err(AgentError::InvalidSpec(
+                    "transition timing parallel requires max_speculative_llm_calls_per_turn greater than 0".into(),
+                ));
+            }
+        }
         Ok(())
     }
 

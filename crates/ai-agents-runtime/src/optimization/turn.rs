@@ -4,6 +4,8 @@ use ai_agents_state::Transition;
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::branch::RuntimeOptimizationKind;
+
 /// Tracks lifecycle and staged writes for one optimized runtime turn.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -59,6 +61,53 @@ impl TurnOptimizationContext {
         }
         self.speculative_llm_calls_used += 1;
         true
+    }
+
+    pub fn reserve_speculative_llm_call_for(&mut self, _kind: RuntimeOptimizationKind) -> bool {
+        self.reserve_speculative_llm_call()
+    }
+
+    pub fn release_or_mark_failed_reservation(&mut self, _kind: RuntimeOptimizationKind) {}
+
+    pub fn can_schedule_branch(&self, active_tasks: usize, max_parallel_tasks: usize) -> bool {
+        active_tasks < max_parallel_tasks
+    }
+
+    pub fn stage_context_write(&mut self, key: impl Into<String>, value: Value) {
+        self.staged_context_writes.insert(key.into(), value);
+    }
+
+    pub fn take_staged_context_writes(&mut self) -> HashMap<String, Value> {
+        std::mem::take(&mut self.staged_context_writes)
+    }
+
+    /// Returns true when the turn can schedule the requested number of branch calls.
+    pub fn reserve_speculative_llm_calls(&mut self, count: u32) -> bool {
+        if self.speculative_llm_calls_used + count > self.max_speculative_llm_calls {
+            return false;
+        }
+        self.speculative_llm_calls_used += count;
+        true
+    }
+
+    /// Marks the root user message as committed.
+    pub fn mark_user_message_committed(&mut self) {
+        self.user_message_committed = true;
+    }
+
+    /// Marks post-turn lifecycle work as completed.
+    pub fn mark_post_turn_lifecycle_completed(&mut self) {
+        self.post_turn_lifecycle_completed = true;
+    }
+
+    /// Enters a redispatch scope.
+    pub fn enter_redispatch(&mut self) {
+        self.redispatch_depth += 1;
+    }
+
+    /// Leaves a redispatch scope.
+    pub fn exit_redispatch(&mut self) {
+        self.redispatch_depth = self.redispatch_depth.saturating_sub(1);
     }
 }
 

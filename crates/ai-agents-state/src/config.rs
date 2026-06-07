@@ -705,9 +705,13 @@ fn validate_transition_timing(
             location, transition.to
         )));
     }
-    if matches!(transition.timing, TransitionTiming::Parallel) {
+    if matches!(transition.timing, TransitionTiming::Parallel)
+        && transition.guard.is_none()
+        && transition.intent.is_none()
+        && transition.when.trim().is_empty()
+    {
         return Err(AgentError::InvalidSpec(format!(
-            "{} transition '{}' uses reserved parallel timing",
+            "{} transition '{}' uses parallel timing without a guard, intent, or when condition",
             scope, transition.to
         )));
     }
@@ -1084,7 +1088,7 @@ states:
     }
 
     #[test]
-    fn test_parallel_transition_timing_is_reserved() {
+    fn test_parallel_transition_timing_accepts_response_independent_condition() {
         let yaml = r#"
 initial: greeting
 states:
@@ -1097,7 +1101,24 @@ states:
     prompt: "Done"
 "#;
         let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_parallel_transition_without_condition_is_invalid() {
+        let yaml = r#"
+initial: greeting
+states:
+  greeting:
+    transitions:
+      - to: done
+        timing: parallel
+  done:
+    prompt: "Done"
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("parallel timing without"));
     }
 
     #[test]

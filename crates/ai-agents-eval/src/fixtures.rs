@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -22,7 +21,8 @@ use async_trait::async_trait;
 use futures::Stream;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::evidence::{ToolExecutionRecord, ToolExecutionSource};
 use crate::{EvalError, Result};
@@ -79,6 +79,12 @@ pub struct LlmFixtureConfig {
     /// Ordered text responses used by mock mode and fallback replay.
     #[serde(default)]
     pub responses: Vec<String>,
+    /// Per-LLM alias ordered responses for deterministic multi-branch evals.
+    #[serde(default)]
+    pub responses_by_alias: HashMap<String, Vec<String>>,
+    /// Per-LLM alias errors for deterministic failure-path evals.
+    #[serde(default)]
+    pub errors_by_alias: HashMap<String, String>,
 }
 
 /// LLM fixture strategy used while building eval providers.
@@ -485,15 +491,17 @@ pub fn build_llm_registry(
             .collect()
     };
 
-    let fixture_responses = load_fixture_responses(fixtures, base_dir)?;
     let cassette_records = load_cassette_records(fixtures, base_dir)?;
     let mut judge_provider = None;
 
     for (alias, config) in aliases {
+        let fixture_responses = load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
+        let fixture_error = fixtures.errors_by_alias.get(&alias).cloned();
         let provider = match fixtures.mode {
             LlmFixtureMode::Mock => Arc::new(SequenceLLMProvider::new(
                 alias.clone(),
                 fixture_responses.clone(),
+                fixture_error,
             )) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Replay => Arc::new(ReplayLLMProvider::new(
                 alias.clone(),
@@ -583,13 +591,23 @@ fn build_real_provider(
     Ok(Arc::new(provider))
 }
 
-fn load_fixture_responses(config: &LlmFixtureConfig, base_dir: &Path) -> Result<Vec<LLMResponse>> {
+fn load_fixture_responses_for_alias(
+    config: &LlmFixtureConfig,
+    base_dir: &Path,
+    alias: &str,
+) -> Result<Vec<LLMResponse>> {
+    let configured = config
+        .responses_by_alias
+        .get(alias)
+        .unwrap_or(&config.responses);
     let mut responses = Vec::new();
-    for content in &config.responses {
+    for content in configured {
         responses.push(LLMResponse::new(content.clone(), FinishReason::Stop));
     }
     for record in load_cassette_records(config, base_dir)? {
-        responses.push(record.response);
+        if record.alias == alias {
+            responses.push(record.response);
+        }
     }
     if responses.is_empty() {
         responses.push(LLMResponse::new("Mock response", FinishReason::Stop));
@@ -623,6 +641,9 @@ struct CassetteRecord {
     model: String,
     /// Stable hash of messages and request config.
     request_hash: String,
+    /// Hash format version.
+    #[serde(default)]
+    request_hash_version: Option<String>,
     /// Assistant response text or redacted output value.
     response: LLMResponse,
 }
@@ -633,6 +654,8 @@ struct SequenceLLMProvider {
     responses: Arc<Mutex<Vec<LLMResponse>>>,
     /// Zero-based turn index within the scenario.
     index: Arc<Mutex<usize>>,
+    /// Optional deterministic provider error.
+    error: Option<String>,
 }
 
 /// LLM provider replaying cassette records by request hash.
@@ -648,10 +671,11 @@ struct ReplayLLMProvider {
 }
 
 impl SequenceLLMProvider {
-    fn new(_name: String, responses: Vec<LLMResponse>) -> Self {
+    fn new(_name: String, responses: Vec<LLMResponse>, error: Option<String>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses)),
             index: Arc::new(Mutex::new(0)),
+            error,
         }
     }
 
@@ -681,7 +705,7 @@ impl ReplayLLMProvider {
             alias,
             model,
             records: Arc::new(records),
-            responses: SequenceLLMProvider::new("replay-fallback".to_string(), fallback),
+            responses: SequenceLLMProvider::new("replay-fallback".to_string(), fallback, None),
         }
     }
 
@@ -738,6 +762,12 @@ impl LLMProvider for SequenceLLMProvider {
         _messages: &[ChatMessage],
         _config: Option<&LLMConfig>,
     ) -> std::result::Result<LLMResponse, LLMError> {
+        if let Some(error) = &self.error {
+            return Err(LLMError::API {
+                message: error.clone(),
+                status: None,
+            });
+        }
         Ok(self.next_response())
     }
 
@@ -749,6 +779,12 @@ impl LLMProvider for SequenceLLMProvider {
         Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
         LLMError,
     > {
+        if let Some(error) = &self.error {
+            return Err(LLMError::API {
+                message: error.clone(),
+                status: None,
+            });
+        }
         let response = self.next_response();
         Ok(Box::new(futures::stream::iter(chunks_from_response(
             response,
@@ -855,6 +891,7 @@ impl LLMProvider for RecordingLLMProvider {
             alias: self.alias.clone(),
             model: self.model.clone(),
             request_hash: hash_request(messages, config),
+            request_hash_version: Some("sha256-v1".to_string()),
             response: response.clone(),
         };
         if let Some(parent) = self.path.parent() {
@@ -895,17 +932,24 @@ impl LLMProvider for RecordingLLMProvider {
 }
 
 fn hash_request(messages: &[ChatMessage], config: Option<&LLMConfig>) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for message in messages {
-        format!("{:?}", message.role).hash(&mut hasher);
-        message.content.hash(&mut hasher);
-    }
-    if let Some(config) = config {
-        serde_json::to_string(config)
-            .unwrap_or_default()
-            .hash(&mut hasher);
-    }
-    format!("{:016x}", hasher.finish())
+    let canonical_messages: Vec<Value> = messages
+        .iter()
+        .map(|message| {
+            json!({
+                "role": format!("{:?}", message.role),
+                "content": message.content,
+                "name": message.name,
+            })
+        })
+        .collect();
+    let canonical = json!({
+        "version": "sha256-v1",
+        "messages": canonical_messages,
+        "config": config,
+    });
+    let encoded = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(encoded);
+    format!("sha256-v1:{:x}", digest)
 }
 
 fn default_status() -> u16 {

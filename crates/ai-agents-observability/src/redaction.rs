@@ -160,6 +160,8 @@ fn is_safe_dimension(key: &str) -> bool {
             | "runtime.optimization"
             | "commit_behavior"
             | "runtime.commit_behavior"
+            | "speculative"
+            | "runtime.speculative"
             | "background"
             | "runtime.background"
             | "maintenance"

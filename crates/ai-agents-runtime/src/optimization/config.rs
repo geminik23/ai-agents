@@ -22,11 +22,11 @@ pub struct RuntimeOptimizationConfig {
     pub pre_response_deterministic_transitions: bool,
     /// Runs current-state extractors before pre-response transition selection when requested.
     pub pre_response_extractors: bool,
-    /// Reserved for response-independent transition branches.
+    /// Enables response-independent transition branches beside a draft response.
     pub speculative_state_transitions: bool,
-    /// Reserved for overlapping skill routing with a draft response.
+    /// Enables pure skill routing beside a draft response.
     pub speculative_skill_routing: bool,
-    /// Reserved for overlapping auto reasoning decisions with a plain draft response.
+    /// Enables auto reasoning decisions beside a plain draft response.
     pub speculative_reasoning_auto: bool,
     /// Allows facts and relationship maintenance to run concurrently when configured.
     pub parallel_post_turn_memory: bool,
@@ -81,12 +81,24 @@ impl RuntimeOptimizationConfig {
                 "runtime.optimization.background_observability_export requires snapshot export support and is not enabled yet".into(),
             ));
         }
-        if matches!(
-            self.streaming_policy,
-            StreamingOptimizationPolicy::BufferUntilRoutingDone
-        ) {
+        let any_speculative = self.speculative_state_transitions
+            || self.speculative_skill_routing
+            || self.speculative_reasoning_auto;
+        if any_speculative {
+            if !self.enabled {
+                return Err(AgentError::InvalidSpec(
+                    "runtime.optimization.enabled must be true when speculative branch settings are enabled".into(),
+                ));
+            }
+            if self.max_speculative_llm_calls_per_turn == 0 {
+                return Err(AgentError::InvalidSpec(
+                    "runtime.optimization.max_speculative_llm_calls_per_turn must be greater than 0 when speculative branch settings are enabled".into(),
+                ));
+            }
+        }
+        if self.max_speculative_llm_calls_per_turn > self.max_parallel_runtime_tasks as u32 {
             return Err(AgentError::InvalidSpec(
-                "runtime.optimization.streaming_policy=buffer_until_routing_done is reserved until buffered streaming support is enabled".into(),
+                "runtime.optimization.max_speculative_llm_calls_per_turn must be less than or equal to max_parallel_runtime_tasks".into(),
             ));
         }
         if self.post_turn.sessions != MaintenanceTaskPolicy::default() {
@@ -97,14 +109,6 @@ impl RuntimeOptimizationConfig {
         if self.post_turn.memory_compression != MaintenanceTaskPolicy::default() {
             return Err(AgentError::InvalidSpec(
                 "runtime.optimization.post_turn.memory_compression is reserved until compression scheduling is enabled".into(),
-            ));
-        }
-        if self.speculative_state_transitions
-            || self.speculative_skill_routing
-            || self.speculative_reasoning_auto
-        {
-            return Err(AgentError::InvalidSpec(
-                "runtime.optimization speculative branch scheduling is reserved until draft commit support is enabled".into(),
             ));
         }
         Ok(())
@@ -237,7 +241,7 @@ impl Default for BackgroundOverflowPolicy {
 pub enum StreamingOptimizationPolicy {
     /// Run safe preflight routing before opening the stream.
     PreflightOnly,
-    /// Reserved for buffered streaming while routing decisions finish.
+    /// Buffer unresolved stream output until routing decisions finish.
     BufferUntilRoutingDone,
     /// Disable optimized streaming behavior.
     Disabled,
@@ -254,13 +258,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_buffered_streaming_policy_until_supported() {
+    fn accepts_buffered_streaming_policy() {
         let config = RuntimeOptimizationConfig {
             enabled: true,
             streaming_policy: StreamingOptimizationPolicy::BufferUntilRoutingDone,
             ..Default::default()
         };
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     #[test]
@@ -280,6 +284,29 @@ mod tests {
             ..Default::default()
         };
         config.post_turn.memory_compression.mode = MaintenanceMode::Background;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn speculative_flags_require_positive_cap() {
+        let config = RuntimeOptimizationConfig {
+            enabled: true,
+            speculative_skill_routing: true,
+            max_speculative_llm_calls_per_turn: 0,
+            ..Default::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn speculative_cap_must_fit_parallel_limit() {
+        let config = RuntimeOptimizationConfig {
+            enabled: true,
+            speculative_skill_routing: true,
+            max_speculative_llm_calls_per_turn: 5,
+            max_parallel_runtime_tasks: 4,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 }
