@@ -39,15 +39,14 @@ persona:
 
   evolution:
     enabled: true                    # allow evolve() calls from Rust API and hooks. default: false
-    allow_llm_evolve: true           # also register persona_evolve tool for the LLM. default: false
+    allow_llm_evolve: true           # register and grant persona_evolve to the LLM. default: false
     track_changes: true              # keep history of all changes. default: false
     mutable_fields:                  # only these dot-paths can be mutated
       - traits.personality           # e.g. ["grumbling", "dutiful", "wary"] -> ["warm", "dutiful", "loyal"]
       - traits.speaking_style        # e.g. "dry complaints" -> "still dry but genuinely friendly"
       - goals.primary                # e.g. add "look_after_new_recruits" to the list
 
-# NOTE: The persona_evolve tool is auto-registered when allow_llm_evolve is true.
-# You do NOT need to list it in tools: below.
+# NOTE: allow_llm_evolve registers and grants the persona_evolve tool.
 # The LLM sees it as a tool with input: { field, value, reason }.
 # It validates that the field is in mutable_fields before applying.
 system_prompt: |

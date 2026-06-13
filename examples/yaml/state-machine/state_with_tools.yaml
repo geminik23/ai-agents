@@ -2,12 +2,12 @@ name: ToolScopedAgent
 version: "1.0.0"
 description: "Different tools available in different states"
 
-# Per-state tool scoping — control which tools are available in each state.
+# Per-state tool scoping - control which granted tools are visible in each state.
 #
-# Tool availability is resolved per state using 3-level filtering:
-#   - `tools: []` on a state = explicitly no tools (even if agent declares them)
-#   - `tools: [datetime]` on a state = only those tools, nothing else
-#   - omitting `tools` on a state = inherit from agent-level `tools:` list
+# Top-level tools are the maximum grant. State tools can only narrow that grant:
+#   - `tools: []` on a state = explicitly no tools in that state
+#   - `tools: [datetime]` on a state = datetime only if top-level tools also grants it
+#   - omitting `tools` on a state = inherit the top-level grant or parent-state narrowing
 #
 # The framework auto-injects tool names and schemas into the system prompt, so the LLM only sees tools that are available in the current state.
 #
@@ -33,9 +33,9 @@ llm:
   router: router
 
 # Three states with different tool access:
-#   greeting — tools: [] (no tools, pure conversation)
-#   lookup   — tools: [datetime, calculator] (explicit subset)
-#   closing  — tools omitted (inherits agent-level tools list)
+#   greeting - tools: [] (no tools, pure conversation)
+#   lookup   - tools: [datetime, calculator] (explicit subset)
+#   closing  - tools omitted (inherits agent-level tools list)
 states:
   initial: greeting
   states:
@@ -65,7 +65,6 @@ states:
     closing:
       prompt: |
         Thank the user and wish them a good day.
-      tools: []
       transitions:
         - to: lookup
           when: "User asks about date, time, or math calculations"
@@ -73,8 +72,8 @@ states:
           when: "User has another question"
 
 
-# Agent-level tools — states that omit `tools:` inherit this list.
-# States that set `tools: []` or `tools: [...]` override it entirely.
+# Agent-level tools - this is the maximum grant.
+# States that set `tools: []` or `tools: [...]` can only narrow this list.
 tools:
   - datetime
   - calculator
@@ -87,7 +86,7 @@ metadata:
   cli:
     welcome: "=== Tool Scoping Demo ==="
     hints:
-      - "Try: Hi! (in greeting — no tools available)"
-      - "Try: What time is it? (transitions to lookup — tools available)"
-      - "Try: Thanks! (transitions to closing — inherits agent-level tools)"
+      - "Try: Hi! (in greeting - no tools available)"
+      - "Try: What time is it? (transitions to lookup - tools available)"
+      - "Try: Thanks! (transitions to closing - inherits agent-level tools)"
     show_state: true

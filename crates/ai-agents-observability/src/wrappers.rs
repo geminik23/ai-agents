@@ -5,7 +5,7 @@ use crate::manager::ObservabilityManager;
 use crate::span::SpanGuard;
 use ai_agents_core::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
-    ToolResult,
+    ToolCallClassification, ToolResult, ToolSafetyMetadata,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -174,6 +174,14 @@ impl Tool for ObservedTool {
 
     fn input_schema(&self) -> Value {
         self.inner.input_schema()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        self.inner.safety_metadata()
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        self.inner.classify_call(args)
     }
 
     async fn execute(&self, args: Value) -> ToolResult {

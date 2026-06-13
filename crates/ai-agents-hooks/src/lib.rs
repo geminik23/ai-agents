@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
-use ai_agents_core::{AgentError, AgentResponse};
+use ai_agents_core::{AgentError, AgentResponse, ToolExecutionRecord};
 use ai_agents_hitl::{ApprovalRequest, ApprovalResult};
 use ai_agents_llm::{ChatMessage, LLMResponse};
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
@@ -35,6 +35,8 @@ pub trait AgentHooks: Send + Sync {
     async fn on_tool_start(&self, _tool: &str, _args: &Value) {}
 
     async fn on_tool_complete(&self, _tool: &str, _result: &ToolResult, _duration_ms: u64) {}
+
+    async fn on_tool_execution_record(&self, _record: &ToolExecutionRecord) {}
 
     async fn on_state_transition(&self, _from: Option<&str>, _to: &str, _reason: &str) {}
 

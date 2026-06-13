@@ -8,12 +8,17 @@ mod registry;
 pub mod security;
 mod types;
 
-pub use ai_agents_core::{Tool, ToolInfo, ToolResult};
+pub use ai_agents_core::{
+    PermissionOutcome, Tool, ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification,
+    ToolCallSource, ToolExecutionRecord, ToolExecutionRequest, ToolInfo, ToolInvoker,
+    ToolOperationKind, ToolPolicyDecisionRecord, ToolResult, ToolSafetyMetadata,
+    ToolSideEffectLevel,
+};
 pub use condition::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
 };
 pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderError};
-pub use registry::ToolRegistry;
+pub use registry::{ResolvedTool, ToolIdentity, ToolRegistry};
 pub use types::{ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel};
 
 pub use builtin::HttpTool;
@@ -22,7 +27,10 @@ pub use builtin::{
     TextTool,
 };
 
-pub use security::{SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine};
+pub use security::{
+    CommandPolicyConfig, DomainPolicyConfig, OperationPolicyConfig, PathPolicyConfig,
+    SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+};
 
 use schemars::JsonSchema;
 use std::sync::Arc;

@@ -1,12 +1,35 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use ai_agents_core::{Tool, ToolInfo};
+use ai_agents_core::{Tool, ToolInfo, ToolSafetyMetadata};
 
 use super::ToolError;
 use super::provider::{ProviderHealth, ToolProvider, ToolProviderError};
 use super::types::ToolAliases;
+
+/// Canonical identity produced by registry resolution.
+#[derive(Debug, Clone)]
+pub struct ToolIdentity {
+    /// Name, display name, or alias supplied by the caller.
+    pub requested_name: String,
+    /// Canonical tool ID used for policy and execution.
+    pub canonical_id: String,
+    /// Display name of the resolved tool.
+    pub display_name: String,
+    /// Provider ID for provider-backed tools.
+    pub provider_id: Option<String>,
+}
+
+/// Resolved tool handle plus canonical identity evidence.
+#[derive(Clone)]
+pub struct ResolvedTool {
+    /// Canonical identity returned by lookup.
+    pub identity: ToolIdentity,
+    /// Executable tool implementation.
+    pub tool: Arc<dyn Tool>,
+}
 
 #[derive(Clone)]
 enum ToolRef {
@@ -17,6 +40,7 @@ enum ToolRef {
     },
 }
 
+/// Registry for built-in, provider, alias, and localized tool lookup.
 pub struct ToolRegistry {
     builtin_tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
 
@@ -26,68 +50,149 @@ pub struct ToolRegistry {
 
     alias_index: RwLock<HashMap<String, String>>,
 
+    display_name_index: RwLock<HashMap<String, String>>,
+
     builtin_aliases: RwLock<HashMap<String, ToolAliases>>,
+
+    registry_version: AtomicU64,
 }
 
 impl ToolRegistry {
+    /// Creates an empty registry with versioned canonical indexes.
     pub fn new() -> Self {
         Self {
             builtin_tools: RwLock::new(HashMap::new()),
             providers: RwLock::new(HashMap::new()),
             tool_index: RwLock::new(HashMap::new()),
             alias_index: RwLock::new(HashMap::new()),
+            display_name_index: RwLock::new(HashMap::new()),
             builtin_aliases: RwLock::new(HashMap::new()),
+            registry_version: AtomicU64::new(1),
         }
     }
 
+    fn bump_version(&self) {
+        self.registry_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Returns the registry version used in tool execution evidence.
+    pub fn version(&self) -> u64 {
+        self.registry_version.load(Ordering::SeqCst)
+    }
+
+    fn normalize_key(value: &str) -> String {
+        value.trim().to_lowercase()
+    }
+
+    fn insert_unique_index(index: &mut HashMap<String, String>, key: String, tool_id: &str) {
+        match index.get(&key) {
+            None => {
+                index.insert(key, tool_id.to_string());
+            }
+            Some(existing) if existing == tool_id => {}
+            Some(_) => {
+                index.remove(&key);
+            }
+        }
+    }
+
+    /// Registers a built-in or custom tool by canonical ID.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolError> {
         let id = tool.id().to_string();
 
         let mut builtin_tools = self.builtin_tools.write();
         let mut tool_index = self.tool_index.write();
+        let mut display_name_index = self.display_name_index.write();
 
         if builtin_tools.contains_key(&id) || tool_index.contains_key(&id) {
             return Err(ToolError::Duplicate(id));
         }
 
+        Self::insert_unique_index(
+            &mut display_name_index,
+            Self::normalize_key(tool.name()),
+            &id,
+        );
         tool_index.insert(id.clone(), ToolRef::Builtin(tool.clone()));
         builtin_tools.insert(id, tool);
+        self.bump_version();
         Ok(())
     }
 
     pub fn get(&self, id_or_alias: &str) -> Option<Arc<dyn Tool>> {
+        self.resolve(id_or_alias).map(|resolved| resolved.tool)
+    }
+
+    /// Resolves any accepted name to a canonical tool ID.
+    pub fn canonical_id(&self, id_or_alias: &str) -> Option<String> {
+        self.resolve(id_or_alias)
+            .map(|resolved| resolved.identity.canonical_id)
+    }
+
+    /// Resolves safety metadata for a registered tool.
+    pub fn safety_metadata(&self, id_or_alias: &str) -> Option<ToolSafetyMetadata> {
+        self.resolve(id_or_alias)
+            .map(|resolved| resolved.tool.safety_metadata())
+    }
+
+    /// Resolves IDs, display names, and aliases to one canonical tool.
+    pub fn resolve(&self, id_or_alias: &str) -> Option<ResolvedTool> {
         let tool_index = self.tool_index.read();
+        let requested_name = id_or_alias.to_string();
+        let normalized = Self::normalize_key(id_or_alias);
 
-        // Try exact match first
-        if let Some(tool_ref) = tool_index.get(id_or_alias) {
-            return self.resolve_tool_ref(tool_ref);
+        if let Some((canonical_id, tool_ref)) =
+            tool_index.get_key_value(id_or_alias).or_else(|| {
+                tool_index
+                    .iter()
+                    .find(|(id, _)| Self::normalize_key(id) == normalized)
+            })
+        {
+            return self.resolved_tool_from_ref(&requested_name, canonical_id, tool_ref);
         }
 
-        // Try case-insensitive match on tool IDs and display names
-        // (LLM may return display name like "HTTP Client" but ID is "http")
-        let lower_input = id_or_alias.to_lowercase();
-        for (id, tool_ref) in tool_index.iter() {
-            if id.to_lowercase() == lower_input {
-                return self.resolve_tool_ref(tool_ref);
-            }
-            if let Some(tool) = self.resolve_tool_ref(tool_ref) {
-                if tool.name().to_lowercase() == lower_input {
-                    return Some(tool);
-                }
+        if let Some(tool_id) = self.display_name_index.read().get(&normalized).cloned() {
+            if let Some(tool_ref) = tool_index.get(&tool_id) {
+                return self.resolved_tool_from_ref(&requested_name, &tool_id, tool_ref);
             }
         }
 
-        // Try alias lookup (case-insensitive)
         let alias_index = self.alias_index.read();
-        for (alias_key, tool_id) in alias_index.iter() {
-            if alias_key.ends_with(&format!(":{}", lower_input)) {
-                if let Some(tool_ref) = tool_index.get(tool_id) {
-                    return self.resolve_tool_ref(tool_ref);
-                }
+        if let Some(tool_id) = alias_index.get(&normalized).cloned().or_else(|| {
+            alias_index.iter().find_map(|(alias_key, tool_id)| {
+                alias_key
+                    .ends_with(&format!(":{}", normalized))
+                    .then(|| tool_id.clone())
+            })
+        }) {
+            if let Some(tool_ref) = tool_index.get(&tool_id) {
+                return self.resolved_tool_from_ref(&requested_name, &tool_id, tool_ref);
             }
         }
 
         None
+    }
+
+    fn resolved_tool_from_ref(
+        &self,
+        requested_name: &str,
+        canonical_id: &str,
+        tool_ref: &ToolRef,
+    ) -> Option<ResolvedTool> {
+        let tool = self.resolve_tool_ref(tool_ref)?;
+        let provider_id = match tool_ref {
+            ToolRef::Builtin(_) => None,
+            ToolRef::Provider { provider_id, .. } => Some(provider_id.clone()),
+        };
+        Some(ResolvedTool {
+            identity: ToolIdentity {
+                requested_name: requested_name.to_string(),
+                canonical_id: canonical_id.to_string(),
+                display_name: tool.name().to_string(),
+                provider_id,
+            },
+            tool,
+        })
     }
 
     fn resolve_tool_ref(&self, tool_ref: &ToolRef) -> Option<Arc<dyn Tool>> {
@@ -145,6 +250,14 @@ impl ToolRegistry {
         }
 
         {
+            let display_names = self.display_name_index.read();
+            let mut mapped_display_names = mapped.display_name_index.write();
+            for (name, tool_id) in display_names.iter() {
+                mapped_display_names.insert(name.clone(), tool_id.clone());
+            }
+        }
+
+        {
             let builtin_aliases = self.builtin_aliases.read();
             let mut mapped_builtin_aliases = mapped.builtin_aliases.write();
             for (id, aliases) in builtin_aliases.iter() {
@@ -178,6 +291,9 @@ impl ToolRegistry {
         drop(mapped_builtin_tools);
         drop(mapped_tool_index);
         mapped
+            .registry_version
+            .store(self.version(), Ordering::SeqCst);
+        mapped
     }
 
     pub async fn register_provider(
@@ -198,6 +314,7 @@ impl ToolRegistry {
         {
             let mut tool_index = self.tool_index.write();
             let mut alias_index = self.alias_index.write();
+            let mut display_name_index = self.display_name_index.write();
 
             for descriptor in &tools {
                 if tool_index.contains_key(&descriptor.id) {
@@ -205,6 +322,11 @@ impl ToolRegistry {
                 }
 
                 if let Some(tool) = provider.get_tool(&descriptor.id).await {
+                    Self::insert_unique_index(
+                        &mut display_name_index,
+                        Self::normalize_key(&descriptor.name),
+                        &descriptor.id,
+                    );
                     tool_index.insert(
                         descriptor.id.clone(),
                         ToolRef::Provider {
@@ -215,8 +337,13 @@ impl ToolRegistry {
 
                     if let Some(ref aliases) = descriptor.aliases {
                         for (lang, name) in &aliases.names {
-                            let key = format!("{}:{}", lang, name.to_lowercase());
-                            alias_index.insert(key, descriptor.id.clone());
+                            let key = format!("{}:{}", lang, Self::normalize_key(name));
+                            Self::insert_unique_index(&mut alias_index, key, &descriptor.id);
+                            Self::insert_unique_index(
+                                &mut alias_index,
+                                Self::normalize_key(name),
+                                &descriptor.id,
+                            );
                         }
                     }
                 }
@@ -224,6 +351,7 @@ impl ToolRegistry {
         }
 
         self.providers.write().insert(provider_id, provider);
+        self.bump_version();
 
         Ok(())
     }
@@ -234,6 +362,7 @@ impl ToolRegistry {
         if removed.is_some() {
             let mut tool_index = self.tool_index.write();
             let mut alias_index = self.alias_index.write();
+            let mut display_name_index = self.display_name_index.write();
 
             let tools_to_remove: Vec<String> = tool_index
                 .iter()
@@ -255,6 +384,8 @@ impl ToolRegistry {
             }
 
             alias_index.retain(|_, tool_id| !tools_to_remove.contains(tool_id));
+            display_name_index.retain(|_, tool_id| !tools_to_remove.contains(tool_id));
+            self.bump_version();
 
             true
         } else {
@@ -270,18 +401,20 @@ impl ToolRegistry {
         {
             let mut alias_index = self.alias_index.write();
             for (lang, name) in &aliases.names {
-                let key = format!("{}:{}", lang, name.to_lowercase());
-                alias_index.insert(key, tool_id.to_string());
+                let key = format!("{}:{}", lang, Self::normalize_key(name));
+                Self::insert_unique_index(&mut alias_index, key, tool_id);
+                Self::insert_unique_index(&mut alias_index, Self::normalize_key(name), tool_id);
             }
         }
 
         self.builtin_aliases
             .write()
             .insert(tool_id.to_string(), aliases);
+        self.bump_version();
     }
 
     pub fn get_by_alias(&self, alias: &str, lang: &str) -> Option<Arc<dyn Tool>> {
-        let key = format!("{}:{}", lang, alias.to_lowercase());
+        let key = format!("{}:{}", lang, Self::normalize_key(alias));
         let alias_index = self.alias_index.read();
 
         if let Some(tool_id) = alias_index.get(&key) {
@@ -318,6 +451,7 @@ impl ToolRegistry {
 
                 let mut tool_index = self.tool_index.write();
                 let mut alias_index = self.alias_index.write();
+                let mut display_name_index = self.display_name_index.write();
 
                 let old_tools: Vec<String> = tool_index
                     .iter()
@@ -338,9 +472,15 @@ impl ToolRegistry {
                     tool_index.remove(tool_id);
                 }
                 alias_index.retain(|_, tool_id| !old_tools.contains(tool_id));
+                display_name_index.retain(|_, tool_id| !old_tools.contains(tool_id));
 
                 for descriptor in &tools {
                     if let Some(tool) = provider.get_tool(&descriptor.id).await {
+                        Self::insert_unique_index(
+                            &mut display_name_index,
+                            Self::normalize_key(&descriptor.name),
+                            &descriptor.id,
+                        );
                         tool_index.insert(
                             descriptor.id.clone(),
                             ToolRef::Provider {
@@ -351,12 +491,18 @@ impl ToolRegistry {
 
                         if let Some(ref aliases) = descriptor.aliases {
                             for (lang, name) in &aliases.names {
-                                let key = format!("{}:{}", lang, name.to_lowercase());
-                                alias_index.insert(key, descriptor.id.clone());
+                                let key = format!("{}:{}", lang, Self::normalize_key(name));
+                                Self::insert_unique_index(&mut alias_index, key, &descriptor.id);
+                                Self::insert_unique_index(
+                                    &mut alias_index,
+                                    Self::normalize_key(name),
+                                    &descriptor.id,
+                                );
                             }
                         }
                     }
                 }
+                self.bump_version();
             }
             Ok(())
         } else {
@@ -441,6 +587,27 @@ impl ToolRegistry {
         self.generate_filtered_prompt_with_lang(tool_ids, None, parallel)
     }
 
+    /// Generates a prompt for an explicit tool scope.
+    pub fn generate_scoped_prompt_with_parallel(
+        &self,
+        tool_ids: &[String],
+        parallel: bool,
+    ) -> String {
+        self.generate_scoped_prompt_with_lang(tool_ids, None, parallel)
+    }
+
+    pub fn generate_scoped_prompt_with_lang(
+        &self,
+        tool_ids: &[String],
+        language: Option<&str>,
+        parallel: bool,
+    ) -> String {
+        if tool_ids.is_empty() {
+            return String::new();
+        }
+        self.generate_filtered_prompt_inner(tool_ids, language, parallel)
+    }
+
     pub fn generate_filtered_prompt_with_lang(
         &self,
         tool_ids: &[String],
@@ -451,6 +618,15 @@ impl ToolRegistry {
             return self.generate_tools_prompt_with_lang(language, parallel);
         }
 
+        self.generate_filtered_prompt_inner(tool_ids, language, parallel)
+    }
+
+    fn generate_filtered_prompt_inner(
+        &self,
+        tool_ids: &[String],
+        language: Option<&str>,
+        parallel: bool,
+    ) -> String {
         let tool_index = self.tool_index.read();
         let builtin_aliases = self.builtin_aliases.read();
         let mut prompt = String::from("Available tools:\n");
@@ -775,6 +951,27 @@ mod tests {
         assert!(prompt_par.contains("JSON array"));
         assert!(prompt_par.contains("tool_name1"));
         assert!(prompt_par.contains("tool_name2"));
+    }
+
+    #[test]
+    fn test_canonical_resolution_and_scoped_empty_prompt() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool {
+                id: "calculator".to_string(),
+            }))
+            .unwrap();
+        let aliases = ToolAliases::new().with_name("ko", "계산기");
+        registry.set_tool_aliases("calculator", aliases);
+
+        let by_id = registry.resolve("calculator").unwrap();
+        assert_eq!(by_id.identity.canonical_id, "calculator");
+
+        let by_alias = registry.resolve("계산기").unwrap();
+        assert_eq!(by_alias.identity.canonical_id, "calculator");
+
+        let scoped = registry.generate_scoped_prompt_with_parallel(&[], false);
+        assert!(scoped.is_empty());
     }
 
     #[test]

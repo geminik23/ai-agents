@@ -82,10 +82,11 @@ pub mod agent {
         BackgroundOverflowPolicy, MainResponseDraft, MaintenanceMode, MaintenanceTaskPolicy,
         ParallelToolsConfig, PostTurnOptimizationConfig, RuntimeAgent, RuntimeBranch,
         RuntimeBranchOutcome, RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior,
-        RuntimeConfig, RuntimeOptimizationConfig, RuntimeOptimizationKind, RuntimeTaskPriority,
-        RuntimeTaskPurpose, ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamChunk,
-        StreamingConfig, StreamingDraftResult, StreamingOptimizationPolicy, ToolCall,
-        TurnActorContext, TurnBranchScheduler, TurnOptimizationContext,
+        RuntimeConfig, RuntimeControlHandle, RuntimeOptimizationConfig, RuntimeOptimizationKind,
+        RuntimeTaskPriority, RuntimeTaskPurpose, ScheduledBranchSet, SkillCandidate,
+        StreamBranchBuffer, StreamChunk, StreamingConfig, StreamingDraftResult,
+        StreamingOptimizationPolicy, ToolCall, TurnActorContext, TurnBranchScheduler,
+        TurnOptimizationContext,
     };
 }
 
@@ -431,18 +432,24 @@ pub mod disambiguation {
 
 pub mod tool_security {
     pub use ai_agents_tools::{
+        CommandPolicyConfig, DomainPolicyConfig, OperationPolicyConfig, PathPolicyConfig,
         SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
     };
 }
 
 pub mod tools {
-    pub use ai_agents_core::{Tool, ToolInfo, ToolResult};
+    pub use ai_agents_core::{
+        PermissionOutcome, Tool, ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification,
+        ToolCallSource, ToolExecutionRecord, ToolExecutionRequest, ToolInfo, ToolInvoker,
+        ToolOperationKind, ToolPolicyDecisionRecord, ToolResult, ToolSafetyMetadata,
+        ToolSideEffectLevel,
+    };
     pub use ai_agents_tools::{
         CalculatorTool, ConditionEvaluator, DateTimeTool, EchoTool, EvaluationContext, FileTool,
-        JsonTool, LLMGetter, MathTool, ProviderHealth, RandomTool, SimpleLLMGetter, TemplateTool,
-        TextTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor, ToolMetadata,
-        ToolProvider, ToolProviderError, ToolProviderType, ToolRegistry, TrustLevel,
-        create_builtin_registry,
+        JsonTool, LLMGetter, MathTool, ProviderHealth, RandomTool, ResolvedTool, SimpleLLMGetter,
+        TemplateTool, TextTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor,
+        ToolIdentity, ToolMetadata, ToolProvider, ToolProviderError, ToolProviderType,
+        ToolRegistry, TrustLevel, create_builtin_registry,
     };
     pub use ai_agents_tools::{HttpTool, generate_schema};
 }

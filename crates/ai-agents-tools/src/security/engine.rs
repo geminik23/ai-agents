@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -41,10 +42,11 @@ impl ToolCallTracker {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ToolSecurityEngine {
     config: ToolSecurityConfig,
     tool_call_tracker: Arc<RwLock<ToolCallTracker>>,
+    policy_version: u64,
 }
 
 impl ToolSecurityEngine {
@@ -52,11 +54,16 @@ impl ToolSecurityEngine {
         Self {
             config,
             tool_call_tracker: Arc::new(RwLock::new(ToolCallTracker::default())),
+            policy_version: 1,
         }
     }
 
     pub fn config(&self) -> &ToolSecurityConfig {
         &self.config
+    }
+
+    pub fn policy_version(&self) -> u64 {
+        self.policy_version
     }
 
     pub async fn check_tool_execution(
@@ -68,79 +75,297 @@ impl ToolSecurityEngine {
             return Ok(SecurityCheckResult::Allow);
         }
 
-        let tool_config = self.config.tools.get(tool_id);
-
-        if let Some(config) = tool_config {
-            if !config.enabled {
+        let tool_config = match self.config.tools.get(tool_id) {
+            Some(config) => config,
+            None if self.config.fail_closed => {
                 return Ok(SecurityCheckResult::Block {
-                    reason: format!("Tool '{}' is disabled", tool_id),
+                    reason: format!("Tool '{}' has no explicit security policy", tool_id),
                 });
             }
-
-            if let Some(rate_limit) = config.rate_limit {
-                let calls = self
-                    .tool_call_tracker
-                    .read()
-                    .get_calls_in_window(tool_id, 60);
-                if calls >= rate_limit as usize {
-                    return Ok(SecurityCheckResult::Block {
-                        reason: format!(
-                            "Rate limit exceeded for tool '{}': {} calls per minute",
-                            tool_id, rate_limit
-                        ),
-                    });
-                }
+            None => {
+                self.tool_call_tracker.write().record_call(tool_id);
+                debug!(tool_id = %tool_id, "Tool execution allowed by legacy open policy");
+                return Ok(SecurityCheckResult::Allow);
             }
+        };
 
-            if let Some(url) = args.get("url").and_then(|u| u.as_str()) {
-                for blocked in &config.blocked_domains {
-                    if url.contains(blocked) {
-                        return Ok(SecurityCheckResult::Block {
-                            reason: format!(
-                                "Domain '{}' is blocked for tool '{}'",
-                                blocked, tool_id
-                            ),
-                        });
-                    }
-                }
+        if !tool_config.enabled {
+            return Ok(SecurityCheckResult::Unavailable {
+                reason: format!("Tool '{}' is disabled", tool_id),
+            });
+        }
 
-                if !config.allowed_domains.is_empty() {
-                    let is_allowed = config.allowed_domains.iter().any(|d| url.contains(d));
-                    if !is_allowed {
-                        return Ok(SecurityCheckResult::Block {
-                            reason: format!(
-                                "URL domain not in allowed list for tool '{}'",
-                                tool_id
-                            ),
-                        });
-                    }
-                }
+        if let Some(rate_limit) = tool_config.rate_limit {
+            let calls = self
+                .tool_call_tracker
+                .read()
+                .get_calls_in_window(tool_id, 60);
+            if calls >= rate_limit as usize {
+                return Ok(SecurityCheckResult::Block {
+                    reason: format!(
+                        "Rate limit exceeded for tool '{}': {} calls per minute",
+                        tool_id, rate_limit
+                    ),
+                });
             }
+        }
 
-            if let Some(path) = args.get("path").and_then(|p| p.as_str()) {
-                if !config.allowed_paths.is_empty() {
-                    let is_allowed = config.allowed_paths.iter().any(|p| path.starts_with(p));
-                    if !is_allowed {
-                        return Ok(SecurityCheckResult::Block {
-                            reason: format!("Path not in allowed list for tool '{}'", tool_id),
-                        });
-                    }
-                }
-            }
+        if let Some(result) = self.check_domain_policy(tool_id, tool_config, args) {
+            return Ok(result);
+        }
 
-            if config.require_confirmation {
-                let message = config
-                    .confirmation_message
-                    .clone()
-                    .unwrap_or_else(|| format!("Confirm execution of tool '{}'?", tool_id));
-                return Ok(SecurityCheckResult::RequireConfirmation { message });
-            }
+        if let Some(result) = self.check_path_policy(tool_id, tool_config, args) {
+            return Ok(result);
+        }
+
+        if let Some(result) = self.check_operation_policy(tool_id, tool_config, args) {
+            return Ok(result);
+        }
+
+        if let Some(result) = self.check_command_policy(tool_id, tool_config, args) {
+            return Ok(result);
+        }
+
+        if tool_config.require_confirmation {
+            let message = tool_config
+                .confirmation_message
+                .clone()
+                .unwrap_or_else(|| format!("Confirm execution of tool '{}' ?", tool_id));
+            return Ok(SecurityCheckResult::RequireConfirmation { message });
         }
 
         self.tool_call_tracker.write().record_call(tool_id);
         debug!(tool_id = %tool_id, "Tool execution allowed");
 
         Ok(SecurityCheckResult::Allow)
+    }
+
+    pub fn check_command_execution(
+        &self,
+        tool_id: &str,
+        command: &str,
+        args: &[String],
+    ) -> SecurityCheckResult {
+        if !self.config.enabled {
+            return SecurityCheckResult::Allow;
+        }
+        let Some(tool_config) = self.config.tools.get(tool_id) else {
+            return if self.config.fail_closed {
+                SecurityCheckResult::Block {
+                    reason: format!("Tool '{}' has no explicit command policy", tool_id),
+                }
+            } else {
+                SecurityCheckResult::Allow
+            };
+        };
+        let value = serde_json::json!({
+            "command": command,
+            "argv": std::iter::once(command.to_string()).chain(args.iter().cloned()).collect::<Vec<_>>()
+        });
+        self.check_command_policy(tool_id, tool_config, &value)
+            .unwrap_or(SecurityCheckResult::Allow)
+    }
+
+    fn check_domain_policy(
+        &self,
+        tool_id: &str,
+        tool_config: &ToolPolicyConfig,
+        args: &serde_json::Value,
+    ) -> Option<SecurityCheckResult> {
+        let url = args.get("url").and_then(|u| u.as_str())?;
+        let host = match reqwest::Url::parse(url) {
+            Ok(parsed) => parsed.host_str().map(normalize_host),
+            Err(_) => None,
+        }?;
+
+        let denied = tool_config
+            .blocked_domains
+            .iter()
+            .chain(tool_config.domains.deny.iter());
+        for pattern in denied {
+            if host_matches(pattern, &host) {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!("Domain '{}' is blocked for tool '{}'", pattern, tool_id),
+                });
+            }
+        }
+
+        for pattern in &tool_config.domains.unavailable {
+            if host_matches(pattern, &host) {
+                return Some(SecurityCheckResult::Unavailable {
+                    reason: format!("Domain '{}' is unavailable for tool '{}'", pattern, tool_id),
+                });
+            }
+        }
+
+        for pattern in &tool_config.domains.requires_approval {
+            if host_matches(pattern, &host) {
+                return Some(SecurityCheckResult::RequireConfirmation {
+                    message: format!(
+                        "Confirm access to domain '{}' for tool '{}' ?",
+                        host, tool_id
+                    ),
+                });
+            }
+        }
+
+        let allowed: Vec<&String> = tool_config
+            .allowed_domains
+            .iter()
+            .chain(tool_config.domains.allow.iter())
+            .collect();
+        if !allowed.is_empty() && !allowed.iter().any(|pattern| host_matches(pattern, &host)) {
+            return Some(SecurityCheckResult::Block {
+                reason: format!("URL domain not in allowed list for tool '{}'", tool_id),
+            });
+        }
+
+        None
+    }
+
+    fn check_path_policy(
+        &self,
+        tool_id: &str,
+        tool_config: &ToolPolicyConfig,
+        args: &serde_json::Value,
+    ) -> Option<SecurityCheckResult> {
+        let path = args.get("path").and_then(|p| p.as_str())?;
+        let normalized = normalize_path(path);
+
+        for pattern in tool_config.paths.deny.iter() {
+            if path_matches(pattern, &normalized) {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!("Path is blocked for tool '{}'", tool_id),
+                });
+            }
+        }
+
+        for pattern in tool_config.paths.unavailable.iter() {
+            if path_matches(pattern, &normalized) {
+                return Some(SecurityCheckResult::Unavailable {
+                    reason: format!("Path is unavailable for tool '{}'", tool_id),
+                });
+            }
+        }
+
+        for pattern in tool_config.paths.requires_approval.iter() {
+            if path_matches(pattern, &normalized) {
+                return Some(SecurityCheckResult::RequireConfirmation {
+                    message: format!("Confirm access to path '{}' for tool '{}' ?", path, tool_id),
+                });
+            }
+        }
+
+        let allowed: Vec<&String> = tool_config
+            .allowed_paths
+            .iter()
+            .chain(tool_config.paths.allow.iter())
+            .collect();
+        if !allowed.is_empty()
+            && !allowed
+                .iter()
+                .any(|pattern| path_matches(pattern, &normalized))
+        {
+            return Some(SecurityCheckResult::Block {
+                reason: format!("Path not in allowed list for tool '{}'", tool_id),
+            });
+        }
+
+        None
+    }
+
+    fn check_operation_policy(
+        &self,
+        tool_id: &str,
+        tool_config: &ToolPolicyConfig,
+        args: &serde_json::Value,
+    ) -> Option<SecurityCheckResult> {
+        let operation = args
+            .get("operation")
+            .or_else(|| args.get("function"))
+            .or_else(|| args.get("method"))
+            .and_then(|v| v.as_str())
+            .map(|value| value.trim().to_ascii_lowercase())?;
+
+        if contains_casefold(&tool_config.operations.deny, &operation) {
+            return Some(SecurityCheckResult::Block {
+                reason: format!(
+                    "Operation '{}' is blocked for tool '{}'",
+                    operation, tool_id
+                ),
+            });
+        }
+        if contains_casefold(&tool_config.operations.unavailable, &operation) {
+            return Some(SecurityCheckResult::Unavailable {
+                reason: format!(
+                    "Operation '{}' is unavailable for tool '{}'",
+                    operation, tool_id
+                ),
+            });
+        }
+        if contains_casefold(&tool_config.operations.requires_approval, &operation) {
+            return Some(SecurityCheckResult::RequireConfirmation {
+                message: format!("Confirm operation '{}' for tool '{}' ?", operation, tool_id),
+            });
+        }
+        if !tool_config.operations.allow.is_empty()
+            && !contains_casefold(&tool_config.operations.allow, &operation)
+        {
+            return Some(SecurityCheckResult::Block {
+                reason: format!(
+                    "Operation '{}' is not allowed for tool '{}'",
+                    operation, tool_id
+                ),
+            });
+        }
+
+        None
+    }
+
+    fn check_command_policy(
+        &self,
+        tool_id: &str,
+        tool_config: &ToolPolicyConfig,
+        args: &serde_json::Value,
+    ) -> Option<SecurityCheckResult> {
+        let command = args.get("command").and_then(|v| v.as_str()).or_else(|| {
+            args.get("argv")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.first())
+                .and_then(|v| v.as_str())
+        })?;
+        let command = command.trim();
+
+        if contains_casefold(&tool_config.commands.deny, command) {
+            return Some(SecurityCheckResult::Block {
+                reason: format!("Command '{}' is blocked for tool '{}'", command, tool_id),
+            });
+        }
+        if contains_casefold(&tool_config.commands.unavailable, command) {
+            return Some(SecurityCheckResult::Unavailable {
+                reason: format!(
+                    "Command '{}' is unavailable for tool '{}'",
+                    command, tool_id
+                ),
+            });
+        }
+        if contains_casefold(&tool_config.commands.requires_approval, command) {
+            return Some(SecurityCheckResult::RequireConfirmation {
+                message: format!("Confirm command '{}' for tool '{}' ?", command, tool_id),
+            });
+        }
+        if !tool_config.commands.allow.is_empty()
+            && !contains_casefold(&tool_config.commands.allow, command)
+        {
+            return Some(SecurityCheckResult::Block {
+                reason: format!(
+                    "Command '{}' is not allowed for tool '{}'",
+                    command, tool_id
+                ),
+            });
+        }
+
+        None
     }
 
     pub fn get_tool_timeout(&self, tool_id: &str) -> u64 {
@@ -160,6 +385,40 @@ impl Default for ToolSecurityEngine {
     fn default() -> Self {
         Self::new(ToolSecurityConfig::default())
     }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn host_matches(pattern: &str, host: &str) -> bool {
+    let pattern = normalize_host(pattern.trim_start_matches("*."));
+    host == pattern || host.ends_with(&format!(".{}", pattern))
+}
+
+fn normalize_path(path: &str) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn path_matches(pattern: &str, path: &Path) -> bool {
+    let pattern = normalize_path(pattern);
+    path.starts_with(pattern)
+}
+
+fn contains_casefold(values: &[String], needle: &str) -> bool {
+    values
+        .iter()
+        .any(|value| value.eq_ignore_ascii_case(needle))
 }
 
 #[cfg(test)]
@@ -187,7 +446,7 @@ mod tests {
         let result = engine.check_tool_execution("http", &args).await.unwrap();
         assert!(result.is_blocked());
 
-        let args = serde_json::json!({"url": "https://good.com/api"});
+        let args = serde_json::json!({"url": "https://not-evil.com/api"});
         let result = engine.check_tool_execution("http", &args).await.unwrap();
         assert!(result.is_allowed());
     }
@@ -228,6 +487,7 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_blocked());
+        assert!(result.is_unavailable());
     }
 
     #[tokio::test]
@@ -294,5 +554,28 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn test_operation_policy() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.operations.deny = vec!["delete".to_string()];
+        tool_config.operations.requires_approval = vec!["write".to_string()];
+        config.tools.insert("file".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let result = engine
+            .check_tool_execution("file", &serde_json::json!({"operation": "delete"}))
+            .await
+            .unwrap();
+        assert!(result.is_blocked());
+
+        let result = engine
+            .check_tool_execution("file", &serde_json::json!({"operation": "write"}))
+            .await
+            .unwrap();
+        assert!(result.requires_approval());
     }
 }

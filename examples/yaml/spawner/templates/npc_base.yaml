@@ -5,7 +5,7 @@
 #   metadata.template.variables:  - read by GenerateAgentTool for variable discovery
 #
 # The LLM sees available templates and their variables automatically
-# in the generate_agent tool description. No system prompt changes needed.
+# in the spawn_agent tool description. No system prompt changes needed.
 #
 # Jinja2 variables:
 #   {{ name }}                 - caller-provided NPC name

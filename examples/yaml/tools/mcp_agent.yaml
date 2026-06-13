@@ -35,9 +35,10 @@ tools:
   # The discovered server functions are available through `tool: filesystem`.
   #
   # Views define named subsets of the server's functions.
-  # Each view becomes an independent tool in the registry, sharing the parent's
-  # MCP connection. States reference views by name for least-privilege scoping.
+  # Each view becomes an independent tool ID in the registry, sharing the parent's MCP connection, security policy, and HITL policy.
+  # States reference views by name for least-privilege scoping.
   # The parent tool (`filesystem`) is always registered with ALL functions.
+  # Top-level tools must grant every parent or view ID that states may use.
   - name: filesystem
     type: mcp
     transport: stdio
@@ -53,6 +54,10 @@ tools:
       fs_write:
         functions: [write_file, create_directory, move_file]
         description: "Filesystem write operations (create, move)"
+
+  # View IDs are also listed at top level so states can narrow to them.
+  - fs_read
+  - fs_write
 
 states:
   initial: ready
@@ -81,8 +86,7 @@ states:
         - to: ready
           when: "user is done or changes topic"
 
-    # Only write MCP functions are visible here. HITL approval still applies
-    # because the parent's hitl_functions config passes through to all views.
+    # Only write MCP functions are visible here. Parent blocked_functions and hitl_functions still apply through the shared executor.
     editing:
       prompt: "I can help you create, modify, or delete files."
       tools: [fs_write, datetime]

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generate_schema;
-use ai_agents_core::{Tool, ToolResult};
+use ai_agents_core::{Tool, ToolResult, ToolSafetyMetadata};
 
 /// This Tool is for development purposes only.
 /// It evaluates mathematical expressions.
@@ -51,6 +51,10 @@ impl Tool for CalculatorTool {
 
     fn input_schema(&self) -> Value {
         generate_schema::<CalculatorInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        ToolSafetyMetadata::compute()
     }
 
     async fn execute(&self, args: Value) -> ToolResult {

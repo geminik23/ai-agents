@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::generate_schema;
-use ai_agents_core::{Tool, ToolResult};
+use ai_agents_core::{
+    Tool, ToolCallClassification, ToolOperationKind, ToolResult, ToolSafetyMetadata,
+};
 
 pub struct TemplateTool {
     env: Environment<'static>,
@@ -77,6 +79,24 @@ impl Tool for TemplateTool {
 
     fn input_schema(&self) -> Value {
         generate_schema::<TemplateInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        ToolSafetyMetadata::read_only(ToolOperationKind::Read)
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        let operation = args
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if operation.eq_ignore_ascii_case("render_file") {
+            ToolCallClassification::from_metadata(&ToolSafetyMetadata::read_only(
+                ToolOperationKind::Read,
+            ))
+        } else {
+            ToolCallClassification::from_metadata(&ToolSafetyMetadata::compute())
+        }
     }
 
     async fn execute(&self, args: Value) -> ToolResult {

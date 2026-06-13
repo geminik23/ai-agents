@@ -1180,39 +1180,66 @@ impl AgentBuilder {
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
 
-        // Extract declared tool IDs from spec (agent-level tool scope)
-        // - None  = `tools:` not specified in YAML -> all registered tools available : WILL CHANGE as no tools (Future task)
-        // - Some([]) = `tools: []` in YAML -> explicitly no tools
-        // - Some([...]) = specific tools listed
-        let declared_tool_ids: Option<Vec<String>> = self.spec.as_ref().and_then(|s| {
-            s.tools.as_ref().map(|tools| {
-                let mut ids: Vec<String> = tools.iter().map(|t| t.name().to_string()).collect();
+        // Build the effective tool grant.
+        // YAML top-level tools are explicit ordinary grants, while feature flags such as spawner management, persona evolution, and orchestration tools are explicit feature grants.
+        let declared_tool_ids: Option<Vec<String>> = Some(if self.spec.is_none() {
+            tools_arc.list_ids()
+        } else {
+            let mut ids: Vec<String> = self
+                .spec
+                .as_ref()
+                .and_then(|s| s.tools.as_ref())
+                .map(|tools| {
+                    let mut ids: Vec<String> = tools
+                        .iter()
+                        .filter_map(|t| {
+                            tools_arc
+                                .canonical_id(t.name())
+                                .or_else(|| Some(t.name().to_string()))
+                        })
+                        .collect();
 
-                // Include view names from MCP entries so they pass availability checks
-                for entry in tools {
-                    if let Some(mcp_config) = entry.to_mcp_config() {
-                        for view_name in mcp_config.views.keys() {
-                            ids.push(view_name.clone());
+                    for entry in tools {
+                        if let Some(mcp_config) = entry.to_mcp_config() {
+                            for view_name in mcp_config.views.keys() {
+                                ids.push(
+                                    tools_arc
+                                        .canonical_id(view_name)
+                                        .unwrap_or_else(|| view_name.clone()),
+                                );
+                            }
                         }
                     }
-                }
 
-                // Auto-registered tools must bypass scoping when the user has an explicit list.
-                // persona_evolve is auto-registered when allow_llm_evolve is true.
-                if persona_manager
-                    .as_ref()
-                    .is_some_and(|pm| pm.should_register_evolve_tool())
-                {
-                    ids.push("persona_evolve".to_string());
-                }
+                    ids
+                })
+                .unwrap_or_default();
 
-                ids
-            })
+            if let Some(ref spec) = self.spec {
+                if let Some(ref spawner) = spec.spawner {
+                    // management_tools and orchestration_tools are explicit registration and grant signals.
+                    ids.extend(spawner.management_tools.granted_management_tool_ids());
+                    ids.extend(spawner.orchestration_tools.granted_orchestration_tool_ids());
+                }
+            }
+
+            if persona_manager
+                .as_ref()
+                .is_some_and(|pm| pm.should_register_evolve_tool())
+            {
+                // allow_llm_evolve is an explicit registration and grant signal.
+                ids.push("persona_evolve".to_string());
+            }
+
+            ids.sort();
+            ids.dedup();
+            ids
         });
 
-        // Validate: every non-MCP tool declared in the YAML spec must exist in the registry.
+        // Validate: every effective non-MCP tool grant must exist in the registry.
         // MCP tools are excluded because they are registered via auto_configure_mcp() which
         // may or may not have been called (and MCP view names are synthetic).
+        // Feature grants such as spawner management tools, orchestration tools, and persona_evolve must be registered before build.
         if let Some(ref ids) = declared_tool_ids {
             let mcp_names: Vec<String> = self
                 .spec
@@ -1241,9 +1268,9 @@ impl AgentBuilder {
 
             if !missing.is_empty() {
                 return Err(AgentError::Config(format!(
-                    "Tools declared in YAML but not registered: [{}]. \
-                     Register them via .tool(Arc::new(...)) before .build(), \
-                     or remove them from the YAML tools: list.",
+                    "Tools granted by YAML but not registered: [{}]. \
+                     Register them via .tool(Arc::new(...)) or the matching auto_configure_* method before .build(), \
+                     or remove the grant from YAML.",
                     missing.join(", ")
                 )));
             }

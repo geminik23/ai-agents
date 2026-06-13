@@ -83,6 +83,8 @@ pub struct StepResult {
     pub step_index: usize,
     pub args: Option<Value>,
     pub result: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 impl SkillContext {
@@ -100,10 +102,21 @@ impl SkillContext {
     }
 
     pub fn add_result(&mut self, step_index: usize, args: Option<Value>, result: Value) {
+        self.add_result_with_metadata(step_index, args, result, None);
+    }
+
+    pub fn add_result_with_metadata(
+        &mut self,
+        step_index: usize,
+        args: Option<Value>,
+        result: Value,
+        metadata: Option<Value>,
+    ) {
         self.step_results.push(StepResult {
             step_index,
             args,
             result,
+            metadata,
         });
     }
 

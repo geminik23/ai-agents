@@ -5,6 +5,10 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 
+use ai_agents_core::{
+    ToolCallClassification, ToolOperationKind, ToolSafetyMetadata, ToolSideEffectLevel,
+};
+
 use crate::{Tool, ToolResult, generate_schema};
 
 pub struct HttpTool {
@@ -75,6 +79,40 @@ impl Tool for HttpTool {
 
     fn input_schema(&self) -> Value {
         generate_schema::<HttpInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        ToolSafetyMetadata {
+            read_only: false,
+            concurrency_safe: false,
+            operation: ToolOperationKind::Network,
+            side_effect_level: ToolSideEffectLevel::ExternalWrite,
+            requires_network: true,
+            destructive: false,
+            open_world: true,
+            host_dependent: false,
+            requires_user_interaction: false,
+            supports_cancellation: false,
+            default_requires_approval: true,
+            should_defer_schema: false,
+            max_output_chars: Some(20_000),
+            max_result_size_chars: Some(20_000),
+        }
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        let mut metadata = self.safety_metadata();
+        let method = args
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD") {
+            metadata.read_only = true;
+            metadata.concurrency_safe = true;
+            metadata.side_effect_level = ToolSideEffectLevel::ExternalRead;
+            metadata.default_requires_approval = false;
+        }
+        ToolCallClassification::from_metadata(&metadata)
     }
 
     async fn execute(&self, args: Value) -> ToolResult {

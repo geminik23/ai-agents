@@ -160,7 +160,7 @@ Declarative state machine examples - from minimal transitions to production-grad
 | `two_state_greeting.yaml` | Minimal: 2 states, 1 transition each |
 | `guard_transitions.yaml` | Context-based guard transitions (deterministic, no LLM call) |
 | `nested_states.yaml` | Hierarchical sub-states with `^` escape and turn timeout |
-| `state_with_tools.yaml` | Per-state tool scoping (`tools: []` vs inherit) |
+| `state_with_tools.yaml` | Top-level maximum tool grants with per-state narrowing |
 | `state_lifecycle.yaml` | `on_enter` / `on_exit` / `on_reenter` actions in a draft-review workflow, plus a secondary retry path with cooldown |
 | `support_state_machine.yaml` | Full customer support workflow with hierarchical technical support, global escalation, and fallback clarification |
 
@@ -179,6 +179,8 @@ cargo run -p ai-agents-cli -- run examples/yaml/state-machine/support_state_mach
 
 Progressive tool usage examples - from basic tool calls to multi-tool composition.
 
+Top-level `tools:` is an explicit ordinary-tool grant. Omitted or empty top-level `tools:` means no ordinary LLM-callable tools. Explicit feature flags such as orchestration tools and persona evolution can also grant their generated tools. State-level `tools` can narrow the effective grant but cannot expose tools that were not granted.
+
 | File | Description |
 |------|-------------|
 | `basic_tools.yaml` | Calculator and DateTime - LLM auto-selects the right tool |
@@ -192,6 +194,7 @@ Progressive tool usage examples - from basic tool calls to multi-tool compositio
 Note: The `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
 The framework auto-injects tool information (names, descriptions, argument schemas) into the prompt at runtime.
 The system prompt focuses on behavioral guidance only.
+Security, HITL, recovery, and eval use canonical tool IDs after display names or aliases are resolved.
 
 Examples:
 
@@ -426,10 +429,10 @@ Dynamic agent spawning - create, message, list, and remove agents at runtime fro
 
 | File | Description |
 |------|-------------|
-| `game_master.yaml` | Game master that spawns NPC agents on demand using four spawner tools (`generate_agent`, `send_message`, `list_agents`, `remove_agent`) with shared LLMs, named templates, and auto-naming |
+| `game_master.yaml` | Game master that spawns NPC agents on demand using four management tools (`spawn_agent`, `send_agent_message`, `list_agents`, `remove_agent`) with shared LLMs, named templates, and auto-naming |
 | `team_manager.yaml` | Team manager that spawns specialist agents (researcher, writer) with shared SQLite storage, tool allowlist, and multi-template LLM selection |
 
-Note: The spawner tools are auto-registered by `AgentBuilder::auto_configure_spawner()` when the YAML has a `spawner:` section.
+Note: Spawner management tools are registered by `AgentBuilder::auto_configure_spawner()` and granted when `spawner.management_tools` is enabled.
 
 Examples:
 
@@ -445,10 +448,10 @@ Agent persona - structured identity, personality traits, evolution, and context-
 | File | Description |
 |------|-------------|
 | `persona_basic.yaml` | Minimal persona with identity (name, role, affiliation), personality traits, speaking style, goals, and hidden goals that coexist with `system_prompt` |
-| `persona_evolution.yaml` | Evolvable persona where `traits.personality`, `traits.speaking_style`, and `goals.primary` can be mutated at runtime via Rust API or the auto-registered `persona_evolve` tool |
+| `persona_evolution.yaml` | Evolvable persona where `traits.personality`, `traits.speaking_style`, and `goals.primary` can be mutated at runtime via Rust API or the auto-registered and granted `persona_evolve` tool |
 | `persona_secrets.yaml` | Persona with context-conditional secrets revealed only when `ContextManager` values satisfy typed conditions (`gte`, `eq`, `all`, `any`) - includes runtime context defaults for CLI testing |
 
-Note: Persona is prepended to the system prompt automatically. It survives `prompt_mode: replace` in state machines. The `persona_evolve` tool is auto-registered only when `evolution.allow_llm_evolve: true`. Secrets with no `reveal_conditions` never auto-reveal (API-only access).
+Note: Persona is prepended to the system prompt automatically. It survives `prompt_mode: replace` in state machines. The `persona_evolve` tool is registered and granted only when `evolution.allow_llm_evolve: true`. Secrets with no `reveal_conditions` never auto-reveal (API-only access).
 
 Examples:
 

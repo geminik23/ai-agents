@@ -19,7 +19,7 @@ pub use optimization::{
     ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamingDraftResult,
     StreamingOptimizationPolicy, TurnBranchScheduler, TurnOptimizationContext,
 };
-pub use runtime::RuntimeAgent;
+pub use runtime::{RuntimeAgent, RuntimeControlHandle};
 pub use streaming::{StreamChunk, StreamingConfig};
 pub use turn_context::TurnActorContext;
 

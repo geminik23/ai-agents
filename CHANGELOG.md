@@ -221,7 +221,7 @@
 
 ### Added
 - Dynamic agent spawning: create and manage child agents at runtime from YAML templates or LLM-generated specs, with shared LLMs, storage, shared context, spawn limits and  tool allowlists
-- Spawner template metadata: generate_agent tool auto-discovers template names, descriptions, and variables so the LLM selects the right template without system prompt instructions
+- Spawner template metadata: spawn_agent (rename from `generate_agent` in rc.16) tool auto-discovers template names, descriptions, and variables so the LLM selects the right template without system prompt instructions
 - CLI session persistence: /save, /load, /sessions, /delete commands with spawner-aware cascading that persists the full multi-agent graph
 - CLI HITL approval handler with multi-language support, configurable via metadata.cli.hitl
 - Error recovery wiring: fallback_llm, fallback_response, tool skip, and tool fallback actions now execute at runtime

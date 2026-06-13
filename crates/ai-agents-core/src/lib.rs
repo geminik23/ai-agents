@@ -12,9 +12,11 @@ pub use message::{ChatMessage, Role};
 pub use traits::llm::{LLMCapability, LLMError, LLMProvider, TaskContext, ToolSelection};
 pub use traits::memory::{Memory, MemorySnapshot};
 pub use traits::storage::{AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry};
-pub use traits::tool::{Tool, ToolInfo, ToolResult};
+pub use traits::tool::{Tool, ToolInfo, ToolInvoker, ToolResult};
 pub use types::{
     AgentInfo, AgentResponse, FactCategory, FactFilter, FinishReason, KeyFact, LLMChunk, LLMConfig,
-    LLMFeature, LLMResponse, SessionFilter, SessionMetadata, SessionSummary, StateMachineSnapshot,
-    StateTransitionEvent, TokenUsage, ToolCall,
+    LLMFeature, LLMResponse, PermissionOutcome, SessionFilter, SessionMetadata, SessionSummary,
+    StateMachineSnapshot, StateTransitionEvent, TokenUsage, ToolApprovalRecord, ToolApprovalStatus,
+    ToolCall, ToolCallClassification, ToolCallSource, ToolExecutionRecord, ToolExecutionRequest,
+    ToolOperationKind, ToolPolicyDecisionRecord, ToolSafetyMetadata, ToolSideEffectLevel,
 };

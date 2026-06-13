@@ -8,13 +8,13 @@ description: "Manager that spawns specialist agents for research and writing tas
 #   - shared_storage:  all spawned agents persist sessions to one SQLite DB
 #   - allowed_tools:   spawned agents can only use calculator and datetime
 #
-# Also demonstrates multi-template LLM selection: the generate_agent tool description auto-includes template names, descriptions, and variables from metadata.
+# Also demonstrates multi-template LLM selection: the spawn_agent tool description auto-includes template names, descriptions, and variables from metadata.
 # template.variables in each template file. The LLM reads these and picks the right template without any system prompt instructions.
 #
-# Flow: user asks to create specialist -> LLM calls generate_agent
+# Flow: user asks to create specialist -> LLM calls spawn_agent
 #         -> template path: render researcher or writer template -> spawn -> register
 #         -> LLM path: router generates YAML -> validate -> allowed_tools filter -> spawn
-#       user asks specialist a question -> LLM calls send_message -> agent response
+#       user asks specialist a question -> LLM calls send_agent_message -> agent response
 #       user asks to list team -> LLM calls list_agents -> JSON list
 #       user asks to remove agent -> LLM calls remove_agent -> deregister
 
@@ -28,9 +28,9 @@ system_prompt: |
   - Remove agents that are no longer needed
 
   Always use the available template when creating agents.
-  The generate_agent tool shows available templates and their variables.
+  The spawn_agent tool shows available templates and their variables.
 
-  When delegating work, use send_message to communicate with your team members.
+  When delegating work, use send_agent_message to communicate with your team members.
 
 llms:
   default:
@@ -50,14 +50,16 @@ memory:
   compress_threshold: 20
   summarizer_llm: router
 
-# Only spawner tools - team manager delegates, does not use tools directly.
-tools:
-  - generate_agent
-  - send_message
-  - list_agents
-  - remove_agent
+# `management_tools: true` registers and grants all four dynamic agent management tools.
+# Equivalent explicit grant, shown for reference:
+# tools:
+#   - spawn_agent
+#   - send_agent_message
+#   - list_agents
+#   - remove_agent
 
 spawner:
+  management_tools: true
   shared_llms: true
   max_agents: 10
   name_prefix: "agent_"
@@ -69,6 +71,7 @@ spawner:
     path: ./data/team_sessions.db
 
   # Spawned agents can ONLY use these tools.
+  # This caps child-agent specs, but each child still needs its own top-level tools list.
   # Tools not in this list are stripped from the agent spec before spawning.
   allowed_tools:
     - calculator

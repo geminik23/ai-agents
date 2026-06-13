@@ -442,6 +442,14 @@ impl Tool for RecordingTool {
         self.inner.input_schema()
     }
 
+    fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+        self.inner.safety_metadata()
+    }
+
+    fn classify_call(&self, args: &Value) -> ai_agents_core::ToolCallClassification {
+        self.inner.classify_call(args)
+    }
+
     async fn execute(&self, args: Value) -> ToolResult {
         let started_at = chrono::Utc::now();
         let start = Instant::now();

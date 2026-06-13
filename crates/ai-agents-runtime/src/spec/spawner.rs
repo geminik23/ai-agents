@@ -14,24 +14,24 @@ pub struct AutoSpawnEntry {
     pub agent: String,
 }
 
-/// Orchestration tool selection: all tools or a specific subset.
+/// Tool selection: all tools or a specific subset.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
-pub enum OrchestrationToolsConfig {
-    /// `orchestration_tools: true` registers all orchestration tools.
+pub enum SpawnerToolGrantConfig {
+    /// `management_tools: true` or `orchestration_tools: true` grants all tools in that group.
     All(bool),
-    /// `orchestration_tools: [route_to_agent, group_discussion]` registers listed tools.
+    /// `management_tools: [spawn_agent, list_agents]` grants listed tools.
     Selected(Vec<String>),
 }
 
-impl Default for OrchestrationToolsConfig {
+impl Default for SpawnerToolGrantConfig {
     fn default() -> Self {
         Self::All(false)
     }
 }
 
-impl OrchestrationToolsConfig {
-    /// Returns true if any orchestration tools are enabled.
+impl SpawnerToolGrantConfig {
+    /// Returns true if any tools in this group are enabled.
     pub fn is_enabled(&self) -> bool {
         match self {
             Self::All(v) => *v,
@@ -47,7 +47,42 @@ impl OrchestrationToolsConfig {
             Self::Selected(v) => v.iter().any(|t| t == tool_name),
         }
     }
+
+    /// Returns the selected tool IDs, or all IDs when this config is true.
+    pub fn granted_tool_ids(&self, all_ids: &[&str]) -> Vec<String> {
+        match self {
+            Self::All(true) => all_ids.iter().map(|id| (*id).to_string()).collect(),
+            Self::All(false) => Vec::new(),
+            Self::Selected(ids) => ids.clone(),
+        }
+    }
+
+    /// Returns the orchestration tool IDs granted by this config.
+    pub fn granted_orchestration_tool_ids(&self) -> Vec<String> {
+        const ALL: [&str; 5] = [
+            "route_to_agent",
+            "pipeline_process",
+            "concurrent_ask",
+            "group_discussion",
+            "handoff_conversation",
+        ];
+        self.granted_tool_ids(&ALL)
+    }
+
+    /// Returns the management tool IDs granted by this config.
+    pub fn granted_management_tool_ids(&self) -> Vec<String> {
+        const ALL: [&str; 4] = [
+            "spawn_agent",
+            "send_agent_message",
+            "list_agents",
+            "remove_agent",
+        ];
+        self.granted_tool_ids(&ALL)
+    }
 }
+
+pub type OrchestrationToolsConfig = SpawnerToolGrantConfig;
+pub type ManagementToolsConfig = SpawnerToolGrantConfig;
 
 /// Configuration for dynamic agent spawning declared in the `spawner:` YAML section.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +118,10 @@ pub struct SpawnerConfig {
     /// Agents to create at startup and register in the AgentRegistry.
     #[serde(default)]
     pub auto_spawn: Vec<AutoSpawnEntry>,
+
+    /// Grant dynamic agent management tools (spawn_agent, send_agent_message, list_agents, remove_agent).
+    #[serde(default)]
+    pub management_tools: ManagementToolsConfig,
 
     /// Register orchestration tools (route_to_agent, group_discussion, etc.).
     #[serde(default)]
@@ -126,6 +165,7 @@ impl Default for SpawnerConfig {
             templates: HashMap::new(),
             allowed_tools: None,
             auto_spawn: Vec::new(),
+            management_tools: ManagementToolsConfig::default(),
             orchestration_tools: OrchestrationToolsConfig::default(),
         }
     }
@@ -141,6 +181,7 @@ impl SpawnerConfig {
             || self.name_prefix.is_some()
             || !self.templates.is_empty()
             || !self.auto_spawn.is_empty()
+            || self.management_tools.is_enabled()
             || self.orchestration_tools.is_enabled()
     }
 }
@@ -193,6 +234,49 @@ auto_spawn:
         assert_eq!(config.auto_spawn.len(), 2);
         assert_eq!(config.auto_spawn[0].id, "billing");
         assert_eq!(config.auto_spawn[0].agent, "agents/billing_agent.yaml");
+    }
+
+    #[test]
+    fn test_deserialize_management_tools_all() {
+        let yaml = r#"
+management_tools: true
+"#;
+        let config: SpawnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.management_tools.is_enabled());
+        assert!(config.management_tools.includes("spawn_agent"));
+        assert_eq!(
+            config.management_tools.granted_management_tool_ids(),
+            vec![
+                "spawn_agent".to_string(),
+                "send_agent_message".to_string(),
+                "list_agents".to_string(),
+                "remove_agent".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_deserialize_management_tools_selected() {
+        let yaml = r#"
+management_tools:
+  - spawn_agent
+  - send_agent_message
+  - list_agents
+"#;
+        let config: SpawnerConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.management_tools.is_enabled());
+        assert!(config.management_tools.includes("spawn_agent"));
+        assert!(config.management_tools.includes("send_agent_message"));
+        assert!(config.management_tools.includes("list_agents"));
+        assert!(!config.management_tools.includes("remove_agent"));
+        assert_eq!(
+            config.management_tools.granted_management_tool_ids(),
+            vec![
+                "spawn_agent".to_string(),
+                "send_agent_message".to_string(),
+                "list_agents".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -290,6 +374,7 @@ templates:
             templates: HashMap::new(),
             allowed_tools: Some(vec!["echo".to_string()]),
             auto_spawn: Vec::new(),
+            management_tools: ManagementToolsConfig::default(),
             orchestration_tools: OrchestrationToolsConfig::default(),
         };
         let yaml = serde_yaml::to_string(&config).unwrap();

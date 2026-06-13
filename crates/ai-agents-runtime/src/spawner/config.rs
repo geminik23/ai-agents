@@ -241,7 +241,7 @@ pub async fn auto_configure_spawner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::spec::OrchestrationToolsConfig;
+    use crate::spec::{ManagementToolsConfig, OrchestrationToolsConfig};
 
     // -- extract_template_metadata tests --
 
@@ -541,6 +541,7 @@ system_prompt: "You are {{ name }}."
             templates,
             allowed_tools: Some(vec!["echo".to_string()]),
             auto_spawn: Vec::new(),
+            management_tools: ManagementToolsConfig::default(),
             orchestration_tools: OrchestrationToolsConfig::default(),
         };
 

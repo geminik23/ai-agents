@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_message() {
+    async fn test_send_agent_message() {
         let registry = AgentRegistry::new();
         registry.register(make_spawned("sender")).await.unwrap();
         registry.register(make_spawned("receiver")).await.unwrap();

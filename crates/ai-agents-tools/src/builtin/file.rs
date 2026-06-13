@@ -6,7 +6,10 @@ use std::fs;
 use std::path::Path;
 
 use crate::generate_schema;
-use ai_agents_core::{Tool, ToolResult};
+use ai_agents_core::{
+    Tool, ToolCallClassification, ToolOperationKind, ToolResult, ToolSafetyMetadata,
+    ToolSideEffectLevel,
+};
 
 pub struct FileTool;
 
@@ -115,6 +118,58 @@ impl Tool for FileTool {
 
     fn input_schema(&self) -> Value {
         generate_schema::<FileInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        ToolSafetyMetadata {
+            read_only: false,
+            concurrency_safe: false,
+            operation: ToolOperationKind::Write,
+            side_effect_level: ToolSideEffectLevel::LocalWrite,
+            requires_network: false,
+            destructive: true,
+            open_world: false,
+            host_dependent: false,
+            requires_user_interaction: false,
+            supports_cancellation: false,
+            default_requires_approval: true,
+            should_defer_schema: false,
+            max_output_chars: Some(20_000),
+            max_result_size_chars: Some(20_000),
+        }
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        let operation = args
+            .get("operation")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut metadata = self.safety_metadata();
+        match operation.as_str() {
+            "read" | "exists" | "list" | "info" => {
+                metadata.read_only = true;
+                metadata.concurrency_safe = true;
+                metadata.operation = ToolOperationKind::Read;
+                metadata.side_effect_level = ToolSideEffectLevel::None;
+                metadata.destructive = false;
+                metadata.default_requires_approval = false;
+            }
+            "delete" => {
+                metadata.operation = ToolOperationKind::Delete;
+                metadata.side_effect_level = ToolSideEffectLevel::Destructive;
+                metadata.destructive = true;
+                metadata.default_requires_approval = true;
+            }
+            "write" | "append" | "mkdir" => {
+                metadata.operation = ToolOperationKind::Write;
+                metadata.side_effect_level = ToolSideEffectLevel::LocalWrite;
+                metadata.destructive = false;
+                metadata.default_requires_approval = true;
+            }
+            _ => {}
+        }
+        ToolCallClassification::from_metadata(&metadata)
     }
 
     async fn execute(&self, args: Value) -> ToolResult {

@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -15,7 +15,8 @@ use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
 use ai_agents_core::{
     AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMProvider, LLMResponse,
-    Result, ToolResult,
+    PermissionOutcome, Result, ToolApprovalRecord, ToolApprovalStatus, ToolCallSource,
+    ToolExecutionRecord, ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
 };
 use ai_agents_disambiguation::{
     ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
@@ -46,8 +47,7 @@ use ai_agents_reasoning::{
 };
 use ai_agents_recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
-    LLMFailureAction, MessageFilter, RecoveryManager, RetryConfig, SkipPatternFilter,
-    ToolFailureAction,
+    LLMFailureAction, MessageFilter, RecoveryManager, SkipPatternFilter, ToolFailureAction,
 };
 use ai_agents_relationships::RelationshipManager;
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
@@ -58,7 +58,7 @@ use ai_agents_state::{
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
 use ai_agents_tools::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SecurityCheckResult, ToolCallRecord,
-    ToolRegistry, ToolSecurityEngine,
+    ToolRegistry, ToolSecurityConfig, ToolSecurityEngine,
 };
 
 use super::{
@@ -117,6 +117,82 @@ impl<'a> RootTurnCleanup<'a> {
 impl Drop for RootTurnCleanup<'_> {
     fn drop(&mut self) {
         self.agent.end_root_turn();
+    }
+}
+
+/// Host-owned runtime control state shared with active agents.
+#[derive(Debug)]
+struct RuntimeControlState {
+    /// Monotonic version for runtime-control snapshots.
+    version: AtomicU64,
+    /// Emergency switch that denies all future tool execution.
+    emergency_deny: AtomicBool,
+    /// Optional live replacement for tool security policy.
+    tool_security_override: RwLock<Option<ToolSecurityConfig>>,
+    /// Optional live replacement for the top-level tool scope.
+    tool_scope_override: RwLock<Option<Vec<String>>>,
+}
+
+impl Default for RuntimeControlState {
+    fn default() -> Self {
+        Self {
+            version: AtomicU64::new(1),
+            emergency_deny: AtomicBool::new(false),
+            tool_security_override: RwLock::new(None),
+            tool_scope_override: RwLock::new(None),
+        }
+    }
+}
+
+/// Host-only handle for live runtime safety controls.
+#[derive(Clone)]
+pub struct RuntimeControlHandle {
+    state: Arc<RuntimeControlState>,
+}
+
+impl RuntimeControlHandle {
+    /// Returns the current runtime-control version.
+    pub fn version(&self) -> u64 {
+        self.state.version.load(Ordering::SeqCst)
+    }
+
+    fn bump(&self) -> u64 {
+        self.state.version.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Overrides tool security for later tool calls.
+    pub fn set_tool_security(&self, config: ToolSecurityConfig) -> u64 {
+        *self.state.tool_security_override.write() = Some(config);
+        self.bump()
+    }
+
+    /// Clears the live tool security override.
+    pub fn clear_tool_security_override(&self) -> u64 {
+        *self.state.tool_security_override.write() = None;
+        self.bump()
+    }
+
+    /// Overrides the top-level tool scope for later calls.
+    pub fn set_tool_scope(&self, tool_ids: Vec<String>) -> u64 {
+        *self.state.tool_scope_override.write() = Some(tool_ids);
+        self.bump()
+    }
+
+    /// Clears the live tool scope override.
+    pub fn clear_tool_scope_override(&self) -> u64 {
+        *self.state.tool_scope_override.write() = None;
+        self.bump()
+    }
+
+    /// Enables or disables emergency denial for future tool calls.
+    pub fn set_emergency_deny(&self, enabled: bool) -> u64 {
+        self.state.emergency_deny.store(enabled, Ordering::SeqCst);
+        self.bump()
+    }
+
+    /// Denies future calls and asks active cancellable work to stop.
+    pub fn cancel_all(&self) -> u64 {
+        self.set_emergency_deny(true)
     }
 }
 
@@ -201,6 +277,8 @@ pub struct RuntimeAgent {
     runtime_config: RuntimeConfig,
     /// Queue for background maintenance tasks.
     background_maintenance: Arc<BackgroundMaintenanceQueue>,
+    /// Host-only runtime control state.
+    runtime_control: Arc<RuntimeControlState>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -353,6 +431,7 @@ impl RuntimeAgent {
             observability_manager: None,
             runtime_config: RuntimeConfig::default(),
             background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
+            runtime_control: Arc::new(RuntimeControlState::default()),
         }
     }
 
@@ -1984,6 +2063,23 @@ impl RuntimeAgent {
         self
     }
 
+    /// Returns the host-only runtime control handle.
+    pub fn runtime_control(&self) -> RuntimeControlHandle {
+        RuntimeControlHandle {
+            state: Arc::clone(&self.runtime_control),
+        }
+    }
+
+    /// Returns the effective tool security snapshot for the next decision.
+    fn active_tool_security(&self) -> ToolSecurityEngine {
+        self.runtime_control
+            .tool_security_override
+            .read()
+            .clone()
+            .map(ToolSecurityEngine::new)
+            .unwrap_or_else(|| self.tool_security.clone())
+    }
+
     pub fn with_process_processor(mut self, processor: ProcessProcessor) -> Self {
         let processor = processor.with_stage_observer(Arc::new(ObservabilityProcessStageObserver));
         self.process_processor = Some(processor);
@@ -2432,12 +2528,32 @@ impl RuntimeAgent {
             .render(&self.base_system_prompt, &context)
     }
 
+    fn get_top_level_tool_ids(&self) -> Vec<String> {
+        if let Some(ids) = self.runtime_control.tool_scope_override.read().clone() {
+            return ids
+                .iter()
+                .filter_map(|id| self.tools.canonical_id(id))
+                .collect();
+        }
+        self.declared_tool_ids
+            .as_ref()
+            .map(|ids| {
+                ids.iter()
+                    .filter_map(|id| self.tools.canonical_id(id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
+        let top_level = self.get_top_level_tool_ids();
+        if top_level.is_empty() {
+            return Ok(Vec::new());
+        }
+
         match self.get_current_tool_refs() {
-            // State explicitly sets tools (including empty = no tools)
             Some(tool_refs) => {
                 if tool_refs.is_empty() {
-                    // Explicitly empty: no tools available in this state
                     return Ok(Vec::new());
                 }
 
@@ -2450,15 +2566,18 @@ impl RuntimeAgent {
                 let mut available = Vec::new();
                 for tool_ref in &tool_refs {
                     let tool_id = tool_ref.id();
-
-                    if self.tools.get(tool_id).is_none() {
+                    let Some(canonical_id) = self.tools.canonical_id(tool_id) else {
+                        continue;
+                    };
+                    if !top_level.iter().any(|id| id == &canonical_id) {
+                        debug!(tool = %canonical_id, "Tool not in top-level grant, skipping");
                         continue;
                     }
 
                     if let Some(condition) = tool_ref.condition() {
                         match evaluator.evaluate(condition, &eval_ctx).await {
                             Ok(true) => {
-                                available.push(tool_id.to_string());
+                                available.push(canonical_id);
                             }
                             Ok(false) => {
                                 debug!(tool = tool_id, "Tool condition not met, skipping");
@@ -2468,27 +2587,13 @@ impl RuntimeAgent {
                             }
                         }
                     } else {
-                        available.push(tool_id.to_string());
+                        available.push(canonical_id);
                     }
                 }
 
                 Ok(available)
             }
-            // State doesn't specify tools: fallback to agent-level
-            None => {
-                match &self.declared_tool_ids {
-                    // tools: [...] — specific tools listed
-                    Some(ids) if !ids.is_empty() => Ok(ids
-                        .iter()
-                        .filter(|id| self.tools.get(id).is_some())
-                        .cloned()
-                        .collect()),
-                    // tools: [] — explicitly no tools
-                    Some(_) => Ok(Vec::new()),
-                    // tools: not specified — all registered tools available
-                    None => Ok(self.tools.list_ids()),
-                }
-            }
+            None => Ok(top_level),
         }
     }
 
@@ -2607,10 +2712,8 @@ impl RuntimeAgent {
                 };
 
                 let available_tool_ids = self.get_available_tool_ids().await?;
-                // Only add tools prompt if tools are available.
-                // When tools: [] is set (explicitly empty), show NO tools to the LLM.
                 if !available_tool_ids.is_empty() {
-                    let tools_prompt = self.tools.generate_filtered_prompt_with_parallel(
+                    let tools_prompt = self.tools.generate_scoped_prompt_with_parallel(
                         &available_tool_ids,
                         self.parallel_tools.enabled,
                     );
@@ -2629,20 +2732,10 @@ impl RuntimeAgent {
             format!("{}\n\n{}", persona_prefix, rendered_base)
         };
 
-        let tools_prompt = match &self.declared_tool_ids {
-            Some(ids) if !ids.is_empty() => self
-                .tools
-                .generate_filtered_prompt_with_parallel(ids, self.parallel_tools.enabled),
-            Some(_) => {
-                // tools: [] - explicitly no tools, empty prompt
-                String::new()
-            }
-            None => {
-                // tools: not specified - all registered tools
-                self.tools
-                    .generate_tools_prompt_with_parallel(self.parallel_tools.enabled)
-            }
-        };
+        let available_tool_ids = self.get_available_tool_ids().await?;
+        let tools_prompt = self
+            .tools
+            .generate_scoped_prompt_with_parallel(&available_tool_ids, self.parallel_tools.enabled);
         if !tools_prompt.is_empty() {
             Ok(format!("{}\n\n{}", with_persona, tools_prompt))
         } else {
@@ -2976,131 +3069,431 @@ impl RuntimeAgent {
         None
     }
 
-    async fn execute_tool(&self, tool_call: &ToolCall) -> Result<String> {
-        let tool = self
-            .tools
-            .get(&tool_call.name)
-            .ok_or_else(|| AgentError::Tool(format!("Tool not found: {}", tool_call.name)))?;
-
-        let actor_context = self.outbound_actor_context();
-        let result = if actor_context.is_empty() {
-            tool.execute(tool_call.arguments.clone()).await
-        } else {
-            scope_actor_context(actor_context, tool.execute(tool_call.arguments.clone())).await
-        };
-
-        if result.success {
-            Ok(result.output)
-        } else {
-            Err(AgentError::Tool(result.output))
+    /// Builds a structured record from executor state.
+    fn record_from_parts(
+        &self,
+        request: &ToolExecutionRequest,
+        canonical_id: String,
+        executed_arguments: Value,
+        started_at: chrono::DateTime<chrono::Utc>,
+        start: Instant,
+        executed: bool,
+        success: bool,
+        output: String,
+        metadata: HashMap<String, Value>,
+        policy: ToolPolicyDecisionRecord,
+        approval: Option<ToolApprovalRecord>,
+        timed_out: bool,
+        output_truncated: bool,
+    ) -> ToolExecutionRecord {
+        ToolExecutionRecord {
+            call_id: request.call_id.clone(),
+            requested_name: request.requested_name.clone(),
+            canonical_id,
+            source: request.source.clone(),
+            arguments: request.arguments.clone(),
+            executed_arguments,
+            policy_version: self.active_tool_security().policy_version(),
+            registry_version: self.tools.version(),
+            runtime_config_version: self.runtime_control.version.load(Ordering::SeqCst),
+            executed,
+            success,
+            output,
+            metadata,
+            policy,
+            approval,
+            started_at,
+            duration_ms: start.elapsed().as_millis() as u64,
+            timed_out,
+            cancelled: false,
+            cancellation_reason: None,
+            output_truncated,
         }
     }
 
-    #[instrument(skip(self, tool_call), fields(tool = %tool_call.name))]
-    async fn execute_tool_smart(&self, tool_call: &ToolCall) -> Result<String> {
-        let mut tool_call = tool_call.clone();
-        info!(args = %tool_call.arguments, "Executing tool");
-
+    /// Sends a finalized tool record to hooks, history, and error handling.
+    async fn finish_tool_record(&self, record: &ToolExecutionRecord) {
+        let result = ToolResult {
+            success: record.success,
+            output: record.model_output_string(),
+            metadata: if record.metadata.is_empty() {
+                None
+            } else {
+                Some(record.metadata.clone())
+            },
+        };
         self.hooks
-            .on_tool_start(&tool_call.name, &tool_call.arguments)
+            .on_tool_complete(&record.canonical_id, &result, record.duration_ms)
             .await;
-        let tool_start = Instant::now();
-
-        let available_tool_ids = self.get_available_tool_ids().await?;
-        // Resolve the tool call name to its canonical ID via the registry.
-        // The LLM may use the display name (e.g., "HTTP Client") but
-        // available_tool_ids contains IDs (e.g., "http"). Registry.get()
-        // now matches by ID, display name, and alias.
-        let resolved_id = self
-            .tools
-            .get(&tool_call.name)
-            .map(|t| t.id().to_lowercase());
-        let tool_name_lower = tool_call.name.to_lowercase();
-        if !available_tool_ids.is_empty() {
-            let is_available = available_tool_ids.iter().any(|id| {
-                let id_lower = id.to_lowercase();
-                id_lower == tool_name_lower || resolved_id.as_deref() == Some(&id_lower)
-            });
-            if !is_available {
-                warn!(tool = %tool_call.name, "Tool not available in current context");
-                return Err(AgentError::Tool(format!(
-                    "Tool '{}' is not available. Available tools: {}",
-                    tool_call.name,
-                    available_tool_ids.join(", ")
-                )));
-            }
+        self.hooks.on_tool_execution_record(record).await;
+        self.record_tool_call(&record.canonical_id, record.model_output_value());
+        if !record.success {
+            self.hooks
+                .on_error(&AgentError::Tool(record.output.clone()))
+                .await;
         }
+    }
 
-        // Build language context for HITL localization.
-        let hitl_lang_ctx = self.build_hitl_language_context();
+    /// Invokes a resolved tool once with timeout, cancellation, and actor context.
+    async fn execute_resolved_tool_once(
+        &self,
+        tool: Arc<dyn ai_agents_core::Tool>,
+        args: Value,
+        timeout_ms: u64,
+    ) -> Result<(ToolResult, bool, bool)> {
+        let actor_context = current_turn_actor_context();
+        let future = async move {
+            if let Some(actor_context) = actor_context {
+                scope_actor_context(actor_context, tool.execute(args)).await
+            } else {
+                tool.execute(args).await
+            }
+        };
+        tokio::pin!(future);
+        let timeout = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
+        tokio::pin!(timeout);
+        let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
-        // Compute canonical tool ID before security/HITL checks so both use it.
-        // Use the tool ID (e.g. "http") instead of the name (e.g. "HTTP Client") so it matches the HITL config keys in hitl.tools.<id>.
-        let hitl_tool_id = resolved_id.as_deref().unwrap_or(&tool_name_lower);
-
-        // Check security FIRST -- don't bother the human if security blocks
-        if self.tool_security.config().enabled {
-            let security_result = self
-                .tool_security
-                .check_tool_execution(&tool_call.name, &tool_call.arguments)
-                .await?;
-
-            match security_result {
-                SecurityCheckResult::Allow => {}
-                SecurityCheckResult::Block { reason } => {
-                    warn!(reason = %reason, "Tool blocked by security");
-                    return Err(AgentError::Tool(format!("Blocked: {}", reason)));
-                }
-                SecurityCheckResult::RequireConfirmation { message } => {
-                    // Route through HITL if available, otherwise error
-                    if let Some(ref hitl_engine) = self.hitl_engine {
-                        let check_result = self
-                            .observe_purpose(
-                                ObservationPurpose::HitlLocalization,
-                                hitl_engine.check_tool_with_localization(
-                                    hitl_tool_id,
-                                    &tool_call.arguments,
-                                    &hitl_lang_ctx,
-                                    self.approval_handler.as_ref(),
-                                    Some(&self.llm_registry),
-                                ),
-                            )
-                            .await?;
-                        let result = self.request_hitl_approval(check_result).await?;
-                        match result {
-                            ApprovalResult::Approved | ApprovalResult::Modified { .. } => {}
-                            ApprovalResult::Rejected { reason } => {
-                                let reason_str = reason.as_deref().unwrap_or("rejected");
-                                warn!(tool = %tool_call.name, reason = %reason_str, "Security confirmation rejected by approver");
-                                return Err(AgentError::Tool(format!(
-                                    "Confirmation rejected: {}",
-                                    message
-                                )));
-                            }
-                            _ => {}
-                        }
-                    } else {
-                        warn!(message = %message, "Tool requires confirmation but no HITL handler");
-                        return Err(AgentError::Tool(format!(
-                            "Confirmation required: {}",
-                            message
-                        )));
+        loop {
+            tokio::select! {
+                result = &mut future => return Ok((result, false, false)),
+                _ = &mut timeout => return Ok((ToolResult::error("Tool execution timed out"), true, false)),
+                _ = cancel_tick.tick() => {
+                    if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+                        return Ok((ToolResult::error("Tool execution cancelled by runtime control"), false, true));
                     }
                 }
-                SecurityCheckResult::Warn { message } => {
-                    warn!(message = %message, "Tool security warning");
+            }
+        }
+    }
+
+    /// Truncates model-facing tool output on a character boundary.
+    fn truncate_tool_output(output: String, max_chars: Option<usize>) -> (String, bool) {
+        let Some(max_chars) = max_chars else {
+            return (output, false);
+        };
+        let mut chars = output.chars();
+        let truncated: String = chars.by_ref().take(max_chars).collect();
+        if chars.next().is_some() {
+            (truncated, true)
+        } else {
+            (output, false)
+        }
+    }
+
+    /// Executes a resolved tool with retry policy from recovery settings.
+    async fn run_tool_with_retries(
+        &self,
+        canonical_id: &str,
+        tool: Arc<dyn ai_agents_core::Tool>,
+        args: Value,
+        timeout_ms: u64,
+        max_retries: u32,
+    ) -> Result<(ToolResult, bool, bool)> {
+        let mut attempts = 0;
+        loop {
+            let (result, timed_out, cancelled) = self
+                .execute_resolved_tool_once(tool.clone(), args.clone(), timeout_ms)
+                .await?;
+            if result.success || timed_out || cancelled || attempts >= max_retries {
+                return Ok((result, timed_out, cancelled));
+            }
+            attempts += 1;
+            warn!(tool = %canonical_id, attempt = attempts, error = %result.output, "Retrying failed tool call");
+        }
+    }
+
+    /// Executes a tool request through scope, policy, HITL, timeout, recovery, and evidence recording.
+    async fn execute_tool_record(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> Result<ToolExecutionRecord> {
+        let started_at = chrono::Utc::now();
+        let start = Instant::now();
+        info!(tool = %request.requested_name, args = %request.arguments, "Executing tool");
+
+        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+            let record = self.record_from_parts(
+                &request,
+                request.requested_name.clone(),
+                request.arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                "Tool execution is disabled by runtime control".to_string(),
+                HashMap::new(),
+                ToolPolicyDecisionRecord::deny("runtime emergency deny is enabled"),
+                None,
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        let Some(resolved) = self.tools.resolve(&request.requested_name) else {
+            let record = self.record_from_parts(
+                &request,
+                request.requested_name.clone(),
+                request.arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                format!("Tool '{}' is unavailable", request.requested_name),
+                HashMap::new(),
+                ToolPolicyDecisionRecord::unavailable(format!(
+                    "Tool '{}' is not registered",
+                    request.requested_name
+                )),
+                None,
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        };
+
+        let canonical_id = resolved.identity.canonical_id.clone();
+        let available_tool_ids = self.get_available_tool_ids().await?;
+        if !available_tool_ids.iter().any(|id| id == &canonical_id) {
+            let record = self.record_from_parts(
+                &request,
+                canonical_id.clone(),
+                request.arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                format!(
+                    "Tool '{}' is not available in the current scope",
+                    canonical_id
+                ),
+                HashMap::new(),
+                ToolPolicyDecisionRecord::deny(format!(
+                    "Tool '{}' is not granted by the current top-level and state tool scope",
+                    canonical_id
+                )),
+                None,
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        let mut executed_arguments = request.arguments.clone();
+        self.hooks
+            .on_tool_start(&canonical_id, &executed_arguments)
+            .await;
+
+        let mut metadata = HashMap::new();
+        let classification = resolved.tool.classify_call(&executed_arguments);
+        metadata.insert(
+            "classification".to_string(),
+            serde_json::to_value(&classification).unwrap_or(Value::Null),
+        );
+
+        let mut approval_record = Some(ToolApprovalRecord {
+            status: ToolApprovalStatus::NotRequired,
+            reason: None,
+            modified_arguments: None,
+        });
+
+        let security_engine = self.active_tool_security();
+        let mut security_result = security_engine
+            .check_tool_execution(&canonical_id, &executed_arguments)
+            .await?;
+        match &security_result {
+            SecurityCheckResult::Allow => {}
+            SecurityCheckResult::Warn { message } => {
+                warn!(tool = %canonical_id, message = %message, "Tool security warning");
+            }
+            SecurityCheckResult::Block { reason } => {
+                let record = self.record_from_parts(
+                    &request,
+                    canonical_id,
+                    executed_arguments,
+                    started_at,
+                    start,
+                    false,
+                    false,
+                    format!("Denied: {}", reason),
+                    metadata,
+                    ToolPolicyDecisionRecord::deny(reason.clone()),
+                    approval_record,
+                    false,
+                    false,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+            SecurityCheckResult::Unavailable { reason } => {
+                let record = self.record_from_parts(
+                    &request,
+                    canonical_id,
+                    executed_arguments,
+                    started_at,
+                    start,
+                    false,
+                    false,
+                    format!("Unavailable: {}", reason),
+                    metadata,
+                    ToolPolicyDecisionRecord::unavailable(reason.clone()),
+                    approval_record,
+                    false,
+                    false,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+            SecurityCheckResult::RequireConfirmation { message } => {
+                if self.hitl_engine.is_none() {
+                    approval_record = Some(ToolApprovalRecord {
+                        status: ToolApprovalStatus::Unavailable,
+                        reason: Some("No HITL engine configured".to_string()),
+                        modified_arguments: None,
+                    });
+                    let record = self.record_from_parts(
+                        &request,
+                        canonical_id,
+                        executed_arguments,
+                        started_at,
+                        start,
+                        false,
+                        false,
+                        format!("Approval unavailable: {}", message),
+                        metadata,
+                        ToolPolicyDecisionRecord::approval(message.clone()),
+                        approval_record,
+                        false,
+                        false,
+                    );
+                    self.finish_tool_record(&record).await;
+                    return Ok(record);
+                }
+
+                let check_result = HITLCheckResult::required(
+                    ApprovalTrigger::tool(&canonical_id, executed_arguments.clone()),
+                    HashMap::new(),
+                    message.clone(),
+                    None,
+                );
+                match self.request_hitl_approval(check_result).await? {
+                    ApprovalResult::Approved => {
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Approved,
+                            reason: None,
+                            modified_arguments: None,
+                        });
+                    }
+                    ApprovalResult::Modified { changes } => {
+                        if let Some(obj) = executed_arguments.as_object_mut() {
+                            for (key, value) in changes {
+                                obj.insert(key, value);
+                            }
+                        }
+                        security_result = security_engine
+                            .check_tool_execution(&canonical_id, &executed_arguments)
+                            .await?;
+                        if !matches!(
+                            security_result,
+                            SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+                        ) {
+                            let reason = security_result
+                                .reason()
+                                .unwrap_or("modified arguments failed policy")
+                                .to_string();
+                            let record = self.record_from_parts(
+                                &request,
+                                canonical_id,
+                                executed_arguments.clone(),
+                                started_at,
+                                start,
+                                false,
+                                false,
+                                reason.clone(),
+                                metadata,
+                                ToolPolicyDecisionRecord::deny(reason),
+                                Some(ToolApprovalRecord {
+                                    status: ToolApprovalStatus::Modified,
+                                    reason: None,
+                                    modified_arguments: Some(executed_arguments),
+                                }),
+                                false,
+                                false,
+                            );
+                            self.finish_tool_record(&record).await;
+                            return Ok(record);
+                        }
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Modified,
+                            reason: None,
+                            modified_arguments: Some(executed_arguments.clone()),
+                        });
+                    }
+                    ApprovalResult::Rejected { reason } => {
+                        let reason = reason.unwrap_or_else(|| "rejected".to_string());
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Rejected,
+                            reason: Some(reason.clone()),
+                            modified_arguments: None,
+                        });
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            format!("Approval rejected: {}", reason),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval(reason),
+                            approval_record,
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
+                    ApprovalResult::Timeout => {
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Timeout,
+                            reason: Some("approval timeout".to_string()),
+                            modified_arguments: None,
+                        });
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            "Approval timed out".to_string(),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval("approval timeout"),
+                            approval_record,
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
                 }
             }
         }
 
-        // Check HITL approval for tool (after security passes)
+        let hitl_lang_ctx = self.build_hitl_language_context();
         if let Some(ref hitl_engine) = self.hitl_engine {
             let check_result = self
                 .observe_purpose(
                     ObservationPurpose::HitlLocalization,
                     hitl_engine.check_tool_with_localization(
-                        hitl_tool_id,
-                        &tool_call.arguments,
+                        &canonical_id,
+                        &executed_arguments,
                         &hitl_lang_ctx,
                         self.approval_handler.as_ref(),
                         Some(&self.llm_registry),
@@ -3108,34 +3501,114 @@ impl RuntimeAgent {
                 )
                 .await?;
             if check_result.is_required() {
-                let result = self.request_hitl_approval(check_result).await?;
-                match result {
-                    ApprovalResult::Approved => {}
+                match self.request_hitl_approval(check_result).await? {
+                    ApprovalResult::Approved => {
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Approved,
+                            reason: None,
+                            modified_arguments: None,
+                        });
+                    }
                     ApprovalResult::Modified { changes } => {
-                        if let Some(obj) = tool_call.arguments.as_object_mut() {
-                            for (k, v) in changes {
-                                obj.insert(k, v);
+                        if let Some(obj) = executed_arguments.as_object_mut() {
+                            for (key, value) in changes {
+                                obj.insert(key, value);
                             }
                         }
-                        info!(tool = %tool_call.name, "Tool arguments modified by approver");
+                        let modified_security = security_engine
+                            .check_tool_execution(&canonical_id, &executed_arguments)
+                            .await?;
+                        if !matches!(
+                            modified_security,
+                            SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+                        ) {
+                            let reason = modified_security
+                                .reason()
+                                .unwrap_or("modified arguments failed policy")
+                                .to_string();
+                            let record = self.record_from_parts(
+                                &request,
+                                canonical_id,
+                                executed_arguments.clone(),
+                                started_at,
+                                start,
+                                false,
+                                false,
+                                reason.clone(),
+                                metadata,
+                                ToolPolicyDecisionRecord::deny(reason),
+                                Some(ToolApprovalRecord {
+                                    status: ToolApprovalStatus::Modified,
+                                    reason: None,
+                                    modified_arguments: Some(executed_arguments),
+                                }),
+                                false,
+                                false,
+                            );
+                            self.finish_tool_record(&record).await;
+                            return Ok(record);
+                        }
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Modified,
+                            reason: None,
+                            modified_arguments: Some(executed_arguments.clone()),
+                        });
                     }
-                    ApprovalResult::Rejected { reason: _reason } => {
-                        warn!(tool = %tool_call.name, "Tool execution rejected by HITL");
-                        return Err(AgentError::HITLRejected(format!(
-                            "Tool '{}' was rejected by human approver. Do not retry.",
-                            tool_call.name
-                        )));
+                    ApprovalResult::Rejected { reason } => {
+                        let reason = reason.unwrap_or_else(|| "rejected".to_string());
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            format!("Approval rejected: {}", reason),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval(reason.clone()),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Rejected,
+                                reason: Some(reason),
+                                modified_arguments: None,
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
                     }
-                    _ => {}
+                    ApprovalResult::Timeout => {
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            "Approval timed out".to_string(),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval("approval timeout"),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Timeout,
+                                reason: Some("approval timeout".to_string()),
+                                modified_arguments: None,
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
                 }
             }
 
-            // Check conditions (e.g., amount > 1000)
             let condition_check = self
                 .observe_purpose(
                     ObservationPurpose::HitlLocalization,
                     hitl_engine.check_conditions_with_localization(
-                        &tool_call.arguments,
+                        &executed_arguments,
                         &hitl_lang_ctx,
                         self.approval_handler.as_ref(),
                         Some(&self.llm_registry),
@@ -3143,121 +3616,175 @@ impl RuntimeAgent {
                 )
                 .await?;
             if condition_check.is_required() {
-                let result = self.request_hitl_approval(condition_check).await?;
-                match result {
+                match self.request_hitl_approval(condition_check).await? {
                     ApprovalResult::Approved => {}
                     ApprovalResult::Modified { changes } => {
-                        if let Some(obj) = tool_call.arguments.as_object_mut() {
-                            for (k, v) in changes {
-                                obj.insert(k, v);
+                        if let Some(obj) = executed_arguments.as_object_mut() {
+                            for (key, value) in changes {
+                                obj.insert(key, value);
                             }
                         }
-                        info!(tool = %tool_call.name, "Tool arguments modified by approver (condition)");
+                        let modified_security = security_engine
+                            .check_tool_execution(&canonical_id, &executed_arguments)
+                            .await?;
+                        if !matches!(
+                            modified_security,
+                            SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+                        ) {
+                            let reason = modified_security
+                                .reason()
+                                .unwrap_or("modified arguments failed policy")
+                                .to_string();
+                            let record = self.record_from_parts(
+                                &request,
+                                canonical_id,
+                                executed_arguments,
+                                started_at,
+                                start,
+                                false,
+                                false,
+                                reason.clone(),
+                                metadata,
+                                ToolPolicyDecisionRecord::deny(reason),
+                                approval_record,
+                                false,
+                                false,
+                            );
+                            self.finish_tool_record(&record).await;
+                            return Ok(record);
+                        }
                     }
-                    ApprovalResult::Rejected { reason: _reason } => {
-                        warn!(tool = %tool_call.name, "Tool execution rejected by HITL condition");
-                        return Err(AgentError::HITLRejected(format!(
-                            "Tool '{}' was rejected due to policy condition. Do not retry.",
-                            tool_call.name
-                        )));
+                    ApprovalResult::Rejected { reason } => {
+                        let reason = reason.unwrap_or_else(|| "rejected".to_string());
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            format!("Approval rejected: {}", reason),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval(reason.clone()),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Rejected,
+                                reason: Some(reason),
+                                modified_arguments: None,
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
                     }
-                    _ => {}
+                    ApprovalResult::Timeout => {
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            "Approval timed out".to_string(),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval("approval timeout"),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Timeout,
+                                reason: Some("approval timeout".to_string()),
+                                modified_arguments: None,
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
                 }
             }
         }
 
-        let tool_config = self.recovery_manager.get_tool_config(&tool_call.name);
+        let tool_config = self.recovery_manager.get_tool_config(&canonical_id);
+        let timeout_ms = security_engine.get_tool_timeout(&canonical_id);
+        let (mut result, timed_out, cancelled) = self
+            .run_tool_with_retries(
+                &canonical_id,
+                resolved.tool.clone(),
+                executed_arguments.clone(),
+                timeout_ms,
+                tool_config.max_retries,
+            )
+            .await?;
 
-        let result = if tool_config.max_retries > 0 {
-            let retry_config = RetryConfig {
-                max_retries: tool_config.max_retries,
-                ..Default::default()
-            };
-
-            let tool_call_clone = tool_call.clone();
-            self.recovery_manager
-                .with_retry(
-                    &format!("tool:{}", tool_call.name),
-                    Some(&retry_config),
-                    || {
-                        let tc = tool_call_clone.clone();
-                        async move { self.execute_tool(&tc).await.map_err(|e| e.classify()) }
-                    },
-                )
-                .await
-                .map_err(|e| AgentError::Tool(e.to_string()))
-        } else {
-            self.execute_tool(&tool_call).await
-        };
-
-        // Apply on_failure policy when the tool fails after all retries.
-        let result = match result {
-            Ok(output) => Ok(output),
-            Err(e) => match &tool_config.on_failure {
+        if !result.success {
+            match &tool_config.on_failure {
                 ToolFailureAction::Skip => {
-                    warn!(
-                        tool = %tool_call.name,
-                        error = %e,
-                        "Tool failed, skipping per on_failure: skip policy"
-                    );
-                    Ok(format!(
+                    result = ToolResult::ok(format!(
                         "{{\"skipped\": true, \"reason\": \"Tool '{}' was skipped after failure\"}}",
-                        tool_call.name
-                    ))
+                        canonical_id
+                    ));
                 }
                 ToolFailureAction::Fallback { fallback_tool } => {
-                    warn!(
-                        tool = %tool_call.name,
-                        fallback = %fallback_tool,
-                        error = %e,
-                        "Tool failed, trying fallback tool"
+                    let fallback_request = ToolExecutionRequest::new(
+                        request.call_id.clone(),
+                        fallback_tool.clone(),
+                        executed_arguments.clone(),
+                        ToolCallSource::Fallback {
+                            original_tool: canonical_id.clone(),
+                        },
                     );
-                    let fallback_call = ToolCall {
-                        id: tool_call.id.clone(),
-                        name: fallback_tool.clone(),
-                        arguments: tool_call.arguments.clone(),
-                    };
-                    self.execute_tool(&fallback_call).await
+                    return Box::pin(self.execute_tool_record(fallback_request)).await;
                 }
-                ToolFailureAction::ReportError => Err(e),
-            },
-        };
-
-        let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
-
-        match &result {
-            Ok(output) => {
-                info!(output_len = output.len(), "Tool execution successful");
-                let result_value: Value =
-                    serde_json::from_str(output).unwrap_or(Value::String(output.clone()));
-                self.record_tool_call(&tool_call.name, result_value);
-
-                let tool_result = ToolResult {
-                    success: true,
-                    output: output.clone(),
-                    metadata: None,
-                };
-                self.hooks
-                    .on_tool_complete(&tool_call.name, &tool_result, tool_duration_ms)
-                    .await;
-            }
-            Err(e) => {
-                error!(error = %e, "Tool execution failed");
-                self.record_tool_call(&tool_call.name, serde_json::json!({"error": e.to_string()}));
-
-                let tool_result = ToolResult {
-                    success: false,
-                    output: e.to_string(),
-                    metadata: None,
-                };
-                self.hooks
-                    .on_tool_complete(&tool_call.name, &tool_result, tool_duration_ms)
-                    .await;
-                self.hooks.on_error(e).await;
+                ToolFailureAction::ReportError => {}
             }
         }
 
-        result
+        let (output, output_truncated) =
+            Self::truncate_tool_output(result.output.clone(), classification.max_output_chars);
+        if let Some(result_metadata) = result.metadata {
+            metadata.extend(result_metadata);
+        }
+        let mut record = self.record_from_parts(
+            &request,
+            canonical_id,
+            executed_arguments,
+            started_at,
+            start,
+            true,
+            result.success,
+            output,
+            metadata,
+            ToolPolicyDecisionRecord::allow(),
+            approval_record,
+            timed_out,
+            output_truncated,
+        );
+        record.cancelled = cancelled;
+        if cancelled {
+            record.cancellation_reason = Some("runtime control cancellation".to_string());
+        }
+        self.finish_tool_record(&record).await;
+        Ok(record)
+    }
+
+    #[instrument(skip(self, tool_call), fields(tool = %tool_call.name))]
+    async fn execute_tool_smart(&self, tool_call: &ToolCall) -> Result<String> {
+        let record = self
+            .execute_tool_record(ToolExecutionRequest::new(
+                tool_call.id.clone(),
+                tool_call.name.clone(),
+                tool_call.arguments.clone(),
+                ToolCallSource::Model,
+            ))
+            .await?;
+        if record.success {
+            Ok(record.model_output_string())
+        } else if matches!(record.policy.outcome, PermissionOutcome::RequiresApproval) {
+            Err(AgentError::HITLRejected(record.model_output_string()))
+        } else {
+            Err(AgentError::Tool(record.model_output_string()))
+        }
     }
 
     //
@@ -3436,7 +3963,7 @@ impl RuntimeAgent {
             let response = self
                 .observe_purpose(
                     ObservationPurpose::SkillPrompt,
-                    executor.execute(skill, input, serde_json::json!({})),
+                    executor.execute_with_invoker(skill, input, serde_json::json!({}), self),
                 )
                 .await?;
 
@@ -4806,38 +5333,48 @@ OVERALL: PASS/FAIL"#,
 
     /// Execute a list of state actions (tool calls, skill invocations, context updates, LLM prompts).
     async fn execute_state_actions(&self, actions: &[StateAction]) {
-        for action in actions {
+        for (action_index, action) in actions.iter().enumerate() {
             match action {
                 StateAction::Tool { tool, args } => {
                     let raw_args = args.clone().unwrap_or(Value::Object(Default::default()));
-                    // Render template variables in tool args (e.g., {{ context.order_id }})
                     let args_value = self.render_action_args(&raw_args);
-                    if let Some(t) = self.tools.get(tool) {
-                        self.hooks.on_tool_start(tool, &args_value).await;
-                        let start = Instant::now();
-                        let result = t.execute(args_value).await;
-                        let duration_ms = start.elapsed().as_millis() as u64;
-                        self.hooks
-                            .on_tool_complete(tool, &result, duration_ms)
-                            .await;
-                        if result.success {
-                            debug!(tool = %tool, "State action: tool executed");
-                            // Store tool result in context so YAML prompts can reference it
-                            let context_key = format!("last_tool_result");
-                            let _ = self
-                                .context_manager
-                                .set(&context_key, serde_json::Value::String(result.output));
-                        } else {
-                            warn!(tool = %tool, error = %result.output, "State action: tool failed");
+                    let state = self.state_machine.as_ref().map(|sm| sm.current());
+                    let request = ToolExecutionRequest::new(
+                        uuid::Uuid::new_v4().to_string(),
+                        tool.clone(),
+                        args_value,
+                        ToolCallSource::StateAction {
+                            state,
+                            action_index,
+                        },
+                    );
+                    match self.execute_tool_record(request).await {
+                        Ok(record) if record.success => {
+                            debug!(tool = %record.canonical_id, "State action: tool executed");
+                            let _ = self.context_manager.set(
+                                "last_tool_result",
+                                serde_json::Value::String(record.model_output_string()),
+                            );
+                            let _ = self.context_manager.set(
+                                "last_tool_record",
+                                serde_json::to_value(record).unwrap_or(Value::Null),
+                            );
                         }
-                    } else {
-                        warn!(tool = %tool, "State action: tool not found");
+                        Ok(record) => {
+                            warn!(tool = %record.canonical_id, error = %record.output, "State action: tool failed");
+                        }
+                        Err(e) => {
+                            warn!(tool = %tool, error = %e, "State action: tool failed")
+                        }
                     }
                 }
                 StateAction::Skill { skill } => {
                     if let Some(ref executor) = self.skill_executor {
                         if let Some(def) = self.skills.iter().find(|s| s.id == *skill) {
-                            match executor.execute(def, "", serde_json::json!({})).await {
+                            match executor
+                                .execute_with_invoker(def, "", serde_json::json!({}), self)
+                                .await
+                            {
                                 Ok(_) => debug!(skill = %skill, "State action: skill executed"),
                                 Err(e) => {
                                     warn!(skill = %skill, error = %e, "State action: skill failed")
@@ -5534,13 +6071,22 @@ Respond in JSON format:
                         args.clone()
                     };
 
-                    let tool_call = ToolCall {
-                        id: uuid::Uuid::new_v4().to_string(),
-                        name: tool.clone(),
-                        arguments: final_args,
-                    };
-                    match self.execute_tool_smart(&tool_call).await {
-                        Ok(output) => serde_json::json!({ "output": output }),
+                    let request = ToolExecutionRequest::new(
+                        uuid::Uuid::new_v4().to_string(),
+                        tool.clone(),
+                        final_args,
+                        ToolCallSource::Plan {
+                            step_index: step_idx,
+                        },
+                    );
+                    match self.execute_tool_record(request).await {
+                        Ok(record) if record.success => {
+                            serde_json::json!({ "output": record.model_output_string() })
+                        }
+                        Ok(record) => {
+                            plan.steps[step_idx].mark_failed(record.model_output_string());
+                            continue;
+                        }
                         Err(e) => {
                             plan.steps[step_idx].mark_failed(e.to_string());
                             continue;
@@ -5550,7 +6096,10 @@ Respond in JSON format:
                 PlanAction::Skill { skill } => {
                     if let Some(skill_def) = self.skills.iter().find(|s| &s.id == skill) {
                         if let Some(ref executor) = self.skill_executor {
-                            match executor.execute(skill_def, "", serde_json::json!({})).await {
+                            match executor
+                                .execute_with_invoker(skill_def, "", serde_json::json!({}), self)
+                                .await
+                            {
                                 Ok(output) => serde_json::json!({ "output": output }),
                                 Err(e) => {
                                     plan.steps[step_idx].mark_failed(e.to_string());
@@ -9167,7 +9716,14 @@ Respond in JSON format:
         &self,
         tool_calls: &[ToolCall],
     ) -> Vec<(String, Result<String>)> {
-        if !self.parallel_tools.enabled || tool_calls.len() <= 1 {
+        let can_run_parallel = tool_calls.iter().all(|tc| {
+            self.tools
+                .resolve(&tc.name)
+                .map(|resolved| resolved.tool.classify_call(&tc.arguments).concurrency_safe)
+                .unwrap_or(false)
+        });
+
+        if !self.parallel_tools.enabled || tool_calls.len() <= 1 || !can_run_parallel {
             let mut results = Vec::new();
             for tc in tool_calls {
                 let result = self
@@ -9232,6 +9788,13 @@ Respond in JSON format:
         } else {
             Ok(inner)
         }
+    }
+}
+
+#[async_trait]
+impl ToolInvoker for RuntimeAgent {
+    async fn invoke_tool(&self, request: ToolExecutionRequest) -> Result<ToolExecutionRecord> {
+        self.execute_tool_record(request).await
     }
 }
 
@@ -9398,8 +9961,36 @@ mod tests {
         mock
     }
 
+    /// Test hook that counts completed responses.
     struct ResponseCountingHooks {
         responses: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Test tool that stays active long enough for runtime cancellation.
+    struct SlowTool;
+
+    #[async_trait]
+    impl ai_agents_core::Tool for SlowTool {
+        fn id(&self) -> &str {
+            "slow"
+        }
+
+        fn name(&self) -> &str {
+            "Slow"
+        }
+
+        fn description(&self) -> &str {
+            "Waits until cancelled or timed out."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: Value) -> ToolResult {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            ToolResult::ok("done")
+        }
     }
 
     #[async_trait]
@@ -9453,6 +10044,323 @@ mod tests {
         assert_eq!(messages.len(), 6);
     }
 
+    #[tokio::test]
+    async fn test_runtime_control_cancels_active_tool_call() {
+        let mock = mock_with_response("hello");
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("You are helpful.")
+                .llm(Arc::new(mock))
+                .tool(Arc::new(SlowTool))
+                .build()
+                .unwrap(),
+        );
+        let control = agent.runtime_control();
+        let running_agent = Arc::clone(&agent);
+        let handle = tokio::spawn(async move {
+            running_agent
+                .invoke_tool(ToolExecutionRequest::new(
+                    "slow-call",
+                    "slow",
+                    serde_json::json!({}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        control.cancel_all();
+        let record = handle.await.unwrap();
+
+        assert!(record.executed);
+        assert!(record.cancelled);
+        assert!(!record.success);
+        assert!(record.cancellation_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_spawner_section_does_not_grant_core_tools_when_top_level_tools_omitted() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: SpawnerNoGrantAgent
+system_prompt: "You manage agents."
+spawner:
+  max_agents: 2
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert!(available.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_spawner_section_does_not_grant_core_tools_when_top_level_tools_empty() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: EmptySpawnerNoGrantAgent
+system_prompt: "You manage agents."
+tools: []
+spawner:
+  max_agents: 2
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert!(available.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_management_tools_flag_grants_core_tools_when_top_level_tools_empty() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: ManagementGrantAgent
+system_prompt: "You manage agents."
+tools: []
+spawner:
+  management_tools: true
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert_eq!(available.len(), 4);
+        assert!(available.contains(&"spawn_agent".to_string()));
+        assert!(available.contains(&"send_agent_message".to_string()));
+        assert!(available.contains(&"list_agents".to_string()));
+        assert!(available.contains(&"remove_agent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_management_tools_flag_grants_core_tools_when_top_level_tools_omitted() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: ManagementOmittedToolsGrantAgent
+system_prompt: "You manage agents."
+spawner:
+  management_tools: true
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert_eq!(available.len(), 4);
+        assert!(available.contains(&"spawn_agent".to_string()));
+        assert!(available.contains(&"send_agent_message".to_string()));
+        assert!(available.contains(&"list_agents".to_string()));
+        assert!(available.contains(&"remove_agent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_management_tools_selected_grants_only_selected_tools() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: ManagementSelectedGrantAgent
+system_prompt: "You manage agents."
+tools: []
+spawner:
+  management_tools:
+    - spawn_agent
+    - send_agent_message
+    - list_agents
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert_eq!(available.len(), 3);
+        assert!(available.contains(&"spawn_agent".to_string()));
+        assert!(available.contains(&"send_agent_message".to_string()));
+        assert!(available.contains(&"list_agents".to_string()));
+        assert!(!available.contains(&"remove_agent".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_orchestration_tools_flag_grants_tools_when_top_level_tools_empty() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: OrchestrationGrantAgent
+system_prompt: "You coordinate agents."
+llms:
+  default:
+    provider: openai
+    model: gpt-4
+  router:
+    provider: openai
+    model: gpt-4
+llm:
+  default: default
+  router: router
+tools: []
+spawner:
+  orchestration_tools: true
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert_eq!(available.len(), 5);
+        assert!(available.contains(&"route_to_agent".to_string()));
+        assert!(available.contains(&"pipeline_process".to_string()));
+        assert!(available.contains(&"concurrent_ask".to_string()));
+        assert!(available.contains(&"group_discussion".to_string()));
+        assert!(available.contains(&"handoff_conversation".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_persona_evolve_flag_grants_tool_when_top_level_tools_empty() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: PersonaGrantAgent
+system_prompt: "You can evolve persona."
+llm:
+  provider: openai
+  model: gpt-4
+tools: []
+persona:
+  identity:
+    name: "Guide"
+    role: "Helper"
+  evolution:
+    enabled: true
+    allow_llm_evolve: true
+    mutable_fields:
+      - traits.personality
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert_eq!(available, vec!["persona_evolve".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_persona_evolve_flag_grants_tool_when_top_level_tools_omitted() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: PersonaOmittedToolsGrantAgent
+system_prompt: "You can evolve persona."
+llm:
+  provider: openai
+  model: gpt-4
+persona:
+  identity:
+    name: "Guide"
+    role: "Helper"
+  evolution:
+    enabled: true
+    allow_llm_evolve: true
+    mutable_fields:
+      - traits.personality
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert_eq!(available, vec!["persona_evolve".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_omitted_yaml_tools_exposes_no_tools() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: NoToolsAgent
+system_prompt: "You are helpful."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert!(available.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_state_tools_cannot_widen_top_level_grant() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: NarrowToolsAgent
+system_prompt: "You are helpful."
+tools:
+  - calculator
+states:
+  initial: current
+  states:
+    current:
+      tools: [datetime]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let available = agent.get_available_tool_ids().await.unwrap();
+        assert!(available.is_empty());
+    }
+
     // Tool execution in chat flow
     #[tokio::test]
     async fn test_integration_tool_execution() {
@@ -9491,6 +10399,8 @@ mod tests {
         let yaml = r#"
 name: ToolRejectAgent
 system_prompt: "You use tools when requested."
+tools:
+  - echo
 hitl:
   tools:
     echo:
@@ -9533,6 +10443,8 @@ hitl:
         let yaml = r#"
 name: ToolRejectStreamingAgent
 system_prompt: "You use tools when requested."
+tools:
+  - echo
 streaming:
   enabled: true
 hitl:

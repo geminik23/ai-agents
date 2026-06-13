@@ -101,11 +101,11 @@ impl GenerateAgentTool {
 #[async_trait]
 impl Tool for GenerateAgentTool {
     fn id(&self) -> &str {
-        "generate_agent"
+        "spawn_agent"
     }
 
     fn name(&self) -> &str {
-        "Generate Agent"
+        "Spawn Agent"
     }
 
     fn description(&self) -> &str {
@@ -314,11 +314,11 @@ impl SendMessageTool {
 #[async_trait]
 impl Tool for SendMessageTool {
     fn id(&self) -> &str {
-        "send_message"
+        "send_agent_message"
     }
 
     fn name(&self) -> &str {
-        "Send Message"
+        "Send Agent Message"
     }
 
     fn description(&self) -> &str {
@@ -503,8 +503,8 @@ mod tests {
     #[test]
     fn test_tool_ids_are_unique() {
         let ids = [
-            "generate_agent",
-            "send_message",
+            "spawn_agent",
+            "send_agent_message",
             "list_agents",
             "remove_agent",
         ];
@@ -569,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_agent_schema_has_required_fields() {
+    fn test_spawn_agent_schema_has_required_fields() {
         let schema = generate_schema::<GenerateAgentInput>();
         let props = schema.get("properties").expect("should have properties");
         assert!(props.get("description").is_some());
@@ -589,7 +589,7 @@ mod tests {
     }
 
     #[test]
-    fn test_send_message_schema_has_required_fields() {
+    fn test_send_agent_message_schema_has_required_fields() {
         let schema = generate_schema::<SendMessageInput>();
         let props = schema.get("properties").expect("should have properties");
         assert!(props.get("to").is_some());

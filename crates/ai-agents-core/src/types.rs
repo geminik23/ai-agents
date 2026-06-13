@@ -1,6 +1,374 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
+
+/// High-level operation category used for tool policy and scheduling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolOperationKind {
+    Read,
+    Write,
+    Edit,
+    Delete,
+    Patch,
+    VcsInspect,
+    Diagnostics,
+    Command,
+    Network,
+    Interactive,
+    Compute,
+    Wait,
+}
+
+/// Side-effect level used to decide approval and concurrency behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSideEffectLevel {
+    None,
+    LocalWrite,
+    ExternalRead,
+    ExternalWrite,
+    Destructive,
+}
+
+/// Permission decision returned before tool execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionOutcome {
+    Allow,
+    Deny,
+    RequiresApproval,
+    Unavailable,
+}
+
+/// Static safety metadata attached to a tool registration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolSafetyMetadata {
+    /// True when the tool does not mutate local or external state.
+    pub read_only: bool,
+    /// True when calls can run concurrently without observable races.
+    pub concurrency_safe: bool,
+    /// Default operation category for this tool.
+    pub operation: ToolOperationKind,
+    /// Default side-effect level for this tool.
+    pub side_effect_level: ToolSideEffectLevel,
+    /// True when the tool can access the network.
+    pub requires_network: bool,
+    /// True when the tool can destroy or remove state.
+    pub destructive: bool,
+    /// True when the tool can reach open-ended external resources.
+    pub open_world: bool,
+    /// True when the tool requires a host-provided service.
+    pub host_dependent: bool,
+    /// True when execution requires user interaction.
+    pub requires_user_interaction: bool,
+    /// True when the executor can cancel the tool cooperatively.
+    pub supports_cancellation: bool,
+    /// True when policy should require approval unless explicitly allowed.
+    pub default_requires_approval: bool,
+    /// True when large schemas should be loaded lazily in future registry flows.
+    pub should_defer_schema: bool,
+    /// Default maximum model-facing output characters.
+    pub max_output_chars: Option<usize>,
+    /// Default maximum stored result characters.
+    pub max_result_size_chars: Option<usize>,
+}
+
+impl Default for ToolSafetyMetadata {
+    fn default() -> Self {
+        Self::conservative_unknown()
+    }
+}
+
+impl ToolSafetyMetadata {
+    /// Returns fail-closed metadata for tools that do not declare safety details.
+    pub fn conservative_unknown() -> Self {
+        Self {
+            read_only: false,
+            concurrency_safe: false,
+            operation: ToolOperationKind::Compute,
+            side_effect_level: ToolSideEffectLevel::LocalWrite,
+            requires_network: false,
+            destructive: false,
+            open_world: false,
+            host_dependent: false,
+            requires_user_interaction: false,
+            supports_cancellation: false,
+            default_requires_approval: true,
+            should_defer_schema: false,
+            max_output_chars: Some(20_000),
+            max_result_size_chars: Some(20_000),
+        }
+    }
+
+    /// Returns metadata for a read-only tool with the given operation kind.
+    pub fn read_only(operation: ToolOperationKind) -> Self {
+        Self {
+            read_only: true,
+            concurrency_safe: true,
+            operation,
+            side_effect_level: ToolSideEffectLevel::None,
+            requires_network: false,
+            destructive: false,
+            open_world: false,
+            host_dependent: false,
+            requires_user_interaction: false,
+            supports_cancellation: false,
+            default_requires_approval: false,
+            should_defer_schema: false,
+            max_output_chars: Some(20_000),
+            max_result_size_chars: Some(20_000),
+        }
+    }
+
+    /// Returns metadata for deterministic or local compute tools.
+    pub fn compute() -> Self {
+        Self::read_only(ToolOperationKind::Compute)
+    }
+}
+
+/// Call-level safety classification after arguments are known.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallClassification {
+    /// Operation kind for this specific call.
+    pub operation: ToolOperationKind,
+    /// Side-effect level for this specific call.
+    pub side_effect_level: ToolSideEffectLevel,
+    /// True when this call is read-only.
+    pub read_only: bool,
+    /// True when this call may safely run in parallel.
+    pub concurrency_safe: bool,
+    /// True when this call can destroy or remove state.
+    pub destructive: bool,
+    /// True when this call can access the network.
+    pub requires_network: bool,
+    /// True when this call should ask for approval by default.
+    pub requires_approval: bool,
+    /// Optional timeout override in milliseconds.
+    pub timeout_ms: Option<u64>,
+    /// Optional output cap for this call.
+    pub max_output_chars: Option<usize>,
+}
+
+impl ToolCallClassification {
+    pub fn from_metadata(metadata: &ToolSafetyMetadata) -> Self {
+        Self {
+            operation: metadata.operation,
+            side_effect_level: metadata.side_effect_level,
+            read_only: metadata.read_only,
+            concurrency_safe: metadata.concurrency_safe,
+            destructive: metadata.destructive,
+            requires_network: metadata.requires_network,
+            requires_approval: metadata.default_requires_approval,
+            timeout_ms: None,
+            max_output_chars: metadata.max_output_chars,
+        }
+    }
+}
+
+/// Runtime source that requested a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "source")]
+pub enum ToolCallSource {
+    Model,
+    Skill {
+        skill_id: String,
+        step_index: usize,
+    },
+    StateAction {
+        state: Option<String>,
+        action_index: usize,
+    },
+    Plan {
+        step_index: usize,
+    },
+    Orchestration,
+    Spawner,
+    Fallback {
+        original_tool: String,
+    },
+    Task,
+    Manual,
+    EvalFixture,
+}
+
+/// Request passed into the shared tool execution boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExecutionRequest {
+    /// Stable call ID used in records and history.
+    pub call_id: String,
+    /// Tool name, alias, or display name requested by the caller.
+    pub requested_name: String,
+    /// Original call arguments before approval or policy mutation.
+    pub arguments: Value,
+    /// Runtime path that requested this tool call.
+    pub source: ToolCallSource,
+}
+
+impl ToolExecutionRequest {
+    pub fn new(
+        call_id: impl Into<String>,
+        requested_name: impl Into<String>,
+        arguments: Value,
+        source: ToolCallSource,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            requested_name: requested_name.into(),
+            arguments,
+            source,
+        }
+    }
+}
+
+/// Policy decision stored with every tool execution record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolPolicyDecisionRecord {
+    pub outcome: PermissionOutcome,
+    pub reason: Option<String>,
+    pub requires_user_action: bool,
+    pub retryable: bool,
+}
+
+impl ToolPolicyDecisionRecord {
+    pub fn allow() -> Self {
+        Self {
+            outcome: PermissionOutcome::Allow,
+            reason: None,
+            requires_user_action: false,
+            retryable: false,
+        }
+    }
+
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: PermissionOutcome::Deny,
+            reason: Some(reason.into()),
+            requires_user_action: true,
+            retryable: false,
+        }
+    }
+
+    pub fn approval(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: PermissionOutcome::RequiresApproval,
+            reason: Some(reason.into()),
+            requires_user_action: true,
+            retryable: false,
+        }
+    }
+
+    pub fn unavailable(reason: impl Into<String>) -> Self {
+        Self {
+            outcome: PermissionOutcome::Unavailable,
+            reason: Some(reason.into()),
+            requires_user_action: true,
+            retryable: false,
+        }
+    }
+}
+
+/// Approval status attached to a tool execution record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolApprovalStatus {
+    NotRequired,
+    Approved,
+    Modified,
+    Rejected,
+    Timeout,
+    Unavailable,
+}
+
+/// Human approval evidence for a tool call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolApprovalRecord {
+    pub status: ToolApprovalStatus,
+    pub reason: Option<String>,
+    pub modified_arguments: Option<Value>,
+}
+
+/// Structured internal result for a tool request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolExecutionRecord {
+    /// Stable call ID copied from the request.
+    pub call_id: String,
+    /// Original name, display name, or alias requested by the caller.
+    pub requested_name: String,
+    /// Canonical registry ID used for policy and evidence.
+    pub canonical_id: String,
+    /// Runtime path that requested this call.
+    pub source: ToolCallSource,
+    /// Original call arguments.
+    pub arguments: Value,
+    /// Arguments actually used after approval changes.
+    pub executed_arguments: Value,
+    /// Policy snapshot version used for the decision.
+    pub policy_version: u64,
+    /// Registry snapshot version used for canonical resolution.
+    pub registry_version: u64,
+    /// Runtime-control snapshot version used for execution.
+    pub runtime_config_version: u64,
+    /// True only when the tool implementation was invoked.
+    pub executed: bool,
+    /// True when the model-facing result is successful.
+    pub success: bool,
+    /// Model-facing output or structured error text.
+    pub output: String,
+    /// Preserved tool metadata and executor annotations.
+    pub metadata: HashMap<String, Value>,
+    /// Permission decision for this call.
+    pub policy: ToolPolicyDecisionRecord,
+    /// Approval evidence when approval was checked.
+    pub approval: Option<ToolApprovalRecord>,
+    /// Start timestamp for observability and eval evidence.
+    pub started_at: DateTime<Utc>,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// True when execution exceeded the configured timeout.
+    pub timed_out: bool,
+    /// True when execution was cancelled by runtime control.
+    pub cancelled: bool,
+    /// Human-readable cancellation reason.
+    pub cancellation_reason: Option<String>,
+    /// True when model-facing output was truncated.
+    pub output_truncated: bool,
+}
+
+impl ToolExecutionRecord {
+    /// Returns the value that should be appended to model-visible tool history.
+    pub fn model_output_value(&self) -> Value {
+        if self.success {
+            serde_json::from_str(&self.output)
+                .unwrap_or_else(|_| Value::String(self.output.clone()))
+        } else {
+            serde_json::json!({
+                "success": false,
+                "error": {
+                    "kind": match self.policy.outcome {
+                        PermissionOutcome::Allow => "tool_error",
+                        PermissionOutcome::Deny => "permission_denied",
+                        PermissionOutcome::RequiresApproval => "approval_unavailable",
+                        PermissionOutcome::Unavailable => "tool_unavailable",
+                    },
+                    "reason": self.policy.reason.clone().unwrap_or_else(|| self.output.clone()),
+                    "retryable": self.policy.retryable,
+                    "requires_user_action": self.policy.requires_user_action
+                }
+            })
+        }
+    }
+
+    /// Returns the string form delivered to existing runtime callers.
+    pub fn model_output_string(&self) -> String {
+        if self.success {
+            self.output.clone()
+        } else {
+            self.model_output_value().to_string()
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMResponse {

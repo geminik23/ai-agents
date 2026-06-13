@@ -8,24 +8,24 @@ description: "Game master that creates and manages NPC agents dynamically"
 # Each spawned NPC is a full RuntimeAgent with its own memory, personality, and conversation history.
 #
 # Prerequisites:
-#   - The CLI must wire spawner tools via configure_spawner_tools() without that wiring the four tool IDs below will not resolve.
+#   - The CLI must wire spawner tools via auto_configure_spawner() so the management tool IDs resolve.
 #
-# Spawner tools:
-#   generate_agent  - create a new agent from a description or named template
-#   send_message    - send a message to another registered agent
-#   list_agents     - list all currently registered agents as JSON
-#   remove_agent    - remove an agent from the registry by ID
+# Management tools:
+#   spawn_agent          - create a new agent from a description or named template
+#   send_agent_message   - send a message to another registered agent
+#   list_agents          - list all currently registered agents as JSON
+#   remove_agent         - remove an agent from the registry by ID
 #
-# Flow: user asks for NPC -> LLM calls generate_agent tool
+# Flow: user asks for NPC -> LLM calls spawn_agent tool
 #         -> template path: render npc_base with variables -> spawn agent -> register
 #         -> LLM path: router LLM generates YAML -> validate -> spawn -> register
-#       user asks NPC question -> LLM calls send_message -> registry.send() -> NPC response
+#       user asks NPC question -> LLM calls send_agent_message -> registry.send() -> NPC response
 #       user asks to list NPCs -> LLM calls list_agents -> JSON list
 #       user asks to remove NPC -> LLM calls remove_agent -> deregister
 #
 # The system prompt focuses on behavioral guidance only.
 # Tool names, descriptions, and argument schemas are auto-injected by the framework.
-# Template names and variables are auto-discovered from template metadata - the generate_agent tool description includes them automatically.
+# Template names and variables are auto-discovered from template metadata - the spawn_agent tool description includes them automatically.
 system_prompt: |
   You are a Game Master for the world of Westeros from Game of Thrones.
   You create and manage NPCs (non-player characters) that players can interact with.
@@ -43,7 +43,7 @@ system_prompt: |
   - A short backstory referencing houses, regions, or events of Westeros
 
   Always use the available template when creating NPCs.
-  The generate_agent tool shows available templates and their variables.
+  The spawn_agent tool shows available templates and their variables.
 
 llms:
   default:
@@ -64,19 +64,16 @@ memory:
   compress_threshold: 30   # summarize after 30 messages
   summarizer_llm: router   # use the cheap/fast model for summaries
 
-# Tool scoping (optional):
-#   Spawner tools (generate_agent, send_message, list_agents, remove_agent) are registered automatically by auto_configure_spawner() at startup.
+# Tool scoping:
+#   `management_tools: true` registers and grants all four dynamic agent management tools.
+#   For ordinary tools, omitted top-level `tools:` and `tools: []` both grant no tools.
 #
-#   When `tools:` is omitted, the LLM sees ALL registered tools - spawner tools plus builtins (calculator, datetime, http, json, etc.).
-#   When `tools:` lists specific IDs, the LLM sees ONLY those tools.
-#   When `tools: []` is empty, the LLM sees NO tools at all.
-#
-# Uncomment below to restrict the LLM to spawner tools only:
-tools:
-  - generate_agent
-  - send_message
-  - list_agents
-  - remove_agent
+# Equivalent explicit grant, shown for reference:
+# tools:
+#   - spawn_agent
+#   - send_agent_message
+#   - list_agents
+#   - remove_agent
 
 # Spawner configuration - controls how child agents are created.
 #
@@ -97,6 +94,7 @@ tools:
 #   - Caller variables are top-level: {{ name }}, {{ role }}, {{ personality }}
 #   - Shared context is under the context. prefix: {{ context.world_name }}
 spawner:
+  management_tools: true             # grant spawn_agent, send_agent_message, list_agents, remove_agent
   shared_llms: true                  # NPCs share this agent's LLM connections
   max_agents: 50                     # hard limit on total spawned NPCs
   name_prefix: "npc_"               # auto-naming: npc_001, npc_002, ...
@@ -116,7 +114,7 @@ spawner:
     setting: "Game of Thrones"
 
   # Named templates for spawn_from_template().
-  # The generate_agent tool uses these when a "template" argument is provided.
+  # The spawn_agent tool uses these when a "template" argument is provided.
   templates:
     # File-based template (recommended for complex templates).
     # See templates/npc_base.yaml for the full template with Jinja2 variables.
@@ -136,6 +134,6 @@ metadata:
       - "Try: Create a grizzled Night's Watch deserter hiding in the Riverlands"
       - "Try: Create a cunning spymaster loyal to House Lannister"
       - "Try: List all NPCs"
-      - "Try: Ask the deserter what he saw beyond the Wall (uses send_message)"
+      - "Try: Ask the deserter what he saw beyond the Wall (uses send_agent_message)"
       - "Try: Make the spymaster and the deserter talk to each other"
       - "Try: Remove the deserter"

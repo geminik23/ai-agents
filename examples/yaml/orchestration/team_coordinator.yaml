@@ -6,7 +6,7 @@ description: "Team coordinator that uses orchestration tools to coordinate pre-s
 # Instead of a fixed state machine, the coordinator LLM picks the best tool for each request.
 # The framework auto-injects orchestration tool schemas into the LLM prompt.
 #
-# Available tools (registered by orchestration_tools: true):
+# Available tools (registered and granted by orchestration_tools: true):
 #   route_to_agent        - pick the best agent for a question
 #   pipeline_process      - chain agents sequentially (draft -> review -> edit)
 #   concurrent_ask        - ask multiple agents in parallel and aggregate
@@ -58,10 +58,10 @@ llm:
   router: router                   # used by route, concurrent synthesis, and handoff decisions
 
 # Pre-spawn 5 specialist agents at startup.
-# orchestration_tools: true registers all 5 coordination tools.
+# orchestration_tools: true registers and grants all 5 coordination tools.
 spawner:
   shared_llms: true                # sub-agents reuse parent LLM connections. default: false
-  orchestration_tools: true        # register all 5 tools: route, pipeline, concurrent, group, handoff. default: false
+  orchestration_tools: true        # register and grant all 5 tools: route, pipeline, concurrent, group, handoff. default: false
   auto_spawn:
     - id: writer                   # registry ID the LLM passes to orchestration tools
       agent: agents/writer.yaml    # path relative to this YAML file
