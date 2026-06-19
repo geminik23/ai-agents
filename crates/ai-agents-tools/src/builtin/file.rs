@@ -197,6 +197,9 @@ impl Tool for FileTool {
 
 impl FileTool {
     fn handle_read(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         match fs::read_to_string(&input.path) {
             Ok(content) => {
                 let output = ReadOutput {
@@ -211,6 +214,9 @@ impl FileTool {
     }
 
     fn handle_write(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         let content = input.content.as_deref().unwrap_or("");
         match fs::write(&input.path, content) {
             Ok(_) => {
@@ -229,6 +235,9 @@ impl FileTool {
         use std::fs::OpenOptions;
         use std::io::Write;
 
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         let content = input.content.as_deref().unwrap_or("");
         let file = OpenOptions::new()
             .create(true)
@@ -252,6 +261,9 @@ impl FileTool {
     }
 
     fn handle_exists(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         let path = Path::new(&input.path);
         let output = ExistsOutput {
             exists: path.exists(),
@@ -263,6 +275,9 @@ impl FileTool {
     }
 
     fn handle_delete(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         let path = Path::new(&input.path);
         let result = if path.is_dir() {
             fs::remove_dir_all(path)
@@ -283,6 +298,9 @@ impl FileTool {
     }
 
     fn handle_list(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         let path = Path::new(&input.path);
         if !path.is_dir() {
             return ToolResult::error(format!("Not a directory: {}", input.path));
@@ -327,6 +345,9 @@ impl FileTool {
     }
 
     fn handle_mkdir(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         match fs::create_dir_all(&input.path) {
             Ok(_) => {
                 let output = MkdirOutput {
@@ -340,6 +361,9 @@ impl FileTool {
     }
 
     fn handle_info(&self, input: &FileInput) -> ToolResult {
+        if let Err(error) = self.validate_path(&input.path) {
+            return ToolResult::error(error);
+        }
         let path = Path::new(&input.path);
 
         if !path.exists() {
@@ -380,6 +404,20 @@ impl FileTool {
             created,
         };
         self.to_result(&output)
+    }
+
+    fn validate_path(&self, path: &str) -> Result<(), String> {
+        let blocked = Path::new(path).components().any(|component| {
+            matches!(component, std::path::Component::Normal(value) if value.to_string_lossy() == ".git")
+        });
+        if blocked {
+            Err(
+                "Access to raw .git paths is blocked. Use git_status or git_diff instead."
+                    .to_string(),
+            )
+        } else {
+            Ok(())
+        }
     }
 
     fn matches_pattern(&self, name: &str, pattern: &str) -> bool {
@@ -594,5 +632,18 @@ mod tests {
             }))
             .await;
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn test_git_paths_are_blocked() {
+        let tool = FileTool::new();
+        let result = tool
+            .execute(serde_json::json!({
+                "operation": "read",
+                "path": ".git/config"
+            }))
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("git_status") || result.output.contains("git_diff"));
     }
 }

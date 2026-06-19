@@ -16,7 +16,10 @@ use ai_agents_core::{
 use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
 use ai_agents_llm::{FinishReason, LLMRegistry};
 use ai_agents_runtime::spec::AgentSpec;
-use ai_agents_tools::{ToolRegistry, create_builtin_registry};
+use ai_agents_tools::{
+    DiagnosticItem, DiagnosticsProvider, StaticDiagnosticsProvider, ToolRegistry,
+    UnavailableDiagnosticsProvider, create_builtin_registry,
+};
 use async_trait::async_trait;
 use futures::Stream;
 use parking_lot::Mutex;
@@ -45,6 +48,20 @@ pub struct FixturesConfig {
     /// Optional local HTTP mock server configuration.
     #[serde(default)]
     pub mock_server: Option<MockServerConfig>,
+    /// Optional mocked diagnostics returned by the diagnostics tool.
+    #[serde(default)]
+    pub diagnostics: Option<DiagnosticsFixtureConfig>,
+}
+
+/// Diagnostics fixture configuration for host-backed diagnostics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticsFixtureConfig {
+    /// Whether the provider is available.
+    #[serde(default = "default_true")]
+    pub available: bool,
+    /// Deterministic diagnostics returned by the provider.
+    #[serde(default)]
+    pub items: Vec<DiagnosticItem>,
 }
 
 /// Static output configuration for an eval mock tool.
@@ -333,6 +350,16 @@ pub fn build_tool_registry(
 ) -> Result<ToolRegistry> {
     let builtin = create_builtin_registry();
     let mut registry = ToolRegistry::new();
+    let provider: Arc<dyn DiagnosticsProvider> = if let Some(diagnostics) = &fixtures.diagnostics {
+        Arc::new(StaticDiagnosticsProvider::with_availability(
+            diagnostics.items.clone(),
+            diagnostics.available,
+        ))
+    } else {
+        Arc::new(UnavailableDiagnosticsProvider)
+    };
+    builtin.set_diagnostics_provider(provider.clone());
+    registry.set_diagnostics_provider(provider);
 
     for (id, mock) in &fixtures.tools {
         registry

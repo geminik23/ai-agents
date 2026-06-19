@@ -1179,6 +1179,12 @@ impl AgentBuilder {
 
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
+        tools_arc.set_web_fetch_extractor(
+            llm_registry_arc
+                .router()
+                .ok()
+                .or_else(|| llm_registry_arc.default().ok()),
+        );
 
         // Build the effective tool grant.
         // YAML top-level tools are explicit ordinary grants, while feature flags such as spawner management, persona evolution, and orchestration tools are explicit feature grants.

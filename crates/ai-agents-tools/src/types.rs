@@ -1,6 +1,10 @@
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -179,6 +183,303 @@ impl ToolContext {
         self.language = Some(language.into());
         self
     }
+}
+
+/// Shared slot used by `ask_user` to find the active host handler.
+pub type QuestionHandlerSlot = Arc<RwLock<Option<Arc<dyn QuestionHandler>>>>;
+
+/// Structured question sent from a tool call to the host UI.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct QuestionRequest {
+    /// Text shown to the user.
+    pub question: String,
+    /// Selectable choices shown by CLI and TUI hosts.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// Allows more than one selected option.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// Allows free text when the host supports it.
+    #[serde(default = "default_true")]
+    pub allow_other: bool,
+    /// Fallback value used by non-interactive hosts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<Value>,
+    /// Max seconds to wait before using fallback behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Answer returned by an interactive or fallback question handler.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct QuestionResponse {
+    /// Whether the request received a usable answer.
+    pub answered: bool,
+    /// Selected option labels, empty when free text was used.
+    #[serde(default)]
+    pub selected: Vec<String>,
+    /// Free text answer when the host allowed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub other_text: Option<String>,
+    /// Whether the handler timed out.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// Whether no interactive host was available.
+    #[serde(default)]
+    pub unavailable: bool,
+}
+
+/// Host bridge for asking preference or clarification questions.
+#[async_trait]
+pub trait QuestionHandler: Send + Sync {
+    /// Ask a structured question and return a bounded answer.
+    async fn ask_question(&self, request: QuestionRequest) -> QuestionResponse;
+}
+
+/// Severity assigned to a compiler, linter, or editor diagnostic.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+/// Query sent to a diagnostics provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct DiagnosticsRequest {
+    /// Optional file or directory path filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Optional severity filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub severity: Option<DiagnosticSeverity>,
+    /// Maximum returned diagnostics.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
+/// One diagnostic item returned by a host provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DiagnosticItem {
+    /// File path associated with the diagnostic.
+    pub path: String,
+    /// One-based line number when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// One-based column number when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column: Option<u32>,
+    /// Severity reported by the host.
+    pub severity: DiagnosticSeverity,
+    /// Tool, compiler, linter, or LSP source name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Human-readable diagnostic message.
+    pub message: String,
+    /// Optional provider-specific error or warning code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// Diagnostics returned by a host provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct DiagnosticsResponse {
+    /// Whether a provider was available for this request.
+    pub available: bool,
+    /// Diagnostics matching the request.
+    #[serde(default)]
+    pub diagnostics: Vec<DiagnosticItem>,
+    /// Optional message for unavailable or partial results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Provider hook for compiler, linter, or editor diagnostics.
+#[async_trait]
+pub trait DiagnosticsProvider: Send + Sync {
+    /// Return whether this provider can serve diagnostics now.
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    /// Return diagnostics for the supplied request.
+    async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse;
+}
+
+/// Diagnostics provider used when the host has not installed one.
+#[derive(Debug, Default)]
+pub struct UnavailableDiagnosticsProvider;
+
+#[async_trait]
+impl DiagnosticsProvider for UnavailableDiagnosticsProvider {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn diagnostics(&self, _request: DiagnosticsRequest) -> DiagnosticsResponse {
+        DiagnosticsResponse {
+            available: false,
+            diagnostics: Vec::new(),
+            message: Some("diagnostics provider is unavailable".to_string()),
+        }
+    }
+}
+
+/// Static diagnostics provider used by tests and eval fixtures.
+#[derive(Debug, Clone)]
+pub struct StaticDiagnosticsProvider {
+    diagnostics: Vec<DiagnosticItem>,
+    available: bool,
+}
+
+impl StaticDiagnosticsProvider {
+    /// Create a provider that returns a deterministic diagnostics list.
+    pub fn new(diagnostics: Vec<DiagnosticItem>) -> Self {
+        Self {
+            diagnostics,
+            available: true,
+        }
+    }
+
+    /// Create a provider with explicit availability.
+    pub fn with_availability(diagnostics: Vec<DiagnosticItem>, available: bool) -> Self {
+        Self {
+            diagnostics,
+            available,
+        }
+    }
+}
+
+#[async_trait]
+impl DiagnosticsProvider for StaticDiagnosticsProvider {
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    async fn diagnostics(&self, request: DiagnosticsRequest) -> DiagnosticsResponse {
+        if !self.available {
+            return DiagnosticsResponse {
+                available: false,
+                diagnostics: Vec::new(),
+                message: Some("diagnostics provider is unavailable".to_string()),
+            };
+        }
+
+        let mut diagnostics: Vec<DiagnosticItem> = self
+            .diagnostics
+            .iter()
+            .filter(|item| {
+                request
+                    .path
+                    .as_ref()
+                    .is_none_or(|path| item.path.starts_with(path))
+            })
+            .filter(|item| {
+                request
+                    .severity
+                    .as_ref()
+                    .is_none_or(|severity| &item.severity == severity)
+            })
+            .cloned()
+            .collect();
+
+        if let Some(max_results) = request.max_results {
+            diagnostics.truncate(max_results);
+        }
+
+        DiagnosticsResponse {
+            available: true,
+            diagnostics,
+            message: None,
+        }
+    }
+}
+
+/// Shared slot used by `diagnostics` to find the active provider.
+pub type DiagnosticsProviderSlot = Arc<RwLock<Arc<dyn DiagnosticsProvider>>>;
+
+/// Status value for one session-local todo item.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Cancelled,
+}
+
+impl Default for TodoStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+/// One structured task tracked by the session-local todo tool.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TodoItem {
+    /// Stable task ID chosen by the model or host.
+    pub id: String,
+    /// Task description shown in summaries and UIs.
+    pub content: String,
+    /// Present-continuous phrase for active status displays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
+    /// Current task state.
+    #[serde(default)]
+    pub status: TodoStatus,
+}
+
+/// Session-local todo storage shared by the registry and runtime accessor.
+#[derive(Clone, Default)]
+pub struct TodoStore {
+    inner: Arc<RwLock<Vec<TodoItem>>>,
+}
+
+impl TodoStore {
+    /// Return a snapshot of all todo items.
+    pub fn list(&self) -> Vec<TodoItem> {
+        self.inner.read().clone()
+    }
+
+    /// Replace the full todo list.
+    pub fn set(&self, items: Vec<TodoItem>) {
+        *self.inner.write() = items;
+    }
+
+    /// Update one item by ID and return whether it existed.
+    pub fn update(
+        &self,
+        id: &str,
+        content: Option<String>,
+        active_form: Option<String>,
+        status: Option<TodoStatus>,
+    ) -> bool {
+        let mut items = self.inner.write();
+        let Some(item) = items.iter_mut().find(|item| item.id == id) else {
+            return false;
+        };
+        if let Some(content) = content {
+            item.content = content;
+        }
+        if let Some(active_form) = active_form {
+            item.active_form = Some(active_form);
+        }
+        if let Some(status) = status {
+            item.status = status;
+        }
+        true
+    }
+
+    /// Remove every todo item.
+    pub fn clear(&self) {
+        self.inner.write().clear();
+    }
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]

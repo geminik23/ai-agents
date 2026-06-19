@@ -57,6 +57,39 @@ pub struct ToolPolicyConfig {
     /// Legacy path allowlist mapped to path policy.
     #[serde(default)]
     pub allowed_paths: Vec<String>,
+    /// Explicit read path allowlist for local read-only tools.
+    #[serde(default)]
+    pub read_paths: Vec<String>,
+    /// Explicit write path allowlist for local mutation tools.
+    #[serde(default)]
+    pub write_paths: Vec<String>,
+    /// Paths that override any allowlist.
+    #[serde(default)]
+    pub blocked_paths: Vec<String>,
+    /// Maximum file size read or searched by local tools.
+    #[serde(default)]
+    pub max_file_size_bytes: Option<u64>,
+    /// Maximum model-facing output characters.
+    #[serde(default)]
+    pub max_output_chars: Option<usize>,
+    /// Maximum rows or entries for list/search tools.
+    #[serde(default)]
+    pub max_results: Option<usize>,
+    /// Maximum response bytes for web fetch tools.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
+    /// Blocks private, localhost, link-local, and metadata network targets.
+    #[serde(default = "default_true")]
+    pub blocked_private_networks: bool,
+    /// Allowed URL schemes for network tools.
+    #[serde(default)]
+    pub allowed_schemes: Vec<String>,
+    /// Allowed URL ports for network tools.
+    #[serde(default)]
+    pub allowed_ports: Vec<u16>,
+    /// Maximum redirect count for network tools.
+    #[serde(default)]
+    pub max_redirects: Option<usize>,
     /// Parsed domain policy.
     #[serde(default)]
     pub domains: DomainPolicyConfig,
@@ -82,6 +115,17 @@ impl Default for ToolPolicyConfig {
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
             allowed_paths: Vec::new(),
+            read_paths: Vec::new(),
+            write_paths: Vec::new(),
+            blocked_paths: Vec::new(),
+            max_file_size_bytes: None,
+            max_output_chars: None,
+            max_results: None,
+            max_response_bytes: None,
+            blocked_private_networks: true,
+            allowed_schemes: Vec::new(),
+            allowed_ports: Vec::new(),
+            max_redirects: None,
             domains: DomainPolicyConfig::default(),
             paths: PathPolicyConfig::default(),
             commands: CommandPolicyConfig::default(),

@@ -26,6 +26,7 @@ use tracing_subscriber::layer::SubscriberExt;
 
 use ai_agents::RuntimeAgent;
 
+use crate::question::TuiQuestionHandler;
 use crate::repl::CliReplConfig;
 
 use self::app::{App, UpdateResult};
@@ -103,6 +104,7 @@ pub async fn run_tui(
         }
     });
 
+    agent.set_question_handler(Some(TuiQuestionHandler::new(tx.clone())));
     let agent_arc = Arc::new(agent);
     let mut app = App::new(agent_arc, config, tx, initial_theme, initial_theme_name);
 

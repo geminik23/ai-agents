@@ -19,12 +19,18 @@ pub use condition::{
 };
 pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderError};
 pub use registry::{ResolvedTool, ToolIdentity, ToolRegistry};
-pub use types::{ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel};
+pub use types::{
+    DiagnosticItem, DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot,
+    DiagnosticsRequest, DiagnosticsResponse, QuestionHandler, QuestionHandlerSlot, QuestionRequest,
+    QuestionResponse, StaticDiagnosticsProvider, TodoItem, TodoStatus, TodoStore, ToolAliases,
+    ToolContext, ToolMetadata, ToolProviderType, TrustLevel, UnavailableDiagnosticsProvider,
+};
 
 pub use builtin::HttpTool;
 pub use builtin::{
-    CalculatorTool, DateTimeTool, EchoTool, FileTool, JsonTool, MathTool, RandomTool, TemplateTool,
-    TextTool,
+    AskUserTool, CalculatorTool, DateTimeTool, DiagnosticsTool, EchoTool, FileInfoTool,
+    FileListTool, FileReadTool, FileTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, JsonTool,
+    MathTool, RandomTool, SleepTool, TemplateTool, TextTool, TodoTool, WebFetchTool,
 };
 
 pub use security::{
@@ -77,6 +83,46 @@ pub fn create_builtin_registry() -> ToolRegistry {
     registry
         .register(Arc::new(FileTool::new()))
         .expect("failed to register file");
+    registry
+        .register(Arc::new(GlobTool::new()))
+        .expect("failed to register glob");
+    registry
+        .register(Arc::new(GrepTool::new()))
+        .expect("failed to register grep");
+    registry
+        .register(Arc::new(FileReadTool::new()))
+        .expect("failed to register file_read");
+    registry
+        .register(Arc::new(FileListTool::new()))
+        .expect("failed to register file_list");
+    registry
+        .register(Arc::new(FileInfoTool::new()))
+        .expect("failed to register file_info");
+    registry
+        .register(Arc::new(GitStatusTool::new()))
+        .expect("failed to register git_status");
+    registry
+        .register(Arc::new(GitDiffTool::new()))
+        .expect("failed to register git_diff");
+    registry
+        .register(Arc::new(DiagnosticsTool::new(
+            registry.diagnostics_provider_slot(),
+        )))
+        .expect("failed to register diagnostics");
+    registry
+        .register(Arc::new(AskUserTool::new(registry.question_handler_slot())))
+        .expect("failed to register ask_user");
+    registry
+        .register(Arc::new(TodoTool::new(registry.todo_store())))
+        .expect("failed to register todo");
+    registry
+        .register(Arc::new(SleepTool::new()))
+        .expect("failed to register sleep");
+    registry
+        .register(Arc::new(WebFetchTool::with_extractor_slot(
+            registry.web_fetch_extractor_slot(),
+        )))
+        .expect("failed to register web_fetch");
     registry
         .register(Arc::new(TextTool::new()))
         .expect("failed to register text");

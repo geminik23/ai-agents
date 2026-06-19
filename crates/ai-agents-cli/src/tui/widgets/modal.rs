@@ -37,6 +37,25 @@ impl ModalState {
             buttons: vec!["Yes".to_string(), "No".to_string()],
         }
     }
+
+    /// Create a structured question modal.
+    pub fn question(message: &str, options: Vec<String>, has_default: bool) -> Self {
+        let mut buttons = if options.is_empty() {
+            vec!["Use default".to_string(), "Cancel".to_string()]
+        } else {
+            options
+        };
+        if has_default && !buttons.iter().any(|button| button == "Use default") {
+            buttons.push("Use default".to_string());
+        }
+        Self {
+            title: "QUESTION".to_string(),
+            message: message.to_string(),
+            context_lines: Vec::new(),
+            selected_button: 0,
+            buttons,
+        }
+    }
 }
 
 pub fn render_modal(area: Rect, buf: &mut Buffer, state: &ModalState, theme: &Theme) {

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,6 +9,7 @@ use tracing::debug;
 
 use super::config::*;
 use ai_agents_core::Result;
+use serde_json::Value;
 
 #[derive(Debug, Default)]
 struct ToolCallTracker {
@@ -64,6 +66,62 @@ impl ToolSecurityEngine {
 
     pub fn policy_version(&self) -> u64 {
         self.policy_version
+    }
+
+    pub fn prepare_tool_arguments(&self, tool_id: &str, args: &Value) -> Value {
+        if !self.config.enabled {
+            return args.clone();
+        }
+        let mut prepared = args.clone();
+        let Some(tool_config) = self.config.tools.get(tool_id) else {
+            return prepared;
+        };
+        normalize_default_path_argument(tool_id, &mut prepared);
+        apply_policy_caps(tool_id, tool_config, &mut prepared);
+        prepared
+    }
+
+    pub fn attach_internal_tool_policy(&self, tool_id: &str, args: &Value) -> Value {
+        if !self.config.enabled || tool_id != "web_fetch" {
+            return args.clone();
+        }
+        let mut prepared = args.clone();
+        let Some(tool_config) = self.config.tools.get(tool_id) else {
+            return prepared;
+        };
+        let Some(obj) = prepared.as_object_mut() else {
+            return prepared;
+        };
+        obj.insert(
+            "__ai_agents_policy".to_string(),
+            serde_json::json!({
+                "allowed_domains": &tool_config.allowed_domains,
+                "blocked_domains": &tool_config.blocked_domains,
+                "domain_allow": &tool_config.domains.allow,
+                "domain_deny": &tool_config.domains.deny,
+                "domain_requires_approval": &tool_config.domains.requires_approval,
+                "domain_unavailable": &tool_config.domains.unavailable,
+                "allowed_schemes": &tool_config.allowed_schemes,
+                "allowed_ports": &tool_config.allowed_ports,
+                "blocked_private_networks": tool_config.blocked_private_networks,
+                "max_redirects": tool_config.max_redirects,
+            }),
+        );
+        prepared
+    }
+
+    pub fn get_tool_output_cap(
+        &self,
+        tool_id: &str,
+        classification_cap: Option<usize>,
+    ) -> Option<usize> {
+        let policy_cap = self
+            .config
+            .enabled
+            .then(|| self.config.tools.get(tool_id))
+            .flatten()
+            .and_then(|config| config.max_output_chars);
+        min_optional_usize(classification_cap, policy_cap)
     }
 
     pub async fn check_tool_execution(
@@ -173,10 +231,48 @@ impl ToolSecurityEngine {
         args: &serde_json::Value,
     ) -> Option<SecurityCheckResult> {
         let url = args.get("url").and_then(|u| u.as_str())?;
-        let host = match reqwest::Url::parse(url) {
-            Ok(parsed) => parsed.host_str().map(normalize_host),
-            Err(_) => None,
-        }?;
+        let parsed = match reqwest::Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!("URL is invalid for tool '{}'", tool_id),
+                });
+            }
+        };
+        let host = parsed.host_str().map(normalize_host)?;
+
+        if !tool_config.allowed_schemes.is_empty()
+            && !tool_config
+                .allowed_schemes
+                .iter()
+                .any(|scheme| scheme.eq_ignore_ascii_case(parsed.scheme()))
+        {
+            return Some(SecurityCheckResult::Block {
+                reason: format!(
+                    "URL scheme '{}' is not allowed for tool '{}'",
+                    parsed.scheme(),
+                    tool_id
+                ),
+            });
+        }
+
+        if !tool_config.allowed_ports.is_empty() {
+            let port = parsed.port_or_known_default().unwrap_or(0);
+            if !tool_config.allowed_ports.contains(&port) {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!("URL port '{}' is not allowed for tool '{}'", port, tool_id),
+                });
+            }
+        }
+
+        if tool_config.blocked_private_networks && host_is_private_or_local(&host) {
+            return Some(SecurityCheckResult::Block {
+                reason: format!(
+                    "Private, localhost, link-local, or metadata host is blocked for tool '{}'",
+                    tool_id
+                ),
+            });
+        }
 
         let denied = tool_config
             .blocked_domains
@@ -229,10 +325,17 @@ impl ToolSecurityEngine {
         tool_config: &ToolPolicyConfig,
         args: &serde_json::Value,
     ) -> Option<SecurityCheckResult> {
-        let path = args.get("path").and_then(|p| p.as_str())?;
+        let path = args
+            .get("path")
+            .and_then(|p| p.as_str())
+            .or_else(|| default_path_for_tool(tool_id))?;
         let normalized = normalize_path(path);
 
-        for pattern in tool_config.paths.deny.iter() {
+        for pattern in tool_config
+            .blocked_paths
+            .iter()
+            .chain(tool_config.paths.deny.iter())
+        {
             if path_matches(pattern, &normalized) {
                 return Some(SecurityCheckResult::Block {
                     reason: format!("Path is blocked for tool '{}'", tool_id),
@@ -259,6 +362,8 @@ impl ToolSecurityEngine {
         let allowed: Vec<&String> = tool_config
             .allowed_paths
             .iter()
+            .chain(tool_config.read_paths.iter())
+            .chain(tool_config.write_paths.iter())
             .chain(tool_config.paths.allow.iter())
             .collect();
         if !allowed.is_empty()
@@ -387,6 +492,86 @@ impl Default for ToolSecurityEngine {
     }
 }
 
+fn normalize_default_path_argument(tool_id: &str, args: &mut Value) {
+    let Some(default_path) = default_path_for_tool(tool_id) else {
+        return;
+    };
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    if !obj.contains_key("path") {
+        obj.insert("path".to_string(), Value::String(default_path.to_string()));
+    }
+}
+
+fn default_path_for_tool(tool_id: &str) -> Option<&'static str> {
+    match tool_id {
+        "glob" | "grep" | "git_status" | "git_diff" | "diagnostics" => Some("."),
+        _ => None,
+    }
+}
+
+fn apply_policy_caps(tool_id: &str, config: &ToolPolicyConfig, args: &mut Value) {
+    let Some(obj) = args.as_object_mut() else {
+        return;
+    };
+    match tool_id {
+        "glob" | "file_list" | "git_status" | "diagnostics" => {
+            apply_usize_cap(obj, "max_results", config.max_results);
+        }
+        "grep" => {
+            apply_usize_cap(obj, "max_results", config.max_results);
+            apply_u64_cap(obj, "max_file_size_bytes", config.max_file_size_bytes);
+            apply_usize_cap(obj, "max_output_chars", config.max_output_chars);
+        }
+        "file_read" => {
+            apply_u64_cap(obj, "max_bytes", config.max_file_size_bytes);
+        }
+        "git_diff" => {
+            apply_usize_cap(obj, "max_output_chars", config.max_output_chars);
+        }
+        "web_fetch" => {
+            apply_usize_cap(obj, "max_chars", config.max_output_chars);
+            apply_usize_cap(obj, "max_response_bytes", config.max_response_bytes);
+            apply_usize_cap(obj, "max_redirects", config.max_redirects);
+        }
+        _ => {}
+    }
+}
+
+fn apply_usize_cap(obj: &mut serde_json::Map<String, Value>, key: &str, cap: Option<usize>) {
+    let Some(cap) = cap else {
+        return;
+    };
+    let effective = obj
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| value.min(cap as u64) as usize)
+        .unwrap_or(cap);
+    obj.insert(key.to_string(), Value::from(effective));
+}
+
+fn apply_u64_cap(obj: &mut serde_json::Map<String, Value>, key: &str, cap: Option<u64>) {
+    let Some(cap) = cap else {
+        return;
+    };
+    let effective = obj
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .map(|value| value.min(cap))
+        .unwrap_or(cap);
+    obj.insert(key.to_string(), Value::from(effective));
+}
+
+fn min_optional_usize(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
 fn normalize_host(host: &str) -> String {
     host.trim_end_matches('.').to_ascii_lowercase()
 }
@@ -419,6 +604,38 @@ fn contains_casefold(values: &[String], needle: &str) -> bool {
     values
         .iter()
         .any(|value| value.eq_ignore_ascii_case(needle))
+}
+
+fn host_is_private_or_local(host: &str) -> bool {
+    if matches!(
+        host,
+        "localhost"
+            | "metadata"
+            | "metadata.google.internal"
+            | "169.254.169.254"
+            | "100.100.100.200"
+    ) || host.ends_with(".localhost")
+    {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_documentation()
+                || ip.octets() == [169, 254, 169, 254]
+        }
+        Ok(IpAddr::V6(ip)) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.segments()[0] & 0xfe00 == 0xfc00
+                || ip.segments()[0] & 0xffc0 == 0xfe80
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -577,5 +794,57 @@ mod tests {
             .await
             .unwrap();
         assert!(result.requires_approval());
+    }
+
+    #[tokio::test]
+    async fn omitted_optional_path_uses_default_for_policy() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.read_paths = vec!["./crates".to_string()];
+        config.tools.insert("grep".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let result = engine
+            .check_tool_execution("grep", &serde_json::json!({"pattern": "Tool"}))
+            .await
+            .unwrap();
+        assert!(result.is_blocked());
+
+        let prepared =
+            engine.prepare_tool_arguments("grep", &serde_json::json!({"pattern": "Tool"}));
+        assert_eq!(prepared.get("path").and_then(Value::as_str), Some("."));
+    }
+
+    #[test]
+    fn policy_caps_are_applied_as_upper_bounds() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.max_results = Some(5);
+        tool_config.max_file_size_bytes = Some(1024);
+        tool_config.max_output_chars = Some(1000);
+        config.tools.insert("grep".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let prepared = engine.prepare_tool_arguments(
+            "grep",
+            &serde_json::json!({
+                "pattern": "Tool",
+                "path": ".",
+                "max_results": 50,
+                "max_file_size_bytes": 8192,
+                "max_output_chars": 20000
+            }),
+        );
+        assert_eq!(prepared.get("max_results").and_then(Value::as_u64), Some(5));
+        assert_eq!(
+            prepared.get("max_file_size_bytes").and_then(Value::as_u64),
+            Some(1024)
+        );
+        assert_eq!(
+            prepared.get("max_output_chars").and_then(Value::as_u64),
+            Some(1000)
+        );
     }
 }

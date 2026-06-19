@@ -2,6 +2,7 @@ pub mod approval;
 pub mod cli;
 pub mod eval;
 pub mod metadata;
+pub mod question;
 pub mod repl;
 pub mod run;
 pub mod tui;
@@ -9,6 +10,7 @@ pub mod tui;
 pub use approval::CliApprovalHandler;
 pub use cli::{Cli, Command, EvalArgs, RunArgs, ValidateArgs};
 pub use metadata::{CliOverrides, ResolvedCliMetadata};
+pub use question::{CliQuestionHandler, TuiQuestionHandler};
 pub use repl::{CliRepl, CliReplConfig, CommandResult, PromptStyle, ReplMode};
 pub use run::{
     RunOptions, build_agent, load_spec, resolve_cli_config, run, run_agent, validate_agent,

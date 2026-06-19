@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use crate::approval::CliApprovalHandler;
 use crate::cli::{Cli, Command as CliCommand, RunArgs};
 use crate::metadata::{CliOverrides, ResolvedCliMetadata};
+use crate::question::CliQuestionHandler;
 use crate::repl::{CliRepl, CliReplConfig, PromptStyle, ReplMode};
 
 #[derive(Debug, Clone)]
@@ -96,6 +97,9 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     // The TUI installs a channel-based subscriber inside run_tui().
 
     let agent = build_agent(&options.agent_path).await?;
+    if !is_tui && std::io::stdin().is_terminal() {
+        agent.set_question_handler(Some(CliQuestionHandler::new()));
+    }
 
     // Initialize storage eagerly so fact_store is ready before the first turn.
     // Without this, storage is only created lazily on the first /save or /load,

@@ -14,10 +14,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use tui_textarea::TextArea;
 
 use ai_agents::memory::estimate_tokens;
+use ai_agents::tools::{QuestionRequest, QuestionResponse};
 use ai_agents::{Agent, RuntimeAgent, StreamChunk};
+use tokio::sync::oneshot;
 
+use crate::question::response_from_default;
 use crate::repl::{CliReplConfig, ReplMode, parse_relationship_perspective};
-use crate::tui::event::AppMessage;
+use crate::tui::event::{AppMessage, PendingQuestion};
 use crate::tui::palette::{THEME_NAMES, resolve_theme, theme_bg_color};
 use crate::tui::theme::Theme;
 use crate::tui::widgets::{
@@ -112,8 +115,16 @@ pub struct App {
     // Modal overlay
     modal: Option<ModalState>,
 
+    // Pending ask_user response
+    pending_question: Option<PendingQuestionState>,
+
     // Toast notifications
     toasts: Vec<Toast>,
+}
+
+struct PendingQuestionState {
+    request: QuestionRequest,
+    respond_to: Option<oneshot::Sender<QuestionResponse>>,
 }
 
 impl App {
@@ -175,6 +186,7 @@ impl App {
             left_panel: None,
             right_panel: None,
             modal: None,
+            pending_question: None,
             toasts: Vec::new(),
         }
     }
@@ -219,6 +231,10 @@ impl App {
                 self.is_thinking = false;
                 self.chat.streaming_content = None;
                 self.add_system_message(&format!("[Error] {}", err));
+                UpdateResult::Continue
+            }
+            AppMessage::Question(question) => {
+                self.show_question_modal(question);
                 UpdateResult::Continue
             }
             AppMessage::Tick => {
@@ -1082,7 +1098,13 @@ impl App {
                         modal.selected_button += 1;
                     }
                 }
-                KeyCode::Enter | KeyCode::Esc => {
+                KeyCode::Enter => {
+                    let selected = modal.buttons.get(modal.selected_button).cloned();
+                    self.complete_pending_question(selected, false);
+                    self.modal = None;
+                }
+                KeyCode::Esc => {
+                    self.complete_pending_question(None, false);
                     self.modal = None;
                 }
                 _ => {}
@@ -1128,6 +1150,42 @@ impl App {
     /// Show a modal dialog for confirmations or approvals.
     pub fn show_modal(&mut self, modal: ModalState) {
         self.modal = Some(modal);
+    }
+
+    fn show_question_modal(&mut self, question: PendingQuestion) {
+        let has_default = question.request.default.is_some();
+        let modal = ModalState::question(
+            &question.request.question,
+            question.request.options.clone(),
+            has_default,
+        );
+        self.pending_question = Some(PendingQuestionState {
+            request: question.request,
+            respond_to: Some(question.respond_to),
+        });
+        self.modal = Some(modal);
+    }
+
+    fn complete_pending_question(&mut self, selected: Option<String>, timed_out: bool) {
+        let Some(mut pending) = self.pending_question.take() else {
+            return;
+        };
+        let response = match selected {
+            Some(label) if label == "Use default" || label == "Cancel" => {
+                response_from_default(pending.request.default, timed_out)
+            }
+            Some(label) => QuestionResponse {
+                answered: true,
+                selected: vec![label],
+                other_text: None,
+                timed_out,
+                unavailable: false,
+            },
+            None => response_from_default(pending.request.default, timed_out),
+        };
+        if let Some(sender) = pending.respond_to.take() {
+            let _ = sender.send(response);
+        }
     }
 
     /// Compose the full TUI layout into the terminal frame.

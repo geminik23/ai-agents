@@ -57,8 +57,9 @@ use ai_agents_state::{
 };
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
 use ai_agents_tools::{
-    ConditionEvaluator, EvaluationContext, LLMGetter, SecurityCheckResult, ToolCallRecord,
-    ToolRegistry, ToolSecurityConfig, ToolSecurityEngine,
+    ConditionEvaluator, DiagnosticsProvider, EvaluationContext, LLMGetter, QuestionHandler,
+    SecurityCheckResult, TodoItem, ToolCallRecord, ToolRegistry, ToolSecurityConfig,
+    ToolSecurityEngine,
 };
 
 use super::{
@@ -2070,6 +2071,21 @@ impl RuntimeAgent {
         }
     }
 
+    /// Installs or clears the host question handler used by `ask_user`.
+    pub fn set_question_handler(&self, handler: Option<Arc<dyn QuestionHandler>>) {
+        self.tools.set_question_handler(handler);
+    }
+
+    /// Installs the host diagnostics provider used by `diagnostics`.
+    pub fn set_diagnostics_provider(&self, provider: Arc<dyn DiagnosticsProvider>) {
+        self.tools.set_diagnostics_provider(provider);
+    }
+
+    /// Returns the current session-local todo list.
+    pub fn todos(&self) -> Vec<TodoItem> {
+        self.tools.todos()
+    }
+
     /// Returns the effective tool security snapshot for the next decision.
     fn active_tool_security(&self) -> ToolSecurityEngine {
         self.runtime_control
@@ -3283,7 +3299,9 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
-        let mut executed_arguments = request.arguments.clone();
+        let security_engine = self.active_tool_security();
+        let mut executed_arguments =
+            security_engine.prepare_tool_arguments(&canonical_id, &request.arguments);
         self.hooks
             .on_tool_start(&canonical_id, &executed_arguments)
             .await;
@@ -3301,7 +3319,6 @@ impl RuntimeAgent {
             modified_arguments: None,
         });
 
-        let security_engine = self.active_tool_security();
         let mut security_result = security_engine
             .check_tool_execution(&canonical_id, &executed_arguments)
             .await?;
@@ -3484,6 +3501,30 @@ impl RuntimeAgent {
                     }
                 }
             }
+        }
+
+        if canonical_id == "diagnostics" && !self.tools.diagnostics_available() {
+            let record = self.record_from_parts(
+                &request,
+                canonical_id.clone(),
+                executed_arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                "Diagnostics provider is unavailable".to_string(),
+                metadata,
+                ToolPolicyDecisionRecord::unavailable("diagnostics provider is unavailable"),
+                Some(ToolApprovalRecord {
+                    status: ToolApprovalStatus::Unavailable,
+                    reason: Some("diagnostics provider is unavailable".to_string()),
+                    modified_arguments: None,
+                }),
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
         }
 
         let hitl_lang_ctx = self.build_hitl_language_context();
@@ -3707,11 +3748,13 @@ impl RuntimeAgent {
 
         let tool_config = self.recovery_manager.get_tool_config(&canonical_id);
         let timeout_ms = security_engine.get_tool_timeout(&canonical_id);
+        let tool_arguments =
+            security_engine.attach_internal_tool_policy(&canonical_id, &executed_arguments);
         let (mut result, timed_out, cancelled) = self
             .run_tool_with_retries(
                 &canonical_id,
                 resolved.tool.clone(),
-                executed_arguments.clone(),
+                tool_arguments,
                 timeout_ms,
                 tool_config.max_retries,
             )
@@ -3740,8 +3783,10 @@ impl RuntimeAgent {
             }
         }
 
+        let output_cap =
+            security_engine.get_tool_output_cap(&canonical_id, classification.max_output_chars);
         let (output, output_truncated) =
-            Self::truncate_tool_output(result.output.clone(), classification.max_output_chars);
+            Self::truncate_tool_output(result.output.clone(), output_cap);
         if let Some(result_metadata) = result.metadata {
             metadata.extend(result_metadata);
         }
@@ -10077,6 +10122,37 @@ mod tests {
         assert!(record.cancelled);
         assert!(!record.success);
         assert!(record.cancellation_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn diagnostics_without_provider_records_unavailable_without_execution() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: DiagnosticsNoProviderAgent
+system_prompt: "Review diagnostics."
+tools: [diagnostics]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "diagnostics-call",
+                "diagnostics",
+                serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Unavailable);
     }
 
     #[tokio::test]

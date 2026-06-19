@@ -3,11 +3,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ai_agents_core::{Tool, ToolInfo, ToolSafetyMetadata};
+use ai_agents_core::{LLMProvider, Tool, ToolInfo, ToolSafetyMetadata};
 
 use super::ToolError;
 use super::provider::{ProviderHealth, ToolProvider, ToolProviderError};
-use super::types::ToolAliases;
+use super::types::{
+    DiagnosticsProvider, DiagnosticsProviderSlot, QuestionHandler, QuestionHandlerSlot, TodoItem,
+    TodoStore, ToolAliases, UnavailableDiagnosticsProvider,
+};
 
 /// Canonical identity produced by registry resolution.
 #[derive(Debug, Clone)]
@@ -54,6 +57,14 @@ pub struct ToolRegistry {
 
     builtin_aliases: RwLock<HashMap<String, ToolAliases>>,
 
+    question_handler: QuestionHandlerSlot,
+
+    diagnostics_provider: DiagnosticsProviderSlot,
+
+    todo_store: TodoStore,
+
+    web_fetch_extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
+
     registry_version: AtomicU64,
 }
 
@@ -67,6 +78,10 @@ impl ToolRegistry {
             alias_index: RwLock::new(HashMap::new()),
             display_name_index: RwLock::new(HashMap::new()),
             builtin_aliases: RwLock::new(HashMap::new()),
+            question_handler: Arc::new(RwLock::new(None)),
+            diagnostics_provider: Arc::new(RwLock::new(Arc::new(UnavailableDiagnosticsProvider))),
+            todo_store: TodoStore::default(),
+            web_fetch_extractor: Arc::new(RwLock::new(None)),
             registry_version: AtomicU64::new(1),
         }
     }
@@ -133,6 +148,51 @@ impl ToolRegistry {
     pub fn safety_metadata(&self, id_or_alias: &str) -> Option<ToolSafetyMetadata> {
         self.resolve(id_or_alias)
             .map(|resolved| resolved.tool.safety_metadata())
+    }
+
+    /// Returns the shared question handler slot for host-bound tools.
+    pub fn question_handler_slot(&self) -> QuestionHandlerSlot {
+        Arc::clone(&self.question_handler)
+    }
+
+    /// Installs or clears the question handler used by `ask_user`.
+    pub fn set_question_handler(&self, handler: Option<Arc<dyn QuestionHandler>>) {
+        *self.question_handler.write() = handler;
+    }
+
+    /// Returns the shared diagnostics provider slot for host-bound tools.
+    pub fn diagnostics_provider_slot(&self) -> DiagnosticsProviderSlot {
+        Arc::clone(&self.diagnostics_provider)
+    }
+
+    /// Installs the diagnostics provider used by `diagnostics`.
+    pub fn set_diagnostics_provider(&self, provider: Arc<dyn DiagnosticsProvider>) {
+        *self.diagnostics_provider.write() = provider;
+    }
+
+    /// Returns whether the diagnostics provider can serve requests now.
+    pub fn diagnostics_available(&self) -> bool {
+        self.diagnostics_provider.read().is_available()
+    }
+
+    /// Returns the session-local todo store shared with `todo`.
+    pub fn todo_store(&self) -> TodoStore {
+        self.todo_store.clone()
+    }
+
+    /// Returns a snapshot of session-local todo items.
+    pub fn todos(&self) -> Vec<TodoItem> {
+        self.todo_store.list()
+    }
+
+    /// Returns the shared web-fetch extractor slot.
+    pub fn web_fetch_extractor_slot(&self) -> Arc<RwLock<Option<Arc<dyn LLMProvider>>>> {
+        Arc::clone(&self.web_fetch_extractor)
+    }
+
+    /// Installs or clears the LLM used for `web_fetch` prompt extraction.
+    pub fn set_web_fetch_extractor(&self, extractor: Option<Arc<dyn LLMProvider>>) {
+        *self.web_fetch_extractor.write() = extractor;
     }
 
     /// Resolves IDs, display names, and aliases to one canonical tool.
@@ -231,7 +291,11 @@ impl ToolRegistry {
     where
         F: FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>,
     {
-        let mapped = ToolRegistry::new();
+        let mut mapped = ToolRegistry::new();
+        mapped.question_handler = Arc::clone(&self.question_handler);
+        mapped.diagnostics_provider = Arc::clone(&self.diagnostics_provider);
+        mapped.todo_store = self.todo_store.clone();
+        mapped.web_fetch_extractor = Arc::clone(&self.web_fetch_extractor);
 
         {
             let providers = self.providers.read();

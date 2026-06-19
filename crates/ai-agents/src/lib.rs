@@ -445,11 +445,16 @@ pub mod tools {
         ToolSideEffectLevel,
     };
     pub use ai_agents_tools::{
-        CalculatorTool, ConditionEvaluator, DateTimeTool, EchoTool, EvaluationContext, FileTool,
-        JsonTool, LLMGetter, MathTool, ProviderHealth, RandomTool, ResolvedTool, SimpleLLMGetter,
-        TemplateTool, TextTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor,
-        ToolIdentity, ToolMetadata, ToolProvider, ToolProviderError, ToolProviderType,
-        ToolRegistry, TrustLevel, create_builtin_registry,
+        AskUserTool, CalculatorTool, ConditionEvaluator, DateTimeTool, DiagnosticItem,
+        DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
+        DiagnosticsResponse, DiagnosticsTool, EchoTool, EvaluationContext, FileInfoTool,
+        FileListTool, FileReadTool, FileTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool,
+        JsonTool, LLMGetter, MathTool, ProviderHealth, QuestionHandler, QuestionHandlerSlot,
+        QuestionRequest, QuestionResponse, RandomTool, ResolvedTool, SimpleLLMGetter, SleepTool,
+        StaticDiagnosticsProvider, TemplateTool, TextTool, TodoItem, TodoStatus, TodoStore,
+        TodoTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor, ToolIdentity,
+        ToolMetadata, ToolProvider, ToolProviderError, ToolProviderType, ToolRegistry, TrustLevel,
+        UnavailableDiagnosticsProvider, WebFetchTool, create_builtin_registry,
     };
     pub use ai_agents_tools::{HttpTool, generate_schema};
 }
