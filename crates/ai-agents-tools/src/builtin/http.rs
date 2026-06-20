@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ai_agents_core::{
-    ToolCallClassification, ToolOperationKind, ToolSafetyMetadata, ToolSideEffectLevel,
+    DomainPolicyBinding, ToolCallClassification, ToolExecutionContext, ToolOperationKind,
+    ToolPolicyBindings, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
 use crate::{Tool, ToolResult, generate_schema};
@@ -100,6 +101,14 @@ impl Tool for HttpTool {
         }
     }
 
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            domain_fields: vec![DomainPolicyBinding::url("url")],
+            operation_fields: vec!["method".to_string()],
+            ..Default::default()
+        }
+    }
+
     fn classify_call(&self, args: &Value) -> ToolCallClassification {
         let mut metadata = self.safety_metadata();
         let method = args
@@ -115,16 +124,21 @@ impl Tool for HttpTool {
         ToolCallClassification::from_metadata(&metadata)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: HttpInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
         };
 
-        let timeout = input
+        let timeout_ms = input
             .timeout_ms
-            .map(Duration::from_millis)
-            .unwrap_or(self.default_timeout);
+            .unwrap_or(self.default_timeout.as_millis() as u64)
+            .min(
+                ctx.limits
+                    .timeout_ms
+                    .unwrap_or(self.default_timeout.as_millis() as u64),
+            );
+        let timeout = Duration::from_millis(timeout_ms);
 
         let method = input.method.to_uppercase();
         let mut request = match method.as_str() {

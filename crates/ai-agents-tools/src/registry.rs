@@ -798,7 +798,11 @@ mod tests {
         fn input_schema(&self) -> Value {
             serde_json::json!({"type": "object"})
         }
-        async fn execute(&self, _args: Value) -> ToolResult {
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
             ToolResult::ok("test")
         }
     }

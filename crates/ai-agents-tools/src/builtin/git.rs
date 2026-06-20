@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use ai_agents_core::{
-    Tool, ToolOperationKind, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
+    PathPolicyBinding, ResultLimitBinding, ResultLimitKind, Tool, ToolExecutionContext,
+    ToolOperationKind, ToolPolicyBindings, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
 use crate::generate_schema;
@@ -123,7 +124,18 @@ impl Tool for GitStatusTool {
         vcs_metadata()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path").with_default_path(".")],
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_results",
+                ResultLimitKind::MaxResults,
+            )],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: GitStatusInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -144,7 +156,10 @@ impl Tool for GitStatusTool {
             Ok(raw) => raw,
             Err(error) => return ToolResult::error(error),
         };
-        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS);
+        let max_results = input
+            .max_results
+            .unwrap_or(DEFAULT_MAX_RESULTS)
+            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS));
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();
         let mut untracked = Vec::new();
@@ -220,7 +235,18 @@ impl Tool for GitDiffTool {
         vcs_metadata()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path").with_default_path(".")],
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_output_chars",
+                ResultLimitKind::MaxOutputChars,
+            )],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: GitDiffInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -234,7 +260,14 @@ impl Tool for GitDiffTool {
                 return ToolResult::error("Path filters cannot reference raw .git contents");
             }
         }
-        let max_output_chars = input.max_output_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
+        let max_output_chars = input
+            .max_output_chars
+            .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
+            .min(
+                ctx.limits
+                    .max_output_chars
+                    .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+            );
         let mut diff_args = vec![
             "diff",
             "--no-ext-diff",
@@ -394,7 +427,10 @@ mod tests {
         let dir = init_repo();
         std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
         let result = GitStatusTool::new()
-            .execute(serde_json::json!({"path": dir.path()}))
+            .execute(
+                serde_json::json!({"path": dir.path()}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("untracked"));
@@ -411,7 +447,10 @@ mod tests {
         run_git(dir.path(), &["commit", "-m", "initial"]).unwrap();
         std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
         let result = GitDiffTool::new()
-            .execute(serde_json::json!({"path": dir.path(), "max_output_chars": 20}))
+            .execute(
+                serde_json::json!({"path": dir.path(), "max_output_chars": 20}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("truncated"));

@@ -1,6 +1,6 @@
 use crate::event::{EventStatus, EventType, ObservationPurpose};
 use crate::manager::ObservabilityManager;
-use ai_agents_core::{AgentError, AgentResponse, KeyFact};
+use ai_agents_core::{AgentError, AgentResponse, KeyFact, ToolExecutionRecord};
 use ai_agents_hitl::{ApprovalRequest, ApprovalResult, ApprovalTrigger};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
@@ -55,8 +55,54 @@ fn approval_result_label(result: &ApprovalResult) -> &'static str {
     }
 }
 
+fn purpose_for_tool_record(record: &ToolExecutionRecord) -> ObservationPurpose {
+    match &record.source {
+        ai_agents_core::ToolCallSource::Model
+        | ai_agents_core::ToolCallSource::Manual
+        | ai_agents_core::ToolCallSource::EvalFixture
+        | ai_agents_core::ToolCallSource::Task => ObservationPurpose::MainResponse,
+        ai_agents_core::ToolCallSource::Skill { .. } => ObservationPurpose::SkillRouting,
+        ai_agents_core::ToolCallSource::StateAction { .. } => ObservationPurpose::StateAction,
+        ai_agents_core::ToolCallSource::Plan { .. } => ObservationPurpose::PlanStep,
+        ai_agents_core::ToolCallSource::Orchestration
+        | ai_agents_core::ToolCallSource::Spawner
+        | ai_agents_core::ToolCallSource::Fallback { .. } => {
+            ObservationPurpose::OrchestrationRouting
+        }
+    }
+}
+
 #[async_trait]
 impl AgentHooks for ObservabilityHooks {
+    async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
+        if !self.manager.config().latency.track_tools || record.executed {
+            return;
+        }
+        let mut tags = HashMap::new();
+        tags.insert("requested_name".to_string(), record.requested_name.clone());
+        tags.insert(
+            "policy_outcome".to_string(),
+            format!("{:?}", record.policy.outcome).to_ascii_lowercase(),
+        );
+        tags.insert("executed".to_string(), record.executed.to_string());
+        tags.insert("success".to_string(), record.success.to_string());
+        let payload = Some(serde_json::json!({
+            "call_id": record.call_id,
+            "approval_status": record.approval.as_ref().map(|approval| format!("{:?}", approval.status).to_ascii_lowercase()),
+            "policy_reason": record.policy.reason,
+        }));
+        self.manager.record_lifecycle_event(
+            EventType::ToolCall {
+                tool_id: record.canonical_id.clone(),
+            },
+            purpose_for_tool_record(record),
+            EventStatus::Skipped,
+            record.duration_ms,
+            tags,
+            payload,
+        );
+    }
+
     async fn on_state_transition(&self, from: Option<&str>, to: &str, reason: &str) {
         let mut tags = HashMap::new();
         tags.insert("reason".to_string(), reason.to_string());

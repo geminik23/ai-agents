@@ -10,7 +10,8 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use ai_agents_core::{
-    Tool, ToolOperationKind, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
+    PathPolicyBinding, ResultLimitBinding, ResultLimitKind, Tool, ToolExecutionContext,
+    ToolOperationKind, ToolPolicyBindings, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
 use crate::generate_schema;
@@ -362,7 +363,18 @@ impl Tool for GlobTool {
         read_tool_metadata(ToolOperationKind::Read)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path").with_default_path(".")],
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_results",
+                ResultLimitKind::MaxResults,
+            )],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let started = Instant::now();
         let input: GlobInput = match serde_json::from_value(args) {
             Ok(input) => input,
@@ -421,7 +433,11 @@ impl Tool for GlobTool {
         sort_paths(&mut entries, input.sort.as_deref().unwrap_or("path"));
         let total_count = entries.len();
         let offset = input.offset.unwrap_or(0);
-        let max_results = input.max_results.unwrap_or(100).min(DEFAULT_MAX_RESULTS);
+        let max_results = input
+            .max_results
+            .unwrap_or(100)
+            .min(DEFAULT_MAX_RESULTS)
+            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS));
         let paths: Vec<String> = entries
             .into_iter()
             .skip(offset)
@@ -462,7 +478,19 @@ impl Tool for GrepTool {
         read_tool_metadata(ToolOperationKind::Read)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path").with_default_path(".")],
+            result_limit_fields: vec![
+                ResultLimitBinding::new("max_results", ResultLimitKind::MaxResults),
+                ResultLimitBinding::new("max_file_size_bytes", ResultLimitKind::MaxFileSizeBytes),
+                ResultLimitBinding::new("max_output_chars", ResultLimitKind::MaxOutputChars),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: GrepInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -482,10 +510,25 @@ impl Tool for GrepTool {
         let max_results = input
             .max_results
             .unwrap_or(250)
-            .min(DEFAULT_MAX_RESULTS * 2);
+            .min(DEFAULT_MAX_RESULTS * 2)
+            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS * 2));
         let offset = input.offset.unwrap_or(0);
-        let max_file_size = input.max_file_size_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES);
-        let max_output_chars = input.max_output_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
+        let max_file_size = input
+            .max_file_size_bytes
+            .unwrap_or(DEFAULT_MAX_FILE_BYTES)
+            .min(
+                ctx.limits
+                    .max_file_size_bytes
+                    .unwrap_or(DEFAULT_MAX_FILE_BYTES),
+            );
+        let max_output_chars = input
+            .max_output_chars
+            .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
+            .min(
+                ctx.limits
+                    .max_output_chars
+                    .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+            );
         let context = input.context.unwrap_or(0).min(20);
 
         let files = collect_files(&root, include.as_ref()).await;
@@ -611,7 +654,18 @@ impl Tool for FileReadTool {
         read_tool_metadata(ToolOperationKind::Read)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path")],
+            result_limit_fields: vec![
+                ResultLimitBinding::new("max_bytes", ResultLimitKind::MaxFileSizeBytes),
+                ResultLimitBinding::new("max_lines", ResultLimitKind::MaxLines),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: FileReadInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -627,8 +681,16 @@ impl Tool for FileReadTool {
         if !metadata.is_file() {
             return ToolResult::error(format!("Not a file: {}", input.path));
         }
-        let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES);
-        let max_lines = input.max_lines.unwrap_or(DEFAULT_FILE_READ_MAX_LINES);
+        let max_bytes = input.max_bytes.unwrap_or(DEFAULT_MAX_FILE_BYTES).min(
+            ctx.limits
+                .max_file_size_bytes
+                .unwrap_or(DEFAULT_MAX_FILE_BYTES),
+        );
+        let max_lines = input.max_lines.unwrap_or(DEFAULT_FILE_READ_MAX_LINES).min(
+            ctx.limits
+                .max_results
+                .unwrap_or(DEFAULT_FILE_READ_MAX_LINES),
+        );
         let has_range = input.start_line.is_some() || input.end_line.is_some();
         let large_file = metadata.len() > max_bytes;
         let start_line = input.start_line.unwrap_or(1).max(1);
@@ -690,7 +752,18 @@ impl Tool for FileListTool {
         read_tool_metadata(ToolOperationKind::Read)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path")],
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_results",
+                ResultLimitKind::MaxResults,
+            )],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: FileListInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -798,7 +871,8 @@ impl Tool for FileListTool {
         let max_results = input
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
-            .min(DEFAULT_MAX_RESULTS * 5);
+            .min(DEFAULT_MAX_RESULTS * 5)
+            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS * 5));
         let entries: Vec<FileListEntry> =
             entries.into_iter().skip(offset).take(max_results).collect();
         notes.sort();
@@ -838,7 +912,14 @@ impl Tool for FileInfoTool {
         read_tool_metadata(ToolOperationKind::Read)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path")],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
         let input: FileInfoInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -1321,12 +1402,15 @@ mod tests {
         fs::create_dir(dir.path().join("target")).unwrap();
         fs::write(dir.path().join("target/ignored.rs"), "").unwrap();
         let result = GlobTool::new()
-            .execute(serde_json::json!({
-                "pattern": "*.rs",
-                "path": dir.path(),
-                "max_results": 1,
-                "offset": 1
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "*.rs",
+                    "path": dir.path(),
+                    "max_results": 1,
+                    "offset": 1
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -1340,14 +1424,17 @@ mod tests {
         fs::write(dir.path().join("one.txt"), "alpha\nbeta\n").unwrap();
         fs::write(dir.path().join("two.txt"), "alpha\ngamma\n").unwrap();
         let result = GrepTool::new()
-            .execute(serde_json::json!({
-                "pattern": "alpha",
-                "mode": "literal",
-                "path": dir.path(),
-                "output_mode": "content",
-                "max_results": 1,
-                "offset": 1
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "alpha",
+                    "mode": "literal",
+                    "path": dir.path(),
+                    "output_mode": "content",
+                    "max_results": 1,
+                    "offset": 1
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -1360,10 +1447,13 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("bad.bin"), b"a\0b").unwrap();
         let result = GrepTool::new()
-            .execute(serde_json::json!({
-                "pattern": "a",
-                "path": dir.path()
-            }))
+            .execute(
+                serde_json::json!({
+                    "pattern": "a",
+                    "path": dir.path()
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -1376,11 +1466,14 @@ mod tests {
         let path = dir.path().join("unicode.txt");
         fs::write(&path, "one\n안녕\nthree\n").unwrap();
         let result = FileReadTool::new()
-            .execute(serde_json::json!({
-                "path": path,
-                "start_line": 2,
-                "end_line": 2
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": path,
+                    "start_line": 2,
+                    "end_line": 2
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -1394,10 +1487,13 @@ mod tests {
         let path = dir.path().join("large.txt");
         fs::write(&path, "abcdef").unwrap();
         let result = FileReadTool::new()
-            .execute(serde_json::json!({
-                "path": path,
-                "max_bytes": 2
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": path,
+                    "max_bytes": 2
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -1413,12 +1509,15 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/", dir.path().join("escape")).unwrap();
         let result = FileListTool::new()
-            .execute(serde_json::json!({
-                "path": dir.path(),
-                "recursive": true,
-                "max_results": 1,
-                "offset": 1
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": dir.path(),
+                    "recursive": true,
+                    "max_results": 1,
+                    "offset": 1
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -1436,10 +1535,13 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&target, &link).unwrap();
         let result = FileInfoTool::new()
-            .execute(serde_json::json!({
-                "path": link,
-                "follow_symlinks": true
-            }))
+            .execute(
+                serde_json::json!({
+                    "path": link,
+                    "follow_symlinks": true
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);

@@ -63,7 +63,7 @@ impl Tool for RouteToAgentTool {
         generate_schema::<RouteToAgentInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input = match args.get("input").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return ToolResult::error("missing required field: input"),
@@ -156,7 +156,7 @@ impl Tool for PipelineProcessTool {
         generate_schema::<PipelineProcessInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input = match args.get("input").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return ToolResult::error("missing required field: input"),
@@ -259,7 +259,7 @@ impl Tool for ConcurrentAskTool {
         generate_schema::<ConcurrentAskInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let question = match args.get("question").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return ToolResult::error("missing required field: question"),
@@ -379,7 +379,7 @@ impl Tool for GroupDiscussionTool {
         generate_schema::<GroupDiscussionInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let topic = match args.get("topic").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return ToolResult::error("missing required field: topic"),
@@ -503,7 +503,7 @@ impl Tool for HandoffConversationTool {
         generate_schema::<HandoffConversationInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input = match args.get("input").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return ToolResult::error("missing required field: input"),

@@ -90,6 +90,12 @@ pub struct ToolPolicyConfig {
     /// Maximum redirect count for network tools.
     #[serde(default)]
     pub max_redirects: Option<usize>,
+    /// Maximum files a mutation tool may change.
+    #[serde(default)]
+    pub max_changed_files: Option<usize>,
+    /// Maximum changed lines a mutation tool may produce.
+    #[serde(default)]
+    pub max_changed_lines: Option<usize>,
     /// Parsed domain policy.
     #[serde(default)]
     pub domains: DomainPolicyConfig,
@@ -102,6 +108,9 @@ pub struct ToolPolicyConfig {
     /// Operation policy based on arguments such as operation, function, or method.
     #[serde(default)]
     pub operations: OperationPolicyConfig,
+    /// Custom tool settings exposed through ToolExecutionContext.custom_config.
+    #[serde(default)]
+    pub config: HashMap<String, serde_json::Value>,
 }
 
 impl Default for ToolPolicyConfig {
@@ -126,10 +135,13 @@ impl Default for ToolPolicyConfig {
             allowed_schemes: Vec::new(),
             allowed_ports: Vec::new(),
             max_redirects: None,
+            max_changed_files: None,
+            max_changed_lines: None,
             domains: DomainPolicyConfig::default(),
             paths: PathPolicyConfig::default(),
             commands: CommandPolicyConfig::default(),
             operations: OperationPolicyConfig::default(),
+            config: HashMap::new(),
         }
     }
 }

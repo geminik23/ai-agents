@@ -50,7 +50,7 @@ impl Tool for UnitConverterTool {
 
     fn input_schema(&self) -> Value { generate_schema::<ConvertInput>() }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
         let input: ConvertInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),

@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::sync::Arc;
 
 use super::types::{ToolAliases, ToolMetadata, ToolProviderType};
-use super::{Tool, ToolResult};
+use super::{Tool, ToolExecutionContext, ToolPolicyBindings, ToolResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDescriptor {
@@ -16,6 +16,9 @@ pub struct ToolDescriptor {
     pub aliases: Option<ToolAliases>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ToolMetadata>,
+    /// Policy bindings supplied by provider descriptors when available.
+    #[serde(default)]
+    pub policy_bindings: ToolPolicyBindings,
 }
 
 impl ToolDescriptor {
@@ -32,6 +35,7 @@ impl ToolDescriptor {
             input_schema,
             aliases: None,
             metadata: None,
+            policy_bindings: ToolPolicyBindings::default(),
         }
     }
 
@@ -42,6 +46,12 @@ impl ToolDescriptor {
 
     pub fn with_metadata(mut self, metadata: ToolMetadata) -> Self {
         self.metadata = Some(metadata);
+        self
+    }
+
+    /// Attach policy bindings advertised by the provider.
+    pub fn with_policy_bindings(mut self, bindings: ToolPolicyBindings) -> Self {
+        self.policy_bindings = bindings;
         self
     }
 
@@ -139,9 +149,14 @@ pub trait ToolProvider: Send + Sync {
 
     async fn get_tool(&self, tool_id: &str) -> Option<Arc<dyn Tool>>;
 
-    async fn execute(&self, tool_id: &str, args: Value) -> Result<ToolResult, ToolProviderError> {
+    async fn execute(
+        &self,
+        tool_id: &str,
+        args: Value,
+        ctx: ToolExecutionContext,
+    ) -> Result<ToolResult, ToolProviderError> {
         if let Some(tool) = self.get_tool(tool_id).await {
-            Ok(tool.execute(args).await)
+            Ok(tool.execute(args, ctx).await)
         } else {
             Err(ToolProviderError::ToolNotFound(tool_id.to_string()))
         }

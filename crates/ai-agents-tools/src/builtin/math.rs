@@ -119,7 +119,7 @@ impl Tool for MathTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: MathInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -551,10 +551,13 @@ mod tests {
     async fn test_mean() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "mean",
-                "values": [1, 2, 3, 4, 5]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "mean",
+                    "values": [1, 2, 3, 4, 5]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StatOutput = serde_json::from_str(&result.output).unwrap();
@@ -565,10 +568,13 @@ mod tests {
     async fn test_median_odd() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "median",
-                "values": [1, 3, 2, 5, 4]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "median",
+                    "values": [1, 3, 2, 5, 4]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StatOutput = serde_json::from_str(&result.output).unwrap();
@@ -579,10 +585,13 @@ mod tests {
     async fn test_median_even() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "median",
-                "values": [1, 2, 3, 4]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "median",
+                    "values": [1, 2, 3, 4]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StatOutput = serde_json::from_str(&result.output).unwrap();
@@ -593,10 +602,13 @@ mod tests {
     async fn test_stdev() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "stdev",
-                "values": [2, 4, 4, 4, 5, 5, 7, 9]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "stdev",
+                    "values": [2, 4, 4, 4, 5, 5, 7, 9]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StdevOutput = serde_json::from_str(&result.output).unwrap();
@@ -607,10 +619,13 @@ mod tests {
     async fn test_sum() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "sum",
-                "values": [1, 2, 3, 4, 5]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "sum",
+                    "values": [1, 2, 3, 4, 5]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StatOutput = serde_json::from_str(&result.output).unwrap();
@@ -621,10 +636,13 @@ mod tests {
     async fn test_minmax() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "minmax",
-                "values": [3, 1, 4, 1, 5, 9, 2, 6]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "minmax",
+                    "values": [3, 1, 4, 1, 5, 9, 2, 6]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: MinMaxOutput = serde_json::from_str(&result.output).unwrap();
@@ -637,11 +655,14 @@ mod tests {
     async fn test_round() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "round",
-                "value": 3.14159,
-                "decimals": 2
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "round",
+                    "value": 3.14159,
+                    "decimals": 2
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: SingleOutput = serde_json::from_str(&result.output).unwrap();
@@ -652,12 +673,15 @@ mod tests {
     async fn test_clamp() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "clamp",
-                "value": 15,
-                "min": 0,
-                "max": 10
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "clamp",
+                    "value": 15,
+                    "min": 0,
+                    "max": 10
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: ClampOutput = serde_json::from_str(&result.output).unwrap();
@@ -669,11 +693,14 @@ mod tests {
     async fn test_percentage() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "percentage",
-                "value": 25,
-                "total": 100
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "percentage",
+                    "value": 25,
+                    "total": 100
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: SingleOutput = serde_json::from_str(&result.output).unwrap();
@@ -684,10 +711,13 @@ mod tests {
     async fn test_sqrt() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "sqrt",
-                "value": 16
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "sqrt",
+                    "value": 16
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: SingleOutput = serde_json::from_str(&result.output).unwrap();
@@ -698,11 +728,14 @@ mod tests {
     async fn test_pow() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "pow",
-                "value": 2,
-                "exponent": 10
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "pow",
+                    "value": 2,
+                    "exponent": 10
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: SingleOutput = serde_json::from_str(&result.output).unwrap();
@@ -713,12 +746,15 @@ mod tests {
     async fn test_range() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "range",
-                "min": 0,
-                "max": 5,
-                "step": 1
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "range",
+                    "min": 0,
+                    "max": 5,
+                    "step": 1
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: RangeOutput = serde_json::from_str(&result.output).unwrap();
@@ -729,9 +765,12 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "invalid"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "invalid"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -740,10 +779,13 @@ mod tests {
     async fn test_empty_values() {
         let tool = MathTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "mean",
-                "values": []
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "mean",
+                    "values": []
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

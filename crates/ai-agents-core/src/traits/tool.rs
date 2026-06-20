@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 use crate::Result;
 use crate::types::{
-    ToolCallClassification, ToolExecutionRecord, ToolExecutionRequest, ToolSafetyMetadata,
+    ToolCallClassification, ToolExecutionContext, ToolExecutionRecord, ToolExecutionRequest,
+    ToolPolicyBindings, ToolSafetyMetadata,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +59,9 @@ pub struct ToolInfo {
     /// Safety metadata used by the runtime executor.
     #[serde(default)]
     pub safety: ToolSafetyMetadata,
+    /// Policy bindings declared by the tool.
+    #[serde(default)]
+    pub policy_bindings: ToolPolicyBindings,
 }
 
 /// Core tool trait for external capabilities.
@@ -76,8 +80,13 @@ pub trait Tool: Send + Sync {
     /// JSON Schema describing expected input arguments.
     fn input_schema(&self) -> Value;
 
-    /// Execute the tool with the given arguments and return a result.
-    async fn execute(&self, args: Value) -> ToolResult;
+    /// Execute the tool with arguments and executor context.
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult;
+
+    /// Policy bindings used by the shared executor to apply configured policy.
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings::default()
+    }
 
     /// Safety metadata used by runtime policy, scheduling, and observability.
     fn safety_metadata(&self) -> ToolSafetyMetadata {
@@ -97,6 +106,7 @@ pub trait Tool: Send + Sync {
             description: self.description().to_string(),
             input_schema: self.input_schema(),
             safety: self.safety_metadata(),
+            policy_bindings: self.policy_bindings(),
         }
     }
 }

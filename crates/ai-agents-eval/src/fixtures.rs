@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 
 use ai_agents_core::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
-    ToolResult,
+    ToolExecutionContext, ToolPolicyBindings, ToolResult,
 };
 use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
 use ai_agents_llm::{FinishReason, LLMRegistry};
@@ -102,6 +102,9 @@ pub struct LlmFixtureConfig {
     /// Per-LLM alias errors for deterministic failure-path evals.
     #[serde(default)]
     pub errors_by_alias: HashMap<String, String>,
+    /// Per-LLM alias delay in milliseconds for deterministic branch ordering.
+    #[serde(default)]
+    pub delays_by_alias: HashMap<String, u64>,
 }
 
 /// LLM fixture strategy used while building eval providers.
@@ -179,6 +182,30 @@ pub struct RecordingToolLog {
     inner: Arc<Mutex<Vec<ToolExecutionRecord>>>,
 }
 
+impl From<&ai_agents_core::ToolCallSource> for ToolExecutionSource {
+    fn from(source: &ai_agents_core::ToolCallSource) -> Self {
+        match source {
+            ai_agents_core::ToolCallSource::Model => Self::Llm,
+            ai_agents_core::ToolCallSource::Skill { .. } => Self::Skill,
+            ai_agents_core::ToolCallSource::StateAction { .. } => Self::StateAction,
+            ai_agents_core::ToolCallSource::Orchestration => Self::Orchestration,
+            ai_agents_core::ToolCallSource::Spawner => Self::Spawner,
+            ai_agents_core::ToolCallSource::EvalFixture => Self::Mock,
+            ai_agents_core::ToolCallSource::Plan { .. }
+            | ai_agents_core::ToolCallSource::Fallback { .. }
+            | ai_agents_core::ToolCallSource::Task
+            | ai_agents_core::ToolCallSource::Manual => Self::Llm,
+        }
+    }
+}
+
+fn state_from_source(source: &ai_agents_core::ToolCallSource) -> Option<String> {
+    match source {
+        ai_agents_core::ToolCallSource::StateAction { state, .. } => state.clone(),
+        _ => None,
+    }
+}
+
 impl RecordingToolLog {
     pub fn new() -> Self {
         Self::default()
@@ -190,6 +217,42 @@ impl RecordingToolLog {
 
     pub fn push(&self, record: ToolExecutionRecord) {
         self.inner.lock().push(record);
+    }
+
+    /// Record evidence produced by the shared runtime executor.
+    pub fn push_executor_record(&self, record: &ai_agents_core::ToolExecutionRecord) {
+        let output = record.success.then(|| {
+            serde_json::from_str(&record.output).unwrap_or(Value::String(record.output.clone()))
+        });
+        let mut metadata = record.metadata.clone();
+        metadata.insert("executed".to_string(), Value::Bool(record.executed));
+        metadata.insert(
+            "policy".to_string(),
+            serde_json::to_value(&record.policy).unwrap_or(Value::Null),
+        );
+        metadata.insert(
+            "approval".to_string(),
+            serde_json::to_value(&record.approval).unwrap_or(Value::Null),
+        );
+        metadata.insert("timed_out".to_string(), Value::Bool(record.timed_out));
+        metadata.insert("cancelled".to_string(), Value::Bool(record.cancelled));
+        self.push(ToolExecutionRecord {
+            call_id: record.call_id.clone(),
+            tool_id: record.canonical_id.clone(),
+            requested_name: record.requested_name.clone(),
+            source: ToolExecutionSource::from(&record.source),
+            state: state_from_source(&record.source),
+            actor_id: None,
+            arguments_original: record.arguments.clone(),
+            arguments_executed: record.executed_arguments.clone(),
+            success: record.success,
+            output,
+            error: (!record.success).then_some(record.output.clone()),
+            metadata: Some(serde_json::to_value(metadata).unwrap_or(Value::Null)),
+            started_at: record.started_at,
+            duration_ms: record.duration_ms,
+            observability_span_id: None,
+        });
     }
 
     pub fn records_since(&self, index: usize) -> Vec<ToolExecutionRecord> {
@@ -421,7 +484,11 @@ impl Tool for MockTool {
         serde_json::json!({"type": "object"})
     }
 
-    async fn execute(&self, _args: Value) -> ToolResult {
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ToolResult {
         let output = if self.config.output.is_string() {
             self.config.output.as_str().unwrap_or_default().to_string()
         } else {
@@ -439,15 +506,11 @@ impl Tool for MockTool {
 struct RecordingTool {
     /// Wrapped implementation or shared storage.
     inner: Arc<dyn Tool>,
-    /// Shared log receiving execution records.
-    log: RecordingToolLog,
-    /// Source category assigned to this execution.
-    source: ToolExecutionSource,
 }
 
 impl RecordingTool {
-    fn new(inner: Arc<dyn Tool>, log: RecordingToolLog, source: ToolExecutionSource) -> Self {
-        Self { inner, log, source }
+    fn new(inner: Arc<dyn Tool>, _log: RecordingToolLog, _source: ToolExecutionSource) -> Self {
+        Self { inner }
     }
 }
 
@@ -477,34 +540,12 @@ impl Tool for RecordingTool {
         self.inner.classify_call(args)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
-        let started_at = chrono::Utc::now();
-        let start = Instant::now();
-        let result = self.inner.execute(args.clone()).await;
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let output =
-            serde_json::from_str(&result.output).unwrap_or(Value::String(result.output.clone()));
-        self.log.push(ToolExecutionRecord {
-            call_id: uuid::Uuid::new_v4().to_string(),
-            tool_id: self.inner.id().to_string(),
-            requested_name: self.inner.name().to_string(),
-            source: self.source.clone(),
-            state: None,
-            actor_id: None,
-            arguments_original: args.clone(),
-            arguments_executed: args,
-            success: result.success,
-            output: result.success.then_some(output),
-            error: (!result.success).then_some(result.output.clone()),
-            metadata: result
-                .metadata
-                .clone()
-                .map(|m| serde_json::to_value(m).unwrap_or(Value::Null)),
-            started_at,
-            duration_ms,
-            observability_span_id: None,
-        });
-        result
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        self.inner.policy_bindings()
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
+        self.inner.execute(args, ctx).await
     }
 }
 
@@ -532,17 +573,20 @@ pub fn build_llm_registry(
     for (alias, config) in aliases {
         let fixture_responses = load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
         let fixture_error = fixtures.errors_by_alias.get(&alias).cloned();
+        let fixture_delay_ms = fixtures.delays_by_alias.get(&alias).copied().unwrap_or(0);
         let provider = match fixtures.mode {
             LlmFixtureMode::Mock => Arc::new(SequenceLLMProvider::new(
                 alias.clone(),
                 fixture_responses.clone(),
                 fixture_error,
+                fixture_delay_ms,
             )) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Replay => Arc::new(ReplayLLMProvider::new(
                 alias.clone(),
                 config.model.clone(),
                 cassette_records.clone(),
                 fixture_responses.clone(),
+                fixture_delay_ms,
             )) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Real => build_real_provider(&config)?,
             LlmFixtureMode::Record => {
@@ -691,6 +735,8 @@ struct SequenceLLMProvider {
     index: Arc<Mutex<usize>>,
     /// Optional deterministic provider error.
     error: Option<String>,
+    /// Fixed delay before returning a response.
+    delay_ms: u64,
 }
 
 /// LLM provider replaying cassette records by request hash.
@@ -703,14 +749,28 @@ struct ReplayLLMProvider {
     records: Arc<Vec<CassetteRecord>>,
     /// Ordered text responses used by mock mode and fallback replay.
     responses: SequenceLLMProvider,
+    /// Fixed delay before returning a replayed response.
+    delay_ms: u64,
 }
 
 impl SequenceLLMProvider {
-    fn new(_name: String, responses: Vec<LLMResponse>, error: Option<String>) -> Self {
+    fn new(
+        _name: String,
+        responses: Vec<LLMResponse>,
+        error: Option<String>,
+        delay_ms: u64,
+    ) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses)),
             index: Arc::new(Mutex::new(0)),
             error,
+            delay_ms,
+        }
+    }
+
+    async fn wait_if_configured(&self) {
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         }
     }
 
@@ -735,12 +795,25 @@ impl ReplayLLMProvider {
         model: String,
         records: Vec<CassetteRecord>,
         fallback: Vec<LLMResponse>,
+        delay_ms: u64,
     ) -> Self {
         Self {
             alias,
             model,
             records: Arc::new(records),
-            responses: SequenceLLMProvider::new("replay-fallback".to_string(), fallback, None),
+            responses: SequenceLLMProvider::new(
+                "replay-fallback".to_string(),
+                fallback,
+                None,
+                delay_ms,
+            ),
+            delay_ms,
+        }
+    }
+
+    async fn wait_if_configured(&self) {
+        if self.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(self.delay_ms)).await;
         }
     }
 
@@ -764,6 +837,7 @@ impl LLMProvider for ReplayLLMProvider {
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> std::result::Result<LLMResponse, LLMError> {
+        self.wait_if_configured().await;
         Ok(self.response_for(messages, config))
     }
 
@@ -775,6 +849,7 @@ impl LLMProvider for ReplayLLMProvider {
         Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
         LLMError,
     > {
+        self.wait_if_configured().await;
         let response = self.response_for(messages, config);
         Ok(Box::new(futures::stream::iter(chunks_from_response(
             response,
@@ -797,6 +872,7 @@ impl LLMProvider for SequenceLLMProvider {
         _messages: &[ChatMessage],
         _config: Option<&LLMConfig>,
     ) -> std::result::Result<LLMResponse, LLMError> {
+        self.wait_if_configured().await;
         if let Some(error) = &self.error {
             return Err(LLMError::API {
                 message: error.clone(),
@@ -814,6 +890,7 @@ impl LLMProvider for SequenceLLMProvider {
         Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
         LLMError,
     > {
+        self.wait_if_configured().await;
         if let Some(error) = &self.error {
             return Err(LLMError::API {
                 message: error.clone(),

@@ -9,9 +9,12 @@ pub mod security;
 mod types;
 
 pub use ai_agents_core::{
-    PermissionOutcome, Tool, ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification,
-    ToolCallSource, ToolExecutionRecord, ToolExecutionRequest, ToolInfo, ToolInvoker,
-    ToolOperationKind, ToolPolicyDecisionRecord, ToolResult, ToolSafetyMetadata,
+    CommandBindingKind, CommandPolicyBinding, DomainPolicyBinding, PathAccessMode, PathBindingKind,
+    PathPolicyBinding, PermissionOutcome, ResultLimitBinding, ResultLimitKind, Tool,
+    ToolActorContext, ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification,
+    ToolCallSource, ToolCancellationToken, ToolExecutionContext, ToolExecutionLimits,
+    ToolExecutionRecord, ToolExecutionRequest, ToolInfo, ToolInvoker, ToolOperationKind,
+    ToolPolicyBindings, ToolPolicyDecisionRecord, ToolResult, ToolSafetyMetadata,
     ToolSideEffectLevel,
 };
 pub use condition::{

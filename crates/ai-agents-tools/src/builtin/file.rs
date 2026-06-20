@@ -7,8 +7,8 @@ use std::path::Path;
 
 use crate::generate_schema;
 use ai_agents_core::{
-    Tool, ToolCallClassification, ToolOperationKind, ToolResult, ToolSafetyMetadata,
-    ToolSideEffectLevel,
+    PathPolicyBinding, Tool, ToolCallClassification, ToolExecutionContext, ToolOperationKind,
+    ToolPolicyBindings, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
 pub struct FileTool;
@@ -139,6 +139,14 @@ impl Tool for FileTool {
         }
     }
 
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read_write("path")],
+            operation_fields: vec!["operation".to_string()],
+            ..Default::default()
+        }
+    }
+
     fn classify_call(&self, args: &Value) -> ToolCallClassification {
         let operation = args
             .get("operation")
@@ -172,7 +180,7 @@ impl Tool for FileTool {
         ToolCallClassification::from_metadata(&metadata)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
         let input: FileInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -466,19 +474,25 @@ mod tests {
         let tool = FileTool::new();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "write",
-                "path": path_str,
-                "content": "hello world"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "write",
+                    "path": path_str,
+                    "content": "hello world"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "read",
-                "path": path_str
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "read",
+                    "path": path_str
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("hello world"));
@@ -491,18 +505,24 @@ mod tests {
         let path_str = file_path.to_str().unwrap();
         let tool = FileTool::new();
 
-        tool.execute(serde_json::json!({
-            "operation": "write",
-            "path": path_str,
-            "content": "line1\n"
-        }))
+        tool.execute(
+            serde_json::json!({
+                "operation": "write",
+                "path": path_str,
+                "content": "line1\n"
+            }),
+            ai_agents_core::ToolExecutionContext::test("test"),
+        )
         .await;
 
-        tool.execute(serde_json::json!({
-            "operation": "append",
-            "path": path_str,
-            "content": "line2\n"
-        }))
+        tool.execute(
+            serde_json::json!({
+                "operation": "append",
+                "path": path_str,
+                "content": "line2\n"
+            }),
+            ai_agents_core::ToolExecutionContext::test("test"),
+        )
         .await;
 
         let content = fs::read_to_string(&file_path).unwrap();
@@ -518,10 +538,13 @@ mod tests {
         let tool = FileTool::new();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "exists",
-                "path": path_str
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "exists",
+                    "path": path_str
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("\"exists\":false"));
@@ -529,10 +552,13 @@ mod tests {
         fs::write(&file_path, "test").unwrap();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "exists",
-                "path": path_str
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "exists",
+                    "path": path_str
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("\"exists\":true"));
@@ -549,10 +575,13 @@ mod tests {
         assert!(file_path.exists());
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "delete",
-                "path": path_str
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "delete",
+                    "path": path_str
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(!file_path.exists());
@@ -568,20 +597,26 @@ mod tests {
         fs::write(dir.path().join("c.txt"), "c").unwrap();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "list",
-                "path": dir.path().to_str().unwrap()
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "list",
+                    "path": dir.path().to_str().unwrap()
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("\"count\":3"));
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "list",
-                "path": dir.path().to_str().unwrap(),
-                "pattern": "*.txt"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "list",
+                    "path": dir.path().to_str().unwrap(),
+                    "pattern": "*.txt"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("\"count\":2"));
@@ -594,10 +629,13 @@ mod tests {
         let tool = FileTool::new();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "mkdir",
-                "path": new_dir.to_str().unwrap()
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "mkdir",
+                    "path": new_dir.to_str().unwrap()
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(new_dir.exists());
@@ -612,10 +650,13 @@ mod tests {
         fs::write(&file_path, "test content").unwrap();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "info",
-                "path": file_path.to_str().unwrap()
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "info",
+                    "path": file_path.to_str().unwrap()
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("\"is_file\":true"));
@@ -626,10 +667,13 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = FileTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "invalid",
-                "path": "/tmp/test"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "invalid",
+                    "path": "/tmp/test"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -638,10 +682,13 @@ mod tests {
     async fn test_git_paths_are_blocked() {
         let tool = FileTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "read",
-                "path": ".git/config"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "read",
+                    "path": ".git/config"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
         assert!(result.output.contains("git_status") || result.output.contains("git_diff"));

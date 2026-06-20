@@ -57,7 +57,7 @@ impl Tool for CalculatorTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: CalculatorInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -95,12 +95,18 @@ mod tests {
         let calc = CalculatorTool::new();
 
         let result = calc
-            .execute(serde_json::json!({"expression": "2 + 3"}))
+            .execute(
+                serde_json::json!({"expression": "2 + 3"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
         let result = calc
-            .execute(serde_json::json!({"expression": "10 * 5"}))
+            .execute(
+                serde_json::json!({"expression": "10 * 5"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
     }
@@ -109,7 +115,10 @@ mod tests {
     async fn test_operator_precedence() {
         let calc = CalculatorTool::new();
         let result = calc
-            .execute(serde_json::json!({"expression": "2 + 3 * 4"}))
+            .execute(
+                serde_json::json!({"expression": "2 + 3 * 4"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -121,7 +130,10 @@ mod tests {
     async fn test_parentheses() {
         let calc = CalculatorTool::new();
         let result = calc
-            .execute(serde_json::json!({"expression": "(2 + 3) * 4"}))
+            .execute(
+                serde_json::json!({"expression": "(2 + 3) * 4"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -132,7 +144,12 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_expression() {
         let calc = CalculatorTool::new();
-        let result = calc.execute(serde_json::json!({"expression": "2 +"})).await;
+        let result = calc
+            .execute(
+                serde_json::json!({"expression": "2 +"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
+            .await;
         assert!(!result.success);
     }
 
@@ -140,7 +157,10 @@ mod tests {
     async fn test_invalid_input() {
         let calc = CalculatorTool::new();
         let result = calc
-            .execute(serde_json::json!({"wrong_field": "test"}))
+            .execute(
+                serde_json::json!({"wrong_field": "test"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

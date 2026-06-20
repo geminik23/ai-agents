@@ -59,7 +59,7 @@ impl Tool for PersonaEvolveTool {
         serde_json::to_value(schema).unwrap_or_default()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let field = match args.get("field").and_then(|v| v.as_str()) {
             Some(f) => f,
             None => {
@@ -174,7 +174,9 @@ mod tests {
             "reason": "Gained confidence in battle"
         });
 
-        let result = tool.execute(args).await;
+        let result = tool
+            .execute(args, ai_agents_core::ToolExecutionContext::test("test"))
+            .await;
         assert!(result.success);
         assert!(result.output.contains("updated successfully"));
 
@@ -201,7 +203,9 @@ mod tests {
             "reason": "Testing"
         });
 
-        let result = tool.execute(args).await;
+        let result = tool
+            .execute(args, ai_agents_core::ToolExecutionContext::test("test"))
+            .await;
         assert!(!result.success);
         assert!(result.output.contains("not in persona mutable_fields"));
     }
@@ -215,7 +219,9 @@ mod tests {
             "reason": "Testing"
         });
 
-        let result = tool.execute(args).await;
+        let result = tool
+            .execute(args, ai_agents_core::ToolExecutionContext::test("test"))
+            .await;
         assert!(!result.success);
         assert!(result.output.contains("'field' parameter is required"));
     }
@@ -229,7 +235,9 @@ mod tests {
             "reason": "Testing"
         });
 
-        let result = tool.execute(args).await;
+        let result = tool
+            .execute(args, ai_agents_core::ToolExecutionContext::test("test"))
+            .await;
         assert!(!result.success);
         assert!(result.output.contains("'value' parameter is required"));
     }
@@ -244,7 +252,9 @@ mod tests {
             "reason": "Trying to cheat"
         });
 
-        let result = tool.execute(args).await;
+        let result = tool
+            .execute(args, ai_agents_core::ToolExecutionContext::test("test"))
+            .await;
         assert!(!result.success);
     }
 

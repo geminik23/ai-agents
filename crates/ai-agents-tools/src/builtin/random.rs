@@ -109,7 +109,7 @@ impl Tool for RandomTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: RandomInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -260,7 +260,12 @@ mod tests {
     #[tokio::test]
     async fn test_uuid() {
         let tool = RandomTool::new();
-        let result = tool.execute(serde_json::json!({"operation": "uuid"})).await;
+        let result = tool
+            .execute(
+                serde_json::json!({"operation": "uuid"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
+            .await;
         assert!(result.success);
 
         let output: UuidOutput = serde_json::from_str(&result.output).unwrap();
@@ -272,11 +277,14 @@ mod tests {
     async fn test_number() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "number",
-                "min": 10.0,
-                "max": 20.0
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "number",
+                    "min": 10.0,
+                    "max": 20.0
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -288,11 +296,14 @@ mod tests {
     async fn test_number_invalid_range() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "number",
-                "min": 20.0,
-                "max": 10.0
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "number",
+                    "min": 20.0,
+                    "max": 10.0
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -301,11 +312,14 @@ mod tests {
     async fn test_integer() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "integer",
-                "min": 1,
-                "max": 10
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "integer",
+                    "min": 1,
+                    "max": 10
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -317,11 +331,14 @@ mod tests {
     async fn test_choice() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "choice",
-                "items": ["a", "b", "c", "d"],
-                "count": 2
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "choice",
+                    "items": ["a", "b", "c", "d"],
+                    "count": 2
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -334,10 +351,13 @@ mod tests {
     async fn test_choice_single() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "choice",
-                "items": [1, 2, 3]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "choice",
+                    "items": [1, 2, 3]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -349,10 +369,13 @@ mod tests {
     async fn test_choice_empty() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "choice",
-                "items": []
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "choice",
+                    "items": []
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -361,10 +384,13 @@ mod tests {
     async fn test_shuffle() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "shuffle",
-                "items": [1, 2, 3, 4, 5]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "shuffle",
+                    "items": [1, 2, 3, 4, 5]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -375,7 +401,12 @@ mod tests {
     #[tokio::test]
     async fn test_bool() {
         let tool = RandomTool::new();
-        let result = tool.execute(serde_json::json!({"operation": "bool"})).await;
+        let result = tool
+            .execute(
+                serde_json::json!({"operation": "bool"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
+            .await;
         assert!(result.success);
 
         let output: BoolOutput = serde_json::from_str(&result.output).unwrap();
@@ -386,7 +417,10 @@ mod tests {
     async fn test_string_default() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({"operation": "string"}))
+            .execute(
+                serde_json::json!({"operation": "string"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -399,11 +433,14 @@ mod tests {
     async fn test_string_hex() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "string",
-                "length": 8,
-                "charset": "hex"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "string",
+                    "length": 8,
+                    "charset": "hex"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -416,11 +453,14 @@ mod tests {
     async fn test_string_numeric() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "string",
-                "length": 10,
-                "charset": "numeric"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "string",
+                    "length": 10,
+                    "charset": "numeric"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -432,7 +472,10 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = RandomTool::new();
         let result = tool
-            .execute(serde_json::json!({"operation": "invalid"}))
+            .execute(
+                serde_json::json!({"operation": "invalid"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

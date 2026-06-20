@@ -116,7 +116,7 @@ impl Tool for GenerateAgentTool {
         generate_schema::<GenerateAgentInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let description = match args.get("description").and_then(|v| v.as_str()) {
             Some(d) => d,
             None => return ToolResult::error("missing required field: description"),
@@ -329,7 +329,7 @@ impl Tool for SendMessageTool {
         generate_schema::<SendMessageInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let to = match args.get("to").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => return ToolResult::error("missing required field: to"),
@@ -392,7 +392,11 @@ impl Tool for ListAgentsTool {
         generate_schema::<ListAgentsInput>()
     }
 
-    async fn execute(&self, _args: Value) -> ToolResult {
+    async fn execute(
+        &self,
+        _args: Value,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ToolResult {
         let agents = self.registry.list();
         match serde_json::to_string(&agents) {
             Ok(json) => ToolResult::ok(json),
@@ -451,7 +455,7 @@ impl Tool for RemoveAgentTool {
         generate_schema::<RemoveAgentInput>()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let id = match args.get("id").and_then(|v| v.as_str()) {
             Some(i) => i,
             None => return ToolResult::error("missing required field: id"),

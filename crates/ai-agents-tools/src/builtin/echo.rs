@@ -54,7 +54,7 @@ impl Tool for EchoTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: EchoInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -80,7 +80,10 @@ mod tests {
     async fn test_echo() {
         let echo = EchoTool::new();
         let result = echo
-            .execute(serde_json::json!({"message": "Hello, world!"}))
+            .execute(
+                serde_json::json!({"message": "Hello, world!"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
 
         assert!(result.success);
@@ -93,7 +96,10 @@ mod tests {
     async fn test_invalid_input() {
         let echo = EchoTool::new();
         let result = echo
-            .execute(serde_json::json!({"wrong_field": "test"}))
+            .execute(
+                serde_json::json!({"wrong_field": "test"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

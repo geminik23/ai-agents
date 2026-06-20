@@ -15,8 +15,9 @@ use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
 use ai_agents_core::{
     AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMProvider, LLMResponse,
-    PermissionOutcome, Result, ToolApprovalRecord, ToolApprovalStatus, ToolCallSource,
-    ToolExecutionRecord, ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
+    PermissionOutcome, Result, ToolActorContext, ToolApprovalRecord, ToolApprovalStatus,
+    ToolCallSource, ToolCancellationToken, ToolExecutionContext, ToolExecutionRecord,
+    ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
 };
 use ai_agents_disambiguation::{
     ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
@@ -94,6 +95,16 @@ enum SkillRouteResult {
     NeedsClarification(AgentResponse),
 }
 
+/// Result of response-independent parallel transition selection.
+enum ParallelTransitionSelection {
+    /// A transition matched and can be committed before the old-state response.
+    Candidate(TransitionCandidate),
+    /// All eligible transition checks ran and none matched.
+    NoMatch,
+    /// LLM-based route evaluation needed speculative capacity that was unavailable.
+    ReservationExhausted,
+}
+
 /// Outcome of post_loop_processing - drives the caller's next step.
 enum PostLoopResult {
     /// No transition fired. Content is the LLM response for this turn.
@@ -126,8 +137,8 @@ impl Drop for RootTurnCleanup<'_> {
 struct RuntimeControlState {
     /// Monotonic version for runtime-control snapshots.
     version: AtomicU64,
-    /// Emergency switch that denies all future tool execution.
-    emergency_deny: AtomicBool,
+    /// Emergency switch that denies future calls and is shared with active tool contexts.
+    emergency_deny: Arc<AtomicBool>,
     /// Optional live replacement for tool security policy.
     tool_security_override: RwLock<Option<ToolSecurityConfig>>,
     /// Optional live replacement for the top-level tool scope.
@@ -138,7 +149,7 @@ impl Default for RuntimeControlState {
     fn default() -> Self {
         Self {
             version: AtomicU64::new(1),
-            emergency_deny: AtomicBool::new(false),
+            emergency_deny: Arc::new(AtomicBool::new(false)),
             tool_security_override: RwLock::new(None),
             tool_scope_override: RwLock::new(None),
         }
@@ -3155,14 +3166,15 @@ impl RuntimeAgent {
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
+        ctx: ToolExecutionContext,
         timeout_ms: u64,
     ) -> Result<(ToolResult, bool, bool)> {
         let actor_context = current_turn_actor_context();
         let future = async move {
             if let Some(actor_context) = actor_context {
-                scope_actor_context(actor_context, tool.execute(args)).await
+                scope_actor_context(actor_context, tool.execute(args, ctx)).await
             } else {
-                tool.execute(args).await
+                tool.execute(args, ctx).await
             }
         };
         tokio::pin!(future);
@@ -3203,13 +3215,14 @@ impl RuntimeAgent {
         canonical_id: &str,
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
+        ctx: ToolExecutionContext,
         timeout_ms: u64,
         max_retries: u32,
     ) -> Result<(ToolResult, bool, bool)> {
         let mut attempts = 0;
         loop {
             let (result, timed_out, cancelled) = self
-                .execute_resolved_tool_once(tool.clone(), args.clone(), timeout_ms)
+                .execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout_ms)
                 .await?;
             if result.success || timed_out || cancelled || attempts >= max_retries {
                 return Ok((result, timed_out, cancelled));
@@ -3300,18 +3313,32 @@ impl RuntimeAgent {
         }
 
         let security_engine = self.active_tool_security();
-        let mut executed_arguments =
-            security_engine.prepare_tool_arguments(&canonical_id, &request.arguments);
+        let bindings = resolved.tool.policy_bindings();
+        let mut executed_arguments = security_engine.prepare_tool_arguments_with_bindings(
+            &canonical_id,
+            &request.arguments,
+            &bindings,
+        );
         self.hooks
             .on_tool_start(&canonical_id, &executed_arguments)
             .await;
 
         let mut metadata = HashMap::new();
+        let safety = resolved.tool.safety_metadata();
         let classification = resolved.tool.classify_call(&executed_arguments);
+        let limits = security_engine.effective_limits(&canonical_id, &safety, &classification);
         metadata.insert(
             "classification".to_string(),
             serde_json::to_value(&classification).unwrap_or(Value::Null),
         );
+        metadata.insert(
+            "effective_limits".to_string(),
+            serde_json::to_value(&limits).unwrap_or(Value::Null),
+        );
+        let policy_snapshot = security_engine.policy_snapshot(&canonical_id);
+        if !policy_snapshot.is_null() {
+            metadata.insert("policy_snapshot".to_string(), policy_snapshot.clone());
+        }
 
         let mut approval_record = Some(ToolApprovalRecord {
             status: ToolApprovalStatus::NotRequired,
@@ -3320,7 +3347,7 @@ impl RuntimeAgent {
         });
 
         let mut security_result = security_engine
-            .check_tool_execution(&canonical_id, &executed_arguments)
+            .check_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
             .await?;
         match &security_result {
             SecurityCheckResult::Allow => {}
@@ -3412,7 +3439,11 @@ impl RuntimeAgent {
                             }
                         }
                         security_result = security_engine
-                            .check_tool_execution(&canonical_id, &executed_arguments)
+                            .check_tool_execution_with_bindings(
+                                &canonical_id,
+                                &executed_arguments,
+                                &bindings,
+                            )
                             .await?;
                         if !matches!(
                             security_result,
@@ -3557,7 +3588,11 @@ impl RuntimeAgent {
                             }
                         }
                         let modified_security = security_engine
-                            .check_tool_execution(&canonical_id, &executed_arguments)
+                            .check_tool_execution_with_bindings(
+                                &canonical_id,
+                                &executed_arguments,
+                                &bindings,
+                            )
                             .await?;
                         if !matches!(
                             modified_security,
@@ -3666,7 +3701,11 @@ impl RuntimeAgent {
                             }
                         }
                         let modified_security = security_engine
-                            .check_tool_execution(&canonical_id, &executed_arguments)
+                            .check_tool_execution_with_bindings(
+                                &canonical_id,
+                                &executed_arguments,
+                                &bindings,
+                            )
                             .await?;
                         if !matches!(
                             modified_security,
@@ -3747,14 +3786,54 @@ impl RuntimeAgent {
         }
 
         let tool_config = self.recovery_manager.get_tool_config(&canonical_id);
-        let timeout_ms = security_engine.get_tool_timeout(&canonical_id);
-        let tool_arguments =
-            security_engine.attach_internal_tool_policy(&canonical_id, &executed_arguments);
+        let timeout_ms = limits
+            .timeout_ms
+            .unwrap_or_else(|| security_engine.get_tool_timeout(&canonical_id));
+        let deadline = Some(started_at + chrono::Duration::milliseconds(timeout_ms as i64));
+        let turn_actor = current_turn_actor_context();
+        let actor = ToolActorContext {
+            actor_id: turn_actor
+                .as_ref()
+                .and_then(|context| context.effective_actor_id().map(str::to_string))
+                .or_else(|| self.actor_id()),
+            origin_actor_id: turn_actor
+                .as_ref()
+                .and_then(|context| context.origin_actor_id.clone()),
+            sender_agent_id: turn_actor
+                .as_ref()
+                .and_then(|context| context.sender_agent_id.clone()),
+        };
+        let tool_context = ToolExecutionContext {
+            requested_name: request.requested_name.clone(),
+            canonical_id: canonical_id.clone(),
+            display_name: resolved.identity.display_name.clone(),
+            provider_id: resolved.identity.provider_id.clone(),
+            registry_version: self.tools.version(),
+            policy_version: security_engine.policy_version(),
+            runtime_control_version: self.runtime_control.version.load(Ordering::SeqCst),
+            call_id: request.call_id.clone(),
+            source: request.source.clone(),
+            actor,
+            cancellation: ToolCancellationToken::new(
+                Arc::clone(&self.runtime_control.emergency_deny),
+                Some("runtime control cancellation".to_string()),
+            ),
+            started_at,
+            deadline,
+            permission: ToolPolicyDecisionRecord::allow(),
+            approval: approval_record.clone(),
+            classification: classification.clone(),
+            safety,
+            limits: limits.clone(),
+            policy_snapshot,
+            custom_config: security_engine.custom_config(&canonical_id),
+        };
         let (mut result, timed_out, cancelled) = self
             .run_tool_with_retries(
                 &canonical_id,
                 resolved.tool.clone(),
-                tool_arguments,
+                executed_arguments.clone(),
+                tool_context,
                 timeout_ms,
                 tool_config.max_retries,
             )
@@ -3783,8 +3862,7 @@ impl RuntimeAgent {
             }
         }
 
-        let output_cap =
-            security_engine.get_tool_output_cap(&canonical_id, classification.max_output_chars);
+        let output_cap = limits.max_output_chars;
         let (output, output_truncated) =
             Self::truncate_tool_output(result.output.clone(), output_cap);
         if let Some(result_metadata) = result.metadata {
@@ -4658,11 +4736,10 @@ OVERALL: PASS/FAIL"#,
             speculative_call_slots -= 1;
         }
         if transition_enabled {
-            if optional_slots == 0 || speculative_call_slots == 0 {
+            if optional_slots == 0 {
                 transition_enabled = false;
             } else {
                 optional_slots -= 1;
-                speculative_call_slots -= 1;
             }
         }
         if skill_enabled && (optional_slots == 0 || speculative_call_slots == 0) {
@@ -4747,7 +4824,15 @@ OVERALL: PASS/FAIL"#,
                     )
                     .await
                     {
-                        Ok(candidate) => RuntimeBranchResult::Transition(candidate),
+                        Ok(ParallelTransitionSelection::Candidate(candidate)) => {
+                            RuntimeBranchResult::Transition(Some(candidate))
+                        }
+                        Ok(ParallelTransitionSelection::NoMatch) => {
+                            RuntimeBranchResult::Transition(None)
+                        }
+                        Ok(ParallelTransitionSelection::ReservationExhausted) => {
+                            RuntimeBranchResult::Cancelled
+                        }
                         Err(error) => RuntimeBranchResult::Failed(error),
                     }
                 }),
@@ -4830,6 +4915,7 @@ OVERALL: PASS/FAIL"#,
         let mut transition_candidate: Option<TransitionCandidate> = None;
         let mut skill_candidate: Option<SkillCandidate> = None;
         let mut reasoning_decision: Option<ReasoningMode> = None;
+        let mut transition_fallback_required = false;
         let mut skill_fallback_required = false;
         let mut reasoning_fallback_required = false;
 
@@ -4998,7 +5084,10 @@ OVERALL: PASS/FAIL"#,
             }
 
             if transition_finalized && skill_finalized && reasoning_finalized {
-                if skill_fallback_required || reasoning_fallback_required {
+                if transition_fallback_required
+                    || skill_fallback_required
+                    || reasoning_fallback_required
+                {
                     if !main_pending {
                         self.finalize_branch_loss(
                             &main_id,
@@ -5143,6 +5232,7 @@ OVERALL: PASS/FAIL"#,
                             Some(Err(AgentError::Other("main branch cancelled".to_string())));
                     } else if branch_id == transition_id {
                         transition_finalized = true;
+                        transition_fallback_required = true;
                     } else if branch_id == skill_id {
                         skill_pending = false;
                         skill_finalized = true;
@@ -5234,9 +5324,9 @@ OVERALL: PASS/FAIL"#,
     async fn select_parallel_transition_candidate(
         &self,
         processed_input: &str,
-    ) -> Result<Option<TransitionCandidate>> {
+    ) -> Result<ParallelTransitionSelection> {
         let Some((transitions, current_state)) = self.transitions_available_for_commit() else {
-            return Ok(None);
+            return Ok(ParallelTransitionSelection::NoMatch);
         };
         let parallel: Vec<Transition> = transitions
             .into_iter()
@@ -5244,7 +5334,7 @@ OVERALL: PASS/FAIL"#,
             .filter(|transition| !transition.requires_response)
             .collect();
         if parallel.is_empty() {
-            return Ok(None);
+            return Ok(ParallelTransitionSelection::NoMatch);
         }
         let empty_staged = HashMap::new();
         if let Some(candidate) = self.select_deterministic_transition_candidate(
@@ -5253,7 +5343,7 @@ OVERALL: PASS/FAIL"#,
             &parallel,
             &empty_staged,
         ) {
-            return Ok(Some(candidate));
+            return Ok(ParallelTransitionSelection::Candidate(candidate));
         }
         let when_transitions: Vec<(usize, &Transition)> = parallel
             .iter()
@@ -5261,7 +5351,7 @@ OVERALL: PASS/FAIL"#,
             .filter(|(_, transition)| !transition.when.trim().is_empty())
             .collect();
         if when_transitions.is_empty() {
-            return Ok(None);
+            return Ok(ParallelTransitionSelection::NoMatch);
         }
         let llm = self
             .llm_registry
@@ -5279,7 +5369,7 @@ OVERALL: PASS/FAIL"#,
         if !self
             .reserve_active_speculative_llm_call(RuntimeOptimizationKind::ParallelStateTransition)
         {
-            return Ok(None);
+            return Ok(ParallelTransitionSelection::ReservationExhausted);
         }
         let context_preview = self.branch_context_preview();
         let prompt = format!(
@@ -5299,14 +5389,16 @@ OVERALL: PASS/FAIL"#,
             .map_err(|e| AgentError::LLM(e.to_string()))?;
         let choice = response.content.trim().parse::<usize>().unwrap_or(0);
         if choice == 0 || choice > when_transitions.len() {
-            return Ok(None);
+            return Ok(ParallelTransitionSelection::NoMatch);
         }
         let transition = when_transitions[choice - 1].1.clone();
-        Ok(Some(TransitionCandidate::new(
-            current_state,
-            transition.clone(),
-            Self::transition_reason(&transition),
-        )))
+        Ok(ParallelTransitionSelection::Candidate(
+            TransitionCandidate::new(
+                current_state,
+                transition.clone(),
+                Self::transition_reason(&transition),
+            ),
+        ))
     }
 
     /// Re-enters the runtime loop after an optimized transition commits.
@@ -8752,8 +8844,10 @@ Respond in JSON format:
                     transition_pending = false;
                     transition_branch.transition_to(RuntimeBranchStatus::Completed)?;
                     match result {
-                        Ok(Some(candidate)) => transition_candidate = Some(candidate),
-                        Ok(None) => {
+                        Ok(ParallelTransitionSelection::Candidate(candidate)) => {
+                            transition_candidate = Some(candidate)
+                        }
+                        Ok(ParallelTransitionSelection::NoMatch) => {
                             self.finalize_optional_branch(
                                 &transition_id,
                                 RuntimeOptimizationKind::ParallelStateTransition,
@@ -8763,6 +8857,24 @@ Respond in JSON format:
                             );
                             routing_resolved.store(true, Ordering::SeqCst);
                             transition_finalized = true;
+                        }
+                        Ok(ParallelTransitionSelection::ReservationExhausted) => {
+                            self.finalize_optional_branch(
+                                &transition_id,
+                                RuntimeOptimizationKind::ParallelStateTransition,
+                                RuntimeCommitBehavior::TransitionDecision,
+                                "cancelled",
+                                false,
+                            );
+                            routing_resolved.store(true, Ordering::SeqCst);
+                            self.finalize_branch_loss(
+                                &main_id,
+                                RuntimeOptimizationKind::BufferedStreamingRouting,
+                                RuntimeCommitBehavior::FinalResponse,
+                                main_pending,
+                                main_result.as_ref().map(|result| result.is_err()),
+                            );
+                            return Ok(None);
                         }
                         Err(_) => {
                             self.finalize_optional_branch(
@@ -10011,6 +10123,56 @@ mod tests {
         responses: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    /// Test tool that returns the execution context it received.
+    struct ContextEchoTool;
+
+    #[async_trait]
+    impl ai_agents_core::Tool for ContextEchoTool {
+        fn id(&self) -> &str {
+            "context_echo"
+        }
+
+        fn name(&self) -> &str {
+            "Context Echo"
+        }
+
+        fn description(&self) -> &str {
+            "Returns selected execution context fields."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: vec![ai_agents_core::PathPolicyBinding::read("path")],
+                result_limit_fields: vec![ai_agents_core::ResultLimitBinding::new(
+                    "max_results",
+                    ai_agents_core::ResultLimitKind::MaxResults,
+                )],
+                ..Default::default()
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            ToolResult::ok(
+                serde_json::json!({
+                    "requested_name": ctx.requested_name,
+                    "canonical_id": ctx.canonical_id,
+                    "display_name": ctx.display_name,
+                    "max_results": ctx.limits.max_results,
+                    "custom_config": ctx.custom_config,
+                })
+                .to_string(),
+            )
+        }
+    }
+
     /// Test tool that stays active long enough for runtime cancellation.
     struct SlowTool;
 
@@ -10032,7 +10194,11 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
 
-        async fn execute(&self, _args: Value) -> ToolResult {
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             ToolResult::ok("done")
         }
@@ -10087,6 +10253,55 @@ mod tests {
         let messages = agent.memory.get_messages(None).await.unwrap();
         // 3 user + 3 assistant = 6 messages
         assert_eq!(messages.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn context_preserves_requested_and_canonical_identity() {
+        let mock = mock_with_response("hello");
+        let mut tools = ai_agents_tools::ToolRegistry::new();
+        tools.register(Arc::new(ContextEchoTool)).unwrap();
+
+        let mut security = ToolSecurityConfig::default();
+        security.enabled = true;
+        security.fail_closed = true;
+        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
+        policy.read_paths = vec![".".to_string()];
+        policy.max_results = Some(7);
+        policy
+            .config
+            .insert("backend".to_string(), serde_json::json!("memory"));
+        security.tools.insert("context_echo".to_string(), policy);
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .tools(tools)
+            .tool_security(ToolSecurityEngine::new(security))
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "ctx-call",
+                "Context Echo",
+                serde_json::json!({"path": ".", "max_results": 99}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.success);
+        assert_eq!(record.requested_name, "Context Echo");
+        assert_eq!(record.canonical_id, "context_echo");
+        assert_eq!(record.policy.outcome, PermissionOutcome::Allow);
+        assert_eq!(record.executed_arguments["max_results"], 7);
+        let output: Value = serde_json::from_str(&record.output).unwrap();
+        assert_eq!(output["requested_name"], "Context Echo");
+        assert_eq!(output["canonical_id"], "context_echo");
+        assert_eq!(output["max_results"], 7);
+        assert_eq!(output["custom_config"]["backend"], "memory");
+        assert!(record.metadata.contains_key("effective_limits"));
+        assert!(record.metadata.contains_key("policy_snapshot"));
     }
 
     #[tokio::test]
@@ -11136,6 +11351,143 @@ skills:
                 .iter()
                 .any(|event| event.dimensions.contains_key("branch_status"))
         );
+    }
+
+    #[tokio::test]
+    async fn test_parallel_transition_low_cap_allows_deterministic_route() {
+        let mock = mock_with_response("unused");
+        let call_counter = mock.clone();
+        let yaml = r#"
+name: ParallelTransitionLowCapAgent
+system_prompt: "Route before stale responses when safe."
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 1
+    speculative_state_transitions: true
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("route", serde_json::json!("billing"))
+            .unwrap();
+        agent.update_active_turn_context("billing help", HashMap::new());
+        assert!(
+            agent.reserve_active_speculative_llm_call(
+                RuntimeOptimizationKind::ParallelStateTransition
+            )
+        );
+
+        let selection = agent
+            .select_parallel_transition_candidate("billing help")
+            .await
+            .unwrap();
+        agent.end_root_turn();
+
+        match selection {
+            ParallelTransitionSelection::Candidate(candidate) => {
+                assert_eq!(candidate.target(), "billing");
+            }
+            ParallelTransitionSelection::NoMatch => panic!("deterministic route did not match"),
+            ParallelTransitionSelection::ReservationExhausted => {
+                panic!("deterministic route consumed LLM budget")
+            }
+        }
+        assert_eq!(call_counter.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_buffered_streaming_transition_reservation_falls_back() {
+        use futures::StreamExt;
+
+        let mock = mock_with_responses(vec![
+            "Serial streaming response",
+            "Serial streaming response",
+        ]);
+        let router_mock = mock_with_response("1");
+        let router_counter = router_mock.clone();
+        let yaml = r#"
+name: BufferedReservationFallbackAgent
+system_prompt: "Stream normally if speculative routing cannot be evaluated."
+llm:
+  default: default
+  router: router
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+streaming:
+  enabled: true
+  buffer_size: 8
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 1
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          when: "User asks about billing"
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(mock))
+            .llm_alias("router", Arc::new(router_mock))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("hello").await.unwrap();
+        let mut content = String::new();
+        let mut error = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => content.push_str(&text),
+                StreamChunk::Error { message } => error = Some(message),
+                StreamChunk::Done {} => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(error, None);
+        assert_eq!(content, "Serial streaming response");
+        assert_eq!(router_counter.call_count(), 0);
+        let events = agent.observability().unwrap().raw_events();
+        assert!(events.iter().any(|event| {
+            event.dimensions.get("branch_status") == Some(&"cancelled".to_string())
+                && event.dimensions.get("commit_behavior")
+                    == Some(&"transition_decision".to_string())
+        }));
     }
 
     #[tokio::test]

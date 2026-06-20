@@ -11,7 +11,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ai_agents_core::{
-    ChatMessage, LLMConfig, LLMProvider, Tool, ToolCallClassification, ToolOperationKind,
+    ChatMessage, DomainPolicyBinding, LLMConfig, LLMProvider, ResultLimitBinding, ResultLimitKind,
+    Tool, ToolCallClassification, ToolExecutionContext, ToolOperationKind, ToolPolicyBindings,
     ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
@@ -76,9 +77,6 @@ struct WebFetchInput {
     /// Maximum redirects. Defaults to 5.
     #[serde(default)]
     max_redirects: Option<usize>,
-    #[serde(default, rename = "__ai_agents_policy")]
-    #[schemars(skip)]
-    policy: Option<WebFetchPolicyInput>,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -103,6 +101,54 @@ struct WebFetchPolicyInput {
     blocked_private_networks: bool,
     #[serde(default)]
     max_redirects: Option<usize>,
+}
+
+impl WebFetchPolicyInput {
+    /// Build redirect-time policy from the executor-provided policy snapshot.
+    fn from_context(value: &Value) -> Self {
+        let mut policy = serde_json::from_value::<Self>(value.clone()).unwrap_or_default();
+        policy.domain_allow.extend(
+            value
+                .get("domains")
+                .and_then(|domains| domains.get("allow"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+        policy.domain_deny.extend(
+            value
+                .get("domains")
+                .and_then(|domains| domains.get("deny"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+        policy.domain_requires_approval.extend(
+            value
+                .get("domains")
+                .and_then(|domains| domains.get("requires_approval"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+        policy.domain_unavailable.extend(
+            value
+                .get("domains")
+                .and_then(|domains| domains.get("unavailable"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_string),
+        );
+        policy
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -166,26 +212,48 @@ impl Tool for WebFetchTool {
         ToolCallClassification::from_metadata(&self.safety_metadata())
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            domain_fields: vec![DomainPolicyBinding::url("url")],
+            result_limit_fields: vec![
+                ResultLimitBinding::new("max_chars", ResultLimitKind::MaxOutputChars),
+                ResultLimitBinding::new("max_response_bytes", ResultLimitKind::MaxResponseBytes),
+                ResultLimitBinding::new("max_redirects", ResultLimitKind::MaxRedirects),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: WebFetchInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
-        let max_output_chars = input.max_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS);
+        let policy = WebFetchPolicyInput::from_context(&ctx.policy_snapshot);
+        let max_output_chars = input.max_chars.unwrap_or(DEFAULT_MAX_OUTPUT_CHARS).min(
+            ctx.limits
+                .max_output_chars
+                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+        );
         let max_response_bytes = input
             .max_response_bytes
             .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
-            .min(DEFAULT_MAX_RESPONSE_BYTES * 8);
+            .min(DEFAULT_MAX_RESPONSE_BYTES * 8)
+            .min(
+                ctx.limits
+                    .max_response_bytes
+                    .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES * 8),
+            );
         let max_redirects = input
             .max_redirects
-            .or_else(|| {
-                input
-                    .policy
-                    .as_ref()
-                    .and_then(|policy| policy.max_redirects)
-            })
+            .or(policy.max_redirects)
             .unwrap_or(DEFAULT_MAX_REDIRECTS)
-            .min(DEFAULT_MAX_REDIRECTS * 4);
+            .min(DEFAULT_MAX_REDIRECTS * 4)
+            .min(
+                ctx.limits
+                    .max_redirects
+                    .unwrap_or(DEFAULT_MAX_REDIRECTS * 4),
+            );
         let cache_ttl = input.cache_ttl_seconds.unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
         let cache_key = format!(
             "{}|{}|{}|{}",
@@ -210,13 +278,19 @@ impl Tool for WebFetchTool {
         };
         let mut current_url = original_url.clone();
         let mut redirects = Vec::new();
-        if let Err(result) = validate_url_with_policy(&current_url, input.policy.as_ref()).await {
+        if let Err(result) = validate_url_with_policy(&current_url, Some(&policy)).await {
             return result;
         }
 
         let response = loop {
-            if let Err(result) = validate_url_with_policy(&current_url, input.policy.as_ref()).await
-            {
+            if ctx.cancellation.is_cancelled() {
+                return ToolResult::error(
+                    ctx.cancellation
+                        .reason()
+                        .unwrap_or("Tool execution cancelled"),
+                );
+            }
+            if let Err(result) = validate_url_with_policy(&current_url, Some(&policy)).await {
                 return result;
             }
             let response = match self.client.get(current_url.clone()).send().await {
@@ -242,9 +316,7 @@ impl Tool for WebFetchTool {
                         return ToolResult::error(format!("Invalid redirect URL: {}", error));
                     }
                 };
-                if let Err(result) =
-                    validate_url_with_policy(&next_url, input.policy.as_ref()).await
-                {
+                if let Err(result) = validate_url_with_policy(&next_url, Some(&policy)).await {
                     return result;
                 }
                 redirects.push(next_url.to_string());
@@ -269,6 +341,13 @@ impl Tool for WebFetchTool {
                     return ToolResult::error(format!("Response stream failed: {}", error));
                 }
             };
+            if ctx.cancellation.is_cancelled() {
+                return ToolResult::error(
+                    ctx.cancellation
+                        .reason()
+                        .unwrap_or("Tool execution cancelled"),
+                );
+            }
             if body.len().saturating_add(chunk.len()) > max_response_bytes {
                 return ToolResult::error(format!(
                     "Response exceeded max_response_bytes {}",
@@ -633,7 +712,10 @@ mod tests {
     #[tokio::test]
     async fn blocks_localhost_urls() {
         let result = WebFetchTool::new()
-            .execute(serde_json::json!({"url": "http://127.0.0.1:1234"}))
+            .execute(
+                serde_json::json!({"url": "http://127.0.0.1:1234"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -641,7 +723,10 @@ mod tests {
     #[tokio::test]
     async fn blocks_metadata_hosts() {
         let result = WebFetchTool::new()
-            .execute(serde_json::json!({"url": "http://169.254.169.254/latest"}))
+            .execute(
+                serde_json::json!({"url": "http://169.254.169.254/latest"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

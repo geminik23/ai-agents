@@ -5,7 +5,8 @@ use crate::manager::ObservabilityManager;
 use crate::span::SpanGuard;
 use ai_agents_core::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
-    ToolCallClassification, ToolResult, ToolSafetyMetadata,
+    ToolCallClassification, ToolExecutionContext, ToolPolicyBindings, ToolResult,
+    ToolSafetyMetadata,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -184,9 +185,13 @@ impl Tool for ObservedTool {
         self.inner.classify_call(args)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        self.inner.policy_bindings()
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         if !self.manager.config().latency.track_tools {
-            return self.inner.execute(args).await;
+            return self.inner.execute(args, ctx).await;
         }
         let mut span = self.manager.start_span(
             EventType::ToolCall {
@@ -197,7 +202,7 @@ impl Tool for ObservedTool {
         if self.manager.config().privacy.include_tool_args {
             span.set_payload(serde_json::json!({"args": args.clone()}));
         }
-        let result = self.inner.execute(args).await;
+        let result = self.inner.execute(args, ctx).await;
         if !result.success {
             span.set_error(ObservationError::new("tool_error", result.output.clone()));
         }

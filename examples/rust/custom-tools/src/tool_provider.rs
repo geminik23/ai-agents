@@ -60,7 +60,7 @@ impl Tool for WeatherTool {
     fn description(&self) -> &str { "Get current weather for a city." }
     fn input_schema(&self) -> Value { generate_schema::<WeatherInput>() }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
         let input: WeatherInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -101,7 +101,7 @@ impl Tool for StockPriceTool {
     fn description(&self) -> &str { "Get current stock price by ticker symbol." }
     fn input_schema(&self) -> Value { generate_schema::<StockPriceInput>() }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
         let input: StockPriceInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),

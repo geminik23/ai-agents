@@ -123,7 +123,7 @@ impl Tool for GlobTool {
         read_only_metadata(ToolOperationKind::Read, true)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: GlobInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -282,7 +282,7 @@ impl Tool for GrepTool {
         read_only_metadata(ToolOperationKind::Read, true)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: GrepInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -522,7 +522,7 @@ impl Tool for FileReadTool {
         read_only_metadata(ToolOperationKind::Read, true)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: FileReadInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -685,7 +685,7 @@ impl Tool for FileListTool {
         read_only_metadata(ToolOperationKind::Read, true)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: FileListInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -850,7 +850,7 @@ impl Tool for FileInfoTool {
         read_only_metadata(ToolOperationKind::Read, true)
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: FileInfoInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -1224,7 +1224,7 @@ mod tests {
                 "path": dir.path(),
                 "max_results": 1,
                 "offset": 1
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         assert!(result.output.contains("b.rs"));
@@ -1248,7 +1248,7 @@ mod tests {
                 "output_mode": "content",
                 "max_results": 1,
                 "offset": 1
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         assert!(result.output.contains("hello tools"));
@@ -1266,7 +1266,7 @@ mod tests {
                 "path": path,
                 "start_line": 2,
                 "end_line": 3
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         assert!(result.output.contains("one 😄"));
@@ -1279,7 +1279,7 @@ mod tests {
             .execute(serde_json::json!({
                 "path": large,
                 "max_bytes": 100
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         assert!(result.output.contains("large_file"));
@@ -1299,7 +1299,7 @@ mod tests {
                 "path": dir.path(),
                 "include_glob": "*.txt",
                 "max_results": 1
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         assert!(result.output.contains("a.txt"));
@@ -1315,7 +1315,7 @@ mod tests {
         let result = tool
             .execute(serde_json::json!({
                 "path": file
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         assert!(result.output.contains("\"kind\":\"file\""));

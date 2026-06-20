@@ -99,7 +99,7 @@ impl Tool for TemplateTool {
         }
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: TemplateInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -172,11 +172,14 @@ mod tests {
     async fn test_render_simple() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render",
-                "template": "Hello {{ name }}!",
-                "data": {"name": "World"}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "render",
+                    "template": "Hello {{ name }}!",
+                    "data": {"name": "World"}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: RenderOutput = serde_json::from_str(&result.output).unwrap();
@@ -187,11 +190,14 @@ mod tests {
     async fn test_render_with_filter() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render",
-                "template": "Hello {{ name|upper }}!",
-                "data": {"name": "world"}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "render",
+                    "template": "Hello {{ name|upper }}!",
+                    "data": {"name": "world"}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: RenderOutput = serde_json::from_str(&result.output).unwrap();
@@ -206,7 +212,7 @@ mod tests {
                 "operation": "render",
                 "template": "{% for item in items %}{{ item }}{% if not loop.last %}, {% endif %}{% endfor %}",
                 "data": {"items": ["a", "b", "c"]}
-            }))
+            }), ai_agents_core::ToolExecutionContext::test("test"))
             .await;
         assert!(result.success);
         let output: RenderOutput = serde_json::from_str(&result.output).unwrap();
@@ -217,11 +223,14 @@ mod tests {
     async fn test_render_with_conditional() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render",
-                "template": "{% if show %}visible{% else %}hidden{% endif %}",
-                "data": {"show": true}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "render",
+                    "template": "{% if show %}visible{% else %}hidden{% endif %}",
+                    "data": {"show": true}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: RenderOutput = serde_json::from_str(&result.output).unwrap();
@@ -232,16 +241,19 @@ mod tests {
     async fn test_render_nested_data() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render",
-                "template": "Order #{{ order.id }}: {{ order.items|length }} items",
-                "data": {
-                    "order": {
-                        "id": "12345",
-                        "items": ["item1", "item2", "item3"]
+            .execute(
+                serde_json::json!({
+                    "operation": "render",
+                    "template": "Order #{{ order.id }}: {{ order.items|length }} items",
+                    "data": {
+                        "order": {
+                            "id": "12345",
+                            "items": ["item1", "item2", "item3"]
+                        }
                     }
-                }
-            }))
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: RenderOutput = serde_json::from_str(&result.output).unwrap();
@@ -256,11 +268,14 @@ mod tests {
 
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render_file",
-                "path": file_path.to_str().unwrap(),
-                "data": {"name": "File"}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "render_file",
+                    "path": file_path.to_str().unwrap(),
+                    "data": {"name": "File"}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: RenderFileOutput = serde_json::from_str(&result.output).unwrap();
@@ -271,10 +286,13 @@ mod tests {
     async fn test_render_missing_template() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render",
-                "data": {}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "render",
+                    "data": {}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -283,11 +301,14 @@ mod tests {
     async fn test_render_invalid_template() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "render",
-                "template": "{{ unclosed",
-                "data": {}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "render",
+                    "template": "{{ unclosed",
+                    "data": {}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -296,10 +317,13 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = TemplateTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "invalid",
-                "data": {}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "invalid",
+                    "data": {}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

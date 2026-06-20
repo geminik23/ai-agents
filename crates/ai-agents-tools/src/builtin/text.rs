@@ -124,7 +124,7 @@ impl Tool for TextTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: TextInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -452,10 +452,13 @@ mod tests {
     async fn test_length_unicode() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "length",
-                "text": "안녕하세요"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "length",
+                    "text": "안녕하세요"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: LengthOutput = serde_json::from_str(&result.output).unwrap();
@@ -466,12 +469,15 @@ mod tests {
     async fn test_substring() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "substring",
-                "text": "hello world",
-                "start": 0,
-                "end": 5
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "substring",
+                    "text": "hello world",
+                    "start": 0,
+                    "end": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -483,19 +489,25 @@ mod tests {
         let tool = TextTool::new();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "uppercase",
-                "text": "hello"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "uppercase",
+                    "text": "hello"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("HELLO"));
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "lowercase",
-                "text": "HELLO"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "lowercase",
+                    "text": "HELLO"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         assert!(result.output.contains("hello"));
@@ -505,10 +517,13 @@ mod tests {
     async fn test_trim() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "trim",
-                "text": "  hello  "
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "trim",
+                    "text": "  hello  "
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -520,11 +535,14 @@ mod tests {
         let tool = TextTool::new();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "split",
-                "text": "a,b,c",
-                "delimiter": ","
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "split",
+                    "text": "a,b,c",
+                    "delimiter": ","
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: SplitOutput = serde_json::from_str(&result.output).unwrap();
@@ -532,11 +550,14 @@ mod tests {
         assert_eq!(output.count, 3);
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "join",
-                "items": ["a", "b", "c"],
-                "delimiter": "-"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "join",
+                    "items": ["a", "b", "c"],
+                    "delimiter": "-"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -547,12 +568,15 @@ mod tests {
     async fn test_replace() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "replace",
-                "text": "hello world",
-                "find": "world",
-                "replace_with": "rust"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "replace",
+                    "text": "hello world",
+                    "find": "world",
+                    "replace_with": "rust"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -563,11 +587,14 @@ mod tests {
     async fn test_contains() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "contains",
-                "text": "hello world",
-                "find": "world"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "contains",
+                    "text": "hello world",
+                    "find": "world"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: BoolOutput = serde_json::from_str(&result.output).unwrap();
@@ -578,11 +605,14 @@ mod tests {
     async fn test_repeat() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "repeat",
-                "text": "ab",
-                "count": 3
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "repeat",
+                    "text": "ab",
+                    "count": 3
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -593,10 +623,13 @@ mod tests {
     async fn test_reverse() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "reverse",
-                "text": "hello"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "reverse",
+                    "text": "hello"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -608,23 +641,29 @@ mod tests {
         let tool = TextTool::new();
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "pad_left",
-                "text": "5",
-                "width": 3,
-                "pad_char": "0"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "pad_left",
+                    "text": "5",
+                    "width": 3,
+                    "pad_char": "0"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output.result, "005");
 
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "pad_right",
-                "text": "hi",
-                "width": 5
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "pad_right",
+                    "text": "hi",
+                    "width": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -635,11 +674,14 @@ mod tests {
     async fn test_truncate() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "truncate",
-                "text": "hello world",
-                "width": 8
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "truncate",
+                    "text": "hello world",
+                    "width": 8
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: StringOutput = serde_json::from_str(&result.output).unwrap();
@@ -650,10 +692,13 @@ mod tests {
     async fn test_lines() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "lines",
-                "text": "line1\nline2\nline3"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "lines",
+                    "text": "line1\nline2\nline3"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: LinesOutput = serde_json::from_str(&result.output).unwrap();
@@ -664,10 +709,13 @@ mod tests {
     async fn test_words() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "words",
-                "text": "hello  world   test"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "words",
+                    "text": "hello  world   test"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output: SplitOutput = serde_json::from_str(&result.output).unwrap();
@@ -679,9 +727,12 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = TextTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "invalid"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "invalid"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

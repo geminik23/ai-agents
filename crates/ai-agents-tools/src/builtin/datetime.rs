@@ -101,7 +101,7 @@ impl Tool for DateTimeTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: DateTimeInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -323,7 +323,12 @@ mod tests {
     #[tokio::test]
     async fn test_now() {
         let tool = DateTimeTool::new();
-        let result = tool.execute(serde_json::json!({"operation": "now"})).await;
+        let result = tool
+            .execute(
+                serde_json::json!({"operation": "now"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
+            .await;
         assert!(result.success);
 
         let output: NowOutput = serde_json::from_str(&result.output).unwrap();
@@ -335,10 +340,13 @@ mod tests {
     async fn test_now_with_format() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "now",
-                "format": "%Y-%m-%d"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "now",
+                    "format": "%Y-%m-%d"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
     }
@@ -347,11 +355,14 @@ mod tests {
     async fn test_format() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "format",
-                "value": "2024-12-25T10:30:00Z",
-                "format": "%B %d, %Y"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "format",
+                    "value": "2024-12-25T10:30:00Z",
+                    "format": "%B %d, %Y"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -363,10 +374,13 @@ mod tests {
     async fn test_parse_iso() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "parse",
-                "value": "2024-01-15T12:00:00Z"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "parse",
+                    "value": "2024-01-15T12:00:00Z"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -378,10 +392,13 @@ mod tests {
     async fn test_parse_simple_date() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "parse",
-                "value": "2024-01-15"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "parse",
+                    "value": "2024-01-15"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
     }
@@ -390,12 +407,15 @@ mod tests {
     async fn test_add_days() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "add",
-                "value": "2024-01-15T00:00:00Z",
-                "amount": 10,
-                "unit": "days"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "add",
+                    "value": "2024-01-15T00:00:00Z",
+                    "amount": 10,
+                    "unit": "days"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -407,12 +427,15 @@ mod tests {
     async fn test_add_negative() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "add",
-                "value": "2024-01-15T00:00:00Z",
-                "amount": -5,
-                "unit": "days"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "add",
+                    "value": "2024-01-15T00:00:00Z",
+                    "amount": -5,
+                    "unit": "days"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -424,11 +447,14 @@ mod tests {
     async fn test_diff() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "diff",
-                "value": "2024-01-01T00:00:00Z",
-                "value2": "2024-01-02T00:00:00Z"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "diff",
+                    "value": "2024-01-01T00:00:00Z",
+                    "value2": "2024-01-02T00:00:00Z"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -442,7 +468,10 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({"operation": "invalid"}))
+            .execute(
+                serde_json::json!({"operation": "invalid"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -451,7 +480,10 @@ mod tests {
     async fn test_missing_value() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({"operation": "format"}))
+            .execute(
+                serde_json::json!({"operation": "format"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -460,10 +492,13 @@ mod tests {
     async fn test_parse_unix_timestamp() {
         let tool = DateTimeTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "parse",
-                "value": "1704067200"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "parse",
+                    "value": "1704067200"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
     }

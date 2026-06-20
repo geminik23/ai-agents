@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use ai_agents_core::{Tool, ToolResult};
+use ai_agents_core::{Tool, ToolExecutionContext, ToolPolicyBindings, ToolResult};
 
 use super::wrapper::MCPWrapperTool;
 
@@ -101,7 +101,14 @@ impl Tool for MCPViewTool {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            operation_fields: vec!["function".to_string()],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         // Extract the `function` field from input.
         let function = match args.get("function").and_then(|v| v.as_str()) {
             Some(f) => f.to_string(),
@@ -145,6 +152,17 @@ impl Tool for MCPViewTool {
             );
         }
 
-        self.parent.call_function(&function, params).await
+        let mut result = self.parent.call_function(&function, params).await;
+        let metadata = result.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert(
+            "mcp_view_id".to_string(),
+            serde_json::json!(ctx.canonical_id),
+        );
+        metadata.insert(
+            "mcp_parent_id".to_string(),
+            serde_json::json!(self.parent.id()),
+        );
+        metadata.insert("mcp_function".to_string(), serde_json::json!(function));
+        result
     }
 }

@@ -131,6 +131,9 @@ impl<'a> ScheduledBranchSet<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::optimization::{
+        RuntimeCommitBehavior, RuntimeOptimizationKind, RuntimeTaskPriority, RuntimeTaskPurpose,
+    };
     use std::collections::HashMap;
 
     #[test]
@@ -147,5 +150,49 @@ mod tests {
         let mut turn = TurnOptimizationContext::new("input", HashMap::new(), 1);
         assert!(scheduler.reserve_branch(&mut turn));
         assert!(!scheduler.reserve_branch(&mut turn));
+    }
+
+    #[test]
+    fn scheduled_branch_set_cancels_pending_branches() {
+        let mut branches = ScheduledBranchSet::new(1).unwrap();
+        let branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::MainResponse,
+            RuntimeOptimizationKind::SpeculativeSkillRouting,
+            RuntimeTaskPriority::Normal,
+            RuntimeCommitBehavior::FinalResponse,
+        );
+        let branch_id = branch.branch_id();
+
+        assert!(branches.schedule(
+            branch,
+            Box::pin(async { std::future::pending::<RuntimeBranchResult>().await }),
+        ));
+        let pending = branches.cancel_pending();
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].branch_id(), branch_id);
+        assert!(branches.is_empty());
+        assert!(branches.reserve_task());
+    }
+
+    #[tokio::test]
+    async fn scheduled_branch_set_keeps_completed_outcomes_out_of_cancelled_set() {
+        let mut branches = ScheduledBranchSet::new(1).unwrap();
+        let branch = RuntimeBranch::new(
+            RuntimeTaskPurpose::MainResponse,
+            RuntimeOptimizationKind::SpeculativeSkillRouting,
+            RuntimeTaskPriority::Normal,
+            RuntimeCommitBehavior::FinalResponse,
+        );
+        let branch_id = branch.branch_id();
+
+        assert!(branches.schedule(branch, Box::pin(async { RuntimeBranchResult::Cancelled }),));
+        let outcome = branches.next_completed().await.unwrap();
+        let pending = branches.cancel_pending();
+
+        assert_eq!(outcome.branch.branch_id(), branch_id);
+        assert!(matches!(outcome.result, RuntimeBranchResult::Cancelled));
+        assert!(pending.is_empty());
+        assert!(branches.reserve_task());
     }
 }

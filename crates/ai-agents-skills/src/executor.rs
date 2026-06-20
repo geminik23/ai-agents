@@ -7,12 +7,16 @@ use minijinja::Environment;
 
 use crate::definition::{SkillContext, SkillDefinition, SkillStep};
 
+/// Executes skill steps with either prompt-only mode or a runtime tool invoker.
 pub struct SkillExecutor {
+    /// LLM registry used by prompt steps.
     llm_registry: Arc<LLMRegistry>,
+    /// Tool registry used for direct-mode diagnostics.
     tools: Arc<ToolRegistry>,
 }
 
 impl SkillExecutor {
+    /// Creates a skill executor from shared LLM and tool registries.
     pub fn new(llm_registry: Arc<LLMRegistry>, tools: Arc<ToolRegistry>) -> Self {
         Self {
             llm_registry,
@@ -20,6 +24,7 @@ impl SkillExecutor {
         }
     }
 
+    /// Executes prompt-only skills without a runtime tool invoker.
     pub async fn execute(
         &self,
         skill: &SkillDefinition,
@@ -30,36 +35,14 @@ impl SkillExecutor {
 
         for (index, step) in skill.steps.iter().enumerate() {
             match step {
-                SkillStep::Tool {
-                    tool,
-                    args,
-                    output_as: _,
-                } => {
-                    let rendered_args = self.render_args(args.clone(), &ctx)?;
-                    let tool_impl = self
-                        .tools
-                        .get(tool)
-                        .ok_or_else(|| AgentError::Skill(format!("Tool not found: {}", tool)))?;
-
-                    let result = tool_impl.execute(rendered_args.clone()).await;
-                    eprintln!("[Skill] Tool '{}' returned: {}", tool, result.output);
-
-                    let result_value: serde_json::Value = serde_json::from_str(&result.output)
-                        .unwrap_or_else(|_| {
-                            serde_json::json!({
-                                "output": result.output,
-                                "success": result.success
-                            })
-                        });
-
-                    ctx.add_result(index, Some(rendered_args), result_value);
-
-                    if !result.success {
-                        return Err(AgentError::Skill(format!(
-                            "Tool '{}' failed: {}",
-                            tool, result.output
-                        )));
+                SkillStep::Tool { tool, .. } => {
+                    if self.tools.get(tool).is_none() {
+                        return Err(AgentError::Skill(format!("Tool not found: {}", tool)));
                     }
+                    return Err(AgentError::Skill(format!(
+                        "Skill '{}' contains tool step '{}'; use execute_with_invoker so runtime policy, HITL, observability, and eval evidence are preserved",
+                        skill.id, tool
+                    )));
                 }
                 SkillStep::Prompt { prompt, llm } => {
                     let rendered_prompt = self.render_prompt(prompt, &ctx)?;
@@ -92,6 +75,7 @@ impl SkillExecutor {
         ))
     }
 
+    /// Executes skills through the shared tool invoker for every tool step.
     pub async fn execute_with_invoker<I>(
         &self,
         skill: &SkillDefinition,
@@ -296,5 +280,35 @@ Current weather in {{ steps[0].args.location }}: {{ steps[0].result.temperature 
 
         let result = executor.render_template_string(template, &ctx).unwrap();
         assert_eq!(result, "JAY");
+    }
+
+    #[tokio::test]
+    async fn direct_execute_rejects_tool_steps() {
+        let registry = LLMRegistry::new();
+        let mut tools = ToolRegistry::new();
+        tools
+            .register(Arc::new(ai_agents_tools::EchoTool::new()))
+            .unwrap();
+        let executor = SkillExecutor::new(Arc::new(registry), Arc::new(tools));
+        let skill = SkillDefinition {
+            id: "tool_skill".to_string(),
+            description: "Uses a tool".to_string(),
+            trigger: "test".to_string(),
+            steps: vec![SkillStep::Tool {
+                tool: "echo".to_string(),
+                args: Some(serde_json::json!({"message": "hello"})),
+                output_as: None,
+            }],
+            reasoning: None,
+            reflection: None,
+            disambiguation: None,
+        };
+
+        let error = executor
+            .execute(&skill, "hello", serde_json::json!({}))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("execute_with_invoker"));
     }
 }

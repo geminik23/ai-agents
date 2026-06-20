@@ -14,7 +14,7 @@ use rmcp::model as mcp_model;
 use rmcp::service::{Peer, RunningService};
 use rmcp::{RoleClient, ServiceExt};
 
-use ai_agents_core::{Tool, ToolResult};
+use ai_agents_core::{Tool, ToolExecutionContext, ToolPolicyBindings, ToolResult};
 
 /// A discovered function from an MCP server (name, description, schema).
 #[derive(Debug, Clone)]
@@ -479,7 +479,14 @@ impl Tool for MCPWrapperTool {
         self.schema.clone()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            operation_fields: vec!["function".to_string()],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         // Extract the `function` field from input
         let function = match args.get("function").and_then(|v| v.as_str()) {
             Some(f) => f.to_string(),
@@ -513,7 +520,11 @@ impl Tool for MCPWrapperTool {
             );
         }
 
-        self.call_function(&function, params).await
+        let mut result = self.call_function(&function, params).await;
+        let metadata = result.metadata.get_or_insert_with(HashMap::new);
+        metadata.insert("mcp_parent_id".to_string(), json!(ctx.canonical_id));
+        metadata.insert("mcp_function".to_string(), json!(function));
+        result
     }
 }
 

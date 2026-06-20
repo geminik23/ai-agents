@@ -3,10 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
+use ai_agents_hooks::AgentHooks;
 use ai_agents_observability::ObservabilityConfig;
 use ai_agents_observability::config::ExportFormat;
 use ai_agents_runtime::spec::{AgentSpec, LLMConfigOrSelector, StorageConfig};
 use ai_agents_runtime::{Agent, AgentBuilder, RuntimeAgent, StreamChunk};
+use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
 use tokio::time::{Duration, timeout};
@@ -26,6 +28,18 @@ use crate::suite::{
     Scenario, ScenarioResult, ScenarioStatus, ScenarioStep, Turn, TurnResult,
 };
 use crate::{EvalError, Result};
+
+/// Eval hook that records executor-level tool evidence, including non-executed attempts.
+struct EvalToolRecordHooks {
+    log: RecordingToolLog,
+}
+
+#[async_trait]
+impl AgentHooks for EvalToolRecordHooks {
+    async fn on_tool_execution_record(&self, record: &ai_agents_core::ToolExecutionRecord) {
+        self.log.push_executor_record(record);
+    }
+}
 
 /// Runtime options supplied by CLI or Rust callers.
 #[derive(Debug, Clone, Default)]
@@ -513,11 +527,12 @@ impl EvalRunner {
             .map_err(|error| EvalError::Config(error.to_string()))?;
         let (llm_registry, _judge_llm) =
             build_llm_registry(&spec, &self.suite.fixtures.llm, base_dir)?;
-        let tool_registry = build_tool_registry(&self.suite.fixtures, tool_log)?;
+        let tool_registry = build_tool_registry(&self.suite.fixtures, tool_log.clone())?;
         let mut builder = AgentBuilder::from_yaml_file(agent_path)
             .map_err(|error| EvalError::Config(error.to_string()))?
             .llm_registry(llm_registry)
             .tools(tool_registry)
+            .hooks(Arc::new(EvalToolRecordHooks { log: tool_log }))
             .auto_configure_features()
             .map_err(|error| EvalError::Config(error.to_string()))?
             .auto_configure_mcp()
@@ -867,29 +882,35 @@ impl Drop for EnvGuard {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn runner_executes_mocked_suite_and_redacts_outputs() {
-        let dir = std::env::temp_dir().join(format!(
-            "ai_agents_eval_runner_test_{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let agent_path = dir.join("agent.yaml");
-        std::fs::write(
-            &agent_path,
-            r#"
+    #[test]
+    fn runner_executes_mocked_suite_and_redacts_outputs() {
+        std::thread::Builder::new()
+            .name("eval-runner-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let dir = std::env::temp_dir().join(format!(
+                        "ai_agents_eval_runner_test_{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    let agent_path = dir.join("agent.yaml");
+                    std::fs::write(
+                        &agent_path,
+                        r#"
 name: TestAgent
 system_prompt: "You are helpful."
 llm:
   provider: openai
   model: gpt-4.1-nano
 "#,
-        )
-        .unwrap();
-        let suite_path = dir.join("suite.yaml");
-        std::fs::write(
-            &suite_path,
-            r#"
+                    )
+                    .unwrap();
+                    let suite_path = dir.join("suite.yaml");
+                    std::fs::write(
+                        &suite_path,
+                        r#"
 name: Runner Suite
 agent: agent.yaml
 fixtures:
@@ -904,20 +925,25 @@ scenarios:
         assert:
           response_contains: "Hello"
 "#,
-        )
-        .unwrap();
-        let options = EvalRunnerOptions {
-            output: dir.join("out"),
-            ..Default::default()
-        };
-        let runner = EvalRunner::from_file(&suite_path, options).unwrap();
-        let result = runner.run().await.unwrap();
-        assert_eq!(result.passed, 1);
-        let turn = &result.scenarios[0].attempts[0].turns[0];
-        assert_eq!(turn.input.value, "[redacted]");
-        assert_eq!(turn.response.value, "[redacted]");
-        let json = serde_json::to_string(&result).unwrap();
-        assert!(!json.contains("Hello from mock"));
-        let _ = std::fs::remove_dir_all(dir);
+                    )
+                    .unwrap();
+                    let options = EvalRunnerOptions {
+                        output: dir.join("out"),
+                        ..Default::default()
+                    };
+                    let runner = EvalRunner::from_file(&suite_path, options).unwrap();
+                    let result = runner.run().await.unwrap();
+                    assert_eq!(result.passed, 1);
+                    let turn = &result.scenarios[0].attempts[0].turns[0];
+                    assert_eq!(turn.input.value, "[redacted]");
+                    assert_eq!(turn.response.value, "[redacted]");
+                    let json = serde_json::to_string(&result).unwrap();
+                    assert!(!json.contains("Hello from mock"));
+                    let _ = std::fs::remove_dir_all(dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 }

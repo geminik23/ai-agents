@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// High-level operation category used for tool policy and scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -164,6 +166,415 @@ impl ToolCallClassification {
             timeout_ms: None,
             max_output_chars: metadata.max_output_chars,
         }
+    }
+}
+
+/// Effective tool limits derived from runtime defaults, policy, safety metadata, and call classification.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionLimits {
+    /// Maximum wall-clock execution time in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Maximum model-facing output characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_chars: Option<usize>,
+    /// Maximum stored result characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_result_chars: Option<usize>,
+    /// Maximum rows, matches, entries, or items returned by list-like tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+    /// Maximum local file bytes that a tool may read or inspect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_file_size_bytes: Option<u64>,
+    /// Maximum response bytes accepted from network tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<usize>,
+    /// Maximum redirect hops for network tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_redirects: Option<usize>,
+    /// Maximum files a future mutation tool may change in one call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_changed_files: Option<usize>,
+    /// Maximum changed lines a future mutation tool may produce in one call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_changed_lines: Option<usize>,
+}
+
+impl ToolExecutionLimits {
+    /// Returns a copy with each optional cap lowered by the matching cap from `other`.
+    pub fn lowered_by(mut self, other: &Self) -> Self {
+        self.timeout_ms = min_optional_u64(self.timeout_ms, other.timeout_ms);
+        self.max_output_chars = min_optional_usize(self.max_output_chars, other.max_output_chars);
+        self.max_result_chars = min_optional_usize(self.max_result_chars, other.max_result_chars);
+        self.max_results = min_optional_usize(self.max_results, other.max_results);
+        self.max_file_size_bytes =
+            min_optional_u64(self.max_file_size_bytes, other.max_file_size_bytes);
+        self.max_response_bytes =
+            min_optional_usize(self.max_response_bytes, other.max_response_bytes);
+        self.max_redirects = min_optional_usize(self.max_redirects, other.max_redirects);
+        self.max_changed_files =
+            min_optional_usize(self.max_changed_files, other.max_changed_files);
+        self.max_changed_lines =
+            min_optional_usize(self.max_changed_lines, other.max_changed_lines);
+        self
+    }
+}
+
+/// Turn actor and sender identity forwarded into tool execution.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolActorContext {
+    /// Effective actor ID used for memory and user-scoped evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<String>,
+    /// Original user, customer, player, or top-level actor for the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_actor_id: Option<String>,
+    /// Immediate agent sender for inter-agent hops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_agent_id: Option<String>,
+}
+
+/// Cooperative cancellation observer shared with a tool call.
+#[derive(Clone)]
+pub struct ToolCancellationToken {
+    cancelled: Arc<AtomicBool>,
+    reason: Option<String>,
+}
+
+impl std::fmt::Debug for ToolCancellationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolCancellationToken")
+            .field("cancelled", &self.is_cancelled())
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
+impl Default for ToolCancellationToken {
+    fn default() -> Self {
+        Self::new(Arc::new(AtomicBool::new(false)), None)
+    }
+}
+
+impl ToolCancellationToken {
+    /// Create a cancellation observer from shared runtime state.
+    pub fn new(cancelled: Arc<AtomicBool>, reason: Option<String>) -> Self {
+        Self { cancelled, reason }
+    }
+
+    /// Returns true when the runtime has requested cooperative cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Returns the current cancellation reason when one was provided.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+}
+
+/// Context passed unchanged from the shared executor into a tool implementation.
+#[derive(Debug, Clone)]
+pub struct ToolExecutionContext {
+    /// Tool name, alias, or display name requested by the caller.
+    pub requested_name: String,
+    /// Canonical tool ID used for policy, HITL, recovery, and evidence.
+    pub canonical_id: String,
+    /// Display name resolved from the registry.
+    pub display_name: String,
+    /// Provider ID for provider-backed tools.
+    pub provider_id: Option<String>,
+    /// Registry snapshot version used for this call.
+    pub registry_version: u64,
+    /// Policy snapshot version used for this call.
+    pub policy_version: u64,
+    /// Runtime-control snapshot version used for this call.
+    pub runtime_control_version: u64,
+    /// Stable call ID used in records and history.
+    pub call_id: String,
+    /// Runtime path that requested this call.
+    pub source: ToolCallSource,
+    /// Actor and sender identity for the current turn.
+    pub actor: ToolActorContext,
+    /// Cooperative cancellation observer.
+    pub cancellation: ToolCancellationToken,
+    /// UTC time at which shared executor handling started.
+    pub started_at: DateTime<Utc>,
+    /// UTC deadline derived from the timeout budget.
+    pub deadline: Option<DateTime<Utc>>,
+    /// Permission decision that allowed this call to reach the tool.
+    pub permission: ToolPolicyDecisionRecord,
+    /// HITL decision evidence when approval was checked.
+    pub approval: Option<ToolApprovalRecord>,
+    /// Call-level safety classification after arguments are known.
+    pub classification: ToolCallClassification,
+    /// Static tool safety metadata from the resolved registration.
+    pub safety: ToolSafetyMetadata,
+    /// Effective limits that tools must treat as upper bounds.
+    pub limits: ToolExecutionLimits,
+    /// Raw per-tool policy snapshot when the runtime is allowed to expose it.
+    pub policy_snapshot: Value,
+    /// Custom settings from tool_security.tools.<tool_id>.config.
+    pub custom_config: Value,
+}
+
+impl ToolExecutionContext {
+    /// Builds a minimal context for unit tests and direct examples.
+    pub fn test(tool_id: impl Into<String>) -> Self {
+        let tool_id = tool_id.into();
+        let started_at = Utc::now();
+        Self {
+            requested_name: tool_id.clone(),
+            canonical_id: tool_id.clone(),
+            display_name: tool_id.clone(),
+            provider_id: None,
+            registry_version: 0,
+            policy_version: 0,
+            runtime_control_version: 0,
+            call_id: "test-call".to_string(),
+            source: ToolCallSource::Manual,
+            actor: ToolActorContext::default(),
+            cancellation: ToolCancellationToken::default(),
+            started_at,
+            deadline: None,
+            permission: ToolPolicyDecisionRecord::allow(),
+            approval: None,
+            classification: ToolCallClassification::from_metadata(&ToolSafetyMetadata::compute()),
+            safety: ToolSafetyMetadata::compute(),
+            limits: ToolExecutionLimits::default(),
+            policy_snapshot: Value::Null,
+            custom_config: Value::Null,
+        }
+    }
+}
+
+/// Path access mode declared by a tool policy binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathAccessMode {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+/// Path argument role declared by a tool policy binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathBindingKind {
+    Path,
+    BasePath,
+    Cwd,
+    PatchBase,
+    MultiPath,
+}
+
+/// Declarative mapping from an input field to path policy checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathPolicyBinding {
+    /// Dot path to the argument field containing the path value.
+    pub field: String,
+    /// Access mode requested for the field.
+    pub mode: PathAccessMode,
+    /// Role of the path in the tool request.
+    pub kind: PathBindingKind,
+    /// Default value used when the field is omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_path: Option<String>,
+}
+
+impl PathPolicyBinding {
+    /// Declare a read-only path field.
+    pub fn read(field: impl Into<String>) -> Self {
+        Self::new(field, PathAccessMode::Read, PathBindingKind::Path)
+    }
+
+    /// Declare a write path field.
+    pub fn write(field: impl Into<String>) -> Self {
+        Self::new(field, PathAccessMode::Write, PathBindingKind::Path)
+    }
+
+    /// Declare a read-write path field.
+    pub fn read_write(field: impl Into<String>) -> Self {
+        Self::new(field, PathAccessMode::ReadWrite, PathBindingKind::Path)
+    }
+
+    /// Declare a path field with an explicit binding kind.
+    pub fn new(field: impl Into<String>, mode: PathAccessMode, kind: PathBindingKind) -> Self {
+        Self {
+            field: field.into(),
+            mode,
+            kind,
+            default_path: None,
+        }
+    }
+
+    /// Attach a default path used for policy checks when the field is absent.
+    pub fn with_default_path(mut self, default_path: impl Into<String>) -> Self {
+        self.default_path = Some(default_path.into());
+        self
+    }
+}
+
+/// Declarative mapping from an input field to URL or domain policy checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainPolicyBinding {
+    /// Dot path to the argument field containing a URL or host.
+    pub field: String,
+    /// True when the field is a full URL instead of a bare host.
+    pub is_url: bool,
+}
+
+impl DomainPolicyBinding {
+    /// Declare a URL field such as `url`.
+    pub fn url(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            is_url: true,
+        }
+    }
+
+    /// Declare a bare host or domain field.
+    pub fn host(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            is_url: false,
+        }
+    }
+}
+
+/// Command argument role declared by a tool policy binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandBindingKind {
+    CommandString,
+    Argv,
+    Cwd,
+    Env,
+    TemplateVariable,
+}
+
+/// Declarative mapping from an input field to command policy checks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandPolicyBinding {
+    /// Dot path to the argument field containing command data.
+    pub field: String,
+    /// Role of the command data in the request.
+    pub kind: CommandBindingKind,
+}
+
+impl CommandPolicyBinding {
+    /// Declare a command string field.
+    pub fn command(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            kind: CommandBindingKind::CommandString,
+        }
+    }
+
+    /// Declare an argv array field.
+    pub fn argv(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            kind: CommandBindingKind::Argv,
+        }
+    }
+}
+
+/// Limit kind declared by a result-limit policy binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultLimitKind {
+    MaxResults,
+    MaxLines,
+    MaxOutputChars,
+    MaxFileSizeBytes,
+    MaxResponseBytes,
+    MaxRedirects,
+    Pagination,
+}
+
+/// Declarative mapping from an input field to a common limit cap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResultLimitBinding {
+    /// Dot path to the argument field containing a numeric limit.
+    pub field: String,
+    /// Common limit applied to this field.
+    pub kind: ResultLimitKind,
+}
+
+impl ResultLimitBinding {
+    /// Declare a numeric cap field.
+    pub fn new(field: impl Into<String>, kind: ResultLimitKind) -> Self {
+        Self {
+            field: field.into(),
+            kind,
+        }
+    }
+}
+
+/// Tool-declared policy bindings used by the shared executor.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyBindings {
+    /// Path fields subject to path allow, deny, and approval policy.
+    #[serde(default)]
+    pub path_fields: Vec<PathPolicyBinding>,
+    /// URL or host fields subject to domain policy.
+    #[serde(default)]
+    pub domain_fields: Vec<DomainPolicyBinding>,
+    /// Command fields subject to command policy.
+    #[serde(default)]
+    pub command_fields: Vec<CommandPolicyBinding>,
+    /// Operation selector fields subject to operation policy.
+    #[serde(default)]
+    pub operation_fields: Vec<String>,
+    /// Request limit fields that should be capped by effective policy.
+    #[serde(default)]
+    pub result_limit_fields: Vec<ResultLimitBinding>,
+}
+
+impl ToolPolicyBindings {
+    /// Returns true when the tool exposes any path binding.
+    pub fn has_path_bindings(&self) -> bool {
+        !self.path_fields.is_empty()
+    }
+
+    /// Returns true when the tool exposes any URL or domain binding.
+    pub fn has_domain_bindings(&self) -> bool {
+        !self.domain_fields.is_empty()
+    }
+
+    /// Returns true when the tool exposes any command binding.
+    pub fn has_command_bindings(&self) -> bool {
+        !self.command_fields.is_empty()
+    }
+
+    /// Returns true when the tool exposes any operation selector binding.
+    pub fn has_operation_bindings(&self) -> bool {
+        !self.operation_fields.is_empty()
+    }
+
+    /// Returns true when the tool exposes any request limit binding.
+    pub fn has_result_limit_bindings(&self) -> bool {
+        !self.result_limit_fields.is_empty()
+    }
+}
+
+fn min_optional_usize(left: Option<usize>, right: Option<usize>) -> Option<usize> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
+    }
+}
+
+fn min_optional_u64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(left), None) => Some(left),
+        (None, Some(right)) => Some(right),
+        (None, None) => None,
     }
 }
 

@@ -2105,7 +2105,11 @@ tools:
             fn input_schema(&self) -> serde_json::Value {
                 serde_json::json!({})
             }
-            async fn execute(&self, _args: serde_json::Value) -> ai_agents_core::ToolResult {
+            async fn execute(
+                &self,
+                _args: serde_json::Value,
+                _ctx: ai_agents_core::ToolExecutionContext,
+            ) -> ai_agents_core::ToolResult {
                 ai_agents_core::ToolResult::ok("ok")
             }
         }

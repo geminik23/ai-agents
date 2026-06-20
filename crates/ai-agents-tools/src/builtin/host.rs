@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use ai_agents_core::{
-    Tool, ToolOperationKind, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
+    PathPolicyBinding, ResultLimitBinding, ResultLimitKind, Tool, ToolExecutionContext,
+    ToolOperationKind, ToolPolicyBindings, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
 use crate::generate_schema;
@@ -219,7 +220,18 @@ impl Tool for DiagnosticsTool {
         }
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("path").with_default_path(".")],
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_results",
+                ResultLimitKind::MaxResults,
+            )],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: DiagnosticsInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -231,7 +243,8 @@ impl Tool for DiagnosticsTool {
         let max_results = input
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
-            .min(DEFAULT_MAX_RESULTS * 5);
+            .min(DEFAULT_MAX_RESULTS * 5)
+            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS * 5));
         let provider = self.provider.read().clone();
         let response = provider
             .diagnostics(DiagnosticsRequest {
@@ -281,7 +294,11 @@ impl Tool for AskUserTool {
         }
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings::default()
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
         let input: AskUserInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -350,7 +367,14 @@ impl Tool for TodoTool {
         }
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            operation_fields: vec!["operation".to_string()],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, _ctx: ToolExecutionContext) -> ToolResult {
         let input: TodoInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
@@ -424,21 +448,27 @@ impl Tool for SleepTool {
         }
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings::default()
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let input: SleepInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
-        if input.duration_ms > DEFAULT_SLEEP_MAX_MS {
+        let max_duration_ms =
+            DEFAULT_SLEEP_MAX_MS.min(ctx.limits.timeout_ms.unwrap_or(DEFAULT_SLEEP_MAX_MS));
+        if input.duration_ms > max_duration_ms {
             return ToolResult::error(format!(
                 "duration_ms exceeds max_duration_ms {}",
-                DEFAULT_SLEEP_MAX_MS
+                max_duration_ms
             ));
         }
         tokio::time::sleep(Duration::from_millis(input.duration_ms)).await;
         let output = SleepOutput {
             slept_ms: input.duration_ms,
-            max_duration_ms: DEFAULT_SLEEP_MAX_MS,
+            max_duration_ms,
             reason: input.reason,
         };
         json_result(&output, None)
@@ -565,7 +595,10 @@ mod tests {
                 }])) as Arc<dyn crate::types::DiagnosticsProvider>,
             ));
         let result = DiagnosticsTool::new(provider)
-            .execute(serde_json::json!({"severity": "error"}))
+            .execute(
+                serde_json::json!({"severity": "error"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -577,11 +610,14 @@ mod tests {
     async fn ask_user_uses_default_without_handler() {
         let slot = Arc::new(RwLock::new(None));
         let result = AskUserTool::new(slot)
-            .execute(serde_json::json!({
-                "question": "Pick one",
-                "options": ["a", "b"],
-                "default": "a"
-            }))
+            .execute(
+                serde_json::json!({
+                    "question": "Pick one",
+                    "options": ["a", "b"],
+                    "default": "a"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
         let output = value(&result.output);
@@ -593,24 +629,33 @@ mod tests {
     async fn todo_set_update_and_clear() {
         let tool = TodoTool::new(TodoStore::default());
         let set = tool
-            .execute(serde_json::json!({
-                "operation": "set",
-                "items": [{"id": "a", "content": "Draft", "status": "pending"}]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "set",
+                    "items": [{"id": "a", "content": "Draft", "status": "pending"}]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(set.success);
         let update = tool
-            .execute(serde_json::json!({
-                "operation": "update",
-                "id": "a",
-                "status": "completed"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "update",
+                    "id": "a",
+                    "status": "completed"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(update.success);
         let output = value(&update.output);
         assert_eq!(output["items"][0]["status"], "completed");
         let clear = tool
-            .execute(serde_json::json!({"operation": "clear"}))
+            .execute(
+                serde_json::json!({"operation": "clear"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(clear.success);
         assert_eq!(value(&clear.output)["count"], 0);
@@ -619,7 +664,10 @@ mod tests {
     #[tokio::test]
     async fn sleep_rejects_over_cap() {
         let result = SleepTool::new()
-            .execute(serde_json::json!({"duration_ms": 30_001}))
+            .execute(
+                serde_json::json!({"duration_ms": 30_001}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }

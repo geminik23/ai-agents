@@ -14,9 +14,12 @@ pub use traits::memory::{Memory, MemorySnapshot};
 pub use traits::storage::{AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry};
 pub use traits::tool::{Tool, ToolInfo, ToolInvoker, ToolResult};
 pub use types::{
-    AgentInfo, AgentResponse, FactCategory, FactFilter, FinishReason, KeyFact, LLMChunk, LLMConfig,
-    LLMFeature, LLMResponse, PermissionOutcome, SessionFilter, SessionMetadata, SessionSummary,
-    StateMachineSnapshot, StateTransitionEvent, TokenUsage, ToolApprovalRecord, ToolApprovalStatus,
-    ToolCall, ToolCallClassification, ToolCallSource, ToolExecutionRecord, ToolExecutionRequest,
-    ToolOperationKind, ToolPolicyDecisionRecord, ToolSafetyMetadata, ToolSideEffectLevel,
+    AgentInfo, AgentResponse, CommandBindingKind, CommandPolicyBinding, DomainPolicyBinding,
+    FactCategory, FactFilter, FinishReason, KeyFact, LLMChunk, LLMConfig, LLMFeature, LLMResponse,
+    PathAccessMode, PathBindingKind, PathPolicyBinding, PermissionOutcome, ResultLimitBinding,
+    ResultLimitKind, SessionFilter, SessionMetadata, SessionSummary, StateMachineSnapshot,
+    StateTransitionEvent, TokenUsage, ToolActorContext, ToolApprovalRecord, ToolApprovalStatus,
+    ToolCall, ToolCallClassification, ToolCallSource, ToolCancellationToken, ToolExecutionContext,
+    ToolExecutionLimits, ToolExecutionRecord, ToolExecutionRequest, ToolOperationKind,
+    ToolPolicyBindings, ToolPolicyDecisionRecord, ToolSafetyMetadata, ToolSideEffectLevel,
 };

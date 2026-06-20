@@ -104,7 +104,7 @@ impl Tool for JsonTool {
         ToolSafetyMetadata::compute()
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input: JsonInput = match serde_json::from_value(args) {
             Ok(input) => input,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -386,10 +386,13 @@ mod tests {
     async fn test_parse_string() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "parse",
-                "data": "{\"name\": \"test\", \"value\": 42}"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "parse",
+                    "data": "{\"name\": \"test\", \"value\": 42}"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -403,10 +406,13 @@ mod tests {
     async fn test_parse_invalid() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "parse",
-                "data": "{invalid json}"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "parse",
+                    "data": "{invalid json}"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
@@ -415,11 +421,14 @@ mod tests {
     async fn test_get_simple() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "get",
-                "data": {"user": {"name": "Alice", "age": 30}},
-                "path": "user.name"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "get",
+                    "data": {"user": {"name": "Alice", "age": 30}},
+                    "path": "user.name"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -432,11 +441,14 @@ mod tests {
     async fn test_get_array_index() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "get",
-                "data": {"items": ["a", "b", "c"]},
-                "path": "items.1"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "get",
+                    "data": {"items": ["a", "b", "c"]},
+                    "path": "items.1"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -449,11 +461,14 @@ mod tests {
     async fn test_get_not_found() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "get",
-                "data": {"a": 1},
-                "path": "b.c.d"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "get",
+                    "data": {"a": 1},
+                    "path": "b.c.d"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -465,12 +480,15 @@ mod tests {
     async fn test_set_simple() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "set",
-                "data": {"user": {"name": "Alice"}},
-                "path": "user.age",
-                "value": 30
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "set",
+                    "data": {"user": {"name": "Alice"}},
+                    "path": "user.age",
+                    "value": 30
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -483,12 +501,15 @@ mod tests {
     async fn test_set_nested() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "set",
-                "data": {},
-                "path": "a.b.c",
-                "value": "deep"
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "set",
+                    "data": {},
+                    "path": "a.b.c",
+                    "value": "deep"
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -500,11 +521,14 @@ mod tests {
     async fn test_merge() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "merge",
-                "data": {"a": 1, "b": {"x": 10}},
-                "data2": {"b": {"y": 20}, "c": 3}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "merge",
+                    "data": {"a": 1, "b": {"x": 10}},
+                    "data2": {"b": {"y": 20}, "c": 3}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -519,11 +543,14 @@ mod tests {
     async fn test_stringify() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "stringify",
-                "data": {"name": "test"},
-                "pretty": false
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "stringify",
+                    "data": {"name": "test"},
+                    "pretty": false
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -535,10 +562,13 @@ mod tests {
     async fn test_keys() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "keys",
-                "data": {"a": 1, "b": 2, "c": 3}
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "keys",
+                    "data": {"a": 1, "b": 2, "c": 3}
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -553,10 +583,13 @@ mod tests {
     async fn test_values() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({
-                "operation": "values",
-                "data": [1, 2, 3]
-            }))
+            .execute(
+                serde_json::json!({
+                    "operation": "values",
+                    "data": [1, 2, 3]
+                }),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(result.success);
 
@@ -568,7 +601,10 @@ mod tests {
     async fn test_invalid_operation() {
         let tool = JsonTool::new();
         let result = tool
-            .execute(serde_json::json!({"operation": "invalid"}))
+            .execute(
+                serde_json::json!({"operation": "invalid"}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
             .await;
         assert!(!result.success);
     }
