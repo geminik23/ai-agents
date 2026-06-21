@@ -23,22 +23,27 @@ pub use condition::{
 pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderError};
 pub use registry::{ResolvedTool, ToolIdentity, ToolRegistry};
 pub use types::{
-    DiagnosticItem, DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot,
-    DiagnosticsRequest, DiagnosticsResponse, QuestionHandler, QuestionHandlerSlot, QuestionRequest,
-    QuestionResponse, StaticDiagnosticsProvider, TodoItem, TodoStatus, TodoStore, ToolAliases,
-    ToolContext, ToolMetadata, ToolProviderType, TrustLevel, UnavailableDiagnosticsProvider,
+    CommandRequest, CommandResponse, CommandRunner, CommandRunnerSlot, DiagnosticItem,
+    DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
+    DiagnosticsResponse, FileVersionEvidence, FileVersionStore, ProcessCommandRunner,
+    QuestionHandler, QuestionHandlerSlot, QuestionRequest, QuestionResponse, StaticCommandRunner,
+    StaticDiagnosticsProvider, TodoItem, TodoStatus, TodoStore, ToolAliases, ToolContext,
+    ToolMetadata, ToolProviderType, TrustLevel, UnavailableCommandRunner,
+    UnavailableDiagnosticsProvider, file_version_evidence,
 };
 
 pub use builtin::HttpTool;
 pub use builtin::{
-    AskUserTool, CalculatorTool, DateTimeTool, DiagnosticsTool, EchoTool, FileInfoTool,
-    FileListTool, FileReadTool, FileTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, JsonTool,
-    MathTool, RandomTool, SleepTool, TemplateTool, TextTool, TodoTool, WebFetchTool,
+    AskUserTool, CalculatorTool, CommandTool, DateTimeTool, DiagnosticsTool, EchoTool,
+    FileEditTool, FileInfoTool, FileListTool, FileReadTool, FileTool, FileWriteTool, GitDiffTool,
+    GitStatusTool, GlobTool, GrepTool, JsonTool, MathTool, PatchTool, RandomTool, SleepTool,
+    TemplateTool, TextTool, TodoTool, WebFetchTool,
 };
 
 pub use security::{
-    CommandPolicyConfig, DomainPolicyConfig, OperationPolicyConfig, PathPolicyConfig,
-    SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+    CommandPolicyConfig, CommandRuleConfig, CommandTemplateConfig, DomainPolicyConfig,
+    NoWritePolicyBehavior, OperationPolicyConfig, PathPolicyConfig, SecurityCheckResult,
+    ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
 };
 
 use schemars::JsonSchema;
@@ -92,9 +97,25 @@ pub fn create_builtin_registry() -> ToolRegistry {
     registry
         .register(Arc::new(GrepTool::new()))
         .expect("failed to register grep");
+    let file_versions = registry.file_version_store();
     registry
-        .register(Arc::new(FileReadTool::new()))
+        .register(Arc::new(FileReadTool::with_version_store(
+            file_versions.clone(),
+        )))
         .expect("failed to register file_read");
+    registry
+        .register(Arc::new(FileWriteTool::with_version_store(
+            file_versions.clone(),
+        )))
+        .expect("failed to register file_write");
+    registry
+        .register(Arc::new(FileEditTool::with_version_store(
+            file_versions.clone(),
+        )))
+        .expect("failed to register file_edit");
+    registry
+        .register(Arc::new(PatchTool::with_version_store(file_versions)))
+        .expect("failed to register patch");
     registry
         .register(Arc::new(FileListTool::new()))
         .expect("failed to register file_list");
@@ -126,6 +147,9 @@ pub fn create_builtin_registry() -> ToolRegistry {
             registry.web_fetch_extractor_slot(),
         )))
         .expect("failed to register web_fetch");
+    registry
+        .register(Arc::new(CommandTool::new(registry.command_runner_slot())))
+        .expect("failed to register command");
     registry
         .register(Arc::new(TextTool::new()))
         .expect("failed to register text");

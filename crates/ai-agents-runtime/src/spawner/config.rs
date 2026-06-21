@@ -181,7 +181,7 @@ pub async fn auto_configure_spawner(
         None => return Ok((builder, None)),
     };
 
-    let mut spawner = AgentSpawner::new();
+    let mut spawner = AgentSpawner::new().with_resource_locks(builder.shared_resource_locks());
 
     if spawner_config.shared_llms {
         if let Some(reg) = llm_registry {

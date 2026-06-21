@@ -15,6 +15,7 @@ use ai_agents_core::{
 };
 
 use crate::generate_schema;
+use crate::types::{FileVersionEvidence, FileVersionStore, file_version_evidence};
 
 const DEFAULT_MAX_RESULTS: usize = 200;
 const DEFAULT_MAX_FILE_BYTES: u64 = 1_048_576;
@@ -64,12 +65,19 @@ impl Default for GrepTool {
 }
 
 /// Reads bounded text slices from local files.
-pub struct FileReadTool;
+pub struct FileReadTool {
+    versions: FileVersionStore,
+}
 
 impl FileReadTool {
     /// Create a safe text file reader.
     pub fn new() -> Self {
-        Self
+        Self::with_version_store(FileVersionStore::default())
+    }
+
+    /// Create a safe text file reader backed by shared version storage.
+    pub fn with_version_store(versions: FileVersionStore) -> Self {
+        Self { versions }
     }
 }
 
@@ -259,6 +267,8 @@ struct FileReadOutput {
     truncated: bool,
     large_file: bool,
     encoding: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<FileVersionEvidence>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -712,6 +722,7 @@ impl Tool for FileReadTool {
                 truncated: true,
                 large_file: true,
                 encoding: "utf-8".to_string(),
+                version: None,
             };
             return json_result_with_caps(&output, true, None);
         }
@@ -724,7 +735,15 @@ impl Tool for FileReadTool {
         }
 
         match read_text_range(&path, start_line, effective_end, max_lines, max_bytes).await {
-            Ok(output) => json_result_with_caps(&output, output.truncated, None),
+            Ok(mut output) => {
+                if let Ok(bytes) = fs::read(&path) {
+                    if let Ok(version) = file_version_evidence(&path, &bytes) {
+                        self.versions.record(version.clone());
+                        output.version = Some(version);
+                    }
+                }
+                json_result_with_caps(&output, output.truncated, None)
+            }
             Err(error) => ToolResult::error(error),
         }
     }
@@ -1315,6 +1334,7 @@ async fn read_text_range(
         truncated,
         large_file: file_size > max_bytes,
         encoding: "utf-8".to_string(),
+        version: None,
     })
 }
 

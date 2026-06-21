@@ -10,6 +10,7 @@ use tracing::info;
 
 use crate::AgentBuilder;
 use crate::RuntimeAgent;
+use crate::runtime::ToolResourceLocks;
 use crate::spec::AgentSpec;
 use ai_agents_core::{AgentError, AgentStorage, Result};
 use ai_agents_llm::LLMRegistry;
@@ -86,6 +87,9 @@ pub struct AgentSpawner {
     /// Tool names that spawned agents are allowed to declare.
     allowed_tools: Option<Vec<String>>,
 
+    /// Shared resource locks inherited by spawned child agents.
+    resource_locks: Option<ToolResourceLocks>,
+
     /// Shared observability manager for spawned child agents.
     observability_manager: Option<Arc<ObservabilityManager>>,
 
@@ -107,6 +111,7 @@ impl AgentSpawner {
             name_prefix: None,
             templates: HashMap::new(),
             allowed_tools: None,
+            resource_locks: None,
             observability_manager: None,
             counter: AtomicU32::new(1),
             agent_count: AtomicU32::new(0),
@@ -180,6 +185,12 @@ impl AgentSpawner {
         self
     }
 
+    /// Share the parent's resource lock table with spawned agents.
+    pub fn with_resource_locks(mut self, locks: ToolResourceLocks) -> Self {
+        self.resource_locks = Some(locks);
+        self
+    }
+
     /// Share the parent's observability manager with spawned agents.
     pub fn with_observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
         self.observability_manager = Some(manager);
@@ -231,6 +242,9 @@ impl AgentSpawner {
 
         if let Some(ref manager) = self.observability_manager {
             builder = builder.observability(Arc::clone(manager));
+        }
+        if let Some(ref locks) = self.resource_locks {
+            builder = builder.with_shared_resource_locks(Arc::clone(locks));
         }
 
         // Shared storage with per-agent namespacing.

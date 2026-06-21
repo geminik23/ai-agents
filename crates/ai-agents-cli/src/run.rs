@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ai_agents::{
     AgentBuilder, LoggingHooks, RuntimeAgent,
     spec::{AgentSpec, CliPromptStyle},
+    tools::ProcessCommandRunner,
 };
 use anyhow::{Context, Result};
 
@@ -97,6 +98,7 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     // The TUI installs a channel-based subscriber inside run_tui().
 
     let agent = build_agent(&options.agent_path).await?;
+    agent.set_command_runner(Arc::new(ProcessCommandRunner));
     if !is_tui && std::io::stdin().is_terminal() {
         agent.set_question_handler(Some(CliQuestionHandler::new()));
     }

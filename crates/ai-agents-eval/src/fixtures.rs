@@ -17,8 +17,9 @@ use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
 use ai_agents_llm::{FinishReason, LLMRegistry};
 use ai_agents_runtime::spec::AgentSpec;
 use ai_agents_tools::{
-    DiagnosticItem, DiagnosticsProvider, StaticDiagnosticsProvider, ToolRegistry,
-    UnavailableDiagnosticsProvider, create_builtin_registry,
+    CommandResponse, DiagnosticItem, DiagnosticsProvider, StaticCommandRunner,
+    StaticDiagnosticsProvider, ToolRegistry, UnavailableDiagnosticsProvider,
+    create_builtin_registry,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -51,6 +52,9 @@ pub struct FixturesConfig {
     /// Optional mocked diagnostics returned by the diagnostics tool.
     #[serde(default)]
     pub diagnostics: Option<DiagnosticsFixtureConfig>,
+    /// Optional mocked command-runner responses for the command tool.
+    #[serde(default)]
+    pub commands: Option<CommandsFixtureConfig>,
 }
 
 /// Diagnostics fixture configuration for host-backed diagnostics.
@@ -62,6 +66,28 @@ pub struct DiagnosticsFixtureConfig {
     /// Deterministic diagnostics returned by the provider.
     #[serde(default)]
     pub items: Vec<DiagnosticItem>,
+}
+
+/// Command-runner fixture configuration for process-backed validation tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandsFixtureConfig {
+    /// Whether the command runner is available.
+    #[serde(default = "default_true")]
+    pub available: bool,
+    /// Deterministic exact-argv command responses.
+    #[serde(default)]
+    pub entries: Vec<CommandFixtureEntry>,
+}
+
+/// One exact-argv mocked command response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandFixtureEntry {
+    /// Full argv vector used for exact matching.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Mocked command response returned to the tool.
+    #[serde(default)]
+    pub response: CommandResponse,
 }
 
 /// Static output configuration for an eval mock tool.
@@ -245,6 +271,7 @@ impl RecordingToolLog {
             actor_id: None,
             arguments_original: record.arguments.clone(),
             arguments_executed: record.executed_arguments.clone(),
+            executed: record.executed,
             success: record.success,
             output,
             error: (!record.success).then_some(record.output.clone()),
@@ -423,6 +450,20 @@ pub fn build_tool_registry(
     };
     builtin.set_diagnostics_provider(provider.clone());
     registry.set_diagnostics_provider(provider);
+
+    if let Some(commands) = &fixtures.commands {
+        let responses = commands
+            .entries
+            .iter()
+            .map(|entry| (entry.argv.clone(), entry.response.clone()))
+            .collect();
+        let runner = Arc::new(StaticCommandRunner::with_availability(
+            responses,
+            commands.available,
+        ));
+        builtin.set_command_runner(runner.clone());
+        registry.set_command_runner(runner);
+    }
 
     for (id, mock) in &fixtures.tools {
         registry

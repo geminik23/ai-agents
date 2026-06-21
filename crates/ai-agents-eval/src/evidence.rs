@@ -44,6 +44,9 @@ pub struct ToolExecutionRecord {
     pub arguments_original: Value,
     /// Arguments passed to the wrapped tool.
     pub arguments_executed: Value,
+    /// Whether the wrapped tool implementation was invoked.
+    #[serde(default = "default_executed_true")]
+    pub executed: bool,
     /// Whether the operation succeeded.
     pub success: bool,
     /// Directory where output artifacts are written.
@@ -62,6 +65,10 @@ pub struct ToolExecutionRecord {
     /// Optional observability span ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observability_span_id: Option<String>,
+}
+
+fn default_executed_true() -> bool {
+    true
 }
 
 /// Skill routing evidence inferred or reported for a turn.

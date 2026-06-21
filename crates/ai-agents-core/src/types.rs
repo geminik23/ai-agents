@@ -151,6 +151,8 @@ pub struct ToolCallClassification {
     pub timeout_ms: Option<u64>,
     /// Optional output cap for this call.
     pub max_output_chars: Option<usize>,
+    /// True when retrying the same call cannot repeat side effects.
+    pub safely_retryable: bool,
 }
 
 impl ToolCallClassification {
@@ -165,6 +167,7 @@ impl ToolCallClassification {
             requires_approval: metadata.default_requires_approval,
             timeout_ms: None,
             max_output_chars: metadata.max_output_chars,
+            safely_retryable: metadata.read_only,
         }
     }
 }
@@ -193,6 +196,9 @@ pub struct ToolExecutionLimits {
     /// Maximum redirect hops for network tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_redirects: Option<usize>,
+    /// Maximum exact replacements a mutation tool may perform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_replacements: Option<usize>,
     /// Maximum files a future mutation tool may change in one call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_changed_files: Option<usize>,
@@ -213,6 +219,7 @@ impl ToolExecutionLimits {
         self.max_response_bytes =
             min_optional_usize(self.max_response_bytes, other.max_response_bytes);
         self.max_redirects = min_optional_usize(self.max_redirects, other.max_redirects);
+        self.max_replacements = min_optional_usize(self.max_replacements, other.max_replacements);
         self.max_changed_files =
             min_optional_usize(self.max_changed_files, other.max_changed_files);
         self.max_changed_lines =
@@ -479,6 +486,22 @@ impl CommandPolicyBinding {
             kind: CommandBindingKind::Argv,
         }
     }
+
+    /// Declare a command working-directory field.
+    pub fn cwd(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            kind: CommandBindingKind::Cwd,
+        }
+    }
+
+    /// Declare a command environment object field.
+    pub fn env(field: impl Into<String>) -> Self {
+        Self {
+            field: field.into(),
+            kind: CommandBindingKind::Env,
+        }
+    }
 }
 
 /// Limit kind declared by a result-limit policy binding.
@@ -491,6 +514,9 @@ pub enum ResultLimitKind {
     MaxFileSizeBytes,
     MaxResponseBytes,
     MaxRedirects,
+    MaxReplacements,
+    MaxChangedFiles,
+    MaxChangedLines,
     Pagination,
 }
 

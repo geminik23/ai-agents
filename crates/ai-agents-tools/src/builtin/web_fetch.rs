@@ -255,16 +255,31 @@ impl Tool for WebFetchTool {
                     .unwrap_or(DEFAULT_MAX_REDIRECTS * 4),
             );
         let cache_ttl = input.cache_ttl_seconds.unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
+
+        let original_url = match reqwest::Url::parse(&input.url) {
+            Ok(url) => url,
+            Err(error) => return ToolResult::error(format!("Invalid URL: {}", error)),
+        };
+        if let Err(result) = validate_url_with_policy(&original_url, Some(&policy)).await {
+            return result;
+        }
         let cache_key = format!(
-            "{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}",
             input.url,
             input.prompt.as_deref().unwrap_or(""),
             max_output_chars,
-            max_response_bytes
+            max_response_bytes,
+            policy_cache_fingerprint(&policy)
         );
         if cache_ttl > 0 {
-            if let Some(entry) = self.cache.read().get(&cache_key).cloned() {
+            let cached_entry = { self.cache.read().get(&cache_key).cloned() };
+            if let Some(entry) = cached_entry {
                 if Instant::now() < entry.expires_at {
+                    if let Err(result) =
+                        validate_cached_output_with_policy(&entry.output, &policy).await
+                    {
+                        return result;
+                    }
                     let mut output = entry.output;
                     output.from_cache = true;
                     return web_result(&output, output.truncated, max_output_chars, true, None);
@@ -272,10 +287,6 @@ impl Tool for WebFetchTool {
             }
         }
 
-        let original_url = match reqwest::Url::parse(&input.url) {
-            Ok(url) => url,
-            Err(error) => return ToolResult::error(format!("Invalid URL: {}", error)),
-        };
         let mut current_url = original_url.clone();
         let mut redirects = Vec::new();
         if let Err(result) = validate_url_with_policy(&current_url, Some(&policy)).await {
@@ -427,6 +438,38 @@ async fn validate_url_with_policy(
         check_configured_url_policy(url, policy)?;
     }
     Ok(())
+}
+
+async fn validate_cached_output_with_policy(
+    output: &WebFetchOutput,
+    policy: &WebFetchPolicyInput,
+) -> Result<(), ToolResult> {
+    let final_url = reqwest::Url::parse(&output.final_url)
+        .map_err(|error| ToolResult::error(format!("Cached final URL is invalid: {}", error)))?;
+    validate_url_with_policy(&final_url, Some(policy)).await?;
+    for redirect in &output.redirects {
+        let url = reqwest::Url::parse(redirect).map_err(|error| {
+            ToolResult::error(format!("Cached redirect URL is invalid: {}", error))
+        })?;
+        validate_url_with_policy(&url, Some(policy)).await?;
+    }
+    Ok(())
+}
+
+fn policy_cache_fingerprint(policy: &WebFetchPolicyInput) -> String {
+    serde_json::json!({
+        "allowed_domains": policy.allowed_domains,
+        "blocked_domains": policy.blocked_domains,
+        "domain_allow": policy.domain_allow,
+        "domain_deny": policy.domain_deny,
+        "domain_requires_approval": policy.domain_requires_approval,
+        "domain_unavailable": policy.domain_unavailable,
+        "allowed_schemes": policy.allowed_schemes,
+        "allowed_ports": policy.allowed_ports,
+        "blocked_private_networks": policy.blocked_private_networks,
+        "max_redirects": policy.max_redirects,
+    })
+    .to_string()
 }
 
 async fn validate_url(url: &reqwest::Url) -> Result<(), ToolResult> {

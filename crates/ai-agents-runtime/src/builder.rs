@@ -31,7 +31,7 @@ use ai_agents_tools::{ToolRegistry, ToolSecurityEngine, create_builtin_registry}
 
 use super::AgentInfo;
 use super::StreamingConfig;
-use super::runtime::RuntimeAgent;
+use super::runtime::{RuntimeAgent, ToolResourceLocks};
 use crate::spec::{AgentSpec, StorageConfig};
 
 fn feature_overrides_from_config(config: &crate::spec::LLMConfig) -> HashMap<LLMFeature, bool> {
@@ -120,6 +120,7 @@ pub struct AgentBuilder {
     persona_manager: Option<Arc<ai_agents_persona::PersonaManager>>,
     persona_templates: Option<Arc<ai_agents_persona::PersonaTemplateRegistry>>,
     observability_manager: Option<Arc<ObservabilityManager>>,
+    resource_locks: Option<ToolResourceLocks>,
     llm_registry_observed: bool,
 }
 
@@ -159,6 +160,7 @@ impl AgentBuilder {
             persona_manager: None,
             persona_templates: None,
             observability_manager: None,
+            resource_locks: None,
             llm_registry_observed: false,
         }
     }
@@ -204,6 +206,7 @@ impl AgentBuilder {
             persona_manager: None,
             persona_templates: None,
             observability_manager: None,
+            resource_locks: None,
             llm_registry_observed: false,
         }
     }
@@ -212,6 +215,17 @@ impl AgentBuilder {
         let spec: AgentSpec = serde_yaml::from_str(yaml_content)?;
         spec.validate()?;
         Ok(Self::from_spec(spec))
+    }
+
+    pub(crate) fn shared_resource_locks(&mut self) -> ToolResourceLocks {
+        self.resource_locks
+            .get_or_insert_with(|| Arc::new(parking_lot::RwLock::new(HashMap::new())))
+            .clone()
+    }
+
+    pub(crate) fn with_shared_resource_locks(mut self, locks: ToolResourceLocks) -> Self {
+        self.resource_locks = Some(locks);
+        self
     }
 
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -785,6 +799,7 @@ impl AgentBuilder {
         if let Some(ref manager) = observability_manager {
             spawner = spawner.with_observability(Arc::clone(manager));
         }
+        spawner = spawner.with_resource_locks(self.shared_resource_locks());
 
         if spawner_config.shared_llms {
             if let Some(ref reg) = self.llm_registry {
@@ -898,6 +913,7 @@ impl AgentBuilder {
                     if let Some(ref manager) = observability_manager {
                         sub_builder = sub_builder.observability(Arc::clone(manager));
                     }
+                    sub_builder.resource_locks = Some(self.shared_resource_locks());
                     match sub_builder
                         .auto_configure_llms()
                         .and_then(|b| b.auto_configure_features())
@@ -986,6 +1002,7 @@ impl AgentBuilder {
     }
 
     pub fn build(mut self) -> Result<RuntimeAgent> {
+        let resource_locks = self.shared_resource_locks();
         // Capture actor memory and facts configs before partial moves of spec consume fields.
         let actor_memory_config = self
             .spec
@@ -1291,6 +1308,7 @@ impl AgentBuilder {
             system_prompt,
             max_iterations,
         )
+        .with_shared_resource_locks(resource_locks)
         .with_declared_tool_ids(declared_tool_ids);
 
         if let Some(tokens) = self.max_context_tokens {

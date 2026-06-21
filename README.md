@@ -17,14 +17,14 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Safety by default - tool policies, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.15** — Under active development. Stable `v1.0.0` is planned for release by mid-July 2026 at the latest. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.15** — Under active development. Stable `v1.0.0` is planned for release before August 1, 2026. APIs and YAML schema may change between minor versions.
 
 ## Features
 
 - **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
-- **Built-in tools + MCP** - calculator, datetime, echo, file, glob, grep, file_read, file_list, file_info, git_status, git_diff, diagnostics, ask_user, todo, sleep, web_fetch, JSON, text, template, math, random, and HTTP; connect any MCP server for hundreds more
-- **Tool scoping, policy, and context** - explicit top-level tool grants, state-level narrowing, policy bindings, effective execution limits, context-aware custom tools, multi-language aliases, safe parallel execution
+- **Built-in tools + MCP** - calculator, datetime, echo, file, glob, grep, file_read, file_write, file_edit, file_list, file_info, patch, git_status, git_diff, diagnostics, ask_user, todo, sleep, web_fetch, command, JSON, text, template, math, random, and HTTP; connect any MCP server for hundreds more
+- **Tool scoping, policy, and context** - explicit top-level tool grants, state-level narrowing, policy bindings, effective execution limits, context-aware custom tools, read-before-write guards, command allowlists, multi-language aliases, and safe parallel execution
 - **Input/output process pipeline** - normalize, detect, extract, sanitize, validate, transform, format - all LLM-based, works across languages
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
 - **Memory stack** - CompactingMemory, token budgeting, SQLite/Redis/file persistence, session metadata, actor facts, and relationship memory
@@ -56,7 +56,7 @@ name: MyAgent
 system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 
 # For any OpenAI-compatible server:
 # llm:
@@ -111,7 +111,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> ai_agents::Result<()> {
-    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
+    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-5.4-nano")?;
 
     let agent = AgentBuilder::new()
         .system_prompt("You are a helpful assistant.")

@@ -30,6 +30,38 @@ impl Default for ToolSecurityConfig {
     }
 }
 
+/// Behavior when a mutation tool has no explicit write policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NoWritePolicyBehavior {
+    Deny,
+    DryRunOnly,
+}
+
+impl Default for NoWritePolicyBehavior {
+    fn default() -> Self {
+        Self::DryRunOnly
+    }
+}
+
+/// Exact argv command allowed by command policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandRuleConfig {
+    /// Full argv vector, including executable name.
+    #[serde(default)]
+    pub argv: Vec<String>,
+}
+
+/// Argv command template with literal and wildcard variable segments.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandTemplateConfig {
+    /// Template name used in evidence and diagnostics.
+    pub name: String,
+    /// Argv segments. Values in {braces} are template variables.
+    #[serde(default)]
+    pub argv: Vec<String>,
+}
+
 /// Per-tool policy configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolPolicyConfig {
@@ -39,6 +71,9 @@ pub struct ToolPolicyConfig {
     /// Requires approval for this tool after hard denials pass.
     #[serde(default, alias = "require_approval")]
     pub require_confirmation: bool,
+    /// Explicitly permits side-effecting calls to skip classification-default approval.
+    #[serde(default)]
+    pub allow_without_confirmation: bool,
     /// Message shown when tool-level approval is required.
     #[serde(default)]
     pub confirmation_message: Option<String>,
@@ -96,6 +131,45 @@ pub struct ToolPolicyConfig {
     /// Maximum changed lines a mutation tool may produce.
     #[serde(default)]
     pub max_changed_lines: Option<usize>,
+    /// Maximum exact replacements a mutation tool may perform.
+    #[serde(default)]
+    pub max_replacements: Option<usize>,
+    /// Requires a matching file-read version before mutating an existing file.
+    #[serde(default)]
+    pub require_read_before_write: bool,
+    /// Allows overwriting existing files for mutation tools.
+    #[serde(default)]
+    pub overwrite_existing: bool,
+    /// Allows mutation tools to create missing parent directories.
+    #[serde(default)]
+    pub create_parent_dirs: bool,
+    /// Behavior when no write_paths allowlist is configured.
+    #[serde(default)]
+    pub no_write_policy: NoWritePolicyBehavior,
+    /// Exact argv allowlist for the command tool.
+    #[serde(default)]
+    pub allowed_commands: Vec<CommandRuleConfig>,
+    /// Argv templates for the command tool.
+    #[serde(default)]
+    pub command_templates: Vec<CommandTemplateConfig>,
+    /// Working directories allowed for command execution.
+    #[serde(default)]
+    pub working_dirs: Vec<String>,
+    /// Environment variables that may be passed from tool arguments.
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    /// Environment variables redacted from evidence.
+    #[serde(default)]
+    pub redact_env: Vec<String>,
+    /// Reject shell-like command strings and metacharacters.
+    #[serde(default = "default_true")]
+    pub deny_shell: bool,
+    /// Reject interactive command execution.
+    #[serde(default = "default_true")]
+    pub deny_interactive: bool,
+    /// Allows approval-based command escalation beyond the allowlist.
+    #[serde(default)]
+    pub allow_command_escalation: bool,
     /// Parsed domain policy.
     #[serde(default)]
     pub domains: DomainPolicyConfig,
@@ -118,6 +192,7 @@ impl Default for ToolPolicyConfig {
         Self {
             enabled: true,
             require_confirmation: false,
+            allow_without_confirmation: false,
             confirmation_message: None,
             rate_limit: None,
             timeout_ms: None,
@@ -137,6 +212,19 @@ impl Default for ToolPolicyConfig {
             max_redirects: None,
             max_changed_files: None,
             max_changed_lines: None,
+            max_replacements: None,
+            require_read_before_write: false,
+            overwrite_existing: false,
+            create_parent_dirs: false,
+            no_write_policy: NoWritePolicyBehavior::default(),
+            allowed_commands: Vec::new(),
+            command_templates: Vec::new(),
+            working_dirs: Vec::new(),
+            env_passthrough: Vec::new(),
+            redact_env: Vec::new(),
+            deny_shell: true,
+            deny_interactive: true,
+            allow_command_escalation: false,
             domains: DomainPolicyConfig::default(),
             paths: PathPolicyConfig::default(),
             commands: CommandPolicyConfig::default(),
@@ -172,8 +260,8 @@ pub struct PathPolicyConfig {
     pub unavailable: Vec<String>,
 }
 
-/// Command allow, deny, approval, and unavailable policy lists.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// Command allow, deny, approval, unavailable, and typed execution policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandPolicyConfig {
     #[serde(default)]
     pub allow: Vec<String>,
@@ -183,6 +271,38 @@ pub struct CommandPolicyConfig {
     pub requires_approval: Vec<String>,
     #[serde(default)]
     pub unavailable: Vec<String>,
+    #[serde(default)]
+    pub allowed_commands: Vec<CommandRuleConfig>,
+    #[serde(default)]
+    pub templates: Vec<CommandTemplateConfig>,
+    #[serde(default)]
+    pub working_dirs: Vec<String>,
+    #[serde(default)]
+    pub env_passthrough: Vec<String>,
+    #[serde(default = "default_true")]
+    pub deny_shell: bool,
+    #[serde(default = "default_true")]
+    pub deny_interactive: bool,
+    #[serde(default)]
+    pub allow_escalation: bool,
+}
+
+impl Default for CommandPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            requires_approval: Vec::new(),
+            unavailable: Vec::new(),
+            allowed_commands: Vec::new(),
+            templates: Vec::new(),
+            working_dirs: Vec::new(),
+            env_passthrough: Vec::new(),
+            deny_shell: true,
+            deny_interactive: true,
+            allow_escalation: false,
+        }
+    }
 }
 
 /// Operation allow, deny, approval, and unavailable policy lists.

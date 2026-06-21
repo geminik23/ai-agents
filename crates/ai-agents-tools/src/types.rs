@@ -3,8 +3,13 @@ use parking_lot::RwLock;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::Digest;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +188,84 @@ impl ToolContext {
         self.language = Some(language.into());
         self
     }
+}
+
+/// Version evidence captured when file contents are read.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct FileVersionEvidence {
+    /// Normalized file path used as the version key.
+    pub path: String,
+    /// SHA-256 hash of the observed file bytes.
+    pub sha256: String,
+    /// File size in bytes at observation time.
+    pub size_bytes: u64,
+    /// Modified timestamp as milliseconds since Unix epoch when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_unix_ms: Option<u128>,
+}
+
+/// Session-local file version store used for read-before-write checks.
+#[derive(Clone, Default)]
+pub struct FileVersionStore {
+    inner: Arc<RwLock<HashMap<String, FileVersionEvidence>>>,
+}
+
+impl FileVersionStore {
+    /// Record a file version under its normalized path key.
+    pub fn record(&self, evidence: FileVersionEvidence) {
+        self.inner.write().insert(evidence.path.clone(), evidence);
+    }
+
+    /// Return the version evidence stored for a path.
+    pub fn get(&self, path: impl AsRef<Path>) -> Option<FileVersionEvidence> {
+        let key = normalize_version_path(path.as_ref());
+        self.inner.read().get(&key).cloned()
+    }
+
+    /// Return true when the stored version matches the supplied evidence.
+    pub fn matches(&self, evidence: &FileVersionEvidence) -> bool {
+        self.inner
+            .read()
+            .get(&evidence.path)
+            .is_some_and(|stored| stored == evidence)
+    }
+}
+
+/// Build file version evidence from observed bytes and metadata.
+pub fn file_version_evidence(
+    path: impl AsRef<Path>,
+    bytes: &[u8],
+) -> std::io::Result<FileVersionEvidence> {
+    let path = path.as_ref();
+    let metadata = std::fs::metadata(path)?;
+    let modified_unix_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis());
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, bytes);
+    let hash = sha2::Digest::finalize(hasher);
+    Ok(FileVersionEvidence {
+        path: normalize_version_path(path),
+        sha256: format!("{:x}", hash),
+        size_bytes: metadata.len(),
+        modified_unix_ms,
+    })
+}
+
+fn normalize_version_path(path: &Path) -> String {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    path.components()
+        .collect::<PathBuf>()
+        .to_string_lossy()
+        .to_string()
 }
 
 /// Shared slot used by `ask_user` to find the active host handler.
@@ -399,6 +482,370 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
 
 /// Shared slot used by `diagnostics` to find the active provider.
 pub type DiagnosticsProviderSlot = Arc<RwLock<Arc<dyn DiagnosticsProvider>>>;
+
+/// Request sent to a host command runner.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct CommandRequest {
+    /// Full argv vector, including executable name.
+    pub argv: Vec<String>,
+    /// Working directory for process execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Environment variables explicitly supplied by policy.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Max runtime in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    /// Max combined output characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_chars: Option<usize>,
+    /// User-visible reason for the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Result returned by a host command runner.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct CommandResponse {
+    /// Whether the process completed with exit code 0.
+    pub success: bool,
+    /// Process exit code when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Termination reason: exited, timeout, cancelled, unavailable, or error.
+    pub termination: String,
+    /// Captured stdout after truncation.
+    #[serde(default)]
+    pub stdout: String,
+    /// Captured stderr after truncation.
+    #[serde(default)]
+    pub stderr: String,
+    /// Captured stdout and stderr after truncation.
+    #[serde(default)]
+    pub combined_output: String,
+    /// True when output was truncated.
+    #[serde(default)]
+    pub truncated: bool,
+    /// True when the timeout ended the command.
+    #[serde(default)]
+    pub timed_out: bool,
+    /// Working directory used for execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Redacted argv evidence.
+    #[serde(default)]
+    pub argv_redacted: Vec<String>,
+}
+
+/// Host bridge for controlled command execution.
+#[async_trait]
+pub trait CommandRunner: Send + Sync {
+    /// Return whether this runner can execute commands now.
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    /// Run a command request and return bounded output evidence.
+    async fn run_command(
+        &self,
+        request: CommandRequest,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> CommandResponse;
+}
+
+/// Command runner used when no host installed process execution.
+#[derive(Debug, Default)]
+pub struct UnavailableCommandRunner;
+
+#[async_trait]
+impl CommandRunner for UnavailableCommandRunner {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn run_command(
+        &self,
+        request: CommandRequest,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> CommandResponse {
+        CommandResponse {
+            success: false,
+            termination: "unavailable".to_string(),
+            cwd: request.cwd,
+            argv_redacted: redact_argv(&request.argv),
+            ..CommandResponse::default()
+        }
+    }
+}
+
+/// Static command runner used by tests and eval fixtures.
+#[derive(Debug, Clone, Default)]
+pub struct StaticCommandRunner {
+    responses: HashMap<Vec<String>, CommandResponse>,
+    available: bool,
+}
+
+impl StaticCommandRunner {
+    /// Create a deterministic runner from exact argv responses.
+    pub fn new(responses: HashMap<Vec<String>, CommandResponse>) -> Self {
+        Self {
+            responses,
+            available: true,
+        }
+    }
+
+    /// Create a deterministic runner with explicit availability.
+    pub fn with_availability(
+        responses: HashMap<Vec<String>, CommandResponse>,
+        available: bool,
+    ) -> Self {
+        Self {
+            responses,
+            available,
+        }
+    }
+}
+
+#[async_trait]
+impl CommandRunner for StaticCommandRunner {
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    async fn run_command(
+        &self,
+        request: CommandRequest,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> CommandResponse {
+        if !self.available {
+            return CommandResponse {
+                success: false,
+                termination: "unavailable".to_string(),
+                cwd: request.cwd,
+                argv_redacted: redact_argv(&request.argv),
+                ..CommandResponse::default()
+            };
+        }
+        self.responses
+            .get(&request.argv)
+            .cloned()
+            .unwrap_or_else(|| CommandResponse {
+                success: false,
+                exit_code: Some(127),
+                termination: "not_found".to_string(),
+                stderr: "mock command not found".to_string(),
+                combined_output: "mock command not found".to_string(),
+                cwd: request.cwd,
+                argv_redacted: redact_argv(&request.argv),
+                ..CommandResponse::default()
+            })
+    }
+}
+
+/// Process-backed command runner for CLI and trusted hosts.
+#[derive(Debug, Clone, Default)]
+pub struct ProcessCommandRunner;
+
+#[async_trait]
+impl CommandRunner for ProcessCommandRunner {
+    async fn run_command(
+        &self,
+        request: CommandRequest,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> CommandResponse {
+        if request.argv.is_empty() {
+            return CommandResponse {
+                success: false,
+                termination: "error".to_string(),
+                stderr: "argv must not be empty".to_string(),
+                combined_output: "argv must not be empty".to_string(),
+                cwd: request.cwd,
+                argv_redacted: Vec::new(),
+                ..CommandResponse::default()
+            };
+        }
+        let mut command = tokio::process::Command::new(&request.argv[0]);
+        command.args(&request.argv[1..]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear();
+        command.kill_on_drop(true);
+        if let Some(cwd) = &request.cwd {
+            command.current_dir(cwd);
+        }
+        for (key, value) in &request.env {
+            command.env(key, value);
+        }
+        let timeout_ms = request
+            .timeout_ms
+            .or(ctx.limits.timeout_ms)
+            .unwrap_or(30_000);
+        let max_output_chars = request
+            .max_output_chars
+            .or(ctx.limits.max_output_chars)
+            .unwrap_or(20_000);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                return CommandResponse {
+                    success: false,
+                    termination: "error".to_string(),
+                    stderr: error.to_string(),
+                    combined_output: error.to_string(),
+                    cwd: request.cwd,
+                    argv_redacted: redact_argv(&request.argv),
+                    ..CommandResponse::default()
+                };
+            }
+        };
+        let output_byte_cap = max_output_chars.saturating_mul(4).max(1);
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let stdout_task = tokio::spawn(read_pipe_bounded(stdout, output_byte_cap));
+        let stderr_task = tokio::spawn(read_pipe_bounded(stderr, output_byte_cap));
+        let status = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await;
+        match status {
+            Ok(Ok(status)) => {
+                let (stdout, stdout_truncated) = stdout_task.await.unwrap_or_default();
+                let (stderr, stderr_truncated) = stderr_task.await.unwrap_or_default();
+                command_output_response(
+                    status,
+                    stdout,
+                    stderr,
+                    stdout_truncated || stderr_truncated,
+                    request,
+                    max_output_chars,
+                )
+            }
+            Ok(Err(error)) => CommandResponse {
+                success: false,
+                termination: "error".to_string(),
+                stderr: error.to_string(),
+                combined_output: error.to_string(),
+                cwd: request.cwd,
+                argv_redacted: redact_argv(&request.argv),
+                ..CommandResponse::default()
+            },
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                stdout_task.abort();
+                stderr_task.abort();
+                let message = "command timed out; process cleanup requested".to_string();
+                CommandResponse {
+                    success: false,
+                    termination: "timeout".to_string(),
+                    stderr: message.clone(),
+                    combined_output: message,
+                    timed_out: true,
+                    cwd: request.cwd,
+                    argv_redacted: redact_argv(&request.argv),
+                    ..CommandResponse::default()
+                }
+            }
+        }
+    }
+}
+
+/// Shared slot used by `command` to find the active host runner.
+pub type CommandRunnerSlot = Arc<RwLock<Arc<dyn CommandRunner>>>;
+
+async fn read_pipe_bounded<R>(pipe: Option<R>, max_bytes: usize) -> (Vec<u8>, bool)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let Some(mut pipe) = pipe else {
+        return (Vec::new(), false);
+    };
+    let mut output = Vec::new();
+    let mut truncated = false;
+    let mut buffer = vec![0u8; 8192];
+    loop {
+        let read = match pipe.read(&mut buffer).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        let remaining = max_bytes.saturating_sub(output.len());
+        if remaining > 0 {
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        if read > remaining {
+            truncated = true;
+        }
+    }
+    (output, truncated)
+}
+
+fn command_output_response(
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    pre_truncated: bool,
+    request: CommandRequest,
+    max_output_chars: usize,
+) -> CommandResponse {
+    let stdout = String::from_utf8_lossy(&stdout).to_string();
+    let stderr = String::from_utf8_lossy(&stderr).to_string();
+    let combined = if stderr.is_empty() {
+        stdout.clone()
+    } else if stdout.is_empty() {
+        stderr.clone()
+    } else {
+        format!("{}\n{}", stdout, stderr)
+    };
+    let (stdout, stdout_truncated) = truncate_chars(stdout, max_output_chars);
+    let (stderr, stderr_truncated) = truncate_chars(stderr, max_output_chars);
+    let (combined_output, combined_truncated) = truncate_chars(combined, max_output_chars);
+    CommandResponse {
+        success: status.success(),
+        exit_code: status.code(),
+        termination: "exited".to_string(),
+        stdout,
+        stderr,
+        combined_output,
+        truncated: pre_truncated || stdout_truncated || stderr_truncated || combined_truncated,
+        timed_out: false,
+        cwd: request.cwd,
+        argv_redacted: redact_argv(&request.argv),
+    }
+}
+
+fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let truncated: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        (truncated, true)
+    } else {
+        (value, false)
+    }
+}
+
+fn redact_argv(argv: &[String]) -> Vec<String> {
+    let mut redacted = Vec::with_capacity(argv.len());
+    let mut redact_next = false;
+    for arg in argv {
+        let lower = arg.to_ascii_lowercase();
+        let sensitive = lower.contains("token")
+            || lower.contains("secret")
+            || lower.contains("password")
+            || lower.contains("apikey")
+            || lower.contains("api-key");
+        if redact_next || sensitive {
+            redacted.push("[redacted]".to_string());
+        } else {
+            redacted.push(arg.clone());
+        }
+        redact_next = matches!(
+            lower.as_str(),
+            "--token" | "--secret" | "--password" | "--api-key"
+        );
+    }
+    redacted
+}
 
 /// Status value for one session-local todo item.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

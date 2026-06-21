@@ -8,8 +8,9 @@ use ai_agents_core::{LLMProvider, Tool, ToolInfo, ToolSafetyMetadata};
 use super::ToolError;
 use super::provider::{ProviderHealth, ToolProvider, ToolProviderError};
 use super::types::{
-    DiagnosticsProvider, DiagnosticsProviderSlot, QuestionHandler, QuestionHandlerSlot, TodoItem,
-    TodoStore, ToolAliases, UnavailableDiagnosticsProvider,
+    CommandRunner, CommandRunnerSlot, DiagnosticsProvider, DiagnosticsProviderSlot,
+    FileVersionStore, QuestionHandler, QuestionHandlerSlot, TodoItem, TodoStore, ToolAliases,
+    UnavailableCommandRunner, UnavailableDiagnosticsProvider,
 };
 
 /// Canonical identity produced by registry resolution.
@@ -61,7 +62,11 @@ pub struct ToolRegistry {
 
     diagnostics_provider: DiagnosticsProviderSlot,
 
+    command_runner: CommandRunnerSlot,
+
     todo_store: TodoStore,
+
+    file_versions: FileVersionStore,
 
     web_fetch_extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
 
@@ -80,7 +85,9 @@ impl ToolRegistry {
             builtin_aliases: RwLock::new(HashMap::new()),
             question_handler: Arc::new(RwLock::new(None)),
             diagnostics_provider: Arc::new(RwLock::new(Arc::new(UnavailableDiagnosticsProvider))),
+            command_runner: Arc::new(RwLock::new(Arc::new(UnavailableCommandRunner))),
             todo_store: TodoStore::default(),
+            file_versions: FileVersionStore::default(),
             web_fetch_extractor: Arc::new(RwLock::new(None)),
             registry_version: AtomicU64::new(1),
         }
@@ -173,6 +180,26 @@ impl ToolRegistry {
     /// Returns whether the diagnostics provider can serve requests now.
     pub fn diagnostics_available(&self) -> bool {
         self.diagnostics_provider.read().is_available()
+    }
+
+    /// Returns the shared command runner slot for host-bound tools.
+    pub fn command_runner_slot(&self) -> CommandRunnerSlot {
+        Arc::clone(&self.command_runner)
+    }
+
+    /// Installs the command runner used by `command`.
+    pub fn set_command_runner(&self, runner: Arc<dyn CommandRunner>) {
+        *self.command_runner.write() = runner;
+    }
+
+    /// Returns whether the command runner can serve requests now.
+    pub fn command_runner_available(&self) -> bool {
+        self.command_runner.read().is_available()
+    }
+
+    /// Returns the session-local file version store shared with file tools.
+    pub fn file_version_store(&self) -> FileVersionStore {
+        self.file_versions.clone()
     }
 
     /// Returns the session-local todo store shared with `todo`.
@@ -294,7 +321,9 @@ impl ToolRegistry {
         let mut mapped = ToolRegistry::new();
         mapped.question_handler = Arc::clone(&self.question_handler);
         mapped.diagnostics_provider = Arc::clone(&self.diagnostics_provider);
+        mapped.command_runner = Arc::clone(&self.command_runner);
         mapped.todo_store = self.todo_store.clone();
+        mapped.file_versions = self.file_versions.clone();
         mapped.web_fetch_extractor = Arc::clone(&self.web_fetch_extractor);
 
         {

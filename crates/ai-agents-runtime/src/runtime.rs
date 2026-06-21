@@ -10,6 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
+/// Shared lock table used to serialize side-effecting tool calls by canonical resource.
+pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
 use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
@@ -58,9 +61,9 @@ use ai_agents_state::{
 };
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
 use ai_agents_tools::{
-    ConditionEvaluator, DiagnosticsProvider, EvaluationContext, LLMGetter, QuestionHandler,
-    SecurityCheckResult, TodoItem, ToolCallRecord, ToolRegistry, ToolSecurityConfig,
-    ToolSecurityEngine,
+    CommandRunner, ConditionEvaluator, DiagnosticsProvider, EvaluationContext, LLMGetter,
+    QuestionHandler, SecurityCheckResult, TodoItem, ToolCallRecord, ToolRegistry,
+    ToolSecurityConfig, ToolSecurityEngine,
 };
 
 use super::{
@@ -289,6 +292,8 @@ pub struct RuntimeAgent {
     runtime_config: RuntimeConfig,
     /// Queue for background maintenance tasks.
     background_maintenance: Arc<BackgroundMaintenanceQueue>,
+    /// Cross-tool locks for side-effecting calls that target the same resource.
+    resource_locks: ToolResourceLocks,
     /// Host-only runtime control state.
     runtime_control: Arc<RuntimeControlState>,
 }
@@ -443,6 +448,7 @@ impl RuntimeAgent {
             observability_manager: None,
             runtime_config: RuntimeConfig::default(),
             background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
+            resource_locks: new_tool_resource_locks(),
             runtime_control: Arc::new(RuntimeControlState::default()),
         }
     }
@@ -459,6 +465,11 @@ impl RuntimeAgent {
 
     pub fn with_storage(self, storage: Arc<dyn AgentStorage>) -> Self {
         *self.storage.write() = Some(storage);
+        self
+    }
+
+    pub(crate) fn with_shared_resource_locks(mut self, locks: ToolResourceLocks) -> Self {
+        self.resource_locks = locks;
         self
     }
 
@@ -2092,6 +2103,11 @@ impl RuntimeAgent {
         self.tools.set_diagnostics_provider(provider);
     }
 
+    /// Installs the host command runner used by `command`.
+    pub fn set_command_runner(&self, runner: Arc<dyn CommandRunner>) {
+        self.tools.set_command_runner(runner);
+    }
+
     /// Returns the current session-local todo list.
     pub fn todos(&self) -> Vec<TodoItem> {
         self.tools.todos()
@@ -3209,6 +3225,27 @@ impl RuntimeAgent {
         }
     }
 
+    /// Acquires a cross-tool lock for side-effecting calls that share a resource.
+    async fn acquire_tool_resource_lock(
+        &self,
+        canonical_id: &str,
+        args: &Value,
+        classification: &ai_agents_core::ToolCallClassification,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if classification.read_only && classification.concurrency_safe {
+            return None;
+        }
+        let key = tool_resource_lock_key(canonical_id, args);
+        let lock = {
+            let mut locks = self.resource_locks.write();
+            locks
+                .entry(key)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        Some(lock.lock_owned().await)
+    }
+
     /// Executes a resolved tool with retry policy from recovery settings.
     async fn run_tool_with_retries(
         &self,
@@ -3219,6 +3256,11 @@ impl RuntimeAgent {
         timeout_ms: u64,
         max_retries: u32,
     ) -> Result<(ToolResult, bool, bool)> {
+        let max_retries = if ctx.classification.safely_retryable {
+            max_retries
+        } else {
+            0
+        };
         let mut attempts = 0;
         loop {
             let (result, timed_out, cancelled) = self
@@ -3534,6 +3576,175 @@ impl RuntimeAgent {
             }
         }
 
+        if canonical_id == "command" && !self.tools.command_runner_available() {
+            let record = self.record_from_parts(
+                &request,
+                canonical_id.clone(),
+                executed_arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                "Command runner is unavailable".to_string(),
+                metadata,
+                ToolPolicyDecisionRecord::unavailable("command runner is unavailable"),
+                Some(ToolApprovalRecord {
+                    status: ToolApprovalStatus::Unavailable,
+                    reason: Some("command runner is unavailable".to_string()),
+                    modified_arguments: None,
+                }),
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        if approval_record
+            .as_ref()
+            .is_some_and(|record| matches!(record.status, ToolApprovalStatus::NotRequired))
+        {
+            if let Some(message) =
+                security_engine.classification_approval_message(&canonical_id, &classification)
+            {
+                if self.hitl_engine.is_none() {
+                    approval_record = Some(ToolApprovalRecord {
+                        status: ToolApprovalStatus::Unavailable,
+                        reason: Some("No HITL engine configured".to_string()),
+                        modified_arguments: None,
+                    });
+                    let record = self.record_from_parts(
+                        &request,
+                        canonical_id,
+                        executed_arguments,
+                        started_at,
+                        start,
+                        false,
+                        false,
+                        format!("Approval unavailable: {}", message),
+                        metadata,
+                        ToolPolicyDecisionRecord::approval(message),
+                        approval_record,
+                        false,
+                        false,
+                    );
+                    self.finish_tool_record(&record).await;
+                    return Ok(record);
+                }
+                let check_result = HITLCheckResult::required(
+                    ApprovalTrigger::tool(&canonical_id, executed_arguments.clone()),
+                    HashMap::new(),
+                    message.clone(),
+                    None,
+                );
+                match self.request_hitl_approval(check_result).await? {
+                    ApprovalResult::Approved => {
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Approved,
+                            reason: None,
+                            modified_arguments: None,
+                        });
+                    }
+                    ApprovalResult::Modified { changes } => {
+                        if let Some(obj) = executed_arguments.as_object_mut() {
+                            for (key, value) in changes {
+                                obj.insert(key, value);
+                            }
+                        }
+                        let modified_security = security_engine
+                            .check_tool_execution_with_bindings(
+                                &canonical_id,
+                                &executed_arguments,
+                                &bindings,
+                            )
+                            .await?;
+                        if !matches!(
+                            modified_security,
+                            SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+                        ) {
+                            let reason = modified_security
+                                .reason()
+                                .unwrap_or("modified arguments failed policy")
+                                .to_string();
+                            let record = self.record_from_parts(
+                                &request,
+                                canonical_id,
+                                executed_arguments.clone(),
+                                started_at,
+                                start,
+                                false,
+                                false,
+                                reason.clone(),
+                                metadata,
+                                ToolPolicyDecisionRecord::deny(reason),
+                                Some(ToolApprovalRecord {
+                                    status: ToolApprovalStatus::Modified,
+                                    reason: None,
+                                    modified_arguments: Some(executed_arguments),
+                                }),
+                                false,
+                                false,
+                            );
+                            self.finish_tool_record(&record).await;
+                            return Ok(record);
+                        }
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Modified,
+                            reason: None,
+                            modified_arguments: Some(executed_arguments.clone()),
+                        });
+                    }
+                    ApprovalResult::Rejected { reason } => {
+                        let reason = reason.unwrap_or_else(|| "rejected".to_string());
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            format!("Approval rejected: {}", reason),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval(reason.clone()),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Rejected,
+                                reason: Some(reason),
+                                modified_arguments: None,
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
+                    ApprovalResult::Timeout => {
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments,
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            "Approval timed out".to_string(),
+                            metadata,
+                            ToolPolicyDecisionRecord::approval("approval timeout"),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Timeout,
+                                reason: Some("approval timeout".to_string()),
+                                modified_arguments: None,
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
+                }
+            }
+        }
+
         if canonical_id == "diagnostics" && !self.tools.diagnostics_available() {
             let record = self.record_from_parts(
                 &request,
@@ -3828,6 +4039,9 @@ impl RuntimeAgent {
             policy_snapshot,
             custom_config: security_engine.custom_config(&canonical_id),
         };
+        let _resource_guard = self
+            .acquire_tool_resource_lock(&canonical_id, &executed_arguments, &classification)
+            .await;
         let (mut result, timed_out, cancelled) = self
             .run_tool_with_retries(
                 &canonical_id,
@@ -10076,6 +10290,38 @@ fn observation_purpose_for_process(hint: ProcessPurposeHint) -> ObservationPurpo
     }
 }
 
+fn new_tool_resource_locks() -> ToolResourceLocks {
+    Arc::new(RwLock::new(HashMap::new()))
+}
+
+fn tool_resource_lock_key(canonical_id: &str, args: &Value) -> String {
+    let resource = ["path", "base_path", "cwd", "url"]
+        .into_iter()
+        .find_map(|field| args.get(field).and_then(Value::as_str))
+        .map(normalized_resource_key);
+    match resource {
+        Some(value) => format!("resource:{}", value),
+        None => format!("tool:{}", canonical_id),
+    }
+}
+
+fn normalized_resource_key(value: &str) -> String {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return value.to_ascii_lowercase();
+    }
+    let path = std::path::Path::new(value);
+    let path = if path.is_absolute() {
+        path.components().collect::<std::path::PathBuf>()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+            .components()
+            .collect()
+    };
+    path.to_string_lossy().to_string()
+}
+
 fn render_concurrent_template(
     template: &str,
     user_input: &str,
@@ -10176,6 +10422,17 @@ mod tests {
     /// Test tool that stays active long enough for runtime cancellation.
     struct SlowTool;
 
+    /// Test tool that fails once and must not be retried for writes.
+    struct FlakyWriteTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Test tool that tracks concurrent execution on one path.
+    struct LockedWriteTool {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
     #[async_trait]
     impl ai_agents_core::Tool for SlowTool {
         fn id(&self) -> &str {
@@ -10200,6 +10457,140 @@ mod tests {
             _ctx: ai_agents_core::ToolExecutionContext,
         ) -> ToolResult {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            ToolResult::ok("done")
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for FlakyWriteTool {
+        fn id(&self) -> &str {
+            "flaky_write"
+        }
+
+        fn name(&self) -> &str {
+            "Flaky Write"
+        }
+
+        fn description(&self) -> &str {
+            "Fails on the first write attempt."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                ..Default::default()
+            }
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            ai_agents_core::ToolSafetyMetadata {
+                read_only: false,
+                concurrency_safe: false,
+                operation: ai_agents_core::ToolOperationKind::Write,
+                side_effect_level: ai_agents_core::ToolSideEffectLevel::LocalWrite,
+                requires_network: false,
+                destructive: false,
+                open_world: false,
+                host_dependent: false,
+                requires_user_interaction: false,
+                supports_cancellation: true,
+                default_requires_approval: false,
+                should_defer_schema: false,
+                max_output_chars: Some(1024),
+                max_result_size_chars: Some(1024),
+            }
+        }
+
+        fn classify_call(&self, _args: &Value) -> ai_agents_core::ToolCallClassification {
+            let mut classification =
+                ai_agents_core::ToolCallClassification::from_metadata(&self.safety_metadata());
+            classification.safely_retryable = false;
+            classification
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                ToolResult::error("first failure")
+            } else {
+                ToolResult::ok("second success")
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for LockedWriteTool {
+        fn id(&self) -> &str {
+            "locked_write"
+        }
+
+        fn name(&self) -> &str {
+            "Locked Write"
+        }
+
+        fn description(&self) -> &str {
+            "Tracks concurrent execution on one resource."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object", "properties": {"path": {"type": "string"}}})
+        }
+
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                ..Default::default()
+            }
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            ai_agents_core::ToolSafetyMetadata {
+                read_only: false,
+                concurrency_safe: false,
+                operation: ai_agents_core::ToolOperationKind::Write,
+                side_effect_level: ai_agents_core::ToolSideEffectLevel::LocalWrite,
+                requires_network: false,
+                destructive: false,
+                open_world: false,
+                host_dependent: false,
+                requires_user_interaction: false,
+                supports_cancellation: true,
+                default_requires_approval: false,
+                should_defer_schema: false,
+                max_output_chars: Some(1024),
+                max_result_size_chars: Some(1024),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            loop {
+                let current_max = self.max_active.load(Ordering::SeqCst);
+                if active <= current_max {
+                    break;
+                }
+                if self
+                    .max_active
+                    .compare_exchange(current_max, active, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
             ToolResult::ok("done")
         }
     }
@@ -10337,6 +10728,98 @@ mod tests {
         assert!(record.cancelled);
         assert!(!record.success);
         assert!(record.cancellation_reason.is_some());
+    }
+
+    #[tokio::test]
+    async fn non_idempotent_tool_calls_are_not_retried() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
+
+        let mock = mock_with_response("hello");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .tool(Arc::new(FlakyWriteTool {
+                calls: Arc::clone(&calls),
+            }))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    default: ToolRetryConfig {
+                        max_retries: 2,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "flaky-call",
+                "flaky_write",
+                serde_json::json!({"path": "./tmp.txt"}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(!record.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn side_effecting_tools_are_serialized_per_resource() {
+        let mock = mock_with_response("hello");
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("You are helpful.")
+                .llm(Arc::new(mock))
+                .tool(Arc::new(LockedWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .build()
+                .unwrap(),
+        );
+
+        let left = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "lock-1",
+                        "locked_write",
+                        serde_json::json!({"path": "./same.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        let right = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "lock-2",
+                        "locked_write",
+                        serde_json::json!({"path": "./same.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert!(left.success);
+        assert!(right.success);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

@@ -30,7 +30,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> ai_agents::Result<()> {
-//!     let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
+//!     let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-5.4-nano")?;
 //!
 //!     let agent = AgentBuilder::new()
 //!         .system_prompt("You are a helpful assistant.")
@@ -432,8 +432,9 @@ pub mod disambiguation {
 
 pub mod tool_security {
     pub use ai_agents_tools::{
-        CommandPolicyConfig, DomainPolicyConfig, OperationPolicyConfig, PathPolicyConfig,
-        SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+        CommandPolicyConfig, CommandRuleConfig, CommandTemplateConfig, DomainPolicyConfig,
+        NoWritePolicyBehavior, OperationPolicyConfig, PathPolicyConfig, SecurityCheckResult,
+        ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
     };
 }
 
@@ -448,16 +449,20 @@ pub mod tools {
         ToolSideEffectLevel,
     };
     pub use ai_agents_tools::{
-        AskUserTool, CalculatorTool, ConditionEvaluator, DateTimeTool, DiagnosticItem,
+        AskUserTool, CalculatorTool, CommandRequest, CommandResponse, CommandRunner,
+        CommandRunnerSlot, CommandTool, ConditionEvaluator, DateTimeTool, DiagnosticItem,
         DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
-        DiagnosticsResponse, DiagnosticsTool, EchoTool, EvaluationContext, FileInfoTool,
-        FileListTool, FileReadTool, FileTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool,
-        JsonTool, LLMGetter, MathTool, ProviderHealth, QuestionHandler, QuestionHandlerSlot,
-        QuestionRequest, QuestionResponse, RandomTool, ResolvedTool, SimpleLLMGetter, SleepTool,
-        StaticDiagnosticsProvider, TemplateTool, TextTool, TodoItem, TodoStatus, TodoStore,
-        TodoTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor, ToolIdentity,
-        ToolMetadata, ToolProvider, ToolProviderError, ToolProviderType, ToolRegistry, TrustLevel,
+        DiagnosticsResponse, DiagnosticsTool, EchoTool, EvaluationContext, FileEditTool,
+        FileInfoTool, FileListTool, FileReadTool, FileTool, FileVersionEvidence, FileVersionStore,
+        FileWriteTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, JsonTool, LLMGetter,
+        MathTool, PatchTool, ProcessCommandRunner, ProviderHealth, QuestionHandler,
+        QuestionHandlerSlot, QuestionRequest, QuestionResponse, RandomTool, ResolvedTool,
+        SimpleLLMGetter, SleepTool, StaticCommandRunner, StaticDiagnosticsProvider, TemplateTool,
+        TextTool, TodoItem, TodoStatus, TodoStore, TodoTool, ToolAliases, ToolCallRecord,
+        ToolContext, ToolDescriptor, ToolIdentity, ToolMetadata, ToolProvider, ToolProviderError,
+        ToolProviderType, ToolRegistry, TrustLevel, UnavailableCommandRunner,
         UnavailableDiagnosticsProvider, WebFetchTool, create_builtin_registry,
+        file_version_evidence,
     };
     pub use ai_agents_tools::{HttpTool, generate_schema};
 }

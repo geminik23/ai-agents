@@ -125,6 +125,9 @@ pub struct ToolCalledObject {
     /// Minimum number of matching items required.
     #[serde(default)]
     pub count_gte: Option<usize>,
+    /// Whether the wrapped tool implementation was invoked.
+    #[serde(default)]
+    pub executed: Option<bool>,
     /// Whether the operation succeeded.
     #[serde(default)]
     pub success: Option<bool>,
@@ -756,6 +759,9 @@ fn evaluate_tool_called(
         records.retain(|record| record.tool_id == id || record.requested_name == id);
     }
     if let Some(object) = object {
+        if let Some(executed) = object.executed {
+            records.retain(|record| record.executed == executed);
+        }
         if let Some(success) = object.success {
             records.retain(|record| record.success == success);
         }
@@ -1327,6 +1333,7 @@ mod tests {
                 actor_id: Some("actor-1".to_string()),
                 arguments_original: json!({"id":"ORD-1"}),
                 arguments_executed: json!({"id":"ORD-1"}),
+                executed: true,
                 success: true,
                 output: Some(json!({"status":"cancellable"})),
                 error: None,

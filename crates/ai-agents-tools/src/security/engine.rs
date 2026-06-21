@@ -135,6 +135,7 @@ impl ToolSecurityEngine {
             max_file_size_bytes: policy.and_then(|config| config.max_file_size_bytes),
             max_response_bytes: policy.and_then(|config| config.max_response_bytes),
             max_redirects: policy.and_then(|config| config.max_redirects),
+            max_replacements: policy.and_then(|config| config.max_replacements),
             max_changed_files: policy.and_then(|config| config.max_changed_files),
             max_changed_lines: policy.and_then(|config| config.max_changed_lines),
         }
@@ -149,6 +150,40 @@ impl ToolSecurityEngine {
             .get(tool_id)
             .and_then(|config| serde_json::to_value(config).ok())
             .unwrap_or(Value::Null)
+    }
+
+    /// Returns the approval message required by call classification defaults.
+    pub fn classification_approval_message(
+        &self,
+        tool_id: &str,
+        classification: &ToolCallClassification,
+    ) -> Option<String> {
+        if !classification.requires_approval || classification.read_only {
+            return None;
+        }
+        if !matches!(
+            classification.operation,
+            ai_agents_core::ToolOperationKind::Write
+                | ai_agents_core::ToolOperationKind::Edit
+                | ai_agents_core::ToolOperationKind::Delete
+                | ai_agents_core::ToolOperationKind::Patch
+                | ai_agents_core::ToolOperationKind::Command
+        ) {
+            return None;
+        }
+        let tool_config = self
+            .config
+            .enabled
+            .then(|| self.config.tools.get(tool_id))
+            .flatten();
+        if tool_config.is_some_and(|config| config.allow_without_confirmation) {
+            return None;
+        }
+        Some(format!(
+            "Confirm {} operation for tool '{}' ?",
+            format!("{:?}", classification.operation).to_ascii_lowercase(),
+            tool_id
+        ))
     }
 
     pub fn custom_config(&self, tool_id: &str) -> Value {
@@ -427,7 +462,7 @@ impl ToolSecurityEngine {
                 .iter()
                 .chain(tool_config.paths.deny.iter())
             {
-                if path_matches(pattern, &normalized) {
+                if path_matches_bound(pattern, &value.path, &normalized) {
                     return Some(SecurityCheckResult::Block {
                         reason: format!("Path is blocked for tool '{}'", tool_id),
                     });
@@ -435,7 +470,7 @@ impl ToolSecurityEngine {
             }
 
             for pattern in tool_config.paths.unavailable.iter() {
-                if path_matches(pattern, &normalized) {
+                if path_matches_bound(pattern, &value.path, &normalized) {
                     return Some(SecurityCheckResult::Unavailable {
                         reason: format!("Path is unavailable for tool '{}'", tool_id),
                     });
@@ -443,7 +478,7 @@ impl ToolSecurityEngine {
             }
 
             for pattern in tool_config.paths.requires_approval.iter() {
-                if path_matches(pattern, &normalized) {
+                if path_matches_bound(pattern, &value.path, &normalized) {
                     return Some(SecurityCheckResult::RequireConfirmation {
                         message: format!(
                             "Confirm access to path '{}' for tool '{}' ?",
@@ -453,11 +488,40 @@ impl ToolSecurityEngine {
                 }
             }
 
-            let allowed = allowed_paths_for_mode(tool_config, value.mode);
+            if !matches!(value.kind, ai_agents_core::PathBindingKind::Cwd)
+                && matches!(
+                    value.mode,
+                    PathAccessMode::Write | PathAccessMode::ReadWrite
+                )
+                && !has_write_allowlist(tool_config)
+            {
+                let dry_run = args
+                    .get("dry_run")
+                    .and_then(Value::as_bool)
+                    .unwrap_or_else(|| default_dry_run_for_tool(tool_id));
+                if matches!(tool_config.no_write_policy, NoWritePolicyBehavior::Deny) || !dry_run {
+                    return Some(SecurityCheckResult::Block {
+                        reason: format!(
+                            "Tool '{}' cannot mutate paths without an explicit write_paths policy",
+                            tool_id
+                        ),
+                    });
+                }
+            }
+
+            let allowed = allowed_paths_for_value(tool_config, &value);
+            if matches!(value.kind, ai_agents_core::PathBindingKind::Cwd) && allowed.is_empty() {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!(
+                        "Tool '{}' requires an explicit working_dirs policy for command cwd",
+                        tool_id
+                    ),
+                });
+            }
             if !allowed.is_empty()
                 && !allowed
                     .iter()
-                    .any(|pattern| path_matches(pattern, &normalized))
+                    .any(|pattern| path_matches_bound(pattern, &value.path, &normalized))
             {
                 return Some(SecurityCheckResult::Block {
                     reason: format!("Path not in allowed list for tool '{}'", tool_id),
@@ -538,33 +602,80 @@ impl ToolSecurityEngine {
             );
         }
         for command in commands {
-            let command = command.trim();
+            let display = command.display();
+            let command_name = command.command_name();
 
-            if contains_casefold(&tool_config.commands.deny, command) {
+            if command.is_string
+                && command_denies_shell(tool_config)
+                && contains_shell_syntax(&display)
+            {
                 return Some(SecurityCheckResult::Block {
-                    reason: format!("Command '{}' is blocked for tool '{}'", command, tool_id),
-                });
-            }
-            if contains_casefold(&tool_config.commands.unavailable, command) {
-                return Some(SecurityCheckResult::Unavailable {
                     reason: format!(
-                        "Command '{}' is unavailable for tool '{}'",
-                        command, tool_id
+                        "Command '{}' uses shell syntax denied for tool '{}'",
+                        display, tool_id
                     ),
                 });
             }
-            if contains_casefold(&tool_config.commands.requires_approval, command) {
-                return Some(SecurityCheckResult::RequireConfirmation {
-                    message: format!("Confirm command '{}' for tool '{}' ?", command, tool_id),
+            if contains_casefold(&tool_config.commands.deny, &display)
+                || contains_casefold(&tool_config.commands.deny, &command_name)
+            {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!("Command '{}' is blocked for tool '{}'", display, tool_id),
                 });
             }
+            if contains_casefold(&tool_config.commands.unavailable, &display)
+                || contains_casefold(&tool_config.commands.unavailable, &command_name)
+            {
+                return Some(SecurityCheckResult::Unavailable {
+                    reason: format!(
+                        "Command '{}' is unavailable for tool '{}'",
+                        display, tool_id
+                    ),
+                });
+            }
+            if contains_casefold(&tool_config.commands.requires_approval, &display)
+                || contains_casefold(&tool_config.commands.requires_approval, &command_name)
+            {
+                return Some(SecurityCheckResult::RequireConfirmation {
+                    message: format!("Confirm command '{}' for tool '{}' ?", display, tool_id),
+                });
+            }
+            let has_exact_allowlist = command_has_exact_allowlist(tool_config);
+            if command_requires_exact_allowlist(tool_id) && !has_exact_allowlist {
+                return Some(SecurityCheckResult::Block {
+                    reason: format!(
+                        "Tool '{}' requires allowed_commands or command_templates before execution",
+                        tool_id
+                    ),
+                });
+            }
+            if has_exact_allowlist {
+                if !command_matches_allowed(tool_config, &command.argv) {
+                    if command_allows_escalation(tool_config) {
+                        return Some(SecurityCheckResult::RequireConfirmation {
+                            message: format!(
+                                "Confirm command '{}' outside the exact allowlist for tool '{}' ?",
+                                display, tool_id
+                            ),
+                        });
+                    }
+                    return Some(SecurityCheckResult::Block {
+                        reason: format!(
+                            "Command '{}' is not in the exact argv allowlist for tool '{}'",
+                            display, tool_id
+                        ),
+                    });
+                }
+                continue;
+            }
             if !tool_config.commands.allow.is_empty()
-                && !contains_casefold(&tool_config.commands.allow, command)
+                && !contains_casefold(&tool_config.commands.allow, &display)
+                && !contains_casefold(&tool_config.commands.allow, &command_name)
             {
                 return Some(SecurityCheckResult::Block {
                     reason: format!(
                         "Command '{}' is not allowed for tool '{}'",
-                        command, tool_id
+                        display, tool_id
                     ),
                 });
             }
@@ -630,6 +741,15 @@ fn apply_policy_caps(config: &ToolPolicyConfig, bindings: &ToolPolicyBindings, a
             }
             ResultLimitKind::MaxRedirects => {
                 apply_usize_cap(obj, &binding.field, config.max_redirects);
+            }
+            ResultLimitKind::MaxReplacements => {
+                apply_usize_cap(obj, &binding.field, config.max_replacements);
+            }
+            ResultLimitKind::MaxChangedFiles => {
+                apply_usize_cap(obj, &binding.field, config.max_changed_files);
+            }
+            ResultLimitKind::MaxChangedLines => {
+                apply_usize_cap(obj, &binding.field, config.max_changed_lines);
             }
         }
     }
@@ -717,27 +837,54 @@ fn legacy_policy_bindings(tool_id: &str) -> ToolPolicyBindings {
             operation_fields: vec!["operation".to_string()],
             ..Default::default()
         },
-        "file_write" | "file_edit" => ToolPolicyBindings {
+        "file_write" => ToolPolicyBindings {
             path_fields: vec![PathPolicyBinding::write("path")],
+            result_limit_fields: vec![
+                ResultLimitBinding::new("max_changed_files", ResultLimitKind::MaxChangedFiles),
+                ResultLimitBinding::new("max_changed_lines", ResultLimitKind::MaxChangedLines),
+            ],
+            ..Default::default()
+        },
+        "file_edit" => ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::write("path")],
+            result_limit_fields: vec![
+                ResultLimitBinding::new("max_replacements", ResultLimitKind::MaxReplacements),
+                ResultLimitBinding::new("max_changed_lines", ResultLimitKind::MaxChangedLines),
+            ],
             ..Default::default()
         },
         "patch" => ToolPolicyBindings {
-            path_fields: vec![ai_agents_core::PathPolicyBinding::new(
-                "path",
-                PathAccessMode::Write,
-                ai_agents_core::PathBindingKind::PatchBase,
-            )],
+            path_fields: vec![
+                ai_agents_core::PathPolicyBinding::new(
+                    "base_path",
+                    PathAccessMode::Write,
+                    ai_agents_core::PathBindingKind::PatchBase,
+                )
+                .with_default_path("."),
+            ],
+            result_limit_fields: vec![
+                ResultLimitBinding::new("max_changed_files", ResultLimitKind::MaxChangedFiles),
+                ResultLimitBinding::new("max_changed_lines", ResultLimitKind::MaxChangedLines),
+            ],
             ..Default::default()
         },
         "command" => ToolPolicyBindings {
             command_fields: vec![
                 CommandPolicyBinding::command("command"),
                 CommandPolicyBinding::argv("argv"),
+                CommandPolicyBinding::env("env"),
             ],
-            path_fields: vec![ai_agents_core::PathPolicyBinding::new(
-                "cwd",
-                PathAccessMode::ReadWrite,
-                ai_agents_core::PathBindingKind::Cwd,
+            path_fields: vec![
+                ai_agents_core::PathPolicyBinding::new(
+                    "cwd",
+                    PathAccessMode::ReadWrite,
+                    ai_agents_core::PathBindingKind::Cwd,
+                )
+                .with_default_path("."),
+            ],
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_output_chars",
+                ResultLimitKind::MaxOutputChars,
             )],
             ..Default::default()
         },
@@ -749,12 +896,29 @@ fn legacy_policy_bindings(tool_id: &str) -> ToolPolicyBindings {
 struct BoundPathValue {
     path: String,
     mode: PathAccessMode,
+    kind: ai_agents_core::PathBindingKind,
 }
 
 #[derive(Debug, Clone)]
 struct BoundDomainValue {
     value: String,
     is_url: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BoundCommandValue {
+    argv: Vec<String>,
+    is_string: bool,
+}
+
+impl BoundCommandValue {
+    fn display(&self) -> String {
+        self.argv.join(" ")
+    }
+
+    fn command_name(&self) -> String {
+        self.argv.first().cloned().unwrap_or_default()
+    }
 }
 
 fn validate_policy_bindings(
@@ -831,6 +995,8 @@ fn path_policy_configured(config: &ToolPolicyConfig) -> bool {
     !config.allowed_paths.is_empty()
         || !config.read_paths.is_empty()
         || !config.write_paths.is_empty()
+        || !config.working_dirs.is_empty()
+        || !config.commands.working_dirs.is_empty()
         || !config.blocked_paths.is_empty()
         || !config.paths.allow.is_empty()
         || !config.paths.deny.is_empty()
@@ -854,6 +1020,12 @@ fn command_policy_configured(config: &ToolPolicyConfig) -> bool {
         || !config.commands.deny.is_empty()
         || !config.commands.requires_approval.is_empty()
         || !config.commands.unavailable.is_empty()
+        || !config.commands.allowed_commands.is_empty()
+        || !config.commands.templates.is_empty()
+        || !config.allowed_commands.is_empty()
+        || !config.command_templates.is_empty()
+        || !config.env_passthrough.is_empty()
+        || !config.commands.env_passthrough.is_empty()
 }
 
 fn operation_policy_configured(config: &ToolPolicyConfig) -> bool {
@@ -869,6 +1041,7 @@ fn result_limit_policy_configured(config: &ToolPolicyConfig) -> bool {
         || config.max_results.is_some()
         || config.max_response_bytes.is_some()
         || config.max_redirects.is_some()
+        || config.max_replacements.is_some()
         || config.max_changed_files.is_some()
         || config.max_changed_lines.is_some()
 }
@@ -898,14 +1071,16 @@ fn collect_path_binding_values(
     match value {
         Value::String(path) => values.push(BoundPathValue {
             path,
-            mode: binding.mode,
+            mode: effective_path_mode(args, binding),
+            kind: binding.kind,
         }),
         Value::Array(items) => {
             for item in items {
                 if let Some(path) = item.as_str() {
                     values.push(BoundPathValue {
                         path: path.to_string(),
-                        mode: binding.mode,
+                        mode: effective_path_mode(args, binding),
+                        kind: binding.kind,
                     });
                 }
             }
@@ -958,7 +1133,7 @@ fn bound_operation_values(args: &Value, bindings: &ToolPolicyBindings) -> Vec<St
         .collect()
 }
 
-fn bound_command_values(args: &Value, bindings: &ToolPolicyBindings) -> Vec<String> {
+fn bound_command_values(args: &Value, bindings: &ToolPolicyBindings) -> Vec<BoundCommandValue> {
     let mut values = Vec::new();
     for binding in &bindings.command_fields {
         collect_command_binding_values(args, binding, &mut values);
@@ -969,47 +1144,94 @@ fn bound_command_values(args: &Value, bindings: &ToolPolicyBindings) -> Vec<Stri
 fn collect_command_binding_values(
     args: &Value,
     binding: &CommandPolicyBinding,
-    values: &mut Vec<String>,
+    values: &mut Vec<BoundCommandValue>,
 ) {
     let Some(value) = value_at_path(args, &binding.field) else {
         return;
     };
     match binding.kind {
-        CommandBindingKind::CommandString
-        | CommandBindingKind::Cwd
-        | CommandBindingKind::TemplateVariable => {
+        CommandBindingKind::CommandString => {
             if let Some(command) = value.as_str() {
-                values.push(command.to_string());
+                if let Some(argv) = parse_command_words(command) {
+                    values.push(BoundCommandValue {
+                        argv,
+                        is_string: true,
+                    });
+                } else {
+                    values.push(BoundCommandValue {
+                        argv: vec![command.to_string()],
+                        is_string: true,
+                    });
+                }
             }
         }
         CommandBindingKind::Argv => {
-            if let Some(command) = value
-                .as_array()
-                .and_then(|items| items.first())
-                .and_then(Value::as_str)
-            {
-                values.push(command.to_string());
+            if let Some(argv) = value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            }) {
+                if !argv.is_empty() {
+                    values.push(BoundCommandValue {
+                        argv,
+                        is_string: false,
+                    });
+                }
             }
         }
-        CommandBindingKind::Env => {}
+        CommandBindingKind::Cwd
+        | CommandBindingKind::TemplateVariable
+        | CommandBindingKind::Env => {}
     }
 }
 
-fn allowed_paths_for_mode(config: &ToolPolicyConfig, mode: PathAccessMode) -> Vec<&String> {
+fn allowed_paths_for_value<'a>(
+    config: &'a ToolPolicyConfig,
+    value: &BoundPathValue,
+) -> Vec<&'a String> {
+    if matches!(value.kind, ai_agents_core::PathBindingKind::Cwd) {
+        return config
+            .working_dirs
+            .iter()
+            .chain(config.commands.working_dirs.iter())
+            .collect();
+    }
     let mut allowed: Vec<&String> = config
         .allowed_paths
         .iter()
         .chain(config.paths.allow.iter())
         .collect();
-    match mode {
+    match value.mode {
         PathAccessMode::Read => allowed.extend(config.read_paths.iter()),
-        PathAccessMode::Write => allowed.extend(config.write_paths.iter()),
-        PathAccessMode::ReadWrite => {
-            allowed.extend(config.read_paths.iter());
+        PathAccessMode::Write | PathAccessMode::ReadWrite => {
             allowed.extend(config.write_paths.iter());
         }
     }
     allowed
+}
+
+fn has_write_allowlist(config: &ToolPolicyConfig) -> bool {
+    !config.write_paths.is_empty()
+        || !config.allowed_paths.is_empty()
+        || !config.paths.allow.is_empty()
+}
+
+fn effective_path_mode(args: &Value, binding: &PathPolicyBinding) -> PathAccessMode {
+    if !matches!(binding.mode, PathAccessMode::ReadWrite) {
+        return binding.mode;
+    }
+    let operation = args
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    match operation.as_str() {
+        "read" | "exists" | "list" | "info" => PathAccessMode::Read,
+        "write" | "append" | "mkdir" | "delete" | "edit" | "patch" => PathAccessMode::Write,
+        _ => binding.mode,
+    }
 }
 
 fn value_at_path<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
@@ -1094,10 +1316,131 @@ fn path_matches(pattern: &str, path: &Path) -> bool {
     path.starts_with(pattern)
 }
 
+fn path_matches_bound(pattern: &str, raw_path: &str, normalized: &Path) -> bool {
+    if !path_matches(pattern, normalized) {
+        return false;
+    }
+    let raw = Path::new(raw_path);
+    let pattern_path = Path::new(pattern);
+    let Ok(resolved) = resolve_existing_or_parent(raw) else {
+        return false;
+    };
+    if pattern_path.exists() {
+        let Ok(resolved_pattern) = pattern_path.canonicalize() else {
+            return false;
+        };
+        return resolved.starts_with(resolved_pattern.components().collect::<PathBuf>());
+    }
+    true
+}
+
+fn resolve_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
+    if path.exists() {
+        return path.canonicalize();
+    }
+    let normalized = if path.is_absolute() {
+        path.components().collect::<PathBuf>()
+    } else {
+        std::env::current_dir()?.join(path).components().collect()
+    };
+    let mut ancestor = normalized.as_path();
+    let mut missing = Vec::new();
+    while !ancestor.exists() {
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        missing.push(name.to_os_string());
+        ancestor = ancestor.parent().unwrap_or_else(|| Path::new("."));
+    }
+    let mut resolved = ancestor.canonicalize()?;
+    for component in missing.iter().rev() {
+        resolved.push(component);
+    }
+    Ok(resolved.components().collect())
+}
+
+fn default_dry_run_for_tool(tool_id: &str) -> bool {
+    tool_id == "patch"
+}
+
 fn contains_casefold(values: &[String], needle: &str) -> bool {
     values
         .iter()
         .any(|value| value.eq_ignore_ascii_case(needle))
+}
+
+fn command_denies_shell(config: &ToolPolicyConfig) -> bool {
+    config.deny_shell || config.commands.deny_shell
+}
+
+fn command_allows_escalation(config: &ToolPolicyConfig) -> bool {
+    config.allow_command_escalation || config.commands.allow_escalation
+}
+
+fn command_requires_exact_allowlist(tool_id: &str) -> bool {
+    tool_id == "command"
+}
+
+fn command_has_exact_allowlist(config: &ToolPolicyConfig) -> bool {
+    !config.allowed_commands.is_empty()
+        || !config.commands.allowed_commands.is_empty()
+        || !config.command_templates.is_empty()
+        || !config.commands.templates.is_empty()
+}
+
+fn command_matches_allowed(config: &ToolPolicyConfig, argv: &[String]) -> bool {
+    config
+        .allowed_commands
+        .iter()
+        .chain(config.commands.allowed_commands.iter())
+        .any(|rule| rule.argv == argv)
+        || config
+            .command_templates
+            .iter()
+            .chain(config.commands.templates.iter())
+            .any(|template| command_matches_template(&template.argv, argv))
+}
+
+fn command_matches_template(template: &[String], argv: &[String]) -> bool {
+    template.len() == argv.len()
+        && template.iter().zip(argv.iter()).all(|(expected, actual)| {
+            (expected.starts_with('{') && expected.ends_with('}')) || expected == actual
+        })
+}
+
+fn contains_shell_syntax(value: &str) -> bool {
+    const DENIED: &[char] = &[';', '&', '|', '<', '>', '`', '$', '\n', '\r'];
+    value.chars().any(|ch| DENIED.contains(&ch))
+        || value.contains("$(")
+        || value.contains("${")
+        || value.contains("<(")
+        || value.contains(">(")
+}
+
+fn parse_command_words(value: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for ch in value.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '\'' | '"') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    (!words.is_empty()).then_some(words)
 }
 
 fn host_is_private_or_local(host: &str) -> bool {
@@ -1478,5 +1821,142 @@ mod tests {
             .unwrap();
 
         assert!(result.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn read_paths_do_not_authorize_file_write() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.read_paths = vec!["./workspace".to_string()];
+        tool_config.no_write_policy = NoWritePolicyBehavior::Deny;
+        config.tools.insert("file_write".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let result = engine
+            .check_tool_execution_with_bindings(
+                "file_write",
+                &serde_json::json!({"path": "./workspace/out.txt", "dry_run": false}),
+                &legacy_policy_bindings("file_write"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn command_cwd_requires_working_dir_allowlist() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.read_paths = vec![".".to_string()];
+        tool_config.allowed_commands = vec![CommandRuleConfig {
+            argv: vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()],
+        }];
+        config.tools.insert("command".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let result = engine
+            .check_tool_execution_with_bindings(
+                "command",
+                &serde_json::json!({"argv": ["cargo", "fmt", "--all"], "cwd": "."}),
+                &legacy_policy_bindings("command"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn command_requires_exact_argv_allowlist() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.allow_without_confirmation = true;
+        tool_config.working_dirs = vec![".".to_string()];
+        config.tools.insert("command".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let result = engine
+            .check_tool_execution_with_bindings(
+                "command",
+                &serde_json::json!({"argv": ["cargo", "fmt", "--all"], "cwd": "."}),
+                &legacy_policy_bindings("command"),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_blocked());
+        assert!(
+            result
+                .reason()
+                .unwrap()
+                .contains("requires allowed_commands or command_templates")
+        );
+    }
+
+    #[tokio::test]
+    async fn command_exact_argv_allowlist_is_enforced() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.allowed_commands = vec![CommandRuleConfig {
+            argv: vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()],
+        }];
+        tool_config.working_dirs = vec![".".to_string()];
+        config.tools.insert("command".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let allowed = engine
+            .check_tool_execution_with_bindings(
+                "command",
+                &serde_json::json!({"argv": ["cargo", "fmt", "--all"], "cwd": "."}),
+                &legacy_policy_bindings("command"),
+            )
+            .await
+            .unwrap();
+        assert!(allowed.is_allowed());
+
+        let blocked = engine
+            .check_tool_execution_with_bindings(
+                "command",
+                &serde_json::json!({"argv": ["cargo", "test"], "cwd": "."}),
+                &legacy_policy_bindings("command"),
+            )
+            .await
+            .unwrap();
+        assert!(blocked.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn no_write_policy_dry_run_only_allows_dry_run() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.no_write_policy = NoWritePolicyBehavior::DryRunOnly;
+        config.tools.insert("file_edit".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let dry_run = engine
+            .check_tool_execution_with_bindings(
+                "file_edit",
+                &serde_json::json!({"path": "./note.txt", "dry_run": true}),
+                &legacy_policy_bindings("file_edit"),
+            )
+            .await
+            .unwrap();
+        assert!(dry_run.is_allowed());
+
+        let actual = engine
+            .check_tool_execution_with_bindings(
+                "file_edit",
+                &serde_json::json!({"path": "./note.txt", "dry_run": false}),
+                &legacy_policy_bindings("file_edit"),
+            )
+            .await
+            .unwrap();
+        assert!(actual.is_blocked());
     }
 }

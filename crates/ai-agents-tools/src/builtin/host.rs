@@ -422,7 +422,7 @@ impl Tool for SleepTool {
     }
 
     fn description(&self) -> &str {
-        "Wait for a bounded duration without shell access. Default maximum is 30000 ms."
+        "Wait for a policy-bounded duration without shell access. Default maximum is 30000 ms."
     }
 
     fn input_schema(&self) -> Value {
@@ -457,8 +457,8 @@ impl Tool for SleepTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
-        let max_duration_ms =
-            DEFAULT_SLEEP_MAX_MS.min(ctx.limits.timeout_ms.unwrap_or(DEFAULT_SLEEP_MAX_MS));
+        let policy_max_ms = sleep_policy_max_duration_ms(&ctx).unwrap_or(DEFAULT_SLEEP_MAX_MS);
+        let max_duration_ms = policy_max_ms.min(ctx.limits.timeout_ms.unwrap_or(policy_max_ms));
         if input.duration_ms > max_duration_ms {
             return ToolResult::error(format!(
                 "duration_ms exceeds max_duration_ms {}",
@@ -515,6 +515,17 @@ fn diagnostics_to_result(response: DiagnosticsResponse, max_results: usize) -> T
         Ok(json) => ToolResult::ok_with_metadata(json, metadata),
         Err(error) => ToolResult::error(format!("Serialization error: {}", error)),
     }
+}
+
+fn sleep_policy_max_duration_ms(ctx: &ToolExecutionContext) -> Option<u64> {
+    ctx.custom_config
+        .get("max_duration_ms")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            ctx.policy_snapshot
+                .get("max_duration_ms")
+                .and_then(Value::as_u64)
+        })
 }
 
 fn default_question_response(default: Option<Value>, timed_out: bool) -> QuestionResponse {
@@ -659,6 +670,17 @@ mod tests {
             .await;
         assert!(clear.success);
         assert_eq!(value(&clear.output)["count"], 0);
+    }
+
+    #[tokio::test]
+    async fn sleep_respects_custom_policy_cap() {
+        let mut ctx = ai_agents_core::ToolExecutionContext::test("sleep");
+        ctx.custom_config = serde_json::json!({"max_duration_ms": 5});
+        let result = SleepTool::new()
+            .execute(serde_json::json!({"duration_ms": 10}), ctx)
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("max_duration_ms 5"));
     }
 
     #[tokio::test]
