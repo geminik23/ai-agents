@@ -100,12 +100,13 @@ html {
   scroll-behavior: smooth;
   font-size: 16px;
   -webkit-text-size-adjust: 100%;
-  overflow-x: hidden;
+  overflow-x: clip;
 }
 
 body {
   margin: 0;
-  overflow-x: hidden;
+  padding-top: 64px;
+  overflow-x: clip;
   font-family: var(--font-sans);
   font-size: 1rem;
   line-height: 1.7;
@@ -164,8 +165,10 @@ p { margin: 0 0 1.25em; }
 //   .mobile-menu-toggle)
 // ══════════════════════════════════════════════
 .site-header {
-  position: sticky;
+  position: fixed;
   top: 0;
+  left: 0;
+  right: 0;
   z-index: 100;
   background: var(--header-bg);
   backdrop-filter: blur(12px);
@@ -908,53 +911,8 @@ pre {
 }
 
 // ══════════════════════════════════════════════
-// DOCS LAYOUT  (classes: .docs-layout,
-//   .docs-sidebar, .docs-content,
-//   .docs-toc, .docs-pager)
+// DOCS LAYOUT — now handled inline in docs.html template
 // ══════════════════════════════════════════════
-.docs-layout {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 2rem;
-  padding: 2rem 0;
-
-  @media (min-width: 1024px) {
-    grid-template-columns: 250px 1fr;
-  }
-}
-
-.docs-sidebar {
-  @media (min-width: 1024px) {
-    position: sticky;
-    top: 80px;
-    max-height: calc(100vh - 96px);
-    overflow-y: auto;
-  }
-
-  nav ul {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-  }
-
-  nav li a {
-    display: block;
-    padding: 0.4rem 0.75rem;
-    border-radius: 6px;
-    color: var(--text-muted);
-    font-size: 0.9rem;
-    transition: all 0.15s;
-
-    &:hover { color: var(--text); background: var(--bg-surface); }
-    &.active { color: var(--accent); background: var(--accent-muted); font-weight: 600; }
-  }
-}
-
-.docs-content {
-  min-width: 0;
-  max-width: 100%;
-  width: 100%;
-}
 
 .page-shell {
   min-width: 0;
@@ -1016,43 +974,6 @@ pre {
 
 .section-subsections-header {
   margin-top: 2.5rem;
-}
-
-.docs-toc {
-  margin-bottom: 2rem;
-  summary {
-    cursor: pointer;
-    color: var(--text-muted);
-    font-weight: 600;
-    font-size: 0.9rem;
-    &:hover { color: var(--text); }
-  }
-  ul {
-    list-style: none;
-    padding-left: 1rem;
-    margin: 0.5rem 0;
-  }
-  li { margin: 0.25rem 0; }
-  a {
-    color: var(--text-muted);
-    font-size: 0.85rem;
-    &:hover { color: var(--link-hover); }
-  }
-}
-
-.docs-pager {
-  display: flex;
-  justify-content: space-between;
-  margin-top: 3rem;
-  padding-top: 1.5rem;
-  border-top: 1px solid var(--border);
-  gap: 1rem;
-
-  a {
-    color: var(--link);
-    font-weight: 500;
-    &:hover { color: var(--link-hover); }
-  }
 }
 
 // ══════════════════════════════════════════════

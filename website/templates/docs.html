@@ -1,135 +1,134 @@
 {% extends "base.html" %} {% block title %}{{ page.title }} | Docs — {{ config.title }}{% endblock
 title %} {% block content %} {# Fetch all doc pages for sidebar navigation #} {% set docs_section =
-get_section(path="docs/_index.md") %}
+get_section(path="docs/_index.md") %} {# ── Mobile sidebar toggle ─────────────────────────────── #}
+<input type="checkbox" id="sidebar-toggle" class="docs-sidebar-checkbox" hidden />
+<label for="sidebar-toggle" class="docs-sidebar-toggle" aria-label="Toggle navigation">
+    <span class="docs-sidebar-toggle-icon"></span>
+</label>
 
-<div class="docs-layout">
-    {# ── Mobile sidebar toggle ─────────────────────────────── #}
-    <input type="checkbox" id="sidebar-toggle" class="docs-sidebar-checkbox" hidden />
-    <label for="sidebar-toggle" class="docs-sidebar-toggle" aria-label="Toggle navigation">
-        <span class="docs-sidebar-toggle-icon"></span>
-    </label>
+{# ── Left sidebar — page selector + page TOC ─────────────── #}
+<nav class="docs-sidebar" aria-label="Documentation navigation">
+    <div class="docs-sidebar-top">
+        <details class="docs-page-selector">
+            <summary class="docs-page-selector-summary">
+                {% set current_title = page.title %} {% for doc_page in docs_section.pages %} {% if
+                doc_page.path == current_path %} {% set_global current_title = doc_page.title %} {%
+                endif %} {% endfor %}
+                <span class="docs-page-selector-label">Documentation</span>
+                <span class="docs-page-selector-current">{{ current_title }}</span>
+                <span class="docs-page-selector-chevron" aria-hidden="true">&#8250;</span>
+            </summary>
+            <ul class="docs-page-selector-list">
+                {% for doc_page in docs_section.pages %}
+                <li>
+                    <a
+                        href="{{ doc_page.permalink }}"
+                        class="docs-page-selector-link {% if doc_page.path == current_path %}is-active{% endif %}"
+                    >
+                        {{ doc_page.title }}
+                    </a>
+                </li>
+                {% endfor %}
+            </ul>
+        </details>
 
-    {# ── Left sidebar — doc page list ─────────────────────── #}
-    <nav class="docs-sidebar" aria-label="Documentation navigation">
-        <div class="docs-sidebar-header">
-            <h2 class="docs-sidebar-title">Documentation</h2>
-            <label for="sidebar-toggle" class="docs-sidebar-close" aria-label="Close navigation"
-                >&times;</label
-            >
-        </div>
+        <label for="sidebar-toggle" class="docs-sidebar-close" aria-label="Close navigation"
+            >&times;</label
+        >
+    </div>
 
-        <ul class="docs-nav">
-            {% for doc_page in docs_section.pages %}
-            <li class="docs-nav-item">
-                <a
-                    href="{{ doc_page.permalink }}"
-                    class="docs-nav-link {% if doc_page.path == current_path %}is-active{% endif %}"
-                >
-                    {{ doc_page.title }}
-                </a>
-            </li>
-            {% endfor %}
-        </ul>
-    </nav>
-
-    {# ── Sidebar backdrop for mobile ──────────────────────── #}
-    <label for="sidebar-toggle" class="docs-sidebar-backdrop"></label>
-
-    {# ── Main content area ─────────────────────────────────── #}
-    <main class="docs-main">
-        <article class="docs-content">
-            <h1 class="docs-content-title">{{ page.title }}</h1>
-
-            {# ── Inline table of contents ────────────────────────── #} {% if page.toc %}
-            <details class="docs-toc" open>
-                <summary class="docs-toc-heading">On this page</summary>
-                <nav class="docs-toc-nav" aria-label="Table of contents">
+    {# ── Page table of contents ──────────────────────────── #} {% if page.toc %}
+    <div class="docs-toc-section">
+        <h3 class="docs-toc-title">On this page</h3>
+        <nav class="docs-toc-nav" aria-label="Table of contents">
+            <ul class="docs-toc-list">
+                {% for h1 in page.toc %}
+                <li class="docs-toc-item docs-toc-item--h2">
+                    <a href="{{ h1.permalink }}">{{ h1.title }}</a>
+                    {% if h1.children %}
                     <ul class="docs-toc-list">
-                        {% for h1 in page.toc %}
-                        <li class="docs-toc-item docs-toc-item--h2">
-                            <a href="{{ h1.permalink }}">{{ h1.title }}</a>
-                            {% if h1.children %}
-                            <ul class="docs-toc-list">
-                                {% for h2 in h1.children %}
-                                <li class="docs-toc-item docs-toc-item--h3">
-                                    <a href="{{ h2.permalink }}">{{ h2.title }}</a>
-                                </li>
-                                {% endfor %}
-                            </ul>
-                            {% endif %}
+                        {% for h2 in h1.children %}
+                        <li class="docs-toc-item docs-toc-item--h3">
+                            <a href="{{ h2.permalink }}">{{ h2.title }}</a>
                         </li>
                         {% endfor %}
                     </ul>
-                </nav>
-            </details>
-            {% endif %} {# ── Page body ───────────────────────────────────────── #}
-            <div class="docs-body">{{ page.content | safe }}</div>
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </nav>
+    </div>
+    {% endif %}
+</nav>
 
-            {# ── Prev / Next navigation ─────────────────────────── #} {% if page.lower or
-            page.higher %}
-            <nav class="docs-pager" aria-label="Previous and next pages">
-                {% if page.higher %}
-                <a href="{{ page.higher.permalink }}" class="docs-pager-link docs-pager-link--prev">
-                    <span class="docs-pager-direction">&larr; Previous</span>
-                    <span class="docs-pager-title">{{ page.higher.title }}</span>
-                </a>
-                {% else %}
-                <span class="docs-pager-link docs-pager-link--placeholder"></span>
-                {% endif %} {% if page.lower %}
-                <a href="{{ page.lower.permalink }}" class="docs-pager-link docs-pager-link--next">
-                    <span class="docs-pager-direction">Next &rarr;</span>
-                    <span class="docs-pager-title">{{ page.lower.title }}</span>
-                </a>
-                {% else %}
-                <span class="docs-pager-link docs-pager-link--placeholder"></span>
-                {% endif %}
-            </nav>
+{# ── Sidebar backdrop for mobile ──────────────────────── #}
+<label for="sidebar-toggle" class="docs-sidebar-backdrop"></label>
+
+{# ── Main content area ─────────────────────────────────── #}
+<main class="docs-main">
+    <article class="docs-content">
+        <h1 class="docs-content-title">{{ page.title }}</h1>
+
+        {# ── Page body ───────────────────────────────────────── #}
+        <div class="docs-body">{{ page.content | safe }}</div>
+
+        {# ── Prev / Next navigation ─────────────────────────── #} {% if page.lower or page.higher
+        %}
+        <nav class="docs-pager" aria-label="Previous and next pages">
+            {% if page.higher %}
+            <a href="{{ page.higher.permalink }}" class="docs-pager-link docs-pager-link--prev">
+                <span class="docs-pager-direction">&larr; Previous</span>
+                <span class="docs-pager-title">{{ page.higher.title }}</span>
+            </a>
+            {% else %}
+            <span class="docs-pager-link docs-pager-link--placeholder"></span>
+            {% endif %} {% if page.lower %}
+            <a href="{{ page.lower.permalink }}" class="docs-pager-link docs-pager-link--next">
+                <span class="docs-pager-direction">Next &rarr;</span>
+                <span class="docs-pager-title">{{ page.lower.title }}</span>
+            </a>
+            {% else %}
+            <span class="docs-pager-link docs-pager-link--placeholder"></span>
             {% endif %}
-        </article>
-    </main>
-</div>
+        </nav>
+        {% endif %}
+    </article>
+</main>
 
 <style>
-    /* ── Layout ──────────────────────────────────────────────── */
-    .docs-layout {
-        display: flex;
-        width: 90%;
-        max-width: 1280px;
-        margin: 0 auto;
-        min-height: calc(100vh - 8rem);
-        overflow-x: hidden;
-    }
+    /*
+       Layout: two independent columns.
+       Sidebar is position:fixed so it never scrolls with the page.
+       Main content has margin-left to make room for the sidebar.
+       Both are centered together using a shared max-width container
+       implemented through calc() on the sidebar left offset.
+    */
 
-    /* ── Sidebar ─────────────────────────────────────────────── */
+    /* ── Sidebar (fixed, never scrolls away) ─────────────────── */
     .docs-sidebar {
+        position: fixed;
+        top: 64px;
+        left: calc(50% - 660px);
         width: 260px;
-        flex-shrink: 0;
-        padding: 2rem 1rem 2rem 1.5rem;
+        height: calc(100vh - 64px);
+        padding: 1.25rem 0.75rem 1rem 1.5rem;
         border-right: 1px solid var(--border);
         background: var(--bg-surface);
-        overflow-y: auto;
-        position: sticky;
-        top: 0;
-        height: 100vh;
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        z-index: 5;
         transition:
             background 0.2s,
             border-color 0.2s;
     }
 
-    .docs-sidebar-header {
+    .docs-sidebar-top {
+        flex-shrink: 0;
         display: flex;
-        align-items: center;
-        justify-content: space-between;
-        margin-bottom: 1rem;
-    }
-
-    .docs-sidebar-title {
-        font-size: 0.85rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.05em;
-        color: var(--text-muted);
-        margin: 0;
+        align-items: flex-start;
+        gap: 0.5rem;
     }
 
     .docs-sidebar-close {
@@ -138,23 +137,78 @@ get_section(path="docs/_index.md") %}
         cursor: pointer;
         color: var(--text-muted);
         line-height: 1;
+        padding: 0.25rem 0;
+        margin-left: auto;
     }
 
-    .docs-nav {
+    /* ── Page selector (collapsible) ─────────────────────────── */
+    .docs-page-selector {
+        flex: 1;
+        min-width: 0;
+        background: var(--bg-surface-2);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+    }
+
+    .docs-page-selector-summary {
+        display: flex;
+        align-items: center;
+        gap: 0.5rem;
+        padding: 0.55rem 0.75rem;
+        cursor: pointer;
+        user-select: none;
+        transition: background 0.15s;
+    }
+
+    .docs-page-selector-summary:hover {
+        background: var(--bg-elevated);
+    }
+
+    .docs-page-selector-label {
+        font-size: 0.65rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-faint);
+        flex-shrink: 0;
+    }
+
+    .docs-page-selector-current {
+        font-size: 0.82rem;
+        font-weight: 600;
+        color: var(--accent);
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+
+    .docs-page-selector-chevron {
+        font-size: 0.85rem;
+        color: var(--text-muted);
+        flex-shrink: 0;
+        transition: transform 0.2s;
+    }
+
+    .docs-page-selector[open] .docs-page-selector-chevron {
+        transform: rotate(90deg);
+    }
+
+    .docs-page-selector-list {
         list-style: none;
         margin: 0;
-        padding: 0;
+        padding: 0.25rem 0;
+        border-top: 1px solid var(--border);
+        max-height: 45vh;
+        overflow-y: auto;
     }
 
-    .docs-nav-item + .docs-nav-item {
-        margin-top: 0.125rem;
-    }
-
-    .docs-nav-link {
+    .docs-page-selector-link {
         display: block;
-        padding: 0.4rem 0.75rem;
-        border-radius: 6px;
-        font-size: 0.9rem;
+        padding: 0.38rem 0.75rem;
+        font-size: 0.82rem;
         color: var(--text-muted);
         text-decoration: none;
         transition:
@@ -162,22 +216,82 @@ get_section(path="docs/_index.md") %}
             color 0.15s;
     }
 
-    .docs-nav-link:hover {
+    .docs-page-selector-link:hover {
+        background: var(--bg-elevated);
+        color: var(--text);
+    }
+
+    .docs-page-selector-link.is-active {
+        color: var(--accent);
+        font-weight: 600;
+        background: var(--accent-muted);
+    }
+
+    /* ── Page TOC in sidebar ─────────────────────────────────── */
+    .docs-toc-section {
+        flex: 1;
+        min-height: 0;
+        margin-top: 1rem;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .docs-toc-title {
+        font-size: 0.65rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--text-faint);
+        margin: 0 0 0.5rem 0.5rem;
+        flex-shrink: 0;
+    }
+
+    .docs-toc-nav {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding-right: 0.25rem;
+        padding-bottom: 1rem;
+    }
+
+    .docs-toc-list {
+        list-style: none;
+        margin: 0;
+        padding: 0;
+    }
+
+    .docs-toc-list .docs-toc-list {
+        padding-left: 0.85rem;
+    }
+
+    .docs-toc-item a {
+        display: block;
+        padding: 0.2rem 0.5rem;
+        font-size: 0.82rem;
+        line-height: 1.35;
+        color: var(--text-muted);
+        text-decoration: none;
+        border-radius: 4px;
+        transition:
+            background 0.15s,
+            color 0.15s;
+    }
+
+    .docs-toc-item a:hover {
         background: var(--bg-surface-2);
         color: var(--text);
     }
 
-    .docs-nav-link.is-active {
-        background: var(--accent-muted);
-        color: var(--accent);
-        font-weight: 600;
+    .docs-toc-item--h3 a {
+        font-size: 0.78rem;
+        padding-left: 0.75rem;
     }
 
     /* ── Main content ────────────────────────────────────────── */
     .docs-main {
-        flex: 1;
+        margin-left: calc(50% - 660px + 260px);
+        margin-right: calc(50% - 660px);
         min-width: 0;
-        width: 100%;
         padding: 2rem 2.5rem 4rem;
         overflow-x: hidden;
     }
@@ -324,54 +438,6 @@ get_section(path="docs/_index.md") %}
         margin: 0 0 1.25em;
     }
 
-    /* ── Table of contents ───────────────────────────────────── */
-    .docs-toc {
-        background: var(--bg-surface);
-        border: 1px solid var(--border);
-        border-radius: 8px;
-        padding: 1rem 1.25rem;
-        margin-bottom: 2rem;
-        transition:
-            background 0.2s,
-            border-color 0.2s;
-    }
-
-    .docs-toc-heading {
-        font-size: 0.85rem;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        color: var(--text-muted);
-        cursor: pointer;
-        user-select: none;
-    }
-
-    .docs-toc-nav {
-        margin-top: 0.75rem;
-    }
-
-    .docs-toc-list {
-        list-style: none;
-        margin: 0;
-        padding: 0;
-    }
-
-    .docs-toc-list .docs-toc-list {
-        padding-left: 1rem;
-    }
-
-    .docs-toc-item a {
-        display: block;
-        padding: 0.2rem 0;
-        font-size: 0.875rem;
-        color: var(--text-muted);
-        text-decoration: none;
-    }
-
-    .docs-toc-item a:hover {
-        color: var(--link-hover);
-    }
-
     /* ── Prev / Next pager ───────────────────────────────────── */
     .docs-pager {
         display: flex;
@@ -478,29 +544,38 @@ get_section(path="docs/_index.md") %}
         background: rgba(0, 0, 0, 0.4);
     }
 
-    /* ── Responsive — mobile ─────────────────────────────────── */
+    /* ── Responsive — narrow desktop (1320px and below) ──────── */
+    @media (max-width: 1320px) {
+        .docs-sidebar {
+            left: 5%;
+        }
+
+        .docs-main {
+            margin-left: calc(5% + 260px);
+            margin-right: 5%;
+        }
+    }
+
+    /* ── Responsive — mobile (768px and below) ────────────────── */
     @media (max-width: 768px) {
         .docs-sidebar-toggle {
             display: flex;
         }
 
         .docs-sidebar {
-            position: fixed;
-            top: 0;
             left: 0;
             z-index: 100;
-            height: 100vh;
             width: 280px;
             transform: translateX(-100%);
             transition: transform 0.25s ease;
             box-shadow: 2px 0 12px rgba(0, 0, 0, 0.15);
+            overflow-y: auto;
         }
 
         .docs-sidebar-close {
             display: block;
         }
 
-        /* Show sidebar when checkbox is checked */
         .docs-sidebar-checkbox:checked ~ .docs-sidebar {
             transform: translateX(0);
         }
@@ -509,12 +584,11 @@ get_section(path="docs/_index.md") %}
             display: block;
         }
 
-        .docs-layout {
-            width: 90%;
-        }
-
         .docs-main {
-            padding: 1.5rem 0 4rem;
+            margin-left: 0;
+            margin-right: 0;
+            max-width: 100%;
+            padding: 1.5rem 1rem 4rem;
         }
 
         .docs-body table {
