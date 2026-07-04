@@ -1,7 +1,12 @@
 name: HttpToolAgent
 version: "1.0.0"
-description: "HTTP client tool for fetching external data"
+description: "Raw HTTP API client tool for fetching external data"
 
+# Raw HTTP API client example.
+#
+# Use `http` for API-style GET, POST, PUT, PATCH, DELETE, and HEAD requests.
+# Use `web_fetch` instead when the goal is public page retrieval and text extraction.
+#
 # NOTE: Do NOT list tool names or descriptions here.
 # The framework auto-injects all tool names, descriptions, and argument schemas
 # into the prompt at runtime via generate_tools_prompt().
@@ -13,7 +18,7 @@ system_prompt: |
 
 llm:
   provider: openai
-  model: gpt-4.1-mini
+  model: gpt-5.4-mini
 
 tools:
   - name: http

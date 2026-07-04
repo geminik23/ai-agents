@@ -74,7 +74,7 @@ impl Tool for WordCountTool {
 async fn main() -> ai_agents::Result<()> {
     init_tracing();
 
-    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-mini")?;
+    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-5.4-mini")?;
 
     let agent = AgentBuilder::new()
         .system_prompt(

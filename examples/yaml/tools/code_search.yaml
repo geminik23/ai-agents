@@ -1,0 +1,56 @@
+name: CodeSearchAgent
+version: "1.0.0"
+description: "Search code and docs with read-only discovery tools"
+
+# Read-only code and docs search example.
+#
+# This pattern is useful for docs QA, API lookup, and codebase research when the
+# agent should stay strictly read-only. Start broad with glob or file_list, then
+# narrow with grep and file_read.
+#
+# Flow: user question -> glob / file_list -> grep -> file_read / file_info -> summary
+system_prompt: |
+  You answer questions about the local repository by searching files safely.
+  Prefer grep for symbol or phrase lookup, then read only the most relevant files.
+  Quote exact paths and line ranges when possible.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Read-only discovery tools granted to the model.
+tools:
+  - glob
+  - grep
+  - file_list
+  - file_read
+  - file_info
+
+# Keep the readable surface narrow and predictable for docs QA.
+tool_security:
+  enabled: true
+  tools:
+    glob:
+      read_paths: [./crates, ./website, ./examples, ./temp]
+      blocked_paths: [./target, ./.git]
+    grep:
+      read_paths: [./crates, ./website, ./examples, ./temp]
+      blocked_paths: [./target, ./.git]
+    file_list:
+      read_paths: [./crates, ./website, ./examples, ./temp]
+      blocked_paths: [./target, ./.git]
+    file_read:
+      read_paths: [./crates, ./website, ./examples, ./temp]
+      blocked_paths: [./target, ./.git]
+    file_info:
+      read_paths: [./crates, ./website, ./examples, ./temp]
+      blocked_paths: [./target, ./.git]
+
+metadata:
+  cli:
+    welcome: "=== Code Search Demo ==="
+    hints:
+      - "Try: Find the docs section that explains tool security"
+      - "Try: Search for RuntimeControlHandle in the crates folder"
+      - "Try: Which file documents the built-in tool catalog?"
+    show_tools: true

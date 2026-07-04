@@ -33,5 +33,9 @@ name = "yaml-custom-tool"
 path = "src/yaml_custom_tool.rs"
 
 [[bin]]
+name = "context-tool"
+path = "src/context_tool.rs"
+
+[[bin]]
 name = "tool-provider"
 path = "src/tool_provider.rs"

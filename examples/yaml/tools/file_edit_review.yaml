@@ -1,0 +1,54 @@
+name: FileEditReviewAgent
+version: "1.0.0"
+description: "Review an exact file edit with dry-run output and policy-gated apply"
+
+# Controlled file edit example.
+#
+# Use this when the agent should propose a precise replacement instead of rewriting
+# a whole file. The agent can read the file first, run a dry run, inspect the diff
+# summary, and then apply the edit only inside the allowed write root.
+#
+# Flow: inspect file -> file_edit dry_run -> review summary -> approved apply -> final report
+system_prompt: |
+  You make precise file edits with minimal scope.
+  Read the file before editing, prefer dry_run first, and explain the diff summary.
+  Only apply an edit after the dry run looks correct.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Read first, then use the exact edit tool inside the sandbox path.
+tools:
+  - file_read
+  - file_edit
+  - todo
+
+# Enable approval handling for non-dry-run mutation.
+hitl:
+  default_timeout_seconds: 300
+  on_timeout: reject
+
+# Restrict reads and writes to the committed example fixture sandbox.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    file_read:
+      read_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+    file_edit:
+      write_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+      require_read_before_write: true
+      max_replacements: 5
+      max_changed_lines: 20
+
+metadata:
+  cli:
+    welcome: "=== File Edit Review Demo ==="
+    hints:
+      - "Try: Dry-run a replacement in examples/fixtures/tool_examples/edit_target.txt"
+      - "Try: Replace 'Status: draft' with 'Status: reviewed'"
+      - "Try: Explain the diff before applying the edit"
+    show_tools: true

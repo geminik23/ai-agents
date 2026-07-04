@@ -8,7 +8,7 @@ description: "Uses an MCP server as a single tool with runtime-discovered functi
 # Views create named subsets of those functions for state-level scoping.
 #
 # Flow: user input -> state routing -> scoped tool set -> function dispatch -> MCP server -> response
-#                  -> non-filesystem request -> datetime/http or normal chat -> response
+#                  -> non-filesystem request -> datetime/web_fetch or normal chat -> response
 #
 # Prerequisites:
 #   - Install npm so `npx` can spawn the MCP server
@@ -24,12 +24,12 @@ system_prompt: |
 
 llm:
   provider: openai
-  model: gpt-4.1-mini
+  model: gpt-5.4-mini
 
 tools:
   # Built-in tools available for general-purpose questions.
   - datetime
-  - http
+  - web_fetch
 
   # MCP server declared as a single tool entry.
   # The discovered server functions are available through `tool: filesystem`.
@@ -108,7 +108,7 @@ states:
     general:
       prompt: "I'll help with your question."
       # Only the built-in tools are available in this state.
-      tools: [datetime, http]
+      tools: [datetime, web_fetch]
       transitions:
         - to: ready
           when: "user is done or changes topic"

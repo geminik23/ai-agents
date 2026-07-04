@@ -1,0 +1,45 @@
+name: WebFetchResearchAgent
+version: "1.0.0"
+description: "Fetch public web pages with bounded output and optional extraction"
+
+# Safe web fetch example.
+#
+# Use this when the agent should read public documentation pages without a full
+# browser or unrestricted HTTP client. The tool validates schemes, hosts, DNS/IP
+# targets, redirects, and byte limits before returning bounded text.
+#
+# Flow: public URL -> web_fetch -> optional prompt extraction -> summary
+#
+# NOTE: This example makes a real network request to an allowed public domain.
+system_prompt: |
+  You research public documentation pages safely.
+  Prefer focused extraction prompts when the user asks a narrow question.
+  Mention the final fetched URL when redirects happened.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+tools:
+  - web_fetch
+
+# Keep the network policy narrow and explicit. Per-call caps such as
+# max_response_bytes and max_chars are part of the web_fetch tool input.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    web_fetch:
+      domains:
+        allow: [docs.rs, ai-agents.rs]
+      allowed_schemes: [https]
+      blocked_private_networks: true
+      timeout_ms: 15000
+
+metadata:
+  cli:
+    welcome: "=== Web Fetch Research Demo ==="
+    hints:
+      - "Try: Fetch https://docs.rs/serde/latest/serde/ and summarize it"
+      - "Try: Read a page from ai-agents.rs and extract the main topic"
+    show_tools: true

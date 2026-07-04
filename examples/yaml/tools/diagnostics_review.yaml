@@ -1,0 +1,30 @@
+name: DiagnosticsReviewAgent
+version: "1.0.0"
+description: "Review compiler or editor diagnostics from a host-provided provider"
+
+# Host diagnostics example.
+#
+# The diagnostics tool depends on a host provider. IDEs or eval fixtures can
+# inject real diagnostics. The default CLI runtime leaves the provider unavailable,
+# which makes the tool return a structured unavailable result instead of hanging.
+#
+# Flow: user request -> diagnostics provider -> summarized issues or unavailable result
+system_prompt: |
+  You review diagnostics and explain the most important errors first.
+  If diagnostics are unavailable, say so clearly and suggest a next step.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+tools:
+  - diagnostics
+  - file_read
+
+metadata:
+  cli:
+    welcome: "=== Diagnostics Review Demo ==="
+    hints:
+      - "Try: Show the current diagnostics summary"
+      - "In plain CLI this usually returns unavailable unless a host installs a provider"
+    show_tools: true

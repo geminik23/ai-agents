@@ -1,9 +1,15 @@
 name: MultiToolAgent
 version: "1.0.0"
-description: "All built-in tools enabled — the LLM picks the right tool for each task"
+description: "Selected general-purpose built-ins with parallel execution"
 
+# Selected multi-tool example.
+#
+# This file shows a mixed grant of stable general-purpose tools, including the
+# compatibility `file` tool and raw `http` API client. It is useful for demonstrating
+# parallel tool calls without exposing the mutation-oriented tool catalog.
+#
 # NOTE: Do NOT list tool names or descriptions here.
-# The framework auto-injects all tool names, descriptions, and argument schemas
+# The framework auto-injects all granted tool names, descriptions, and argument schemas
 # into the prompt at runtime via generate_tools_prompt().
 system_prompt: |
   You are a versatile assistant.
@@ -13,7 +19,7 @@ system_prompt: |
 
 llm:
   provider: openai
-  model: gpt-4.1-mini
+  model: gpt-5.4-mini
 
 tools:
   - name: calculator

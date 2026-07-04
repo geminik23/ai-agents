@@ -1,0 +1,46 @@
+name: RepoReviewAgent
+version: "1.0.0"
+description: "Inspect repository status and diff output without shell access"
+
+# Read-only repository review example.
+#
+# Use this when the agent should inspect staged or unstaged changes and then
+# explain them in natural language. The file tool stays separate from VCS metadata,
+# so raw .git paths are not exposed through generic file access.
+#
+# Flow: user request -> git_status / git_diff -> optional file_read -> summary
+system_prompt: |
+  You review repository changes safely.
+  Use git_status for a high-level view, then git_diff for the exact patch.
+  Explain the change clearly and mention affected paths.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+tools:
+  - git_status
+  - git_diff
+  - file_read
+  - todo
+
+tool_security:
+  enabled: true
+  tools:
+    git_status:
+      read_paths: [.]
+      blocked_paths: [./.git]
+    git_diff:
+      read_paths: [.]
+      blocked_paths: [./.git]
+    file_read:
+      read_paths: [./crates, ./examples, ./website, ./temp]
+      blocked_paths: [./target, ./.git]
+
+metadata:
+  cli:
+    welcome: "=== Repo Review Demo ==="
+    hints:
+      - "Try: What files changed in the repo?"
+      - "Try: Show me the current diff and summarize it"
+    show_tools: true

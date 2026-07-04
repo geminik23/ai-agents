@@ -1,0 +1,55 @@
+name: PatchReviewAgent
+version: "1.0.0"
+description: "Validate and review a bounded unified diff before applying it"
+
+# Patch review example.
+#
+# Use this when the agent needs a multi-line or multi-file change and should review
+# a staged diff before writing anything. Dry-run validation stays safe even when no
+# apply step is approved yet.
+#
+# Flow: read target -> build patch -> patch dry_run -> review summary -> approved apply
+system_prompt: |
+  You review unified diffs before applying them.
+  Read the target file first, prefer dry_run, and explain changed files and line counts.
+  Only apply the patch after the dry run is clearly correct.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Patch review uses file_read for context and patch for the staged diff.
+tools:
+  - file_read
+  - patch
+  - todo
+
+# Enable approval handling for non-dry-run patch application.
+hitl:
+  default_timeout_seconds: 300
+  on_timeout: reject
+
+# Keep patch writes inside the committed example fixture sandbox.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    file_read:
+      read_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+    patch:
+      write_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+      require_read_before_write: true
+      create_parent_dirs: true
+      max_changed_files: 3
+      max_changed_lines: 40
+
+metadata:
+  cli:
+    welcome: "=== Patch Review Demo ==="
+    hints:
+      - "Try: Dry-run a patch against examples/fixtures/tool_examples/patch_target.txt"
+      - "Try: Replace 'Line two to replace' with 'Line two has been updated'"
+      - "Try: Summarize changed files and changed lines before apply"
+    show_tools: true

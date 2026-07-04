@@ -1,0 +1,51 @@
+name: CommandValidationAgent
+version: "1.0.0"
+description: "Run exact allowlisted validation commands with bounded output"
+
+# Controlled command example.
+#
+# This pattern is useful for validation steps such as formatting, checking, or
+# deterministic smoke tests. The command tool is not a shell. It runs exact argv
+# commands only, inside explicit working directories, with bounded output.
+#
+# Flow: user validation request -> command argv allowlist -> bounded output -> summary
+system_prompt: |
+  You run allowlisted validation commands when the user asks for a safe check.
+  Prefer argv commands, mention the working directory, and summarize the result clearly.
+  Do not attempt shell syntax or commands outside the configured allowlist.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Only the controlled command tool and todo helper are needed here.
+tools:
+  - command
+  - todo
+
+# Keep command execution non-interactive and allowlisted.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    command:
+      allow_without_confirmation: true
+      allowed_commands:
+        - argv: [cargo, fmt, --all]
+        - argv: [cargo, check, --workspace]
+        - argv: [cargo, test, -p, ai-agents-tools]
+      working_dirs: [.]
+      deny_shell: true
+      deny_interactive: true
+      timeout_ms: 120000
+      max_output_chars: 30000
+      env_passthrough: []
+
+metadata:
+  cli:
+    welcome: "=== Command Validation Demo ==="
+    hints:
+      - "Try: Run cargo fmt --all"
+      - "Try: Run cargo check --workspace"
+      - "Try: Explain the result of an allowlisted validation command"
+    show_tools: true

@@ -246,7 +246,7 @@ impl ToolProvider for MockApiProvider {
 async fn main() -> ai_agents::Result<()> {
     init_tracing();
 
-    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
+    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-5.4-nano")?;
 
     // Create a registry and register the provider.
     // register_provider() is async because it calls list_tools() to discover and index all tools the provider serves.

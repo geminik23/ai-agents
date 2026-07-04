@@ -1,0 +1,61 @@
+name: WorkspaceResearchAgent
+version: "1.0.0"
+description: "Search and inspect a workspace with read-only discovery tools"
+
+# Read-only workspace research example.
+#
+# This pattern is useful when the agent should inspect code, docs, or project layout
+# without any mutation tools. The top-level tool grant stays narrow and the runtime
+# still applies canonical IDs, output bounds, and pagination.
+#
+# Flow: user question -> glob / grep / file_list -> file_read / file_info -> summary
+#                  -> no tool needed -> normal LLM response
+#
+# NOTE: Do NOT list tool names in the system prompt. Tool schemas are auto-injected.
+system_prompt: |
+  You help users inspect a workspace safely.
+  Prefer broad discovery first, then narrow down to specific files.
+  Quote exact paths when referencing results.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# Read-only discovery and inspection tools for codebase exploration.
+tools:
+  - glob
+  - grep
+  - file_list
+  - file_read
+  - file_info
+  - todo
+
+# Narrow the allowed read surface. Output bounds are also enforced by each tool's
+# built-in defaults and request-level max_* arguments.
+tool_security:
+  enabled: true
+  tools:
+    glob:
+      read_paths: [./crates, ./examples, ./website, ./temp]
+      blocked_paths: [./target, ./.git]
+    grep:
+      read_paths: [./crates, ./examples, ./website, ./temp]
+      blocked_paths: [./target, ./.git]
+    file_list:
+      read_paths: [./crates, ./examples, ./website, ./temp]
+      blocked_paths: [./target, ./.git]
+    file_read:
+      read_paths: [./crates, ./examples, ./website, ./temp]
+      blocked_paths: [./target, ./.git]
+    file_info:
+      read_paths: [./crates, ./examples, ./website, ./temp]
+      blocked_paths: [./target, ./.git]
+
+metadata:
+  cli:
+    welcome: "=== Workspace Research Demo ==="
+    hints:
+      - "Try: Find all Rust files related to tool security"
+      - "Try: Search for RuntimeControlHandle in the crates folder"
+      - "Try: List the examples/yaml/tools directory"
+    show_tools: true

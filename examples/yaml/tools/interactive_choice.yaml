@@ -1,0 +1,31 @@
+name: InteractiveChoiceAgent
+version: "1.0.0"
+description: "Ask the user a structured follow-up question during a turn"
+
+# Interactive question example.
+#
+# This pattern is useful when the model needs a user preference before it can
+# continue. In the plain REPL, the CLI prints numbered options. In the TUI,
+# the question appears as a modal. In non-interactive environments, the tool
+# uses the configured default or returns an unavailable-style response.
+#
+# Flow: user request -> ask_user -> answer selected by host -> final response
+system_prompt: |
+  You ask a short follow-up question when the user has multiple valid choices.
+  Use ask_user instead of guessing preferences.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+tools:
+  - ask_user
+  - todo
+
+metadata:
+  cli:
+    welcome: "=== Interactive Choice Demo ==="
+    hints:
+      - "Try: Help me choose a database for a small local app"
+      - "Try: Pick a frontend framework for my dashboard"
+    show_tools: true

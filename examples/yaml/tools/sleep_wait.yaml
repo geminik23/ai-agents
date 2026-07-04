@@ -1,0 +1,42 @@
+name: SleepWaitAgent
+version: "1.0.0"
+description: "Wait for short policy-bounded delays without shell access"
+
+# Bounded wait example.
+#
+# Use sleep for short polling, retry spacing, or demo timing when a shell command
+# would be unnecessary. The runtime caps the requested duration using both the
+# tool policy and the effective timeout.
+#
+# Flow: wait request -> sleep duration cap -> bounded wait -> summary
+system_prompt: |
+  You may wait briefly when the user explicitly asks for a short pause.
+  Keep waits small, explain the reason, and report the actual duration.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# sleep is a bounded wait primitive, not a shell escape hatch.
+tools:
+  - sleep
+  - todo
+
+# Trusted hosts can tune the maximum duration through tool-specific config.
+tool_security:
+  enabled: true
+  fail_closed: true
+  default_timeout_ms: 5000
+  tools:
+    sleep:
+      timeout_ms: 5000
+      config:
+        max_duration_ms: 1000
+
+metadata:
+  cli:
+    welcome: "=== Sleep Wait Demo ==="
+    hints:
+      - "Try: Wait for 250 ms before answering"
+      - "Try: Explain the maximum configured wait"
+    show_tools: true

@@ -1,0 +1,48 @@
+name: CatalogSearchAgent
+version: "1.0.0"
+description: "Rust custom tool that reads runtime context and custom tool config"
+
+# Context-aware custom tool example.
+#
+# The catalog_search tool is implemented in Rust and registered by the binary.
+# This YAML grants the tool and provides runtime policy plus custom settings.
+# Custom settings under config become ToolExecutionContext.custom_config.
+#
+# Flow: user query -> catalog_search -> ctx.limits and ctx.custom_config -> bounded JSON results
+system_prompt: |
+  You help users search a small product catalog.
+  Use catalog_search for product, SKU, category, or inventory questions.
+  Explain which backend and tenant were used when that helps the user trust the result.
+
+llm:
+  provider: openai
+  model: gpt-5.4-nano
+
+tools:
+  - name: catalog_search
+
+# tool_security restricts the custom tool and passes tool-specific config.
+# max_results becomes ctx.limits.max_results because the tool declares a result-limit binding.
+# config is custom data for the Rust tool. The shared executor does not interpret it.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    catalog_search:
+      max_results: 2
+      max_output_chars: 4000
+      timeout_ms: 5000
+      config:
+        backend: memory
+        tenant: demo-store
+        default_currency: USD
+        include_internal_ids: false
+
+metadata:
+  cli:
+    welcome: "=== Context Tool Demo ==="
+    hints:
+      - "Try: Find running shoes"
+      - "Try: Search for kitchen products"
+      - "Try: Which catalog backend is being used?"
+    show_tools: true

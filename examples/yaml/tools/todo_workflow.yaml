@@ -1,0 +1,33 @@
+name: TodoWorkflowAgent
+version: "1.0.0"
+description: "Keep a session-local task list while planning work"
+
+# Session-local todo workflow example.
+#
+# The todo tool is useful when the agent should keep an explicit task list
+# across a multi-step conversation. The todo state lives inside the runtime
+# session, so later turns can list or update tasks without external storage.
+#
+# Flow: request -> todo set / update / list -> progress summary
+system_prompt: |
+  You maintain a concise task list while helping the user.
+  When the user asks to create, update, list, or clear tasks, call the todo tool before answering.
+  Do not describe task-list changes unless the todo tool has run for that request.
+  Use todo to capture the current plan, update status as work progresses,
+  and summarize outstanding tasks clearly.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+tools:
+  - todo
+  - ask_user
+
+metadata:
+  cli:
+    welcome: "=== Todo Workflow Demo ==="
+    hints:
+      - "Try: Plan a release checklist for a Rust CLI update"
+      - "Try: Break down a docs rewrite into 4 tasks"
+    show_tools: true

@@ -1,0 +1,55 @@
+name: FileWriteSandboxAgent
+version: "1.0.0"
+description: "Create files inside a write-scoped sandbox with dry-run review"
+
+# Controlled file write example.
+#
+# Use this when the agent should create a small artifact instead of editing an
+# existing file. Dry runs show what would be written, while real writes stay
+# inside the configured sandbox and require normal mutation approval.
+#
+# Flow: request -> file_write dry_run -> review summary -> approved write -> final report
+system_prompt: |
+  You create small files only inside the configured sandbox.
+  Prefer dry_run first, describe the target path and byte count, and ask for approval
+  before a non-dry-run write when the host requires it.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# file_write is separate from file_edit and patch so create/overwrite policy is explicit.
+tools:
+  - file_write
+  - file_read
+  - todo
+
+# Non-dry-run mutation can use HITL; dry runs return a summary without writing.
+hitl:
+  default_timeout_seconds: 300
+  on_timeout: reject
+
+# Restrict writes to the committed example fixture sandbox.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    file_read:
+      read_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+    file_write:
+      write_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+      overwrite_existing: false
+      create_parent_dirs: true
+      max_changed_files: 1
+      max_changed_lines: 40
+
+metadata:
+  cli:
+    welcome: "=== File Write Sandbox Demo ==="
+    hints:
+      - "Try: Dry-run creating examples/fixtures/tool_examples/generated_note.md"
+      - "Try: Create a short checklist file in examples/fixtures/tool_examples"
+      - "Try: Explain whether overwrite is allowed"
+    show_tools: true

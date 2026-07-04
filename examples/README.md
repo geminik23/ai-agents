@@ -110,7 +110,7 @@ Minimal getting-started examples.
 
 | File | Description |
 |------|-------------|
-| `simple_chat.yaml` | Smallest YAML-first chat agent |
+| `simple_chat.yaml` | Smallest YAML-first chat agent with explicit `tools: []` |
 | `simple_chat_stream.yaml` | Minimal streaming chat example |
 | `simple_tools.yaml` | Minimal built-in tools example |
 | `openai_compatible.yaml` | Connect to any OpenAI-compatible server such as LM Studio, vLLM, TGI, LocalAI, or Ollama `/v1` |
@@ -184,11 +184,23 @@ Top-level `tools:` is an explicit ordinary-tool grant. Omitted or empty top-leve
 | File | Description |
 |------|-------------|
 | `basic_tools.yaml` | Calculator and DateTime - LLM auto-selects the right tool |
+| `workspace_research.yaml` | Read-only workspace discovery with `glob`, `grep`, `file_list`, `file_read`, `file_info`, and `todo` |
+| `code_search.yaml` | Read-only docs and code search with `glob`, `grep`, `file_list`, `file_read`, and `file_info` |
+| `repo_review.yaml` | Read-only repository inspection with `git_status`, `git_diff`, and optional `file_read` follow-up |
+| `file_write_sandbox.yaml` | Create or overwrite a sandboxed file with `file_write`, dry-run review, and explicit write policy |
+| `file_edit_review.yaml` | Exact file replacement with `file_edit`, read-before-write policy, dry-run review, and HITL-ready apply |
+| `patch_review.yaml` | Unified diff validation with `patch`, bounded file and line caps, and HITL-ready apply |
+| `command_validation.yaml` | Exact allowlisted validation commands with `command`, bounded output, and explicit working directories |
+| `interactive_choice.yaml` | Structured user follow-up questions through `ask_user` in plain REPL or TUI modal form |
+| `todo_workflow.yaml` | Session-local planning and progress tracking with the `todo` tool |
+| `sleep_wait.yaml` | Short policy-bounded waits with the `sleep` tool and no shell access |
+| `diagnostics_review.yaml` | Host-provided diagnostics review; returns unavailable when no diagnostics provider is installed |
+| `web_fetch_research.yaml` | Bounded public web fetch with redirect checks, DNS/IP safety, and optional extraction prompt |
 | `text_and_json.yaml` | Unicode-aware text processing and structured JSON operations |
-| `file_and_template.yaml` | File I/O and Jinja2 template rendering |
+| `file_and_template.yaml` | Legacy file I/O plus Jinja2 template rendering |
 | `math_and_random.yaml` | Statistical math and random value generation |
-| `multi_tool_agent.yaml` | All built-in tools with parallel execution |
-| `http_tool.yaml` | External HTTP calls (makes real network requests) |
+| `multi_tool_agent.yaml` | Selected general-purpose built-ins with parallel execution |
+| `http_tool.yaml` | Raw HTTP API client tool for external API calls (makes real network requests) |
 | `mcp_agent.yaml` | MCP-backed filesystem tool with views - one MCP server scoped into `fs_read` and `fs_write` view tools for per-state least-privilege access |
 
 Note: The `system_prompt` in these examples intentionally does NOT list tool names or descriptions.
@@ -200,6 +212,18 @@ Examples:
 
 ```sh
 cargo run -p ai-agents-cli -- run examples/yaml/tools/basic_tools.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/workspace_research.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/code_search.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/repo_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/file_write_sandbox.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/file_edit_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/patch_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/command_validation.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/interactive_choice.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/todo_workflow.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/sleep_wait.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/diagnostics_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/web_fetch_research.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/text_and_json.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/file_and_template.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/math_and_random.yaml
@@ -678,14 +702,15 @@ cargo run --bin multi-provider
 
 ### `rust/custom-tools/`
 
-Custom tool examples - from a minimal `Tool` trait implementation to a full `ToolProvider` with dynamic discovery.
+Custom tool examples - from a context-aware `Tool::execute(args, ctx)` implementation to a full `ToolProvider` with dynamic discovery.
 
 | Binary | Description |
 |--------|-------------|
-| `simple-tool` | Minimal `Tool` trait - 5 methods, hand-written JSON Schema, `.tool()` registration |
+| `simple-tool` | Minimal `Tool` trait, hand-written JSON Schema, `.tool()` registration |
 | `schema-tool` | Auto-generated `input_schema` via `schemars::JsonSchema` - no hand-written JSON |
 | `stateful-tool` | Tool with mutable state across calls using `RwLock` (interior mutability pattern) |
 | `yaml-custom-tool` | YAML-defined agent + Rust domain tool injection (recommended production pattern) |
+| `context-tool` | YAML-defined custom tool config exposed through `ToolExecutionContext.custom_config` and `ctx.limits` |
 | `tool-provider` | Custom `ToolProvider` - dynamic tool discovery, health checks, multi-language aliases |
 
 Run from:
@@ -697,6 +722,7 @@ cargo run --bin simple-tool
 cargo run --bin schema-tool
 cargo run --bin stateful-tool
 cargo run --bin yaml-custom-tool
+cargo run --bin context-tool
 cargo run --bin tool-provider
 ```
 
