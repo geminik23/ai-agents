@@ -14,7 +14,7 @@ The `ai-agents-cli` crate gives you a ready-made command-line tool for running a
 ### From crates.io (recommended)
 
 ```sh
-cargo install ai-agents-cli --version 1.0.0-rc.15
+cargo install ai-agents-cli --version 1.0.0-rc.16
 ```
 
 ### From source
@@ -365,6 +365,28 @@ When you type `/` in the input area, a floating completion popup appears above t
 When `--stream` is enabled, tokens appear in real time in the chat area.
 Tool calls and state transitions are displayed inline as they happen.
 
+### `ask_user` behavior
+
+The CLI installs a question handler for the `ask_user` tool:
+
+- Plain REPL - prints the question and numbered options, then reads from stdin.
+- TUI - shows the question as a modal with option buttons. Full multi-select and free-text parity with the plain REPL is deferred.
+- Non-interactive fallback - if stdin is not interactive, the tool uses its configured `default` when present or returns an unavailable-style result.
+
+This is separate from HITL approval. HITL approves risky actions. `ask_user` is for normal clarification or preference questions inside the conversation flow.
+
+### `command` behavior
+
+The CLI installs a `ProcessCommandRunner` for the `command` tool when an agent is built through `ai-agents-cli`.
+
+- The tool runs argv-based processes, not a shell.
+- stdin is closed by default.
+- output is bounded by policy and tool limits.
+- the working directory must match `tool_security.tools.command.working_dirs`.
+- exact argv allowlists such as `allowed_commands` are checked before the process starts.
+
+If an agent is loaded by another host that does not install a command runner, the shared executor returns an explicit unavailable result instead of trying to spawn a process.
+
 ### Plain Mode Fallback
 
 The plain REPL is used automatically when stdout is not a terminal (piped input, CI).
@@ -386,7 +408,7 @@ name: DemoAgent
 system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 
 metadata:
   cli:
@@ -415,6 +437,8 @@ metadata:
 | `prompt_style`             | string     | `"simple"` or `"with_state"`             |
 | `disable_builtin_commands` | bool       | Disable slash commands except `/quit`    |
 | `theme`                    | string     | Color theme name (see Themes section)    |
+| `hitl.style`               | string     | CLI approval style: `prompt`, `auto_approve`, or `auto_reject` |
+| `hitl.show_context`        | bool       | Show approval arguments in the prompt    |
 
 ---
 

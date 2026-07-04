@@ -1,0 +1,70 @@
+name: Live Example - Tools Patch Review
+agent: ../../../yaml/tools/patch_review.yaml
+
+# Live eval suite for dry-run patch validation against committed fixture files.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools_patch_review_live.yaml \
+#     --output target/eval/live/examples/tools_patch_review \
+#     --real-llm
+#
+# Flow: read fixture -> live model -> patch dry run -> patch summary with no apply
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: patch-review-dry-run-only
+    name: Real model dry-runs a unified diff without applying it
+    tags: [live, examples, yaml, tools, mutation, dry-run, fixture, real-llm, patch, file_read]
+    language: en
+    turns:
+      - input: "Before answering, call file_read on examples/fixtures/tool_examples/patch_target.txt. Then call patch to dry-run a unified diff with base_path examples/fixtures/tool_examples that replaces 'Line two to replace' with 'Line two has been updated'. Keep dry_run true, do not apply the patch, and state that no file was changed."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: file_read
+                count_gte: 1
+                executed: true
+                success: true
+            - tool_called:
+                id: patch
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: patch
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: patch
+                result_path:
+                  path: bytes_written
+                  eq: 0
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "Line two has been updated"
+                - "no file was changed"
+                - "No file was changed"
+            - response_not_contains:
+                - "I applied the patch"
+                - "the patch was applied"
+                - "I changed the file on disk"
+                - "patched the file on disk"

@@ -1,0 +1,22 @@
+name: No Tools Explicit Empty Mocked Eval
+agent: ../yaml/basic/simple_chat.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"echo","arguments":{"message":"hello"}}'
+      - "I cannot use tools in this agent, so I will answer directly."
+scenarios:
+  - id: explicit-empty-tools-denies-tool
+    tags: [tools, grants, deny, mock]
+    turns:
+      - input: Try to call a tool even though tools is empty.
+        assert:
+          response_contains: "cannot use tools"
+          tool_called:
+            id: echo
+            executed: false
+            success: false

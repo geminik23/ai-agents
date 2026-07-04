@@ -1,0 +1,22 @@
+name: File Edit Denied Mocked Eval
+agent: ../yaml/tools/file_edit_review.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"file_edit","arguments":{"path":"./Cargo.toml","old_text":"name","new_text":"title","dry_run":true}}'
+      - "The edit was blocked because the path is outside the allowed sandbox."
+scenarios:
+  - id: file-edit-blocked-path
+    tags: [tools, mutation, policy, deny, mock]
+    turns:
+      - input: Try to edit outside the allowed sandbox.
+        assert:
+          response_contains: "blocked"
+          tool_called:
+            id: file_edit
+            executed: false
+            success: false

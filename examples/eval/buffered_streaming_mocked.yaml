@@ -3,9 +3,9 @@ agent: ../yaml/runtime-optimization/buffered_streaming.yaml
 
 # Speculative branch evaluation suite.
 # Use this no-key suite to verify that buffered streaming emits the committed routed response.
-# The route can win before the old-state draft consumes a mocked response, so both default fixtures use the committed response.
+# The default mocked LLM is delayed so the deterministic route wins before the old-state draft commits.
 #
-# Flow: streaming input -> buffered branch routing -> technical state response -> assertions
+# Flow: streaming input -> buffered branch routing -> technical state response -> cancelled stale branch -> assertions
 settings:
   timeout_per_turn_ms: 5000
   retries: 0
@@ -26,6 +26,8 @@ fixtures:
       default:
         - "Technical committed response."
         - "Technical committed response."
+    delays_by_alias:
+      default: 50
 
 scenarios:
   - id: buffered-route-win
@@ -44,6 +46,11 @@ scenarios:
                 dimension_counts:
                   - match_dimensions:
                       branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: cancelled
                     assert:
                       path: count
                       gte: 1

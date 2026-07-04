@@ -107,7 +107,7 @@ title %} {% block content %}
 <span class="code-key">system_prompt</span>: <span class="code-string">"You help customers safely."</span>
 <span class="code-key">llm</span>:
   <span class="code-key">provider</span>: <span class="code-string">openai</span>
-  <span class="code-key">model</span>: <span class="code-string">gpt-4.1-nano</span>
+  <span class="code-key">model</span>: <span class="code-string">gpt-5.4-nano</span>
 <span class="code-key">tools</span>:
   - <span class="code-string">calculator</span></code></pre>
                     </div>
@@ -368,7 +368,7 @@ title %} {% block content %}
 <span class="code-key">system_prompt</span>: <span class="code-string">"You are a helpful assistant."</span>
 <span class="code-key">llm</span>:
   <span class="code-key">provider</span>: <span class="code-string">openai</span>
-  <span class="code-key">model</span>: <span class="code-string">gpt-4.1-nano</span>
+  <span class="code-key">model</span>: <span class="code-string">gpt-5.4-nano</span>
 
 <span class="code-comment"># Run it</span>
 <span class="code-prompt">$</span> ai-agents-cli run agent.yaml</code></pre>
@@ -421,7 +421,7 @@ title %} {% block content %}
 <span class="code-attribute">#[tokio::main]</span>
 <span class="code-keyword">async fn</span> <span class="code-fn">main</span>() -> ai_agents::Result&lt;()&gt; {
     <span class="code-keyword">let</span> llm = UnifiedLLMProvider::from_env(
-        ProviderType::OpenAI, <span class="code-string">"gpt-4.1-nano"</span>
+        ProviderType::OpenAI, <span class="code-string">"gpt-5.4-nano"</span>
     )?;
 
     <span class="code-keyword">let</span> agent = AgentBuilder::new()

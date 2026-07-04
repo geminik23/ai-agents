@@ -1,0 +1,25 @@
+name: File Write Dry Run Mocked Eval
+agent: ../yaml/tools/file_write_sandbox.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"file_write","arguments":{"path":"./examples/fixtures/tool_examples/generated_note.md","content":"# Generated Note\n\n- Review before apply\n","create_parent_dirs":true,"dry_run":true}}'
+      - "Dry run reviewed one file and did not write bytes."
+scenarios:
+  - id: file-write-dry-run
+    tags: [tools, file_write, mutation, mock]
+    turns:
+      - input: Dry-run creating a generated note.
+        assert:
+          response_contains: "Dry run reviewed"
+          tool_called:
+            id: file_write
+            executed: true
+            success: true
+            result_path:
+              path: dry_run
+              eq: true

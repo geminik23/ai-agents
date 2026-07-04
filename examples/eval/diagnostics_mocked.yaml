@@ -1,0 +1,31 @@
+name: Mocked Diagnostics Eval
+agent: ../yaml/tools/diagnostics_review.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"diagnostics","arguments":{"path":"src/main.rs","severity":"error"}}'
+      - "The repo currently has one Rust error in src/main.rs."
+  diagnostics:
+    available: true
+    items:
+      - path: src/main.rs
+        line: 12
+        column: 5
+        severity: error
+        source: rustc
+        message: cannot find function `runn` in this scope
+        code: E0425
+scenarios:
+  - id: diagnostics-summary
+    tags: [tools, diagnostics, mock]
+    turns:
+      - input: Summarize the current diagnostics.
+        assert:
+          response_contains: "src/main.rs"
+          tool_called:
+            id: diagnostics
+            success: true

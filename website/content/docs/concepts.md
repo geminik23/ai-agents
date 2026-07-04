@@ -69,7 +69,7 @@ name: LifecycleDemo
 system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 memory:
   type: in-memory
   max_messages: 100
@@ -96,7 +96,7 @@ name: MinimalAgent
 system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 ```
 
 ---
@@ -111,11 +111,11 @@ If the primary LLM fails, the framework can automatically fall back to another n
 llms:
   default:
     provider: openai
-    model: gpt-4.1-mini
+    model: gpt-5.4-mini
     temperature: 0.7
   router:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-nano
   fallback:
     provider: ollama
     model: llama3
@@ -142,6 +142,10 @@ Transitions between states happen in two ways. **Condition-based** transitions u
 States support lifecycle actions (`on_enter`, `on_reenter`, `on_exit`) for setting context, and `extract` for pulling structured data from user input.
 
 ```yaml
+tools:
+  - calculator
+  - web_fetch
+
 states:
   initial: greeting
   fallback: confused
@@ -153,7 +157,7 @@ states:
           when: "the user has stated what they need"
     helping:
       prompt: "Help the user with their request."
-      tools: [calculator, http]
+      tools: [calculator, web_fetch]
       transitions:
         - to: closing
           when: "the user's issue is resolved"
@@ -179,6 +183,10 @@ Skills are **stateless and single-shot**: the executor runs each step as an isol
 Skills can define their own reasoning and reflection settings independently of the agent-level defaults. You can also put skills in external `.skill.yaml` files and reference them by path.
 
 ```yaml
+tools:
+  - datetime
+  - random
+
 skills:
   - id: daily_briefing
     description: "Get a daily briefing with time and a fun fact."
@@ -201,25 +209,32 @@ skills:
 
 ## Tools
 
-Tools give the agent the ability to act - call APIs, read files, do math, manipulate data. The framework ships with built-in tools: `datetime`, `json`, `http`, `file`, `text`, `template`, `math`, `calculator`, `random`, and `echo`.
+Tools give the agent the ability to act - call APIs, read files, inspect repositories, ask the user follow-up questions, keep a todo list, do math, manipulate data, edit files, review patches, and run controlled validation commands. The framework ships with built-in tools such as `calculator`, `datetime`, `echo`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `file_list`, `file_info`, `patch`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `command`, `json`, `http`, `file`, `text`, `template`, `math`, and `random`.
 
 For external tools, you can connect any MCP (Model Context Protocol) server. MCP tools support `stdio` transport, startup timeouts, security restrictions, and function-level views that let you expose subsets of an MCP server's capabilities to different states.
 
-Tool availability follows a 3-level scoping rule: state-level `tools` override spec-level `tools`, which override the full tool registry. This means you can restrict what the agent can use based on where it is in the conversation. Tools can also be secured with rate limits, domain restrictions, timeouts, and HITL approval.
+Tool availability is explicit and fail-closed. Omitted top-level `tools:` means no LLM-callable tools, and `tools: []` also means no tools. The top-level `tools:` list is the normal maximum grant; state-level `tools` can only narrow the effective grant, never widen it to the full registry. Explicit feature flags such as `spawner.management_tools`, `spawner.orchestration_tools`, and `persona.evolution.allow_llm_evolve` are also grants for their generated tools. Security policies, HITL, recovery, observability, and eval evidence use canonical tool IDs after aliases and display names are resolved. `ask_user` is separate from HITL approval: it asks a preference or clarification question through a host question handler instead of approving a risky action.
+
+The split local-file tools block raw `.git` paths, while `git_status` and `git_diff` expose bounded repository inspection. Mutation tools such as `file_write`, `file_edit`, and `patch` require explicit `write_paths` policy, canonicalize existing paths and write-parent ancestors to deny symlink escapes, and use read-before-write version checks when configured. Side-effecting tools share path-like resource locks across model, skill, state, fallback, orchestration, and spawned-runtime paths. The `command` tool is not a shell: it runs exact allowlisted argv commands inside explicit `working_dirs`, starts from an empty environment, filters env through policy, redacts argv evidence, and bounds output. Host-backed tools such as `diagnostics`, `ask_user`, and `command` return explicit unavailable results when their host hooks are absent; `ask_user` can use a configured default answer.
 
 ```yaml
 tools:
   - calculator
-  - datetime
-  - name: http
+  - glob
+  - grep
+  - file_read
+  - git_status
+  - web_fetch
+  - ask_user
+  - todo
   - name: filesystem
     type: mcp
     transport: stdio
     command: npx
-    args: ["-y", "@anthropic/mcp-filesystem"]
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "./"]
     views:
       fs_read:
-        functions: [read_file, list_directory]
+        functions: [read_file, list_allowed_directories, search_files]
         description: "Read-only file access"
 ```
 
@@ -510,12 +525,13 @@ A parent agent can create and manage child agents at runtime using the spawner s
 
 The spawner supports three creation methods: raw YAML strings, `AgentSpec` objects, and named Jinja2 templates. Templates can be defined inline in the YAML or loaded from separate files. A central `AgentRegistry` tracks all spawned agents and provides inter-agent messaging - one agent can send a message to another and receive its response, or broadcast to all agents at once.
 
-When `spawner:` is present in the YAML, the framework automatically registers four built-in tools: `generate_agent` (create a new agent from a description or template), `send_message` (talk to another agent), `list_agents` (see all registered agents), and `remove_agent` (remove an agent from the registry). The parent LLM decides when to use these tools based on the conversation.
+When `spawner:` is present in the YAML, the framework automatically registers four management tools: `spawn_agent` (create a new agent from a description or template), `send_agent_message` (talk to another agent), `list_agents` (see all registered agents), and `remove_agent` (remove an agent from the registry). Grant them with `spawner.management_tools`, or list them under top-level `tools:` when the parent LLM should call them.
 
-Spawned agents share the parent's LLM connections and storage backend by default. A `NamespacedStorage` adapter isolates each agent's sessions by prefixing keys with the agent ID, so multiple agents can safely share a single SQLite database. An `allowed_tools` list restricts what tools spawned agents can declare, preventing LLM-generated YAML from accessing sensitive tools like `http` or `file`.
+Spawned agents share the parent's LLM connections and storage backend by default. A `NamespacedStorage` adapter isolates each agent's sessions by prefixing keys with the agent ID, so multiple agents can safely share a single SQLite database. An `allowed_tools` list restricts what tools spawned agents can declare, preventing LLM-generated YAML from accessing sensitive network, file mutation, and command tools such as `http`, `web_fetch`, `file`, `file_write`, `file_edit`, `patch`, or `command`.
 
 ```yaml
 spawner:
+  management_tools: true
   shared_llms: true
   max_agents: 20
   name_prefix: "npc_"
@@ -532,7 +548,7 @@ spawner:
       system_prompt: "You are {{ name }}, a {{ role }} in {{ context.world_name }}."
       llm:
         provider: openai
-        model: gpt-4.1-nano
+        model: gpt-5.4-nano
 ```
 
 ---
@@ -649,7 +665,7 @@ The framework provides multiple safety layers to keep agents predictable and sec
 
 **Error recovery** handles transient failures with configurable retry, exponential backoff, fallback LLMs, and fallback responses. Context overflow (too many tokens) can be handled by summarizing or truncating. Each of these is configurable per subsystem - LLM calls, tool calls, and general errors all have separate policies.
 
-**Tool security** adds rate limits, domain allow/block lists, timeouts, and confirmation requirements on a per-tool basis. You can restrict `http` calls to specific domains or limit how many times a tool can be called per time window.
+**Tool security** adds rate limits, domain/path allow and block lists, timeouts, effective limit caps, custom tool config, and confirmation requirements on a per-tool basis. The shared executor resolves the requested name to a canonical ID, checks policy with tool-declared bindings, builds `ToolExecutionContext`, and records `ToolExecutionRecord` evidence even when a call is denied or unavailable before execution. Under fail-closed policy, custom tools must expose bindings for configured path, domain, command, operation, and result-limit constraints that the shared executor cannot otherwise apply.
 
 **HITL (Human-in-the-Loop)** lets you require human approval before sensitive operations execute. Approval messages support multiple languages, and you can scope approval rules to specific states or conditions. Timeout behavior is configurable - reject, allow, or use a default.
 
@@ -666,9 +682,15 @@ error_recovery:
 tool_security:
   enabled: true
   tools:
-    http:
-      rate_limit: 10
-      allowed_domains: [api.example.com]
+    web_fetch:
+      domains:
+        allow: [api.example.com]
+      max_response_bytes: 1048576
+    my_search_tool:
+      read_paths: [./docs]
+      max_results: 25
+      config:
+        backend: tantivy
 
 hitl:
   default_timeout_seconds: 30
@@ -780,7 +802,7 @@ user input
   -> finalize losing branch telemetry
 ```
 
-Speculative execution is opt-in and bounded by `max_speculative_llm_calls_per_turn`. This is important because discarded branches can still consume tokens and cost. When the cap is lower than the number of eligible branches, the runtime schedules only behavior-preserving branches and falls back to the serial committed path for skipped branch families. Observability reports expose `branch_status`, `optimization`, `commit_behavior`, `winner`, and `speculative` dimensions so eval suites and dashboards can track the cost of discarded work. Branch telemetry is the supported way to inspect speculative LLM work; final response hooks still fire once for the committed response.
+Speculative execution is opt-in and bounded by `max_speculative_llm_calls_per_turn`. This is important because discarded or cancelled branches can still consume tokens and cost. Deterministic guard and resolved-intent checks do not consume speculative LLM budget. When the cap is lower than the number of eligible LLM branches, the runtime schedules only behavior-preserving branches and falls back to the serial committed path for skipped branch families. Observability reports expose `branch_status`, `optimization`, `commit_behavior`, `winner`, and `speculative` dimensions so eval suites and dashboards can track committed, discarded, failed, and cancelled branch work. Branch telemetry is the supported way to inspect speculative LLM work; final response hooks still fire once for the committed response.
 
 Streaming supports a buffered routing policy for response-independent parallel state-transition routing. With `streaming_policy: buffer_until_routing_done`, output from the unresolved main branch is hidden until routing is safe. The buffer limit applies while routing is unresolved. After the transition branch misses or fails, later chunks are no longer counted against that unresolved-routing buffer. The runtime emits chunks only after the committed content is known: if the main branch wins and the raw draft still matches the committed response, buffered chunks are emitted in order; otherwise the committed content is emitted. If the transition branch wins, stale branch output is discarded and the committed route response is emitted instead. If the buffered main branch fails, branch telemetry is finalized as failed before the stream error is returned.
 

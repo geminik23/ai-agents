@@ -1,0 +1,60 @@
+name: Live Example - Tools Interactive Choice
+agent: ../../../yaml/tools/interactive_choice.yaml
+
+# Live eval suite for structured ask-user fallback behavior.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools_interactive_choice_live.yaml \
+#     --output target/eval/live/examples/tools_interactive_choice \
+#     --real-llm
+#
+# Flow: preference request -> live model -> ask_user default fallback -> final recommendation
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: interactive-choice-uses-default-fallback
+    name: Real model asks a structured question with a default answer
+    tags: [live, examples, yaml, tools, host-backed, fixture, real-llm, ask_user]
+    language: en
+    turns:
+      - input: "Before answering, call ask_user with one database preference question, options sqlite and postgres, and default sqlite. Use the selected answer to recommend a database for a small local app."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: ask_user
+                count_gte: 1
+                executed: true
+                success: true
+                args_original:
+                  path: default
+                  eq: sqlite
+            - tool_called:
+                id: ask_user
+                result_path:
+                  path: selected
+                  contains: sqlite
+            - tool_called:
+                id: ask_user
+                result_path:
+                  path: unavailable
+                  eq: true
+            - response_contains_any:
+                - "sqlite"
+                - "SQLite"
+            - response_not_contains:
+                - "waiting for your answer"
+                - "I need you to choose"

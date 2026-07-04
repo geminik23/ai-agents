@@ -17,7 +17,7 @@ Pick whichever option fits your workflow.
 ### Option 1: CLI only (fastest)
 
 ```sh
-cargo install ai-agents-cli --version 1.0.0-rc.15
+cargo install ai-agents-cli --version 1.0.0-rc.16
 ```
 
 ### Option 2: As a library
@@ -26,7 +26,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.15"
+ai-agents = "1.0.0-rc.16"
 ```
 
 ### Option 3: From source
@@ -50,8 +50,10 @@ name: MyAgent
 system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 ```
+
+This agent omits top-level `tools:`, so it has no tool access. Add top-level `tools:` explicitly when you want to grant tools.
 
 ### 2. Set your API key
 
@@ -101,7 +103,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> ai_agents::Result<()> {
-    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
+    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-5.4-nano")?;
 
     let agent = AgentBuilder::new()
         .system_prompt("You are a helpful assistant.")

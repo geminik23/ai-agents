@@ -1,0 +1,36 @@
+name: Command Validation Mocked Eval
+agent: ../yaml/tools/command_validation.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"command","arguments":{"argv":["cargo","fmt","--all"],"cwd":"."}}'
+      - "cargo fmt --all completed successfully in the repository root."
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, fmt, --all]
+        response:
+          success: true
+          exit_code: 0
+          termination: exited
+          stdout: "Formatting complete"
+          stderr: ""
+          combined_output: "Formatting complete"
+          truncated: false
+          timed_out: false
+          cwd: "."
+          argv_redacted: [cargo, fmt, --all]
+scenarios:
+  - id: command-allowlist
+    tags: [tools, command, mock]
+    turns:
+      - input: Run the allowlisted formatting check.
+        assert:
+          response_contains: "completed successfully"
+          tool_called:
+            id: command
+            success: true

@@ -39,7 +39,7 @@ export OPENAI_API_KEY=sk-...
 ```yaml
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 ```
 
 Other model options:
@@ -448,7 +448,7 @@ llm:
 
 tools:
   - calculator
-  - http
+  - web_fetch
 ```
 
 This setup uses Claude for generating responses and Groq for fast internal routing - saving cost and latency on tool selection, guard evaluation, and disambiguation.
@@ -562,7 +562,7 @@ The `llm` crate supports HTTP-level retry with exponential backoff, complementar
 ```yaml
 llm:
   provider: openai
-  model: gpt-4
+  model: gpt-5.4-mini
   resilient: true
   resilient_attempts: 3
   resilient_base_delay_ms: 1000
@@ -587,10 +587,10 @@ To use Azure OpenAI endpoints, pass `api_version` and `deployment_id` as extra p
 ```yaml
 llm:
   provider: openai
-  model: gpt-4
+  model: gpt-5.4-mini
   base_url: "https://my-resource.openai.azure.com"
   api_version: "2024-06-01"
-  deployment_id: my-gpt4-deployment
+  deployment_id: my-gpt-5-4-mini-deployment
 ```
 
 > **Note:** Full Azure support (dedicated `azure-openai` provider type) is planned for a future release. The extra-based approach above works today.
@@ -602,7 +602,7 @@ For OpenAI models that support web search:
 ```yaml
 llm:
   provider: openai
-  model: gpt-4
+  model: gpt-5.4-mini
   openai_enable_web_search: true
   openai_web_search_context_size: medium
 ```
@@ -626,7 +626,7 @@ For any parameter not modeled by the framework, inject raw JSON into the request
 ```yaml
 llm:
   provider: openai
-  model: gpt-4
+  model: gpt-5.4-mini
   extra_body:
     logprobs: true
     top_logprobs: 5

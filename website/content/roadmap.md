@@ -42,6 +42,7 @@ This page tracks what has shipped in each release candidate, what we are working
 | **rc.13** | LLM provider enhancements and observability - capability overrides, Ollama options, privacy-safe tracing, cost metrics, reports, raw events, and Prometheus text export |
 | **rc.14** | Evaluation framework - YAML and JSONL scenario suites, fixtures, assertions, judges, strict redaction, observability overlay, and CI reports |
 | **rc.15** | Runtime latency optimization + speculative branch execution - pre-response routing, background actor-memory maintenance, stable orchestration ordering, parallel transition decisions, speculative skill and reasoning branches, buffered streaming, branch observability, and eval flush support |
+| **rc.16** | Built-in tool expansion - canonical tool identity, read-only discovery tools, mutation tools with dry-run review, command allowlists, interactive questions, session todos, bounded waits, web retrieval, diagnostics, tool policy enforcement, live example eval suites, and committed fixture files |
 
 ---
 
@@ -110,7 +111,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Evaluation Framework** | YAML/JSONL scenario runner with assertions, LLM judge, fixtures, strict redaction, parallel execution, observability overlay, and CI reports | ✅ Done | rc.14 |
 | **Runtime Latency Optimization** | Pre-response deterministic transitions, background actor-memory maintenance, stable orchestration ordering, branch-aware observability foundations, and eval flushing | ✅ Done | rc.15 |
 | **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | ✅ Done | rc.15 |
-| **Built-in Tool Expansion** | Safe discovery, repository inspection, diagnostics, interactive questions, session todos, bounded waits, web retrieval primitives, context-aware tool policy, file write/edit, patch review, and controlled validation commands | Implemented on main | rc.16 |
+| **Built-in Tool Expansion** | Safe discovery, repository inspection, diagnostics, interactive questions, session todos, bounded waits, web retrieval primitives, context-aware tool policy, file write/edit, patch review, and controlled validation commands | ✅ Done | rc.16 |
 | **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | Planned | v1.0.0 |
 | **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned within v1 | Confirmed for the v1 line |
 | **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, task runs, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned within v1 | Confirmed for the v1 line |

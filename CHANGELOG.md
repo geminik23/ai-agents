@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.0.0-rc.16
+
+### Added
+- Tool identity: canonical tool IDs, display-name aliases, MCP view IDs, and registry versioning for stable execution records and non-executed attempt evidence
+- Read-only tools: glob, grep, file_read, file_list, file_info, git_status, git_diff, diagnostics, ask_user, todo, sleep, and web_fetch
+- Mutation tools: file_write, file_edit, and patch with dry-run review, read-before-write guards, path policy, and bounded output
+- Command tool: allowlisted argv execution with cwd/env policy, bounded output, and fail-closed missing bindings
+- Tool security: fail-closed domain, path, command, operation, and result-limit policy blocks with unavailable outcomes
+- Context-aware execution: custom and built-in tools receive execution context with limits, custom config, and policy bindings
+- Spawner tools: explicit management_tools opt-in grants for spawn_agent, send_agent_message, list_agents, and remove_agent
+- Runtime control: host-only overrides for tool security, tool scope, emergency denial, and cancellation
+- Host hooks: question handling, diagnostics providers, runtime todo access, and web fetch extraction
+- Web fetch: redirect policy checks, DNS/IP safety, and optional extraction prompt
+- Evaluation coverage: mocked suites for tool success, denial, unavailable, approval, dry-run, and blocked paths
+- Live example eval suites: 17 live suites for read-only tools, grant/scoping, utility tools, host-backed diagnostics, ask-user fallback, bounded sleep, and dry-run mutation
+- Live eval registry: coverage map, status vocabulary, risk tags, and run commands
+- Committed fixtures: dry-run edit and patch fixture files under examples/fixtures/tool_examples
+
+### Changed
+- Tool grants: omitted or empty top-level tools means no ordinary LLM-callable tools; state-level tools can narrow but not widen the effective grant
+- Tool security: fail-closed policy now also covers result-limit rules that depend on declared bindings
+- Skill execution: direct skill execution is prompt-only and tool steps must use the shared executor path
+- Executor: side-effecting tool calls are serialized per tool/resource key and non-idempotent calls are not retried unless marked safe
+- Todo workflow example: system prompt now instructs the model to call the todo tool before describing task-list changes
+- Live eval suites: committed live suites use structural runtime evidence, concrete prompts, and deterministic response checks instead of judge gates
+- Web fetch: cached responses are now policy-sensitive and re-validated before reuse
+
+### Fixed
+- file_edit no-match failure returns a clear error instead of a silent no-op
+- patch dry-run delete and parent path policy checks are enforced
+- command tool fails closed when no allowlist binding is configured
+- spawned runtime shares locks with parent runtime for cross-tool safety
+- sleep tool is policy-extensible for max duration overrides
+- HITL-modified tool arguments are rechecked against security policy before execution
+- Raw .git paths are blocked from file tools while bounded VCS tools provide repository inspection
+- Speculative scheduling: deterministic routes no longer consume LLM budget under low caps and exhausted transition reservation falls back to the serial path
+- Stale public example wording that claimed all built-ins while granting only a legacy subset
+
 ## 1.0.0-rc.15
 
 ### Added

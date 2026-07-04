@@ -54,9 +54,30 @@ Evaluation suites run an agent against declarative scenarios and write reports f
 | `eval/speculative_reasoning_react_mocked.yaml` | No-key speculative branch suite that verifies ReAct selection discards the plain draft |
 | `eval/speculative_reasoning_plan_mocked.yaml` | No-key speculative branch suite that verifies plan-and-execute selection runs the committed plan path |
 | `eval/speculative_reasoning_judge_failure_mocked.yaml` | No-key speculative branch suite that verifies judge failure commits the plain draft and records a failed branch |
-| `eval/buffered_streaming_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming emits the committed route |
+| `eval/buffered_streaming_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming emits the committed route and records cancelled stale work |
 | `eval/buffered_streaming_main_win_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming can commit the main draft |
 | `eval/real_llm_semantic_judge.yaml` | Live provider suite using real LLM calls and an LLM judge; tagged `live` and requires an API key |
+| `eval/diagnostics_mocked.yaml` | Mocked diagnostics provider suite that verifies the `diagnostics` tool can read host-backed issues deterministically |
+| `eval/code_search_mocked.yaml` | Mocked tool-call suite that verifies read-only code search with `grep` |
+| `eval/file_write_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `file_write` dry-run evidence without writing bytes |
+| `eval/file_edit_review_mocked.yaml` | Mocked tool-call suite that verifies `file_edit` dry-run review output |
+| `eval/file_edit_denied_mocked.yaml` | Mocked tool-call suite that verifies blocked path denial for `file_edit` |
+| `eval/file_edit_approval_rejected_mocked.yaml` | Mocked approval suite that verifies non-approved `file_edit` does not execute |
+| `eval/patch_review_mocked.yaml` | Mocked tool-call suite that verifies `patch` dry-run validation |
+| `eval/ask_user_fallback_mocked.yaml` | Mocked tool-call suite that verifies `ask_user` uses its default answer without a host handler |
+| `eval/command_validation_mocked.yaml` | Mocked command-runner suite that verifies allowlisted `command` execution |
+| `eval/command_blocked_mocked.yaml` | Mocked command-runner suite that verifies non-allowlisted `command` denial |
+| `eval/sleep_wait_mocked.yaml` | Mocked tool-call suite that verifies `sleep` respects policy and timeout caps |
+| `eval/no_tools_explicit_empty_mocked.yaml` | Mocked grant suite that verifies `tools: []` denies ordinary tool calls |
+| `eval/web_fetch_policy_mocked.yaml` | Mocked tool-call suite that verifies blocked local URLs fail under `web_fetch` safety policy |
+
+### Live example eval suites
+
+Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider, structural tool evidence, deterministic response checks, and fixture-backed external dependencies where needed. They require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
+
+Live suites prefer one primary behavior per scenario, concrete prompts for required tool calls, equivalent safe tool paths where appropriate, and stable response checks for minimum useful output. Keep exact multi-tool sequences and response-quality judge gates in mocked or focused suites.
+
+See `eval/live/examples/README.md` for the full registry, risk tags, status vocabulary, and run commands.
 
 Examples:
 
@@ -91,6 +112,12 @@ cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
   --scenarios examples/eval/real_llm_semantic_judge.yaml \
   --output target/eval/real_llm_semantic_judge \
+  --real-llm
+
+# Live example eval. The suite declares its own agent path.
+cargo run -p ai-agents-cli -- eval \
+  --scenarios examples/eval/live/examples/tools_code_search_live.yaml \
+  --output target/eval/live/examples/tools_code_search \
   --real-llm
 ```
 

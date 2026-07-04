@@ -1,0 +1,71 @@
+name: Live Example - Tools Math And Random
+agent: ../../../yaml/tools/math_and_random.yaml
+
+# Live eval suite for math and random utilities.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools_math_and_random_live.yaml \
+#     --output target/eval/live/examples/tools_math_and_random \
+#     --real-llm
+#
+# Flow: one utility request -> live model -> local utility tool evidence -> flexible summary
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: math-tool-computes-average
+    name: Real model uses math
+    tags: [live, examples, yaml, tools, utility, real-llm, math]
+    language: en
+    turns:
+      - input: "Before answering, call the math tool to compute the average of [10, 20, 30, 40, 50]. Report the result as Average: <value>."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: math
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: result
+                  gte: 30
+                  lte: 30
+            - response_contains_any:
+                - "Average: 30"
+                - "Average is 30"
+                - "average is 30"
+                - "mean is 30"
+
+  - id: random-tool-generates-uuid
+    name: Real model uses random
+    tags: [live, examples, yaml, tools, utility, real-llm, random]
+    language: en
+    turns:
+      - input: "Before answering, call the random tool to generate one UUID, and include the word UUID in the answer."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: random
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: uuid
+                  exists: true
+            - response_contains_any:
+                - "UUID"
+                - "uuid"

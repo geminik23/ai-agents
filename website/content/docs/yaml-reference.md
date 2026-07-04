@@ -163,7 +163,7 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 ```yaml
 llm:
   provider: openai
-  model: gpt-4.1-mini
+  model: gpt-5.4-mini
   temperature: 0.5
   max_tokens: 4000
 ```
@@ -211,10 +211,10 @@ Define multiple named LLM configurations when you need different models for diff
 llms:
   default:
     provider: openai
-    model: gpt-4.1-mini
+    model: gpt-5.4-mini
   router:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-nano
   fallback:
     provider: ollama
     model: llama3
@@ -313,7 +313,7 @@ Each state shapes the LLM's behavior for a phase of the conversation.
 | `prompt` | `string` | - | State-specific prompt (appended to system_prompt by default) |
 | `prompt_mode` | `string` | `"append"` | How to combine with system_prompt: `append`, `replace`, `prepend` |
 | `llm` | `string` | `null` | Override the LLM alias for this state |
-| `tools` | `list` | *inherit* | Tool IDs available in this state. `[]` = no tools. Omit = inherit agent-level tools |
+| `tools` | `list` | *inherit* | Tool IDs available in this state. `[]` = no tools. Omit = inherit current grant. State tools can only narrow top-level `tools:` |
 | `skills` | `list` | *inherit* | Skill IDs available in this state |
 | `max_turns` | `u32` | `null` | Auto-transition via `timeout_to` after this many turns |
 | `timeout_to` | `string` | `null` | State to enter when `max_turns` is exceeded |
@@ -793,7 +793,11 @@ steps:
 
 ## Tools
 
-The `tools` list declares which tools the agent can use. The framework auto-injects tool names, descriptions, and argument schemas into the prompt - do **not** list them in `system_prompt`.
+The top-level `tools` list declares the maximum set of tools the agent can use. The framework auto-injects tool names, descriptions, and argument schemas into the prompt - do **not** list them in `system_prompt`.
+
+Omitting top-level `tools:` means no LLM-callable tools. `tools: []` also means no tools. Registering built-ins, MCP tools, or spawner tools does not grant model access by itself; list each callable tool or view explicitly under top-level `tools:`.
+
+YAML feature flags can also be registration and grant signals: `spawner.management_tools` grants selected agent management tools, `spawner.orchestration_tools` grants selected orchestration tools, and `persona.evolution.allow_llm_evolve: true` grants `persona_evolve`. These are explicit opt-ins, so they apply even when top-level `tools:` is omitted or empty.
 
 ### Simple String Form
 
@@ -803,7 +807,7 @@ Reference a built-in tool by name:
 tools:
   - calculator
   - datetime
-  - http
+  - echo
 ```
 
 ### Structured Form
@@ -811,16 +815,96 @@ tools:
 ```yaml
 tools:
   - name: calculator
-  - name: datetime
-  - name: text
-  - name: json
-  - name: math
-  - name: random
-  - name: file
-  - name: template
-  - name: http
-  - name: echo
+  - name: glob
+  - name: grep
+  - name: file_read
+  - name: file_list
+  - name: file_info
+  - name: file_write
+  - name: file_edit
+  - name: patch
+  - name: git_status
+  - name: git_diff
+  - name: diagnostics
+  - name: command
+  - name: ask_user
+  - name: todo
+  - name: sleep
+  - name: web_fetch
 ```
+
+### Built-in catalog
+
+Read-only workspace discovery and inspection:
+
+- `glob` - find paths by glob pattern with stable sorting and pagination
+- `grep` - search text files with regex or literal matching
+- `file_read` - read bounded UTF-8 text ranges from local files
+- `file_list` - list directory entries with recursion, glob filters, and pagination
+- `file_info` - inspect safe file metadata without reading contents
+
+Read-only repository and host inspection:
+
+- `git_status` - inspect repository status without shell access
+- `git_diff` - inspect bounded unified diffs without shell access
+- `diagnostics` - read compiler, linter, LSP, or editor diagnostics when a host provider is installed
+
+Controlled mutation and validation:
+
+- `file_write` - create or overwrite one file with atomic writes, dry-run review, and write-path policy
+- `file_edit` - replace exact text with uniqueness/no-match checks, dry-run diff summaries, near-match hints, and read-before-write support
+- `patch` - validate or apply bounded unified diffs with per-file policy checks, delete gating, and parent-directory policy
+- `command` - run exact allowlisted non-interactive argv commands with bounded output, redacted evidence, and explicit working directories
+
+Interaction and session-local helpers:
+
+- `ask_user` - ask the user a structured follow-up question through a host question handler
+- `todo` - manage a session-local structured task list
+- `sleep` - wait for a policy-bounded duration without shell access
+
+Network and legacy built-ins:
+
+- `web_fetch` - fetch public web content with scheme, redirect, DNS/IP, byte, output, cache, and optional extraction controls
+- `calculator`, `datetime`, `echo`, `json`, `math`, `random`, `text`, `template` - existing compute and text/data helpers
+- `file` - compatibility aggregate file tool; new YAML should prefer split file tools above. Raw `.git` paths are blocked by file tools; use `git_status` or `git_diff` for repository inspection.
+- `http` - raw HTTP API client for GET, POST, PUT, PATCH, DELETE, and HEAD requests. Use domain and method policy for API calls; use `web_fetch` when the goal is public page retrieval and text extraction.
+
+### Expanded built-in inputs
+
+These inputs are generated into the model-facing tool schemas when the tool is granted. All outputs are bounded and include truncation metadata where applicable.
+
+| Tool | Required inputs | Optional inputs and defaults |
+|------|-----------------|------------------------------|
+| `glob` | `pattern` | `path: "."`, `max_results: 100`, `offset: 0`, `include_dirs: false`, `sort: path` |
+| `grep` | `pattern` | `mode: regex`, `path: "."`, `include_glob`, `case_sensitive: false`, `output_mode: files_with_matches`, `context: 0`, `max_results: 250`, `offset: 0`, `max_file_size_bytes: 1048576`, `max_output_chars: 20000` |
+| `file_read` | `path` | `start_line: 1`, `end_line`, `max_lines: 2000`, `max_bytes: 1048576` |
+| `file_list` | `path` | `recursive: false`, `include_glob`, `exclude_glob`, `include_hidden: false`, `max_results: 200`, `offset: 0`, `sort: path` |
+| `file_info` | `path` | `follow_symlinks: false` |
+| `git_status` | none | `path: "."`, `include_untracked: true`, `max_results: 200` |
+| `git_diff` | none | `path: "."`, `staged: false`, `paths: []`, `max_output_chars: 20000` |
+| `diagnostics` | none | `path`, `severity: all` (`error`, `warning`, `info`, `hint`, `all`), `max_results: 200` |
+| `ask_user` | `question` | `options: []`, `multi_select: false`, `allow_other: true`, `default`, `timeout_seconds` |
+| `todo` | `operation` (`list`, `set`, `update`, `clear`) | `items` for `set`; `id`, `status`, `content`, and `active_form` for `update` |
+| `sleep` | `duration_ms` | `reason`; default maximum is 30000 ms and trusted policy can change it with `config.max_duration_ms` plus `timeout_ms` |
+| `file_write` | `path`, `content` | `overwrite: false`, `create_parent_dirs: false`, `dry_run: false` |
+| `file_edit` | `path`, `old_text`, `new_text` | `replace_all: false`, `dry_run: false`, `max_replacements: 20` |
+| `patch` | `patch` | `base_path: "."`, `dry_run: true`, `allow_new_files`, `allow_delete: false`; omitted `dry_run` is treated as true for classification and preflight |
+| `command` | `argv` preferred; `command` string is compatibility-only | `cwd: "."`, `env: {}`, `timeout_ms: 30000`, `max_output_chars: 20000`, `reason` |
+| `web_fetch` | `url` | `prompt`, `max_chars: 20000`, `cache_ttl_seconds: 900`, `max_response_bytes: 1048576`, `max_redirects: 5` |
+
+`ask_user` uses a host question handler, not HITL approval. Without an interactive handler it uses `default` when present or returns `answered: false` with an unavailable flag. `diagnostics` returns `available: false` unless a host or eval fixture installs a diagnostics provider.
+
+`command` is not a shell. Granting the tool is not enough: the command policy must include an exact `allowed_commands` argv entry or a `command_templates` entry before the built-in can execute. `commands.allow` is legacy command-name matching and does not replace the exact argv allowlist.
+
+### Built-in tool-specific config
+
+Tool arguments are generated into model-facing schemas and are supplied by the model at call time. `tool_security.tools.<tool_id>.config` is host-supplied configuration and is not model-callable. Built-ins should use framework policy fields when possible; only use `config` for explicit tool-specific settings.
+
+| Tool | Config key | Meaning |
+|------|------------|---------|
+| `sleep` | `max_duration_ms` | Maximum requested wait duration. The effective cap is also bounded by `timeout_ms` and `tool_security.default_timeout_ms`. |
+
+Other current built-ins use their input schema plus common policy fields such as `read_paths`, `write_paths`, `domains`, `allowed_commands`, `max_results`, `max_output_chars`, `max_response_bytes`, and `max_changed_lines`. Custom tools receive arbitrary `config` values through `ToolExecutionContext.custom_config`.
 
 ### MCP Tool
 
@@ -830,7 +914,7 @@ Declare an MCP server as a tool entry. The framework connects at startup, discov
 tools:
   - name: filesystem
     type: mcp
-    transport: stdio                # stdio | sse
+    transport: stdio                # stdio | http | sse
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "./"]
     startup_timeout_ms: 15000
@@ -843,9 +927,14 @@ tools:
       fs_write:
         functions: [write_file, create_directory, move_file]
         description: "Filesystem write operations"
+  - fs_read
+  - fs_write
+  - datetime
 ```
 
 Views create named subsets of a server's functions. States reference views by name for scoped tool access. The parent tool name (e.g. `filesystem`) always includes **all** functions.
+
+MCP parent tools and views share the same executor, connection, security policy, HITL policy, and canonical identity resolution. MCP function names are passed in tool arguments, while policy and availability use the canonical parent or view tool ID.
 
 ```yaml
 states:
@@ -860,11 +949,13 @@ states:
 
 ### Per-State Tool Scoping
 
-Tool availability per state uses 3-level filtering:
+Tool availability per state narrows the top-level grant:
 
-- `tools: []` - explicitly no tools (even if agent declares them)
-- `tools: [datetime]` - only those tools
-- *omit `tools`* - inherit from agent-level `tools` list
+- `tools: []` - explicitly no tools in this state
+- `tools: [datetime]` - only `datetime`, and only if top-level `tools:` also grants `datetime`
+- *omit `tools`* - inherit the current top-level grant or parent-state narrowing
+
+A state cannot expose a tool that is absent from the effective grant. The effective grant is top-level `tools:` plus explicitly enabled feature tools such as orchestration tools or `persona_evolve`. Tool security, HITL, eval assertions, and recovery policies use canonical tool IDs, not localized aliases or display names.
 
 ### `tool_aliases`
 
@@ -878,12 +969,12 @@ Multi-language names and descriptions for tools. Lets the same tool appear with 
 ```yaml
 tool_aliases:
   calculator:
-    ko:
-      name: "계산기"
-      description: "수학 계산을 수행합니다"
-    ja:
-      name: "電卓"
-      description: "数学の計算を実行します"
+    names:
+      ko: "계산기"
+      ja: "電卓"
+    descriptions:
+      ko: "수학 계산을 수행합니다"
+      ja: "数学の計算を実行します"
 ```
 
 ---
@@ -1619,7 +1710,7 @@ error_recovery:
 
 ## Tool Security
 
-The `tool_security` block enforces safety constraints on tool execution.
+The `tool_security` block enforces safety constraints after tool availability has already been checked. Security can restrict, deny, require approval, or mark a granted tool unavailable, but it does not grant access to tools omitted from top-level `tools:`.
 
 | Detail | Value |
 |--------|-------|
@@ -1629,24 +1720,165 @@ The `tool_security` block enforces safety constraints on tool execution.
 ```yaml
 tool_security:
   enabled: true
+  fail_closed: true
   default_timeout_ms: 5000
   tools:
+    file_read:
+      read_paths: [./crates, ./examples, ./website]
+      blocked_paths: [./target, ./.git]
+
+    file_write:
+      write_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+      overwrite_existing: false
+      create_parent_dirs: true
+      max_changed_files: 1
+      max_changed_lines: 100
+
+    file_edit:
+      write_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+      require_read_before_write: true
+      max_replacements: 5
+      max_changed_lines: 20
+
+    patch:
+      write_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+      require_read_before_write: true
+      create_parent_dirs: true
+      max_changed_files: 3
+      max_changed_lines: 40
+
+    command:
+      allow_without_confirmation: true
+      allowed_commands:
+        - argv: [cargo, fmt, --all]
+        - argv: [cargo, check, --workspace]
+      working_dirs: [.]
+      deny_shell: true
+      deny_interactive: true
+      timeout_ms: 120000
+      max_output_chars: 30000
+      env_passthrough: []
+
+    sleep:
+      timeout_ms: 60000
+      config:
+        max_duration_ms: 60000
+
+    git_status:
+      read_paths: [.]
+      blocked_paths: [./.git]
+
+    web_fetch:
+      domains:
+        allow:
+          - docs.rs
+          - ai-agents.rs
+      allowed_schemes: [https]
+      blocked_private_networks: true
+      timeout_ms: 15000
+
+    my_search_tool:
+      read_paths: [./crates, ./examples]
+      blocked_paths: [./target, ./.git]
+      max_results: 100
+      max_output_chars: 12000
+      config:
+        backend: tantivy
+        index_path: ./search-index
+        ranking: bm25
+
     http:
       rate_limit: 10
       timeout_ms: 10000
-      allowed_domains:
-        - "api.example.com"
-        - "httpbin.org"
-      blocked_domains:
-        - "internal.corp.net"
+      domains:
+        allow:
+          - "api.example.com"
+          - "httpbin.org"
+        deny:
+          - "internal.corp.net"
+      operations:
+        allow: [GET, HEAD]
+        requires_approval: [POST, PUT, PATCH, DELETE]
       require_confirmation: true
 ```
+
+Runtime-enforced per-tool policy fields:
+
+| Field | Meaning |
+|-------|---------|
+| `enabled` | Set to `false` to make a granted tool unavailable |
+| `require_confirmation` | Require HITL approval after hard denials pass; `require_approval` is accepted as an alias |
+| `allow_without_confirmation` | Explicitly disable the default approval requirement for side-effecting calls inside policy |
+| `rate_limit` | Maximum calls per minute for that tool |
+| `timeout_ms` | Tool execution timeout; falls back to `tool_security.default_timeout_ms` |
+| `read_paths` / `allowed_paths` | Allowed local roots checked against a tool call's read path arguments |
+| `write_paths` | Allowed local write roots for mutation tools |
+| `working_dirs` | Allowed working directories for the `command` tool; `read_paths` never grant command cwd access, and `command` also requires `allowed_commands` or `command_templates` when `working_dirs` is set |
+| `blocked_paths` | Paths that override any allowlist and stay blocked |
+| `require_read_before_write` | Require a matching `file_read` version before mutating an existing file |
+| `overwrite_existing` | Allow mutation tools to overwrite existing files |
+| `create_parent_dirs` | Allow mutation tools to create missing parent directories |
+| `no_write_policy` | Behavior when no explicit write policy exists: `deny` or `dry_run_only` |
+| `max_replacements` | Maximum exact replacements for `file_edit` |
+| `domains.allow` / `domains.deny` | Domain allow/deny policy for URL tools |
+| `domains.requires_approval` | Domains that require HITL approval before execution |
+| `domains.unavailable` | Domains reported as unavailable without executing the tool |
+| `allowed_schemes` | Allowed URL schemes for network tools such as `web_fetch` |
+| `allowed_ports` | Allowed URL ports for network tools |
+| `blocked_private_networks` | Block localhost, private IPs, link-local, and metadata-service targets |
+| `operations.allow` / `operations.deny` | Allow or deny `operation`, `function`, or `method` argument values |
+| `operations.requires_approval` | Operation values that require HITL approval |
+| `allowed_commands` | Exact argv allowlist entries for the `command` tool |
+| `command_templates` | Argv templates where literal segments must match and `{name}` segments act as wildcard variables |
+| `env_passthrough` | Environment variable names that the `command` tool may accept from call arguments |
+| `deny_shell` / `deny_interactive` | Reject shell syntax and interactive command execution |
+| `allow_command_escalation` | Allow approval-based escalation outside the exact argv allowlist |
+| `commands.allow` / `commands.deny` | Legacy fixed command identity matching for process-backed tools |
+| `commands.requires_approval` | Legacy command identities that require HITL approval |
+| `max_results` | Maximum rows, matches, or entries exposed through `ctx.limits.max_results` |
+| `max_file_size_bytes` | Maximum local file bytes exposed through `ctx.limits.max_file_size_bytes` |
+| `max_output_chars` | Maximum model-facing output characters exposed through `ctx.limits.max_output_chars` |
+| `max_response_bytes` | Maximum network response bytes exposed through `ctx.limits.max_response_bytes` |
+| `max_redirects` | Maximum redirect hops exposed through `ctx.limits.max_redirects` |
+| `max_changed_files` / `max_changed_lines` | Common caps reserved for mutation tools |
+| `config` | Host-supplied custom settings exposed as `ToolExecutionContext.custom_config`; not shown in model-facing schemas. Current built-in config: `sleep.config.max_duration_ms` |
+
+Policy cap fields are applied as upper bounds or defaults before execution for built-ins that support the corresponding input, and they are passed to all tools in `ToolExecutionContext.limits`. Examples: `grep.max_output_chars`, `git_diff.max_output_chars`, `web_fetch.max_response_bytes`, `web_fetch.max_redirects`, `file_edit.max_replacements`, and `patch.max_changed_lines`. Optional-path tools such as `glob`, `grep`, `git_status`, `git_diff`, and `diagnostics` declare `path: "."` for policy checks when the call omits `path`. `patch` declares `base_path: "."` and treats omitted `dry_run` as true during classification and preflight. Path policy canonicalizes existing paths and write-parent ancestors to deny symlink escapes. `web_fetch` re-checks configured scheme, port, and domain policy on redirect targets using the context policy snapshot.
+
+Custom tools should not read `tool_security` YAML directly. Put framework-common policy fields at the top level of the tool policy and put tool-specific settings under `config`. The runtime passes common caps through `ToolExecutionContext.limits` and passes `config` through `ToolExecutionContext.custom_config`. When `fail_closed: true`, a custom tool is denied before execution if configured path, domain, command, operation, or result-limit policy cannot be applied because the tool exposes no matching `policy_bindings()`.
+
+```yaml
+tools:
+  - name: catalog_search
+
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    catalog_search:
+      max_results: 2          # becomes ctx.limits.max_results
+      max_output_chars: 4000  # becomes ctx.limits.max_output_chars
+      config:
+        backend: memory       # becomes ctx.custom_config.backend
+        tenant: demo-store    # becomes ctx.custom_config.tenant
+```
+
+For mutation and command built-ins, prefer `tool_security.enabled: true` with `fail_closed: true`. `read_paths` never authorize writes; use `write_paths` or a write-capable path policy for actual mutation. Pair `command` with exact `allowed_commands` or `command_templates` and explicit `working_dirs`; `commands.allow` is legacy identity matching and is not sufficient for argv execution. The stable examples use argv form because the string `command` form is compatibility-only and rejects shell syntax by default. Process-backed command execution starts from an empty environment, adds only `env_passthrough` values, bounds output before collection completes, and redacts sensitive argv values in records.
+
+Legacy `allowed_domains`, `blocked_domains`, and `allowed_paths` still work for compatibility. New YAML should prefer `domains.*`, `write_paths`, and `working_dirs`.
+
+Migration note: before the explicit-grant change, some projects relied on omitted top-level `tools:` exposing every registered tool. That is no longer true. Omit `tools:` or set `tools: []` for a no-tools agent, and list every ordinary tool explicitly when you want it to be callable.
 
 ---
 
 ## HITL (Human-in-the-Loop)
 
-Pause tool execution and ask a human for approval before proceeding.
+Pause risky tool execution and ask a human for approval before proceeding.
+
+`ask_user` is not HITL approval. HITL approves a risky action that policy already allows to ask about. `ask_user` is a normal tool used for preference or clarification questions through a host question handler.
 
 ### Top-Level Settings
 
@@ -1887,7 +2119,7 @@ reflection:
 
 Detect ambiguous user messages and ask clarifying questions before proceeding.
 
-> **Note:** Disambiguation relies on the router LLM to detect ambiguity, classify the type, and generate clarification questions. Very small models (e.g. gpt-4.1-nano) may misclassify ambiguity types or ignore style instructions. Use at least a mid-tier model or latest model (e.g. gpt-4.1-mini or gpt-5.4-nano) for the router if disambiguation quality matters.
+> **Note:** Disambiguation relies on the router LLM to detect ambiguity, classify the type, and generate clarification questions. Fast lower-cost models such as `gpt-5.4-nano` may misclassify ambiguity types or ignore style instructions. Use `gpt-5.4-mini` or a stronger model for the router if disambiguation quality matters.
 
 The threshold is the sole decision for ambiguity. The detector LLM returns a confidence score (0.0-1.0) for how clear the user's intent is. Messages scoring below the threshold trigger clarification.
 
@@ -2386,7 +2618,7 @@ MCP tools are declared inline in the `tools` list (not as a separate top-level b
 tools:
   - name: filesystem
     type: mcp
-    transport: stdio         # stdio | sse
+    transport: stdio         # stdio | http | sse
     command: npx
     args: ["-y", "@modelcontextprotocol/server-filesystem", "./"]
     startup_timeout_ms: 15000
@@ -2405,7 +2637,7 @@ tools:
 |-------|------|-------------|
 | `name` | `string` | Tool identifier, also the parent tool name |
 | `type` | `string` | Must be `"mcp"` |
-| `transport` | `string` | `stdio` (spawn process) or `sse` (HTTP server) |
+| `transport` | `string` | `stdio` (spawn process), `http`, or `sse` |
 | `command` | `string` | Command to spawn (for `stdio`) |
 | `args` | `list` | Command arguments |
 | `env` | `map` | Environment variables for the spawned process |
@@ -2588,12 +2820,13 @@ persona:
 
 The `spawner:` section lets a parent agent create and manage child agents at runtime. Child agents can be spawned from inline YAML, `AgentSpec` objects, or named Jinja2 templates. A central registry tracks spawned agents and provides inter-agent messaging.
 
-Four built-in tools are automatically registered when `spawner:` is present: `generate_agent`, `send_message`, `list_agents`, and `remove_agent`.
+Four management tools are automatically registered when `spawner:` is present: `spawn_agent`, `send_agent_message`, `list_agents`, and `remove_agent`. Grant them with `management_tools` or under top-level `tools:` when the parent LLM should call them.
 
 ### Basic Configuration
 
 ```yaml
 spawner:
+  management_tools: true
   shared_llms: true
   max_agents: 50
   name_prefix: "npc_"
@@ -2610,7 +2843,7 @@ spawner:
       system_prompt: "You are {{ name }}, a {{ role }} in {{ context.world_name }}."
       llm:
         provider: openai
-        model: gpt-4.1-nano
+        model: gpt-5.4-nano
 ```
 
 ### File-Based Templates
@@ -2633,6 +2866,7 @@ spawner:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `management_tools` | `bool` or `list` | `false` | Grant management tools. `true` grants all four; a list grants only selected IDs. |
 | `shared_llms` | `bool` | `false` | Reuse parent's LLM connections for spawned agents |
 | `max_agents` | `u32` | - | Hard limit on total spawned agents |
 | `name_prefix` | `string` | - | Auto-name agents (e.g. `npc_001`, `npc_002`) |
@@ -2644,10 +2878,26 @@ spawner:
 
 | Tool | Description |
 |------|-------------|
-| `generate_agent` | Spawn an agent from a description (via LLM-generated YAML or named template) |
-| `send_message` | Send a message to another registered agent and get its response |
+| `spawn_agent` | Spawn an agent from a description (via LLM-generated YAML or named template) |
+| `send_agent_message` | Send a message to another registered agent and get its response |
 | `list_agents` | List all registered agents as JSON |
 | `remove_agent` | Remove an agent from the registry by ID |
+
+### Management Tools
+
+`management_tools` registers and grants dynamic agent-management tools. It accepts `true` for all four tools, or a list of selected tool IDs.
+
+```yaml
+spawner:
+  management_tools: true
+
+# or selectively:
+spawner:
+  management_tools:
+    - spawn_agent
+    - send_agent_message
+    - list_agents
+```
 
 ### Template Variables
 
@@ -2655,7 +2905,7 @@ In templates, caller-provided variables are top-level (`{{ name }}`, `{{ role }}
 
 ### Security
 
-The `allowed_tools` list prevents spawned agents from accessing sensitive tools. `generate_agent` is never injected into spawned agents by default, preventing recursive spawning. LLM-generated YAML that references tools outside the allowlist is stripped before the agent is built.
+The `allowed_tools` list prevents spawned agents from accessing sensitive tools. `spawn_agent` is never injected into spawned agents by default, preventing recursive spawning. LLM-generated YAML that references tools outside the allowlist is stripped before the agent is built.
 
 ### Auto-Spawn (Pre-Spawn Agents at Startup)
 
@@ -2682,12 +2932,12 @@ When `shared_llms: true`, auto-spawned agents inherit the parent's LLM connectio
 
 ### Orchestration Tools
 
-`orchestration_tools` registers multi-agent coordination patterns as tools that the LLM can call at runtime. This enables dynamic orchestration where the LLM decides which agents to involve.
+`orchestration_tools` registers and grants multi-agent coordination patterns as tools that the LLM can call at runtime. This enables dynamic orchestration where the LLM decides which agents to involve.
 
 ```yaml
 spawner:
   shared_llms: true
-  orchestration_tools: true    # register all 5 orchestration tools
+  orchestration_tools: true    # register and grant all 5 orchestration tools
   # or selectively:
   # orchestration_tools: [route_to_agent, pipeline_process, concurrent_ask, group_discussion, handoff_conversation]
   templates:
@@ -2811,6 +3061,8 @@ fixtures:
 | `llm.responses` | list | `[]` | Ordered mock responses for `mock` mode |
 | `llm.cassette` | path? | `null` | JSONL cassette path for `replay` or `record` mode |
 | `mock_server` | map | disabled | Start a lightweight local HTTP server and inject `mock_server.base_url` into runtime context |
+| `diagnostics` | map? | `null` | Static diagnostics provider for deterministic `diagnostics` tool evals |
+| `commands` | map? | `null` | Static command-runner responses for deterministic `command` tool evals |
 
 LLM fixture modes:
 
@@ -2989,6 +3241,7 @@ Tool assertion object fields:
 | `id` | Tool ID or requested tool name to match. String form `tool_called: lookup_order` is shorthand for this. |
 | `count` | Exact number of matching calls. |
 | `count_gte` | Minimum number of matching calls. |
+| `executed` | Filter to calls where the wrapped tool implementation did or did not run. Use `false` for denied, unavailable, approval-rejected, or timeout paths. |
 | `success` | Filter to successful or failed calls before counting. |
 | `source_in` | Allowed source labels such as `llm`, `skill`, `state_action`, `on_enter`, `on_exit`, `post_transition`, `spawner`, `orchestration`, or `mock`. |
 | `args` / `args_executed` | Path assertion against the arguments actually executed. |
@@ -3085,7 +3338,7 @@ name: MinimalAgent
 system_prompt: "You are a helpful assistant."
 llm:
   provider: openai
-  model: gpt-4.1-nano
+  model: gpt-5.4-nano
 ```
 
 ## Complete Full Example
@@ -3105,10 +3358,10 @@ system_prompt: |
 llms:
   default:
     provider: openai
-    model: gpt-4.1-mini
+    model: gpt-5.4-mini
   router:
     provider: openai
-    model: gpt-4.1-nano
+    model: gpt-5.4-nano
 
 llm:
   default: default
@@ -3148,6 +3401,20 @@ tools:
   - calculator
   - datetime
   - http
+
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    calculator: {}
+    datetime: {}
+    http:
+      domains:
+        allow: [api.example.com]
+      operations:
+        allow: [GET, HEAD]
+        requires_approval: [POST, PUT, PATCH, DELETE]
+      timeout_ms: 10000
 
 parallel_tools:
   enabled: true

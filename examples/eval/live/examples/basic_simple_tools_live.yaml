@@ -1,0 +1,48 @@
+name: Live Example - Basic Simple Tools
+agent: ../../../yaml/basic/simple_tools.yaml
+
+# Live eval suite for the minimal built-in tools example.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/basic_simple_tools_live.yaml \
+#     --output target/eval/live/examples/basic_simple_tools \
+#     --real-llm
+#
+# Flow: calculation request -> live model -> calculator tool evidence -> concise answer
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: simple-tools-calculates-product
+    name: Real model uses calculator from a minimal grant
+    tags: [live, examples, yaml, tools, grant, utility, real-llm, calculator]
+    language: en
+    turns:
+      - input: "Before answering, call the calculator tool to calculate 24 * 17, then briefly report the result."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: result
+                  gte: 408
+                  lte: 408
+            - response_contains: "408"
+            - tool_not_called: grep
+            - tool_not_called: file_read

@@ -1,0 +1,70 @@
+name: Live Example - Tools File Edit Review
+agent: ../../../yaml/tools/file_edit_review.yaml
+
+# Live eval suite for dry-run exact file edits against committed fixture files.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools_file_edit_review_live.yaml \
+#     --output target/eval/live/examples/tools_file_edit_review \
+#     --real-llm
+#
+# Flow: read fixture -> live model -> file_edit dry run -> diff summary with no apply
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: file-edit-dry-run-only
+    name: Real model dry-runs an exact edit without applying it
+    tags: [live, examples, yaml, tools, mutation, dry-run, fixture, real-llm, file_edit, file_read]
+    language: en
+    turns:
+      - input: "Before answering, call file_read on examples/fixtures/tool_examples/edit_target.txt. Then call file_edit to dry-run replacing 'Status: draft' with 'Status: reviewed'. Keep dry_run true, do not apply the edit, and state that no file was changed."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: file_read
+                count_gte: 1
+                executed: true
+                success: true
+            - tool_called:
+                id: file_edit
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: file_edit
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: file_edit
+                result_path:
+                  path: bytes_written
+                  eq: 0
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "Status: reviewed"
+                - "no file was changed"
+                - "No file was changed"
+            - response_not_contains:
+                - "I changed the file on disk"
+                - "I edited the file on disk"
+                - "I applied the edit"
+                - "the edit was applied"

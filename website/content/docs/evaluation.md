@@ -239,7 +239,7 @@ assert:
           gte: 1
 ```
 
-For speculative branch checks, configure branch dimensions and assert the committed and losing outcomes:
+For speculative branch checks, configure branch dimensions and assert committed, discarded, failed, or cancelled outcomes:
 
 ```yaml
 observability:
@@ -261,11 +261,17 @@ scenarios:
                 assert:
                   path: count
                   gte: 1
+              - match_dimensions:
+                  branch_status: cancelled
+                  speculative: "true"
+                assert:
+                  path: count
+                  gte: 1
 ```
 
 Branch raw events also carry both `speculative` and `runtime.speculative` dimensions for export and debugging. Dimension-count assertions operate on configured aggregate dimensions, so include `speculative` when you want to match speculative branch metrics. Branch telemetry is the stable way to inspect speculative LLM work because losing branches do not fire final response hooks.
 
-Runtime optimization can schedule background actor memory maintenance. The eval runner flushes background runtime tasks before collecting turn evidence, so facts, relationships, and observability assertions see the completed post-turn state. The example suite `examples/eval/runtime_optimization_mocked.yaml` shows a no-key regression check for pre-response guard routing, and `examples/eval/speculative_parallel_transition_mocked.yaml` checks that a parallel transition can discard a stale draft and expose branch status dimensions.
+Runtime optimization can schedule background actor memory maintenance. The eval runner flushes background runtime tasks before collecting turn evidence, so facts, relationships, and observability assertions see the completed post-turn state. The example suite `examples/eval/runtime_optimization_mocked.yaml` shows a no-key regression check for pre-response guard routing, and the speculative suites cover committed, discarded, failed, and cancelled branch status dimensions.
 
 ---
 
@@ -301,7 +307,7 @@ Important parts:
 | `name` | Report name. |
 | `agent` | Agent YAML path, resolved relative to the suite file. CLI `--agent` can override it. |
 | `settings` | Timeouts, retries, isolation, parallelism, and redaction. |
-| `fixtures` | Mock/replay/record/real LLM modes, mock tools, context, and mock server. |
+| `fixtures` | Mock/replay/record/real LLM modes, optional per-alias mock delays, mock tools, context, mock server, mocked diagnostics providers, and mocked command-runner responses. |
 | `scenarios` | Test cases with direct turns or advanced steps. |
 | `assert` | Assertions evaluated after a turn. |
 
@@ -327,6 +333,105 @@ load suite
 ```
 
 The runner uses the same builder path as normal agents. Fixtures replace selected dependencies before the agent is built.
+
+### Mocked LLM delays
+
+Use `fixtures.llm.delays_by_alias` when a no-key suite needs deterministic branch ordering, such as proving that a fast route cancels a slow draft branch.
+
+```yaml
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Committed response."
+      router:
+        - "1"
+    delays_by_alias:
+      default: 50
+```
+
+Delays are in milliseconds and apply to mocked or replay fallback providers for the named alias.
+
+### Mocked diagnostics fixture
+
+Use `fixtures.diagnostics` when you want deterministic coverage for the `diagnostics` tool without a live IDE or compiler host:
+
+```yaml
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "There is one Rust error in src/main.rs."
+  diagnostics:
+    available: true
+    items:
+      - path: src/main.rs
+        line: 12
+        column: 5
+        severity: error
+        source: rustc
+        message: cannot find function `runn` in this scope
+        code: E0425
+```
+
+When no diagnostics fixture or host provider is installed, the shared executor records an explicit unavailable result instead of invoking the tool implementation or hanging.
+
+### Mocked command fixture
+
+Use `fixtures.commands` when you want deterministic coverage for the `command` tool without spawning a real process:
+
+```yaml
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"command","arguments":{"argv":["cargo","fmt","--all"],"cwd":"."}}'
+      - "Formatting completed successfully."
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, fmt, --all]
+        response:
+          success: true
+          exit_code: 0
+          termination: exited
+          stdout: "Formatting complete"
+          stderr: ""
+          combined_output: "Formatting complete"
+          truncated: false
+          timed_out: false
+          cwd: "."
+          argv_redacted: [cargo, fmt, --all]
+```
+
+When no command fixture or host runner is installed, the shared executor records an explicit unavailable result for `command` before the tool tries to execute.
+
+Tool evidence comes from executor-level `ToolExecutionRecord` values. Assertions can check successful calls, denied calls, unavailable tools, approval rejection, approval timeout, cancellation, and missing policy bindings because non-executed attempts are still recorded and can be matched with `executed: false`.
+
+### Focused built-in tool evals
+
+The examples directory includes no-key suites for both success and denial paths:
+
+```text
+examples/eval/code_search_mocked.yaml              -> grep search
+examples/eval/file_write_dry_run_mocked.yaml       -> file_write dry run
+examples/eval/file_edit_review_mocked.yaml         -> file_edit dry run
+examples/eval/file_edit_denied_mocked.yaml         -> blocked write path
+examples/eval/file_edit_approval_rejected_mocked.yaml -> approval rejected before execution
+examples/eval/patch_review_mocked.yaml             -> patch dry run
+examples/eval/ask_user_fallback_mocked.yaml        -> ask_user default fallback
+examples/eval/web_fetch_policy_mocked.yaml         -> blocked URL policy
+examples/eval/diagnostics_mocked.yaml              -> diagnostics fixture
+examples/eval/command_validation_mocked.yaml       -> command allowlist
+examples/eval/command_blocked_mocked.yaml          -> blocked command
+examples/eval/sleep_wait_mocked.yaml               -> bounded sleep wait
+examples/eval/no_tools_explicit_empty_mocked.yaml  -> tools: [] denies calls
+examples/eval/no_tools_omitted_mocked.yaml         -> omitted tools denies calls
+examples/eval/speculative_losing_tool_draft_mocked.yaml -> losing branch tool call stays inert
+```
+
+Use these as templates for permission-denial, approval, host-fixture, and no-tools regression coverage.
 
 ---
 
@@ -445,6 +550,21 @@ cargo run -p ai-agents-cli -- eval \
 
 Real mode needs provider credentials such as `OPENAI_API_KEY`, network access, and acceptance of provider cost and nondeterminism.
 
+### Live example suites
+
+The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, or dry-run-only.
+
+```sh
+cargo run -p ai-agents-cli -- eval \
+  --scenarios examples/eval/live/examples/tools_code_search_live.yaml \
+  --output target/eval/live/examples/tools_code_search \
+  --real-llm
+```
+
+These suites declare their own `agent` path. Use `examples/eval/live/examples/README.md` as the registry for status, risk tags, and deferred high-risk examples.
+
+Live suites should usually check one primary behavior per scenario. If several safe tools can satisfy the same read-only request, use `any` over structural `tool_called` assertions. Prefer concrete prompts such as "Before answering, call the file_read tool ..." when the suite requires tool evidence. Add deterministic response checks for stable result values, requested symbols, fixture details, and dry-run wording so the suite verifies minimum useful user-visible output. Keep exact multi-tool sequences, denial paths, unavailable providers, approval behavior, and response-quality judges in mocked or focused suites where the model output is deterministic.
+
 ---
 
 ## LLM judge assertions
@@ -464,7 +584,9 @@ assert:
 
 If `llm` is omitted, the runner uses the router alias, then the default alias. The judge must return strict JSON. Judge failures are categorized separately from deterministic assertion failures.
 
-Use judge assertions sparingly in default CI. Prefer deterministic checks for state, context, tools, metadata, facts, relationships, orchestration, and observability.
+A judge sees the final response plus limited scenario context. It does not see raw tool records, state history, denied-tool evidence, or dry-run flags. Check those with structural assertions instead.
+
+Use judge assertions sparingly in default CI and live smoke suites. Prefer deterministic checks for response text, state, context, tools, metadata, facts, relationships, orchestration, and observability.
 
 ---
 
@@ -483,6 +605,8 @@ fixtures:
 ```
 
 A mock tool with the same ID as a built-in replaces that built-in during eval.
+
+For the built-in `command` tool, prefer `fixtures.commands` so the shared executor still records the normal command-tool path instead of replacing the tool entirely.
 
 For HTTP-style tests, use the mock server:
 
@@ -529,15 +653,19 @@ assert:
     - response_contains: "Can you clarify"
 ```
 
+For live provider suites, avoid coupling several exact tool calls in one turn. Split coverage into focused scenarios, use `any` when equivalent safe tools are acceptable, and add deterministic response checks for stable values or bounded wording. Response substring checks are literal, so use `response_contains_any` for known casing or wording variants and avoid tiny substrings that can pass unrelated responses.
+
 Common deterministic assertions:
 
 | Assertion | Checks |
 |-----------|--------|
+| `response_contains` / `response_contains_any` | Stable substrings that should appear in the final response. |
+| `response_not_contains` | Complete overclaim phrases that must not appear in the final response. |
 | `state` / `state_in` / `state_not` | Current state after the turn. |
 | `state_history_contains` | Transition history. |
 | `metadata_contains` | Top-level response metadata. |
 | `metadata_path` / `context_path` | Dot-path assertions. |
-| `tool_called` | Tool ID, success, source, arguments, output. |
+| `tool_called` | Tool ID, executed flag, success, source, arguments, output. |
 | `facts_include` | Actor facts by actor/category and optional semantic judge. |
 | `relationship` | Relationship dimensions and counts. |
 | `orchestration` | Pattern, final agent, included agents, stage count. |
@@ -550,10 +678,21 @@ assert:
   tool_called:
     id: lookup_order
     count_gte: 1
+    executed: true
     success: true
     result_path:
       path: status
       eq: cancellable
+```
+
+Denied, unavailable, approval-rejected, and approval-timeout calls should usually assert `executed: false` so the eval proves that the wrapped tool implementation did not run.
+
+```yaml
+assert:
+  tool_called:
+    id: command
+    executed: false
+    success: false
 ```
 
 ---
@@ -619,6 +758,8 @@ Rules:
 | `examples/eval/buffered_streaming_mocked.yaml` | Buffered streaming route winner. |
 | `examples/eval/buffered_streaming_main_win_mocked.yaml` | Buffered streaming main draft winner. |
 | `examples/eval/real_llm_semantic_judge.yaml` | Live provider response and live judge. |
+| `examples/eval/live/examples/tools_code_search_live.yaml` | Live read-only tool-use smoke test for a runnable YAML example. |
+| `examples/eval/live/examples/README.md` | Registry for live example eval suites, risk tags, and run commands. |
 
 See [Examples](@/examples/_index.md) for the full examples catalog.
 

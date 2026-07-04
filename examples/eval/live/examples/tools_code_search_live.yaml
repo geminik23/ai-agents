@@ -1,0 +1,71 @@
+name: Live Example - Tools Code Search
+agent: ../../../yaml/tools/code_search.yaml
+
+# Live eval suite for the read-only code search example.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools_code_search_live.yaml \
+#     --output target/eval/live/examples/tools_code_search \
+#     --real-llm
+#
+# Flow: prompt -> live model -> read-only search tool evidence -> grounded summary
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: code-search-inspects-tool-context-source
+    name: Real model inspects ToolExecutionContext source
+    tags: [live, examples, yaml, tools, read-only, real-llm, grep, file_read, file_list, glob, file_info]
+    language: en
+    turns:
+      - input: "Use file_read to inspect crates/ai-agents-core/src/types.rs, then summarize the ToolExecutionContext fields with the source path."
+        assert:
+          all:
+            - response_not_empty: true
+            - any:
+                - tool_called:
+                    id: grep
+                    count_gte: 1
+                    executed: true
+                    success: true
+                - tool_called:
+                    id: file_read
+                    count_gte: 1
+                    executed: true
+                    success: true
+                - tool_called:
+                    id: file_list
+                    count_gte: 1
+                    executed: true
+                    success: true
+                - tool_called:
+                    id: glob
+                    count_gte: 1
+                    executed: true
+                    success: true
+                - tool_called:
+                    id: file_info
+                    count_gte: 1
+                    executed: true
+                    success: true
+            - response_contains: "ToolExecutionContext"
+            - response_contains_any:
+                - "types.rs"
+                - "requested_name"
+                - "canonical_id"
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch
+            - tool_not_called: command

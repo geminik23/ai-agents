@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0.0-rc.15"
+ai-agents = "1.0.0-rc.16"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,7 +35,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0.0-rc.15", features = ["full"] }
+ai-agents = { version = "1.0.0-rc.16", features = ["full"] }
 ```
 
 ---
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         system_prompt: "You are a helpful assistant."
         llm:
           provider: openai
-          model: gpt-4.1-nano
+          model: gpt-5.4-nano
     "#;
 
     let agent = AgentBuilder::from_yaml(yaml)?
@@ -113,7 +113,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-4.1-nano")?;
+    let llm = UnifiedLLMProvider::from_env(ProviderType::OpenAI, "gpt-5.4-nano")?;
 
     let agent = AgentBuilder::new()
         .system_prompt("You are a helpful assistant.")
@@ -141,6 +141,8 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 ```
 
 The full builder chain used by the CLI is: `auto_configure_llms` &#x2192; `auto_configure_features` &#x2192; `auto_configure_mcp` &#x2192; `auto_configure_spawner` &#x2192; `build`. The MCP and spawner steps must come after `auto_configure_features()` so the tool registry exists. Custom `.tool()`, `.hooks()`, and `.system_prompt()` calls can go anywhere before `.build()`.
+
+Registration and availability are separate for ordinary tools. `auto_configure_features()`, `auto_configure_mcp()`, and `auto_configure_spawner()` register tools, but YAML top-level `tools:` decides what the model can call. When loading YAML, omitted top-level `tools:` means no ordinary LLM-callable tools even if Rust registered them. Explicit YAML feature flags such as `spawner.management_tools`, `spawner.orchestration_tools`, and `persona.evolution.allow_llm_evolve` are exceptions because they intentionally register and grant their generated tools. In pure Rust builder flows without YAML, registered tools are treated as the explicit grant.
 
 ---
 
@@ -255,10 +257,15 @@ Branch observability labels use `RuntimeOptimizationKind` and `RuntimeCommitBeha
 
 ## Custom Tools
 
+`Tool::id()` is the canonical ID used by YAML `tools:`, `tool_security.tools`, `hitl.tools`, eval evidence, recovery policy, and aliases. Display names and localized aliases may be shown to the model, but runtime policy resolves them back to the canonical ID before execution.
+
 Implement the `Tool` trait to give your agent new capabilities:
 
 ```rust
-use ai_agents::tools::{Tool, ToolResult};
+use ai_agents::tools::{
+    ResultLimitBinding, ResultLimitKind, Tool, ToolExecutionContext, ToolPolicyBindings,
+    ToolResult,
+};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
@@ -283,10 +290,26 @@ impl Tool for WeatherTool {
         })
     }
 
-    async fn execute(&self, args: Value) -> ToolResult {
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            result_limit_fields: vec![ResultLimitBinding::new(
+                "max_results",
+                ResultLimitKind::MaxResults,
+            )],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         let city = args["city"].as_str().unwrap_or("unknown");
-        // Call your weather API here...
-        ToolResult::ok(format!("72°F and sunny in {}", city))
+        let backend = ctx.custom_config.get("backend").and_then(Value::as_str).unwrap_or("mock");
+        let max_results = ctx.limits.max_results.unwrap_or(1);
+        ToolResult::ok(json!({
+            "city": city,
+            "backend": backend,
+            "max_results": max_results,
+            "forecast": "72°F and sunny"
+        }).to_string())
     }
 }
 ```
@@ -306,6 +329,66 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 `ToolResult` has two constructors:
 - `ToolResult::ok("output")` - success
 - `ToolResult::error("message")` - failure (the agent sees the error and can retry or explain)
+
+For a runnable version of this pattern, see `examples/rust/custom-tools/src/context_tool.rs` and `examples/rust/custom-tools/agents/context_tool_agent.yaml`. The example shows `max_results` flowing through `ctx.limits` and `backend`, `tenant`, and related custom settings flowing through `ctx.custom_config`.
+
+For tools that need runtime safety or scheduling hints, override the optional metadata methods too:
+
+```rust
+use ai_agents::tools::{
+    ToolCallClassification, ToolOperationKind, ToolSafetyMetadata, ToolSideEffectLevel,
+};
+
+fn safety_metadata(&self) -> ToolSafetyMetadata {
+    ToolSafetyMetadata {
+        read_only: true,
+        concurrency_safe: true,
+        operation: ToolOperationKind::Read,
+        side_effect_level: ToolSideEffectLevel::None,
+        requires_network: false,
+        destructive: false,
+        open_world: false,
+        host_dependent: false,
+        requires_user_interaction: false,
+        supports_cancellation: true,
+        default_requires_approval: false,
+        should_defer_schema: false,
+        max_output_chars: Some(20_000),
+        max_result_size_chars: Some(20_000),
+    }
+}
+
+fn classify_call(&self, args: &Value) -> ToolCallClassification {
+    ToolCallClassification::from_metadata(&self.safety_metadata())
+}
+```
+
+The shared runtime resolves names to canonical IDs, checks scope and `tool_security`, applies HITL when needed, builds `ToolExecutionContext`, enforces timeout/cancellation, acquires cross-tool resource locks for side-effecting path-like calls, and records a structured `ToolExecutionRecord`. YAML skills, state actions, fallback, orchestration, generated tools, and spawned runtimes use the same path through `ToolInvoker`, so tool calls do not bypass runtime policy. Direct `SkillExecutor::execute` is prompt-only; use `execute_with_invoker` for skills that contain tool steps.
+
+Custom tools should use `ctx.limits` for effective framework caps and `ctx.custom_config` for tool-specific settings from `tool_security.tools.<tool_id>.config`. Tool input arguments are model-callable schema fields; `config` is host-supplied and not model-callable. Do not parse `tool_security` YAML directly inside the tool. If `fail_closed: true` and a path, domain, command, operation, or result-limit policy is configured and cannot be enforced by the shared executor alone, custom tools must declare matching `policy_bindings()` or execution is denied before the implementation runs. Side-effecting tools should also set call classification carefully: use `requires_approval` for risky mutation or command calls and set `safely_retryable` only when repeating the exact call cannot duplicate side effects. For path-like resources, the runtime lock key is shared across tools, so custom mutation tools should expose accurate path bindings and argument names when possible.
+
+Host-backed built-in hooks are installed on the built runtime:
+
+```rust
+use ai_agents::tools::{DiagnosticsProvider, QuestionHandler};
+use std::sync::Arc;
+
+let agent = AgentBuilder::from_yaml_file("agent.yaml")?
+    .auto_configure_llms()?
+    .auto_configure_features()?
+    .build()?;
+
+agent.set_question_handler(Some(my_question_handler as Arc<dyn QuestionHandler>));
+agent.set_diagnostics_provider(my_diagnostics_provider as Arc<dyn DiagnosticsProvider>);
+agent.set_command_runner(Arc::new(ai_agents::tools::ProcessCommandRunner));
+
+let todos = agent.todos();
+let control = agent.runtime_control();
+```
+
+`set_question_handler()` powers `ask_user`, `set_diagnostics_provider()` powers `diagnostics`, `set_command_runner()` powers `command`, and `todos()` returns the current runtime-local task list. `ProcessCommandRunner` runs argv without a shell, starts from an empty environment, applies policy-filtered env values, bounds stdout/stderr while reading, cleans up on timeout, and redacts sensitive argv values in evidence. The runtime-control handle can update tool security with `set_tool_security()`, override the effective tool scope with `set_tool_scope()`, clear those overrides, enable emergency denial with `set_emergency_deny()`, or call `cancel_all()` for future tool calls.
+
+`web_fetch` prompt extraction also uses the runtime LLM registry when a router or default model is available, so nested extraction calls flow through the normal observed provider path.
 
 ---
 
@@ -703,10 +786,10 @@ Session persistence requires a storage backend. Enable one via feature flags:
 
 ```toml
 # SQLite (file-based, good for single-server)
-ai-agents = { version = "1.0.0-rc.15", features = ["sqlite"] }
+ai-agents = { version = "1.0.0-rc.16", features = ["sqlite"] }
 
 # Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.15", features = ["redis-storage"] }
+ai-agents = { version = "1.0.0-rc.16", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -852,7 +935,7 @@ Some internal feature crates avoid depending on `ai-agents-observability` direct
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.15)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.16)**
 
 ---
 
