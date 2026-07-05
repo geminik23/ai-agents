@@ -96,7 +96,6 @@ live examples yaml tools read-only host-backed utility grant scoping denial muta
 | `examples/yaml/tools/interactive_choice.yaml` | `ask_user`, `todo` | `fixture-live` | `tools_interactive_choice_live.yaml` | Uses the default ask-user fallback, so no real human is required. |
 | `examples/yaml/tools/diagnostics_review.yaml` | `diagnostics`, `file_read` | `fixture-live` | `tools_diagnostics_review_live.yaml` | Uses deterministic diagnostics fixture data with a concrete bounded diagnostics request. |
 | `examples/yaml/tools/sleep_wait.yaml` | `sleep`, `todo` | `live-auto` | `tools_sleep_wait_live.yaml` | Uses a short bounded wait. |
-| `examples/yaml/basic/omitted_tools_chat.yaml` | omitted `tools:` denies ordinary tools | `live-auto` | `basic_omitted_tools_chat_live.yaml` | Verifies no ordinary tools execute. |
 | `examples/yaml/basic/simple_tools.yaml` | minimal built-in tools | `live-auto` | `basic_simple_tools_live.yaml` | Verifies a minimal safe tool grant. |
 | `examples/yaml/state-machine/state_with_tools.yaml` | state-level tool narrowing | `live-auto` | `state_machine_state_with_tools_live.yaml` | Verifies state transition evidence and scoped tool execution. |
 | `examples/yaml/tools/multi_tool_agent.yaml` | multiple built-ins and parallel calls | `fixture-live` | `tools_multi_tool_agent_live.yaml` | Uses focused safe local tool scenarios; risky granted tools are replaced by failing eval mocks and asserted not called. |
@@ -125,7 +124,6 @@ examples/eval/file_edit_review_mocked.yaml
 examples/eval/file_edit_denied_mocked.yaml
 examples/eval/file_edit_approval_rejected_mocked.yaml
 examples/eval/patch_review_mocked.yaml
-examples/eval/no_tools_omitted_mocked.yaml
 examples/eval/no_tools_explicit_empty_mocked.yaml
 examples/eval/web_fetch_policy_mocked.yaml
 examples/eval/sleep_wait_mocked.yaml

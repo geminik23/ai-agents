@@ -427,7 +427,6 @@ examples/eval/command_validation_mocked.yaml       -> command allowlist
 examples/eval/command_blocked_mocked.yaml          -> blocked command
 examples/eval/sleep_wait_mocked.yaml               -> bounded sleep wait
 examples/eval/no_tools_explicit_empty_mocked.yaml  -> tools: [] denies calls
-examples/eval/no_tools_omitted_mocked.yaml         -> omitted tools denies calls
 examples/eval/speculative_losing_tool_draft_mocked.yaml -> losing branch tool call stays inert
 ```
 
