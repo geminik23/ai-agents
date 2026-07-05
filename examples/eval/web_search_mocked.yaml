@@ -1,0 +1,68 @@
+name: Web Search Mocked Eval
+agent: ../yaml/tools/web_search_research.yaml
+
+# No-key mocked eval for the provider-neutral web_search tool.
+# Flow: user query -> mocked tool call -> fixture search results -> cited summary
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/web_search_mocked.yaml \
+#     --output target/eval/web_search_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"web_search","arguments":{"query":"rust async ecosystem","max_results":3}}'
+      - "Found recent Rust async ecosystem updates including Tokio 1.40 and async-trait 0.1.81 from the fixture search results."
+  web_search:
+    available: true
+    entries:
+      - query: "rust async ecosystem"
+        response:
+          available: true
+          provider: "fixture"
+          results:
+            - title: "Tokio 1.40 released"
+              url: "https://tokio.rs/blog/2024-08-tokio-1-40"
+              snippet: "Tokio 1.40 stabilizes runtime metrics and improves task scheduling."
+              source: "fixture"
+              published_at: null
+            - title: "async-trait 0.1.81"
+              url: "https://docs.rs/async-trait/latest/async_trait/"
+              snippet: "async-trait adds improved diagnostics for native async trait bounds."
+              source: "fixture"
+              published_at: null
+          truncated: false
+          message: null
+
+scenarios:
+  - id: web-search-returns-bounded-results
+    tags: [tools, web_search, mock]
+    turns:
+      - input: Search for recent Rust async ecosystem news.
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: web_search
+                count_gte: 1
+                executed: true
+                success: true
+            - tool_called:
+                id: web_search
+                result_path:
+                  path: count
+                  gte: 1
+            - tool_called:
+                id: web_search
+                result_path:
+                  path: available
+                  eq: true
+            - response_contains_any:
+                - "Tokio"
+                - "tokio.rs"
+                - "async-trait"

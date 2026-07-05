@@ -1,0 +1,65 @@
+name: Live Example - Tools Move Review
+agent: ../../../yaml/tools/move_review.yaml
+
+# Live eval suite for dry-run move_path against committed fixture files.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools_move_review_live.yaml \
+#     --output target/eval/live/examples/tools_move_review \
+#     --real-llm
+#
+# Flow: read fixture -> live model -> move_path dry run -> summary with no file moved
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: move-path-dry-run-only
+    name: Real model dry-runs a move without applying it
+    tags: [live, examples, yaml, tools, mutation, dry-run, fixture, real-llm, move_path]
+    language: en
+    turns:
+      - input: "Before answering, call move_path to dry-run moving examples/fixtures/tool_examples/edit_target.txt to examples/fixtures/tool_examples/moved_note.txt. Keep dry_run true, do not apply the move, and state that no file was changed."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: move_path
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: move_path
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: move_path
+                result_path:
+                  path: moved
+                  eq: true
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "Dry-run"
+                - "No file was changed"
+                - "no file was changed"
+            - response_not_contains:
+                - "I moved the file on disk"
+                - "I applied the move"
+                - "the move was applied"
+            - tool_not_called: command

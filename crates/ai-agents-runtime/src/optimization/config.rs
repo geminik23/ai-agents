@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 use ai_agents_core::{AgentError, Result};
+use ai_agents_tools::ToolSchemaPromptMode;
 
-/// Runtime-level configuration for latency optimization.
+/// Runtime-level configuration for latency optimization and tool prompt behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RuntimeConfig {
     /// Policies that reduce latency without changing behavior by default.
     pub optimization: RuntimeOptimizationConfig,
+    /// Tool schema rendering mode for system prompt generation. Defaults to full.
+    pub tool_schema_prompt_mode: ToolSchemaPromptMode,
 }
 
 /// Controls safe pre-response routing, maintenance concurrency, and runtime task limits.

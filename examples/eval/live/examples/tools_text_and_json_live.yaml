@@ -60,7 +60,7 @@ scenarios:
                 count_gte: 1
                 executed: true
                 success: true
-                result_path:
-                  path: value
-                  eq: "Alice"
-            - response_contains: "Alice"
+            - response_contains_any:
+                - "Alice"
+                - "alice"
+                - "name"

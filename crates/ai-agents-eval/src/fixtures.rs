@@ -18,8 +18,9 @@ use ai_agents_llm::{FinishReason, LLMRegistry};
 use ai_agents_runtime::spec::AgentSpec;
 use ai_agents_tools::{
     CommandResponse, DiagnosticItem, DiagnosticsProvider, StaticCommandRunner,
-    StaticDiagnosticsProvider, ToolRegistry, UnavailableDiagnosticsProvider,
-    create_builtin_registry,
+    StaticDiagnosticsProvider, StaticWebSearchProvider, ToolRegistry,
+    UnavailableDiagnosticsProvider, UnavailableWebSearchProvider, WebSearchProvider,
+    WebSearchResponse, create_builtin_registry,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -55,6 +56,9 @@ pub struct FixturesConfig {
     /// Optional mocked command-runner responses for the command tool.
     #[serde(default)]
     pub commands: Option<CommandsFixtureConfig>,
+    /// Optional mocked web-search responses for the web_search tool.
+    #[serde(default)]
+    pub web_search: Option<WebSearchFixtureConfig>,
 }
 
 /// Diagnostics fixture configuration for host-backed diagnostics.
@@ -88,6 +92,27 @@ pub struct CommandFixtureEntry {
     /// Mocked command response returned to the tool.
     #[serde(default)]
     pub response: CommandResponse,
+}
+
+/// One exact-query mocked web-search response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchFixtureEntry {
+    /// Query string matched exactly by the static provider.
+    pub query: String,
+    /// Mocked search response returned to the tool.
+    #[serde(default)]
+    pub response: WebSearchResponse,
+}
+
+/// Web-search fixture configuration for provider-neutral search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebSearchFixtureConfig {
+    /// Whether the provider is available.
+    #[serde(default = "default_true")]
+    pub available: bool,
+    /// Deterministic exact-query search responses.
+    #[serde(default)]
+    pub entries: Vec<WebSearchFixtureEntry>,
 }
 
 /// Static output configuration for an eval mock tool.
@@ -464,6 +489,23 @@ pub fn build_tool_registry(
         builtin.set_command_runner(runner.clone());
         registry.set_command_runner(runner);
     }
+
+    let search_provider: Arc<dyn WebSearchProvider> = if let Some(web_search) = &fixtures.web_search
+    {
+        let responses = web_search
+            .entries
+            .iter()
+            .map(|entry| (entry.query.clone(), entry.response.clone()))
+            .collect();
+        Arc::new(StaticWebSearchProvider::with_availability(
+            responses,
+            web_search.available,
+        ))
+    } else {
+        Arc::new(UnavailableWebSearchProvider)
+    };
+    builtin.set_web_search_provider(search_provider.clone());
+    registry.set_web_search_provider(search_provider);
 
     for (id, mock) in &fixtures.tools {
         registry

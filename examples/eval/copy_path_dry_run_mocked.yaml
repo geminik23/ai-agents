@@ -1,0 +1,55 @@
+name: Copy Path Mocked Eval
+agent: ../yaml/tools/copy_review.yaml
+
+# No-key mocked eval for copy_path dry-run behavior.
+# Flow: user request -> mocked tool call -> dry-run copy summary -> assertions
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/copy_path_dry_run_mocked.yaml \
+#     --output target/eval/copy_path_dry_run_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"copy_path","arguments":{"source_path":"examples/fixtures/tool_examples/edit_target.txt","destination_path":"examples/fixtures/tool_examples/copied_note.txt","dry_run":true}}'
+      - "Dry-run copy planned from edit_target.txt to copied_note.txt. No file was changed."
+
+scenarios:
+  - id: copy-path-dry-run
+    tags: [tools, copy_path, mock, dry_run]
+    turns:
+      - input: Dry-run copying examples/fixtures/tool_examples/edit_target.txt to examples/fixtures/tool_examples/copied_note.txt.
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: copy_path
+                count_gte: 1
+                executed: true
+                success: true
+            - tool_called:
+                id: copy_path
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: copy_path
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: copy_path
+                result_path:
+                  path: copied
+                  eq: true
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "Dry-run"
+                - "No file was changed"
+                - "no file was changed"

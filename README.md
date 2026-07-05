@@ -23,7 +23,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 - **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
-- **Built-in tools + MCP** - calculator, datetime, echo, file, glob, grep, file_read, file_write, file_edit, file_list, file_info, patch, git_status, git_diff, diagnostics, ask_user, todo, sleep, web_fetch, command, JSON, text, template, math, random, and HTTP; connect any MCP server for hundreds more
+- **Built-in tools + MCP** - calculator, datetime, echo, file, glob, grep, file_read, file_write, file_edit, file_list, file_info, patch, copy_path, move_path, delete_path, git_status, git_diff, diagnostics, ask_user, todo, sleep, web_fetch, web_search, command, JSON, text, template, math, random, and HTTP; connect any MCP server for hundreds more
 - **Tool scoping, policy, and context** - explicit top-level tool grants, state-level narrowing, policy bindings, effective execution limits, context-aware custom tools, read-before-write guards, command allowlists, multi-language aliases, and safe parallel execution
 - **Input/output process pipeline** - normalize, detect, extract, sanitize, validate, transform, format - all LLM-based, works across languages
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts

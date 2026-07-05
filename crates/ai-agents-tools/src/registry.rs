@@ -10,8 +10,25 @@ use super::provider::{ProviderHealth, ToolProvider, ToolProviderError};
 use super::types::{
     CommandRunner, CommandRunnerSlot, DiagnosticsProvider, DiagnosticsProviderSlot,
     FileVersionStore, QuestionHandler, QuestionHandlerSlot, TodoItem, TodoStore, ToolAliases,
-    UnavailableCommandRunner, UnavailableDiagnosticsProvider,
+    UnavailableCommandRunner, UnavailableDiagnosticsProvider, UnavailableWebSearchProvider,
+    WebSearchProvider, WebSearchProviderSlot,
 };
+
+/// Schema rendering mode for tool prompt generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSchemaPromptMode {
+    /// Include full JSON schema properties for every granted tool.
+    Full,
+    /// Include only compact descriptors: name, description, required fields, and property types.
+    Compact,
+}
+
+impl Default for ToolSchemaPromptMode {
+    fn default() -> Self {
+        Self::Full
+    }
+}
 
 /// Canonical identity produced by registry resolution.
 #[derive(Debug, Clone)]
@@ -70,6 +87,8 @@ pub struct ToolRegistry {
 
     web_fetch_extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
 
+    web_search_provider: WebSearchProviderSlot,
+
     registry_version: AtomicU64,
 }
 
@@ -89,6 +108,7 @@ impl ToolRegistry {
             todo_store: TodoStore::default(),
             file_versions: FileVersionStore::default(),
             web_fetch_extractor: Arc::new(RwLock::new(None)),
+            web_search_provider: Arc::new(RwLock::new(Arc::new(UnavailableWebSearchProvider))),
             registry_version: AtomicU64::new(1),
         }
     }
@@ -222,6 +242,21 @@ impl ToolRegistry {
         *self.web_fetch_extractor.write() = extractor;
     }
 
+    /// Returns the shared provider slot for `web_search`.
+    pub fn web_search_provider_slot(&self) -> WebSearchProviderSlot {
+        Arc::clone(&self.web_search_provider)
+    }
+
+    /// Installs the provider used by `web_search`.
+    pub fn set_web_search_provider(&self, provider: Arc<dyn WebSearchProvider>) {
+        *self.web_search_provider.write() = provider;
+    }
+
+    /// Returns whether the web search provider can serve requests now.
+    pub fn web_search_available(&self) -> bool {
+        self.web_search_provider.read().is_available()
+    }
+
     /// Resolves IDs, display names, and aliases to one canonical tool.
     pub fn resolve(&self, id_or_alias: &str) -> Option<ResolvedTool> {
         let tool_index = self.tool_index.read();
@@ -325,6 +360,7 @@ impl ToolRegistry {
         mapped.todo_store = self.todo_store.clone();
         mapped.file_versions = self.file_versions.clone();
         mapped.web_fetch_extractor = Arc::clone(&self.web_fetch_extractor);
+        mapped.web_search_provider = Arc::clone(&self.web_search_provider);
 
         {
             let providers = self.providers.read();
@@ -774,6 +810,85 @@ impl ToolRegistry {
         prompt
     }
 
+    /// Generate a scoped prompt with a configurable schema rendering mode.
+    pub fn generate_scoped_prompt_with_mode(
+        &self,
+        tool_ids: &[impl AsRef<str>],
+        language: Option<&str>,
+        parallel: bool,
+        mode: ToolSchemaPromptMode,
+    ) -> String {
+        if tool_ids.is_empty() {
+            return String::new();
+        }
+        match mode {
+            ToolSchemaPromptMode::Full => self.generate_scoped_prompt_with_lang(
+                &tool_ids
+                    .iter()
+                    .map(|s| s.as_ref().to_string())
+                    .collect::<Vec<_>>(),
+                language,
+                parallel,
+            ),
+            ToolSchemaPromptMode::Compact => {
+                self.generate_compact_prompt_inner(tool_ids, language, parallel)
+            }
+        }
+    }
+
+    /// Generate a compact tool prompt with stable ordering and reduced schema.
+    fn generate_compact_prompt_inner(
+        &self,
+        tool_ids: &[impl AsRef<str>],
+        language: Option<&str>,
+        parallel: bool,
+    ) -> String {
+        let tool_index = self.tool_index.read();
+        let builtin_aliases = self.builtin_aliases.read();
+        let mut prompt = String::from("Available tools:\n");
+        let mut found_any = false;
+
+        for id in tool_ids {
+            let id = id.as_ref();
+            if let Some(tool_ref) = tool_index.get(id) {
+                if let Some(tool) = self.resolve_tool_ref(tool_ref) {
+                    found_any = true;
+
+                    let (name, description) = if let Some(lang) = language {
+                        if let Some(aliases) = builtin_aliases.get(id) {
+                            let n = aliases
+                                .names
+                                .get(lang)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| tool.name());
+                            let d = aliases
+                                .descriptions
+                                .get(lang)
+                                .map(|s| s.as_str())
+                                .unwrap_or_else(|| tool.description());
+                            (n, d)
+                        } else {
+                            (tool.name(), tool.description())
+                        }
+                    } else {
+                        (tool.name(), tool.description())
+                    };
+
+                    let schema = tool.input_schema();
+                    let compact = compact_schema_descriptor(&schema);
+                    prompt.push_str(&format!("- {}: {}. {}\n", name, description, compact));
+                }
+            }
+        }
+
+        if !found_any {
+            return String::new();
+        }
+
+        Self::append_tool_format_instructions(&mut prompt, parallel);
+        prompt
+    }
+
     /// Append tool call format instructions to a prompt.
     /// When `parallel` is true, also instructs the LLM to use a JSON array
     /// for multiple simultaneous tool calls.
@@ -793,6 +908,56 @@ impl ToolRegistry {
         }
         prompt.push_str("\nWhen you receive a tool result, summarize it naturally for the user.\n");
         prompt.push_str("If no tool is needed, respond normally.");
+    }
+}
+
+/// Build a compact schema descriptor from a full JSON schema.
+/// Includes required fields and property types only, with stable key ordering.
+fn compact_schema_descriptor(schema: &serde_json::Value) -> String {
+    let props = schema.get("properties").and_then(|p| p.as_object());
+    let required = schema.get("required").and_then(|r| r.as_array());
+    let mut parts = Vec::new();
+
+    if let Some(req) = required {
+        let req_fields: Vec<String> = req
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        if !req_fields.is_empty() {
+            parts.push(format!("required: [{}]", req_fields.join(", ")));
+        }
+    }
+
+    if let Some(props) = props {
+        let mut prop_parts = Vec::new();
+        for (key, value) in props.iter() {
+            let prop_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("?");
+            let prop_desc = value
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            let short_desc = if prop_desc.len() > 40 {
+                format!("{}...", &prop_desc[..40])
+            } else if !prop_desc.is_empty() {
+                prop_desc.to_string()
+            } else {
+                String::new()
+            };
+            if short_desc.is_empty() {
+                prop_parts.push(format!("{}({})", key, prop_type));
+            } else {
+                prop_parts.push(format!("{}({}): {}", key, prop_type, short_desc));
+            }
+        }
+        if !prop_parts.is_empty() {
+            parts.push(format!("args: {}", prop_parts.join("; ")));
+        }
+    }
+
+    if parts.is_empty() {
+        "Args: none".to_string()
+    } else {
+        parts.join(". ")
     }
 }
 

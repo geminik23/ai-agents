@@ -1142,6 +1142,525 @@ fn json_result<T: Serialize>(output: &T) -> ToolResult {
     }
 }
 
+/// Copies a file or directory tree with policy-gated dry-run previews.
+pub struct CopyPathTool;
+
+impl CopyPathTool {
+    /// Create a copy tool.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for CopyPathTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Moves a file or directory with policy-gated dry-run previews.
+pub struct MovePathTool;
+
+impl MovePathTool {
+    /// Create a move tool.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MovePathTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Deletes a file or directory with policy-gated dry-run previews.
+pub struct DeletePathTool;
+
+impl DeletePathTool {
+    /// Create a delete tool.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for DeletePathTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CopyPathInput {
+    /// Source path to copy from.
+    source_path: String,
+    /// Destination path to copy to.
+    destination_path: String,
+    /// Allow replacing an existing destination.
+    #[serde(default)]
+    overwrite: bool,
+    /// Create missing parent directories for the destination.
+    #[serde(default)]
+    create_parent_dirs: bool,
+    /// Validate and return a summary without copying.
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct MovePathInput {
+    /// Source path to move from.
+    source_path: String,
+    /// Destination path to move to.
+    destination_path: String,
+    /// Allow replacing an existing destination.
+    #[serde(default)]
+    overwrite: bool,
+    /// Create missing parent directories for the destination.
+    #[serde(default)]
+    create_parent_dirs: bool,
+    /// Validate and return a summary without moving.
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DeletePathInput {
+    /// Path to delete.
+    path: String,
+    /// Remove a directory and its contents. Required for directories.
+    #[serde(default)]
+    recursive: bool,
+    /// Validate and return a summary without deleting.
+    #[serde(default = "default_true")]
+    dry_run: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct PathMutationOutput {
+    source_path: Option<String>,
+    destination_path: Option<String>,
+    path: Option<String>,
+    dry_run: bool,
+    copied: bool,
+    moved: bool,
+    deleted: bool,
+    recursive: bool,
+    overwritten: bool,
+    bytes_affected: usize,
+    items_affected: usize,
+    approval_required: bool,
+    diff_summary: String,
+}
+
+#[async_trait]
+impl Tool for CopyPathTool {
+    fn id(&self) -> &str {
+        "copy_path"
+    }
+
+    fn name(&self) -> &str {
+        "Copy Path"
+    }
+
+    fn description(&self) -> &str {
+        "Copy a file or directory tree with source and destination policy checks and dry-run previews."
+    }
+
+    fn input_schema(&self) -> Value {
+        generate_schema::<CopyPathInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        path_mutation_metadata(ToolOperationKind::Write)
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        path_mutation_classification(args)
+    }
+
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![
+                PathPolicyBinding::read("source_path"),
+                PathPolicyBinding::write("destination_path"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
+        let input: CopyPathInput = match serde_json::from_value(args) {
+            Ok(input) => input,
+            Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
+        };
+        let source = PathBuf::from(&input.source_path);
+        let destination = PathBuf::from(&input.destination_path);
+        if let Err(reason) =
+            validate_safe_target(&source).and_then(|_| validate_safe_target(&destination))
+        {
+            return ToolResult::error(reason);
+        }
+        let policy = MutationPolicySnapshot::from_context(&ctx.policy_snapshot);
+        if let Err(reason) = ensure_read_allowed(&source, &policy) {
+            return ToolResult::error(reason);
+        }
+        if let Err(reason) = ensure_write_allowed(&destination, input.dry_run, &policy) {
+            return ToolResult::error(reason);
+        }
+        if !source.exists() {
+            return ToolResult::error(format!("source path does not exist: {}", input.source_path));
+        }
+        let destination_exists = destination.exists();
+        if destination_exists && !input.overwrite {
+            return ToolResult::error("overwrite must be true to replace an existing destination");
+        }
+        if destination_exists && !policy.overwrite_existing && !input.dry_run {
+            return ToolResult::error("overwrite_existing policy is false for this destination");
+        }
+        if let Some(parent) = destination.parent() {
+            if !parent.exists() {
+                if !(input.create_parent_dirs && policy.create_parent_dirs) {
+                    return ToolResult::error(
+                        "destination parent directory does not exist or create_parent_dirs is not allowed",
+                    );
+                }
+                if !input.dry_run {
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        return ToolResult::error(format!(
+                            "Create parent directory error: {}",
+                            error
+                        ));
+                    }
+                }
+            }
+        }
+        let bytes_affected = path_size(&source).unwrap_or(0);
+        let items_affected = path_item_count(&source).unwrap_or(1);
+        if !input.dry_run {
+            if let Err(error) = copy_path(&source, &destination) {
+                return ToolResult::error(format!("Copy error: {}", error));
+            }
+        }
+        json_result(&PathMutationOutput {
+            source_path: Some(input.source_path.clone()),
+            destination_path: Some(input.destination_path.clone()),
+            path: None,
+            dry_run: input.dry_run,
+            copied: true,
+            moved: false,
+            deleted: false,
+            recursive: source.is_dir(),
+            overwritten: destination_exists,
+            bytes_affected,
+            items_affected,
+            approval_required: !input.dry_run && policy.approval_required(),
+            diff_summary: format!(
+                "copy {} -> {} ({} bytes)",
+                input.source_path, input.destination_path, bytes_affected
+            ),
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for MovePathTool {
+    fn id(&self) -> &str {
+        "move_path"
+    }
+
+    fn name(&self) -> &str {
+        "Move Path"
+    }
+
+    fn description(&self) -> &str {
+        "Move or rename a file or directory with source and destination policy checks and dry-run previews."
+    }
+
+    fn input_schema(&self) -> Value {
+        generate_schema::<MovePathInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        path_mutation_metadata(ToolOperationKind::Write)
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        path_mutation_classification(args)
+    }
+
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![
+                PathPolicyBinding::read_write("source_path"),
+                PathPolicyBinding::write("destination_path"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
+        let input: MovePathInput = match serde_json::from_value(args) {
+            Ok(input) => input,
+            Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
+        };
+        let source = PathBuf::from(&input.source_path);
+        let destination = PathBuf::from(&input.destination_path);
+        if let Err(reason) =
+            validate_safe_target(&source).and_then(|_| validate_safe_target(&destination))
+        {
+            return ToolResult::error(reason);
+        }
+        let policy = MutationPolicySnapshot::from_context(&ctx.policy_snapshot);
+        if let Err(reason) = ensure_write_allowed(&source, input.dry_run, &policy) {
+            return ToolResult::error(reason);
+        }
+        if let Err(reason) = ensure_write_allowed(&destination, input.dry_run, &policy) {
+            return ToolResult::error(reason);
+        }
+        if !source.exists() {
+            return ToolResult::error(format!("source path does not exist: {}", input.source_path));
+        }
+        let destination_exists = destination.exists();
+        if destination_exists && !input.overwrite {
+            return ToolResult::error("overwrite must be true to replace an existing destination");
+        }
+        if destination_exists && !policy.overwrite_existing && !input.dry_run {
+            return ToolResult::error("overwrite_existing policy is false for this destination");
+        }
+        if let Some(parent) = destination.parent() {
+            if !parent.exists() {
+                if !(input.create_parent_dirs && policy.create_parent_dirs) {
+                    return ToolResult::error(
+                        "destination parent directory does not exist or create_parent_dirs is not allowed",
+                    );
+                }
+                if !input.dry_run {
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        return ToolResult::error(format!(
+                            "Create parent directory error: {}",
+                            error
+                        ));
+                    }
+                }
+            }
+        }
+        let bytes_affected = path_size(&source).unwrap_or(0);
+        let items_affected = path_item_count(&source).unwrap_or(1);
+        if !input.dry_run {
+            if let Err(error) = fs::rename(&source, &destination) {
+                return ToolResult::error(format!("Move error: {}", error));
+            }
+        }
+        json_result(&PathMutationOutput {
+            source_path: Some(input.source_path.clone()),
+            destination_path: Some(input.destination_path.clone()),
+            path: None,
+            dry_run: input.dry_run,
+            copied: false,
+            moved: true,
+            deleted: false,
+            recursive: source.is_dir(),
+            overwritten: destination_exists,
+            bytes_affected,
+            items_affected,
+            approval_required: !input.dry_run && policy.approval_required(),
+            diff_summary: format!(
+                "move {} -> {} ({} bytes)",
+                input.source_path, input.destination_path, bytes_affected
+            ),
+        })
+    }
+}
+
+#[async_trait]
+impl Tool for DeletePathTool {
+    fn id(&self) -> &str {
+        "delete_path"
+    }
+
+    fn name(&self) -> &str {
+        "Delete Path"
+    }
+
+    fn description(&self) -> &str {
+        "Delete a file or directory with explicit policy checks, recursive-delete gating, and dry-run previews."
+    }
+
+    fn input_schema(&self) -> Value {
+        generate_schema::<DeletePathInput>()
+    }
+
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        path_mutation_metadata(ToolOperationKind::Delete)
+    }
+
+    fn classify_call(&self, args: &Value) -> ToolCallClassification {
+        path_mutation_classification(args)
+    }
+
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::write("path")],
+            ..Default::default()
+        }
+    }
+
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
+        let input: DeletePathInput = match serde_json::from_value(args) {
+            Ok(input) => input,
+            Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
+        };
+        let path = PathBuf::from(&input.path);
+        if let Err(reason) = validate_safe_target(&path) {
+            return ToolResult::error(reason);
+        }
+        let policy = MutationPolicySnapshot::from_context(&ctx.policy_snapshot);
+        if let Err(reason) = ensure_write_allowed(&path, input.dry_run, &policy) {
+            return ToolResult::error(reason);
+        }
+        if !path.exists() {
+            return ToolResult::error(format!("path does not exist: {}", input.path));
+        }
+        if path.is_dir() && !input.recursive {
+            return ToolResult::error("recursive must be true to delete a directory");
+        }
+        let bytes_affected = path_size(&path).unwrap_or(0);
+        let items_affected = path_item_count(&path).unwrap_or(1);
+        if !input.dry_run {
+            let result = if path.is_dir() {
+                fs::remove_dir_all(&path)
+            } else {
+                fs::remove_file(&path)
+            };
+            if let Err(error) = result {
+                return ToolResult::error(format!("Delete error: {}", error));
+            }
+        }
+        json_result(&PathMutationOutput {
+            source_path: None,
+            destination_path: None,
+            path: Some(input.path.clone()),
+            dry_run: input.dry_run,
+            copied: false,
+            moved: false,
+            deleted: true,
+            recursive: path.is_dir(),
+            overwritten: false,
+            bytes_affected,
+            items_affected,
+            approval_required: !input.dry_run && policy.approval_required(),
+            diff_summary: format!(
+                "delete {} ({} bytes, {} items)",
+                input.path, bytes_affected, items_affected
+            ),
+        })
+    }
+}
+
+fn path_mutation_metadata(operation: ToolOperationKind) -> ToolSafetyMetadata {
+    ToolSafetyMetadata {
+        read_only: false,
+        concurrency_safe: false,
+        operation,
+        side_effect_level: if matches!(operation, ToolOperationKind::Delete) {
+            ToolSideEffectLevel::Destructive
+        } else {
+            ToolSideEffectLevel::LocalWrite
+        },
+        requires_network: false,
+        destructive: matches!(operation, ToolOperationKind::Delete),
+        open_world: false,
+        host_dependent: false,
+        requires_user_interaction: false,
+        supports_cancellation: true,
+        default_requires_approval: true,
+        should_defer_schema: false,
+        max_output_chars: Some(DEFAULT_MAX_OUTPUT_CHARS),
+        max_result_size_chars: Some(DEFAULT_MAX_OUTPUT_CHARS),
+    }
+}
+
+fn path_mutation_classification(args: &Value) -> ToolCallClassification {
+    let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
+    let mut classification =
+        ToolCallClassification::from_metadata(&path_mutation_metadata(ToolOperationKind::Write));
+    classification.safely_retryable = dry_run;
+    if dry_run {
+        classification.read_only = true;
+        classification.concurrency_safe = true;
+        classification.side_effect_level = ToolSideEffectLevel::None;
+        classification.requires_approval = false;
+    }
+    classification
+}
+
+fn ensure_read_allowed(path: &Path, policy: &MutationPolicySnapshot) -> Result<(), String> {
+    let normalized = normalize_path(path);
+    let resolved = resolve_existing_or_parent(path)?;
+    for blocked in &policy.blocked_paths {
+        if path_matches_policy(blocked, &normalized, &resolved)? {
+            return Err("source path is blocked by policy".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
+    if source.is_dir() {
+        copy_directory(source, destination)
+    } else {
+        if let Some(parent) = destination.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::copy(source, destination)?;
+        Ok(())
+    }
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        if from.is_dir() {
+            copy_directory(&from, &to)?;
+        } else {
+            fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn path_size(path: &Path) -> std::io::Result<usize> {
+    if path.is_dir() {
+        let mut total = 0usize;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            total += path_size(&entry.path())?;
+        }
+        Ok(total)
+    } else {
+        Ok(fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0))
+    }
+}
+
+fn path_item_count(path: &Path) -> std::io::Result<usize> {
+    if path.is_dir() {
+        let mut total = 1usize;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            total += path_item_count(&entry.path())?;
+        }
+        Ok(total)
+    } else {
+        Ok(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1239,5 +1758,67 @@ mod tests {
         let files = parse_unified_diff(patch).unwrap();
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].changed_lines(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_path_dry_run_does_not_remove_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gone.txt");
+        fs::write(&path, "bye\n").unwrap();
+        let tool = DeletePathTool::new();
+        let result = tool
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "dry_run": true}),
+                ToolExecutionContext::test("delete_path"),
+            )
+            .await;
+        assert!(result.success);
+        assert!(path.exists(), "dry-run must not remove the file");
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["deleted"], true);
+        assert_eq!(output["dry_run"], true);
+    }
+
+    #[tokio::test]
+    async fn delete_path_requires_recursive_for_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested");
+        fs::create_dir_all(&path).unwrap();
+        let tool = DeletePathTool::new();
+        let result = tool
+            .execute(
+                serde_json::json!({"path": path.to_string_lossy(), "recursive": false, "dry_run": true}),
+                ToolExecutionContext::test("delete_path"),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("recursive must be true"));
+    }
+
+    #[tokio::test]
+    async fn copy_path_dry_run_does_not_create_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&source, "hello").unwrap();
+        let tool = CopyPathTool::new();
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": true
+                }),
+                ToolExecutionContext::test("copy_path"),
+            )
+            .await;
+        assert!(result.success);
+        assert!(
+            !destination.exists(),
+            "dry-run must not create the destination"
+        );
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["copied"], true);
+        assert_eq!(output["dry_run"], true);
     }
 }

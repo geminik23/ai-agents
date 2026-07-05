@@ -1,0 +1,56 @@
+name: MoveReviewAgent
+version: "1.0.0"
+description: "Move or rename a file or directory with dry-run review and explicit path policy"
+
+# Move path review example.
+#
+# Use this when the agent should move or rename files with a review step before applying.
+# Dry-run is the default so the model previews the operation without touching the filesystem.
+# Move checks both source and destination write policy.
+# The framework auto-injects tool schemas into the prompt, so the system prompt does not list tool names.
+#
+# Flow: read source -> move_path dry run -> review summary -> approved apply
+#
+# Prerequisites:
+#   - examples/fixtures/tool_examples/ directory exists with fixture files
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/tools/move_review.yaml
+system_prompt: |
+  You move files and directories with dry-run review.
+  Use move_path with dry_run true first, summarize the planned move, and only apply when asked.
+  Do not move paths outside the configured write roots.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# file_read provides source context. move_path performs the move with dry-run
+# defaults. todo tracks multi-step move workflows.
+tools:
+  - file_read
+  - move_path
+  - todo
+
+# Keep move operations inside the committed example fixture sandbox.
+# Tool security narrows runtime behavior. It does not grant tool access.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    move_path:
+      write_paths:                    # allowed roots for both source and destination
+        - examples/fixtures/tool_examples
+      overwrite_existing: false       # block replacing existing files. default: false
+      create_parent_dirs: true        # allow creating missing parent dirs. default: false
+    file_read:
+      read_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+
+metadata:
+  cli:
+    welcome: "=== Move Review Demo ==="
+    hints:
+      - "Try: Dry-run moving examples/fixtures/tool_examples/edit_target.txt to moved_note.txt"
+      - "Try: Summarize the planned move before applying"
+    show_tools: true

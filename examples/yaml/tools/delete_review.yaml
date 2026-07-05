@@ -1,0 +1,59 @@
+name: DeleteReviewAgent
+version: "1.0.0"
+description: "Delete a file or directory with dry-run review, recursive-delete gating, and explicit write policy"
+
+# Delete path review example.
+#
+# Use this when the agent should delete files with a review step before applying.
+# Dry-run is the default so the model previews the operation without touching the filesystem.
+# Directories require recursive true.
+# The tool is marked destructive in safety metadata, so approval is required by default for non-dry-run calls.
+# The framework auto-injects tool schemas into the prompt,
+# so the system prompt does not list tool names.
+#
+# Flow: read target -> delete_path dry run -> review summary -> approved apply
+#
+# Prerequisites:
+#   - examples/fixtures/tool_examples/ directory exists with fixture files
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/tools/delete_review.yaml
+system_prompt: |
+  You delete files and directories with dry-run review.
+  Use delete_path with dry_run true first, summarize the planned deletion, and only apply when asked.
+  Require recursive true for directories. Do not delete paths outside the configured write roots.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# file_read provides target context. delete_path performs the deletion with
+# dry-run defaults and recursive-delete gating. todo tracks multi-step cleanup
+# workflows.
+tools:
+  - file_read
+  - delete_path
+  - todo
+
+# Keep delete operations inside the committed example fixture sandbox.
+# Tool security narrows runtime behavior. It does not grant tool access.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    delete_path:
+      write_paths:                    # allowed roots for deletion
+        - examples/fixtures/tool_examples
+      overwrite_existing: false       # not applicable to delete but kept for consistency
+      create_parent_dirs: false       # delete should not create directories. default: false
+    file_read:
+      read_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+
+metadata:
+  cli:
+    welcome: "=== Delete Review Demo ==="
+    hints:
+      - "Try: Dry-run deleting examples/fixtures/tool_examples/edit_target.txt"
+      - "Try: Explain what recursive means for directory deletion"
+    show_tools: true

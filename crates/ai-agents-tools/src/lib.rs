@@ -21,23 +21,26 @@ pub use condition::{
     ConditionEvaluator, EvaluationContext, LLMGetter, SimpleLLMGetter, ToolCallRecord,
 };
 pub use provider::{ProviderHealth, ToolDescriptor, ToolProvider, ToolProviderError};
-pub use registry::{ResolvedTool, ToolIdentity, ToolRegistry};
+pub use registry::{ResolvedTool, ToolIdentity, ToolRegistry, ToolSchemaPromptMode};
 pub use types::{
     CommandRequest, CommandResponse, CommandRunner, CommandRunnerSlot, DiagnosticItem,
     DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
     DiagnosticsResponse, FileVersionEvidence, FileVersionStore, ProcessCommandRunner,
     QuestionHandler, QuestionHandlerSlot, QuestionRequest, QuestionResponse, StaticCommandRunner,
-    StaticDiagnosticsProvider, TodoItem, TodoStatus, TodoStore, ToolAliases, ToolContext,
-    ToolMetadata, ToolProviderType, TrustLevel, UnavailableCommandRunner,
-    UnavailableDiagnosticsProvider, file_version_evidence,
+    StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem, TodoStatus, TodoStore,
+    ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel, UnavailableCommandRunner,
+    UnavailableDiagnosticsProvider, UnavailableWebSearchProvider, WebSearchProvider,
+    WebSearchProviderSlot, WebSearchRequest, WebSearchResponse, WebSearchResultItem,
+    WebSearchSafeSearch, file_version_evidence,
 };
 
 pub use builtin::HttpTool;
 pub use builtin::{
-    AskUserTool, CalculatorTool, CommandTool, DateTimeTool, DiagnosticsTool, EchoTool,
-    FileEditTool, FileInfoTool, FileListTool, FileReadTool, FileTool, FileWriteTool, GitDiffTool,
-    GitStatusTool, GlobTool, GrepTool, JsonTool, MathTool, PatchTool, RandomTool, SleepTool,
-    TemplateTool, TextTool, TodoTool, WebFetchTool,
+    AskUserTool, CalculatorTool, CommandTool, CopyPathTool, DateTimeTool, DeletePathTool,
+    DiagnosticsTool, EchoTool, FileEditTool, FileInfoTool, FileListTool, FileReadTool, FileTool,
+    FileWriteTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, JsonTool, MathTool,
+    MovePathTool, PatchTool, RandomTool, SleepTool, TemplateTool, TextTool, TodoTool, WebFetchTool,
+    WebSearchTool,
 };
 
 pub use security::{
@@ -117,6 +120,15 @@ pub fn create_builtin_registry() -> ToolRegistry {
         .register(Arc::new(PatchTool::with_version_store(file_versions)))
         .expect("failed to register patch");
     registry
+        .register(Arc::new(CopyPathTool::new()))
+        .expect("failed to register copy_path");
+    registry
+        .register(Arc::new(MovePathTool::new()))
+        .expect("failed to register move_path");
+    registry
+        .register(Arc::new(DeletePathTool::new()))
+        .expect("failed to register delete_path");
+    registry
         .register(Arc::new(FileListTool::new()))
         .expect("failed to register file_list");
     registry
@@ -147,6 +159,11 @@ pub fn create_builtin_registry() -> ToolRegistry {
             registry.web_fetch_extractor_slot(),
         )))
         .expect("failed to register web_fetch");
+    registry
+        .register(Arc::new(WebSearchTool::with_provider_slot(
+            registry.web_search_provider_slot(),
+        )))
+        .expect("failed to register web_search");
     registry
         .register(Arc::new(CommandTool::new(registry.command_runner_slot())))
         .expect("failed to register command");

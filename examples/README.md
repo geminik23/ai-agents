@@ -70,6 +70,11 @@ Evaluation suites run an agent against declarative scenarios and write reports f
 | `eval/sleep_wait_mocked.yaml` | Mocked tool-call suite that verifies `sleep` respects policy and timeout caps |
 | `eval/no_tools_explicit_empty_mocked.yaml` | Mocked grant suite that verifies `tools: []` denies ordinary tool calls |
 | `eval/web_fetch_policy_mocked.yaml` | Mocked tool-call suite that verifies blocked local URLs fail under `web_fetch` safety policy |
+| `eval/web_search_mocked.yaml` | Mocked web-search suite that verifies provider-backed search returns bounded cited results |
+| `eval/web_search_unavailable_mocked.yaml` | Mocked web-search suite that verifies unavailable provider records `executed: false` |
+| `eval/copy_path_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `copy_path` dry-run evidence without copying |
+| `eval/move_path_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `move_path` dry-run evidence without moving |
+| `eval/delete_path_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `delete_path` dry-run evidence without deleting |
 
 ### Live example eval suites
 
@@ -225,6 +230,10 @@ Top-level `tools:` is an explicit ordinary-tool grant. Omitted or empty top-leve
 | `web_fetch_research.yaml` | Bounded public web fetch with redirect checks, DNS/IP safety, and optional extraction prompt |
 | `text_and_json.yaml` | Unicode-aware text processing and structured JSON operations |
 | `file_and_template.yaml` | Legacy file I/O plus Jinja2 template rendering |
+| `copy_review.yaml` | Copy a file or directory with `copy_path`, dry-run review, and explicit write policy |
+| `move_review.yaml` | Move or rename a file or directory with `move_path`, dry-run review, and source/destination policy |
+| `delete_review.yaml` | Delete a file or directory with `delete_path`, recursive-delete gating, dry-run review, and explicit write policy |
+| `web_search_research.yaml` | Provider-neutral web search through a host-provided search provider with `web_fetch` fallback when no provider is installed |
 | `math_and_random.yaml` | Statistical math and random value generation |
 | `multi_tool_agent.yaml` | Selected general-purpose built-ins with parallel execution |
 | `http_tool.yaml` | Raw HTTP API client tool for external API calls (makes real network requests) |
@@ -253,6 +262,10 @@ cargo run -p ai-agents-cli -- run examples/yaml/tools/diagnostics_review.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/web_fetch_research.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/text_and_json.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/file_and_template.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/copy_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/move_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/delete_review.yaml
+cargo run -p ai-agents-cli -- run examples/yaml/tools/web_search_research.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/math_and_random.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/multi_tool_agent.yaml
 cargo run -p ai-agents-cli -- run examples/yaml/tools/http_tool.yaml

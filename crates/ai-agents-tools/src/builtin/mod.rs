@@ -14,13 +14,16 @@ mod random;
 mod template;
 mod text;
 mod web_fetch;
+mod web_search;
 
 pub use calculator::CalculatorTool;
 pub use command::CommandTool;
 pub use datetime::DateTimeTool;
 pub use echo::EchoTool;
 pub use file::FileTool;
-pub use fs_mutation::{FileEditTool, FileWriteTool, PatchTool};
+pub use fs_mutation::{
+    CopyPathTool, DeletePathTool, FileEditTool, FileWriteTool, MovePathTool, PatchTool,
+};
 pub use fs_readonly::{FileInfoTool, FileListTool, FileReadTool, GlobTool, GrepTool};
 pub use git::{GitDiffTool, GitStatusTool};
 pub use host::{AskUserTool, DiagnosticsTool, SleepTool, TodoTool};
@@ -31,6 +34,7 @@ pub use random::RandomTool;
 pub use template::TemplateTool;
 pub use text::TextTool;
 pub use web_fetch::WebFetchTool;
+pub use web_search::WebSearchTool;
 
 use super::Tool;
 use crate::types::{TodoStore, UnavailableDiagnosticsProvider};
@@ -55,6 +59,9 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(FileWriteTool::with_version_store(versions.clone())),
         Arc::new(FileEditTool::with_version_store(versions.clone())),
         Arc::new(PatchTool::with_version_store(versions.clone())),
+        Arc::new(CopyPathTool::new()),
+        Arc::new(MovePathTool::new()),
+        Arc::new(DeletePathTool::new()),
         Arc::new(FileListTool::new()),
         Arc::new(FileInfoTool::new()),
         Arc::new(GitStatusTool::new()),
@@ -66,6 +73,7 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(TodoTool::new(TodoStore::default())),
         Arc::new(SleepTool::new()),
         Arc::new(WebFetchTool::new()),
+        Arc::new(WebSearchTool::new()),
         Arc::new(CommandTool::new(command_runner)),
         Arc::new(TextTool::new()),
         Arc::new(TemplateTool::new()),
@@ -88,6 +96,9 @@ pub fn get_builtin_tool(id: &str) -> Option<Arc<dyn Tool>> {
         "file_write" => Some(Arc::new(FileWriteTool::new())),
         "file_edit" => Some(Arc::new(FileEditTool::new())),
         "patch" => Some(Arc::new(PatchTool::new())),
+        "copy_path" => Some(Arc::new(CopyPathTool::new())),
+        "move_path" => Some(Arc::new(MovePathTool::new())),
+        "delete_path" => Some(Arc::new(DeletePathTool::new())),
         "file_list" => Some(Arc::new(FileListTool::new())),
         "file_info" => Some(Arc::new(FileInfoTool::new())),
         "git_status" => Some(Arc::new(GitStatusTool::new())),
@@ -99,6 +110,7 @@ pub fn get_builtin_tool(id: &str) -> Option<Arc<dyn Tool>> {
         "todo" => Some(Arc::new(TodoTool::new(TodoStore::default()))),
         "sleep" => Some(Arc::new(SleepTool::new())),
         "web_fetch" => Some(Arc::new(WebFetchTool::new())),
+        "web_search" => Some(Arc::new(WebSearchTool::new())),
         "command" => Some(Arc::new(CommandTool::new(Arc::new(RwLock::new(Arc::new(
             crate::types::UnavailableCommandRunner,
         )

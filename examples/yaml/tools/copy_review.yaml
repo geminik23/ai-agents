@@ -1,0 +1,55 @@
+name: CopyReviewAgent
+version: "1.0.0"
+description: "Copy a file or directory tree with dry-run review and explicit path policy"
+
+# Copy path review example.
+#
+# Use this when the agent should copy files or directories with a review step before applying.
+# Dry-run is the default so the model previews the operation without touching the filesystem.
+# The framework auto-injects tool schemas into the prompt, so the system prompt does not list tool names.
+#
+# Flow: read source -> copy_path dry run -> review summary -> approved apply
+#
+# Prerequisites:
+#   - examples/fixtures/tool_examples/ directory exists with fixture files
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/tools/copy_review.yaml
+system_prompt: |
+  You copy files and directories with dry-run review.
+  Use copy_path with dry_run true first, summarize the planned copy, and only apply when asked.
+  Do not copy into paths outside the configured write roots.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# file_read provides source context. copy_path performs the copy with dry-run
+# defaults. todo tracks multi-step copy workflows.
+tools:
+  - file_read
+  - copy_path
+  - todo
+
+# Keep copy operations inside the committed example fixture sandbox.
+# Tool security narrows runtime behavior. It does not grant tool access.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    copy_path:
+      write_paths:                    # allowed destination roots for copy
+        - examples/fixtures/tool_examples
+      overwrite_existing: false       # block replacing existing files. default: false
+      create_parent_dirs: true        # allow creating missing parent dirs. default: false
+    file_read:
+      read_paths: [./examples/fixtures/tool_examples]
+      blocked_paths: [./target, ./.git]
+
+metadata:
+  cli:
+    welcome: "=== Copy Review Demo ==="
+    hints:
+      - "Try: Dry-run copying examples/fixtures/tool_examples/edit_target.txt to copied_note.txt"
+      - "Try: Summarize the planned copy before applying"
+    show_tools: true

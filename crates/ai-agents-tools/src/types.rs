@@ -483,6 +483,201 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
 /// Shared slot used by `diagnostics` to find the active provider.
 pub type DiagnosticsProviderSlot = Arc<RwLock<Arc<dyn DiagnosticsProvider>>>;
 
+/// Safe-search preference for provider-neutral web search.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchSafeSearch {
+    Off,
+    Moderate,
+    Strict,
+}
+
+impl Default for WebSearchSafeSearch {
+    fn default() -> Self {
+        Self::Moderate
+    }
+}
+
+/// Search request sent to a host web-search provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+pub struct WebSearchRequest {
+    /// Search query sent to the provider.
+    pub query: String,
+    /// Maximum result count requested by the model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+    /// Optional domain filters requested by the model or eval fixture.
+    #[serde(default)]
+    pub include_domains: Vec<String>,
+    /// Optional language hint such as en or ja.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Optional region hint such as US or JP.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    /// Optional provider safe-search preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub safe_search: Option<WebSearchSafeSearch>,
+}
+
+/// One normalized search result returned by a provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+pub struct WebSearchResultItem {
+    /// Result title shown to the user.
+    pub title: String,
+    /// Canonical result URL when the provider supplies one.
+    pub url: String,
+    /// Short provider snippet or summary.
+    #[serde(default)]
+    pub snippet: String,
+    /// Optional provider or source label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Optional publication timestamp or date string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at: Option<String>,
+}
+
+/// Normalized response returned by a web-search provider.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct WebSearchResponse {
+    /// Whether a provider was available for this request.
+    pub available: bool,
+    /// Provider name or fixture label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Search results after provider normalization.
+    #[serde(default)]
+    pub results: Vec<WebSearchResultItem>,
+    /// Whether returned results were truncated by policy or provider limits.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Optional unavailable or partial-result message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Host bridge for provider-neutral public web search.
+#[async_trait]
+pub trait WebSearchProvider: Send + Sync {
+    /// Return whether this provider can serve search requests now.
+    fn is_available(&self) -> bool {
+        true
+    }
+
+    /// Search with a bounded provider-neutral request.
+    async fn search(&self, request: WebSearchRequest) -> WebSearchResponse;
+}
+
+/// Web-search provider used when no host installed search.
+#[derive(Debug, Default)]
+pub struct UnavailableWebSearchProvider;
+
+#[async_trait]
+impl WebSearchProvider for UnavailableWebSearchProvider {
+    fn is_available(&self) -> bool {
+        false
+    }
+
+    async fn search(&self, _request: WebSearchRequest) -> WebSearchResponse {
+        WebSearchResponse {
+            available: false,
+            results: Vec::new(),
+            message: Some("web search provider is unavailable".to_string()),
+            ..WebSearchResponse::default()
+        }
+    }
+}
+
+/// Static web-search provider used by tests and eval fixtures.
+#[derive(Debug, Clone, Default)]
+pub struct StaticWebSearchProvider {
+    responses: HashMap<String, WebSearchResponse>,
+    available: bool,
+}
+
+impl StaticWebSearchProvider {
+    /// Create a deterministic provider from exact-query responses.
+    pub fn new(responses: HashMap<String, WebSearchResponse>) -> Self {
+        Self {
+            responses,
+            available: true,
+        }
+    }
+
+    /// Create a deterministic provider with explicit availability.
+    pub fn with_availability(
+        responses: HashMap<String, WebSearchResponse>,
+        available: bool,
+    ) -> Self {
+        Self {
+            responses,
+            available,
+        }
+    }
+}
+
+#[async_trait]
+impl WebSearchProvider for StaticWebSearchProvider {
+    fn is_available(&self) -> bool {
+        self.available
+    }
+
+    async fn search(&self, request: WebSearchRequest) -> WebSearchResponse {
+        if !self.available {
+            return WebSearchResponse {
+                available: false,
+                message: Some("web search provider is unavailable".to_string()),
+                ..WebSearchResponse::default()
+            };
+        }
+
+        let mut response = self
+            .responses
+            .get(&request.query)
+            .cloned()
+            .unwrap_or_else(|| WebSearchResponse {
+                available: true,
+                provider: Some("static".to_string()),
+                results: Vec::new(),
+                message: Some("no fixture search results matched the query".to_string()),
+                ..WebSearchResponse::default()
+            });
+        response.available = true;
+        if response.provider.is_none() {
+            response.provider = Some("static".to_string());
+        }
+        if !request.include_domains.is_empty() {
+            let before = response.results.len();
+            response
+                .results
+                .retain(|item| result_matches_domains(&item.url, &request.include_domains));
+            response.truncated |= response.results.len() != before;
+        }
+        if let Some(max_results) = request.max_results {
+            if response.results.len() > max_results {
+                response.results.truncate(max_results);
+                response.truncated = true;
+            }
+        }
+        response
+    }
+}
+
+/// Shared slot used by `web_search` to find the active host provider.
+pub type WebSearchProviderSlot = Arc<RwLock<Arc<dyn WebSearchProvider>>>;
+
+fn result_matches_domains(url: &str, domains: &[String]) -> bool {
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| url.to_ascii_lowercase());
+    domains.iter().any(|domain| {
+        let domain = domain.trim().to_ascii_lowercase();
+        host == domain || host.ends_with(&format!(".{}", domain))
+    })
+}
+
 /// Request sent to a host command runner.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct CommandRequest {

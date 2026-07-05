@@ -107,6 +107,10 @@ live examples yaml tools read-only host-backed utility grant scoping denial muta
 | `examples/yaml/tools/http_tool.yaml` | `http`, `json` | `deferred-55` | `temp/side_plan/55_auto_eval_remaining_examples.md` | Raw HTTP coverage needs public-network or mock-server policy. |
 | `examples/yaml/tools/mcp_agent.yaml` | MCP filesystem views plus built-ins | `manual-only` | `temp/side_plan/55_auto_eval_remaining_examples.md` | Requires local `npx` process startup and a filesystem sandbox. |
 | `examples/yaml/tools/file_and_template.yaml` | legacy/general `file`, `template` | `deferred-55` | `temp/side_plan/55_auto_eval_remaining_examples.md` | Legacy file behavior needs sandbox clarification before live automation. |
+| `examples/yaml/tools/copy_review.yaml` | `copy_path`, `file_read`, `todo` | `fixture-live` | `tools_copy_review_live.yaml` | Dry-run mutation against committed fixture files. |
+| `examples/yaml/tools/move_review.yaml` | `move_path`, `file_read`, `todo` | `fixture-live` | `tools_move_review_live.yaml` | Dry-run mutation against committed fixture files. |
+| `examples/yaml/tools/delete_review.yaml` | `delete_path`, `file_read`, `todo` | `fixture-live` | `tools_delete_review_live.yaml` | Dry-run mutation against committed fixture files. |
+| `examples/yaml/tools/web_search_research.yaml` | `web_search`, `web_fetch` | `fixture-live` | `tools_web_search_research_live.yaml` | Uses real LLM with unavailable provider; model should suggest web_fetch fallback. |
 | `examples/fixtures/tool_examples/edit_target.txt` | dry-run edit fixture | `support-file` | fixture | Used by `tools_file_edit_review_live.yaml`. |
 | `examples/fixtures/tool_examples/patch_target.txt` | dry-run patch fixture | `support-file` | fixture | Used by `tools_patch_review_live.yaml`. |
 

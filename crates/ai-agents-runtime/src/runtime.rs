@@ -2108,6 +2108,11 @@ impl RuntimeAgent {
         self.tools.set_command_runner(runner);
     }
 
+    /// Installs the host web-search provider used by `web_search`.
+    pub fn set_web_search_provider(&self, provider: Arc<dyn ai_agents_tools::WebSearchProvider>) {
+        self.tools.set_web_search_provider(provider);
+    }
+
     /// Returns the current session-local todo list.
     pub fn todos(&self) -> Vec<TodoItem> {
         self.tools.todos()
@@ -2756,9 +2761,11 @@ impl RuntimeAgent {
 
                 let available_tool_ids = self.get_available_tool_ids().await?;
                 if !available_tool_ids.is_empty() {
-                    let tools_prompt = self.tools.generate_scoped_prompt_with_parallel(
+                    let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
                         &available_tool_ids,
+                        None,
                         self.parallel_tools.enabled,
+                        self.runtime_config.tool_schema_prompt_mode,
                     );
                     if !tools_prompt.is_empty() {
                         return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
@@ -2776,9 +2783,12 @@ impl RuntimeAgent {
         };
 
         let available_tool_ids = self.get_available_tool_ids().await?;
-        let tools_prompt = self
-            .tools
-            .generate_scoped_prompt_with_parallel(&available_tool_ids, self.parallel_tools.enabled);
+        let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
+            &available_tool_ids,
+            None,
+            self.parallel_tools.enabled,
+            self.runtime_config.tool_schema_prompt_mode,
+        );
         if !tools_prompt.is_empty() {
             Ok(format!("{}\n\n{}", with_persona, tools_prompt))
         } else {
@@ -3760,6 +3770,30 @@ impl RuntimeAgent {
                 Some(ToolApprovalRecord {
                     status: ToolApprovalStatus::Unavailable,
                     reason: Some("diagnostics provider is unavailable".to_string()),
+                    modified_arguments: None,
+                }),
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        if canonical_id == "web_search" && !self.tools.web_search_available() {
+            let record = self.record_from_parts(
+                &request,
+                canonical_id.clone(),
+                executed_arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                "Web search provider is unavailable".to_string(),
+                metadata,
+                ToolPolicyDecisionRecord::unavailable("web search provider is unavailable"),
+                Some(ToolApprovalRecord {
+                    status: ToolApprovalStatus::Unavailable,
+                    reason: Some("web search provider is unavailable".to_string()),
                     modified_arguments: None,
                 }),
                 false,
@@ -10843,6 +10877,37 @@ tools: [diagnostics]
                 "diagnostics-call",
                 "diagnostics",
                 serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn web_search_without_provider_records_unavailable_without_execution() {
+        let mock = mock_with_response("hello");
+        let yaml = r#"
+name: WebSearchNoProviderAgent
+system_prompt: "You search the web."
+tools: [web_search]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "web-search-call",
+                "web_search",
+                serde_json::json!({"query": "rust async"}),
                 ToolCallSource::Manual,
             ))
             .await

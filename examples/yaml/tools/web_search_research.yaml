@@ -1,0 +1,59 @@
+name: WebSearchResearchAgent
+version: "1.0.0"
+description: "Search public web indexes through a host-provided provider with bounded cited results"
+
+# Provider-neutral web search example.
+#
+# Use this when the agent should discover sources through a search API rather than fetching a known URL.
+# The tool is host-backed: it requires a configured provider and reports unavailable when none is installed.
+# The framework auto-injects tool schemas into the prompt, so the system prompt does not list tool names.
+#
+# NOTE: web_search requires a host provider. Without one, the tool reports
+# unavailable and the model should suggest web_fetch as a fallback.
+#
+# Flow: user query -> web_search through host provider -> bounded cited summary
+#                  -> unavailable -> suggest web_fetch for known URLs
+#
+# Prerequisites:
+#   - A configured web search provider (Tavily, Brave, or custom implementation)
+#   - Without a provider, the tool reports unavailable
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/tools/web_search_research.yaml
+system_prompt: |
+  You research public information using provider-neutral web search.
+  Use web_search to discover sources, then summarize the results with citations.
+  If web_search is unavailable, say so clearly and suggest using web_fetch for a known URL.
+  Do not fabricate result URLs or snippets.
+
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+
+# web_search discovers URLs through a host provider. web_fetch is granted as a
+# fallback so the model can retrieve a known URL when search is unavailable.
+tools:
+  - web_search
+  - web_fetch
+
+# Tool security narrows runtime behavior. It does not grant tool access.
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    web_search:
+      max_results: 5           # maximum results per query. default: 5
+      max_output_chars: 12000  # model-facing output cap. default: 12000
+      timeout_ms: 10000        # provider call timeout. default: 10000
+      rate_limit: 10           # max calls per minute. default: unlimited
+    web_fetch:
+      max_chars: 12000
+      timeout_ms: 10000
+
+metadata:
+  cli:
+    welcome: "=== Web Search Research Demo ==="
+    hints:
+      - "Try: Search for recent Rust async ecosystem news"
+      - "Without a host provider, web_search reports unavailable and suggests web_fetch"
+    show_tools: true

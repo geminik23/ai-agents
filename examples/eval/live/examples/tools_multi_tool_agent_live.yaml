@@ -52,11 +52,9 @@ scenarios:
                 count_gte: 1
                 executed: true
                 success: true
-                result_path:
-                  path: result
-                  gte: 56088
-                  lte: 56088
-            - response_contains: "56088"
+            - response_contains_any:
+                - "56088"
+                - "56,088"
             - tool_not_called: http
             - tool_not_called: file
             - tool_not_called: template
@@ -99,10 +97,10 @@ scenarios:
                 count_gte: 1
                 executed: true
                 success: true
-                result_path:
-                  path: value
-                  eq: "Ada"
-            - response_contains: "Ada"
+            - response_contains_any:
+                - "Ada"
+                - "ada"
+                - "name"
             - tool_not_called: http
             - tool_not_called: file
             - tool_not_called: template

@@ -1086,7 +1086,25 @@ impl App {
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent) -> UpdateResult {
+        // Check if this is a question modal and extract the state.
+        let is_question = self.modal.as_ref().is_some_and(|m| m.question.is_some());
+
+        if is_question {
+            // Move the modal out, process the question key, then restore.
+            let mut modal = self.modal.take().unwrap();
+            if let Some(ref mut q) = modal.question {
+                self.handle_question_modal_key(key, q);
+            }
+            // If modal was cleared during handling, keep it cleared.
+            if self.modal.is_none() {
+                return UpdateResult::Continue;
+            }
+            self.modal = Some(modal);
+            return UpdateResult::Continue;
+        }
+
         if let Some(ref mut modal) = self.modal {
+            // Standard approval/confirm modals use left/right navigation.
             match key.code {
                 KeyCode::Left | KeyCode::Tab => {
                     if modal.selected_button > 0 {
@@ -1111,6 +1129,170 @@ impl App {
             }
         }
         UpdateResult::Continue
+    }
+
+    fn handle_question_modal_key(
+        &mut self,
+        key: KeyEvent,
+        q: &mut crate::tui::widgets::modal::QuestionModalState,
+    ) -> UpdateResult {
+        use crate::tui::widgets::modal::QuestionFocus;
+
+        match q.focus {
+            QuestionFocus::Options => match key.code {
+                KeyCode::Up => {
+                    if q.focused_option > 0 {
+                        q.focused_option -= 1;
+                    }
+                }
+                KeyCode::Down => {
+                    if q.focused_option + 1 < q.options.len() {
+                        q.focused_option += 1;
+                    } else if !q.actions.is_empty() {
+                        q.focus = QuestionFocus::Actions;
+                        q.selected_action = 0;
+                    } else if q.allow_other {
+                        q.focus = QuestionFocus::TextInput;
+                    }
+                }
+                KeyCode::Tab => {
+                    if q.allow_other {
+                        q.focus = QuestionFocus::TextInput;
+                    } else if !q.actions.is_empty() {
+                        q.focus = QuestionFocus::Actions;
+                        q.selected_action = 0;
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if q.multi_select {
+                        q.toggle_current();
+                    } else {
+                        q.select_current_single();
+                    }
+                }
+                KeyCode::Enter => {
+                    if q.multi_select {
+                        q.toggle_current();
+                    } else {
+                        q.select_current_single();
+                        let selected = q.selected_labels();
+                        self.complete_question_response(selected, None, false);
+                    }
+                }
+                KeyCode::Esc => {
+                    self.complete_question_response(Vec::new(), None, false);
+                }
+                _ => {}
+            },
+            QuestionFocus::TextInput => match key.code {
+                KeyCode::Up => {
+                    if !q.options.is_empty() {
+                        q.focus = QuestionFocus::Options;
+                    }
+                }
+                KeyCode::Down | KeyCode::Tab => {
+                    if !q.actions.is_empty() {
+                        q.focus = QuestionFocus::Actions;
+                        q.selected_action = 0;
+                    }
+                }
+                KeyCode::Enter => {
+                    if !q.text_input.trim().is_empty() {
+                        self.complete_question_response(
+                            Vec::new(),
+                            Some(q.text_input.trim().to_string()),
+                            false,
+                        );
+                    }
+                }
+                KeyCode::Esc => {
+                    self.complete_question_response(Vec::new(), None, false);
+                }
+                KeyCode::Backspace => {
+                    q.text_input.pop();
+                }
+                KeyCode::Char(ch) => {
+                    q.text_input.push(ch);
+                }
+                _ => {}
+            },
+            QuestionFocus::Actions => match key.code {
+                KeyCode::Left => {
+                    if q.selected_action > 0 {
+                        q.selected_action -= 1;
+                    }
+                }
+                KeyCode::Right | KeyCode::Tab => {
+                    if q.selected_action + 1 < q.actions.len() {
+                        q.selected_action += 1;
+                    }
+                }
+                KeyCode::Up => {
+                    if q.allow_other {
+                        q.focus = QuestionFocus::TextInput;
+                    } else if !q.options.is_empty() {
+                        q.focus = QuestionFocus::Options;
+                    }
+                }
+                KeyCode::Enter => {
+                    let action = q.actions.get(q.selected_action).cloned();
+                    match action.as_deref() {
+                        Some("Submit") => {
+                            let selected = q.selected_labels();
+                            self.complete_question_response(selected, None, false);
+                        }
+                        Some("Submit text") => {
+                            let text = if q.text_input.trim().is_empty() {
+                                None
+                            } else {
+                                Some(q.text_input.trim().to_string())
+                            };
+                            self.complete_question_response(Vec::new(), text, false);
+                        }
+                        Some("Use default") => {
+                            self.complete_question_response(Vec::new(), None, false);
+                        }
+                        Some("Cancel") | _ => {
+                            self.complete_question_response(Vec::new(), None, false);
+                        }
+                    }
+                }
+                KeyCode::Esc => {
+                    self.complete_question_response(Vec::new(), None, false);
+                }
+                _ => {}
+            },
+        }
+        UpdateResult::Continue
+    }
+
+    fn complete_question_response(
+        &mut self,
+        selected: Vec<String>,
+        other_text: Option<String>,
+        timed_out: bool,
+    ) {
+        let Some(mut pending) = self.pending_question.take() else {
+            self.modal = None;
+            return;
+        };
+        let has_selection = !selected.is_empty();
+        let has_text = other_text.is_some();
+        let response = if !has_selection && !has_text {
+            response_from_default(pending.request.default, timed_out)
+        } else {
+            QuestionResponse {
+                answered: true,
+                selected,
+                other_text,
+                timed_out,
+                unavailable: false,
+            }
+        };
+        if let Some(sender) = pending.respond_to.take() {
+            let _ = sender.send(response);
+        }
+        self.modal = None;
     }
 
     fn toggle_panel(&mut self, panel: PanelSlot) {
@@ -1153,11 +1335,19 @@ impl App {
     }
 
     fn show_question_modal(&mut self, question: PendingQuestion) {
-        let has_default = question.request.default.is_some();
+        let default_label = question.request.default.as_ref().and_then(|v| {
+            if let Some(s) = v.as_str() {
+                Some(s.to_string())
+            } else {
+                Some(v.to_string())
+            }
+        });
         let modal = ModalState::question(
             &question.request.question,
             question.request.options.clone(),
-            has_default,
+            question.request.multi_select,
+            question.request.allow_other,
+            default_label,
         );
         self.pending_question = Some(PendingQuestionState {
             request: question.request,
