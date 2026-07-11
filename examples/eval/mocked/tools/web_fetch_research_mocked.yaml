@@ -2,7 +2,7 @@ name: Web Fetch Research Mocked Eval
 agent: ../../../yaml/tools/web_fetch_research.yaml
 
 # No-key mocked eval for a policy-allowed bounded web fetch.
-# Flow: allowed public URL -> mocked web_fetch call -> fixture page -> focused summary
+# Flow: allowed public URL -> real web_fetch tool -> in-memory transport -> focused summary
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -16,22 +16,19 @@ fixtures:
   llm:
     mode: mock
     responses:
-      - '{"tool":"web_fetch","arguments":{"url":"https://docs.rs/serde/latest/serde/","prompt":"What is Serde used for?","max_chars":1200,"max_response_bytes":4096}}'
+      - '{"tool":"web_fetch","arguments":{"url":"https://docs.rs/serde/latest/serde/","prompt":"What is Serde used for?","max_chars":1200,"max_response_bytes":4096,"cache_ttl_seconds":0}}'
       - "The fixture page says Serde is a Rust framework for efficiently serializing and deserializing data structures."
-  tools:
-    web_fetch:
-      success: true
-      output:
-        url: "https://docs.rs/serde/latest/serde/"
-        final_url: "https://docs.rs/serde/latest/serde/"
+  web_fetch_transport:
+    routes:
+      - url: "https://docs.rs/serde/latest/serde/"
+        status: 302
+        headers:
+          Location: "https://docs.rs/serde/latest/serde/index.html"
+      - url: "https://docs.rs/serde/latest/serde/index.html"
         status: 200
-        content_type: text/html
-        content: "Serde is a framework for serializing and deserializing Rust data structures efficiently and generically."
-        truncated: false
-        from_cache: false
-        redirects: []
-        extraction_prompt_used: true
-        extraction_available: true
+        headers:
+          Content-Type: text/html
+        body: "<html><body><main>Serde is a framework for serializing and deserializing Rust data structures efficiently and generically.</main></body></html>"
 
 scenarios:
   - id: web-fetch-allowed-page-returns-bounded-content
@@ -48,7 +45,7 @@ scenarios:
                 count: 1
                 executed: true
                 success: true
-                source_in: [llm, mock]
+                source_in: [llm]
             - tool_called:
                 id: web_fetch
                 args_executed:
@@ -68,7 +65,12 @@ scenarios:
                 id: web_fetch
                 result_path:
                   path: final_url
-                  eq: "https://docs.rs/serde/latest/serde/"
+                  eq: "https://docs.rs/serde/latest/serde/index.html"
+            - tool_called:
+                id: web_fetch
+                result_path:
+                  path: redirects
+                  eq: ["https://docs.rs/serde/latest/serde/index.html"]
             - tool_called:
                 id: web_fetch
                 result_path:

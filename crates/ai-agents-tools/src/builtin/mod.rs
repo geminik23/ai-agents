@@ -33,7 +33,10 @@ pub use math::MathTool;
 pub use random::RandomTool;
 pub use template::TemplateTool;
 pub use text::TextTool;
-pub use web_fetch::WebFetchTool;
+pub use web_fetch::{
+    WebFetchResolver, WebFetchTool, WebFetchTransport, WebFetchTransportRequest,
+    WebFetchTransportResponse,
+};
 pub use web_search::WebSearchTool;
 
 use super::Tool;

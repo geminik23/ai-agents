@@ -39,6 +39,13 @@ scenarios:
         assert:
           all:
             - response_not_empty: true
+            - response_contains: "Combined analysis shows strong fundamentals, bullish technicals, and positive sentiment."
             - orchestration:
                 type: concurrent
                 agents_include: [fundamental, technical, sentiment]
+            - metadata_path:
+                path: orchestration.strategy
+                eq: LlmSynthesis
+            - metadata_path:
+                path: orchestration.agents
+                exists: true

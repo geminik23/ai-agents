@@ -2,7 +2,7 @@ name: Persona Basic Mocked Eval
 agent: ../../../yaml/persona/persona_basic.yaml
 
 # Mocked eval for the basic persona agent.
-# Verifies that persona identity (name, role) appears in responses.
+# Verifies that persona identity and role are composed into the actual system request.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -31,3 +31,11 @@ scenarios:
             - response_not_empty: true
             - response_contains: "Jay"
             - response_contains: "Senior Support"
+            - llm_request:
+                system_contains:
+                  - "## Identity"
+                  - "You are Jay, Senior Support Representative."
+                  - "Help the customer with their account issue."
+                user_contains: "Hi, I need help with my account."
+                count: 1
+                same_request: true

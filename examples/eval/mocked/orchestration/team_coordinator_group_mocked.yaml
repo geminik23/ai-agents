@@ -1,0 +1,54 @@
+name: Team Coordinator Group Discussion Mocked Eval
+agent: ../../../yaml/orchestration/team_coordinator.yaml
+
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - '{"tool":"group_discussion","arguments":{"topic":"Should we adopt GraphQL?","participants":["researcher","analyst","writer"],"style":"brainstorm","max_rounds":1}}'
+        - "Researcher: GraphQL can reduce over-fetching but needs ecosystem evaluation."
+        - "Analyst: adoption should be measured against client flexibility and operational cost."
+        - "Writer: document a small pilot and clear API governance before adoption."
+        - "The team recommends a measured GraphQL pilot with API governance."
+
+scenarios:
+  - id: coordinator-runs-group-discussion
+    name: Coordinator gathers one discussion round from three specialists
+    tags: [mock, examples, yaml, orchestration, team-coordinator, group-discussion]
+    language: en
+    turns:
+      - input: Have the team discuss whether we should adopt GraphQL.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "GraphQL pilot"
+            - tool_called:
+                id: group_discussion
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: participants
+                  contains: writer
+                result_path:
+                  path: rounds
+                  eq: 1
+            - tool_called:
+                id: group_discussion
+                args_executed:
+                  path: max_rounds
+                  eq: 1
+                result_path:
+                  path: termination
+                  eq: max_rounds_reached
+            - tool_called:
+                id: group_discussion
+                result_path:
+                  path: conclusion
+                  contains: "Researcher: GraphQL"

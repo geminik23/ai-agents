@@ -2,8 +2,7 @@ name: Memory Basic Mocked Eval
 agent: ../../../yaml/memory/memory_basic.yaml
 
 # Mocked memory eval suite.
-# Verifies multi-turn conversation works with in-memory storage.
-# The mock LLM ignores conversation history, so we verify structural response evidence only.
+# Verifies prior user and assistant messages reach later LLM requests through in-memory storage.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -37,3 +36,10 @@ scenarios:
           all:
             - response_not_empty: true
             - response_contains: "Alex"
+            - llm_request:
+                user_contains:
+                  - "My name is Alex and I work as a backend engineer."
+                  - "What is my name?"
+                assistant_contains: "I will remember that your name is Alex."
+                same_request: true
+                count: 1

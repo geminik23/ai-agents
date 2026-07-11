@@ -1,35 +1,64 @@
 name: Basic Retry Mocked Eval
 agent: ../../../yaml/error-recovery/basic_retry.yaml
 
-# No-key smoke test for the retry-configured agent.
-# Consistent errors exhaust retries and propagate, so this suite uses normal
-# mock responses to verify the config loads and the agent runs end-to-end.
+# Deterministic no-key coverage for the source agent's retry policy.
+# The default LLM fails once with a transient error, then recovers on retry.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
 #     --scenarios examples/eval/mocked/error-recovery/basic_retry_mocked.yaml \
 #     --output target/eval/mocked/error-recovery/basic_retry_mocked
 #
-# Flow: user input -> mocked LLM response -> assertions
+# Flow: user input -> transient LLM error -> configured retry -> recovered response
 settings:
   timeout_per_turn_ms: 5000
   retries: 0
   isolation: scenario
 
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, purpose, status]
+
 fixtures:
   llm:
     mode: mock
-    responses:
-      - "Retry agent is ready and responding normally."
+    outcomes_by_alias:
+      default:
+        - type: error
+          message: "transient provider outage"
+          status: 503
+        - type: response
+          content: "Retry succeeded after the transient provider outage."
 
 scenarios:
-  - id: retry-agent-smoke
-    name: Retry config loads and agent responds
-    tags: [error-recovery, retry, mock, smoke]
+  - id: retry-agent-recovers
+    name: Transient LLM failure is retried and recovers
+    tags: [error-recovery, retry, mock]
     language: en
     turns:
       - input: Hello, can you help me?
         assert:
           all:
             - response_not_empty: true
-            - response_contains: "responding normally"
+            - response_contains: "Retry succeeded after the transient provider outage."
+            - observability:
+                purpose_counts:
+                  main_response:
+                    path: count
+                    count: 2
+                dimension_counts:
+                  - match_dimensions:
+                      alias: default
+                      purpose: main_response
+                      status: error
+                    assert:
+                      path: count
+                      count: 1
+                  - match_dimensions:
+                      alias: default
+                      purpose: main_response
+                      status: success
+                    assert:
+                      path: count
+                      count: 1

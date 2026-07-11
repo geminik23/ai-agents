@@ -13,6 +13,11 @@ settings:
   retries: 0
   isolation: scenario
 
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, status]
+
 fixtures:
   llm:
     mode: mock
@@ -52,8 +57,45 @@ scenarios:
           all:
             - response_not_empty: true
             - response_contains: "error"
+            - llm_request:
+                user_contains:
+                  - "Tell me about async Rust."
+                  - "Tell me about trait objects."
+                  - "Tell me about error handling patterns."
+                assistant_contains:
+                  - "Turn one response about async Rust."
+                  - "Turn three response about trait objects."
+                same_request: true
+                count: 1
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      alias: router
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      alias: default
+                      status: success
+                    assert:
+                      path: count
+                      gte: 4
       - input: What did we discuss earlier?
         assert:
           all:
             - response_not_empty: true
             - response_contains: "compaction"
+            - llm_request:
+                system_contains:
+                  - "[Previous conversation summary]"
+                  - "Summary: the user discussed async Rust, tokio, trait objects, and error handling."
+                user_contains:
+                  - "Tell me about trait objects."
+                  - "Tell me about error handling patterns."
+                  - "What did we discuss earlier?"
+                assistant_contains:
+                  - "Turn three response about trait objects."
+                  - "Turn four response about error handling patterns."
+                same_request: true
+                count: 1

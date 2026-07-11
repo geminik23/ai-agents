@@ -1,0 +1,69 @@
+name: Multi Tool Agent JSON Mocked Eval
+agent: ../../../yaml/tools/multi_tool_agent.yaml
+
+# Focused parent coverage for JSON selection with risky granted tools absent.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"json","arguments":{"operation":"get","data":{"release":{"version":"1.2.3"}},"path":"release.version"}}'
+      - "release.version is exactly 1.2.3."
+  tools:
+    http:
+      success: false
+      output:
+        error: http disabled for this mocked suite
+    file:
+      success: false
+      output:
+        error: file disabled for this mocked suite
+    template:
+      success: false
+      output:
+        error: template disabled for this mocked suite
+
+scenarios:
+  - id: multi-tool-selects-json-only
+    name: JSON is selected without risky tools
+    tags: [mock, examples, yaml, tools, multi-tool, json, scoping]
+    language: en
+    turns:
+      - input: Extract release.version from {"release":{"version":"1.2.3"}} using only the JSON tool.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "release.version is exactly 1.2.3."
+            - tool_called:
+                id: json
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: json
+                args_executed:
+                  path: operation
+                  eq: get
+            - tool_called:
+                id: json
+                args_executed:
+                  path: path
+                  eq: release.version
+            - tool_called:
+                id: json
+                result_path:
+                  path: value
+                  eq: "1.2.3"
+            - tool_called:
+                id: json
+                result_path:
+                  path: found
+                  eq: true
+            - tool_not_called: http
+            - tool_not_called: file
+            - tool_not_called: template

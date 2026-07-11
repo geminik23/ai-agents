@@ -1,0 +1,148 @@
+name: Todo Workflow Mocked Eval
+agent: ../../../yaml/tools/todo_workflow.yaml
+
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"todo","arguments":{"operation":"set","items":[{"id":"release-1","content":"Review changelog","active_form":"Reviewing changelog","status":"in_progress"},{"id":"release-2","content":"Run cargo test","active_form":"Running cargo test","status":"pending"}]}}'
+      - "Created two release tasks. Review changelog is in progress and Run cargo test is pending."
+      - '{"tool":"todo","arguments":{"operation":"update","id":"release-1","status":"completed"}}'
+      - "Review changelog is completed; Run cargo test remains pending."
+      - '{"tool":"todo","arguments":{"operation":"list"}}'
+      - "The list still has two tasks: Review changelog is completed and Run cargo test is pending."
+      - '{"tool":"todo","arguments":{"operation":"clear"}}'
+      - "The task list is now empty."
+
+scenarios:
+  - id: todo-workflow-proves-session-lifecycle
+    name: Real todo state persists through set update list and clear
+    tags: [tools, todo, lifecycle, session, safety, mock]
+    language: en
+    turns:
+      - input: Create release-1 as in progress for Review changelog and release-2 as pending for Run cargo test. Do not ask a follow-up question.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "two release tasks"
+            - tool_called:
+                id: todo
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: todo
+                args_executed:
+                  path: operation
+                  eq: set
+            - tool_called:
+                id: todo
+                result_path:
+                  path: operation
+                  eq: set
+            - tool_called:
+                id: todo
+                result_path:
+                  path: count
+                  eq: 2
+            - tool_not_called: ask_user
+      - input: Mark release-1 completed and summarize what remains. Do not ask me anything.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "completed"
+            - response_contains: "remains pending"
+            - tool_called:
+                id: todo
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: todo
+                args_executed:
+                  path: operation
+                  eq: update
+            - tool_called:
+                id: todo
+                args_executed:
+                  path: id
+                  eq: release-1
+            - tool_called:
+                id: todo
+                result_path:
+                  path: operation
+                  eq: update
+            - tool_called:
+                id: todo
+                result_path:
+                  path: updated
+                  eq: true
+            - tool_called:
+                id: todo
+                result_path:
+                  path: count
+                  eq: 2
+            - tool_not_called: ask_user
+      - input: List the current tasks without asking a follow-up question.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "two tasks"
+            - response_contains: "Review changelog is completed"
+            - response_contains: "Run cargo test is pending"
+            - tool_called:
+                id: todo
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: todo
+                args_executed:
+                  path: operation
+                  eq: list
+            - tool_called:
+                id: todo
+                result_path:
+                  path: operation
+                  eq: list
+            - tool_called:
+                id: todo
+                result_path:
+                  path: count
+                  eq: 2
+            - tool_not_called: ask_user
+      - input: Clear the task list and report its final size. Do not ask me anything.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "empty"
+            - tool_called:
+                id: todo
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: todo
+                args_executed:
+                  path: operation
+                  eq: clear
+            - tool_called:
+                id: todo
+                result_path:
+                  path: operation
+                  eq: clear
+            - tool_called:
+                id: todo
+                result_path:
+                  path: count
+                  eq: 0
+            - tool_not_called: ask_user

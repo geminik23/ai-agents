@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -24,9 +24,106 @@ const DEFAULT_CACHE_TTL_SECONDS: u64 = 900;
 const DEFAULT_MAX_REDIRECTS: usize = 5;
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
 
+/// A single HTTP GET issued by the web fetch tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFetchTransportRequest {
+    pub url: String,
+    pub max_response_bytes: usize,
+}
+
+/// The transport-level fields consumed by the web fetch tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebFetchTransportResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub location: Option<String>,
+    pub body: Vec<u8>,
+}
+
+/// Sends HTTP requests without applying URL or redirect policy.
+#[async_trait]
+pub trait WebFetchTransport: Send + Sync {
+    async fn send(
+        &self,
+        request: WebFetchTransportRequest,
+    ) -> Result<WebFetchTransportResponse, String>;
+}
+
+/// Resolves hostnames for SSRF validation before each request.
+#[async_trait]
+pub trait WebFetchResolver: Send + Sync {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String>;
+}
+
+struct ReqwestWebFetchTransport {
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl WebFetchTransport for ReqwestWebFetchTransport {
+    async fn send(
+        &self,
+        request: WebFetchTransportRequest,
+    ) -> Result<WebFetchTransportResponse, String> {
+        let response = self
+            .client
+            .get(&request.url)
+            .send()
+            .await
+            .map_err(|error| format!("Request failed: {}", error))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(str::to_string)
+                    .map_err(|_| "Redirect Location header is not valid UTF-8".to_string())
+            })
+            .transpose()?;
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| format!("Response stream failed: {}", error))?;
+            if body.len().saturating_add(chunk.len()) > request.max_response_bytes {
+                return Err(format!(
+                    "Response exceeded max_response_bytes {}",
+                    request.max_response_bytes
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(WebFetchTransportResponse {
+            status,
+            content_type,
+            location,
+            body,
+        })
+    }
+}
+
+struct TokioWebFetchResolver;
+
+#[async_trait]
+impl WebFetchResolver for TokioWebFetchResolver {
+    async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
+        tokio::net::lookup_host((host, port))
+            .await
+            .map(|addresses| addresses.map(|address| address.ip()).collect())
+            .map_err(|error| format!("DNS lookup failed: {}", error))
+    }
+}
+
 /// Fetches public web content with SSRF-oriented network safety checks.
 pub struct WebFetchTool {
-    client: reqwest::Client,
+    transport: Arc<dyn WebFetchTransport>,
+    resolver: Arc<dyn WebFetchResolver>,
     cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
     extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
 }
@@ -44,8 +141,30 @@ impl WebFetchTool {
             .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        Self::with_extractor_slot_and_transport(
+            extractor,
+            Arc::new(ReqwestWebFetchTransport { client }),
+            Arc::new(TokioWebFetchResolver),
+        )
+    }
+
+    /// Create a web fetch tool with injected HTTP and DNS implementations.
+    pub fn with_transport_and_resolver(
+        transport: Arc<dyn WebFetchTransport>,
+        resolver: Arc<dyn WebFetchResolver>,
+    ) -> Self {
+        Self::with_extractor_slot_and_transport(Arc::new(RwLock::new(None)), transport, resolver)
+    }
+
+    /// Create a web fetch tool with extraction, HTTP, and DNS implementations.
+    pub fn with_extractor_slot_and_transport(
+        extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
+        transport: Arc<dyn WebFetchTransport>,
+        resolver: Arc<dyn WebFetchResolver>,
+    ) -> Self {
         Self {
-            client,
+            transport,
+            resolver,
             cache: Arc::new(RwLock::new(HashMap::new())),
             extractor,
         }
@@ -260,7 +379,9 @@ impl Tool for WebFetchTool {
             Ok(url) => url,
             Err(error) => return ToolResult::error(format!("Invalid URL: {}", error)),
         };
-        if let Err(result) = validate_url_with_policy(&original_url, Some(&policy)).await {
+        if let Err(result) =
+            validate_url_with_policy(&original_url, Some(&policy), self.resolver.as_ref()).await
+        {
             return result;
         }
         let cache_key = format!(
@@ -275,8 +396,12 @@ impl Tool for WebFetchTool {
             let cached_entry = { self.cache.read().get(&cache_key).cloned() };
             if let Some(entry) = cached_entry {
                 if Instant::now() < entry.expires_at {
-                    if let Err(result) =
-                        validate_cached_output_with_policy(&entry.output, &policy).await
+                    if let Err(result) = validate_cached_output_with_policy(
+                        &entry.output,
+                        &policy,
+                        self.resolver.as_ref(),
+                    )
+                    .await
                     {
                         return result;
                     }
@@ -289,9 +414,6 @@ impl Tool for WebFetchTool {
 
         let mut current_url = original_url.clone();
         let mut redirects = Vec::new();
-        if let Err(result) = validate_url_with_policy(&current_url, Some(&policy)).await {
-            return result;
-        }
 
         let response = loop {
             if ctx.cancellation.is_cancelled() {
@@ -301,25 +423,28 @@ impl Tool for WebFetchTool {
                         .unwrap_or("Tool execution cancelled"),
                 );
             }
-            if let Err(result) = validate_url_with_policy(&current_url, Some(&policy)).await {
+            if let Err(result) =
+                validate_url_with_policy(&current_url, Some(&policy), self.resolver.as_ref()).await
+            {
                 return result;
             }
-            let response = match self.client.get(current_url.clone()).send().await {
+            let response = match self
+                .transport
+                .send(WebFetchTransportRequest {
+                    url: current_url.to_string(),
+                    max_response_bytes,
+                })
+                .await
+            {
                 Ok(response) => response,
-                Err(error) => return ToolResult::error(format!("Request failed: {}", error)),
+                Err(error) => return ToolResult::error(error),
             };
-            if response.status().is_redirection() {
+            if (300..400).contains(&response.status) {
                 if redirects.len() >= max_redirects {
                     return ToolResult::error("Redirect limit exceeded");
                 }
-                let Some(location) = response.headers().get(reqwest::header::LOCATION) else {
+                let Some(location) = response.location.as_deref() else {
                     return ToolResult::error("Redirect response missing Location header");
-                };
-                let location = match location.to_str() {
-                    Ok(location) => location,
-                    Err(_) => {
-                        return ToolResult::error("Redirect Location header is not valid UTF-8");
-                    }
                 };
                 let next_url = match current_url.join(location) {
                     Ok(url) => url,
@@ -327,7 +452,9 @@ impl Tool for WebFetchTool {
                         return ToolResult::error(format!("Invalid redirect URL: {}", error));
                     }
                 };
-                if let Err(result) = validate_url_with_policy(&next_url, Some(&policy)).await {
+                if let Err(result) =
+                    validate_url_with_policy(&next_url, Some(&policy), self.resolver.as_ref()).await
+                {
                     return result;
                 }
                 redirects.push(next_url.to_string());
@@ -337,37 +464,22 @@ impl Tool for WebFetchTool {
             break response;
         };
 
-        let status = response.status().as_u16();
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string);
-        let mut body = Vec::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = match chunk {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    return ToolResult::error(format!("Response stream failed: {}", error));
-                }
-            };
-            if ctx.cancellation.is_cancelled() {
-                return ToolResult::error(
-                    ctx.cancellation
-                        .reason()
-                        .unwrap_or("Tool execution cancelled"),
-                );
-            }
-            if body.len().saturating_add(chunk.len()) > max_response_bytes {
-                return ToolResult::error(format!(
-                    "Response exceeded max_response_bytes {}",
-                    max_response_bytes
-                ));
-            }
-            body.extend_from_slice(&chunk);
+        let status = response.status;
+        let content_type = response.content_type;
+        if response.body.len() > max_response_bytes {
+            return ToolResult::error(format!(
+                "Response exceeded max_response_bytes {}",
+                max_response_bytes
+            ));
         }
-        let raw_text = match String::from_utf8(body) {
+        if ctx.cancellation.is_cancelled() {
+            return ToolResult::error(
+                ctx.cancellation
+                    .reason()
+                    .unwrap_or("Tool execution cancelled"),
+            );
+        }
+        let raw_text = match String::from_utf8(response.body) {
             Ok(text) => text,
             Err(_) => return ToolResult::error("Response body is not UTF-8 text"),
         };
@@ -432,8 +544,9 @@ impl Tool for WebFetchTool {
 async fn validate_url_with_policy(
     url: &reqwest::Url,
     policy: Option<&WebFetchPolicyInput>,
+    resolver: &dyn WebFetchResolver,
 ) -> Result<(), ToolResult> {
-    validate_url(url).await?;
+    validate_url(url, resolver).await?;
     if let Some(policy) = policy {
         check_configured_url_policy(url, policy)?;
     }
@@ -443,15 +556,16 @@ async fn validate_url_with_policy(
 async fn validate_cached_output_with_policy(
     output: &WebFetchOutput,
     policy: &WebFetchPolicyInput,
+    resolver: &dyn WebFetchResolver,
 ) -> Result<(), ToolResult> {
     let final_url = reqwest::Url::parse(&output.final_url)
         .map_err(|error| ToolResult::error(format!("Cached final URL is invalid: {}", error)))?;
-    validate_url_with_policy(&final_url, Some(policy)).await?;
+    validate_url_with_policy(&final_url, Some(policy), resolver).await?;
     for redirect in &output.redirects {
         let url = reqwest::Url::parse(redirect).map_err(|error| {
             ToolResult::error(format!("Cached redirect URL is invalid: {}", error))
         })?;
-        validate_url_with_policy(&url, Some(policy)).await?;
+        validate_url_with_policy(&url, Some(policy), resolver).await?;
     }
     Ok(())
 }
@@ -472,7 +586,10 @@ fn policy_cache_fingerprint(policy: &WebFetchPolicyInput) -> String {
     .to_string()
 }
 
-async fn validate_url(url: &reqwest::Url) -> Result<(), ToolResult> {
+async fn validate_url(
+    url: &reqwest::Url,
+    resolver: &dyn WebFetchResolver,
+) -> Result<(), ToolResult> {
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -500,11 +617,15 @@ async fn validate_url(url: &reqwest::Url) -> Result<(), ToolResult> {
         return Ok(());
     }
     let port = url.port_or_known_default().unwrap_or(443);
-    let addresses = tokio::net::lookup_host((host, port))
+    let addresses = resolver
+        .resolve(host, port)
         .await
-        .map_err(|error| ToolResult::error(format!("DNS lookup failed: {}", error)))?;
+        .map_err(ToolResult::error)?;
+    if addresses.is_empty() {
+        return Err(ToolResult::error("DNS lookup returned no addresses"));
+    }
     for address in addresses {
-        validate_socket_addr(address)?;
+        validate_ip(address)?;
     }
     Ok(())
 }
@@ -590,10 +711,6 @@ fn check_configured_url_policy(
     Ok(())
 }
 
-fn validate_socket_addr(address: SocketAddr) -> Result<(), ToolResult> {
-    validate_ip(address.ip())
-}
-
 fn validate_ip(ip: IpAddr) -> Result<(), ToolResult> {
     if is_blocked_ip(ip) {
         Err(ToolResult::error(
@@ -621,6 +738,10 @@ fn is_blocked_ip(ip: IpAddr) -> bool {
                 || ip.is_multicast()
                 || ip.segments()[0] & 0xfe00 == 0xfc00
                 || ip.segments()[0] & 0xffc0 == 0xfe80
+                || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| is_blocked_ip(IpAddr::V4(mapped)))
         }
     }
 }
@@ -752,26 +873,295 @@ fn web_result(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn blocks_localhost_urls() {
-        let result = WebFetchTool::new()
-            .execute(
-                serde_json::json!({"url": "http://127.0.0.1:1234"}),
-                ai_agents_core::ToolExecutionContext::test("test"),
-            )
-            .await;
-        assert!(!result.success);
+    #[derive(Default)]
+    struct FixtureTransport {
+        routes: RwLock<HashMap<String, WebFetchTransportResponse>>,
+        requests: RwLock<Vec<String>>,
+    }
+
+    impl FixtureTransport {
+        fn route(&self, url: &str, response: WebFetchTransportResponse) {
+            self.routes.write().insert(url.to_string(), response);
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.read().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WebFetchTransport for FixtureTransport {
+        async fn send(
+            &self,
+            request: WebFetchTransportRequest,
+        ) -> Result<WebFetchTransportResponse, String> {
+            self.requests.write().push(request.url.clone());
+            self.routes
+                .read()
+                .get(&request.url)
+                .cloned()
+                .ok_or_else(|| format!("Unconfigured web fetch route: {}", request.url))
+        }
+    }
+
+    struct FixtureResolver {
+        addresses: HashMap<String, Vec<IpAddr>>,
+        default: Vec<IpAddr>,
+    }
+
+    impl Default for FixtureResolver {
+        fn default() -> Self {
+            Self {
+                addresses: HashMap::new(),
+                default: vec![IpAddr::from([93, 184, 216, 34])],
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WebFetchResolver for FixtureResolver {
+        async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+            Ok(self
+                .addresses
+                .get(host)
+                .cloned()
+                .unwrap_or_else(|| self.default.clone()))
+        }
+    }
+
+    fn response(
+        status: u16,
+        content_type: Option<&str>,
+        location: Option<&str>,
+        body: &str,
+    ) -> WebFetchTransportResponse {
+        WebFetchTransportResponse {
+            status,
+            content_type: content_type.map(str::to_string),
+            location: location.map(str::to_string),
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    fn fixture_tool(transport: Arc<FixtureTransport>) -> WebFetchTool {
+        WebFetchTool::with_transport_and_resolver(transport, Arc::new(FixtureResolver::default()))
+    }
+
+    fn output(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.output).expect("web fetch output should be JSON")
     }
 
     #[tokio::test]
-    async fn blocks_metadata_hosts() {
-        let result = WebFetchTool::new()
+    async fn blocks_non_public_ip_ranges_without_requesting() {
+        for url in [
+            "http://127.0.0.1/",
+            "http://10.0.0.1/",
+            "http://169.254.1.1/",
+            "http://169.254.169.254/latest",
+            "http://192.0.2.1/",
+            "http://[::1]/",
+            "http://[fe80::1]/",
+            "http://[2001:db8::1]/",
+            "http://[::ffff:10.0.0.1]/",
+        ] {
+            let result = WebFetchTool::new()
+                .execute(
+                    serde_json::json!({"url": url}),
+                    ai_agents_core::ToolExecutionContext::test("web_fetch"),
+                )
+                .await;
+            assert!(!result.success, "URL should be blocked: {}", url);
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_transport_fetches_html_and_text() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/page",
+            response(
+                200,
+                Some("text/html"),
+                None,
+                "<h1>Title</h1><p>Hello &amp; bye</p>",
+            ),
+        );
+        transport.route(
+            "https://public.test/plain",
+            response(200, Some("text/plain"), None, "plain response"),
+        );
+        let tool = fixture_tool(transport);
+
+        let html = tool
             .execute(
-                serde_json::json!({"url": "http://169.254.169.254/latest"}),
-                ai_agents_core::ToolExecutionContext::test("test"),
+                serde_json::json!({"url": "https://public.test/page"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
             )
             .await;
+        let text = tool
+            .execute(
+                serde_json::json!({"url": "https://public.test/plain"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(html.success);
+        assert_eq!(output(&html)["content"], "Title\nHello & bye");
+        assert!(text.success);
+        assert_eq!(output(&text)["content"], "plain response");
+    }
+
+    #[tokio::test]
+    async fn in_memory_transport_follows_exact_route_redirects() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("/final"), ""),
+        );
+        transport.route(
+            "https://public.test/final",
+            response(200, Some("text/plain"), None, "done"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://public.test/start"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(result.success);
+        assert_eq!(output(&result)["final_url"], "https://public.test/final");
+        assert_eq!(
+            transport.requests(),
+            vec![
+                "https://public.test/start".to_string(),
+                "https://public.test/final".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_private_redirect_before_second_request() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("http://private.test/secret"), ""),
+        );
+        let mut resolver = FixtureResolver::default();
+        resolver.addresses.insert(
+            "private.test".to_string(),
+            vec![IpAddr::from([10, 0, 0, 1])],
+        );
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::new(resolver),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://public.test/start"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
         assert!(!result.success);
+        assert_eq!(transport.requests(), vec!["https://public.test/start"]);
+        assert!(result.output.contains("Private"));
+    }
+
+    #[tokio::test]
+    async fn enforces_byte_limit_on_injected_responses() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/large",
+            response(200, Some("text/plain"), None, "123456"),
+        );
+        let result = fixture_tool(transport)
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/large",
+                    "max_response_bytes": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("max_response_bytes 5"));
+    }
+
+    #[tokio::test]
+    async fn caches_injected_transport_responses() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/cached",
+            response(200, Some("text/plain"), None, "cached"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+        let args = serde_json::json!({
+            "url": "https://public.test/cached",
+            "cache_ttl_seconds": 60
+        });
+
+        let first = tool
+            .execute(
+                args.clone(),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let second = tool
+            .execute(
+                args,
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(first.success && second.success);
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(output(&first)["from_cache"], false);
+        assert_eq!(output(&second)["from_cache"], true);
+    }
+
+    #[tokio::test]
+    async fn applies_policy_before_injected_transport() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://blocked.test/page",
+            response(200, Some("text/plain"), None, "not reached"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+        let mut context = ai_agents_core::ToolExecutionContext::test("web_fetch");
+        context.policy_snapshot = serde_json::json!({
+            "blocked_domains": ["blocked.test"]
+        });
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://blocked.test/page"}),
+                context,
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(transport.requests().is_empty());
+        assert!(result.output.contains("blocked by policy"));
+    }
+
+    #[tokio::test]
+    async fn reports_unconfigured_exact_routes() {
+        let transport = Arc::new(FixtureTransport::default());
+        let result = fixture_tool(Arc::clone(&transport))
+            .execute(
+                serde_json::json!({"url": "https://public.test/missing"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Unconfigured web fetch route"));
+        assert_eq!(transport.requests(), vec!["https://public.test/missing"]);
     }
 
     #[test]
@@ -787,12 +1177,5 @@ mod tests {
 
         assert!(check_configured_url_policy(&allowed, &policy).is_ok());
         assert!(check_configured_url_policy(&denied, &policy).is_err());
-    }
-
-    #[test]
-    fn converts_html_to_text() {
-        let text = html_to_text("<html><body><h1>Title</h1><p>Hello &amp; bye</p></body></html>");
-        assert!(text.contains("Title"));
-        assert!(text.contains("Hello & bye"));
     }
 }

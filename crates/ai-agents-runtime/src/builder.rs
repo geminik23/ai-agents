@@ -211,6 +211,13 @@ impl AgentBuilder {
         }
     }
 
+    /// Builds from an existing spec while resolving relative resources from the supplied directory.
+    pub fn from_spec_with_base_dir(spec: AgentSpec, base_dir: impl Into<PathBuf>) -> Self {
+        let mut builder = Self::from_spec(spec);
+        builder.yaml_dir = Some(base_dir.into());
+        builder
+    }
+
     pub fn from_yaml(yaml_content: &str) -> Result<Self> {
         let spec: AgentSpec = serde_yaml::from_str(yaml_content)?;
         spec.validate()?;
@@ -231,11 +238,12 @@ impl AgentBuilder {
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(AgentError::IoError)?;
-        let mut builder = Self::from_yaml(&content)?;
-        if let Some(parent) = path.parent() {
-            builder.yaml_dir = Some(parent.to_path_buf());
-        }
-        Ok(builder)
+        let spec: AgentSpec = serde_yaml::from_str(&content)?;
+        spec.validate()?;
+        Ok(match path.parent() {
+            Some(parent) => Self::from_spec_with_base_dir(spec, parent),
+            None => Self::from_spec(spec),
+        })
     }
 
     pub fn from_template(template_name: &str) -> Result<Self> {
@@ -1667,6 +1675,99 @@ skills:
         let builder = AgentBuilder::from_spec(spec);
         assert!(builder.spec.is_some());
         assert_eq!(builder.system_prompt, Some("You are helpful".to_string()));
+    }
+
+    #[test]
+    fn test_builder_from_spec_with_base_dir_preserves_mutations() {
+        let yaml = r#"
+name: OriginalAgent
+system_prompt: "Original prompt"
+max_iterations: 10
+llm:
+  provider: openai
+  model: gpt-4
+"#;
+        let mut spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        spec.name = "RewrittenAgent".to_string();
+        spec.system_prompt = "Rewritten prompt".to_string();
+        spec.max_iterations = 37;
+        let base_dir = PathBuf::from("rewritten-agent-dir");
+
+        let builder = AgentBuilder::from_spec_with_base_dir(spec, &base_dir);
+
+        let stored_spec = builder.spec.as_ref().unwrap();
+        assert_eq!(stored_spec.name, "RewrittenAgent");
+        assert_eq!(stored_spec.system_prompt, "Rewritten prompt");
+        assert_eq!(stored_spec.max_iterations, 37);
+        assert_eq!(builder.system_prompt.as_deref(), Some("Rewritten prompt"));
+        assert_eq!(builder.max_iterations, Some(37));
+        assert_eq!(builder.yaml_dir.as_deref(), Some(base_dir.as_path()));
+    }
+
+    #[tokio::test]
+    async fn test_builder_from_spec_with_base_dir_resolves_spawner_paths() {
+        use ai_agents_llm::mock::MockLLMProvider;
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "ai-agents-builder-base-dir-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let templates_dir = base_dir.join("templates");
+        let agents_dir = base_dir.join("agents");
+        std::fs::create_dir_all(&templates_dir).unwrap();
+        std::fs::create_dir_all(&agents_dir).unwrap();
+
+        let template_content = "name: {{ name }}\nsystem_prompt: Template prompt\n";
+        std::fs::write(templates_dir.join("worker.yaml"), template_content).unwrap();
+        std::fs::write(
+            agents_dir.join("child.yaml"),
+            r#"
+name: ChildAgent
+system_prompt: "Child prompt"
+llm:
+  provider: openai
+  model: gpt-4
+"#,
+        )
+        .unwrap();
+
+        let yaml = r#"
+name: ParentAgent
+system_prompt: "Parent prompt"
+llm:
+  provider: openai
+  model: gpt-4
+spawner:
+  shared_llms: true
+  templates:
+    worker:
+      path: templates/worker.yaml
+  auto_spawn:
+    - id: child
+      agent: agents/child.yaml
+"#;
+        let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let mut registry = LLMRegistry::new();
+        registry.register("default", Arc::new(MockLLMProvider::new("test")));
+        registry.set_default("default");
+
+        let builder = AgentBuilder::from_spec_with_base_dir(spec, &base_dir)
+            .llm_registry(registry)
+            .auto_configure_spawner()
+            .await
+            .unwrap();
+
+        let template = builder
+            .spawner
+            .as_ref()
+            .unwrap()
+            .templates()
+            .get("worker")
+            .unwrap();
+        assert_eq!(template.content, template_content);
+        assert!(builder.spawner_registry.as_ref().unwrap().contains("child"));
+
+        std::fs::remove_dir_all(base_dir).unwrap();
     }
 
     #[test]

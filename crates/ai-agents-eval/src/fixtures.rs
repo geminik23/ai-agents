@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +22,8 @@ use ai_agents_runtime::spec::AgentSpec;
 use ai_agents_tools::{
     CommandResponse, DiagnosticItem, DiagnosticsProvider, StaticCommandRunner,
     StaticDiagnosticsProvider, StaticWebSearchProvider, ToolRegistry,
-    UnavailableDiagnosticsProvider, UnavailableWebSearchProvider, WebSearchProvider,
+    UnavailableDiagnosticsProvider, UnavailableWebSearchProvider, WebFetchResolver, WebFetchTool,
+    WebFetchTransport, WebFetchTransportRequest, WebFetchTransportResponse, WebSearchProvider,
     WebSearchResponse, create_builtin_registry,
 };
 use async_trait::async_trait;
@@ -61,9 +63,26 @@ pub struct FixturesConfig {
     /// Optional mocked web-search responses for the web_search tool.
     #[serde(default)]
     pub web_search: Option<WebSearchFixtureConfig>,
+    /// Optional exact-URL in-memory transport for the real web_fetch tool.
+    #[serde(default)]
+    pub web_fetch_transport: Option<WebFetchTransportFixtureConfig>,
     /// Deterministic approval responses for human-in-the-loop requests.
     #[serde(default)]
     pub approvals: Option<ApprovalFixtureConfig>,
+    /// Narrow per-attempt workspace additions for existing tool policies.
+    #[serde(default)]
+    pub workspace_policy: Option<WorkspacePolicyFixtureConfig>,
+}
+
+/// Existing tool policies that receive the isolated attempt workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct WorkspacePolicyFixtureConfig {
+    /// Tool policies that receive the workspace in read_paths.
+    #[serde(default)]
+    pub read_tools: Vec<String>,
+    /// Tool policies that receive the workspace in write_paths.
+    #[serde(default)]
+    pub write_tools: Vec<String>,
 }
 
 /// Deterministic approval behavior for one eval handler instance.
@@ -305,6 +324,30 @@ pub struct WebSearchFixtureConfig {
     pub entries: Vec<WebSearchFixtureEntry>,
 }
 
+/// Exact-URL responses served in memory to the real web_fetch tool.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WebFetchTransportFixtureConfig {
+    /// Routes matched against the normalized URL requested by web_fetch.
+    #[serde(default)]
+    pub routes: Vec<WebFetchTransportFixtureRoute>,
+}
+
+/// One no-socket web_fetch transport response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebFetchTransportFixtureRoute {
+    /// Absolute URL matched exactly after URL normalization.
+    pub url: String,
+    /// HTTP status returned by the transport.
+    #[serde(default = "default_status")]
+    pub status: u16,
+    /// Response headers. Content-Type and Location retain their web semantics.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// String bodies are returned verbatim; other values are encoded as JSON.
+    #[serde(default)]
+    pub body: Value,
+}
+
 /// Static output configuration for an eval mock tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolMockConfig {
@@ -343,9 +386,26 @@ pub struct LlmFixtureConfig {
     /// Per-LLM alias errors for deterministic failure-path evals.
     #[serde(default)]
     pub errors_by_alias: HashMap<String, String>,
+    /// Per-LLM alias ordered response and error outcomes.
+    #[serde(default)]
+    pub outcomes_by_alias: HashMap<String, Vec<LlmFixtureOutcome>>,
     /// Per-LLM alias delay in milliseconds for deterministic branch ordering.
     #[serde(default)]
     pub delays_by_alias: HashMap<String, u64>,
+}
+
+/// One response or error in an ordered mock LLM sequence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum LlmFixtureOutcome {
+    Response {
+        content: String,
+    },
+    Error {
+        message: String,
+        #[serde(default)]
+        status: Option<u16>,
+    },
 }
 
 /// LLM fixture strategy used while building eval providers.
@@ -413,6 +473,117 @@ impl MockServerHandle {
 impl Drop for MockServerHandle {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+/// Generated values shared by every agent build and reset in one attempt.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AttemptFixtureContext {
+    /// Opaque identifier used to isolate non-file persistence.
+    pub isolation_id: String,
+    /// Absolute per-attempt workspace exposed as eval.workspace.
+    pub workspace: PathBuf,
+    /// Optional server URL exposed as mock_server.base_url.
+    pub mock_server_base_url: Option<String>,
+}
+
+impl AttemptFixtureContext {
+    pub fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
+        let isolation_id = uuid::Uuid::new_v4().to_string();
+        let workspace = std::env::temp_dir().join(format!("ai_agents_eval_{}", isolation_id));
+        std::fs::create_dir_all(&workspace)?;
+        let workspace = workspace.canonicalize()?;
+        Ok(Self {
+            isolation_id,
+            workspace,
+            mock_server_base_url: mock_server.map(|server| server.base_url.clone()),
+        })
+    }
+
+    pub fn runtime_context(&self) -> HashMap<String, Value> {
+        let mut context = HashMap::from([(
+            "eval".to_string(),
+            json!({"workspace": self.workspace.display().to_string()}),
+        )]);
+        if let Some(base_url) = &self.mock_server_base_url {
+            context.insert("mock_server".to_string(), json!({"base_url": base_url}));
+        }
+        context
+    }
+
+    pub fn interpolate_llm_fixture(&self, config: &LlmFixtureConfig) -> Result<LlmFixtureConfig> {
+        let mut rewritten = config.clone();
+        for response in &mut rewritten.responses {
+            *response = self.interpolate_response(response)?;
+        }
+        for responses in rewritten.responses_by_alias.values_mut() {
+            for response in responses {
+                *response = self.interpolate_response(response)?;
+            }
+        }
+        for outcomes in rewritten.outcomes_by_alias.values_mut() {
+            for outcome in outcomes {
+                if let LlmFixtureOutcome::Response { content } = outcome {
+                    *content = self.interpolate_response(content)?;
+                }
+            }
+        }
+        Ok(rewritten)
+    }
+
+    fn interpolate_response(&self, response: &str) -> Result<String> {
+        const WORKSPACE_TOKEN: &str = "{{ eval.workspace }}";
+        const MOCK_SERVER_TOKEN: &str = "{{ mock_server.base_url }}";
+        if !response.contains(WORKSPACE_TOKEN) && !response.contains(MOCK_SERVER_TOKEN) {
+            return Ok(response.to_string());
+        }
+        if response.contains(MOCK_SERVER_TOKEN) && self.mock_server_base_url.is_none() {
+            return Err(EvalError::Config(format!(
+                "mock LLM response uses {} without an enabled fixtures.mock_server",
+                MOCK_SERVER_TOKEN
+            )));
+        }
+        let workspace = self.workspace.display().to_string();
+        let mock_server = self.mock_server_base_url.as_deref();
+        if let Ok(mut value) = serde_json::from_str::<Value>(response) {
+            interpolate_json_strings(&mut value, &workspace, mock_server);
+            return serde_json::to_string(&value).map_err(EvalError::from);
+        }
+        Ok(interpolate_fixture_string(
+            response,
+            &workspace,
+            mock_server,
+        ))
+    }
+}
+
+fn interpolate_json_strings(value: &mut Value, workspace: &str, mock_server: Option<&str>) {
+    match value {
+        Value::String(text) => *text = interpolate_fixture_string(text, workspace, mock_server),
+        Value::Array(values) => {
+            for value in values {
+                interpolate_json_strings(value, workspace, mock_server);
+            }
+        }
+        Value::Object(values) => {
+            let previous = std::mem::take(values);
+            for (key, mut value) in previous {
+                interpolate_json_strings(&mut value, workspace, mock_server);
+                values.insert(
+                    interpolate_fixture_string(&key, workspace, mock_server),
+                    value,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn interpolate_fixture_string(value: &str, workspace: &str, mock_server: Option<&str>) -> String {
+    let value = value.replace("{{ eval.workspace }}", workspace);
+    match mock_server {
+        Some(base_url) => value.replace("{{ mock_server.base_url }}", base_url),
+        None => value,
     }
 }
 
@@ -708,11 +879,21 @@ pub fn build_tool_registry(
             .map_err(|error| EvalError::Config(error.to_string()))?;
     }
 
+    let web_fetch = fixtures
+        .web_fetch_transport
+        .as_ref()
+        .map(build_web_fetch_fixture_tool)
+        .transpose()?;
     for id in builtin.list_ids() {
         if fixtures.tools.contains_key(&id) {
             continue;
         }
-        if let Some(tool) = builtin.get(&id) {
+        let tool = if id == "web_fetch" {
+            web_fetch.clone().or_else(|| builtin.get(&id))
+        } else {
+            builtin.get(&id)
+        };
+        if let Some(tool) = tool {
             registry
                 .register(Arc::new(RecordingTool::new(
                     tool,
@@ -724,6 +905,71 @@ pub fn build_tool_registry(
     }
 
     Ok(registry)
+}
+
+fn build_web_fetch_fixture_tool(config: &WebFetchTransportFixtureConfig) -> Result<Arc<dyn Tool>> {
+    let mut routes = HashMap::new();
+    for route in &config.routes {
+        let normalized_url = reqwest::Url::parse(&route.url)
+            .map_err(|error| {
+                EvalError::Config(format!(
+                    "invalid fixtures.web_fetch_transport route URL '{}': {}",
+                    route.url, error
+                ))
+            })?
+            .to_string();
+        let content_type = header_value(&route.headers, "content-type").map(str::to_string);
+        let location = header_value(&route.headers, "location").map(str::to_string);
+        let response = WebFetchTransportResponse {
+            status: route.status,
+            content_type,
+            location,
+            body: mock_body_to_string(&route.body).into_bytes(),
+        };
+        if routes.insert(normalized_url.clone(), response).is_some() {
+            return Err(EvalError::Config(format!(
+                "duplicate fixtures.web_fetch_transport route URL '{}'",
+                normalized_url
+            )));
+        }
+    }
+    Ok(Arc::new(WebFetchTool::with_transport_and_resolver(
+        Arc::new(FixtureWebFetchTransport { routes }),
+        Arc::new(FixtureWebFetchResolver),
+    )))
+}
+
+fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+struct FixtureWebFetchTransport {
+    routes: HashMap<String, WebFetchTransportResponse>,
+}
+
+#[async_trait]
+impl WebFetchTransport for FixtureWebFetchTransport {
+    async fn send(
+        &self,
+        request: WebFetchTransportRequest,
+    ) -> std::result::Result<WebFetchTransportResponse, String> {
+        self.routes
+            .get(&request.url)
+            .cloned()
+            .ok_or_else(|| format!("No fixtures.web_fetch_transport route for {}", request.url))
+    }
+}
+
+struct FixtureWebFetchResolver;
+
+#[async_trait]
+impl WebFetchResolver for FixtureWebFetchResolver {
+    async fn resolve(&self, _host: &str, _port: u16) -> std::result::Result<Vec<IpAddr>, String> {
+        Ok(vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))])
+    }
 }
 
 /// Tool implementation returning a configured eval fixture result.
@@ -879,15 +1125,14 @@ pub fn build_llm_registry(
 
     for (alias, config) in aliases {
         let fixture_responses = load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
-        let fixture_error = fixtures.errors_by_alias.get(&alias).cloned();
+        let fixture_outcomes =
+            load_fixture_outcomes_for_alias(fixtures, &alias, &fixture_responses);
         let fixture_delay_ms = fixtures.delays_by_alias.get(&alias).copied().unwrap_or(0);
         let provider = match fixtures.mode {
-            LlmFixtureMode::Mock => Arc::new(SequenceLLMProvider::new(
-                alias.clone(),
-                fixture_responses.clone(),
-                fixture_error,
-                fixture_delay_ms,
-            )) as Arc<dyn LLMProvider>,
+            LlmFixtureMode::Mock => {
+                Arc::new(SequenceLLMProvider::new(fixture_outcomes, fixture_delay_ms))
+                    as Arc<dyn LLMProvider>
+            }
             LlmFixtureMode::Replay => Arc::new(ReplayLLMProvider::new(
                 alias.clone(),
                 config.model.clone(),
@@ -1001,6 +1246,40 @@ fn load_fixture_responses_for_alias(
     Ok(responses)
 }
 
+fn load_fixture_outcomes_for_alias(
+    config: &LlmFixtureConfig,
+    alias: &str,
+    responses: &[LLMResponse],
+) -> Vec<SequenceOutcome> {
+    if let Some(outcomes) = config.outcomes_by_alias.get(alias)
+        && !outcomes.is_empty()
+    {
+        return outcomes
+            .iter()
+            .map(|outcome| match outcome {
+                LlmFixtureOutcome::Response { content } => {
+                    SequenceOutcome::Response(LLMResponse::new(content.clone(), FinishReason::Stop))
+                }
+                LlmFixtureOutcome::Error { message, status } => SequenceOutcome::Error {
+                    message: message.clone(),
+                    status: *status,
+                },
+            })
+            .collect();
+    }
+    if let Some(message) = config.errors_by_alias.get(alias) {
+        return vec![SequenceOutcome::Error {
+            message: message.clone(),
+            status: None,
+        }];
+    }
+    responses
+        .iter()
+        .cloned()
+        .map(SequenceOutcome::Response)
+        .collect()
+}
+
 fn load_cassette_records(
     config: &LlmFixtureConfig,
     base_dir: &Path,
@@ -1034,14 +1313,21 @@ struct CassetteRecord {
     response: LLMResponse,
 }
 
-/// Deterministic LLM provider returning fixture responses in order.
+#[derive(Clone)]
+enum SequenceOutcome {
+    Response(LLMResponse),
+    Error {
+        message: String,
+        status: Option<u16>,
+    },
+}
+
+/// Deterministic LLM provider returning fixture outcomes in order.
 struct SequenceLLMProvider {
-    /// Ordered text responses used by mock mode and fallback replay.
-    responses: Arc<Mutex<Vec<LLMResponse>>>,
+    /// Ordered response and error outcomes used by mock mode.
+    outcomes: Arc<Vec<SequenceOutcome>>,
     /// Zero-based turn index within the scenario.
-    index: Arc<Mutex<usize>>,
-    /// Optional deterministic provider error.
-    error: Option<String>,
+    index: Mutex<usize>,
     /// Fixed delay before returning a response.
     delay_ms: u64,
 }
@@ -1061,16 +1347,10 @@ struct ReplayLLMProvider {
 }
 
 impl SequenceLLMProvider {
-    fn new(
-        _name: String,
-        responses: Vec<LLMResponse>,
-        error: Option<String>,
-        delay_ms: u64,
-    ) -> Self {
+    fn new(outcomes: Vec<SequenceOutcome>, delay_ms: u64) -> Self {
         Self {
-            responses: Arc::new(Mutex::new(responses)),
-            index: Arc::new(Mutex::new(0)),
-            error,
+            outcomes: Arc::new(outcomes),
+            index: Mutex::new(0),
             delay_ms,
         }
     }
@@ -1081,18 +1361,20 @@ impl SequenceLLMProvider {
         }
     }
 
-    fn next_response(&self) -> LLMResponse {
-        let responses = self.responses.lock();
+    fn next_outcome(&self) -> std::result::Result<LLMResponse, LLMError> {
         let mut index = self.index.lock();
-        let response = responses
-            .get(*index)
-            .cloned()
-            .or_else(|| responses.last().cloned())
-            .unwrap_or_else(|| LLMResponse::new("Mock response", FinishReason::Stop));
-        if *index + 1 < responses.len() {
+        let outcome = self.outcomes.get(*index).or_else(|| self.outcomes.last());
+        if *index + 1 < self.outcomes.len() {
             *index += 1;
         }
-        response
+        match outcome {
+            Some(SequenceOutcome::Response(response)) => Ok(response.clone()),
+            Some(SequenceOutcome::Error { message, status }) => Err(LLMError::API {
+                message: message.clone(),
+                status: *status,
+            }),
+            None => Ok(LLMResponse::new("Mock response", FinishReason::Stop)),
+        }
     }
 }
 
@@ -1109,9 +1391,10 @@ impl ReplayLLMProvider {
             model,
             records: Arc::new(records),
             responses: SequenceLLMProvider::new(
-                "replay-fallback".to_string(),
-                fallback,
-                None,
+                fallback
+                    .into_iter()
+                    .map(SequenceOutcome::Response)
+                    .collect(),
                 delay_ms,
             ),
             delay_ms,
@@ -1133,7 +1416,9 @@ impl ReplayLLMProvider {
         }) {
             return record.response.clone();
         }
-        self.responses.next_response()
+        self.responses
+            .next_outcome()
+            .unwrap_or_else(|_| LLMResponse::new("Mock response", FinishReason::Stop))
     }
 }
 
@@ -1180,13 +1465,7 @@ impl LLMProvider for SequenceLLMProvider {
         _config: Option<&LLMConfig>,
     ) -> std::result::Result<LLMResponse, LLMError> {
         self.wait_if_configured().await;
-        if let Some(error) = &self.error {
-            return Err(LLMError::API {
-                message: error.clone(),
-                status: None,
-            });
-        }
-        Ok(self.next_response())
+        self.next_outcome()
     }
 
     async fn complete_stream(
@@ -1198,13 +1477,7 @@ impl LLMProvider for SequenceLLMProvider {
         LLMError,
     > {
         self.wait_if_configured().await;
-        if let Some(error) = &self.error {
-            return Err(LLMError::API {
-                message: error.clone(),
-                status: None,
-            });
-        }
-        let response = self.next_response();
+        let response = self.next_outcome()?;
         Ok(Box::new(futures::stream::iter(chunks_from_response(
             response,
         ))))
@@ -1382,6 +1655,153 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_fixture_parses_tagged_outcomes_by_alias() {
+        let config: FixturesConfig = serde_yaml::from_str(
+            r#"
+llm:
+  mode: mock
+  outcomes_by_alias:
+    worker:
+      - type: error
+        message: transient overload
+      - type: response
+        content: recovered
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.llm.outcomes_by_alias["worker"],
+            vec![
+                LlmFixtureOutcome::Error {
+                    message: "transient overload".to_string(),
+                    status: None,
+                },
+                LlmFixtureOutcome::Response {
+                    content: "recovered".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_provider_mixes_outcomes_with_independent_alias_cursors() {
+        let config: LlmFixtureConfig = serde_yaml::from_str(
+            r#"
+mode: mock
+outcomes_by_alias:
+  alpha:
+    - type: error
+      message: retry alpha
+    - type: response
+      content: alpha recovered
+  beta:
+    - type: response
+      content: beta first
+    - type: response
+      content: beta second
+"#,
+        )
+        .unwrap();
+        let fallback = vec![LLMResponse::new("fallback", FinishReason::Stop)];
+        let alpha = SequenceLLMProvider::new(
+            load_fixture_outcomes_for_alias(&config, "alpha", &fallback),
+            0,
+        );
+        let beta = SequenceLLMProvider::new(
+            load_fixture_outcomes_for_alias(&config, "beta", &fallback),
+            0,
+        );
+
+        assert!(matches!(
+            alpha.complete(&[], None).await,
+            Err(LLMError::API { message, status: None }) if message == "retry alpha"
+        ));
+        assert_eq!(
+            beta.complete(&[], None).await.unwrap().content,
+            "beta first"
+        );
+        assert_eq!(
+            alpha.complete(&[], None).await.unwrap().content,
+            "alpha recovered"
+        );
+        assert_eq!(
+            beta.complete(&[], None).await.unwrap().content,
+            "beta second"
+        );
+        assert_eq!(
+            alpha.complete(&[], None).await.unwrap().content,
+            "alpha recovered"
+        );
+        assert_eq!(
+            beta.complete(&[], None).await.unwrap().content,
+            "beta second"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_provider_stream_errors_advance_to_recovery() {
+        let provider = SequenceLLMProvider::new(
+            vec![
+                SequenceOutcome::Error {
+                    message: "stream retry".to_string(),
+                    status: None,
+                },
+                SequenceOutcome::Response(LLMResponse::new("stream recovered", FinishReason::Stop)),
+            ],
+            0,
+        );
+
+        assert!(matches!(
+            provider.complete_stream(&[], None).await,
+            Err(LLMError::API { message, status: None }) if message == "stream retry"
+        ));
+        assert_eq!(
+            provider.complete(&[], None).await.unwrap().content,
+            "stream recovered"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_provider_preserves_legacy_responses_and_errors() {
+        let config = LlmFixtureConfig {
+            mode: LlmFixtureMode::Mock,
+            responses: vec!["global".to_string()],
+            responses_by_alias: HashMap::from([(
+                "worker".to_string(),
+                vec!["first".to_string(), "second".to_string()],
+            )]),
+            errors_by_alias: HashMap::from([(
+                "failing".to_string(),
+                "permanent failure".to_string(),
+            )]),
+            ..Default::default()
+        };
+        let worker_responses =
+            load_fixture_responses_for_alias(&config, Path::new("."), "worker").unwrap();
+        let failing_responses =
+            load_fixture_responses_for_alias(&config, Path::new("."), "failing").unwrap();
+        let worker = SequenceLLMProvider::new(
+            load_fixture_outcomes_for_alias(&config, "worker", &worker_responses),
+            0,
+        );
+        let failing = SequenceLLMProvider::new(
+            load_fixture_outcomes_for_alias(&config, "failing", &failing_responses),
+            0,
+        );
+
+        assert_eq!(worker.complete(&[], None).await.unwrap().content, "first");
+        assert_eq!(worker.complete(&[], None).await.unwrap().content, "second");
+        assert_eq!(worker.complete(&[], None).await.unwrap().content, "second");
+        for _ in 0..2 {
+            assert!(matches!(
+                failing.complete(&[], None).await,
+                Err(LLMError::API { message, status: None }) if message == "permanent failure"
+            ));
+        }
+    }
 
     #[test]
     fn approval_fixture_parses_all_triggers_and_outcomes() {
@@ -1578,6 +1998,133 @@ default:
     }
 
     #[test]
+    fn workspace_policy_is_optional_and_deserializes_narrow_tool_lists() {
+        let absent: FixturesConfig = serde_yaml::from_str("llm: { mode: mock }").unwrap();
+        assert_eq!(absent.workspace_policy, None);
+
+        let configured: FixturesConfig = serde_yaml::from_str(
+            r#"
+workspace_policy:
+  read_tools: [file_read]
+  write_tools: [file_write]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.workspace_policy,
+            Some(WorkspacePolicyFixtureConfig {
+                read_tools: vec!["file_read".to_string()],
+                write_tools: vec!["file_write".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn attempt_context_uses_opaque_absolute_unique_workspaces() {
+        let scenario_id = "customer-refund-scenario";
+        let first = AttemptFixtureContext::create(None).unwrap();
+        let second = AttemptFixtureContext::create(None).unwrap();
+
+        assert!(first.workspace.is_absolute());
+        assert!(second.workspace.is_absolute());
+        assert_ne!(first.workspace, second.workspace);
+        assert!(!first.workspace.display().to_string().contains(scenario_id));
+        let suffix = first
+            .workspace
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .trim_start_matches("ai_agents_eval_")
+            .to_string();
+        assert_eq!(uuid::Uuid::parse_str(&suffix).unwrap().to_string(), suffix);
+        assert_eq!(
+            first.runtime_context()["eval"]["workspace"],
+            json!(first.workspace.display().to_string())
+        );
+    }
+
+    #[test]
+    fn attempt_context_interpolates_only_exact_tokens_json_safely() {
+        let context = AttemptFixtureContext {
+            isolation_id: "attempt-one".to_string(),
+            workspace: PathBuf::from(r"C:\eval\attempt"),
+            mock_server_base_url: Some("http://127.0.0.1:43123".to_string()),
+        };
+        let config = LlmFixtureConfig {
+            mode: LlmFixtureMode::Mock,
+            responses: vec![
+                r#"{"{{ eval.workspace }}":{"workspace":"{{ eval.workspace }}"},"nested":{"workspace":"{{ eval.workspace }}"},"items":["{{ mock_server.base_url }}/ok",7]}"#.to_string(),
+                "keep {{ unrelated.template }} and {{eval.workspace}}".to_string(),
+            ],
+            responses_by_alias: HashMap::from([(
+                "worker".to_string(),
+                vec!["write to {{ eval.workspace }}".to_string()],
+            )]),
+            outcomes_by_alias: HashMap::from([(
+                "reviewer".to_string(),
+                vec![
+                    LlmFixtureOutcome::Error {
+                        message: "keep {{ eval.workspace }} literal".to_string(),
+                        status: None,
+                    },
+                    LlmFixtureOutcome::Response {
+                        content: "review {{ eval.workspace }}".to_string(),
+                    },
+                ],
+            )]),
+            ..Default::default()
+        };
+
+        let rewritten = context.interpolate_llm_fixture(&config).unwrap();
+        let json: Value = serde_json::from_str(&rewritten.responses[0]).unwrap();
+        assert_eq!(json["nested"]["workspace"], json!(r"C:\eval\attempt"));
+        assert!(json.get(r"C:\eval\attempt").is_some());
+        assert_eq!(json["items"][0], json!("http://127.0.0.1:43123/ok"));
+        assert_eq!(
+            rewritten.responses[1],
+            "keep {{ unrelated.template }} and {{eval.workspace}}"
+        );
+        assert_eq!(
+            rewritten.responses_by_alias["worker"][0],
+            r"write to C:\eval\attempt"
+        );
+        assert_eq!(
+            rewritten.outcomes_by_alias["reviewer"][0],
+            LlmFixtureOutcome::Error {
+                message: "keep {{ eval.workspace }} literal".to_string(),
+                status: None,
+            }
+        );
+        assert_eq!(
+            rewritten.outcomes_by_alias["reviewer"][1],
+            LlmFixtureOutcome::Response {
+                content: r"review C:\eval\attempt".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn attempt_context_rejects_mock_server_token_without_server() {
+        let context = AttemptFixtureContext {
+            isolation_id: "attempt-one".to_string(),
+            workspace: PathBuf::from("/tmp/attempt-one"),
+            mock_server_base_url: None,
+        };
+        let config = LlmFixtureConfig {
+            mode: LlmFixtureMode::Mock,
+            responses: vec!["{{ mock_server.base_url }}/missing".to_string()],
+            ..Default::default()
+        };
+
+        let error = context.interpolate_llm_fixture(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("without an enabled fixtures.mock_server")
+        );
+    }
+
+    #[test]
     fn context_file_and_inline_context_merge() {
         let dir = std::env::temp_dir().join(format!(
             "ai_agents_eval_fixture_test_{}",
@@ -1600,6 +2147,79 @@ default:
         assert_eq!(context.get("feature"), Some(&serde_json::json!(true)));
         assert!(context.get("user").is_some());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_transport_uses_real_tool_without_sockets() {
+        let fixtures: FixturesConfig = serde_yaml::from_str(
+            r#"
+web_fetch_transport:
+  routes:
+    - url: https://fixture.example/data
+      status: 200
+      headers:
+        Content-Type: application/json
+      body: { ok: true }
+"#,
+        )
+        .unwrap();
+        let registry = build_tool_registry(&fixtures, RecordingToolLog::new()).unwrap();
+        let tool = registry.get("web_fetch").unwrap();
+        let result = tool
+            .execute(
+                json!({"url":"https://fixture.example/data","cache_ttl_seconds":0}),
+                ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["status"], 200);
+        assert_eq!(output["content"], "{\"ok\":true}");
+
+        let missing = tool
+            .execute(
+                json!({"url":"https://fixture.example/missing","cache_ttl_seconds":0}),
+                ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        assert!(!missing.success);
+        assert!(
+            missing
+                .output
+                .contains("No fixtures.web_fetch_transport route")
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_transport_preserves_redirect_policy_checks() {
+        let fixtures: FixturesConfig = serde_yaml::from_str(
+            r#"
+web_fetch_transport:
+  routes:
+    - url: https://fixture.example/start
+      status: 302
+      headers:
+        Location: https://blocked.example/secret
+    - url: https://blocked.example/secret
+      status: 200
+      body: should-not-be-returned
+"#,
+        )
+        .unwrap();
+        let registry = build_tool_registry(&fixtures, RecordingToolLog::new()).unwrap();
+        let tool = registry.get("web_fetch").unwrap();
+        let mut execution_context = ToolExecutionContext::test("web_fetch");
+        execution_context.policy_snapshot = json!({"blocked_domains":["blocked.example"]});
+        let result = tool
+            .execute(
+                json!({"url":"https://fixture.example/start","cache_ttl_seconds":0}),
+                execution_context,
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("blocked by policy"));
     }
 
     #[test]

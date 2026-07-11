@@ -34,6 +34,76 @@ cargo run -p ai-agents-cli -- eval \
 
 Most suites declare their own `agent:` path, so `--agent` is optional unless you intentionally want to override it.
 
+## Attempt-local fixtures
+
+Every scenario attempt receives an opaque temporary workspace. Generated values are available in runtime context as `eval.workspace` and, when enabled, `mock_server.base_url`.
+
+Mock LLM response fixtures can reference only these generated tokens:
+
+```yaml
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"http","arguments":{"method":"GET","url":"{{ mock_server.base_url }}/status"}}'
+      - '{"tool":"file_write","arguments":{"path":"{{ eval.workspace }}/note.md","content":"review","dry_run":true}}'
+```
+
+Interpolation is JSON-safe and leaves unrelated template expressions unchanged. Referencing `mock_server.base_url` without enabling the mock server is a configuration error.
+
+Parent storage and `spawner.shared_storage` file, SQLite, or Redis backends are isolated per attempt. When a source agent has an existing path policy, `fixtures.workspace_policy` can narrowly add the attempt workspace to named policies without disabling other restrictions:
+
+```yaml
+fixtures:
+  workspace_policy:
+    write_tools: [file_write]
+```
+
+Use `fixtures.web_fetch_transport` for exact-URL, no-socket responses through the real `web_fetch` implementation. This does not bypass URL, domain, redirect, private-network, or response-size policy.
+
+```yaml
+fixtures:
+  web_fetch_transport:
+    routes:
+      - url: https://docs.example.test/article
+        status: 200
+        headers:
+          content-type: text/html
+        body: "<h1>Fixture article</h1>"
+```
+
+## Sequenced LLM outcomes and request evidence
+
+Use `outcomes_by_alias` when one alias must fail and then recover:
+
+```yaml
+fixtures:
+  llm:
+    mode: mock
+    outcomes_by_alias:
+      default:
+        - type: error
+          message: transient provider outage
+          status: 503
+        - type: response
+          content: Recovered response.
+```
+
+The final outcome repeats after exhaustion. An error without `status` retains the legacy status-less API error behavior.
+
+Use `llm_request` to verify the actual messages sent to an LLM rather than trusting a canned response:
+
+```yaml
+assert:
+  llm_request:
+    count_gte: 1
+    system_contains: "Senior Support Representative"
+    user_contains: "account"
+    same_request: true
+```
+
+LLM request contents remain in memory for assertions and are not serialized into eval reports or assertion summaries.
+
 ## Deterministic HITL suites
 
 The `mocked/hitl/` suites exercise approval behavior without API keys, real HTTP, or human input:

@@ -182,6 +182,7 @@ mod tests {
                         context: serde_json::Value::Null,
                         tool_executions: Vec::new(),
                         approvals: Vec::new(),
+                        llm_requests: Vec::new(),
                         skill: None,
                         disambiguation: None,
                         facts: None,

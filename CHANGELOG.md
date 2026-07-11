@@ -5,10 +5,14 @@
 ### Added
 - HITL evaluation: deterministic approval fixtures support approve, reject, modify, timeout, unavailable, and localized decisions without human input
 - Approval assertions: eval suites can verify triggers, raw and effective decisions, localized messages, modified arguments, and execution outcomes
+- Eval isolation: each attempt receives isolated workspace and storage values that fixtures can use without touching configured source paths
+- Eval network fixtures: real HTTP and web fetch behavior can run through attempt-local or no-socket routes while retaining security checks
+- LLM eval evidence: sequenced provider outcomes and non-serializing request assertions verify retry, memory, persona, and reasoning behavior
 
 ### Changed
 - Evaluation fixtures: mocked built-in tools preserve their schemas, safety classification, and policy behavior while replacing external execution
 - Evaluation errors: failed turns retain partial responses and structural evidence, with explicit expected-error matching for intentional failures
+- Agent construction: rewritten specifications retain their original resource directory for relative skills, templates, and spawned agents
 
 ## 1.0.0-rc.16
 

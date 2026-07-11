@@ -1,0 +1,84 @@
+name: Workspace Research Mocked Eval
+agent: ../../../yaml/tools/workspace_research.yaml
+
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"file_list","arguments":{"path":"examples/yaml/tools","recursive":false,"max_results":100}}'
+      - "The committed tools directory includes basic_tools.yaml, repo_review.yaml, todo_workflow.yaml, and workspace_research.yaml."
+      - '{"tool":"file_read","arguments":{"path":"examples/yaml/tools/workspace_research.yaml","start_line":1,"end_line":80}}'
+      - "workspace_research.yaml grants read-only discovery through glob, grep, file_list, file_read, and file_info."
+
+scenarios:
+  - id: workspace-research-uses-real-read-only-tools
+    name: Real workspace tools inspect committed examples without mutation
+    tags: [tools, workspace, read-only, local, fixture, mock]
+    language: en
+    turns:
+      - input: List examples/yaml/tools and identify the four parent tool examples under evaluation.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "basic_tools.yaml"
+            - response_contains: "workspace_research.yaml"
+            - tool_called:
+                id: file_list
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: file_list
+                args_executed:
+                  path: path
+                  eq: "examples/yaml/tools"
+            - tool_called:
+                id: file_list
+                result_path:
+                  path: count
+                  gte: 4
+            - tool_called:
+                id: file_list
+                result_path:
+                  path: truncated
+                  eq: false
+            - tool_not_called: todo
+      - input: Read examples/yaml/tools/workspace_research.yaml and summarize its read-only tool grant.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "read-only"
+            - response_contains: "file_read"
+            - tool_called:
+                id: file_read
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: file_read
+                args_executed:
+                  path: path
+                  eq: "examples/yaml/tools/workspace_research.yaml"
+            - tool_called:
+                id: file_read
+                result_path:
+                  path: path
+                  eq: "examples/yaml/tools/workspace_research.yaml"
+            - tool_called:
+                id: file_read
+                result_path:
+                  path: content
+                  contains: "blocked_paths: [./target, ./.git]"
+            - tool_called:
+                id: file_read
+                result_path:
+                  path: truncated
+                  eq: false
+            - tool_not_called: todo

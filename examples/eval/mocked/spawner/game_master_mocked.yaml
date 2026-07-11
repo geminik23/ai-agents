@@ -1,8 +1,8 @@
-name: Team Manager Mocked Lifecycle Eval
-agent: ../../../yaml/spawner/team_manager.yaml
+name: Game Master Mocked Lifecycle Eval
+agent: ../../../yaml/spawner/game_master.yaml
 
-# Deterministic lifecycle coverage for template-backed specialist management.
-# The eval runner rewrites shared SQLite storage into each attempt workspace before agent construction.
+# Deterministic lifecycle coverage for template-backed NPC management.
+# All model responses are local fixtures; management tools mutate only the in-memory scenario registry.
 settings:
   timeout_per_turn_ms: 10000
   retries: 0
@@ -13,30 +13,30 @@ fixtures:
     mode: mock
     responses_by_alias:
       default:
-        - '{"tool":"spawn_agent","arguments":{"name":"Mira Chen","description":"A market intelligence researcher for renewable energy trends.","template":"researcher","domain":"renewable energy market analysis","methodology":"comparative"}}'
-        - "Mira Chen was created from the researcher template with registry ID agent_001."
+        - '{"tool":"spawn_agent","arguments":{"name":"Ser Rowan Rivers","description":"A vigilant Riverlands scout loyal to the smallfolk.","template":"npc_base","role":"scout","personality":"Watchful, plain-spoken, and quietly compassionate. Distrusts banners but protects travelers."}}'
+        - "Ser Rowan Rivers was created from the NPC template with registry ID npc_001."
         - '{"tool":"list_agents","arguments":{}}'
-        - "The active team contains Mira Chen as agent_001."
-        - '{"tool":"send_agent_message","arguments":{"to":"agent_001","message":"Give me one concise finding about renewable energy market growth."}}'
-        - "Renewable energy capacity growth is accelerating as falling technology costs and supportive policy increase adoption."
-        - "Mira Chen reports that renewable energy capacity growth is accelerating as falling technology costs and supportive policy increase adoption."
-        - '{"tool":"remove_agent","arguments":{"id":"agent_001"}}'
-        - "Mira Chen was removed from the active team."
+        - "The active NPC registry contains Ser Rowan Rivers as npc_001."
+        - '{"tool":"send_agent_message","arguments":{"to":"npc_001","message":"What did you see on the kingsroad?"}}'
+        - "Broken wagons and fresh hoofprints. Someone rode south in haste before dawn."
+        - "Ser Rowan Rivers reports broken wagons and fresh hoofprints on the kingsroad."
+        - '{"tool":"remove_agent","arguments":{"id":"npc_001"}}'
+        - "Ser Rowan Rivers was removed from the active NPC registry."
         - '{"tool":"list_agents","arguments":{}}'
-        - "The active team registry is now empty."
+        - "The active NPC registry is now empty."
       router:
         - "No routing or summarization call is expected in this lifecycle fixture."
 
 scenarios:
-  - id: team-manager-template-specialist-lifecycle
+  - id: game-master-template-npc-lifecycle
     name: Spawn, list, message, remove, and verify the final registry
-    tags: [mock, examples, yaml, spawner, lifecycle, management-tools, shared-storage]
+    tags: [mock, examples, yaml, spawner, lifecycle, management-tools]
     language: en
     turns:
-      - input: Create Mira Chen as a comparative market intelligence researcher for renewable energy trends using the available researcher template.
+      - input: Create Ser Rowan Rivers as a vigilant scout using the available NPC template.
         assert:
           all:
-            - response_contains: "Mira Chen was created from the researcher template with registry ID agent_001."
+            - response_contains: "npc_001"
             - tool_called:
                 id: spawn_agent
                 count: 1
@@ -47,32 +47,22 @@ scenarios:
                 id: spawn_agent
                 args_executed:
                   path: name
-                  eq: "Mira Chen"
-            - tool_called:
-                id: spawn_agent
-                args_executed:
-                  path: description
-                  eq: "A market intelligence researcher for renewable energy trends."
+                  eq: "Ser Rowan Rivers"
             - tool_called:
                 id: spawn_agent
                 args_executed:
                   path: template
-                  eq: researcher
+                  eq: npc_base
             - tool_called:
                 id: spawn_agent
                 args_executed:
-                  path: domain
-                  eq: "renewable energy market analysis"
-            - tool_called:
-                id: spawn_agent
-                args_executed:
-                  path: methodology
-                  eq: comparative
+                  path: role
+                  eq: scout
             - tool_called:
                 id: spawn_agent
                 result_path:
                   path: id
-                  eq: agent_001
+                  eq: npc_001
             - tool_called:
                 id: spawn_agent
                 result_path:
@@ -82,19 +72,15 @@ scenarios:
                 id: spawn_agent
                 result_path:
                   path: template
-                  eq: researcher
+                  eq: npc_base
             - tool_not_called: list_agents
             - tool_not_called: send_agent_message
             - tool_not_called: remove_agent
-            - tool_not_called: command
-            - tool_not_called: file
-            - tool_not_called: http
-            - tool_not_called: web_fetch
 
-      - input: List all active team members.
+      - input: List all active NPCs.
         assert:
           all:
-            - response_contains: "The active team contains Mira Chen as agent_001."
+            - response_contains: "npc_001"
             - tool_called:
                 id: list_agents
                 count: 1
@@ -114,15 +100,11 @@ scenarios:
             - tool_not_called: spawn_agent
             - tool_not_called: send_agent_message
             - tool_not_called: remove_agent
-            - tool_not_called: command
-            - tool_not_called: file
-            - tool_not_called: http
-            - tool_not_called: web_fetch
 
-      - input: Ask agent_001 for one concise finding about renewable energy market growth.
+      - input: Ask npc_001 what they saw on the kingsroad.
         assert:
           all:
-            - response_contains: "Mira Chen reports that renewable energy capacity growth is accelerating as falling technology costs and supportive policy increase adoption."
+            - response_contains: "fresh hoofprints"
             - tool_called:
                 id: send_agent_message
                 count: 1
@@ -133,36 +115,30 @@ scenarios:
                 id: send_agent_message
                 args_executed:
                   path: to
-                  eq: agent_001
+                  eq: npc_001
             - tool_called:
                 id: send_agent_message
                 args_executed:
                   path: message
-                  eq: "Give me one concise finding about renewable energy market growth."
+                  eq: "What did you see on the kingsroad?"
             - tool_called:
                 id: send_agent_message
                 result_path:
                   path: from
-                  eq: agent_001
+                  eq: npc_001
             - tool_called:
                 id: send_agent_message
                 result_path:
                   path: response
-                  eq: "Renewable energy capacity growth is accelerating as falling technology costs and supportive policy increase adoption."
+                  eq: "Broken wagons and fresh hoofprints. Someone rode south in haste before dawn."
             - tool_not_called: spawn_agent
             - tool_not_called: list_agents
             - tool_not_called: remove_agent
-            - tool_not_called: calculator
-            - tool_not_called: datetime
-            - tool_not_called: command
-            - tool_not_called: file
-            - tool_not_called: http
-            - tool_not_called: web_fetch
 
-      - input: Remove agent_001 from the active team.
+      - input: Remove npc_001 from the active NPC registry.
         assert:
           all:
-            - response_contains: "Mira Chen was removed from the active team."
+            - response_contains: "removed"
             - tool_called:
                 id: remove_agent
                 count: 1
@@ -173,7 +149,7 @@ scenarios:
                 id: remove_agent
                 args_executed:
                   path: id
-                  eq: agent_001
+                  eq: npc_001
             - tool_called:
                 id: remove_agent
                 result_path:
@@ -183,19 +159,15 @@ scenarios:
                 id: remove_agent
                 result_path:
                   path: id
-                  eq: agent_001
+                  eq: npc_001
             - tool_not_called: spawn_agent
             - tool_not_called: list_agents
             - tool_not_called: send_agent_message
-            - tool_not_called: command
-            - tool_not_called: file
-            - tool_not_called: http
-            - tool_not_called: web_fetch
 
-      - input: List all active team members after the removal.
+      - input: List all active NPCs after the removal.
         assert:
           all:
-            - response_contains: "The active team registry is now empty."
+            - response_contains: "empty"
             - tool_called:
                 id: list_agents
                 count: 1
@@ -215,7 +187,3 @@ scenarios:
             - tool_not_called: spawn_agent
             - tool_not_called: send_agent_message
             - tool_not_called: remove_agent
-            - tool_not_called: command
-            - tool_not_called: file
-            - tool_not_called: http
-            - tool_not_called: web_fetch

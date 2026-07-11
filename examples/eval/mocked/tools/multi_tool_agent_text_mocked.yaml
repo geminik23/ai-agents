@@ -1,0 +1,64 @@
+name: Multi Tool Agent Text Mocked Eval
+agent: ../../../yaml/tools/multi_tool_agent.yaml
+
+# Focused parent coverage for text selection with risky granted tools absent.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"text","arguments":{"operation":"reverse","text":"stressed"}}'
+      - "Reversing stressed returns exactly desserts."
+  tools:
+    http:
+      success: false
+      output:
+        error: http disabled for this mocked suite
+    file:
+      success: false
+      output:
+        error: file disabled for this mocked suite
+    template:
+      success: false
+      output:
+        error: template disabled for this mocked suite
+
+scenarios:
+  - id: multi-tool-selects-text-only
+    name: Text is selected without risky tools
+    tags: [mock, examples, yaml, tools, multi-tool, text, scoping]
+    language: en
+    turns:
+      - input: Reverse 'stressed' using only the text tool.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Reversing stressed returns exactly desserts."
+            - tool_called:
+                id: text
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: text
+                args_executed:
+                  path: operation
+                  eq: reverse
+            - tool_called:
+                id: text
+                args_executed:
+                  path: text
+                  eq: stressed
+            - tool_called:
+                id: text
+                result_path:
+                  path: result
+                  eq: desserts
+            - tool_not_called: http
+            - tool_not_called: file
+            - tool_not_called: template

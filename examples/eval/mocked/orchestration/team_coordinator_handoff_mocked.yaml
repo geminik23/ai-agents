@@ -1,0 +1,56 @@
+name: Team Coordinator Handoff Mocked Eval
+agent: ../../../yaml/orchestration/team_coordinator.yaml
+
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - '{"tool":"handoff_conversation","arguments":{"input":"Research this market and assess the business impact.","initial_agent":"researcher","available_agents":["researcher","analyst"],"max_handoffs":2}}'
+        - "Researcher findings: demand is growing and the sources support further business analysis."
+        - "Analyst assessment: the opportunity is viable if acquisition costs remain controlled."
+        - "The research was handed to the analyst, who found a viable opportunity with a cost constraint."
+      router:
+        - '{"action":"analyst","confidence":0.95,"reason":"business impact needs analysis"}'
+        - '{"action":"stay","confidence":0.95,"reason":"analysis is complete"}'
+
+scenarios:
+  - id: coordinator-hands-research-to-analyst
+    name: Coordinator starts with research and hands business assessment to analyst
+    tags: [mock, examples, yaml, orchestration, team-coordinator, handoff]
+    language: en
+    turns:
+      - input: Research this market and assess the business impact.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "handed to the analyst"
+            - tool_called:
+                id: handoff_conversation
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: initial_agent
+                  eq: researcher
+                result_path:
+                  path: final_agent
+                  eq: analyst
+            - tool_called:
+                id: handoff_conversation
+                args_executed:
+                  path: available_agents
+                  contains: analyst
+                result_path:
+                  path: response
+                  contains: "Analyst assessment"
+            - tool_called:
+                id: handoff_conversation
+                result_path:
+                  path: handoffs
+                  exists: true

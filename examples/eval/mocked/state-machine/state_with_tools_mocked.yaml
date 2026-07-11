@@ -1,0 +1,105 @@
+name: State With Tools Mocked Eval
+agent: ../../../yaml/state-machine/state_with_tools.yaml
+
+# Deterministic parent coverage for state-scoped tool grants.
+# Verifies transitions, narrowed and inherited grants, and denial before execution.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greeting stale response."
+        - '{"tool":"calculator","arguments":{"expression":"6 * 7"}}'
+        - "The lookup calculation result is exactly 42."
+        - "Lookup stale response."
+        - '{"tool":"calculator","arguments":{"expression":"9 + 1"}}'
+        - "The closing calculation result is exactly 10."
+        - "Closing stale response."
+        - '{"tool":"calculator","arguments":{"expression":"100 / 4"}}'
+        - "The calculator request was denied because greeting has no tools."
+      router:
+        - "1"
+        - "1"
+        - "2"
+
+scenarios:
+  - id: state-tools-transition-scope-and-denial
+    name: State transitions apply narrowed, inherited, and empty tool grants
+    tags: [mock, examples, yaml, state-machine, tools, grants, deny]
+    language: en
+    turns:
+      - input: Please calculate 6 * 7.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "exactly 42"
+            - response_not_contains: "Greeting stale"
+            - state: lookup
+            - state_history_contains: lookup
+            - tool_called:
+                id: calculator
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: calculator
+                args_executed:
+                  path: expression
+                  eq: "6 * 7"
+            - tool_called:
+                id: calculator
+                result_path:
+                  path: result
+                  eq: 42.0
+            - tool_not_called: datetime
+      - input: Thanks, and calculate 9 + 1 before I go.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "exactly 10"
+            - response_not_contains: "Lookup stale"
+            - state: closing
+            - state_history_contains: closing
+            - tool_called:
+                id: calculator
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: calculator
+                args_executed:
+                  path: expression
+                  eq: "9 + 1"
+            - tool_called:
+                id: calculator
+                result_path:
+                  path: result
+                  eq: 10.0
+            - tool_not_called: datetime
+      - input: "I have another question: calculate 100 / 4."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "denied because greeting has no tools"
+            - response_not_contains: "Closing stale"
+            - state: greeting
+            - state_history_contains: greeting
+            - tool_called:
+                id: calculator
+                count: 1
+                executed: false
+                success: false
+                source_in: [llm]
+            - tool_called:
+                id: calculator
+                args_original:
+                  path: expression
+                  eq: "100 / 4"
+            - tool_not_called: datetime

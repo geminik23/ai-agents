@@ -1,0 +1,49 @@
+name: Team Coordinator Route Mocked Eval
+agent: ../../../yaml/orchestration/team_coordinator.yaml
+
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - '{"tool":"route_to_agent","arguments":{"input":"I need help with market research.","candidates":["researcher","analyst"],"method":"llm"}}'
+        - "Researcher response: start market research with customer segments, competitors, and source validation."
+        - "The researcher recommends evaluating customer segments, competitors, and reliable sources."
+      router:
+        - "researcher"
+
+scenarios:
+  - id: coordinator-routes-to-researcher
+    name: Coordinator routes market research to one specialist
+    tags: [mock, examples, yaml, orchestration, team-coordinator, route]
+    language: en
+    turns:
+      - input: I need help with market research.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "researcher recommends"
+            - tool_called:
+                id: route_to_agent
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: method
+                  eq: llm
+                result_path:
+                  path: selected_agent
+                  eq: researcher
+            - tool_called:
+                id: route_to_agent
+                args_executed:
+                  path: candidates
+                  contains: analyst
+                result_path:
+                  path: response
+                  contains: "Researcher response"

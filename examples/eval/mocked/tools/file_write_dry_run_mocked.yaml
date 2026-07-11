@@ -1,25 +1,49 @@
 name: File Write Dry Run Mocked Eval
 agent: ../../../yaml/tools/file_write_sandbox.yaml
+
+# Direct parent coverage preserves the isolated attempt workspace and performs no write.
 settings:
   timeout_per_turn_ms: 5000
+  retries: 0
   isolation: scenario
 fixtures:
+  workspace_policy:
+    write_tools: [file_write]
   llm:
     mode: mock
     responses:
-      - '{"tool":"file_write","arguments":{"path":"./examples/fixtures/tool_examples/generated_note.md","content":"# Generated Note\n\n- Review before apply\n","create_parent_dirs":true,"dry_run":true}}'
+      - '{"tool":"file_write","arguments":{"path":"{{ eval.workspace }}/generated_note.md","content":"# Generated Note\n\n- Review before apply\n","create_parent_dirs":true,"dry_run":true}}'
       - "Dry run reviewed one file and did not write bytes."
+
 scenarios:
   - id: file-write-dry-run
-    tags: [tools, file_write, mutation, mock]
+    tags: [mock, examples, yaml, tools, file_write, mutation, dry-run]
     turns:
       - input: Dry-run creating a generated note.
         assert:
-          response_contains: "Dry run reviewed"
-          tool_called:
-            id: file_write
-            executed: true
-            success: true
-            result_path:
-              path: dry_run
-              eq: true
+          all:
+            - response_contains: "Dry run reviewed"
+            - tool_called:
+                id: file_write
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+                args_executed:
+                  path: path
+                  contains: "generated_note.md"
+            - tool_called:
+                id: file_write
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: file_write
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: file_write
+                result_path:
+                  path: bytes_written
+                  eq: 0

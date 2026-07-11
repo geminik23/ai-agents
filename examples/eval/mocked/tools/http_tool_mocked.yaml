@@ -2,7 +2,7 @@ name: HTTP Tool Mocked Eval
 agent: ../../../yaml/tools/http_tool.yaml
 
 # No-key mocked eval for a successful read-only HTTP request.
-# Flow: user URL -> mocked HTTP call -> fixture response -> status summary
+# Flow: fixture URL -> real HTTP tool -> local mock server -> status summary
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -16,23 +16,25 @@ fixtures:
   llm:
     mode: mock
     responses:
-      - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/v1/status","timeout_ms":2000}}'
+      - '{"tool":"http","arguments":{"method":"GET","url":"{{ mock_server.base_url }}/v1/status","timeout_ms":2000}}'
       - "The fixture API returned HTTP 200 OK and reports that fixture-api is healthy."
-  tools:
-    http:
-      success: true
-      output:
+  mock_server:
+    enabled: true
+    routes:
+      - method: GET
+        path: /v1/status
         status: 200
-        status_text: OK
         headers:
-          content-type: application/json
-        body: '{"service":"fixture-api","healthy":true}'
+          Content-Type: application/json
+        body:
+          service: fixture-api
+          healthy: true
 
 scenarios:
   - id: http-get-returns-fixture-response
     tags: [tools, http, network, fixture, mock]
     turns:
-      - input: Fetch https://api.example.test/v1/status with GET and summarize the response.
+      - input: Fetch the fixture status endpoint with GET and summarize the response.
         assert:
           all:
             - response_not_empty: true
@@ -43,7 +45,7 @@ scenarios:
                 count: 1
                 executed: true
                 success: true
-                source_in: [llm, mock]
+                source_in: [llm]
             - tool_called:
                 id: http
                 args_executed:
@@ -53,7 +55,7 @@ scenarios:
                 id: http
                 args_executed:
                   path: url
-                  eq: "https://api.example.test/v1/status"
+                  contains: "/v1/status"
             - tool_called:
                 id: http
                 result_path:

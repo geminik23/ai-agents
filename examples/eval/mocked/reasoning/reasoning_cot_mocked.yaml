@@ -2,8 +2,8 @@ name: Reasoning CoT Mocked Eval
 agent: ../../../yaml/reasoning/reasoning_cot.yaml
 
 # Mocked reasoning eval suite.
-# Verifies chain-of-thought response with visible thinking tags.
-# The mock LLM returns a response with <thinking> tags as the CoT prompt instructs.
+# Verifies CoT instructions and thinking tags are present in the actual model request.
+# Final response checks cover only the tagged output contract and answer.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -30,4 +30,15 @@ scenarios:
         assert:
           all:
             - response_not_empty: true
+            - response_contains: "<thinking>"
+            - response_contains: "</thinking>"
             - response_contains: "128"
+            - llm_request:
+                system_contains:
+                  - "wrap your reasoning in <thinking> tags"
+                  - "Then provide your final answer after the closing tag."
+                  - "Think through this step by step before answering:"
+                  - "Show your thinking process, then give your final answer."
+                user_contains: "What is 15 * 7 + 23?"
+                count: 1
+                same_request: true

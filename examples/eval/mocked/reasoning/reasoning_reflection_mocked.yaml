@@ -2,8 +2,8 @@ name: Reasoning Reflection Mocked Eval
 agent: ../../../yaml/reasoning/reasoning_reflection.yaml
 
 # Mocked reasoning eval suite.
-# Verifies reflection flow: main response + evaluator pass.
-# The evaluator LLM returns a PASS result so no retry is needed.
+# Verifies the evaluator rejects an initial response, requests one deterministic retry, and passes the improved response.
+# Request, response metadata, and observability evidence cover the main request and reflection calls.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -14,18 +14,35 @@ settings:
   retries: 0
   isolation: scenario
 
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, purpose, status]
+
 fixtures:
   llm:
     mode: mock
     responses_by_alias:
       default:
-        - "TCP/IP works in layers. For example, the IP layer routes packets while TCP ensures reliable delivery. Trade-offs include overhead vs reliability. Steps: 1. Physical layer 2. Data link 3. Network 4. Transport."
+        - "TCP/IP moves data between computers."
+        - "TCP/IP works in layers. Example: IP routes a web request across networks while TCP retransmits a lost packet. Steps: 1. IP addresses and routes packets. 2. TCP orders and verifies delivery. The reliability trade-off is added latency and protocol overhead."
       evaluator:
-        - '{"passed":true,"confidence":0.9,"criteria_results":[{"criterion":"Response includes at least one concrete example","passed":true},{"criterion":"Response addresses trade-offs or limitations","passed":true},{"criterion":"Response is structured with clear sections or steps","passed":true}]}'
+        - |-
+            1. FAIL - No concrete example is included.
+            2. FAIL - No trade-off or limitation is discussed.
+            3. FAIL - The explanation has no clear sections or steps.
+            CONFIDENCE: 0.3
+            OVERALL: FAIL
+        - |-
+            1. PASS - A lost packet is a concrete example.
+            2. PASS - Latency and protocol overhead are trade-offs.
+            3. PASS - The response uses numbered steps.
+            CONFIDENCE: 0.9
+            OVERALL: PASS
 
 scenarios:
-  - id: reflection-passes-on-first-evaluation
-    name: Reflection evaluator passes response with examples and trade-offs
+  - id: reflection-retries-after-failed-evaluation
+    name: Reflection evaluator retries and passes an improved response
     tags: [mock, examples, yaml, reasoning, reflection]
     language: en
     turns:
@@ -33,4 +50,45 @@ scenarios:
         assert:
           all:
             - response_not_empty: true
-            - response_contains: "TCP"
+            - response_contains: "lost packet"
+            - response_contains: "trade-off"
+            - response_not_contains: "moves data between computers"
+            - llm_request:
+                system_contains:
+                  - "You are a technical writing assistant."
+                  - "always include a concrete example"
+                user_contains: "Explain how TCP/IP works."
+                count: 1
+                same_request: true
+            - metadata_path:
+                path: reflection.attempts
+                eq: 2
+            - metadata_path:
+                path: reflection.final_evaluation.passed
+                eq: true
+            - metadata_path:
+                path: reflection.history
+                exists: true
+            - observability:
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                  reflection_evaluation:
+                    path: count
+                    gte: 3
+                dimension_counts:
+                  - match_dimensions:
+                      alias: evaluator
+                      purpose: reflection_evaluation
+                      status: success
+                    assert:
+                      path: count
+                      gte: 2
+                  - match_dimensions:
+                      alias: default
+                      purpose: reflection_evaluation
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

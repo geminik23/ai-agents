@@ -1,0 +1,51 @@
+name: Simple Tools Mocked Eval
+agent: ../../../yaml/basic/simple_tools.yaml
+
+# Deterministic parent coverage for the basic tool example.
+# Verifies the exact calculator expression, result, and final response without a provider key.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"calculator","arguments":{"expression":"24 * 17"}}'
+      - "24 * 17 equals exactly 408."
+
+scenarios:
+  - id: simple-tools-calculates-exact-result
+    name: Calculator executes the requested expression and returns its exact result
+    tags: [mock, examples, yaml, basic, tools, calculator]
+    language: en
+    turns:
+      - input: What is 24 * 17?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "24 * 17 equals exactly 408."
+            - tool_called:
+                id: calculator
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: calculator
+                args_executed:
+                  path: expression
+                  eq: "24 * 17"
+            - tool_called:
+                id: calculator
+                result_path:
+                  path: result
+                  eq: 408.0
+            - tool_called:
+                id: calculator
+                result_path:
+                  path: expression
+                  eq: "24 * 17"
+            - tool_not_called: datetime
+            - tool_not_called: echo

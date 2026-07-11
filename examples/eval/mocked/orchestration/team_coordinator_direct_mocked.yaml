@@ -1,0 +1,31 @@
+name: Team Coordinator Direct Response Mocked Eval
+agent: ../../../yaml/orchestration/team_coordinator.yaml
+
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Hello! I coordinate the writer, reviewer, editor, researcher, and analyst."
+
+scenarios:
+  - id: coordinator-responds-without-a-tool
+    name: Coordinator answers a simple greeting directly
+    tags: [mock, examples, yaml, orchestration, team-coordinator, direct]
+    language: en
+    turns:
+      - input: Hello, who is on your team?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "writer, reviewer, editor, researcher, and analyst"
+            - tool_not_called: pipeline_process
+            - tool_not_called: concurrent_ask
+            - tool_not_called: route_to_agent
+            - tool_not_called: group_discussion
+            - tool_not_called: handoff_conversation

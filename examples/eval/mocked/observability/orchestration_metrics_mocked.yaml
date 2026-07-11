@@ -1,0 +1,88 @@
+name: Orchestration Metrics Mocked Eval
+agent: ../../../yaml/observability/orchestration_metrics.yaml
+
+# No-key mocked eval for state-based delegate observability.
+# Verifies routing state transitions, delegated child execution, and orchestration lifecycle metrics.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/observability/orchestration_metrics_mocked.yaml \
+#     --output target/eval/mocked/observability/orchestration_metrics_mocked
+#
+# Flow: routing response -> billing transition -> billing delegate -> stay in billing_help
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true
+    track_tools: true
+    track_orchestration: true
+  aggregation:
+    dimensions: [agent, purpose, state, orchestration_pattern, status]
+  export:
+    formats: [json]
+    path: ./target/eval/mocked/observability/orchestration_metrics_mocked/observability
+    write_report: true
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Routing response assessing the invoice request."
+      - "1"
+      - "Billing specialist found the duplicate invoice charge."
+      - "0"
+
+scenarios:
+  - id: delegate-records-state-and-orchestration-metrics
+    name: Billing delegation records parent, child, state, and lifecycle dimensions
+    tags: [observability, orchestration, delegate, state, mock]
+    language: en
+    turns:
+      - input: I need help with a duplicate charge on my invoice.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Billing specialist"
+            - state: billing_help
+            - state_history_contains: billing_help
+            - orchestration:
+                type: delegate
+                agents_include: [billing]
+            - context_path:
+                path: orchestration.state
+                eq: billing_help
+            - observability:
+                purpose_counts:
+                  state_transition_evaluation:
+                    path: count
+                    gte: 1
+                  orchestration_routing:
+                    path: count
+                    gte: 2
+                dimension_counts:
+                  - match_dimensions:
+                      state: routing
+                      purpose: state_transition_evaluation
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      purpose: orchestration_routing
+                      orchestration_pattern: delegate
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      agent: BillingSpecialist
+                      purpose: main_response
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

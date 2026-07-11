@@ -17,10 +17,13 @@ use crate::assertion::{
     Assertion, AssertionEvalContext, AssertionOutcome, AssertionResultDetail, evaluate_assertion,
 };
 use crate::compatibility::suite_from_jsonl;
-use crate::evidence::{ApprovalEvidence, collect_turn_evidence, relationship_snapshot};
+use crate::evidence::{
+    ApprovalEvidence, LlmRequestEvidence, collect_turn_evidence, relationship_snapshot,
+};
 use crate::fixtures::{
-    LlmFixtureMode, RecordingToolLog, build_approval_handler, build_llm_registry,
-    build_tool_registry, resolve_fixture_context, start_mock_server,
+    AttemptFixtureContext, LlmFixtureMode, RecordingToolLog, WorkspacePolicyFixtureConfig,
+    build_approval_handler, build_llm_registry, build_tool_registry, resolve_fixture_context,
+    start_mock_server,
 };
 use crate::judge::{JudgeConfig, JudgeResolver};
 use crate::metrics::compute_metrics;
@@ -32,10 +35,41 @@ use crate::suite::{
 };
 use crate::{EvalError, Result};
 
-/// Eval hook that records executor-level tool evidence, including non-executed attempts.
-struct EvalToolRecordHooks {
+/// Eval hook that records LLM requests, tools, and resolved approvals.
+struct EvalRecordHooks {
     tool_log: RecordingToolLog,
     approval_log: RecordingApprovalLog,
+    llm_log: RecordingLlmLog,
+}
+
+#[derive(Clone, Default)]
+struct RecordingLlmLog {
+    records: Arc<Mutex<Vec<LlmRequestEvidence>>>,
+}
+
+impl RecordingLlmLog {
+    fn len(&self) -> usize {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    fn push_messages(&self, messages: &[ai_agents_core::ChatMessage]) {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(LlmRequestEvidence::from_messages(messages));
+    }
+
+    fn records_since(&self, start: usize) -> Vec<LlmRequestEvidence> {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(start..)
+            .unwrap_or_default()
+            .to_vec()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -69,7 +103,11 @@ impl RecordingApprovalLog {
 }
 
 #[async_trait]
-impl AgentHooks for EvalToolRecordHooks {
+impl AgentHooks for EvalRecordHooks {
+    async fn on_llm_start(&self, messages: &[ai_agents_core::ChatMessage]) {
+        self.llm_log.push_messages(messages);
+    }
+
     async fn on_tool_execution_record(&self, record: &ai_agents_core::ToolExecutionRecord) {
         self.tool_log.push_executor_record(record);
     }
@@ -420,17 +458,12 @@ impl EvalRunner {
         attempt: u32,
     ) -> Result<AttemptResult> {
         let start = Instant::now();
-        let workspace = std::env::temp_dir().join(format!(
-            "ai_agents_eval_{}_{}_{}",
-            scenario.id,
-            attempt,
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&workspace)?;
         let _env_guard = EnvGuard::apply(&scenario.env)?;
         let mock_server = start_mock_server(self.suite.fixtures.mock_server.as_ref()).await?;
+        let attempt_context = AttemptFixtureContext::create(mock_server.as_ref())?;
         let tool_log = RecordingToolLog::new();
         let approval_log = RecordingApprovalLog::default();
+        let llm_log = RecordingLlmLog::default();
         let approval_handler = self
             .suite
             .fixtures
@@ -441,26 +474,29 @@ impl EvalRunner {
             .build_agent(
                 agent_path,
                 base_dir,
-                &workspace,
+                &attempt_context,
                 tool_log.clone(),
                 approval_log.clone(),
+                llm_log.clone(),
                 approval_handler.clone(),
             )
             .await?;
-        apply_base_context(
-            &agent,
-            &self.suite,
-            base_dir,
-            scenario,
-            mock_server.as_ref(),
-        )?;
+        apply_base_context(&agent, &self.suite, base_dir, scenario, &attempt_context)?;
         let mut turns = Vec::new();
         let mut status = ScenarioStatus::Passed;
 
         if !scenario.turns.is_empty() {
             for (idx, turn) in scenario.turns.iter().enumerate() {
                 let turn_execution = self
-                    .run_turn(&agent, scenario, turn, idx, &tool_log, &approval_log)
+                    .run_turn(
+                        &agent,
+                        scenario,
+                        turn,
+                        idx,
+                        &tool_log,
+                        &approval_log,
+                        &llm_log,
+                    )
                     .await?;
                 let turn_failed = turn_execution
                     .result
@@ -483,13 +519,7 @@ impl EvalRunner {
                     && idx + 1 < scenario.turns.len()
                 {
                     agent.reset().await?;
-                    apply_base_context(
-                        &agent,
-                        &self.suite,
-                        base_dir,
-                        scenario,
-                        mock_server.as_ref(),
-                    )?;
+                    apply_base_context(&agent, &self.suite, base_dir, scenario, &attempt_context)?;
                 }
             }
         }
@@ -503,7 +533,15 @@ impl EvalRunner {
                     for turn in &run.turns {
                         let idx = turns.len();
                         let turn_execution = self
-                            .run_turn(&agent, scenario, turn, idx, &tool_log, &approval_log)
+                            .run_turn(
+                                &agent,
+                                scenario,
+                                turn,
+                                idx,
+                                &tool_log,
+                                &approval_log,
+                                &llm_log,
+                            )
                             .await?;
                         let turn_failed = turn_execution
                             .result
@@ -532,8 +570,8 @@ impl EvalRunner {
                 ScenarioStep::ResetAgent(reset) => {
                     if let Some(options) = reset_options(reset) {
                         if options.delete_persistence || !options.preserve_storage {
-                            let _ = std::fs::remove_dir_all(&workspace);
-                            std::fs::create_dir_all(&workspace)?;
+                            let _ = std::fs::remove_dir_all(&attempt_context.workspace);
+                            std::fs::create_dir_all(&attempt_context.workspace)?;
                         }
                         let preserved_actor = options
                             .preserve_actor_id
@@ -548,9 +586,10 @@ impl EvalRunner {
                                 .build_agent(
                                     agent_path,
                                     base_dir,
-                                    &workspace,
+                                    &attempt_context,
                                     tool_log.clone(),
                                     approval_log.clone(),
+                                    llm_log.clone(),
                                     approval_handler.clone(),
                                 )
                                 .await?;
@@ -561,8 +600,10 @@ impl EvalRunner {
                                 &self.suite,
                                 base_dir,
                                 scenario,
-                                mock_server.as_ref(),
+                                &attempt_context,
                             )?;
+                        } else {
+                            apply_context_map(&agent, attempt_context.runtime_context())?;
                         }
                         if let Some(actor) = preserved_actor.or_else(|| scenario.actor.clone()) {
                             agent.set_actor_id(&actor)?;
@@ -603,26 +644,34 @@ impl EvalRunner {
         &self,
         agent_path: &Path,
         base_dir: &Path,
-        workspace: &Path,
+        attempt_context: &AttemptFixtureContext,
         tool_log: RecordingToolLog,
         approval_log: RecordingApprovalLog,
+        llm_log: RecordingLlmLog,
         approval_handler: Option<Arc<dyn ai_agents_hitl::ApprovalHandler>>,
     ) -> Result<RuntimeAgent> {
         let content = std::fs::read_to_string(agent_path)?;
         let mut spec: AgentSpec = serde_yaml::from_str(&content)?;
         apply_eval_llm_settings(&mut spec, &self.suite.settings);
+        isolate_spec_storage(&mut spec, attempt_context);
+        apply_workspace_policy(
+            &mut spec,
+            self.suite.fixtures.workspace_policy.as_ref(),
+            attempt_context,
+        )?;
         spec.validate()
             .map_err(|error| EvalError::Config(error.to_string()))?;
-        let (llm_registry, _judge_llm) =
-            build_llm_registry(&spec, &self.suite.fixtures.llm, base_dir)?;
+        let llm_fixture = attempt_context.interpolate_llm_fixture(&self.suite.fixtures.llm)?;
+        let (llm_registry, _judge_llm) = build_llm_registry(&spec, &llm_fixture, base_dir)?;
         let tool_registry = build_tool_registry(&self.suite.fixtures, tool_log.clone())?;
-        let mut builder = AgentBuilder::from_yaml_file(agent_path)
-            .map_err(|error| EvalError::Config(error.to_string()))?
+        let agent_base_dir = agent_path.parent().unwrap_or_else(|| Path::new("."));
+        let mut builder = AgentBuilder::from_spec_with_base_dir(spec, agent_base_dir)
             .llm_registry(llm_registry)
             .tools(tool_registry)
-            .hooks(Arc::new(EvalToolRecordHooks {
+            .hooks(Arc::new(EvalRecordHooks {
                 tool_log,
                 approval_log,
+                llm_log,
             }))
             .auto_configure_features()
             .map_err(|error| EvalError::Config(error.to_string()))?
@@ -632,11 +681,6 @@ impl EvalRunner {
 
         if let Some(approval_handler) = approval_handler {
             builder = builder.approval_handler(approval_handler);
-        }
-
-        let storage_override = isolated_storage_config(&spec, workspace);
-        if let Some(storage) = storage_override {
-            builder = builder.storage_config(storage);
         }
 
         if let Some(observability) = self.observability_config(base_dir)? {
@@ -692,6 +736,7 @@ impl EvalRunner {
         index: usize,
         tool_log: &RecordingToolLog,
         approval_log: &RecordingApprovalLog,
+        llm_log: &RecordingLlmLog,
     ) -> Result<TurnExecution> {
         apply_context_value(agent, &turn_runtime_context(turn))?;
         if let Some(actor) = &turn.actor {
@@ -700,6 +745,7 @@ impl EvalRunner {
         let before_relationship = relationship_snapshot(agent);
         let tool_start = tool_log.len();
         let approval_start = approval_log.len();
+        let llm_start = llm_log.len();
         let start = Instant::now();
         let timeout_ms = turn
             .timeout_ms
@@ -732,6 +778,7 @@ impl EvalRunner {
             before_relationship,
         );
         evidence.approvals = approval_log.records_since(approval_start);
+        evidence.llm_requests = llm_log.records_since(llm_start);
         let judge = self.build_judge(agent);
         let mut assertion_results = if let Some(assertion) = &turn.assertions {
             match evaluate_assertion(
@@ -962,19 +1009,88 @@ fn assertion_uses_response(assertion: &Assertion) -> bool {
             .is_some_and(assertion_uses_response)
 }
 
-fn isolated_storage_config(spec: &AgentSpec, workspace: &Path) -> Option<StorageConfig> {
-    if spec.storage.is_none() {
-        return None;
+fn apply_workspace_policy(
+    spec: &mut AgentSpec,
+    config: Option<&WorkspacePolicyFixtureConfig>,
+    context: &AttemptFixtureContext,
+) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if !context.workspace.is_absolute() {
+        return Err(EvalError::Config(
+            "eval attempt workspace must be absolute".to_string(),
+        ));
     }
-    match &spec.storage {
-        StorageConfig::Sqlite(_) => Some(StorageConfig::sqlite(
-            workspace.join("sessions.db").display().to_string(),
-        )),
-        StorageConfig::File(_) => Some(StorageConfig::file(
-            workspace.join("sessions").display().to_string(),
-        )),
-        StorageConfig::Redis(_) => None,
-        StorageConfig::None => None,
+
+    for tool_id in config.read_tools.iter().chain(&config.write_tools) {
+        if !spec.tool_security.tools.contains_key(tool_id) {
+            return Err(EvalError::Config(format!(
+                "fixtures.workspace_policy names tool '{}' without an existing tool policy",
+                tool_id
+            )));
+        }
+    }
+
+    let workspace = context.workspace.display().to_string();
+    for tool_id in &config.read_tools {
+        spec.tool_security
+            .tools
+            .get_mut(tool_id)
+            .expect("workspace policy tool was validated")
+            .read_paths
+            .push(workspace.clone());
+    }
+    for tool_id in &config.write_tools {
+        spec.tool_security
+            .tools
+            .get_mut(tool_id)
+            .expect("workspace policy tool was validated")
+            .write_paths
+            .push(workspace.clone());
+    }
+    Ok(())
+}
+
+fn isolate_spec_storage(spec: &mut AgentSpec, context: &AttemptFixtureContext) {
+    isolate_storage_config(
+        &mut spec.storage,
+        context,
+        "parent-storage",
+        "parent-storage.db",
+    );
+    if let Some(shared_storage) = spec
+        .spawner
+        .as_mut()
+        .and_then(|spawner| spawner.shared_storage.as_mut())
+    {
+        isolate_storage_config(
+            shared_storage,
+            context,
+            "spawner-shared-storage",
+            "spawner-shared-storage.db",
+        );
+    }
+}
+
+fn isolate_storage_config(
+    storage: &mut StorageConfig,
+    context: &AttemptFixtureContext,
+    file_name: &str,
+    sqlite_name: &str,
+) {
+    match storage {
+        StorageConfig::File(config) => {
+            config.path = context.workspace.join(file_name).display().to_string();
+        }
+        StorageConfig::Sqlite(config) => {
+            config.path = context.workspace.join(sqlite_name).display().to_string();
+        }
+        StorageConfig::Redis(config) => {
+            let prefix = config.prefix.as_deref().unwrap_or("agent:");
+            config.prefix = Some(format!("{}eval:{}:", prefix, context.isolation_id));
+        }
+        StorageConfig::None => {}
     }
 }
 
@@ -1000,12 +1116,10 @@ fn apply_base_context(
     suite: &EvalSuite,
     base_dir: &Path,
     scenario: &Scenario,
-    mock_server: Option<&crate::fixtures::MockServerHandle>,
+    attempt_context: &AttemptFixtureContext,
 ) -> Result<()> {
-    if let Some(mock_server) = mock_server {
-        apply_context_map(agent, mock_server.context())?;
-    }
     apply_context_map(agent, resolve_fixture_context(&suite.fixtures, base_dir)?)?;
+    apply_context_map(agent, attempt_context.runtime_context())?;
     apply_context_value(agent, &scenario.context)?;
     if let Some(actor) = &scenario.actor {
         agent.set_actor_id(actor)?;
@@ -1145,6 +1259,298 @@ impl Drop for EnvGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_isolation_rewrites_parent_and_spawner_backends() {
+        let context = AttemptFixtureContext {
+            isolation_id: "attempt-a".to_string(),
+            workspace: PathBuf::from("/tmp/eval-attempt-a"),
+            mock_server_base_url: None,
+        };
+        let mut file_spec: AgentSpec = serde_yaml::from_str(
+            r#"
+name: FileAgent
+system_prompt: test
+storage: { type: file, path: ./parent }
+spawner:
+  shared_storage: { type: sqlite, path: ./shared.db, table: shared_sessions }
+"#,
+        )
+        .unwrap();
+        isolate_spec_storage(&mut file_spec, &context);
+        assert_eq!(
+            file_spec.storage.get_path(),
+            Some("/tmp/eval-attempt-a/parent-storage")
+        );
+        let shared = file_spec
+            .spawner
+            .as_ref()
+            .unwrap()
+            .shared_storage
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            shared.get_path(),
+            Some("/tmp/eval-attempt-a/spawner-shared-storage.db")
+        );
+        assert_eq!(shared.get_table(), Some("shared_sessions"));
+
+        let mut redis_spec: AgentSpec = serde_yaml::from_str(
+            r#"
+name: RedisAgent
+system_prompt: test
+storage: { type: redis, url: redis://localhost, prefix: "parent:" }
+spawner:
+  shared_storage: { type: redis, url: redis://localhost }
+"#,
+        )
+        .unwrap();
+        isolate_spec_storage(&mut redis_spec, &context);
+        assert_eq!(redis_spec.storage.get_prefix(), "parent:eval:attempt-a:");
+        assert_eq!(
+            redis_spec
+                .spawner
+                .as_ref()
+                .unwrap()
+                .shared_storage
+                .as_ref()
+                .unwrap()
+                .get_prefix(),
+            "agent:eval:attempt-a:"
+        );
+
+        let other_context = AttemptFixtureContext {
+            isolation_id: "attempt-b".to_string(),
+            workspace: PathBuf::from("/tmp/eval-attempt-b"),
+            mock_server_base_url: None,
+        };
+        let mut other_redis: AgentSpec = serde_yaml::from_str(
+            r#"
+name: RedisAgent
+system_prompt: test
+storage: { type: redis, url: redis://localhost, prefix: "parent:" }
+"#,
+        )
+        .unwrap();
+        isolate_spec_storage(&mut other_redis, &other_context);
+        assert_ne!(
+            redis_spec.storage.get_prefix(),
+            other_redis.storage.get_prefix()
+        );
+    }
+
+    #[test]
+    fn workspace_policy_is_narrow_and_isolated_per_attempt() {
+        let source: AgentSpec = serde_yaml::from_str(
+            r#"
+name: PolicyAgent
+system_prompt: test
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    file_read:
+      read_paths: [./source]
+      blocked_paths: [./blocked]
+    file_write:
+      write_paths: [./output]
+      blocked_paths: [./blocked]
+    grep:
+      read_paths: [./repository]
+"#,
+        )
+        .unwrap();
+        let config = WorkspacePolicyFixtureConfig {
+            read_tools: vec!["file_read".to_string()],
+            write_tools: vec!["file_write".to_string()],
+        };
+        let first_context = AttemptFixtureContext {
+            isolation_id: "attempt-a".to_string(),
+            workspace: PathBuf::from("/tmp/eval-attempt-a"),
+            mock_server_base_url: None,
+        };
+        let second_context = AttemptFixtureContext {
+            isolation_id: "attempt-b".to_string(),
+            workspace: PathBuf::from("/tmp/eval-attempt-b"),
+            mock_server_base_url: None,
+        };
+
+        let mut first = source.clone();
+        apply_workspace_policy(&mut first, Some(&config), &first_context).unwrap();
+        let mut second = source.clone();
+        apply_workspace_policy(&mut second, Some(&config), &second_context).unwrap();
+
+        assert!(first.tool_security.fail_closed);
+        assert_eq!(
+            first.tool_security.tools["file_read"].read_paths,
+            vec!["./source", "/tmp/eval-attempt-a"]
+        );
+        assert_eq!(
+            first.tool_security.tools["file_write"].write_paths,
+            vec!["./output", "/tmp/eval-attempt-a"]
+        );
+        assert_eq!(
+            first.tool_security.tools["file_read"].blocked_paths,
+            vec!["./blocked"]
+        );
+        assert_eq!(
+            first.tool_security.tools["file_write"].blocked_paths,
+            vec!["./blocked"]
+        );
+        assert_eq!(
+            first.tool_security.tools["grep"].read_paths,
+            vec!["./repository"]
+        );
+        assert_eq!(
+            second.tool_security.tools["file_read"].read_paths,
+            vec!["./source", "/tmp/eval-attempt-b"]
+        );
+        assert_eq!(
+            source.tool_security.tools["file_read"].read_paths,
+            vec!["./source"]
+        );
+        assert_eq!(
+            source.tool_security.tools["file_write"].write_paths,
+            vec!["./output"]
+        );
+    }
+
+    #[test]
+    fn workspace_policy_rejects_unknown_tools_without_partial_mutation() {
+        let mut spec: AgentSpec = serde_yaml::from_str(
+            r#"
+name: PolicyAgent
+system_prompt: test
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    file_read:
+      read_paths: [./source]
+"#,
+        )
+        .unwrap();
+        let original = spec.tool_security.tools["file_read"].read_paths.clone();
+        let config = WorkspacePolicyFixtureConfig {
+            read_tools: vec!["file_read".to_string(), "missing_tool".to_string()],
+            write_tools: Vec::new(),
+        };
+        let context = AttemptFixtureContext {
+            isolation_id: "attempt-a".to_string(),
+            workspace: PathBuf::from("/tmp/eval-attempt-a"),
+            mock_server_base_url: None,
+        };
+
+        let error = apply_workspace_policy(&mut spec, Some(&config), &context).unwrap_err();
+
+        assert!(error.to_string().contains("missing_tool"));
+        assert!(
+            error
+                .to_string()
+                .contains("without an existing tool policy")
+        );
+        assert_eq!(spec.tool_security.tools["file_read"].read_paths, original);
+        assert!(spec.tool_security.fail_closed);
+    }
+
+    #[tokio::test]
+    async fn generated_attempt_context_has_stable_reset_precedence() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_attempt_context_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_test_agent(&dir);
+        let suite_path = dir.join("suite.yaml");
+        std::fs::write(
+            &suite_path,
+            r#"
+name: Attempt Context
+agent: agent.yaml
+fixtures:
+  context:
+    eval: { workspace: fixture-value }
+    mock_server: { base_url: fixture-value }
+    fixture_only: true
+  llm:
+    mode: mock
+    responses: [ok]
+scenarios:
+  - id: context
+    context: { scenario_only: true, precedence: scenario }
+    turns:
+      - input: test
+        context: { precedence: turn }
+"#,
+        )
+        .unwrap();
+        let runner = EvalRunner::from_file(
+            &suite_path,
+            EvalRunnerOptions {
+                output: dir.join("out"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let attempt_context = AttemptFixtureContext {
+            isolation_id: "stable-attempt".to_string(),
+            workspace: dir
+                .join("workspace")
+                .canonicalize()
+                .unwrap_or_else(|_| dir.join("workspace")),
+            mock_server_base_url: Some("http://127.0.0.1:40000".to_string()),
+        };
+        std::fs::create_dir_all(&attempt_context.workspace).unwrap();
+        let scenario = &runner.suite.scenarios[0];
+        let tool_log = RecordingToolLog::new();
+        let approval_log = RecordingApprovalLog::default();
+        let llm_log = RecordingLlmLog::default();
+        let first = runner
+            .build_agent(
+                &dir.join("agent.yaml"),
+                &dir,
+                &attempt_context,
+                tool_log.clone(),
+                approval_log.clone(),
+                llm_log.clone(),
+                None,
+            )
+            .await
+            .unwrap();
+        apply_base_context(&first, &runner.suite, &dir, scenario, &attempt_context).unwrap();
+        let first_context = first.get_context();
+        assert_eq!(
+            first_context["eval"]["workspace"],
+            json!(attempt_context.workspace.display().to_string())
+        );
+        assert_eq!(
+            first_context["mock_server"]["base_url"],
+            "http://127.0.0.1:40000"
+        );
+        assert_eq!(first_context["precedence"], "scenario");
+        apply_context_value(&first, &turn_runtime_context(&scenario.turns[0])).unwrap();
+        assert_eq!(first.get_context()["precedence"], "turn");
+
+        let reset = runner
+            .build_agent(
+                &dir.join("agent.yaml"),
+                &dir,
+                &attempt_context,
+                tool_log,
+                approval_log,
+                llm_log,
+                None,
+            )
+            .await
+            .unwrap();
+        apply_base_context(&reset, &runner.suite, &dir, scenario, &attempt_context).unwrap();
+        assert_eq!(reset.get_context()["eval"], first_context["eval"]);
+        assert_eq!(
+            reset.get_context()["mock_server"],
+            first_context["mock_server"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[tokio::test]
     async fn streaming_error_retains_partial_content_and_consumes_until_done() {
@@ -1302,6 +1708,129 @@ scenarios:
                             .iter()
                             .any(|detail| detail.assertion == "expect_error" && !detail.passed)
                     );
+                    let _ = std::fs::remove_dir_all(dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn captures_composed_llm_requests_per_turn_across_reset() {
+        std::thread::Builder::new()
+            .name("eval-llm-evidence-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let dir = std::env::temp_dir().join(format!(
+                        "ai_agents_eval_llm_evidence_test_{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(
+                        dir.join("agent.yaml"),
+                        r#"
+name: EvidenceAgent
+system_prompt: "Base instruction marker."
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+persona:
+  identity:
+    name: Evidence Guide
+    role: Prompt Inspector
+reasoning:
+  mode: cot
+  output: tagged
+"#,
+                    )
+                    .unwrap();
+                    let result = run_test_suite(
+                        &dir,
+                        "llm-evidence.yaml",
+                        r#"
+name: LLM Evidence
+agent: agent.yaml
+settings:
+  redact_outputs: false
+fixtures:
+  llm:
+    mode: mock
+    responses: [first answer, second answer]
+scenarios:
+  - id: composed
+    steps:
+      - !run
+        turns:
+          - input: first question
+            assert:
+              llm_request:
+                system_contains:
+                  - "You are Evidence Guide, Prompt Inspector."
+                  - "Base instruction marker."
+                  - "Think through this step by step"
+                  - "<instruction>"
+                user_contains: first question
+                count: 1
+                same_request: true
+          - input: second question
+            assert:
+              llm_request:
+                user_contains: [first question, second question]
+                assistant_contains: first answer
+                count: 1
+                same_request: true
+      - !reset_agent true
+      - !run
+        turns:
+          - input: after reset
+            assert:
+              llm_request:
+                system_contains: "Base instruction marker."
+                user_contains: after reset
+                count: 1
+                same_request: true
+"#,
+                    )
+                    .await;
+
+                    assert_eq!(result.passed, 1);
+                    let turns = &result.scenarios[0].attempts[0].turns;
+                    assert_eq!(turns.len(), 3);
+                    assert!(
+                        turns
+                            .iter()
+                            .all(|turn| turn.evidence.llm_requests.len() == 1)
+                    );
+                    let second_messages = &turns[1].evidence.llm_requests[0].messages;
+                    assert!(second_messages.iter().any(|message| {
+                        message.role == ai_agents_core::Role::Assistant
+                            && message.content.contains("first answer")
+                    }));
+                    let reset_messages = &turns[2].evidence.llm_requests[0].messages;
+                    assert!(
+                        reset_messages
+                            .iter()
+                            .all(|message| !message.content.contains("first question"))
+                    );
+                    assert!(
+                        reset_messages
+                            .iter()
+                            .all(|message| !message.content.contains("first answer"))
+                    );
+
+                    let serialized = serde_json::to_string(&result).unwrap();
+                    let serialized_value: Value = serde_json::from_str(&serialized).unwrap();
+                    assert!(
+                        serialized_value["scenarios"][0]["attempts"][0]["turns"][0]
+                            .get("evidence")
+                            .is_none()
+                    );
+                    assert!(!serialized.contains("Base instruction marker"));
+                    assert!(!serialized.contains("Evidence Guide"));
+                    assert!(!serialized.contains("Think through this step by step"));
                     let _ = std::fs::remove_dir_all(dir);
                 });
             })

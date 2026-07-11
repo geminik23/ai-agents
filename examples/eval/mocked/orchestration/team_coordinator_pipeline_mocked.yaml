@@ -1,0 +1,49 @@
+name: Team Coordinator Pipeline Mocked Eval
+agent: ../../../yaml/orchestration/team_coordinator.yaml
+
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - '{"tool":"pipeline_process","arguments":{"input":"Write a short blog post about Rust async programming.","stages":["writer","reviewer","editor"]}}'
+        - "Writer draft: Rust async programming enables efficient concurrent applications."
+        - "Reviewer feedback: explain executors and keep the conclusion concise."
+        - "Editor final: Rust async programming uses futures and executors to build efficient concurrent applications."
+        - "The polished Rust async programming post is ready."
+
+scenarios:
+  - id: coordinator-runs-content-pipeline
+    name: Coordinator processes content through writer, reviewer, and editor
+    tags: [mock, examples, yaml, orchestration, team-coordinator, pipeline]
+    language: en
+    turns:
+      - input: Write a short blog post about Rust async programming.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "polished Rust async programming post"
+            - tool_called:
+                id: pipeline_process
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: stages
+                  contains: editor
+                result_path:
+                  path: response
+                  contains: "Editor final"
+            - tool_called:
+                id: pipeline_process
+                args_executed:
+                  path: input
+                  eq: "Write a short blog post about Rust async programming."
+                result_path:
+                  path: stages
+                  exists: true

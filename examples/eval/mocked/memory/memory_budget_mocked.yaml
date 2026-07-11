@@ -13,6 +13,11 @@ settings:
   retries: 0
   isolation: scenario
 
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, status]
+
 fixtures:
   llm:
     mode: mock
@@ -52,8 +57,45 @@ scenarios:
           all:
             - response_not_empty: true
             - response_contains: "observability"
+            - llm_request:
+                user_contains:
+                  - "Tell me about microservices."
+                  - "Tell me about CI/CD pipelines."
+                  - "Tell me about observability tools."
+                assistant_contains:
+                  - "Turn one response about microservices."
+                  - "Turn three response about CI/CD pipelines."
+                same_request: true
+                count: 1
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      alias: router
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      alias: default
+                      status: success
+                    assert:
+                      path: count
+                      gte: 4
       - input: What did we discuss earlier?
         assert:
           all:
             - response_not_empty: true
             - response_contains: "compression"
+            - llm_request:
+                system_contains:
+                  - "[Previous conversation summary]"
+                  - "Summary: the user discussed microservices, Kubernetes, CI/CD, and observability."
+                user_contains:
+                  - "Tell me about CI/CD pipelines."
+                  - "Tell me about observability tools."
+                  - "What did we discuss earlier?"
+                assistant_contains:
+                  - "Turn three response about CI/CD pipelines."
+                  - "Turn four response about observability tools."
+                same_request: true
+                count: 1

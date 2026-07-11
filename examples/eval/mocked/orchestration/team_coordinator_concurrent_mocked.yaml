@@ -1,0 +1,48 @@
+name: Team Coordinator Concurrent Mocked Eval
+agent: ../../../yaml/orchestration/team_coordinator.yaml
+
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - '{"tool":"concurrent_ask","arguments":{"question":"What are the pros and cons of microservices?","agents":["researcher","analyst"],"aggregation":"all"}}'
+        - "Perspective one: microservices improve independent deployment but add operational complexity."
+        - "Perspective two: microservices scale teams but require robust observability and networking."
+        - "The specialists identified independent scaling and deployment as benefits, with operational complexity as the main cost."
+
+scenarios:
+  - id: coordinator-asks-specialists-concurrently
+    name: Coordinator asks researcher and analyst for parallel perspectives
+    tags: [mock, examples, yaml, orchestration, team-coordinator, concurrent]
+    language: en
+    turns:
+      - input: What are the pros and cons of microservices?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "operational complexity"
+            - tool_called:
+                id: concurrent_ask
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: agents
+                  contains: researcher
+                result_path:
+                  path: response
+                  contains: "**researcher**"
+            - tool_called:
+                id: concurrent_ask
+                args_executed:
+                  path: aggregation
+                  eq: all
+                result_path:
+                  path: agent_results
+                  exists: true

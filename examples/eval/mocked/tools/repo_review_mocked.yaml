@@ -1,0 +1,108 @@
+name: Repo Review Mocked Eval
+agent: ../../../yaml/tools/repo_review.yaml
+
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"git_status","arguments":{"path":".","include_untracked":true,"max_results":20}}'
+      - '{"tool":"git_diff","arguments":{"path":".","staged":false,"paths":["examples/yaml/tools/repo_review.yaml"],"max_output_chars":4000}}'
+      - "The read-only review found one unstaged change in examples/yaml/tools/repo_review.yaml. The patch adds todo to the granted tools and does not modify repository state."
+  tools:
+    git_status:
+      success: true
+      output:
+        branch: main
+        staged: []
+        unstaged:
+          - path: examples/yaml/tools/repo_review.yaml
+            status: M
+        untracked: []
+        count: 1
+        truncated: false
+    git_diff:
+      success: true
+      output:
+        staged: false
+        paths:
+          - examples/yaml/tools/repo_review.yaml
+        summary:
+          - "examples/yaml/tools/repo_review.yaml | 1 +"
+        diff: |-
+          diff --git a/examples/yaml/tools/repo_review.yaml b/examples/yaml/tools/repo_review.yaml
+          --- a/examples/yaml/tools/repo_review.yaml
+          +++ b/examples/yaml/tools/repo_review.yaml
+          @@ -24,0 +25 @@ tools:
+          +  - todo
+        truncated: false
+
+scenarios:
+  - id: repo-review-inspects-fixture-status-and-diff
+    name: Mocked VCS evidence supports a safe structural review
+    tags: [tools, git, read-only, fixture, safety, mock]
+    language: en
+    turns:
+      - input: Review the current status and exact diff, then summarize affected paths without modifying anything.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "examples/yaml/tools/repo_review.yaml"
+            - response_contains: "adds todo"
+            - response_contains: "does not modify repository state"
+            - response_not_contains:
+                - "I modified"
+                - "I wrote"
+                - "I committed"
+            - tool_called:
+                id: git_status
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+            - tool_called:
+                id: git_status
+                args_executed:
+                  path: path
+                  eq: "."
+            - tool_called:
+                id: git_status
+                result_path:
+                  path: count
+                  eq: 1
+            - tool_called:
+                id: git_status
+                result_path:
+                  path: truncated
+                  eq: false
+            - tool_called:
+                id: git_diff
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+            - tool_called:
+                id: git_diff
+                args_executed:
+                  path: staged
+                  eq: false
+            - tool_called:
+                id: git_diff
+                result_path:
+                  path: diff
+                  contains: "+  - todo"
+            - tool_called:
+                id: git_diff
+                result_path:
+                  path: truncated
+                  eq: false
+            - tool_not_called: file_read
+            - tool_not_called: todo
+            - tool_not_called: command
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

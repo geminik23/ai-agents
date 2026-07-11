@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use ai_agents_core::{ChatMessage, Role};
 use ai_agents_hitl::{ApprovalRequest, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger};
 use ai_agents_observability::ObservabilityReport;
 use ai_agents_runtime::RuntimeAgent;
@@ -308,6 +309,38 @@ fn apply_argument_changes(original: &Value, changes: &HashMap<String, Value>) ->
     }
 }
 
+/// One message sent as part of an LLM request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmMessageEvidence {
+    /// Role assigned to the message.
+    pub role: Role,
+    /// Complete message content retained only for in-memory assertions.
+    #[serde(default, skip_serializing)]
+    pub content: String,
+}
+
+/// One complete message list supplied to an LLM call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmRequestEvidence {
+    /// Messages captured together by one LLM start hook invocation.
+    pub messages: Vec<LlmMessageEvidence>,
+}
+
+impl LlmRequestEvidence {
+    /// Copy a hook message slice while preserving its request boundary.
+    pub fn from_messages(messages: &[ChatMessage]) -> Self {
+        Self {
+            messages: messages
+                .iter()
+                .map(|message| LlmMessageEvidence {
+                    role: message.role,
+                    content: message.content.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Full assertion-time evidence collected after a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEvidence {
@@ -324,6 +357,9 @@ pub struct TurnEvidence {
     /// Fully resolved approval requests recorded during this turn.
     #[serde(default)]
     pub approvals: Vec<ApprovalEvidence>,
+    /// Complete LLM requests retained only for in-memory assertions.
+    #[serde(default, skip_serializing)]
+    pub llm_requests: Vec<LlmRequestEvidence>,
     /// Skill evidence for this turn, if available.
     pub skill: Option<SkillEvidence>,
     /// Expected disambiguation status or evidence.
@@ -391,6 +427,7 @@ pub fn collect_turn_evidence(
         context,
         tool_executions: tool_log.records_since(tool_start_index),
         approvals: Vec::new(),
+        llm_requests: Vec::new(),
         skill,
         disambiguation,
         facts,
@@ -530,6 +567,24 @@ fn collect_persona(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn llm_request_preserves_roles_and_keeps_content_in_memory() {
+        let evidence = LlmRequestEvidence::from_messages(&[
+            ChatMessage::system("persona and reasoning prompt"),
+            ChatMessage::user("private user history"),
+            ChatMessage::assistant("private assistant history"),
+        ]);
+
+        assert_eq!(evidence.messages.len(), 3);
+        assert_eq!(evidence.messages[0].role, Role::System);
+        assert_eq!(evidence.messages[1].content, "private user history");
+
+        let serialized = serde_json::to_string(&evidence).unwrap();
+        assert!(!serialized.contains("persona and reasoning prompt"));
+        assert!(!serialized.contains("private user history"));
+        assert!(!serialized.contains("private assistant history"));
+    }
 
     #[test]
     fn normalizes_modified_approval_and_keeps_sensitive_values_in_memory() {

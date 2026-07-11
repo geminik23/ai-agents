@@ -1,3 +1,4 @@
+use ai_agents_core::Role;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -47,6 +48,9 @@ pub struct Assertion {
     /// Tool call assertion in string or object form.
     #[serde(default)]
     pub tool_called: Option<ToolCalledAssertion>,
+    /// LLM request assertion over captured message roles and content.
+    #[serde(default, alias = "llm_messages")]
+    pub llm_request: Option<LlmRequestAssertion>,
     /// Approval request assertion with optional trigger and result filters.
     #[serde(default)]
     pub approval_requested: Option<ApprovalAssertion>,
@@ -155,6 +159,35 @@ pub struct ToolCalledObject {
     /// Path assertion over parsed tool output.
     #[serde(default)]
     pub result_path: Option<PathAssertion>,
+}
+
+/// Filters and counts for matching complete LLM requests.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct LlmRequestAssertion {
+    /// Required substrings in system messages.
+    #[serde(default)]
+    pub system_contains: Option<StringList>,
+    /// Required substrings in user messages.
+    #[serde(default)]
+    pub user_contains: Option<StringList>,
+    /// Required substrings in assistant messages.
+    #[serde(default)]
+    pub assistant_contains: Option<StringList>,
+    /// Required substrings in messages of any role.
+    #[serde(default)]
+    pub any_contains: Option<StringList>,
+    /// Exact number of matching requests required.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Minimum number of matching requests required.
+    #[serde(default)]
+    pub count_gte: Option<usize>,
+    /// Maximum number of matching requests required.
+    #[serde(default)]
+    pub count_lte: Option<usize>,
+    /// Whether all role checks must be satisfied by the same request.
+    #[serde(default)]
+    pub same_request: Option<bool>,
 }
 
 /// Boolean or object form for approval assertions.
@@ -659,6 +692,9 @@ async fn evaluate_simple(
     if let Some(tool) = &assertion.tool_called {
         evaluate_tool_called(tool, evidence, details);
     }
+    if let Some(llm_request) = &assertion.llm_request {
+        evaluate_llm_request(llm_request, evidence, details);
+    }
     if let Some(approval) = &assertion.approval_requested {
         evaluate_approval_requested(approval, evidence, details);
     }
@@ -901,6 +937,105 @@ fn evaluate_tool_called(
         json!(assertion),
         details,
     );
+}
+
+fn evaluate_llm_request(
+    assertion: &LlmRequestAssertion,
+    evidence: &TurnEvidence,
+    details: &mut Vec<AssertionResultDetail>,
+) {
+    let checks = llm_message_checks(assertion);
+    let same_request = assertion.same_request.unwrap_or(true);
+    let matching_count = evidence
+        .llm_requests
+        .iter()
+        .filter(|request| {
+            if checks.is_empty() {
+                return true;
+            }
+            if same_request {
+                checks.iter().all(|(role, text)| {
+                    request.messages.iter().any(|message| {
+                        role.is_none_or(|role| message.role == role)
+                            && message.content.contains(text)
+                    })
+                })
+            } else {
+                checks.iter().any(|(role, text)| {
+                    request.messages.iter().any(|message| {
+                        role.is_none_or(|role| message.role == role)
+                            && message.content.contains(text)
+                    })
+                })
+            }
+        })
+        .count();
+    let content_matches = same_request
+        .then_some(matching_count > 0)
+        .unwrap_or_else(|| {
+            checks.iter().all(|(role, text)| {
+                evidence.llm_requests.iter().any(|request| {
+                    request.messages.iter().any(|message| {
+                        role.is_none_or(|role| message.role == role)
+                            && message.content.contains(text)
+                    })
+                })
+            })
+        });
+    let has_count_constraint =
+        assertion.count.is_some() || assertion.count_gte.is_some() || assertion.count_lte.is_some();
+    let passed = (checks.is_empty() || content_matches)
+        && assertion.count.is_none_or(|count| matching_count == count)
+        && assertion
+            .count_gte
+            .is_none_or(|count| matching_count >= count)
+        && assertion
+            .count_lte
+            .is_none_or(|count| matching_count <= count)
+        && (has_count_constraint || matching_count > 0);
+    let mut roles: Vec<&str> = checks
+        .iter()
+        .map(|(role, _)| match role {
+            Some(Role::System) => "system",
+            Some(Role::User) => "user",
+            Some(Role::Assistant) => "assistant",
+            _ => "any",
+        })
+        .collect();
+    roles.sort_unstable();
+    roles.dedup();
+    push_bool(
+        "llm_request",
+        passed,
+        json!({
+            "matched_count": matching_count,
+            "total_count": evidence.llm_requests.len(),
+        }),
+        json!({
+            "roles": roles,
+            "contains_checks": checks.len(),
+            "count": assertion.count,
+            "count_gte": assertion.count_gte,
+            "count_lte": assertion.count_lte,
+            "same_request": same_request,
+        }),
+        details,
+    );
+}
+
+fn llm_message_checks(assertion: &LlmRequestAssertion) -> Vec<(Option<Role>, String)> {
+    let mut checks = Vec::new();
+    for (role, contains) in [
+        (Some(Role::System), assertion.system_contains.as_ref()),
+        (Some(Role::User), assertion.user_contains.as_ref()),
+        (Some(Role::Assistant), assertion.assistant_contains.as_ref()),
+        (None, assertion.any_contains.as_ref()),
+    ] {
+        if let Some(contains) = contains {
+            checks.extend(contains.items().into_iter().map(|text| (role, text)));
+        }
+    }
+    checks
 }
 
 fn evaluate_approval_requested(
@@ -1630,6 +1765,7 @@ mod tests {
                 rejection_reason: None,
                 error: None,
             }],
+            llm_requests: vec![],
             skill: None,
             disambiguation: None,
             facts: Some(FactsEvidence {
@@ -1702,6 +1838,112 @@ mod tests {
         )
         .await;
         assert!(matches!(result, AssertionOutcome::Passed(_)));
+    }
+
+    #[tokio::test]
+    async fn llm_request_matches_roles_within_one_request_without_serializing_content() {
+        let mut evidence = evidence();
+        evidence.llm_requests = vec![
+            crate::evidence::LlmRequestEvidence {
+                messages: vec![
+                    crate::evidence::LlmMessageEvidence {
+                        role: Role::System,
+                        content: "persona marker and reasoning marker".to_string(),
+                    },
+                    crate::evidence::LlmMessageEvidence {
+                        role: Role::User,
+                        content: "current question".to_string(),
+                    },
+                ],
+            },
+            crate::evidence::LlmRequestEvidence {
+                messages: vec![crate::evidence::LlmMessageEvidence {
+                    role: Role::Assistant,
+                    content: "historical answer".to_string(),
+                }],
+            },
+        ];
+        let assertion = Assertion {
+            llm_request: Some(LlmRequestAssertion {
+                system_contains: Some(StringList::Many(vec![
+                    "persona marker".to_string(),
+                    "reasoning marker".to_string(),
+                ])),
+                user_contains: Some(StringList::One("current question".to_string())),
+                any_contains: Some(StringList::One("reasoning marker".to_string())),
+                count: Some(1),
+                count_gte: Some(1),
+                count_lte: Some(1),
+                same_request: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "ok",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
+        let AssertionOutcome::Passed(details) = result else {
+            panic!("expected LLM request assertion to pass");
+        };
+        let serialized = serde_json::to_string(&details).unwrap();
+        assert!(!serialized.contains("persona marker"));
+        assert!(!serialized.contains("reasoning marker"));
+        assert!(!serialized.contains("current question"));
+        assert!(!serialized.contains("historical answer"));
+    }
+
+    #[tokio::test]
+    async fn llm_request_does_not_combine_role_checks_across_requests() {
+        let mut evidence = evidence();
+        evidence.llm_requests = vec![
+            crate::evidence::LlmRequestEvidence {
+                messages: vec![crate::evidence::LlmMessageEvidence {
+                    role: Role::System,
+                    content: "persona marker".to_string(),
+                }],
+            },
+            crate::evidence::LlmRequestEvidence {
+                messages: vec![crate::evidence::LlmMessageEvidence {
+                    role: Role::User,
+                    content: "current question".to_string(),
+                }],
+            },
+        ];
+        let assertion = Assertion {
+            llm_request: Some(LlmRequestAssertion {
+                system_contains: Some(StringList::One("persona marker".to_string())),
+                user_contains: Some(StringList::One("current question".to_string())),
+                same_request: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "ok",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, AssertionOutcome::Failed(_)));
     }
 
     #[tokio::test]

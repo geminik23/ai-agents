@@ -39,8 +39,9 @@ pub use builtin::{
     AskUserTool, CalculatorTool, CommandTool, CopyPathTool, DateTimeTool, DeletePathTool,
     DiagnosticsTool, EchoTool, FileEditTool, FileInfoTool, FileListTool, FileReadTool, FileTool,
     FileWriteTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, JsonTool, MathTool,
-    MovePathTool, PatchTool, RandomTool, SleepTool, TemplateTool, TextTool, TodoTool, WebFetchTool,
-    WebSearchTool,
+    MovePathTool, PatchTool, RandomTool, SleepTool, TemplateTool, TextTool, TodoTool,
+    WebFetchResolver, WebFetchTool, WebFetchTransport, WebFetchTransportRequest,
+    WebFetchTransportResponse, WebSearchTool,
 };
 
 pub use security::{

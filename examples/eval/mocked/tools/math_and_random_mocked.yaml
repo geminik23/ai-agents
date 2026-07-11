@@ -1,0 +1,94 @@
+name: Math And Random Mocked Eval
+agent: ../../../yaml/tools/math_and_random.yaml
+
+# Exact math coverage plus bounded numeric and boolean-type random checks.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"math","arguments":{"operation":"mean","values":[10,20,30,40,50]}}'
+      - '{"tool":"random","arguments":{"operation":"integer","min":1,"max":6}}'
+      - '{"tool":"random","arguments":{"operation":"bool"}}'
+      - "The exact mean is 30; the random integer and boolean passed their requested constraints."
+
+scenarios:
+  - id: math-is-exact-and-random-values-are-constrained
+    name: Math is deterministic while random outputs satisfy bounds and types
+    tags: [mock, examples, yaml, tools, math, random]
+    language: en
+    turns:
+      - input: Compute the mean of [10, 20, 30, 40, 50], roll an integer from 1 through 6, and generate a boolean.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "The exact mean is 30; the random integer and boolean passed their requested constraints."
+            - tool_called:
+                id: math
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: math
+                args_executed:
+                  path: operation
+                  eq: mean
+            - tool_called:
+                id: math
+                args_executed:
+                  path: values
+                  eq: [10, 20, 30, 40, 50]
+            - tool_called:
+                id: math
+                result_path:
+                  path: result
+                  eq: 30.0
+            - tool_called:
+                id: math
+                result_path:
+                  path: count
+                  eq: 5
+            - tool_called:
+                id: random
+                count: 2
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: random
+                args_executed:
+                  path: operation
+                  eq: integer
+                result_path:
+                  path: value
+                  gte: 1
+                  lte: 6
+            - tool_called:
+                id: random
+                args_executed:
+                  path: operation
+                  eq: integer
+                result_path:
+                  path: min
+                  eq: 1
+            - tool_called:
+                id: random
+                args_executed:
+                  path: operation
+                  eq: integer
+                result_path:
+                  path: max
+                  eq: 6
+            - tool_called:
+                id: random
+                args_executed:
+                  path: operation
+                  eq: bool
+                result_path:
+                  path: value
+                  in: [true, false]

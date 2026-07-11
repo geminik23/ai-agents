@@ -1,0 +1,53 @@
+name: Code Review Group Chat Mocked Eval
+agent: ../../../yaml/orchestration/code_review_group_chat.yaml
+
+# Mocked eval suite for one deterministic group chat round.
+# The three reviewers speak in configured round-robin order, then the router confirms consensus.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/orchestration/code_review_group_chat_mocked.yaml \
+#     --output target/eval/mocked/orchestration/code_review_group_chat_mocked
+#
+# Flow: architect -> security -> performance -> consensus check -> transcript response
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Use a typed request boundary and keep the handler focused."
+        - "Validate authorization before returning account data."
+        - "Avoid repeated lookups by loading the account once."
+      router:
+        - "yes"
+
+scenarios:
+  - id: group-chat-reaches-consensus-in-one-round
+    name: Reviewers produce one ordered round and terminate on consensus
+    tags: [mock, examples, yaml, orchestration, group-chat]
+    language: en
+    turns:
+      - input: Review a handler that loads an account and returns it without an authorization check.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: |-
+                [Round 0] architect: Use a typed request boundary and keep the handler focused.
+                [Round 0] security: Validate authorization before returning account data.
+                [Round 0] performance: Avoid repeated lookups by loading the account once.
+            - orchestration:
+                type: group_chat
+            - metadata_path:
+                path: orchestration.transcript
+                exists: true
+            - metadata_path:
+                path: orchestration.rounds
+                eq: 1
+            - metadata_path:
+                path: orchestration.termination
+                eq: consensus_reached

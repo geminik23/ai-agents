@@ -1,0 +1,93 @@
+name: Text And JSON Mocked Eval
+agent: ../../../yaml/tools/text_and_json.yaml
+
+# Deterministic parent coverage for Unicode text length and nested JSON extraction.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"text","arguments":{"operation":"length","text":"안녕하세요"}}'
+      - '{"tool":"json","arguments":{"operation":"get","data":{"user":{"name":"Alice","age":30}},"path":"user.name"}}'
+      - "The Unicode text has exactly 5 characters and user.name is exactly Alice."
+
+scenarios:
+  - id: text-and-json-return-exact-results
+    name: Text and JSON tools return exact deterministic values
+    tags: [mock, examples, yaml, tools, text, json]
+    language: en
+    turns:
+      - input: Count the characters in '안녕하세요', then extract user.name from {"user":{"name":"Alice","age":30}}.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "The Unicode text has exactly 5 characters and user.name is exactly Alice."
+            - tool_called:
+                id: text
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: text
+                args_executed:
+                  path: operation
+                  eq: length
+            - tool_called:
+                id: text
+                args_executed:
+                  path: text
+                  eq: "안녕하세요"
+            - tool_called:
+                id: text
+                result_path:
+                  path: length
+                  eq: 5
+            - tool_called:
+                id: text
+                result_path:
+                  path: bytes
+                  eq: 15
+            - tool_called:
+                id: json
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: json
+                args_executed:
+                  path: operation
+                  eq: get
+            - tool_called:
+                id: json
+                args_executed:
+                  path: path
+                  eq: user.name
+            - tool_called:
+                id: json
+                args_executed:
+                  path: data
+                  eq:
+                    user:
+                      name: Alice
+                      age: 30
+            - tool_called:
+                id: json
+                result_path:
+                  path: value
+                  eq: Alice
+            - tool_called:
+                id: json
+                result_path:
+                  path: path
+                  eq: user.name
+            - tool_called:
+                id: json
+                result_path:
+                  path: found
+                  eq: true

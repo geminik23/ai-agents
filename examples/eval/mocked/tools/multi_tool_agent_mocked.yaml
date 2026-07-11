@@ -1,0 +1,59 @@
+name: Multi Tool Agent Calculator Mocked Eval
+agent: ../../../yaml/tools/multi_tool_agent.yaml
+
+# Focused parent coverage for calculator selection with risky granted tools absent.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"calculator","arguments":{"expression":"123 * 456"}}'
+      - "123 * 456 equals exactly 56088."
+  tools:
+    http:
+      success: false
+      output:
+        error: http disabled for this mocked suite
+    file:
+      success: false
+      output:
+        error: file disabled for this mocked suite
+    template:
+      success: false
+      output:
+        error: template disabled for this mocked suite
+
+scenarios:
+  - id: multi-tool-selects-calculator-only
+    name: Calculator is selected without risky tools
+    tags: [mock, examples, yaml, tools, multi-tool, calculator, scoping]
+    language: en
+    turns:
+      - input: Calculate 123 * 456 using only the calculator tool.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "123 * 456 equals exactly 56088."
+            - tool_called:
+                id: calculator
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: calculator
+                args_executed:
+                  path: expression
+                  eq: "123 * 456"
+            - tool_called:
+                id: calculator
+                result_path:
+                  path: result
+                  eq: 56088.0
+            - tool_not_called: http
+            - tool_not_called: file
+            - tool_not_called: template

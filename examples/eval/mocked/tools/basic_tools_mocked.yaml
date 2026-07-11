@@ -1,0 +1,73 @@
+name: Basic Tools Mocked Eval
+agent: ../../../yaml/tools/basic_tools.yaml
+
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"calculator","arguments":{"expression":"(100 - 37) * 4 / 3"}}'
+      - "The calculator returned 84."
+      - '{"tool":"datetime","arguments":{"operation":"diff","value":"2025-01-01T00:00:00Z","value2":"2025-12-31T00:00:00Z"}}'
+      - "The deterministic UTC interval is 364 days."
+
+scenarios:
+  - id: basic-tools-executes-deterministic-utilities
+    name: Real local utility tools return structured results
+    tags: [tools, calculator, datetime, local, deterministic, mock]
+    language: en
+    turns:
+      - input: Calculate (100 - 37) * 4 / 3 with the calculator.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "84"
+            - tool_called:
+                id: calculator
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: calculator
+                args_executed:
+                  path: expression
+                  eq: "(100 - 37) * 4 / 3"
+            - tool_called:
+                id: calculator
+                result_path:
+                  path: result
+                  gte: 84
+                  lte: 84
+            - tool_not_called: datetime
+      - input: Use datetime to find the number of days from 2025-01-01T00:00:00Z to 2025-12-31T00:00:00Z.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "364 days"
+            - tool_called:
+                id: datetime
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: datetime
+                args_executed:
+                  path: operation
+                  eq: diff
+            - tool_called:
+                id: datetime
+                result_path:
+                  path: days
+                  eq: 364
+            - tool_called:
+                id: datetime
+                result_path:
+                  path: seconds
+                  eq: 31449600
+            - tool_not_called: calculator
