@@ -1,0 +1,44 @@
+name: Content Pipeline Mocked Eval
+agent: ../../../yaml/orchestration/content_pipeline.yaml
+
+# Mocked eval suite for the pipeline orchestration pattern.
+# Three agents (writer, reviewer, editor) run sequentially in one pipeline state.
+# Child agents share the parent LLM registry, so all responses come from "default".
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/orchestration/content_pipeline_mocked.yaml \
+#     --output target/eval/mocked/orchestration/content_pipeline_mocked
+#
+# Flow: process (writer -> reviewer -> editor) -> transition eval ("1" = Pipeline complete) -> done (re-generate)
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Writer draft about the requested topic."
+      - "Reviewer feedback on the draft with suggestions."
+      - "Editor polished final version of the content."
+      - "1"
+      - "Content pipeline complete. The final version is ready."
+
+scenarios:
+  - id: pipeline-runs-three-stages
+    name: Pipeline processes content through writer, reviewer, and editor
+    tags: [mock, examples, yaml, orchestration, pipeline]
+    language: en
+    turns:
+      - input: Write a short blog post about Rust error handling.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: done
+            - state_history_contains: done
+            - orchestration:
+                type: pipeline
+                stages: 3
+                agents_include: [writer, reviewer, editor]

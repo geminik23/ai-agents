@@ -1,0 +1,86 @@
+name: State Lifecycle Mocked Eval
+agent: ../../../yaml/state-machine/state_lifecycle.yaml
+
+# Mocked state-machine eval suite.
+# Verifies lifecycle context updates for enter, exit, and reenter behavior.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/state_lifecycle_mocked.yaml \
+#     --output target/eval/mocked/state-machine/state_lifecycle_mocked
+#
+# Flow: intake -> drafting -> review -> drafting reentry
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Intake stale response."
+        - "First draft response."
+        - "Drafting stale response."
+        - "Review response with explicit instructions."
+        - "Review stale response."
+        - "Revised draft response."
+      router:
+        - "1"
+        - "1"
+        - "revise"
+
+scenarios:
+  - id: state-lifecycle-updates-context
+    name: Lifecycle hooks update context during draft workflow
+    tags: [mock, examples, yaml, state-machine, lifecycle]
+    language: en
+    turns:
+      - input: Write a short announcement about our Q1 sales meeting.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: drafting
+            - state_history_contains: drafting
+            - context_path:
+                path: phase
+                eq: "drafting"
+            - context_path:
+                path: intake_completed
+                eq: true
+            - context_path:
+                path: draft_version
+                gte: 1
+                lte: 2
+            - response_contains: "First draft"
+      - input: The draft is ready for review.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: review
+            - state_history_contains: review
+            - context_path:
+                path: phase
+                eq: "review"
+            - context_path:
+                path: drafting_completed
+                eq: true
+            - response_contains: "Review response"
+      - input: "revise: make the opening sentence more formal"
+        assert:
+          all:
+            - response_not_empty: true
+            - state: drafting
+            - state_history_contains: drafting
+            - context_path:
+                path: phase
+                eq: "drafting"
+            - context_path:
+                path: draft_version
+                eq: 2
+            - context_path:
+                path: review.action
+                eq: "revise"
+            - response_contains: "Revised draft"
+            - response_not_contains: "Review stale"

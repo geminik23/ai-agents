@@ -1,0 +1,44 @@
+name: Multi-Actor Mocked Eval
+agent: ../../../yaml/session/multi_actor.yaml
+
+# Mocked eval for the multi-actor agent.
+# Actor identity is resolved from the context path player.id.
+# Fixture context sets the player identity before the first turn.
+# The eval runner isolates SQLite storage into a temp workspace.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/session/multi_actor_mocked.yaml \
+#     --output target/eval/mocked/session/multi_actor_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  context:
+    player:
+      id: player_1
+      name: "Mira Vale"
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greetings, Mira Vale. I am Guard Elian. State your business at the harbor gate of Saltmere."
+      router:
+        - '[{"category":"user_context","content":"Visitor is Mira Vale, a merchant from the coast","confidence":0.85,"actor_id":"player_1"}]'
+
+scenarios:
+  - id: multi-actor-context-identity
+    name: Actor identity resolved from context and facts extracted
+    tags: [mock, examples, yaml, session, multi-actor]
+    language: en
+    turns:
+      - input: I am Mira Vale, a merchant from the coast. I carry wool and salted fish.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Mira"
+            - facts_include:
+                actor: player_1
+                category: user_context

@@ -1,0 +1,40 @@
+name: Disambiguation With State Clear Mocked Eval
+agent: ../../../yaml/disambiguation/disambiguation_with_state.yaml
+
+# Mocked disambiguation eval suite.
+# Verifies clear cancel order routes to cancel_order state without disambiguation.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/disambiguation/disambiguation_with_state_clear_mocked.yaml \
+#     --output target/eval/mocked/disambiguation/disambiguation_with_state_clear_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "no"
+        - '{"is_ambiguous":false,"confidence":0.95,"ambiguity_type":null,"reasoning":"clear cancel order with order number","what_is_unclear":[],"detected_language":"en"}'
+        - "1"
+      default:
+        - "I will help you cancel order #12345. Are you sure you want to proceed?"
+
+scenarios:
+  - id: clear-cancel-order-routes-to-state
+    name: Clear cancel order routes to cancel_order state without disambiguation
+    tags: [mock, examples, yaml, disambiguation, state-machine]
+    language: en
+    turns:
+      - input: Cancel my order #12345
+        assert:
+          all:
+            - response_not_empty: true
+            - no_disambiguation: true
+            - state: cancel_order
+            - state_history_contains: cancel_order
+            - response_contains: "12345"

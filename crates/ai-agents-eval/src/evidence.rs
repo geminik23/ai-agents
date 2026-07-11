@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use ai_agents_hitl::{ApprovalRequest, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger};
 use ai_agents_observability::ObservabilityReport;
 use ai_agents_runtime::RuntimeAgent;
 use chrono::{DateTime, Utc};
@@ -168,6 +169,145 @@ pub struct TurnObservabilityEvidence {
     pub report: Option<ObservabilityReport>,
 }
 
+/// Normalized approval decision used by eval evidence and assertions.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalDecision {
+    Approved,
+    Rejected,
+    Modified,
+    Timeout,
+    Error,
+}
+
+/// Normalized trigger that caused an approval request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalTriggerEvidence {
+    Tool { name: String },
+    Condition { name: String, matched: String },
+    State { from: Option<String>, to: String },
+}
+
+impl From<&ApprovalTrigger> for ApprovalTriggerEvidence {
+    fn from(trigger: &ApprovalTrigger) -> Self {
+        match trigger {
+            ApprovalTrigger::Tool { name, .. } => Self::Tool { name: name.clone() },
+            ApprovalTrigger::Condition { name, matched } => Self::Condition {
+                name: name.clone(),
+                matched: matched.clone(),
+            },
+            ApprovalTrigger::State { from, to } => Self::State {
+                from: from.clone(),
+                to: to.clone(),
+            },
+        }
+    }
+}
+
+/// In-memory evidence for one fully resolved approval request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalEvidence {
+    /// Stable request ID assigned by the HITL runtime.
+    pub request_id: String,
+    /// Normalized request trigger without tool argument values.
+    pub trigger: ApprovalTriggerEvidence,
+    /// Decision returned directly by the approval handler.
+    pub raw_decision: ApprovalDecision,
+    /// Decision after runtime timeout and error resolution.
+    pub effective_decision: ApprovalDecision,
+    /// Original tool arguments supplied with the request.
+    #[serde(default, skip_serializing)]
+    pub original_args: Option<Value>,
+    /// Complete tool arguments after an effective modification.
+    #[serde(default, skip_serializing)]
+    pub modified_args: Option<Value>,
+    /// Tool arguments that would be executed after the effective decision.
+    #[serde(default, skip_serializing)]
+    pub effective_args: Option<Value>,
+    /// Localized message shown to the approval handler.
+    #[serde(default, skip_serializing)]
+    pub message: String,
+    /// Rejection reason from the effective result, when present.
+    #[serde(default, skip_serializing)]
+    pub rejection_reason: Option<String>,
+    /// Resolution error from the effective result, when present.
+    #[serde(default, skip_serializing)]
+    pub error: Option<String>,
+}
+
+impl ApprovalEvidence {
+    /// Normalize one approval hook resolution into assertion-time evidence.
+    pub fn from_resolution(
+        request: &ApprovalRequest,
+        raw_result: &ApprovalResult,
+        effective_result: &ApprovalResolvedOutcome,
+    ) -> Self {
+        let original_args = match &request.trigger {
+            ApprovalTrigger::Tool { args, .. } => Some(args.clone()),
+            _ => None,
+        };
+        let (effective_decision, changes, rejection_reason, error) = match effective_result {
+            ApprovalResolvedOutcome::Approved => (ApprovalDecision::Approved, None, None, None),
+            ApprovalResolvedOutcome::Rejected { reason } => {
+                (ApprovalDecision::Rejected, None, reason.clone(), None)
+            }
+            ApprovalResolvedOutcome::Modified { changes } => {
+                (ApprovalDecision::Modified, Some(changes), None, None)
+            }
+            ApprovalResolvedOutcome::Error { message } => {
+                (ApprovalDecision::Error, None, None, Some(message.clone()))
+            }
+        };
+        let modified_args = changes.and_then(|changes| {
+            original_args
+                .as_ref()
+                .map(|original| apply_argument_changes(original, changes))
+        });
+        let effective_args = match effective_decision {
+            ApprovalDecision::Approved => original_args.clone(),
+            ApprovalDecision::Modified => modified_args.clone(),
+            ApprovalDecision::Rejected | ApprovalDecision::Timeout | ApprovalDecision::Error => {
+                None
+            }
+        };
+
+        Self {
+            request_id: request.id.clone(),
+            trigger: ApprovalTriggerEvidence::from(&request.trigger),
+            raw_decision: approval_result_decision(raw_result),
+            effective_decision,
+            original_args,
+            modified_args,
+            effective_args,
+            message: request.message.clone(),
+            rejection_reason,
+            error,
+        }
+    }
+}
+
+fn approval_result_decision(result: &ApprovalResult) -> ApprovalDecision {
+    match result {
+        ApprovalResult::Approved => ApprovalDecision::Approved,
+        ApprovalResult::Rejected { .. } => ApprovalDecision::Rejected,
+        ApprovalResult::Modified { .. } => ApprovalDecision::Modified,
+        ApprovalResult::Timeout => ApprovalDecision::Timeout,
+    }
+}
+
+fn apply_argument_changes(original: &Value, changes: &HashMap<String, Value>) -> Value {
+    let mut modified = original.clone();
+    if let Value::Object(arguments) = &mut modified {
+        for (key, value) in changes {
+            arguments.insert(key.clone(), value.clone());
+        }
+        modified
+    } else {
+        Value::Object(changes.clone().into_iter().collect())
+    }
+}
+
 /// Full assertion-time evidence collected after a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEvidence {
@@ -181,6 +321,9 @@ pub struct TurnEvidence {
     pub context: Value,
     /// Tool calls recorded during this turn.
     pub tool_executions: Vec<ToolExecutionRecord>,
+    /// Fully resolved approval requests recorded during this turn.
+    #[serde(default)]
+    pub approvals: Vec<ApprovalEvidence>,
     /// Skill evidence for this turn, if available.
     pub skill: Option<SkillEvidence>,
     /// Expected disambiguation status or evidence.
@@ -247,6 +390,7 @@ pub fn collect_turn_evidence(
         state_history: agent.state_history(),
         context,
         tool_executions: tool_log.records_since(tool_start_index),
+        approvals: Vec::new(),
         skill,
         disambiguation,
         facts,
@@ -380,4 +524,66 @@ fn collect_persona(
         revealed_secret_count: revealed_count,
         evolution_events: manager.history().len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn normalizes_modified_approval_and_keeps_sensitive_values_in_memory() {
+        let request = ApprovalRequest::new(
+            ApprovalTrigger::tool("transfer", json!({"amount": 100, "currency": "USD"})),
+            "Approve this transfer?",
+        );
+        let mut changes = HashMap::new();
+        changes.insert("amount".to_string(), json!(25));
+        let evidence = ApprovalEvidence::from_resolution(
+            &request,
+            &ApprovalResult::Modified {
+                changes: changes.clone(),
+            },
+            &ApprovalResolvedOutcome::Modified { changes },
+        );
+
+        assert_eq!(evidence.raw_decision, ApprovalDecision::Modified);
+        assert_eq!(evidence.effective_decision, ApprovalDecision::Modified);
+        assert_eq!(
+            evidence.original_args,
+            Some(json!({"amount": 100, "currency": "USD"}))
+        );
+        assert_eq!(
+            evidence.modified_args,
+            Some(json!({"amount": 25, "currency": "USD"}))
+        );
+        assert_eq!(evidence.effective_args, evidence.modified_args);
+        assert_eq!(evidence.message, "Approve this transfer?");
+
+        let serialized = serde_json::to_value(&evidence).unwrap();
+        assert!(serialized.get("original_args").is_none());
+        assert!(serialized.get("modified_args").is_none());
+        assert!(serialized.get("effective_args").is_none());
+        assert!(serialized.get("message").is_none());
+    }
+
+    #[test]
+    fn normalizes_timeout_to_effective_error_without_executable_arguments() {
+        let request = ApprovalRequest::new(
+            ApprovalTrigger::tool("delete", json!({"path": "/private"})),
+            "Delete file?",
+        );
+        let evidence = ApprovalEvidence::from_resolution(
+            &request,
+            &ApprovalResult::Timeout,
+            &ApprovalResolvedOutcome::Error {
+                message: "approval timed out".to_string(),
+            },
+        );
+
+        assert_eq!(evidence.raw_decision, ApprovalDecision::Timeout);
+        assert_eq!(evidence.effective_decision, ApprovalDecision::Error);
+        assert_eq!(evidence.error.as_deref(), Some("approval timed out"));
+        assert!(evidence.effective_args.is_none());
+    }
 }

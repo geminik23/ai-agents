@@ -1,0 +1,38 @@
+name: LLM Fallback Mocked Eval
+agent: ../../../yaml/error-recovery/llm_fallback.yaml
+
+# No-key mocked eval for LLM failover.
+# The primary alias is forced to error so the framework falls back to the
+# fallback alias. The user sees a normal response from the backup model.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/error-recovery/llm_fallback_mocked.yaml \
+#     --output target/eval/mocked/error-recovery/llm_fallback_mocked
+#
+# Flow: user input -> primary LLM fails -> retries exhausted -> fallback_llm -> response
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      fallback:
+        - "Fallback response from backup model."
+    errors_by_alias:
+      primary: "provider unavailable"
+
+scenarios:
+  - id: llm-fallback-on-primary-failure
+    name: Primary LLM failure triggers fallback response
+    tags: [error-recovery, fallback, mock]
+    language: en
+    turns:
+      - input: Hello, are you available?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Fallback response"

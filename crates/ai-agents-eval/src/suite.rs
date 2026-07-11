@@ -205,25 +205,108 @@ pub struct Scenario {
 }
 
 /// One user input and assertion block inside a scenario.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Turn {
     /// User input sent to the runtime.
     pub input: String,
     /// Actor ID used for this scenario, turn, or assertion.
-    #[serde(default)]
     pub actor: Option<String>,
     /// Runtime or fixture context value.
-    #[serde(default)]
     pub context: Value,
     /// Whether to use streaming chat for this turn.
-    #[serde(default)]
     pub stream: Option<bool>,
     /// Optional timeout override for this turn.
-    #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Assertions evaluated after this turn.
-    #[serde(default, rename = "assert")]
     pub assertions: Option<Assertion>,
+}
+
+const EXPECT_ERROR_CONTEXT_KEY: &str = "__ai_agents_eval_expect_error";
+
+#[derive(Deserialize)]
+struct TurnDefinition {
+    input: String,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    context: Value,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    expect_error: Option<ExpectedError>,
+    #[serde(default, rename = "assert")]
+    assertions: Option<Assertion>,
+}
+
+impl<'de> Deserialize<'de> for Turn {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let definition = TurnDefinition::deserialize(deserializer)?;
+        let mut context = definition.context;
+        if let Some(expect_error) = definition.expect_error {
+            let object = match &mut context {
+                Value::Object(object) => object,
+                _ => {
+                    context = Value::Object(serde_json::Map::new());
+                    context
+                        .as_object_mut()
+                        .expect("context was replaced with an object")
+                }
+            };
+            object.insert(
+                EXPECT_ERROR_CONTEXT_KEY.to_string(),
+                serde_json::to_value(expect_error).map_err(serde::de::Error::custom)?,
+            );
+        }
+        Ok(Self {
+            input: definition.input,
+            actor: definition.actor,
+            context,
+            stream: definition.stream,
+            timeout_ms: definition.timeout_ms,
+            assertions: definition.assertions,
+        })
+    }
+}
+
+pub(crate) fn turn_expected_error(turn: &Turn) -> Option<ExpectedError> {
+    turn.context
+        .get(EXPECT_ERROR_CONTEXT_KEY)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+pub(crate) fn turn_runtime_context(turn: &Turn) -> Value {
+    let mut context = turn.context.clone();
+    if let Value::Object(object) = &mut context {
+        object.remove(EXPECT_ERROR_CONTEXT_KEY);
+    }
+    context
+}
+
+/// Runtime error expectation accepting one substring or a list of alternatives.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ExpectedError {
+    One(String),
+    Any(Vec<String>),
+}
+
+impl ExpectedError {
+    pub fn matches(&self, error: &str) -> bool {
+        self.items().iter().any(|expected| error.contains(expected))
+    }
+
+    pub fn items(&self) -> Vec<&str> {
+        match self {
+            Self::One(value) => vec![value.as_str()],
+            Self::Any(values) => values.iter().map(String::as_str).collect(),
+        }
+    }
 }
 
 /// Boolean or reason-string skip configuration.
@@ -398,6 +481,11 @@ pub struct TurnResult {
     pub input: RedactedString,
     /// Assistant response text or redacted output value.
     pub response: RedactedString,
+    /// Whether the runtime produced an assistant response.
+    pub response_present: bool,
+    /// Runtime error emitted while executing this turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_error: Option<RedactedString>,
     /// Current or expected state name.
     pub state: Option<String>,
     /// Optional response or tool metadata.
@@ -475,6 +563,23 @@ mod tests {
         suite.scenarios.push(suite.scenarios[0].clone());
         let error = suite.validate(None).unwrap_err().to_string();
         assert!(error.contains("duplicate scenario id"));
+    }
+
+    #[test]
+    fn expected_error_accepts_string_and_list() {
+        let one: ExpectedError = serde_yaml::from_str("timeout").unwrap();
+        let many: ExpectedError = serde_yaml::from_str("[timeout, unavailable]").unwrap();
+        assert!(one.matches("turn timeout"));
+        assert!(many.matches("service unavailable"));
+        assert!(!many.matches("permission denied"));
+
+        let turn: Turn =
+            serde_yaml::from_str("input: hello\nexpect_error: [timeout, unavailable]").unwrap();
+        assert!(turn_expected_error(&turn).unwrap().matches("turn timeout"));
+        assert_eq!(
+            turn_runtime_context(&turn),
+            Value::Object(serde_json::Map::new())
+        );
     }
 
     #[test]

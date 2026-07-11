@@ -1,0 +1,36 @@
+name: Reasoning Reflection Mocked Eval
+agent: ../../../yaml/reasoning/reasoning_reflection.yaml
+
+# Mocked reasoning eval suite.
+# Verifies reflection flow: main response + evaluator pass.
+# The evaluator LLM returns a PASS result so no retry is needed.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/reasoning/reasoning_reflection_mocked.yaml \
+#     --output target/eval/mocked/reasoning/reasoning_reflection_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "TCP/IP works in layers. For example, the IP layer routes packets while TCP ensures reliable delivery. Trade-offs include overhead vs reliability. Steps: 1. Physical layer 2. Data link 3. Network 4. Transport."
+      evaluator:
+        - '{"passed":true,"confidence":0.9,"criteria_results":[{"criterion":"Response includes at least one concrete example","passed":true},{"criterion":"Response addresses trade-offs or limitations","passed":true},{"criterion":"Response is structured with clear sections or steps","passed":true}]}'
+
+scenarios:
+  - id: reflection-passes-on-first-evaluation
+    name: Reflection evaluator passes response with examples and trade-offs
+    tags: [mock, examples, yaml, reasoning, reflection]
+    language: en
+    turns:
+      - input: Explain how TCP/IP works.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "TCP"

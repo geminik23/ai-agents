@@ -1,0 +1,41 @@
+name: Support State Machine Product Mocked Eval
+agent: ../../../yaml/state-machine/support_state_machine.yaml
+
+# Mocked state-machine eval suite.
+# Verifies the product inquiry branch with a deterministic router response.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/support_state_machine_product_mocked.yaml \
+#     --output target/eval/mocked/state-machine/support_state_machine_product_mocked
+#
+# Flow: greeting -> product_inquiry
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greeting stale response."
+        - "Product inquiry response."
+      router:
+        - "4"
+
+scenarios:
+  - id: support-state-machine-routes-product
+    name: Support machine routes product question to product inquiry
+    tags: [mock, examples, yaml, state-machine, support]
+    language: en
+    turns:
+      - input: What laptop features and pricing do you recommend?
+        assert:
+          all:
+            - response_not_empty: true
+            - state: product_inquiry
+            - state_history_contains: product_inquiry
+            - response_contains: "Product inquiry"
+            - response_not_contains: "Greeting stale"

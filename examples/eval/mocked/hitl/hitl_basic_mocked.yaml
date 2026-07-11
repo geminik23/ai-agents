@@ -1,0 +1,153 @@
+name: HITL Basic Mocked Eval
+agent: ../../../yaml/hitl/hitl_basic.yaml
+
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/approved","timeout_ms":2000}}'
+      - "Approved request completed with fixture status 200 and body marker approved-fixture."
+      - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/rejected","timeout_ms":2000}}'
+      - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/timed-out","timeout_ms":2000}}'
+  tools:
+    http:
+      success: true
+      output:
+        status: 200
+        status_text: OK
+        headers:
+          content-type: application/json
+        body: '{"marker":"approved-fixture","safe":true}'
+  approvals:
+    preferred_language: en
+    supported_languages: [en]
+    rules:
+      - trigger: { type: tool, name: http }
+        occurrence: 3
+        outcome: timeout
+      - trigger: { type: tool, name: http }
+        occurrence: 2
+        outcome: reject
+        reason: fixture rejection
+      - trigger: { type: tool, name: http }
+        occurrence: 1
+        outcome: approve
+    default:
+      outcome: reject
+      reason: unexpected approval request
+
+scenarios:
+  - id: approve-reject-timeout
+    name: HTTP approval outcomes remain deterministic across turns
+    tags: [hitl, http, approval, multi-turn, mock]
+    language: en
+    turns:
+      - input: Fetch the approved fixture URL with GET and summarize it.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Approved request completed with fixture status 200"
+            - response_contains: "approved-fixture"
+            - response_not_contains: ["rejected", "timed out"]
+            - approval_requested:
+                count: 1
+                trigger: { type: tool, name: http }
+                raw_decision: approved
+                effective_decision: approved
+                message: "Approve GET request to https://api.example.test/approved?"
+                original_args:
+                  path: method
+                  eq: GET
+                effective_args:
+                  path: url
+                  eq: "https://api.example.test/approved"
+            - approval_requested:
+                trigger: { type: tool, name: http }
+                original_args:
+                  path: url
+                  eq: "https://api.example.test/approved"
+            - tool_called:
+                id: http
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: url
+                  eq: "https://api.example.test/approved"
+                result_path:
+                  path: status
+                  eq: 200
+            - tool_called:
+                id: http
+                result_path:
+                  path: body
+                  contains: "approved-fixture"
+      - input: Fetch the rejected fixture URL with GET and summarize it.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Operation cancelled: HITL rejected"
+            - response_contains: '"reason":"fixture rejection"'
+            - response_contains: '"requires_user_action":true'
+            - response_contains: '"retryable":false'
+            - response_not_contains: ["status 200", "approved-fixture"]
+            - approval_requested:
+                count: 1
+                trigger: { type: tool, name: http }
+                raw_decision: rejected
+                effective_decision: rejected
+                rejection_reason: fixture rejection
+                message: "Approve GET request to https://api.example.test/rejected?"
+                original_args:
+                  path: method
+                  eq: GET
+            - approval_requested:
+                trigger: { type: tool, name: http }
+                original_args:
+                  path: url
+                  eq: "https://api.example.test/rejected"
+            - tool_called:
+                id: http
+                count: 1
+                executed: false
+                success: false
+                args_original:
+                  path: url
+                  eq: "https://api.example.test/rejected"
+      - input: Fetch the timed-out fixture URL with GET and summarize it.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Operation cancelled: HITL rejected"
+            - response_contains: '"reason":"Timeout"'
+            - response_contains: '"requires_user_action":true'
+            - response_contains: '"retryable":false'
+            - response_not_contains: ["status 200", "approved-fixture"]
+            - approval_requested:
+                count: 1
+                trigger: { type: tool, name: http }
+                raw_decision: timeout
+                effective_decision: rejected
+                rejection_reason: Timeout
+                message: "Approve GET request to https://api.example.test/timed-out?"
+                original_args:
+                  path: method
+                  eq: GET
+            - approval_requested:
+                trigger: { type: tool, name: http }
+                original_args:
+                  path: url
+                  eq: "https://api.example.test/timed-out"
+            - tool_called:
+                id: http
+                count: 1
+                executed: false
+                success: false
+                args_original:
+                  path: url
+                  eq: "https://api.example.test/timed-out"

@@ -1,0 +1,25 @@
+name: File Edit Review Mocked Eval
+agent: ../../../yaml/tools/file_edit_review.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"file_edit","arguments":{"path":"./examples/fixtures/tool_examples/edit_target.txt","old_text":"Status: draft","new_text":"Status: reviewed","dry_run":true}}'
+      - "The dry run would replace Status: draft with Status: reviewed in one file."
+scenarios:
+  - id: file-edit-dry-run
+    tags: [tools, mutation, dry-run, mock]
+    turns:
+      - input: Review an exact edit for the sandbox file.
+        assert:
+          response_contains: "Status: reviewed"
+          tool_called:
+            id: file_edit
+            executed: true
+            success: true
+            result_path:
+              path: dry_run
+              eq: true

@@ -1,0 +1,59 @@
+name: Memory Budget Mocked Eval
+agent: ../../../yaml/memory/memory_budget.yaml
+
+# Mocked memory eval suite.
+# Verifies token-budgeted compacting memory works across enough turns to trigger compression.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/memory/memory_budget_mocked.yaml \
+#     --output target/eval/mocked/memory/memory_budget_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Turn one response about microservices."
+        - "Turn two response about Kubernetes."
+        - "Turn three response about CI/CD pipelines."
+        - "Turn four response about observability tools."
+        - "Turn five response after budget compression."
+      router:
+        - "Summary: the user discussed microservices, Kubernetes, CI/CD, and observability."
+
+scenarios:
+  - id: memory-budget-survives-compression
+    name: Token-budgeted memory responds after compression triggers
+    tags: [mock, examples, yaml, memory, budget]
+    language: en
+    turns:
+      - input: Tell me about microservices.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "microservices"
+      - input: Tell me about Kubernetes.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Kubernetes"
+      - input: Tell me about CI/CD pipelines.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "CI/CD"
+      - input: Tell me about observability tools.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "observability"
+      - input: What did we discuss earlier?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "compression"

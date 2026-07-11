@@ -1,7 +1,7 @@
 use crate::event::{EventStatus, EventType, ObservationPurpose};
 use crate::manager::ObservabilityManager;
 use ai_agents_core::{AgentError, AgentResponse, KeyFact, ToolExecutionRecord};
-use ai_agents_hitl::{ApprovalRequest, ApprovalResult, ApprovalTrigger};
+use ai_agents_hitl::{ApprovalRequest, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger};
 use ai_agents_hooks::AgentHooks;
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use ai_agents_relationships::{DimensionChange, Relationship, RelationshipEvent};
@@ -52,6 +52,15 @@ fn approval_result_label(result: &ApprovalResult) -> &'static str {
         ApprovalResult::Rejected { .. } => "rejected",
         ApprovalResult::Modified { .. } => "modified",
         ApprovalResult::Timeout => "timeout",
+    }
+}
+
+fn approval_outcome_label(outcome: &ApprovalResolvedOutcome) -> &'static str {
+    match outcome {
+        ApprovalResolvedOutcome::Approved => "approved",
+        ApprovalResolvedOutcome::Rejected { .. } => "rejected",
+        ApprovalResolvedOutcome::Modified { .. } => "modified",
+        ApprovalResolvedOutcome::Error { .. } => "error",
     }
 }
 
@@ -162,6 +171,50 @@ impl AgentHooks for ObservabilityHooks {
             },
             ObservationPurpose::HitlLocalization,
             tags,
+        );
+    }
+
+    async fn on_approval_resolved(
+        &self,
+        request: &ApprovalRequest,
+        raw_result: &ApprovalResult,
+        outcome: &ApprovalResolvedOutcome,
+    ) {
+        if !self.manager.config().latency.track_hitl {
+            return;
+        }
+        let mut tags = HashMap::new();
+        tags.insert("request_id".to_string(), request.id.clone());
+        tags.insert(
+            "raw_result".to_string(),
+            approval_result_label(raw_result).to_string(),
+        );
+        tags.insert(
+            "result".to_string(),
+            approval_outcome_label(outcome).to_string(),
+        );
+        tags.insert(
+            "request_trigger".to_string(),
+            request.trigger.trigger_type().to_string(),
+        );
+        let status = if matches!(outcome, ApprovalResolvedOutcome::Error { .. }) {
+            EventStatus::Error
+        } else {
+            EventStatus::Success
+        };
+        self.manager.record_lifecycle_event(
+            EventType::HitlApproval {
+                trigger: "resolved".to_string(),
+            },
+            ObservationPurpose::HitlLocalization,
+            status,
+            0,
+            tags,
+            Some(serde_json::json!({
+                "raw_result": raw_result,
+                "outcome": outcome,
+                "request_trigger": &request.trigger,
+            })),
         );
     }
 
@@ -446,4 +499,126 @@ impl AgentHooks for ObservabilityHooks {
     }
 
     async fn on_response(&self, _response: &AgentResponse) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ObservabilityConfig;
+
+    #[tokio::test]
+    async fn records_raw_and_effective_approval_results_separately() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.export.write_raw_events = true;
+        config.privacy.hash_inputs = false;
+        config.privacy.max_text_chars = 100;
+        let manager = ObservabilityManager::new(config);
+        let hooks = ObservabilityHooks::new(manager.clone());
+
+        let request = ApprovalRequest::new(
+            ApprovalTrigger::tool("calculator", serde_json::json!({})),
+            "Approve?",
+        );
+        hooks
+            .on_approval_result(&request.id, &ApprovalResult::Timeout)
+            .await;
+        hooks
+            .on_approval_resolved(
+                &request,
+                &ApprovalResult::Timeout,
+                &ApprovalResolvedOutcome::Approved,
+            )
+            .await;
+
+        let events = manager.raw_events();
+        assert_eq!(events.len(), 2);
+        let raw = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.event_type,
+                    EventType::HitlApproval { trigger } if trigger == "result"
+                )
+            })
+            .expect("raw approval event");
+        assert_eq!(raw.tags.get("result").map(String::as_str), Some("timeout"));
+        let resolved = events
+            .iter()
+            .find(|event| {
+                matches!(
+                    &event.event_type,
+                    EventType::HitlApproval { trigger } if trigger == "resolved"
+                )
+            })
+            .expect("resolved approval event");
+        assert_eq!(
+            resolved.tags.get("raw_result").map(String::as_str),
+            Some("timeout")
+        );
+        assert_eq!(
+            resolved.tags.get("result").map(String::as_str),
+            Some("approved")
+        );
+        assert_eq!(resolved.status, EventStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn records_timeout_policy_errors_as_resolved_events() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.export.write_raw_events = true;
+        config.privacy.max_text_chars = 100;
+        let manager = ObservabilityManager::new(config);
+        let hooks = ObservabilityHooks::new(manager.clone());
+        let request = ApprovalRequest::new(
+            ApprovalTrigger::state(Some("review".to_string()), "execute"),
+            "Approve?",
+        );
+
+        hooks
+            .on_approval_resolved(
+                &request,
+                &ApprovalResult::Timeout,
+                &ApprovalResolvedOutcome::Error {
+                    message: "HITL approval timeout".to_string(),
+                },
+            )
+            .await;
+
+        let events = manager.raw_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status, EventStatus::Error);
+        assert_eq!(
+            events[0].tags.get("raw_result").map(String::as_str),
+            Some("timeout")
+        );
+        assert_eq!(
+            events[0].tags.get("result").map(String::as_str),
+            Some("error")
+        );
+    }
+
+    #[tokio::test]
+    async fn hitl_tracking_switch_applies_to_resolved_results() {
+        let mut config = ObservabilityConfig::default();
+        config.enabled = true;
+        config.latency.track_hitl = false;
+        let manager = ObservabilityManager::new(config);
+        let hooks = ObservabilityHooks::new(manager.clone());
+
+        let request = ApprovalRequest::new(
+            ApprovalTrigger::tool("calculator", serde_json::json!({})),
+            "Approve?",
+        );
+        hooks
+            .on_approval_resolved(
+                &request,
+                &ApprovalResult::Approved,
+                &ApprovalResolvedOutcome::Approved,
+            )
+            .await;
+
+        assert!(manager.raw_events().is_empty());
+    }
 }

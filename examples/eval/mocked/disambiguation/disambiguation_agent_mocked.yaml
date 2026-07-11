@@ -1,0 +1,37 @@
+name: Disambiguation Agent Mocked Eval
+agent: ../../../yaml/disambiguation/disambiguation_agent.yaml
+
+# Mocked disambiguation eval suite.
+# Verifies vague reference triggers disambiguation with full config.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/disambiguation/disambiguation_agent_mocked.yaml \
+#     --output target/eval/mocked/disambiguation/disambiguation_agent_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "no"
+        - "no"
+        - '{"is_ambiguous":true,"confidence":0.3,"ambiguity_type":"vague_references","reasoning":"unclear reference","what_is_unclear":["target"],"detected_language":"en"}'
+        - '{"question":"What would you like me to send?","options":[{"id":"report","label":"The report","description":"Send the current report"},{"id":"email","label":"An email","description":"Send an email"}]}'
+
+scenarios:
+  - id: ambiguous-send-triggers-clarification
+    name: Vague reference triggers disambiguation clarification
+    tags: [mock, examples, yaml, disambiguation]
+    language: en
+    turns:
+      - input: Send it
+        assert:
+          all:
+            - response_not_empty: true
+            - disambiguation: triggered
+            - response_contains: "send"

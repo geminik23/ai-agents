@@ -21,6 +21,7 @@ ai-agents-relationships = { workspace = true }
 ai-agents-persona = { workspace = true }
 ai-agents-facts = { workspace = true }
 ai-agents-hooks = { workspace = true }
+ai-agents-hitl = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

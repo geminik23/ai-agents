@@ -123,6 +123,15 @@ impl ApprovalResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ApprovalResolvedOutcome {
+    Approved,
+    Rejected { reason: Option<String> },
+    Modified { changes: HashMap<String, Value> },
+    Error { message: String },
+}
+
 #[derive(Debug, Clone)]
 pub enum HITLCheckResult {
     NotRequired,
@@ -219,6 +228,18 @@ mod tests {
     fn test_approval_trigger_state() {
         let trigger = ApprovalTrigger::state(Some("greeting".to_string()), "escalation");
         assert_eq!(trigger.trigger_type(), "state");
+    }
+
+    #[test]
+    fn test_approval_resolved_outcome_serializes_typed_status() {
+        let outcome = ApprovalResolvedOutcome::Error {
+            message: "HITL approval timeout".to_string(),
+        };
+
+        let value = serde_json::to_value(outcome).unwrap();
+
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["message"], "HITL approval timeout");
     }
 
     #[test]

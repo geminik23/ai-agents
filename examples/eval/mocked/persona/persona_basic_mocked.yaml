@@ -1,0 +1,33 @@
+name: Persona Basic Mocked Eval
+agent: ../../../yaml/persona/persona_basic.yaml
+
+# Mocked eval for the basic persona agent.
+# Verifies that persona identity (name, role) appears in responses.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/persona/persona_basic_mocked.yaml \
+#     --output target/eval/mocked/persona/persona_basic_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Hello! I am Jay, your Senior Support Representative at AI Agents Company. I can help with your account issue today."
+
+scenarios:
+  - id: persona-basic-identity
+    name: Persona identity appears in response
+    tags: [mock, examples, yaml, persona]
+    language: en
+    turns:
+      - input: Hi, I need help with my account.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Jay"
+            - response_contains: "Senior Support"

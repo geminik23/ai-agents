@@ -5,7 +5,7 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use ai_agents_core::{AgentError, AgentResponse, ToolExecutionRecord};
-use ai_agents_hitl::{ApprovalRequest, ApprovalResult};
+use ai_agents_hitl::{ApprovalRequest, ApprovalResolvedOutcome, ApprovalResult};
 use ai_agents_llm::{ChatMessage, LLMResponse};
 use ai_agents_memory::{MemoryBudgetEvent, MemoryCompressEvent, MemoryEvictEvent};
 use ai_agents_tools::ToolResult;
@@ -47,6 +47,14 @@ pub trait AgentHooks: Send + Sync {
     async fn on_approval_requested(&self, _request: &ApprovalRequest) {}
 
     async fn on_approval_result(&self, _request_id: &str, _result: &ApprovalResult) {}
+
+    async fn on_approval_resolved(
+        &self,
+        _request: &ApprovalRequest,
+        _raw_result: &ApprovalResult,
+        _outcome: &ApprovalResolvedOutcome,
+    ) {
+    }
 
     async fn on_memory_compress(&self, _event: &MemoryCompressEvent) {}
 
@@ -467,6 +475,12 @@ impl AgentHooks for CompositeHooks {
         }
     }
 
+    async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
+        for hook in &self.hooks {
+            hook.on_tool_execution_record(record).await;
+        }
+    }
+
     async fn on_state_transition(&self, from: Option<&str>, to: &str, reason: &str) {
         for hook in &self.hooks {
             hook.on_state_transition(from, to, reason).await;
@@ -494,6 +508,18 @@ impl AgentHooks for CompositeHooks {
     async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
         for hook in &self.hooks {
             hook.on_approval_result(request_id, result).await;
+        }
+    }
+
+    async fn on_approval_resolved(
+        &self,
+        request: &ApprovalRequest,
+        raw_result: &ApprovalResult,
+        outcome: &ApprovalResolvedOutcome,
+    ) {
+        for hook in &self.hooks {
+            hook.on_approval_resolved(request, raw_result, outcome)
+                .await;
         }
     }
 
@@ -730,15 +756,42 @@ mod tests {
         }
 
         async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
-            let status = match result {
-                ApprovalResult::Approved => "approved",
-                ApprovalResult::Rejected { .. } => "rejected",
-                ApprovalResult::Modified { .. } => "modified",
-                ApprovalResult::Timeout => "timeout",
-            };
+            let status = approval_status(result);
             self.events
                 .lock()
                 .push(format!("approval_result:{}:{}", request_id, status));
+        }
+
+        async fn on_approval_resolved(
+            &self,
+            request: &ApprovalRequest,
+            raw_result: &ApprovalResult,
+            outcome: &ApprovalResolvedOutcome,
+        ) {
+            self.events.lock().push(format!(
+                "approval_resolved:{}:{}:{}",
+                request.id,
+                approval_status(raw_result),
+                resolved_status(outcome)
+            ));
+        }
+    }
+
+    fn approval_status(result: &ApprovalResult) -> &'static str {
+        match result {
+            ApprovalResult::Approved => "approved",
+            ApprovalResult::Rejected { .. } => "rejected",
+            ApprovalResult::Modified { .. } => "modified",
+            ApprovalResult::Timeout => "timeout",
+        }
+    }
+
+    fn resolved_status(outcome: &ApprovalResolvedOutcome) -> &'static str {
+        match outcome {
+            ApprovalResolvedOutcome::Approved => "approved",
+            ApprovalResolvedOutcome::Rejected { .. } => "rejected",
+            ApprovalResolvedOutcome::Modified { .. } => "modified",
+            ApprovalResolvedOutcome::Error { .. } => "error",
         }
     }
 
@@ -790,9 +843,26 @@ mod tests {
         composite
             .on_tool_start("calculator", &serde_json::json!({}))
             .await;
+        let request = ApprovalRequest::new(
+            ai_agents_hitl::ApprovalTrigger::tool("calculator", serde_json::json!({})),
+            "Approve?",
+        );
+        composite
+            .on_approval_resolved(
+                &request,
+                &ApprovalResult::Timeout,
+                &ApprovalResolvedOutcome::Approved,
+            )
+            .await;
 
-        assert_eq!(hooks1.events().len(), 1);
-        assert_eq!(hooks2.events().len(), 1);
+        assert_eq!(
+            hooks1.events(),
+            vec![
+                "tool_start:calculator".to_string(),
+                format!("approval_resolved:{}:timeout:approved", request.id)
+            ]
+        );
+        assert_eq!(hooks1.events(), hooks2.events());
     }
 
     #[tokio::test]

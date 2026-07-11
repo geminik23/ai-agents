@@ -1,0 +1,44 @@
+name: Env Context Mocked Eval
+agent: ../../../yaml/context/env_context.yaml
+
+# Mocked context eval suite.
+# Verifies env context with safe scenario-local environment values.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/context/env_context_mocked.yaml \
+#     --output target/eval/mocked/context/env_context_mocked
+#
+# Flow: scenario env -> env context loader -> mocked response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Development mode is active with an enthusiastic greeting style."
+
+scenarios:
+  - id: env-context-loads-safe-values
+    name: Environment context loads scenario-local values
+    tags: [mock, examples, yaml, context]
+    language: en
+    env:
+      APP_ENV: development
+      GREETING_STYLE: enthusiastic
+    turns:
+      - input: Which environment mode and greeting style are active?
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: app_env
+                eq: "development"
+            - context_path:
+                path: greeting_style
+                eq: "enthusiastic"
+            - response_contains: "Development"
+            - response_contains: "enthusiastic"

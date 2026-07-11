@@ -1,0 +1,52 @@
+name: Nested States Mocked Eval
+agent: ../../../yaml/state-machine/nested_states.yaml
+
+# Mocked state-machine eval suite.
+# Verifies hierarchical state routing and root escape transitions without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/nested_states_mocked.yaml \
+#     --output target/eval/mocked/state-machine/nested_states_mocked
+#
+# Flow: troubleshooting.diagnosing -> fixing -> ^resolved
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Diagnosing stale response."
+        - "Fixing response with clear steps."
+        - "Fixing stale response."
+        - "Resolved response summarizing the fix."
+      router:
+        - "1"
+        - "1"
+
+scenarios:
+  - id: nested-states-route-to-fixing-and-resolved
+    name: Nested troubleshooting routes to fixing and then root resolved
+    tags: [mock, examples, yaml, state-machine, nested]
+    language: en
+    turns:
+      - input: My wifi keeps dropping and I already checked the router logs.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: troubleshooting.fixing
+            - state_history_contains: troubleshooting.fixing
+            - response_contains: "Fixing response"
+            - response_not_contains: "Diagnosing stale"
+      - input: That worked, thanks.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: resolved
+            - state_history_contains: resolved
+            - response_contains: "Resolved response"
+            - response_not_contains: "Fixing stale"

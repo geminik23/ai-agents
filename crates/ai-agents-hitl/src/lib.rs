@@ -17,4 +17,6 @@ pub use handler::{
     create_handler, create_localized_handler,
 };
 pub use localization::{MessageResolver, resolve_best_language, resolve_tool_message};
-pub use types::{ApprovalRequest, ApprovalResult, ApprovalTrigger, HITLCheckResult};
+pub use types::{
+    ApprovalRequest, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger, HITLCheckResult,
+};

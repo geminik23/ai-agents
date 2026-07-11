@@ -1,0 +1,56 @@
+name: Speculative Parallel Transition Mocked Eval
+agent: ../../../yaml/runtime-optimization/parallel_transition.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a parallel transition branch can win and discard the old-state draft safely.
+#
+# Flow: user input -> draft branch + transition choice -> billing redispatch -> assertions
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --agent examples/yaml/runtime-optimization/parallel_transition.yaml \
+#     --scenarios examples/eval/mocked/runtime-optimization/speculative_parallel_transition_mocked.yaml \
+#     --output target/eval/mocked/runtime-optimization/speculative_parallel_transition_mocked
+settings:
+  timeout_per_turn_ms: 5000  # milliseconds to wait for each turn. default: 30000
+  retries: 0                 # keep branch ordering deterministic. default: 0
+  isolation: scenario        # fresh runtime per attempt. default: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Billing committed response."
+      router:
+        - "1"
+
+scenarios:
+  - id: parallel-transition-win
+    name: Parallel route wins and stale draft is not returned
+    tags: [runtime, optimization, branch, state]
+    language: en
+    turns:
+      - input: I was charged twice for my invoice
+        assert:
+          all:
+            - state: billing
+            - response_contains: "Billing committed"
+            - response_not_contains: "Draft"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: discarded
+                    assert:
+                      path: count
+                      gte: 1

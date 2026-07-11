@@ -1,0 +1,50 @@
+name: Support Handoff Mocked Eval
+agent: ../../../yaml/orchestration/support_handoff.yaml
+
+# Mocked eval suite for the handoff orchestration pattern.
+# A general agent handles the first message, the router LLM decides whether to
+# transfer to a specialist (billing or technical). The chain continues until the
+# router says "stay" or max_handoffs is reached.
+# Child agents share the parent LLM registry and use the "default" alias.
+# The handoff decision evaluator uses the "router" alias.
+# The transition evaluator also uses "router" (fallback from "evaluator").
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/orchestration/support_handoff_mocked.yaml \
+#     --output target/eval/mocked/orchestration/support_handoff_mocked
+#
+# Flow: support (general agent) -> router handoff to billing -> billing agent -> router "stay" -> transition eval ("1" = done) -> done (re-generate)
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "General support initial assessment of your issue."
+        - "Billing specialist resolved the duplicate charge on your account."
+        - "Support session complete. The billing specialist resolved the charge issue."
+      router:
+        - '{"action": "billing", "confidence": 0.9, "reason": "billing issue requires specialist"}'
+        - '{"action": "stay", "confidence": 0.9, "reason": "issue resolved"}'
+        - "1"
+
+scenarios:
+  - id: handoff-transfers-to-billing
+    name: Handoff routes billing issue from general to billing specialist
+    tags: [mock, examples, yaml, orchestration, handoff]
+    language: en
+    turns:
+      - input: I was charged twice on my last bill.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: done
+            - state_history_contains: done
+            - orchestration:
+                type: handoff
+                final_agent_in: [billing, technical]

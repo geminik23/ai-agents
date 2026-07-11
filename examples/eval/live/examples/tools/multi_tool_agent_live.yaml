@@ -1,0 +1,106 @@
+name: Live Example - Tools Multi Tool Agent
+agent: ../../../../yaml/tools/multi_tool_agent.yaml
+
+# Live eval suite for a mixed tool grant using only safe local utilities.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/multi_tool_agent_live.yaml \
+#     --output target/eval/live/examples/tools/multi_tool_agent \
+#     --real-llm
+#
+# Flow: one local request -> live model -> safe utility tool -> no HTTP or file tools
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+  tools:
+    http:
+      success: false
+      output:
+        error: http disabled for this live suite
+    file:
+      success: false
+      output:
+        error: file disabled for this live suite
+    template:
+      success: false
+      output:
+        error: template disabled for this live suite
+
+scenarios:
+  - id: multi-tool-calculator-only
+    name: Real model uses calculator and avoids risky granted tools
+    tags: [live, examples, yaml, tools, grant, scoping, utility, fixture, real-llm, calculator]
+    language: en
+    turns:
+      - input: "Before answering, call the calculator tool to calculate 123 * 456. Do not use HTTP, file, or template tools."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+            - response_contains_any:
+                - "56088"
+                - "56,088"
+            - tool_not_called: http
+            - tool_not_called: file
+            - tool_not_called: template
+
+  - id: multi-tool-text-only
+    name: Real model uses text and avoids risky granted tools
+    tags: [live, examples, yaml, tools, grant, scoping, utility, fixture, real-llm, text]
+    language: en
+    turns:
+      - input: "Before answering, call the text tool to count the characters in 'hello world'. Do not use HTTP, file, or template tools."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: text
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: length
+                  eq: 11
+            - response_contains_any:
+                - "11"
+                - "eleven"
+            - tool_not_called: http
+            - tool_not_called: file
+            - tool_not_called: template
+
+  - id: multi-tool-json-only
+    name: Real model uses JSON and avoids risky granted tools
+    tags: [live, examples, yaml, tools, grant, scoping, utility, fixture, real-llm, json]
+    language: en
+    turns:
+      - input: "Before answering, call the JSON tool to extract user.name from {\"user\":{\"name\":\"Ada\"}}. Do not use HTTP, file, or template tools."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: json
+                count_gte: 1
+                executed: true
+                success: true
+            - response_contains_any:
+                - "Ada"
+                - "ada"
+                - "name"
+            - tool_not_called: http
+            - tool_not_called: file
+            - tool_not_called: template

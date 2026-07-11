@@ -1,0 +1,63 @@
+name: Cost by Model Mocked Eval
+agent: ../../../yaml/observability/cost_by_model.yaml
+
+# No-key mocked eval for model-cost observability.
+# Verifies that skill routing and skill prompt purposes are recorded when
+# the router model handles a math skill.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/observability/cost_by_model_mocked.yaml \
+#     --output target/eval/mocked/observability/cost_by_model_mocked
+#
+# Flow: math input -> router skill routing -> router skill prompt -> response
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [model, purpose, status]
+  export:
+    formats: [json]
+    path: ./target/eval/mocked/observability/cost_by_model_mocked/observability
+    write_report: true
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "quick_math"
+        - "18% of 245 is 44.1."
+      default:
+        - "I can help with that."
+
+scenarios:
+  - id: cost-by-model-math
+    name: Router model skill routing and prompt are observed
+    tags: [observability, cost, model, mock]
+    language: en
+    turns:
+      - input: What is 18% of 245?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "44.1"
+            - observability:
+                total_llm_calls_lte: 2
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

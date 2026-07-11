@@ -1,0 +1,40 @@
+name: Cross-Session Mocked Eval
+agent: ../../../yaml/session/cross_session.yaml
+
+# Mocked eval for the cross-session agent.
+# Tests single-session fact extraction with SQLite storage.
+# The router LLM provides fact extraction JSON.
+# The eval runner isolates SQLite storage into a temp workspace.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/session/cross_session_mocked.yaml \
+#     --output target/eval/mocked/session/cross_session_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Nice to meet you, Jay! I will remember that you work as a data scientist in Korea."
+      router:
+        - '[{"category":"user_context","content":"User works as a data scientist in Korea","confidence":0.9,"actor_id":"customer_42"}]'
+
+scenarios:
+  - id: cross-session-facts-extracted
+    name: Facts are extracted and stored in a single session
+    tags: [mock, examples, yaml, session, cross-session]
+    language: en
+    actor: customer_42
+    turns:
+      - input: My name is Jay. I work as a data scientist in Korea.
+        assert:
+          all:
+            - response_not_empty: true
+            - facts_include:
+                actor: customer_42
+                category: user_context

@@ -1,0 +1,50 @@
+name: Live Example - Tools Web Search Research
+agent: ../../../../yaml/tools/web_search_research.yaml
+
+# Live eval suite for provider-neutral web search.
+# Requires provider credentials and may incur provider cost.
+#
+# Without a host web-search provider installed, the tool records unavailable.
+# The live model should recognize unavailability and suggest web_fetch for known URLs.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/web_search_research_live.yaml \
+#     --output target/eval/live/examples/tools/web_search_research \
+#     --real-llm
+#
+# Flow: search request -> live model -> web_search unavailable -> model suggests fallback
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+  web_search:
+    available: false
+
+scenarios:
+  - id: web-search-unavailable-fallback
+    name: Real model handles unavailable web search gracefully
+    tags: [live, examples, yaml, tools, web_search, unavailable, real-llm]
+    language: en
+    turns:
+      - input: "Search the web for recent Rust async ecosystem news using web_search. If web_search is unavailable, say so and suggest using web_fetch for a known URL."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: web_search
+                executed: false
+                success: false
+            - response_contains_any:
+                - "unavailable"
+                - "cannot search"
+                - "web_fetch"
+                - "web fetch"

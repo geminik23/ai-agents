@@ -1,0 +1,84 @@
+name: Command Validation Mocked Eval
+agent: ../../../yaml/tools/command_validation.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"command","arguments":{"argv":["cargo","fmt","--all"],"cwd":"."}}'
+      - "cargo fmt --all completed successfully in working directory . with exit code 0. Output: Formatting complete."
+  commands:
+    available: true
+    entries:
+      - argv: [cargo, fmt, --all]
+        response:
+          success: true
+          exit_code: 0
+          termination: exited
+          stdout: "Formatting complete"
+          stderr: ""
+          combined_output: "Formatting complete"
+          truncated: false
+          timed_out: false
+          cwd: "."
+          argv_redacted: [cargo, fmt, --all]
+scenarios:
+  - id: command-allowlist
+    tags: [tools, command, mock]
+    turns:
+      - input: Run the allowlisted formatting check.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "completed successfully"
+            - response_contains: "working directory ."
+            - response_contains: "exit code 0"
+            - response_contains: "Formatting complete"
+            - tool_called:
+                id: command
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm]
+            - tool_called:
+                id: command
+                args_executed:
+                  path: argv
+                  eq: [cargo, fmt, --all]
+            - tool_called:
+                id: command
+                args_executed:
+                  path: cwd
+                  eq: "."
+            - tool_called:
+                id: command
+                result_path:
+                  path: exit_code
+                  eq: 0
+            - tool_called:
+                id: command
+                result_path:
+                  path: termination
+                  eq: exited
+            - tool_called:
+                id: command
+                result_path:
+                  path: combined_output
+                  eq: "Formatting complete"
+            - tool_called:
+                id: command
+                result_path:
+                  path: timed_out
+                  eq: false
+            - tool_called:
+                id: command
+                result_path:
+                  path: truncated
+                  eq: false
+            - tool_called:
+                id: command
+                result_path:
+                  path: cwd
+                  eq: "."

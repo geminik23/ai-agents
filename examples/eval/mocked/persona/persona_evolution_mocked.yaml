@@ -1,0 +1,33 @@
+name: Persona Evolution Mocked Eval
+agent: ../../../yaml/persona/persona_evolution.yaml
+
+# Mocked eval for the persona evolution agent.
+# The persona_evolve tool is registered via allow_llm_evolve but the mock
+# LLM returns plain text and never calls it.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/persona/persona_evolution_mocked.yaml \
+#     --output target/eval/mocked/persona/persona_evolution_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Grumble. Another visitor at Castle Black. What do you want? I am Steward Edd, and I do not have time for pleasantries."
+
+scenarios:
+  - id: persona-evolution-no-evolve
+    name: Persona evolve tool is available but not called by mock
+    tags: [mock, examples, yaml, persona, evolution]
+    language: en
+    turns:
+      - input: Hello there, I just arrived at Castle Black.
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_not_called: persona_evolve

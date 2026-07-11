@@ -1,0 +1,57 @@
+name: Live Example - Tools Repo Review
+agent: ../../../../yaml/tools/repo_review.yaml
+
+# Live eval suite for read-only repository review.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/repo_review_live.yaml \
+#     --output target/eval/live/examples/tools/repo_review \
+#     --real-llm
+#
+# Flow: prompt -> live model -> git status or diff evidence -> non-mutating summary
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: repo-review-summarizes-current-changes
+    name: Real model reviews current repository changes
+    tags: [live, examples, yaml, tools, read-only, real-llm, git_status, git_diff]
+    language: en
+    turns:
+      - input: "Before answering, call git_status or git_diff to review the current repository status or diff. Summarize the affected paths at a high level, and do not modify anything."
+        assert:
+          all:
+            - response_not_empty: true
+            - any:
+                - tool_called:
+                    id: git_status
+                    count_gte: 1
+                    executed: true
+                    success: true
+                - tool_called:
+                    id: git_diff
+                    count_gte: 1
+                    executed: true
+                    success: true
+            - response_not_contains:
+                - "I modified"
+                - "I changed the files"
+                - "I committed"
+                - "I ran a command"
+                - "I wrote files"
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch
+            - tool_not_called: command

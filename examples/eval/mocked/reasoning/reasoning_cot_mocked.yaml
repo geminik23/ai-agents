@@ -1,0 +1,33 @@
+name: Reasoning CoT Mocked Eval
+agent: ../../../yaml/reasoning/reasoning_cot.yaml
+
+# Mocked reasoning eval suite.
+# Verifies chain-of-thought response with visible thinking tags.
+# The mock LLM returns a response with <thinking> tags as the CoT prompt instructs.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/reasoning/reasoning_cot_mocked.yaml \
+#     --output target/eval/mocked/reasoning/reasoning_cot_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "<thinking>First, 15 * 7 = 105. Then 105 + 23 = 128.</thinking>The answer is 128."
+
+scenarios:
+  - id: cot-produces-tagged-thinking
+    name: Chain-of-thought response includes thinking and final answer
+    tags: [mock, examples, yaml, reasoning, cot]
+    language: en
+    turns:
+      - input: What is 15 * 7 + 23?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "128"

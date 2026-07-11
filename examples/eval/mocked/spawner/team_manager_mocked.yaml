@@ -1,0 +1,39 @@
+name: Team Manager Mocked Eval
+agent: ../../../yaml/spawner/team_manager.yaml
+
+# Mocked eval suite for the spawner management tools pattern.
+# The team manager has spawn_agent, send_agent_message, list_agents, and
+# remove_agent tools registered via management_tools: true.
+# The mock LLM responds normally without calling any spawner tools.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/spawner/team_manager_mocked.yaml \
+#     --output target/eval/mocked/spawner/team_manager_mocked
+#
+# Flow: user input -> mock LLM normal response (no tool calls) -> response
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "I can help you manage your team. What kind of specialist would you like to create?"
+      router:
+        - "Mock router response."
+
+scenarios:
+  - id: team-manager-responds-without-spawning
+    name: Team manager responds normally without calling spawner tools
+    tags: [mock, examples, yaml, spawner, management-tools]
+    language: en
+    turns:
+      - input: Hello, what can you do?
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_not_called: spawn_agent

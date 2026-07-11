@@ -1,0 +1,44 @@
+name: Reasoning Plan Mocked Eval
+agent: ../../../yaml/reasoning/reasoning_plan.yaml
+
+# Mocked reasoning eval suite.
+# Verifies plan-and-execute flow with a calculator tool step and a respond step.
+# The planner LLM returns a JSON plan; the executor runs the tool and synthesizes a response.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/reasoning/reasoning_plan_mocked.yaml \
+#     --output target/eval/mocked/reasoning/reasoning_plan_mocked
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      planner:
+        - '{"steps":[{"id":"calc","description":"Calculate 18 * 7","action_type":"tool","action_target":"calculator","args":{"expression":"18 * 7"},"dependencies":[]},{"id":"answer","description":"Present the result","action_type":"respond","action_target":"The answer is {{ steps[0].result }}.","dependencies":["calc"]}]}'
+      default:
+        - "The answer is 126."
+
+scenarios:
+  - id: plan-and-execute-runs-tool-step
+    name: Plan-and-execute generates plan and runs calculator step
+    tags: [mock, examples, yaml, reasoning, plan]
+    language: en
+    turns:
+      - input: What is 18 * 7?
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: result
+                  gte: 126
+                  lte: 126

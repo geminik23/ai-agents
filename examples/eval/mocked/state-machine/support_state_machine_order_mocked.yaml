@@ -1,0 +1,41 @@
+name: Support State Machine Order Mocked Eval
+agent: ../../../yaml/state-machine/support_state_machine.yaml
+
+# Mocked state-machine eval suite.
+# Verifies the order support branch with a deterministic router response.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/support_state_machine_order_mocked.yaml \
+#     --output target/eval/mocked/state-machine/support_state_machine_order_mocked
+#
+# Flow: greeting -> order_support
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greeting stale response."
+        - "Order support response."
+      router:
+        - "3"
+
+scenarios:
+  - id: support-state-machine-routes-order
+    name: Support machine routes order request to order support
+    tags: [mock, examples, yaml, state-machine, support]
+    language: en
+    turns:
+      - input: Where is my order and tracking number?
+        assert:
+          all:
+            - response_not_empty: true
+            - state: order_support
+            - state_history_contains: order_support
+            - response_contains: "Order support"
+            - response_not_contains: "Greeting stale"

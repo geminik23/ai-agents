@@ -1,0 +1,53 @@
+name: Template Context Mocked Eval
+agent: ../../../yaml/context/template_context.yaml
+
+# Mocked context eval suite.
+# Verifies template-driving context values and built-in time context without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/context/template_context_mocked.yaml \
+#     --output target/eval/mocked/context/template_context_mocked
+#
+# Flow: fixture context + built-in time -> prompt template -> mocked response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  context:
+    user:
+      name: Priya
+      tier: vip
+      company: Acme Labs
+  llm:
+    mode: mock
+    responses:
+      - "Priya, VIP support is active for Acme Labs."
+
+scenarios:
+  - id: template-context-renders-vip-profile
+    name: Template context exposes VIP profile values
+    tags: [mock, examples, yaml, context]
+    language: en
+    turns:
+      - input: Help me with my account tier.
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: user.name
+                eq: "Priya"
+            - context_path:
+                path: user.tier
+                eq: "vip"
+            - context_path:
+                path: user.company
+                eq: "Acme Labs"
+            - context_path:
+                path: time.date
+                exists: true
+            - response_contains: "Priya"
+            - response_contains: "VIP"
+            - response_contains: "Acme Labs"

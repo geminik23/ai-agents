@@ -1,0 +1,65 @@
+name: Live Example - Tools Copy Review
+agent: ../../../../yaml/tools/copy_review.yaml
+
+# Live eval suite for dry-run copy_path against committed fixture files.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/copy_review_live.yaml \
+#     --output target/eval/live/examples/tools/copy_review \
+#     --real-llm
+#
+# Flow: read fixture -> live model -> copy_path dry run -> summary with no file copied
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: copy-path-dry-run-only
+    name: Real model dry-runs a copy without applying it
+    tags: [live, examples, yaml, tools, mutation, dry-run, fixture, real-llm, copy_path]
+    language: en
+    turns:
+      - input: "Before answering, call copy_path to dry-run copying examples/fixtures/tool_examples/edit_target.txt to examples/fixtures/tool_examples/copied_note.txt. Keep dry_run true, do not apply the copy, and state that no file was changed."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: copy_path
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: copy_path
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: copy_path
+                result_path:
+                  path: copied
+                  eq: true
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "Dry-run"
+                - "No file was changed"
+                - "no file was changed"
+            - response_not_contains:
+                - "I copied the file on disk"
+                - "I applied the copy"
+                - "the copy was applied"
+            - tool_not_called: command

@@ -1,0 +1,57 @@
+name: Support State Machine Fallback Mocked Eval
+agent: ../../../yaml/state-machine/support_state_machine.yaml
+
+# Mocked state-machine eval suite.
+# Verifies fallback routing after repeated no-transition decisions.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/support_state_machine_fallback_mocked.yaml \
+#     --output target/eval/mocked/state-machine/support_state_machine_fallback_mocked
+#
+# Flow: greeting no-match -> greeting no-match -> fallback confused
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Vague greeting response one."
+        - "Vague greeting response two."
+        - "Vague greeting response three."
+        - "Confused fallback response with category choices."
+      router:
+        - "0"
+        - "0"
+        - "0"
+
+scenarios:
+  - id: support-state-machine-fallback-after-misses
+    name: Repeated no-match turns trigger the confused fallback state
+    tags: [mock, examples, yaml, state-machine, support, fallback]
+    language: en
+    turns:
+      - input: hmm
+        assert:
+          all:
+            - response_not_empty: true
+            - state: greeting
+            - response_contains: "Vague greeting response one"
+      - input: maybe
+        assert:
+          all:
+            - response_not_empty: true
+            - state: greeting
+            - response_contains: "Vague greeting response two"
+      - input: not sure
+        assert:
+          all:
+            - response_not_empty: true
+            - state: confused
+            - state_history_contains: confused
+            - response_contains: "Confused fallback"
+            - response_not_contains: "Vague greeting response three"

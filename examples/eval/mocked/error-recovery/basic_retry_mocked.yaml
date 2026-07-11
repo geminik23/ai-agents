@@ -1,0 +1,35 @@
+name: Basic Retry Mocked Eval
+agent: ../../../yaml/error-recovery/basic_retry.yaml
+
+# No-key smoke test for the retry-configured agent.
+# Consistent errors exhaust retries and propagate, so this suite uses normal
+# mock responses to verify the config loads and the agent runs end-to-end.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/error-recovery/basic_retry_mocked.yaml \
+#     --output target/eval/mocked/error-recovery/basic_retry_mocked
+#
+# Flow: user input -> mocked LLM response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Retry agent is ready and responding normally."
+
+scenarios:
+  - id: retry-agent-smoke
+    name: Retry config loads and agent responds
+    tags: [error-recovery, retry, mock, smoke]
+    language: en
+    turns:
+      - input: Hello, can you help me?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "responding normally"

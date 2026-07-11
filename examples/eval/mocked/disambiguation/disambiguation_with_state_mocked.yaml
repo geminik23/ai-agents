@@ -1,0 +1,36 @@
+name: Disambiguation With State Mocked Eval
+agent: ../../../yaml/disambiguation/disambiguation_with_state.yaml
+
+# Mocked disambiguation eval suite.
+# Verifies ambiguous cancel triggers disambiguation with multiple intent options.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/disambiguation/disambiguation_with_state_mocked.yaml \
+#     --output target/eval/mocked/disambiguation/disambiguation_with_state_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "no"
+        - '{"is_ambiguous":true,"confidence":0.3,"ambiguity_type":"multiple_intents","reasoning":"cancel could mean order or subscription","what_is_unclear":["intent"],"detected_language":"en"}'
+        - '{"question":"What would you like to cancel?","options":[{"id":"cancel_order","label":"Cancel an order","description":"Cancel a specific order"},{"id":"cancel_subscription","label":"Cancel subscription","description":"Cancel your subscription"}]}'
+
+scenarios:
+  - id: ambiguous-cancel-triggers-clarification
+    name: Ambiguous cancel triggers disambiguation clarification
+    tags: [mock, examples, yaml, disambiguation, state-machine]
+    language: en
+    turns:
+      - input: Cancel
+        assert:
+          all:
+            - response_not_empty: true
+            - disambiguation: triggered
+            - response_contains: "cancel"

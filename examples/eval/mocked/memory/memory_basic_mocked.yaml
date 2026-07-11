@@ -1,0 +1,39 @@
+name: Memory Basic Mocked Eval
+agent: ../../../yaml/memory/memory_basic.yaml
+
+# Mocked memory eval suite.
+# Verifies multi-turn conversation works with in-memory storage.
+# The mock LLM ignores conversation history, so we verify structural response evidence only.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/memory/memory_basic_mocked.yaml \
+#     --output target/eval/mocked/memory/memory_basic_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "I will remember that your name is Alex."
+      - "Your name is Alex, as you mentioned earlier."
+
+scenarios:
+  - id: memory-basic-multi-turn
+    name: In-memory agent responds across multiple turns
+    tags: [mock, examples, yaml, memory]
+    language: en
+    turns:
+      - input: My name is Alex and I work as a backend engineer.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Alex"
+      - input: What is my name?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Alex"

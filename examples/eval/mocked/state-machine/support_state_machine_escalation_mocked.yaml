@@ -1,0 +1,41 @@
+name: Support State Machine Escalation Mocked Eval
+agent: ../../../yaml/state-machine/support_state_machine.yaml
+
+# Mocked state-machine eval suite.
+# Verifies global escalation routing with a deterministic router response.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/support_state_machine_escalation_mocked.yaml \
+#     --output target/eval/mocked/state-machine/support_state_machine_escalation_mocked
+#
+# Flow: greeting -> global escalation
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greeting stale response."
+        - "Escalation response for a manager request."
+      router:
+        - "1"
+
+scenarios:
+  - id: support-state-machine-routes-escalation
+    name: Global transition routes manager request to escalation
+    tags: [mock, examples, yaml, state-machine, support, escalation]
+    language: en
+    turns:
+      - input: I am furious. Get me a manager now.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: escalation
+            - state_history_contains: escalation
+            - response_contains: "Escalation response"
+            - response_not_contains: "Greeting stale"

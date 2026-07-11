@@ -171,6 +171,8 @@ mod tests {
                     index: 0,
                     input: RedactedString::redacted("[redacted]"),
                     response: RedactedString::redacted("[redacted]"),
+                    response_present: true,
+                    runtime_error: None,
                     state: None,
                     metadata: None,
                     evidence: crate::evidence::TurnEvidence {
@@ -179,6 +181,7 @@ mod tests {
                         state_history: Vec::new(),
                         context: serde_json::Value::Null,
                         tool_executions: Vec::new(),
+                        approvals: Vec::new(),
                         skill: None,
                         disambiguation: None,
                         facts: None,
@@ -203,6 +206,23 @@ mod tests {
             duration_ms: latency,
             retries_used: 0,
         }
+    }
+
+    #[test]
+    fn retained_errored_turns_count_toward_latency() {
+        let mut result = scenario(
+            "error",
+            ScenarioStatus::Error {
+                message: "[redacted]".to_string(),
+            },
+            25,
+        );
+        result.attempts[0].turns[0].response_present = false;
+        result.attempts[0].turns[0].runtime_error = Some(RedactedString::redacted("[redacted]"));
+        let metrics = compute_metrics(&[result]);
+        assert_eq!(metrics.errors, 1);
+        assert_eq!(metrics.total_turns, 1);
+        assert_eq!(metrics.avg_latency_ms, 25.0);
     }
 
     #[test]

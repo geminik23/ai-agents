@@ -1,0 +1,69 @@
+name: Tools and Skills Metrics Mocked Eval
+agent: ../../../yaml/observability/tools_and_skills_metrics.yaml
+
+# No-key mocked eval for tool and skill observability.
+# Verifies that skill routing, skill prompt steps, and calculator tool calls
+# are all recorded by observability.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/observability/tools_and_skills_metrics_mocked.yaml \
+#     --output target/eval/mocked/observability/tools_and_skills_metrics_mocked
+#
+# Flow: math input -> router skill routing -> router extract -> calculator tool -> router explain -> response
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose, tool, status]
+  export:
+    formats: [json]
+    path: ./target/eval/mocked/observability/tools_and_skills_metrics_mocked/observability
+    write_report: true
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "measured_math"
+        - "42 * 17"
+        - "42 * 17 equals 714."
+      default:
+        - "I can help with that."
+
+scenarios:
+  - id: tools-skills-metrics-math
+    name: Skill routing, skill prompt, and tool call are observed
+    tags: [observability, skills, tools, mock]
+    language: en
+    turns:
+      - input: Calculate 42 * 17
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "714"
+            - tool_called:
+                id: calculator
+                executed: true
+                success: true
+                source_in: [skill]
+            - observability:
+                total_tool_calls_lte: 1
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

@@ -1,0 +1,56 @@
+name: Live Example - Tools Sleep Wait
+agent: ../../../../yaml/tools/sleep_wait.yaml
+
+# Live eval suite for a short bounded wait.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/sleep_wait_live.yaml \
+#     --output target/eval/live/examples/tools/sleep_wait \
+#     --real-llm
+#
+# Flow: short wait request -> live model -> policy-bounded sleep evidence -> brief answer
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 10000
+  timeout_per_scenario_ms: 30000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: sleep-wait-stays-bounded
+    name: Real model uses a short bounded sleep
+    tags: [live, examples, yaml, tools, utility, real-llm, sleep]
+    language: en
+    turns:
+      - input: "Before answering, call the sleep tool with duration_ms 25 for a short eval pause, then answer briefly and include the word done."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: sleep
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: duration_ms
+                  lte: 1000
+            - tool_called:
+                id: sleep
+                result_path:
+                  path: max_duration_ms
+                  eq: 1000
+            - response_contains_any:
+                - "done"
+                - "Done"
+            - response_not_contains:
+                - "shell command"
+                - "terminal command"
+                - "ran a command"

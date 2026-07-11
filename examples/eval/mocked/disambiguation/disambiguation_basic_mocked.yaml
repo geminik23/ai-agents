@@ -1,0 +1,38 @@
+name: Disambiguation Basic Mocked Eval
+agent: ../../../yaml/disambiguation/disambiguation_basic.yaml
+
+# Mocked disambiguation eval suite.
+# Verifies that vague input triggers a clarification question.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/disambiguation/disambiguation_basic_mocked.yaml \
+#     --output target/eval/mocked/disambiguation/disambiguation_basic_mocked
+#
+# Flow: social check (no) -> detection (ambiguous) -> clarification question
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "no"
+        - '{"is_ambiguous":true,"confidence":0.3,"ambiguity_type":"missing_target","reasoning":"unclear what to send","what_is_unclear":["target"],"detected_language":"en"}'
+        - '{"question":"What would you like me to send?","options":[{"id":"report","label":"The report","description":"Send the current report"},{"id":"email","label":"An email","description":"Send an email"}]}'
+
+scenarios:
+  - id: ambiguous-input-triggers-clarification
+    name: Vague input triggers disambiguation clarification
+    tags: [mock, examples, yaml, disambiguation]
+    language: en
+    turns:
+      - input: Send it
+        assert:
+          all:
+            - response_not_empty: true
+            - disambiguation: triggered
+            - response_contains: "send"

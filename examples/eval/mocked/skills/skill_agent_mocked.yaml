@@ -1,0 +1,83 @@
+name: Skill Agent Mocked Eval
+agent: ../../../yaml/skills/skill_agent.yaml
+
+# Mocked skill eval suite.
+# Verifies combined inline and external skill paths through the main skill agent YAML.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/skills/skill_agent_mocked.yaml \
+#     --output target/eval/mocked/skills/skill_agent_mocked
+#
+# Flow: greeting skill -> math_helper skill -> weather_clothes skill
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "greeting"
+      - "Hello! It is great to see you."
+      - "math_helper"
+      - "15 * 7 + 3"
+      - "15 * 7 + 3 equals 108."
+      - "weather_clothes"
+      - "It is sunny and 18 degrees in Seoul, so wear a light jacket and comfortable layers."
+
+scenarios:
+  - id: skill-agent-routes-combined-skills
+    name: Combined skill agent routes inline, math, and weather paths
+    tags: [mock, examples, yaml, skills, tools]
+    language: en
+    turns:
+      - input: Hello!
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "great to see you"
+            - observability:
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+      - input: What is 15 * 7 + 3?
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: result
+                  gte: 108
+                  lte: 108
+            - response_contains: "108"
+      - input: What should I wear today?
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: echo
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: message
+                  contains: "temperature=18"
+            - response_contains: "Seoul"
+            - response_contains_any:
+                - "light jacket"
+                - "layers"

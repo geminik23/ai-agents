@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-use crate::evidence::{DisambiguationStatus, ToolExecutionRecord, TurnEvidence};
+use crate::evidence::{
+    ApprovalDecision, ApprovalEvidence, ApprovalTriggerEvidence, DisambiguationStatus,
+    ToolExecutionRecord, TurnEvidence,
+};
 use crate::judge::{JudgeAssertion, JudgeInput, JudgeResolver};
 
 /// Collection of assertion clauses evaluated against one turn.
@@ -44,6 +47,12 @@ pub struct Assertion {
     /// Tool call assertion in string or object form.
     #[serde(default)]
     pub tool_called: Option<ToolCalledAssertion>,
+    /// Approval request assertion with optional trigger and result filters.
+    #[serde(default)]
+    pub approval_requested: Option<ApprovalAssertion>,
+    /// Assertion that no approval request matches the optional filters.
+    #[serde(default)]
+    pub approval_not_requested: Option<ApprovalAssertion>,
     /// Tool ID that must not appear in tool evidence.
     #[serde(default)]
     pub tool_not_called: Option<String>,
@@ -146,6 +155,84 @@ pub struct ToolCalledObject {
     /// Path assertion over parsed tool output.
     #[serde(default)]
     pub result_path: Option<PathAssertion>,
+}
+
+/// Boolean or object form for approval assertions.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ApprovalAssertion {
+    Bool(bool),
+    Object(ApprovalAssertionObject),
+}
+
+/// Filters and counts for matching approval evidence.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ApprovalAssertionObject {
+    /// Exact number of matching approval records required.
+    #[serde(default)]
+    pub count: Option<usize>,
+    /// Minimum number of matching approval records required.
+    #[serde(default)]
+    pub count_gte: Option<usize>,
+    /// Maximum number of matching approval records required.
+    #[serde(default)]
+    pub count_lte: Option<usize>,
+    /// Trigger fields that must match one approval record.
+    #[serde(default)]
+    pub trigger: Option<ApprovalTriggerAssertion>,
+    /// Decision returned directly by the approval handler.
+    #[serde(default)]
+    pub raw_decision: Option<ApprovalDecision>,
+    /// Decision after runtime resolution.
+    #[serde(default)]
+    pub effective_decision: Option<ApprovalDecision>,
+    /// Exact localized approval message.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Required substrings in the localized approval message.
+    #[serde(default)]
+    pub message_contains: Option<StringList>,
+    /// Exact effective rejection reason.
+    #[serde(default)]
+    pub rejection_reason: Option<String>,
+    /// Required substring in an effective rejection reason.
+    #[serde(default)]
+    pub rejection_reason_contains: Option<String>,
+    /// Exact effective resolution error.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// Required substring in an effective resolution error.
+    #[serde(default)]
+    pub error_contains: Option<String>,
+    /// Path assertion over original tool arguments.
+    #[serde(default, alias = "args_original")]
+    pub original_args: Option<PathAssertion>,
+    /// Path assertion over modified tool arguments.
+    #[serde(default, alias = "args_modified")]
+    pub modified_args: Option<PathAssertion>,
+    /// Path assertion over effective tool arguments.
+    #[serde(default, alias = "args_effective")]
+    pub effective_args: Option<PathAssertion>,
+}
+
+/// Filters for normalized approval trigger fields.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ApprovalTriggerAssertion {
+    /// Normalized trigger type: tool, condition, or state.
+    #[serde(default, rename = "type")]
+    pub type_name: Option<String>,
+    /// Tool or condition name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Matched condition expression.
+    #[serde(default)]
+    pub matched: Option<String>,
+    /// Source state for state transition approval.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Destination state for state transition approval.
+    #[serde(default)]
+    pub to: Option<String>,
 }
 
 /// Expected disambiguation state for an assertion.
@@ -572,6 +659,12 @@ async fn evaluate_simple(
     if let Some(tool) = &assertion.tool_called {
         evaluate_tool_called(tool, evidence, details);
     }
+    if let Some(approval) = &assertion.approval_requested {
+        evaluate_approval_requested(approval, evidence, details);
+    }
+    if let Some(approval) = &assertion.approval_not_requested {
+        evaluate_approval_not_requested(approval, evidence, details);
+    }
     if let Some(tool_id) = &assertion.tool_not_called {
         let passed = !evidence
             .tool_executions
@@ -808,6 +901,187 @@ fn evaluate_tool_called(
         json!(assertion),
         details,
     );
+}
+
+fn evaluate_approval_requested(
+    assertion: &ApprovalAssertion,
+    evidence: &TurnEvidence,
+    details: &mut Vec<AssertionResultDetail>,
+) {
+    let (matched, expected) = approval_match_counts(assertion, &evidence.approvals);
+    let passed = match assertion {
+        ApprovalAssertion::Bool(expected) => (matched > 0) == *expected,
+        ApprovalAssertion::Object(object) => {
+            matched > 0
+                && object.count.is_none_or(|count| matched == count)
+                && object.count_gte.is_none_or(|count| matched >= count)
+                && object.count_lte.is_none_or(|count| matched <= count)
+        }
+    };
+    push_bool(
+        "approval_requested",
+        passed,
+        json!({"matched_count": matched, "total_count": evidence.approvals.len()}),
+        expected,
+        details,
+    );
+}
+
+fn evaluate_approval_not_requested(
+    assertion: &ApprovalAssertion,
+    evidence: &TurnEvidence,
+    details: &mut Vec<AssertionResultDetail>,
+) {
+    let (matched, expected) = approval_match_counts(assertion, &evidence.approvals);
+    let not_requested = matched == 0;
+    let passed = match assertion {
+        ApprovalAssertion::Bool(expected) => not_requested == *expected,
+        ApprovalAssertion::Object(_) => not_requested,
+    };
+    push_bool(
+        "approval_not_requested",
+        passed,
+        json!({"matched_count": matched, "total_count": evidence.approvals.len()}),
+        expected,
+        details,
+    );
+}
+
+fn approval_match_counts(
+    assertion: &ApprovalAssertion,
+    approvals: &[ApprovalEvidence],
+) -> (usize, Value) {
+    match assertion {
+        ApprovalAssertion::Bool(expected) => (approvals.len(), json!(expected)),
+        ApprovalAssertion::Object(object) => {
+            let count = approvals
+                .iter()
+                .filter(|approval| approval_record_matches(approval, object))
+                .count();
+            (count, approval_assertion_summary(object))
+        }
+    }
+}
+
+fn approval_record_matches(
+    approval: &ApprovalEvidence,
+    assertion: &ApprovalAssertionObject,
+) -> bool {
+    assertion
+        .trigger
+        .as_ref()
+        .is_none_or(|trigger| approval_trigger_matches(&approval.trigger, trigger))
+        && assertion
+            .raw_decision
+            .is_none_or(|decision| approval.raw_decision == decision)
+        && assertion
+            .effective_decision
+            .is_none_or(|decision| approval.effective_decision == decision)
+        && assertion
+            .message
+            .as_ref()
+            .is_none_or(|message| approval.message == *message)
+        && assertion.message_contains.as_ref().is_none_or(|items| {
+            items
+                .items()
+                .iter()
+                .all(|item| approval.message.contains(item))
+        })
+        && assertion
+            .rejection_reason
+            .as_ref()
+            .is_none_or(|reason| approval.rejection_reason.as_ref() == Some(reason))
+        && assertion
+            .rejection_reason_contains
+            .as_ref()
+            .is_none_or(|text| {
+                approval
+                    .rejection_reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.contains(text))
+            })
+        && assertion
+            .error
+            .as_ref()
+            .is_none_or(|error| approval.error.as_ref() == Some(error))
+        && assertion.error_contains.as_ref().is_none_or(|text| {
+            approval
+                .error
+                .as_ref()
+                .is_some_and(|error| error.contains(text))
+        })
+        && argument_path_matches(
+            approval.original_args.as_ref(),
+            assertion.original_args.as_ref(),
+        )
+        && argument_path_matches(
+            approval.modified_args.as_ref(),
+            assertion.modified_args.as_ref(),
+        )
+        && argument_path_matches(
+            approval.effective_args.as_ref(),
+            assertion.effective_args.as_ref(),
+        )
+}
+
+fn argument_path_matches(value: Option<&Value>, assertion: Option<&PathAssertion>) -> bool {
+    assertion.is_none_or(|assertion| value.is_some_and(|value| path_matches(value, assertion)))
+}
+
+fn approval_trigger_matches(
+    trigger: &ApprovalTriggerEvidence,
+    assertion: &ApprovalTriggerAssertion,
+) -> bool {
+    let (type_name, name, matched, from, to) = match trigger {
+        ApprovalTriggerEvidence::Tool { name } => ("tool", Some(name.as_str()), None, None, None),
+        ApprovalTriggerEvidence::Condition { name, matched } => (
+            "condition",
+            Some(name.as_str()),
+            Some(matched.as_str()),
+            None,
+            None,
+        ),
+        ApprovalTriggerEvidence::State { from, to } => {
+            ("state", None, None, from.as_deref(), Some(to.as_str()))
+        }
+    };
+    assertion
+        .type_name
+        .as_deref()
+        .is_none_or(|value| value == type_name)
+        && assertion
+            .name
+            .as_deref()
+            .is_none_or(|value| Some(value) == name)
+        && assertion
+            .matched
+            .as_deref()
+            .is_none_or(|value| Some(value) == matched)
+        && assertion
+            .from
+            .as_deref()
+            .is_none_or(|value| Some(value) == from)
+        && assertion
+            .to
+            .as_deref()
+            .is_none_or(|value| Some(value) == to)
+}
+
+fn approval_assertion_summary(assertion: &ApprovalAssertionObject) -> Value {
+    json!({
+        "count": assertion.count,
+        "count_gte": assertion.count_gte,
+        "count_lte": assertion.count_lte,
+        "trigger": assertion.trigger,
+        "raw_decision": assertion.raw_decision,
+        "effective_decision": assertion.effective_decision,
+        "message_check": assertion.message.is_some() || assertion.message_contains.is_some(),
+        "rejection_reason_check": assertion.rejection_reason.is_some() || assertion.rejection_reason_contains.is_some(),
+        "error_check": assertion.error.is_some() || assertion.error_contains.is_some(),
+        "original_args_path": assertion.original_args.as_ref().map(|value| value.path.as_str()),
+        "modified_args_path": assertion.modified_args.as_ref().map(|value| value.path.as_str()),
+        "effective_args_path": assertion.effective_args.as_ref().map(|value| value.path.as_str()),
+    })
 }
 
 fn serde_plain_source(source: &crate::evidence::ToolExecutionSource) -> String {
@@ -1342,6 +1616,20 @@ mod tests {
                 duration_ms: 1,
                 observability_span_id: None,
             }],
+            approvals: vec![ApprovalEvidence {
+                request_id: "approval-1".to_string(),
+                trigger: ApprovalTriggerEvidence::Tool {
+                    name: "transfer".to_string(),
+                },
+                raw_decision: ApprovalDecision::Modified,
+                effective_decision: ApprovalDecision::Modified,
+                original_args: Some(json!({"amount": 100, "currency": "USD"})),
+                modified_args: Some(json!({"amount": 25, "currency": "USD"})),
+                effective_args: Some(json!({"amount": 25, "currency": "USD"})),
+                message: "Approve transfer for VIP customer?".to_string(),
+                rejection_reason: None,
+                error: None,
+            }],
             skill: None,
             disambiguation: None,
             facts: Some(FactsEvidence {
@@ -1413,6 +1701,132 @@ mod tests {
             },
         )
         .await;
+        assert!(matches!(result, AssertionOutcome::Passed(_)));
+    }
+
+    #[tokio::test]
+    async fn approval_requested_matches_all_constraints_on_one_record() {
+        let assertion = Assertion {
+            approval_requested: Some(ApprovalAssertion::Object(ApprovalAssertionObject {
+                count: Some(1),
+                trigger: Some(ApprovalTriggerAssertion {
+                    type_name: Some("tool".to_string()),
+                    name: Some("transfer".to_string()),
+                    ..Default::default()
+                }),
+                raw_decision: Some(ApprovalDecision::Modified),
+                effective_decision: Some(ApprovalDecision::Modified),
+                message_contains: Some(StringList::One("VIP".to_string())),
+                original_args: Some(PathAssertion {
+                    path: "amount".to_string(),
+                    eq: Some(json!(100)),
+                    ..Default::default()
+                }),
+                effective_args: Some(PathAssertion {
+                    path: "amount".to_string(),
+                    eq: Some(json!(25)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let evidence = evidence();
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "ok",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, AssertionOutcome::Passed(_)));
+    }
+
+    #[tokio::test]
+    async fn approval_constraints_do_not_match_across_records_and_summaries_are_redacted() {
+        let mut evidence = evidence();
+        evidence.approvals.push(ApprovalEvidence {
+            request_id: "approval-2".to_string(),
+            trigger: ApprovalTriggerEvidence::Tool {
+                name: "transfer".to_string(),
+            },
+            raw_decision: ApprovalDecision::Rejected,
+            effective_decision: ApprovalDecision::Rejected,
+            original_args: Some(json!({"amount": 9999})),
+            modified_args: None,
+            effective_args: None,
+            message: "Secret second message".to_string(),
+            rejection_reason: Some("private rejection".to_string()),
+            error: None,
+        });
+        let assertion = Assertion {
+            approval_requested: Some(ApprovalAssertion::Object(ApprovalAssertionObject {
+                raw_decision: Some(ApprovalDecision::Rejected),
+                effective_args: Some(PathAssertion {
+                    path: "amount".to_string(),
+                    eq: Some(json!(25)),
+                    ..Default::default()
+                }),
+                message_contains: Some(StringList::One("Secret".to_string())),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "ok",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
+        let AssertionOutcome::Failed(details) = result else {
+            panic!("expected failed approval assertion");
+        };
+        let serialized = serde_json::to_string(&details).unwrap();
+        assert!(!serialized.contains("Secret"));
+        assert!(!serialized.contains("private rejection"));
+        assert!(!serialized.contains("25"));
+        assert!(!serialized.contains("9999"));
+    }
+
+    #[tokio::test]
+    async fn approval_not_requested_uses_trigger_filters() {
+        let assertion = Assertion {
+            approval_not_requested: Some(ApprovalAssertion::Object(ApprovalAssertionObject {
+                trigger: Some(ApprovalTriggerAssertion {
+                    type_name: Some("state".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let evidence = evidence();
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "ok",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
         assert!(matches!(result, AssertionOutcome::Passed(_)));
     }
 

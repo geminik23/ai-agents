@@ -1,0 +1,21 @@
+name: File Edit Approval Rejected Mocked Eval
+agent: ../../../yaml/tools/file_edit_review.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"file_edit","arguments":{"path":"./examples/fixtures/tool_examples/edit_target.txt","old_text":"Status: draft","new_text":"Status: reviewed","dry_run":false}}'
+      - "The edit was not applied because approval was rejected or unavailable."
+scenarios:
+  - id: file-edit-approval-rejected
+    tags: [tools, mutation, approval, deny, mock]
+    turns:
+      - input: Apply a file edit without approving it.
+        assert:
+          tool_called:
+            id: file_edit
+            executed: false
+            success: false

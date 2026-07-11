@@ -1,0 +1,48 @@
+name: Reasoning With State Mocked Eval
+agent: ../../../yaml/reasoning/reasoning_with_state.yaml
+
+# Mocked reasoning eval suite.
+# Verifies per-state reasoning overrides: greeting has no reasoning, analysis has CoT.
+# Single LLM (no llms block), so transition evaluator shares the default provider.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/reasoning/reasoning_with_state_mocked.yaml \
+#     --output target/eval/mocked/reasoning/reasoning_with_state_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      # Turn 1: greeting response + transition eval (no match, stay in greeting)
+      - "Hello! What can I help you with?"
+      - "0"
+      # Turn 2: greeting response + transition eval (match -> analysis) + analysis CoT response
+      - "Greeting stale response."
+      - "1"
+      - "<thinking>Python is great for prototyping while Rust offers memory safety. Trade-offs include speed vs development time.</thinking>Python is great for rapid prototyping, while Rust offers memory safety and performance."
+
+scenarios:
+  - id: per-state-reasoning-activates-cot
+    name: Greeting state skips reasoning, analysis state uses CoT
+    tags: [mock, examples, yaml, reasoning, state-machine]
+    language: en
+    turns:
+      - input: Hi there!
+        assert:
+          all:
+            - response_not_empty: true
+            - state: greeting
+            - response_contains: "Hello"
+      - input: Compare Python and Rust for web backends.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: analysis
+            - state_history_contains: analysis
+            - response_contains: "Python"
+            - response_contains: "Rust"

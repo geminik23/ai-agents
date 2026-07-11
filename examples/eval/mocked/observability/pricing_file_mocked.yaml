@@ -1,0 +1,56 @@
+name: Pricing File Mocked Eval
+agent: ../../../yaml/observability/pricing_file.yaml
+
+# No-key mocked eval for pricing-file observability.
+# Verifies that the pricing file loads and the agent records main_response
+# telemetry with cost estimation.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/observability/pricing_file_mocked.yaml \
+#     --output target/eval/mocked/observability/pricing_file_mocked
+#
+# Flow: user input -> mocked LLM response -> pricing file lookup -> cost report
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [model, purpose, status]
+  export:
+    formats: [json]
+    path: ./target/eval/mocked/observability/pricing_file_mocked/observability
+    write_report: true
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Pricing file loaded and cost metrics are ready."
+
+scenarios:
+  - id: pricing-file-smoke
+    name: Pricing file loads and agent responds with telemetry
+    tags: [observability, pricing, mock, smoke]
+    language: en
+    turns:
+      - input: Hello, what is the cost of this call?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "cost metrics"
+            - observability:
+                total_llm_calls_lte: 1
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

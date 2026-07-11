@@ -27,8 +27,8 @@ use ai_agents_disambiguation::{
     DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
 };
 use ai_agents_hitl::{
-    ApprovalHandler, ApprovalResult, ApprovalTrigger, HITLCheckResult, HITLEngine,
-    RejectAllHandler, TimeoutAction,
+    ApprovalHandler, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger, HITLCheckResult,
+    HITLEngine, RejectAllHandler, TimeoutAction,
 };
 use ai_agents_hooks::{AgentHooks, NoopHooks};
 use ai_agents_llm::LLMRegistry;
@@ -10049,45 +10049,93 @@ Respond in JSON format:
 
         self.hooks.on_approval_requested(&request).await;
 
-        let request_id = request.id.clone();
         let timeout = request.timeout;
 
-        let result = if let Some(duration) = timeout {
-            match tokio::time::timeout(duration, self.approval_handler.request_approval(request))
-                .await
+        let raw_result = if let Some(duration) = timeout {
+            match tokio::time::timeout(
+                duration,
+                self.approval_handler.request_approval(request.clone()),
+            )
+            .await
             {
                 Ok(result) => result,
                 Err(_) => ApprovalResult::timeout(),
             }
         } else {
-            self.approval_handler.request_approval(request).await
+            self.approval_handler
+                .request_approval(request.clone())
+                .await
         };
 
-        self.hooks.on_approval_result(&request_id, &result).await;
+        self.hooks
+            .on_approval_result(&request.id, &raw_result)
+            .await;
 
-        // Resolve timeout action
-        let result = match result {
-            ApprovalResult::Timeout => {
-                if let Some(ref engine) = self.hitl_engine {
-                    match engine.config().on_timeout {
-                        TimeoutAction::Approve => ApprovalResult::Approved,
-                        TimeoutAction::Reject => ApprovalResult::Rejected {
-                            reason: Some("Timeout".to_string()),
-                        },
-                        TimeoutAction::Error => {
-                            return Err(AgentError::Other("HITL approval timeout".to_string()));
+        let (outcome, effective_result): (ApprovalResolvedOutcome, Result<ApprovalResult>) =
+            match &raw_result {
+                ApprovalResult::Approved => (
+                    ApprovalResolvedOutcome::Approved,
+                    Ok(ApprovalResult::Approved),
+                ),
+                ApprovalResult::Rejected { reason } => (
+                    ApprovalResolvedOutcome::Rejected {
+                        reason: reason.clone(),
+                    },
+                    Ok(ApprovalResult::Rejected {
+                        reason: reason.clone(),
+                    }),
+                ),
+                ApprovalResult::Modified { changes } => (
+                    ApprovalResolvedOutcome::Modified {
+                        changes: changes.clone(),
+                    },
+                    Ok(ApprovalResult::Modified {
+                        changes: changes.clone(),
+                    }),
+                ),
+                ApprovalResult::Timeout => {
+                    if let Some(ref engine) = self.hitl_engine {
+                        match engine.config().on_timeout {
+                            TimeoutAction::Approve => (
+                                ApprovalResolvedOutcome::Approved,
+                                Ok(ApprovalResult::Approved),
+                            ),
+                            TimeoutAction::Reject => {
+                                let reason = Some("Timeout".to_string());
+                                (
+                                    ApprovalResolvedOutcome::Rejected {
+                                        reason: reason.clone(),
+                                    },
+                                    Ok(ApprovalResult::Rejected { reason }),
+                                )
+                            }
+                            TimeoutAction::Error => {
+                                let message = "HITL approval timeout".to_string();
+                                (
+                                    ApprovalResolvedOutcome::Error {
+                                        message: message.clone(),
+                                    },
+                                    Err(AgentError::Other(message)),
+                                )
+                            }
                         }
-                    }
-                } else {
-                    ApprovalResult::Rejected {
-                        reason: Some("Timeout (no engine)".to_string()),
+                    } else {
+                        let reason = Some("Timeout (no engine)".to_string());
+                        (
+                            ApprovalResolvedOutcome::Rejected {
+                                reason: reason.clone(),
+                            },
+                            Ok(ApprovalResult::Rejected { reason }),
+                        )
                     }
                 }
-            }
-            other => other,
-        };
+            };
 
-        Ok(result)
+        self.hooks
+            .on_approval_resolved(&request, &raw_result, &outcome)
+            .await;
+
+        effective_result
     }
 
     pub async fn check_state_hitl(&self, from: Option<&str>, to: &str) -> Result<bool> {
@@ -10634,6 +10682,174 @@ mod tests {
         async fn on_response(&self, _response: &AgentResponse) {
             self.responses.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    struct ApprovalRecordingHooks {
+        events: parking_lot::Mutex<Vec<String>>,
+    }
+
+    impl ApprovalRecordingHooks {
+        fn new() -> Self {
+            Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for ApprovalRecordingHooks {
+        async fn on_approval_result(&self, request_id: &str, result: &ApprovalResult) {
+            self.events.lock().push(format!(
+                "raw:{}:{}",
+                request_id,
+                approval_result_name(result)
+            ));
+        }
+
+        async fn on_approval_resolved(
+            &self,
+            request: &ai_agents_hitl::ApprovalRequest,
+            raw_result: &ApprovalResult,
+            outcome: &ApprovalResolvedOutcome,
+        ) {
+            self.events.lock().push(format!(
+                "resolved:{}:{}:{}",
+                request.id,
+                approval_result_name(raw_result),
+                approval_outcome_name(outcome)
+            ));
+        }
+    }
+
+    fn approval_result_name(result: &ApprovalResult) -> &'static str {
+        match result {
+            ApprovalResult::Approved => "approved",
+            ApprovalResult::Rejected { .. } => "rejected",
+            ApprovalResult::Modified { .. } => "modified",
+            ApprovalResult::Timeout => "timeout",
+        }
+    }
+
+    fn approval_outcome_name(outcome: &ApprovalResolvedOutcome) -> &'static str {
+        match outcome {
+            ApprovalResolvedOutcome::Approved => "approved",
+            ApprovalResolvedOutcome::Rejected { .. } => "rejected",
+            ApprovalResolvedOutcome::Modified { .. } => "modified",
+            ApprovalResolvedOutcome::Error { .. } => "error",
+        }
+    }
+
+    fn assert_correlated_approval_events(
+        events: &[String],
+        raw_status: &str,
+        outcome_status: &str,
+    ) {
+        assert_eq!(events.len(), 2);
+        let raw: Vec<_> = events[0].split(':').collect();
+        let resolved: Vec<_> = events[1].split(':').collect();
+        assert_eq!(raw[0], "raw");
+        assert_eq!(resolved[0], "resolved");
+        assert_eq!(raw[1], resolved[1]);
+        assert_eq!(raw[2], raw_status);
+        assert_eq!(resolved[2], raw_status);
+        assert_eq!(resolved[3], outcome_status);
+    }
+
+    fn approval_check() -> HITLCheckResult {
+        HITLCheckResult::required(
+            ApprovalTrigger::tool("test", serde_json::json!({})),
+            HashMap::new(),
+            "Approve?",
+            None,
+        )
+    }
+
+    fn agent_with_approval_result(
+        raw_result: ApprovalResult,
+        timeout_action: TimeoutAction,
+        hooks: Arc<ApprovalRecordingHooks>,
+    ) -> RuntimeAgent {
+        use ai_agents_hitl::{CallbackHandler, HITLConfig};
+
+        let mut config = HITLConfig::default();
+        config.on_timeout = timeout_action;
+        let handler = CallbackHandler::new(move |_| raw_result.clone());
+        AgentBuilder::new()
+            .system_prompt("Test HITL hooks.")
+            .llm(Arc::new(mock_with_response("done")))
+            .build()
+            .unwrap()
+            .with_hooks(hooks)
+            .with_hitl(HITLEngine::new(config), Arc::new(handler))
+    }
+
+    #[tokio::test]
+    async fn approval_hooks_expose_direct_effective_decisions_after_raw_results() {
+        let cases = vec![
+            (ApprovalResult::Approved, "approved"),
+            (
+                ApprovalResult::Rejected {
+                    reason: Some("denied".to_string()),
+                },
+                "rejected",
+            ),
+            (
+                ApprovalResult::Modified {
+                    changes: HashMap::from([("value".to_string(), serde_json::json!(2))]),
+                },
+                "modified",
+            ),
+        ];
+
+        for (raw_result, expected) in cases {
+            let hooks = Arc::new(ApprovalRecordingHooks::new());
+            let agent =
+                agent_with_approval_result(raw_result, TimeoutAction::Reject, hooks.clone());
+
+            let result = agent.request_hitl_approval(approval_check()).await.unwrap();
+
+            assert_eq!(approval_result_name(&result), expected);
+            assert_correlated_approval_events(&hooks.events(), expected, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn approval_hooks_expose_timeout_policy_decisions() {
+        for (timeout_action, expected) in [
+            (TimeoutAction::Approve, "approved"),
+            (TimeoutAction::Reject, "rejected"),
+        ] {
+            let hooks = Arc::new(ApprovalRecordingHooks::new());
+            let agent =
+                agent_with_approval_result(ApprovalResult::Timeout, timeout_action, hooks.clone());
+
+            let result = agent.request_hitl_approval(approval_check()).await.unwrap();
+
+            assert_eq!(approval_result_name(&result), expected);
+            assert_correlated_approval_events(&hooks.events(), "timeout", expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_error_fires_correlated_resolved_error_before_returning() {
+        let hooks = Arc::new(ApprovalRecordingHooks::new());
+        let agent = agent_with_approval_result(
+            ApprovalResult::Timeout,
+            TimeoutAction::Error,
+            hooks.clone(),
+        );
+
+        let error = agent
+            .request_hitl_approval(approval_check())
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("HITL approval timeout"));
+        assert_correlated_approval_events(&hooks.events(), "timeout", "error");
     }
 
     // Basic YAML → Build → Chat flow

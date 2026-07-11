@@ -1,0 +1,50 @@
+name: Builtin Context Mocked Eval
+agent: ../../../yaml/context/builtin_context.yaml
+
+# Mocked context eval suite.
+# Verifies built-in context sources populate stable runtime paths without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/context/builtin_context_mocked.yaml \
+#     --output target/eval/mocked/context/builtin_context_mocked
+#
+# Flow: built-in context refresh -> mocked response -> context assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "BuiltinContextAgent v1.0.0 has active time and session context."
+
+scenarios:
+  - id: builtin-context-populates-stable-fields
+    name: Built-in context exposes time, session, and agent fields
+    tags: [mock, examples, yaml, context]
+    language: en
+    turns:
+      - input: What built-in context can you see?
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: time.date
+                exists: true
+            - context_path:
+                path: time.year
+                exists: true
+            - context_path:
+                path: session.id
+                exists: true
+            - context_path:
+                path: agent_info.name
+                eq: "BuiltinContextAgent"
+            - context_path:
+                path: agent_info.version
+                eq: "1.0.0"
+            - response_contains: "BuiltinContextAgent"
+            - response_contains: "1.0.0"

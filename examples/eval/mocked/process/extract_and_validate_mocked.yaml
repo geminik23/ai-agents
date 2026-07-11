@@ -1,0 +1,54 @@
+name: Extract And Validate Mocked Eval
+agent: ../../../yaml/process/extract_and_validate.yaml
+
+# Mocked process eval suite.
+# Verifies entity extraction, validation, and context injection without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/process/extract_and_validate_mocked.yaml \
+#     --output target/eval/mocked/process/extract_and_validate_mocked
+#
+# Flow: normalized input -> router extraction JSON -> router validation JSON -> context-aware response
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - '{"email":"alice@example.com","order_number":"ORD-789","urgency":"high","issue_type":"shipping"}'
+        - '{"passes":true,"score":0.95,"issues":[]}'
+      default:
+        - "I found order ORD-789 for alice@example.com. This looks like a high-priority shipping issue."
+
+scenarios:
+  - id: extract-and-validate-stores-entities
+    name: Extraction stores support entities in context
+    tags: [mock, examples, yaml, process, extraction]
+    language: en
+    turns:
+      - input: "My email is alice@example.com and my order ORD-789 has not arrived. This is urgent."
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: extracted.email
+                eq: "alice@example.com"
+            - context_path:
+                path: extracted.order_number
+                eq: "ORD-789"
+            - context_path:
+                path: extracted.urgency
+                eq: "high"
+            - context_path:
+                path: extracted.issue_type
+                eq: "shipping"
+            - response_contains: "ORD-789"
+            - response_contains: "alice@example.com"
+            - response_contains_any:
+                - "high-priority"
+                - "shipping"

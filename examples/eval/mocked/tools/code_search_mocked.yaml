@@ -1,0 +1,21 @@
+name: Code Search Mocked Eval
+agent: ../../../yaml/tools/code_search.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"grep","arguments":{"pattern":"ToolExecutionContext","path":"./crates","output_mode":"files_with_matches"}}'
+      - "The symbol appears in crates/ai-agents-core/src/types.rs."
+scenarios:
+  - id: code-search
+    tags: [tools, search, mock]
+    turns:
+      - input: Find where ToolExecutionContext is defined.
+        assert:
+          response_contains: "types.rs"
+          tool_called:
+            id: grep
+            success: true

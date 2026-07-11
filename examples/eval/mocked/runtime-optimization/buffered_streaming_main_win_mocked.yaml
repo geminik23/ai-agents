@@ -1,0 +1,53 @@
+name: Buffered Streaming Main Win Mocked Eval
+agent: ../../../yaml/runtime-optimization/buffered_streaming.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a main streaming draft can commit when routing misses.
+#
+# Flow: streaming input -> buffered main branch + transition miss -> committed main response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  context:
+    request:
+      topic: general
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "General committed streaming response."
+      router:
+        - "0"
+
+scenarios:
+  - id: buffered-main-win
+    name: Buffered main branch emits committed response
+    tags: [runtime, optimization, branch, streaming]
+    language: en
+    turns:
+      - input: Hello there
+        stream: true
+        assert:
+          all:
+            - state: triage
+            - response_contains: "General committed"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: discarded
+                    assert:
+                      path: count
+                      gte: 1

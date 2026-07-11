@@ -1,0 +1,41 @@
+name: Support State Machine Technical Mocked Eval
+agent: ../../../yaml/state-machine/support_state_machine.yaml
+
+# Mocked state-machine eval suite.
+# Verifies the technical support branch with a deterministic router response.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/support_state_machine_technical_mocked.yaml \
+#     --output target/eval/mocked/state-machine/support_state_machine_technical_mocked
+#
+# Flow: greeting -> technical_support.gathering_info
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greeting stale response."
+        - "Technical support gathering response."
+      router:
+        - "2"
+
+scenarios:
+  - id: support-state-machine-routes-technical
+    name: Support machine routes technical issue to technical support
+    tags: [mock, examples, yaml, state-machine, support]
+    language: en
+    turns:
+      - input: I cannot log in to my account and I see an error.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: technical_support.gathering_info
+            - state_history_contains: technical_support.gathering_info
+            - response_contains: "Technical support"
+            - response_not_contains: "Greeting stale"

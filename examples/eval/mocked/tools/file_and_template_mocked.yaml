@@ -1,0 +1,86 @@
+name: File and Template Mocked Eval
+agent: ../../../yaml/tools/file_and_template.yaml
+
+# No-key mocked eval for rendering a preview and inspecting a fixture path.
+# The generic tool fixtures record both read-only calls and never mutate real files.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/tools/file_and_template_mocked.yaml \
+#     --output target/eval/mocked/tools/file_and_template_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"template","arguments":{"operation":"render","template":"Release: {{ version }}","data":{"version":"1.2.3"}}}'
+      - '{"tool":"file","arguments":{"operation":"info","path":"examples/fixtures/tool_examples/edit_target.txt"}}'
+      - "Rendered the preview 'Release: 1.2.3' and confirmed the fixture target exists. No file write was requested or performed."
+  tools:
+    template:
+      success: true
+      output:
+        rendered: "Release: 1.2.3"
+    file:
+      success: true
+      output:
+        exists: true
+        path: "examples/fixtures/tool_examples/edit_target.txt"
+        type: file
+
+scenarios:
+  - id: template-preview-and-file-info-stay-read-only
+    tags: [tools, template, file, read-only, fixture, mock]
+    turns:
+      - input: 'Render a preview of "Release: {{ version }}" with version 1.2.3, then inspect examples/fixtures/tool_examples/edit_target.txt without writing anything.'
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Release: 1.2.3"
+            - response_contains: "No file write was requested or performed"
+            - tool_called:
+                id: template
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+            - tool_called:
+                id: template
+                args_executed:
+                  path: operation
+                  eq: render
+            - tool_called:
+                id: template
+                result_path:
+                  path: rendered
+                  eq: "Release: 1.2.3"
+            - tool_called:
+                id: file
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+            - tool_called:
+                id: file
+                args_executed:
+                  path: operation
+                  eq: info
+            - tool_called:
+                id: file
+                args_executed:
+                  path: path
+                  eq: "examples/fixtures/tool_examples/edit_target.txt"
+            - tool_called:
+                id: file
+                result_path:
+                  path: exists
+                  eq: true
+            - tool_called:
+                id: file
+                result_path:
+                  path: type
+                  eq: file
+            - tool_not_called: command

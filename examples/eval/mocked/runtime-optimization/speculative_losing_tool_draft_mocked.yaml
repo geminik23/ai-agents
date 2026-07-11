@@ -1,0 +1,51 @@
+name: Speculative Losing Tool Draft Mocked Eval
+agent: ../../../yaml/runtime-optimization/losing_tool_draft.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that tool calls parsed from a losing draft do not execute.
+#
+# Flow: user input -> tool-call draft + transition branch -> route wins -> tool not called -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - '{"tool":"echo","arguments":{"message":"stale"}}'
+        - "Billing committed response."
+      router:
+        - "1"
+
+scenarios:
+  - id: losing-tool-draft
+    name: Losing draft tool call stays inert
+    tags: [runtime, optimization, branch, tool]
+    language: en
+    turns:
+      - input: I was charged twice
+        assert:
+          all:
+            - state: billing
+            - response_contains: "Billing committed"
+            - tool_not_called: echo
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: discarded
+                    assert:
+                      path: count
+                      gte: 1

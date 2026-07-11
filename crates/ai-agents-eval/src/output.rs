@@ -77,12 +77,19 @@ fn render_failures(result: &EvalResult) -> String {
                     .iter()
                     .filter(|r| !r.passed)
                     .collect();
-                if failed.is_empty() {
+                if failed.is_empty() && turn.runtime_error.is_none() {
                     continue;
                 }
                 out.push_str(&format!("### Turn {}\n\n", turn.index + 1));
                 out.push_str(&format!("Input: `{}`\n\n", turn.input.value));
-                out.push_str(&format!("Response: `{}`\n\n", turn.response.value));
+                if turn.response_present {
+                    out.push_str(&format!("Response: `{}`\n\n", turn.response.value));
+                } else {
+                    out.push_str("Response: _absent_\n\n");
+                }
+                if let Some(error) = &turn.runtime_error {
+                    out.push_str(&format!("Runtime error: `{}`\n\n", error.value));
+                }
                 for assertion in failed {
                     out.push_str(&format!(
                         "- `{}` failed: expected `{}`, actual `{}`\n",
@@ -186,6 +193,8 @@ mod tests {
                         index: 0,
                         input: RedactedString::redacted("[redacted]"),
                         response: RedactedString::redacted("[redacted]"),
+                        response_present: true,
+                        runtime_error: None,
                         state: None,
                         metadata: None,
                         evidence: crate::evidence::TurnEvidence {
@@ -196,6 +205,7 @@ mod tests {
                             state_history: Vec::new(),
                             context: serde_json::json!({"secret":"should-not-serialize"}),
                             tool_executions: Vec::new(),
+                            approvals: Vec::new(),
                             skill: None,
                             disambiguation: None,
                             facts: None,
@@ -217,6 +227,22 @@ mod tests {
             metrics: crate::metrics::EvalMetrics::default(),
             observability: None,
         }
+    }
+
+    #[test]
+    fn failure_output_renders_absent_response_and_redacted_runtime_error() {
+        let mut result = result();
+        let scenario = &mut result.scenarios[0];
+        scenario.status = ScenarioStatus::Error {
+            message: "[redacted]".to_string(),
+        };
+        let turn = &mut scenario.attempts[0].turns[0];
+        turn.response = RedactedString::plain("");
+        turn.response_present = false;
+        turn.runtime_error = Some(RedactedString::redacted("[redacted]"));
+        let output = render_failures(&result);
+        assert!(output.contains("Response: _absent_"));
+        assert!(output.contains("Runtime error: `[redacted]`"));
     }
 
     #[test]

@@ -1,0 +1,43 @@
+name: Pre Response Extractor Mocked Eval
+agent: ../../../yaml/runtime-optimization/pre_response_extractor.yaml
+
+# Mocked runtime optimization eval suite.
+# Verifies staged extractor context commits only through the selected pre-response route.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/runtime-optimization/pre_response_extractor_mocked.yaml \
+#     --output target/eval/mocked/runtime-optimization/pre_response_extractor_mocked
+#
+# Flow: user input -> staged extractor -> pre-response guard -> order_lookup response
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "A-12345"
+      default:
+        - "Order lookup flow is active for order A-12345."
+
+scenarios:
+  - id: pre-response-extractor-commits-order-id
+    name: Pre-response extractor stages and commits order context
+    tags: [mock, examples, yaml, runtime-optimization, state-machine]
+    language: en
+    turns:
+      - input: My order number is A-12345.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: order_lookup
+            - state_history_contains: order_lookup
+            - context_path:
+                path: order.id
+                eq: "A-12345"
+            - response_contains: "A-12345"
+            - response_contains: "Order lookup"

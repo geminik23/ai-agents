@@ -1,0 +1,127 @@
+name: HITL Multilingual Mocked Eval
+agent: ../../../yaml/hitl/hitl_multilingual.yaml
+
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - '{"language":"en"}'
+        - '{"language":"ko"}'
+        - '{"language":"ja"}'
+      default:
+        - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/en"}}'
+        - "The approved English HTTP request completed with mocked status 200."
+        - '{"tool":"http","arguments":{"method":"POST","url":"https://api.example.test/ko"}}'
+        - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/ja"}}'
+        - "タイムアウトで拒否されたため、日本語のHTTPリクエストは実行しませんでした。"
+  approvals:
+    rules:
+      - trigger:
+          type: tool
+          name: http
+          args:
+            method: GET
+            url: "https://api.example.test/en"
+        outcome: approve
+      - trigger:
+          type: tool
+          name: http
+          args:
+            method: POST
+            url: "https://api.example.test/ko"
+        outcome: reject
+        reason: "Mocked Korean rejection"
+      - trigger:
+          type: tool
+          name: http
+          args:
+            method: GET
+            url: "https://api.example.test/ja"
+        outcome: timeout
+    default:
+      outcome: unavailable
+  tools:
+    http:
+      success: true
+      output:
+        status: 200
+        status_text: OK
+        headers:
+          content-type: application/json
+        body: '{"source":"mocked-http","ok":true}'
+
+scenarios:
+  - id: localized-http-approval-decisions
+    name: Localized approval messages preserve approval outcomes
+    tags: [hitl, multilingual, http, mock]
+    turns:
+      - input: "Fetch https://api.example.test/en with GET."
+        assert:
+          all:
+            - context_path:
+                path: detection.language
+                eq: en
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: tool
+                  name: http
+                message: "Approve GET request to https://api.example.test/en?"
+                raw_decision: approved
+                effective_decision: approved
+            - tool_called:
+                id: http
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: url
+                  eq: "https://api.example.test/en"
+                result_path:
+                  path: body
+                  contains: mocked-http
+      - input: "https://api.example.test/ko에 POST 요청을 보내 주세요."
+        assert:
+          all:
+            - context_path:
+                path: detection.language
+                eq: ko
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: tool
+                  name: http
+                message: "https://api.example.test/ko에 POST 요청을 승인하시겠습니까?"
+                raw_decision: rejected
+                effective_decision: rejected
+                rejection_reason: "Mocked Korean rejection"
+            - tool_called:
+                id: http
+                count: 1
+                executed: false
+                success: false
+      - input: "https://api.example.test/jaへGETリクエストを送信してください。"
+        assert:
+          all:
+            - context_path:
+                path: detection.language
+                eq: ja
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: tool
+                  name: http
+                message: "https://api.example.test/jaへのGETリクエストを承認しますか？"
+                raw_decision: timeout
+                effective_decision: rejected
+            - tool_called:
+                id: http
+                count: 1
+                executed: false
+                success: false

@@ -1,0 +1,42 @@
+name: Streaming Mocked Eval
+agent: ../../../yaml/basic/simple_chat_stream.yaml
+
+# Streaming mocked evaluation suite.
+# Use this pattern when you want to verify the streaming YAML example without an API key.
+# The mock provider splits this response into multiple stream chunks.
+# The runner collects those chunks into a final response before assertions run.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --agent examples/yaml/basic/simple_chat_stream.yaml \
+#     --scenarios examples/eval/mocked/basic/simple_chat_streaming_mocked.yaml \
+#     --output target/eval/mocked/basic/simple_chat_streaming_mocked
+#
+# Flow: scenario input -> mocked stream chunks -> collected response -> assertions -> reports
+settings:
+  timeout_per_turn_ms: 5000  # milliseconds to wait for the streamed turn. default: 30000
+  retries: 0                 # keep stream smoke tests deterministic. default: 0
+  isolation: scenario        # fresh runtime per attempt. default: scenario
+
+# The mock provider supports streaming and splits this text by words.
+# RuntimeAgent::chat_stream() receives multiple content chunks, then eval joins them.
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Streaming hello from the mocked provider."
+
+# `stream: true` uses RuntimeAgent::chat_stream().
+# Assertions inspect the collected final text, not each individual chunk.
+scenarios:
+  - id: streaming-smoke
+    name: Streaming response is collected and asserted
+    tags: [streaming, smoke]
+    language: en
+    turns:
+      - input: Hello over streaming
+        stream: true
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Streaming hello"

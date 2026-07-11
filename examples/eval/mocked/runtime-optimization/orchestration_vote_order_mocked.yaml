@@ -1,0 +1,50 @@
+name: Orchestration Vote Order Mocked Eval
+agent: ../../../yaml/runtime-optimization/orchestration_vote_order.yaml
+
+# Mocked runtime optimization eval suite.
+# Verifies bounded vote extraction keeps declaration-order tie breaking stable.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/runtime-optimization/orchestration_vote_order_mocked.yaml \
+#     --output target/eval/mocked/runtime-optimization/orchestration_vote_order_mocked
+#
+# Flow: writer/editor/reviewer child responses -> parallel vote extraction -> first declared vote wins tie
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Writer child response."
+        - "Editor child response."
+        - "Reviewer child response."
+      router:
+        - "Ship"
+        - "Revise"
+        - "Hold"
+
+scenarios:
+  - id: orchestration-vote-order-first-tie-break
+    name: Voting aggregation keeps first declaration as tie breaker
+    tags: [mock, examples, yaml, runtime-optimization, orchestration]
+    language: en
+    turns:
+      - input: Should we ship this draft?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Vote result: Ship"
+            - response_contains: "writer: Ship"
+            - response_contains: "editor: Revise"
+            - response_contains: "reviewer: Hold"
+            - orchestration:
+                type: concurrent
+                agents_include: [writer, editor, reviewer]
+            - context_path:
+                path: orchestration.type
+                eq: "concurrent"

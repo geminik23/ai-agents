@@ -1,0 +1,49 @@
+name: Speculative Parallel Transition Miss Mocked Eval
+agent: ../../../yaml/runtime-optimization/parallel_transition.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a missed parallel transition commits the main draft.
+#
+# Flow: user input -> draft branch + transition miss -> triage state -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Draft committed response."
+      router:
+        - "0"
+
+scenarios:
+  - id: parallel-transition-miss
+    name: Parallel route misses and main draft commits
+    tags: [runtime, optimization, branch, state]
+    language: en
+    turns:
+      - input: Hello there
+        assert:
+          all:
+            - state: triage
+            - response_contains: "Draft committed"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: discarded
+                    assert:
+                      path: count
+                      gte: 1

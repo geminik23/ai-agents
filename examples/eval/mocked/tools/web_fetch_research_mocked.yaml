@@ -1,0 +1,81 @@
+name: Web Fetch Research Mocked Eval
+agent: ../../../yaml/tools/web_fetch_research.yaml
+
+# No-key mocked eval for a policy-allowed bounded web fetch.
+# Flow: allowed public URL -> mocked web_fetch call -> fixture page -> focused summary
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/tools/web_fetch_research_mocked.yaml \
+#     --output target/eval/mocked/tools/web_fetch_research_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"web_fetch","arguments":{"url":"https://docs.rs/serde/latest/serde/","prompt":"What is Serde used for?","max_chars":1200,"max_response_bytes":4096}}'
+      - "The fixture page says Serde is a Rust framework for efficiently serializing and deserializing data structures."
+  tools:
+    web_fetch:
+      success: true
+      output:
+        url: "https://docs.rs/serde/latest/serde/"
+        final_url: "https://docs.rs/serde/latest/serde/"
+        status: 200
+        content_type: text/html
+        content: "Serde is a framework for serializing and deserializing Rust data structures efficiently and generically."
+        truncated: false
+        from_cache: false
+        redirects: []
+        extraction_prompt_used: true
+        extraction_available: true
+
+scenarios:
+  - id: web-fetch-allowed-page-returns-bounded-content
+    tags: [tools, web_fetch, policy, network, fixture, mock]
+    turns:
+      - input: Fetch https://docs.rs/serde/latest/serde/ and explain what Serde is used for.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "serializing and deserializing"
+            - response_contains: "Rust"
+            - tool_called:
+                id: web_fetch
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+            - tool_called:
+                id: web_fetch
+                args_executed:
+                  path: url
+                  eq: "https://docs.rs/serde/latest/serde/"
+            - tool_called:
+                id: web_fetch
+                args_executed:
+                  path: max_chars
+                  eq: 1200
+            - tool_called:
+                id: web_fetch
+                result_path:
+                  path: status
+                  eq: 200
+            - tool_called:
+                id: web_fetch
+                result_path:
+                  path: final_url
+                  eq: "https://docs.rs/serde/latest/serde/"
+            - tool_called:
+                id: web_fetch
+                result_path:
+                  path: content
+                  contains: "Rust data structures"
+            - tool_called:
+                id: web_fetch
+                result_path:
+                  path: truncated
+                  eq: false

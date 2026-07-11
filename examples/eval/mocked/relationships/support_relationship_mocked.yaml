@@ -1,0 +1,40 @@
+name: Support Relationship Mocked Eval
+agent: ../../../yaml/relationships/support_relationship.yaml
+
+# Mocked eval for the support relationship agent.
+# Verifies that a relationship is created for the actor after a turn.
+# The router LLM provides relationship evaluation JSON.
+# The eval runner isolates SQLite storage into a temp workspace.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/relationships/support_relationship_mocked.yaml \
+#     --output target/eval/mocked/relationships/support_relationship_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "I understand your frustration with the billing issue. Let me look into this for you right away."
+      router:
+        - '{"changes":[{"perspective":"agent_to_actor","dimension":"trust","delta":0.1,"confidence":0.8,"reason":"Customer reached out for help"}],"notable_event":null}'
+
+scenarios:
+  - id: support-relationship-created
+    name: Relationship is created for actor after a turn
+    tags: [mock, examples, yaml, relationships]
+    language: en
+    actor: user_1
+    turns:
+      - input: I have contacted support three times and this billing bug still is not fixed.
+        assert:
+          all:
+            - response_not_empty: true
+            - relationship:
+                exists: true
+                actor: user_1

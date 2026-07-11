@@ -1,0 +1,67 @@
+name: Live Example - Tools Diagnostics Review
+agent: ../../../../yaml/tools/diagnostics_review.yaml
+
+# Live eval suite for host-backed diagnostics using deterministic fixture data.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/diagnostics_review_live.yaml \
+#     --output target/eval/live/examples/tools/diagnostics_review \
+#     --real-llm
+#
+# Flow: diagnostics request -> fixture provider -> diagnostics tool evidence -> issue summary
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+  diagnostics:
+    available: true
+    items:
+      - path: crates/ai-agents-core/src/types.rs
+        line: 12
+        column: 5
+        severity: warning
+        source: eval-fixture
+        message: example diagnostic for live docs check
+        code: LIVE001
+
+scenarios:
+  - id: diagnostics-review-uses-fixture
+    name: Real model summarizes fixture-backed diagnostics
+    tags: [live, examples, yaml, tools, host-backed, fixture, real-llm, diagnostics]
+    language: en
+    turns:
+      - input: "Before answering, call the diagnostics tool with severity warning and max_results 5. Summarize the returned diagnostic and include its path."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: diagnostics
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: severity
+                  eq: warning
+                result_path:
+                  path: available
+                  eq: true
+            - tool_called:
+                id: diagnostics
+                result_path:
+                  path: count
+                  gte: 1
+            - response_contains_any:
+                - "LIVE001"
+                - "types.rs"
+                - "warning"
+                - "example diagnostic"

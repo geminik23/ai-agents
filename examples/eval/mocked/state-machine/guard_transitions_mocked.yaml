@@ -1,0 +1,62 @@
+name: Guard Transitions Mocked Eval
+agent: ../../../yaml/state-machine/guard_transitions.yaml
+
+# Mocked state-machine eval suite.
+# Verifies LLM extraction plus deterministic guard routing without live providers.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/guard_transitions_mocked.yaml \
+#     --output target/eval/mocked/state-machine/guard_transitions_mocked
+#
+# Flow: collect_name -> extract user.name -> guard to collect_email -> extract user.email -> guard to verify
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Name collection stale response."
+        - "Email collection response for Alice."
+        - "Email collection stale response."
+        - "Verify Alice and alice@example.com."
+      router:
+        - "Alice"
+        - "alice@example.com"
+
+scenarios:
+  - id: guard-transitions-use-extracted-context
+    name: Extracted context values fire deterministic guard transitions
+    tags: [mock, examples, yaml, state-machine, guard, context]
+    language: en
+    turns:
+      - input: My name is Alice.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: collect_email
+            - state_history_contains: collect_email
+            - context_path:
+                path: user.name
+                eq: "Alice"
+            - response_contains: "Alice"
+      - input: My email is alice@example.com.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: verify
+            - state_history_contains: verify
+            - context_path:
+                path: user.name
+                eq: "Alice"
+            - context_path:
+                path: user.email
+                eq: "alice@example.com"
+            - context_path:
+                path: user.verified
+                eq: false
+            - response_contains: "alice@example.com"

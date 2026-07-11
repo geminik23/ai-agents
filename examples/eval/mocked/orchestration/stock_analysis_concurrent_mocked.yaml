@@ -1,0 +1,44 @@
+name: Stock Analysis Concurrent Mocked Eval
+agent: ../../../yaml/orchestration/stock_analysis_concurrent.yaml
+
+# Mocked eval suite for the concurrent orchestration pattern.
+# Three analysts (fundamental, technical, sentiment) run in parallel.
+# The router LLM synthesizes their results via llm_synthesis aggregation.
+# Child agents share the parent LLM registry and use the "default" alias.
+# The synthesizer uses the "router" alias.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/orchestration/stock_analysis_concurrent_mocked.yaml \
+#     --output target/eval/mocked/orchestration/stock_analysis_concurrent_mocked
+#
+# Flow: analyze (fundamental + technical + sentiment in parallel) -> router synthesis -> response
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Fundamental analysis: strong earnings and revenue growth."
+        - "Technical analysis: bullish price trend with support at key levels."
+        - "Sentiment analysis: positive investor sentiment with recent catalysts."
+      router:
+        - "Combined analysis shows strong fundamentals, bullish technicals, and positive sentiment."
+
+scenarios:
+  - id: concurrent-analysts-run-in-parallel
+    name: Three analysts analyze a stock concurrently and results are synthesized
+    tags: [mock, examples, yaml, orchestration, concurrent]
+    language: en
+    turns:
+      - input: Analyze AAPL
+        assert:
+          all:
+            - response_not_empty: true
+            - orchestration:
+                type: concurrent
+                agents_include: [fundamental, technical, sentiment]

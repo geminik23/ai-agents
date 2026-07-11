@@ -1,0 +1,51 @@
+name: Runtime Context Mocked Eval
+agent: ../../../yaml/context/runtime_context.yaml
+
+# Mocked context eval suite.
+# Verifies runtime context injection without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/context/runtime_context_mocked.yaml \
+#     --output target/eval/mocked/context/runtime_context_mocked
+#
+# Flow: fixture context -> prompt template context -> mocked response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  context:
+    user:
+      name: Ada
+      language: French
+      role: platform engineer
+  llm:
+    mode: mock
+    responses:
+      - "Bonjour Ada. I will adapt the answer for a platform engineer."
+
+scenarios:
+  - id: runtime-context-injects-user-profile
+    name: Runtime context values are available during the turn
+    tags: [mock, examples, yaml, context]
+    language: en
+    turns:
+      - input: Say hello using my profile.
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: user.name
+                eq: "Ada"
+            - context_path:
+                path: user.language
+                eq: "French"
+            - context_path:
+                path: user.role
+                eq: "platform engineer"
+            - response_contains: "Ada"
+            - response_contains_any:
+                - "platform engineer"
+                - "Bonjour"

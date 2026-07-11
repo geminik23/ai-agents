@@ -1,0 +1,48 @@
+name: Speculative Skill No Match Mocked Eval
+agent: ../../../yaml/runtime-optimization/speculative_skill_routing.yaml
+
+# Speculative branch evaluation suite.
+# Use this no-key suite to verify that a no-match skill branch safely commits the main draft.
+#
+# Flow: user input -> draft branch + skill selection -> no skill -> main draft response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Plain main response."
+      router:
+        - "none"
+
+scenarios:
+  - id: skill-routing-no-match
+    name: No skill match commits the main draft
+    tags: [runtime, optimization, branch, skill]
+    language: en
+    turns:
+      - input: Say hello normally
+        assert:
+          all:
+            - response_contains: "Plain main"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      branch_status: discarded
+                    assert:
+                      path: count
+                      gte: 1

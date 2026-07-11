@@ -1,0 +1,51 @@
+name: Two State Greeting Mocked Eval
+agent: ../../../yaml/state-machine/two_state_greeting.yaml
+
+# Mocked state-machine eval suite.
+# Verifies the simplest LLM-evaluated state transitions without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/state-machine/two_state_greeting_mocked.yaml \
+#     --output target/eval/mocked/state-machine/two_state_greeting_mocked
+#
+# Flow: greeting response -> router chooses helping -> helping response -> router chooses greeting
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Greeting stale response."
+        - "Helping response for the order issue."
+        - "Helping closure response."
+        - "Greeting reset response."
+      router:
+        - "1"
+        - "1"
+
+scenarios:
+  - id: two-state-greeting-routes-help-and-back
+    name: Two-state example transitions from greeting to helping and back
+    tags: [mock, examples, yaml, state-machine]
+    language: en
+    turns:
+      - input: I need help with my order.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: helping
+            - state_history_contains: helping
+            - response_contains: "Helping response"
+            - response_not_contains: "Greeting stale"
+      - input: Thanks, that is all.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: greeting
+            - state_history_contains: greeting
+            - response_contains: "Greeting reset"

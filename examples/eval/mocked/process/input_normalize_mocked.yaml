@@ -1,0 +1,47 @@
+name: Input Normalize Mocked Eval
+agent: ../../../yaml/process/input_normalize.yaml
+
+# Mocked process eval suite.
+# Verifies the normalization example and its validation rejection path without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/process/input_normalize_mocked.yaml \
+#     --output target/eval/mocked/process/input_normalize_mocked
+#
+# Flow: raw input -> normalize -> validate -> mocked response or rejection -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "\"hello world\"\nNormalized whitespace was received."
+
+scenarios:
+  - id: input-normalize-collapses-whitespace
+    name: Normalized input reaches the response path
+    tags: [mock, examples, yaml, process]
+    language: en
+    turns:
+      - input: "   hello     world   "
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "hello world"
+            - response_not_contains: "hello     world"
+
+  - id: input-normalize-rejects-too-short-input
+    name: Validation rejects input shorter than the minimum length
+    tags: [mock, examples, yaml, process, validation]
+    language: en
+    turns:
+      - input: "x"
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Content too short"
+            - response_contains: "1 < 2"

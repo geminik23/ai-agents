@@ -1,0 +1,37 @@
+name: Disambiguation Agent Clear Mocked Eval
+agent: ../../../yaml/disambiguation/disambiguation_agent.yaml
+
+# Mocked disambiguation eval suite.
+# Verifies direct tool call skips disambiguation via complete_tool_call skip rule.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/disambiguation/disambiguation_agent_clear_mocked.yaml \
+#     --output target/eval/mocked/disambiguation/disambiguation_agent_clear_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "no"
+        - "yes"
+      default:
+        - "42 * 17 = 714"
+
+scenarios:
+  - id: clear-tool-call-skips-disambiguation
+    name: Direct tool call skips disambiguation via complete_tool_call rule
+    tags: [mock, examples, yaml, disambiguation]
+    language: en
+    turns:
+      - input: What is 42 * 17?
+        assert:
+          all:
+            - response_not_empty: true
+            - no_disambiguation: true
+            - response_contains: "714"

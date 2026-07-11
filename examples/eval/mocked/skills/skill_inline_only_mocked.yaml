@@ -1,0 +1,49 @@
+name: Inline Skill Mocked Eval
+agent: ../../../yaml/skills/skill_inline_only.yaml
+
+# Mocked skill eval suite.
+# Verifies prompt-only inline skill routing and execution without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/skills/skill_inline_only_mocked.yaml \
+#     --output target/eval/mocked/skills/skill_inline_only_mocked
+#
+# Flow: skill router -> explain_simply prompt step -> response assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "explain_simply"
+      - "An AI agent is like a helpful robot helper that can decide which task to do next."
+
+scenarios:
+  - id: inline-skill-routes-and-responds
+    name: Inline skill routes beginner explanation request
+    tags: [mock, examples, yaml, skills]
+    language: en
+    turns:
+      - input: Explain an AI agent simply.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "helpful robot helper"
+            - observability:
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+

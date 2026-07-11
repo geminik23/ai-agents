@@ -1,0 +1,60 @@
+name: External Skill Mocked Eval
+agent: ../../../yaml/skills/skill_external_only.yaml
+
+# Mocked skill eval suite.
+# Verifies an external skill through the primary agent YAML, not by evaluating the skill file directly.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/skills/skill_external_only_mocked.yaml \
+#     --output target/eval/mocked/skills/skill_external_only_mocked
+#
+# Flow: skill router -> math_helper prompt step -> calculator tool -> explanation prompt
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "math_helper"
+      - "15 * 7 + 3"
+      - "15 * 7 + 3 equals 108."
+
+scenarios:
+  - id: external-skill-uses-math-helper
+    name: External math skill routes and uses calculator
+    tags: [mock, examples, yaml, skills, tools]
+    language: en
+    turns:
+      - input: What is 15 * 7 + 3?
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: result
+                  gte: 108
+                  lte: 108
+            - response_contains: "108"
+            - observability:
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+

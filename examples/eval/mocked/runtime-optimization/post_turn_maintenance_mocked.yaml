@@ -1,0 +1,61 @@
+name: Post Turn Maintenance Mocked Eval
+agent: ../../../yaml/runtime-optimization/post_turn_maintenance.yaml
+
+# Mocked runtime optimization eval suite.
+# Verifies background post-turn maintenance through observability evidence.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/runtime-optimization/post_turn_maintenance_mocked.yaml \
+#     --output target/eval/mocked/runtime-optimization/post_turn_maintenance_mocked
+#
+# Flow: user response -> background facts + relationship maintenance -> flush -> observability assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "I will remember that Jay prefers concise Rust examples."
+      router:
+        - '[{"category":"user_preference","content":"User prefers concise Rust examples","confidence":0.95,"actor_id":"user_1"}]'
+        - '{"changes":[{"perspective":"agent_to_actor","dimension":"familiarity","delta":0.2,"confidence":0.9,"reason":"actor shared a preference"}],"notable_event":{"description":"Actor shared Rust example preference","significance":0.7}}'
+
+scenarios:
+  - id: post-turn-maintenance-records-background-work
+    name: Background maintenance records facts and relationship purpose telemetry
+    tags: [mock, examples, yaml, runtime-optimization, observability]
+    language: en
+    actor: user_1
+    turns:
+      - input: My name is Jay and I prefer concise Rust examples.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Jay"
+            - observability:
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                  facts_extraction:
+                    path: count
+                    gte: 1
+                  relationship_update:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

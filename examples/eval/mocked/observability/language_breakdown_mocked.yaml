@@ -1,0 +1,62 @@
+name: Language Breakdown Mocked Eval
+agent: ../../../yaml/observability/language_breakdown.yaml
+
+# No-key mocked eval for language-dimension observability.
+# Verifies that the process detect stage stores detected language and that
+# observability groups metrics by language.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/observability/language_breakdown_mocked.yaml \
+#     --output target/eval/mocked/observability/language_breakdown_mocked
+#
+# Flow: input -> router detect language -> store detected_language -> default main LLM -> by_language report
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [language, model, purpose]
+  export:
+    formats: [json]
+    path: ./target/eval/mocked/observability/language_breakdown_mocked/observability
+    write_report: true
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - '{"language":"en","sentiment":"positive","intent":"greeting"}'
+      default:
+        - "Hello! I can help you with that."
+
+scenarios:
+  - id: language-breakdown-english
+    name: Language detection and by-language metrics are captured
+    tags: [observability, language, process, mock]
+    language: en
+    turns:
+      - input: Hello, can you help me?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Hello"
+            - context_path:
+                path: detected_language
+                eq: "en"
+            - observability:
+                total_llm_calls_lte: 2
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      language: en
+                    assert:
+                      path: count
+                      gte: 1

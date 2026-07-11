@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,6 +14,7 @@ use ai_agents_core::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
     ToolExecutionContext, ToolPolicyBindings, ToolResult,
 };
+use ai_agents_hitl::{ApprovalHandler, ApprovalRequest, ApprovalResult, ApprovalTrigger};
 use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
 use ai_agents_llm::{FinishReason, LLMRegistry};
 use ai_agents_runtime::spec::AgentSpec;
@@ -59,6 +61,194 @@ pub struct FixturesConfig {
     /// Optional mocked web-search responses for the web_search tool.
     #[serde(default)]
     pub web_search: Option<WebSearchFixtureConfig>,
+    /// Deterministic approval responses for human-in-the-loop requests.
+    #[serde(default)]
+    pub approvals: Option<ApprovalFixtureConfig>,
+}
+
+/// Deterministic approval behavior for one eval handler instance.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApprovalFixtureConfig {
+    /// Rules evaluated in declaration order.
+    #[serde(default)]
+    pub rules: Vec<ApprovalFixtureRule>,
+    /// Result returned when no rule matches.
+    #[serde(default)]
+    pub default: ApprovalFixtureOutcome,
+    /// Preferred language advertised to the HITL message resolver.
+    #[serde(default)]
+    pub preferred_language: Option<String>,
+    /// Supported languages advertised to the HITL message resolver.
+    #[serde(default)]
+    pub supported_languages: Option<Vec<String>>,
+}
+
+/// One ordered approval rule with an optional 1-based occurrence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalFixtureRule {
+    /// Trigger fields matched against the approval request.
+    pub trigger: ApprovalFixtureTrigger,
+    /// Match only this occurrence of the trigger predicate.
+    #[serde(default)]
+    pub occurrence: Option<NonZeroUsize>,
+    /// Result returned when the rule matches.
+    #[serde(flatten)]
+    pub outcome: ApprovalFixtureOutcome,
+}
+
+/// Approval trigger predicate used by an eval fixture rule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalFixtureTrigger {
+    Tool {
+        name: String,
+        #[serde(default)]
+        args: Option<Value>,
+    },
+    Condition {
+        name: String,
+        #[serde(default)]
+        matched: Option<String>,
+    },
+    StateTransition {
+        #[serde(default)]
+        from: Option<String>,
+        to: String,
+    },
+    DisambiguationEscalation {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+}
+
+/// Approval result produced by a fixture rule or fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ApprovalFixtureOutcome {
+    Approve,
+    Reject {
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    Modify {
+        #[serde(default)]
+        changes: HashMap<String, Value>,
+    },
+    Timeout,
+    #[default]
+    Unavailable,
+}
+
+/// Eval approval handler with isolated, concurrency-safe occurrence counters.
+pub struct FixtureApprovalHandler {
+    config: ApprovalFixtureConfig,
+    occurrences: Mutex<Vec<usize>>,
+}
+
+impl FixtureApprovalHandler {
+    pub fn new(config: ApprovalFixtureConfig) -> Self {
+        let rule_count = config.rules.len();
+        Self {
+            config,
+            occurrences: Mutex::new(vec![0; rule_count]),
+        }
+    }
+
+    fn select_outcome(&self, request: &ApprovalRequest) -> ApprovalFixtureOutcome {
+        let mut occurrences = self.occurrences.lock();
+        for (index, rule) in self.config.rules.iter().enumerate() {
+            if !rule.trigger.matches(&request.trigger) {
+                continue;
+            }
+            occurrences[index] += 1;
+            if rule
+                .occurrence
+                .is_none_or(|occurrence| occurrence.get() == occurrences[index])
+            {
+                return rule.outcome.clone();
+            }
+        }
+        self.config.default.clone()
+    }
+}
+
+impl ApprovalFixtureTrigger {
+    fn matches(&self, trigger: &ApprovalTrigger) -> bool {
+        match (self, trigger) {
+            (
+                Self::Tool { name, args },
+                ApprovalTrigger::Tool {
+                    name: actual_name,
+                    args: actual_args,
+                },
+            ) => name == actual_name && args.as_ref().is_none_or(|args| args == actual_args),
+            (
+                Self::Condition { name, matched },
+                ApprovalTrigger::Condition {
+                    name: actual_name,
+                    matched: actual_matched,
+                },
+            ) => {
+                name != "disambiguation_escalation"
+                    && name == actual_name
+                    && matched
+                        .as_ref()
+                        .is_none_or(|matched| matched == actual_matched)
+            }
+            (
+                Self::StateTransition { from, to },
+                ApprovalTrigger::State {
+                    from: actual_from,
+                    to: actual_to,
+                },
+            ) => from == actual_from && to == actual_to,
+            (
+                Self::DisambiguationEscalation { reason },
+                ApprovalTrigger::Condition {
+                    name,
+                    matched: actual_reason,
+                },
+            ) => {
+                name == "disambiguation_escalation"
+                    && reason.as_ref().is_none_or(|reason| reason == actual_reason)
+            }
+            _ => false,
+        }
+    }
+}
+
+impl From<ApprovalFixtureOutcome> for ApprovalResult {
+    fn from(outcome: ApprovalFixtureOutcome) -> Self {
+        match outcome {
+            ApprovalFixtureOutcome::Approve => Self::approved(),
+            ApprovalFixtureOutcome::Reject { reason } => Self::rejected(reason),
+            ApprovalFixtureOutcome::Modify { changes } => Self::modified(changes),
+            ApprovalFixtureOutcome::Timeout => Self::timeout(),
+            ApprovalFixtureOutcome::Unavailable => {
+                Self::rejected_with_reason("Approval fixture unavailable")
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl ApprovalHandler for FixtureApprovalHandler {
+    async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+        self.select_outcome(&request).into()
+    }
+
+    fn preferred_language(&self) -> Option<String> {
+        self.config.preferred_language.clone()
+    }
+
+    fn supported_languages(&self) -> Option<Vec<String>> {
+        self.config.supported_languages.clone()
+    }
+}
+
+/// Build a fresh approval handler with state isolated to this invocation.
+pub fn build_approval_handler(config: &ApprovalFixtureConfig) -> Arc<dyn ApprovalHandler> {
+    Arc::new(FixtureApprovalHandler::new(config.clone()))
 }
 
 /// Diagnostics fixture configuration for host-backed diagnostics.
@@ -508,9 +698,10 @@ pub fn build_tool_registry(
     registry.set_web_search_provider(search_provider);
 
     for (id, mock) in &fixtures.tools {
+        let contract = builtin.get(id);
         registry
             .register(Arc::new(RecordingTool::new(
-                Arc::new(MockTool::new(id.clone(), mock.clone())),
+                Arc::new(MockTool::new(id.clone(), mock.clone(), contract)),
                 log.clone(),
                 ToolExecutionSource::Mock,
             )))
@@ -541,11 +732,17 @@ struct MockTool {
     id: String,
     /// Configuration used by this component.
     config: ToolMockConfig,
+    /// Built-in contract preserved while fixture execution replaces the implementation.
+    contract: Option<Arc<dyn Tool>>,
 }
 
 impl MockTool {
-    fn new(id: String, config: ToolMockConfig) -> Self {
-        Self { id, config }
+    fn new(id: String, config: ToolMockConfig, contract: Option<Arc<dyn Tool>>) -> Self {
+        Self {
+            id,
+            config,
+            contract,
+        }
     }
 }
 
@@ -556,15 +753,42 @@ impl Tool for MockTool {
     }
 
     fn name(&self) -> &str {
-        &self.id
+        self.contract
+            .as_ref()
+            .map_or(self.id.as_str(), |tool| tool.name())
     }
 
     fn description(&self) -> &str {
-        "Evaluation mock tool"
+        self.contract
+            .as_ref()
+            .map_or("Evaluation mock tool", |tool| tool.description())
     }
 
     fn input_schema(&self) -> Value {
-        serde_json::json!({"type": "object"})
+        self.contract.as_ref().map_or_else(
+            || serde_json::json!({"type": "object"}),
+            |tool| tool.input_schema(),
+        )
+    }
+
+    fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+        self.contract.as_ref().map_or_else(
+            ai_agents_core::ToolSafetyMetadata::conservative_unknown,
+            |tool| tool.safety_metadata(),
+        )
+    }
+
+    fn classify_call(&self, args: &Value) -> ai_agents_core::ToolCallClassification {
+        self.contract.as_ref().map_or_else(
+            || ai_agents_core::ToolCallClassification::from_metadata(&self.safety_metadata()),
+            |tool| tool.classify_call(args),
+        )
+    }
+
+    fn policy_bindings(&self) -> ToolPolicyBindings {
+        self.contract
+            .as_ref()
+            .map_or_else(ToolPolicyBindings::default, |tool| tool.policy_bindings())
     }
 
     async fn execute(
@@ -1160,6 +1384,200 @@ mod tests {
     use super::*;
 
     #[test]
+    fn approval_fixture_parses_all_triggers_and_outcomes() {
+        let config: FixturesConfig = serde_yaml::from_str(
+            r#"
+approvals:
+  preferred_language: en
+  supported_languages: [en, fr]
+  rules:
+    - trigger: { type: tool, name: transfer, args: { amount: 10 } }
+      occurrence: 2
+      outcome: approve
+    - trigger: { type: condition, name: high_value, matched: "amount > 100" }
+      outcome: reject
+      reason: too expensive
+    - trigger: { type: state_transition, from: review, to: complete }
+      outcome: modify
+      changes: { amount: 5 }
+    - trigger: { type: disambiguation_escalation, reason: unclear intent }
+      outcome: timeout
+  default:
+    outcome: unavailable
+"#,
+        )
+        .unwrap();
+        let approvals = config.approvals.unwrap();
+
+        assert_eq!(approvals.rules.len(), 4);
+        assert_eq!(approvals.rules[0].occurrence.unwrap().get(), 2);
+        assert_eq!(approvals.preferred_language.as_deref(), Some("en"));
+        assert_eq!(
+            approvals.supported_languages,
+            Some(vec!["en".to_string(), "fr".to_string()])
+        );
+        assert_eq!(approvals.default, ApprovalFixtureOutcome::Unavailable);
+    }
+
+    #[test]
+    fn approval_fixture_rejects_zero_occurrence() {
+        let error = serde_yaml::from_str::<ApprovalFixtureConfig>(
+            r#"
+rules:
+  - trigger: { type: tool, name: transfer }
+    occurrence: 0
+    outcome: approve
+"#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("nonzero"));
+    }
+
+    #[tokio::test]
+    async fn approval_handler_matches_order_occurrence_and_default() {
+        let config = ApprovalFixtureConfig {
+            rules: vec![
+                ApprovalFixtureRule {
+                    trigger: ApprovalFixtureTrigger::Tool {
+                        name: "transfer".to_string(),
+                        args: Some(json!({"amount": 10})),
+                    },
+                    occurrence: NonZeroUsize::new(2),
+                    outcome: ApprovalFixtureOutcome::Modify {
+                        changes: HashMap::from([("amount".to_string(), json!(5))]),
+                    },
+                },
+                ApprovalFixtureRule {
+                    trigger: ApprovalFixtureTrigger::Tool {
+                        name: "transfer".to_string(),
+                        args: None,
+                    },
+                    occurrence: None,
+                    outcome: ApprovalFixtureOutcome::Reject {
+                        reason: Some("fallback rule".to_string()),
+                    },
+                },
+            ],
+            default: ApprovalFixtureOutcome::Timeout,
+            preferred_language: Some("ja".to_string()),
+            supported_languages: Some(vec!["ja".to_string(), "en".to_string()]),
+        };
+        let handler = FixtureApprovalHandler::new(config);
+        let request = || {
+            ApprovalRequest::new(
+                ApprovalTrigger::tool("transfer", json!({"amount": 10})),
+                "Approve transfer?",
+            )
+        };
+
+        assert!(matches!(
+            handler.request_approval(request()).await,
+            ApprovalResult::Rejected { reason: Some(reason) } if reason == "fallback rule"
+        ));
+        assert!(matches!(
+            handler.request_approval(request()).await,
+            ApprovalResult::Modified { changes } if changes.get("amount") == Some(&json!(5))
+        ));
+        assert!(matches!(
+            handler
+                .request_approval(ApprovalRequest::new(
+                    ApprovalTrigger::tool("email", json!({})),
+                    "Approve email?",
+                ))
+                .await,
+            ApprovalResult::Timeout
+        ));
+        assert_eq!(handler.preferred_language(), Some("ja".to_string()));
+        assert_eq!(
+            handler.supported_languages(),
+            Some(vec!["ja".to_string(), "en".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_handler_matches_condition_state_and_escalation() {
+        let config: ApprovalFixtureConfig = serde_yaml::from_str(
+            r#"
+rules:
+  - trigger: { type: condition, name: high_value, matched: threshold }
+    outcome: approve
+  - trigger: { type: state_transition, from: review, to: complete }
+    outcome: reject
+  - trigger: { type: disambiguation_escalation, reason: unclear }
+    outcome: timeout
+default:
+  outcome: unavailable
+"#,
+        )
+        .unwrap();
+        let handler = FixtureApprovalHandler::new(config);
+
+        let condition = handler
+            .request_approval(ApprovalRequest::new(
+                ApprovalTrigger::condition("high_value", "threshold"),
+                "condition",
+            ))
+            .await;
+        let state = handler
+            .request_approval(ApprovalRequest::new(
+                ApprovalTrigger::state(Some("review".to_string()), "complete"),
+                "state",
+            ))
+            .await;
+        let escalation = handler
+            .request_approval(ApprovalRequest::new(
+                ApprovalTrigger::condition("disambiguation_escalation", "unclear"),
+                "escalation",
+            ))
+            .await;
+        let unavailable = handler
+            .request_approval(ApprovalRequest::new(
+                ApprovalTrigger::condition("disambiguation_escalation", "other"),
+                "other escalation",
+            ))
+            .await;
+
+        assert!(matches!(condition, ApprovalResult::Approved));
+        assert!(matches!(state, ApprovalResult::Rejected { reason: None }));
+        assert!(matches!(escalation, ApprovalResult::Timeout));
+        assert!(matches!(
+            unavailable,
+            ApprovalResult::Rejected { reason: Some(reason) }
+                if reason == "Approval fixture unavailable"
+        ));
+    }
+
+    #[tokio::test]
+    async fn approval_handler_instances_have_fresh_concurrent_state() {
+        let config: ApprovalFixtureConfig = serde_yaml::from_str(
+            r#"
+rules:
+  - trigger: { type: tool, name: transfer }
+    occurrence: 2
+    outcome: approve
+default:
+  outcome: reject
+"#,
+        )
+        .unwrap();
+        let first = build_approval_handler(&config);
+        let second = build_approval_handler(&config);
+        let request =
+            || ApprovalRequest::new(ApprovalTrigger::tool("transfer", json!({})), "transfer");
+
+        let (first_result, second_result) = tokio::join!(
+            first.request_approval(request()),
+            first.request_approval(request())
+        );
+        let approved =
+            usize::from(first_result.is_approved()) + usize::from(second_result.is_approved());
+        assert_eq!(approved, 1);
+        assert!(second.request_approval(request()).await.is_rejected());
+        assert!(second.request_approval(request()).await.is_approved());
+    }
+
+    #[test]
     fn context_file_and_inline_context_merge() {
         let dir = std::env::temp_dir().join(format!(
             "ai_agents_eval_fixture_test_{}",
@@ -1182,6 +1600,32 @@ mod tests {
         assert_eq!(context.get("feature"), Some(&serde_json::json!(true)));
         assert!(context.get("user").is_some());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mocked_builtin_preserves_tool_contract() {
+        let fixtures = FixturesConfig {
+            tools: HashMap::from([(
+                "web_fetch".to_string(),
+                ToolMockConfig {
+                    success: true,
+                    output: json!({"status": 200}),
+                },
+            )]),
+            ..Default::default()
+        };
+        let registry = build_tool_registry(&fixtures, RecordingToolLog::new()).unwrap();
+        let mocked = registry.get("web_fetch").unwrap();
+        let builtin = ai_agents_tools::builtin::get_builtin_tool("web_fetch").unwrap();
+
+        assert_eq!(mocked.name(), builtin.name());
+        assert_eq!(mocked.input_schema(), builtin.input_schema());
+        assert_eq!(
+            serde_json::to_value(mocked.safety_metadata()).unwrap(),
+            serde_json::to_value(builtin.safety_metadata()).unwrap()
+        );
+        assert_eq!(mocked.policy_bindings(), builtin.policy_bindings());
+        assert!(!mocked.policy_bindings().domain_fields.is_empty());
     }
 
     #[test]

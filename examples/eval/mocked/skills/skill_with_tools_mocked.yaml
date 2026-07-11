@@ -1,0 +1,83 @@
+name: Skill With Tools Mocked Eval
+agent: ../../../yaml/skills/skill_with_tools.yaml
+
+# Mocked skill eval suite.
+# Verifies tool-using skill pipelines without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/skills/skill_with_tools_mocked.yaml \
+#     --output target/eval/mocked/skills/skill_with_tools_mocked
+#
+# Flow: daily_briefing skill -> datetime/random tools -> quick_math skill -> calculator tool
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "daily_briefing"
+      - "Here is your cheerful daily briefing with today's date and an energy note."
+      - "quick_math"
+      - "42 * 17 + 3"
+      - "42 * 17 + 3 equals 717."
+
+scenarios:
+  - id: skill-with-tools-routes-major-paths
+    name: Tool-using skills execute briefing and math pipelines
+    tags: [mock, examples, yaml, skills, tools]
+    language: en
+    turns:
+      - input: Give me my daily briefing.
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: datetime
+                executed: true
+                success: true
+                source_in: [skill]
+            - tool_called:
+                id: random
+                executed: true
+                success: true
+                source_in: [skill]
+            - response_contains: "daily briefing"
+            - observability:
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+      - input: What is 42 * 17 + 3?
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: result
+                  gte: 717
+                  lte: 717
+            - response_contains: "717"
+            - observability:
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1

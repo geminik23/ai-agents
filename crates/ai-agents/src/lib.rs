@@ -107,12 +107,13 @@ pub mod dot_path {
 
 pub mod hitl {
     pub use ai_agents_hitl::{
-        ApprovalCondition, ApprovalHandler, ApprovalMessage, ApprovalRequest, ApprovalResult,
-        ApprovalTrigger, AutoApproveHandler, CallbackHandler, HITLCheckResult, HITLConfig,
-        HITLEngine, LlmGenerateConfig, LocalizedHandler, MessageLanguageConfig,
-        MessageLanguageStrategy, MessageResolver, RejectAllHandler, StateApprovalConfig,
-        StateApprovalTrigger, TimeoutAction, ToolApprovalConfig, create_handler,
-        create_localized_handler, resolve_best_language, resolve_tool_message,
+        ApprovalCondition, ApprovalHandler, ApprovalMessage, ApprovalRequest,
+        ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger, AutoApproveHandler,
+        CallbackHandler, HITLCheckResult, HITLConfig, HITLEngine, LlmGenerateConfig,
+        LocalizedHandler, MessageLanguageConfig, MessageLanguageStrategy, MessageResolver,
+        RejectAllHandler, StateApprovalConfig, StateApprovalTrigger, TimeoutAction,
+        ToolApprovalConfig, create_handler, create_localized_handler, resolve_best_language,
+        resolve_tool_message,
     };
 }
 
@@ -589,8 +590,8 @@ pub use tools::{
 pub use hooks::{AgentHooks, CompositeHooks, HookTimer, LoggingHooks, NoopHooks};
 
 pub use hitl::{
-    ApprovalCondition, ApprovalHandler, ApprovalMessage, ApprovalRequest, ApprovalResult,
-    ApprovalTrigger, AutoApproveHandler, HITLCheckResult, HITLConfig, HITLEngine,
+    ApprovalCondition, ApprovalHandler, ApprovalMessage, ApprovalRequest, ApprovalResolvedOutcome,
+    ApprovalResult, ApprovalTrigger, AutoApproveHandler, HITLCheckResult, HITLConfig, HITLEngine,
     LlmGenerateConfig, LocalizedHandler, MessageLanguageConfig, MessageLanguageStrategy,
     MessageResolver, RejectAllHandler, StateApprovalConfig, StateApprovalTrigger, TimeoutAction,
     ToolApprovalConfig, create_handler, create_localized_handler, resolve_best_language,
@@ -604,6 +605,13 @@ mod tests {
         fn assert_type<T>() {}
         assert_type::<crate::llm::MultiLLMRouter>();
         assert_type::<crate::MultiLLMRouter>();
+    }
+
+    #[test]
+    fn test_facade_reexports_approval_resolved_outcome() {
+        fn assert_type<T>() {}
+        assert_type::<crate::hitl::ApprovalResolvedOutcome>();
+        assert_type::<crate::ApprovalResolvedOutcome>();
     }
 }
 

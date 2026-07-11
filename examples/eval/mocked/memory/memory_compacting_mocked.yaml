@@ -1,0 +1,79 @@
+name: Memory Compacting Mocked Eval
+agent: ../../../yaml/memory/memory_compacting.yaml
+
+# Mocked memory eval suite.
+# Verifies compacting memory triggers summarization after enough turns.
+# compress_threshold: 8 means 4 turns (8 messages) triggers compression on turn 4.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/memory/memory_compacting_mocked.yaml \
+#     --output target/eval/mocked/memory/memory_compacting_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Turn one response about Rust."
+        - "Turn two response about Python."
+        - "Turn three response about databases."
+        - "Turn four response about cloud computing."
+        - "Turn five response after compression."
+      router:
+        - "Summary: the user discussed Rust, Python, databases, and cloud computing."
+
+scenarios:
+  - id: memory-compacting-triggers-summarization
+    name: Compacting memory summarizes old messages after threshold
+    tags: [mock, examples, yaml, memory, compacting]
+    language: en
+    turns:
+      - input: Tell me about Rust.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Rust"
+      - input: Tell me about Python.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "Python"
+      - input: Tell me about databases.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "databases"
+      - input: Tell me about cloud computing.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "cloud"
+      - input: What did we discuss earlier?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "compression"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      alias: router
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      alias: default
+                      status: success
+                    assert:
+                      path: count
+                      gte: 5

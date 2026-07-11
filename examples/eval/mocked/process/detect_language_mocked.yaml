@@ -1,0 +1,52 @@
+name: Detect Language Mocked Eval
+agent: ../../../yaml/process/detect_language.yaml
+
+# Mocked process eval suite.
+# Verifies LLM-backed detection stores language, sentiment, and intent in context.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/process/detect_language_mocked.yaml \
+#     --output target/eval/mocked/process/detect_language_mocked
+#
+# Flow: normalized input -> router detection JSON -> context injection -> mocked response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - '{"language":"ko","sentiment":"positive","intent":"greeting"}'
+      default:
+        - "안녕하세요! 감지된 언어와 긍정적인 분위기에 맞춰 답변합니다."
+
+scenarios:
+  - id: detect-language-stores-context
+    name: Detection stage stores language, sentiment, and intent
+    tags: [mock, examples, yaml, process, detection]
+    language: ko
+    turns:
+      - input: "  안녕하세요! 반가워요.  "
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: detected_language
+                eq: "ko"
+            - context_path:
+                path: detected_sentiment
+                eq: "positive"
+            - context_path:
+                path: detected_intent
+                eq: "greeting"
+            - context_path:
+                path: detection.language
+                eq: "ko"
+            - response_contains: "안녕하세요"
+            - response_contains_any:
+                - "긍정"
+                - "감지"

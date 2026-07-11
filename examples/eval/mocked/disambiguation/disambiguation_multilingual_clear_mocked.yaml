@@ -1,0 +1,38 @@
+name: Disambiguation Multilingual Clear Mocked Eval
+agent: ../../../yaml/disambiguation/disambiguation_multilingual.yaml
+
+# Mocked disambiguation eval suite.
+# Verifies Korean clear balance check bypasses disambiguation and routes to skill.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/disambiguation/disambiguation_multilingual_clear_mocked.yaml \
+#     --output target/eval/mocked/disambiguation/disambiguation_multilingual_clear_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      router:
+        - "no"
+        - '{"is_ambiguous":false,"confidence":0.9,"ambiguity_type":null,"reasoning":"clear balance check","what_is_unclear":[],"detected_language":"ko"}'
+        - "check_balance"
+      default:
+        - "고객님의 잔액은 $1,234.56입니다."
+
+scenarios:
+  - id: korean-clear-balance-skips-disambiguation
+    name: Korean clear balance check bypasses disambiguation
+    tags: [mock, examples, yaml, disambiguation, multilingual]
+    language: ko
+    turns:
+      - input: "잔액 확인해줘"
+        assert:
+          all:
+            - response_not_empty: true
+            - no_disambiguation: true
+            - response_contains: "1,234"

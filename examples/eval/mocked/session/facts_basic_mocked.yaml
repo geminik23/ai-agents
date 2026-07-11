@@ -1,0 +1,40 @@
+name: Facts Basic Mocked Eval
+agent: ../../../yaml/session/facts_basic.yaml
+
+# Mocked eval for the facts basic agent.
+# Verifies that facts are extracted from the conversation and stored.
+# The router LLM provides fact extraction JSON.
+# The eval runner isolates SQLite storage into a temp workspace.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/session/facts_basic_mocked.yaml \
+#     --output target/eval/mocked/session/facts_basic_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Nice to meet you, Alex! I will remember that you work as a backend engineer."
+      router:
+        - '[{"category":"user_context","content":"User works as a backend engineer","confidence":0.9,"actor_id":"user_1"}]'
+
+scenarios:
+  - id: facts-basic-extracted
+    name: Facts are extracted from conversation
+    tags: [mock, examples, yaml, session, facts]
+    language: en
+    actor: user_1
+    turns:
+      - input: My name is Alex and I work as a backend engineer.
+        assert:
+          all:
+            - response_not_empty: true
+            - facts_include:
+                actor: user_1
+                category: user_context

@@ -1,0 +1,59 @@
+name: Memory Agent Mocked Eval
+agent: ../../../yaml/memory/memory_agent.yaml
+
+# Mocked memory eval suite.
+# Verifies full production memory config (compacting + budget + max_messages) across turns.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/memory/memory_agent_mocked.yaml \
+#     --output target/eval/mocked/memory/memory_agent_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Turn one response about async Rust."
+        - "Turn two response about tokio runtime."
+        - "Turn three response about trait objects."
+        - "Turn four response about error handling patterns."
+        - "Turn five response after compaction."
+      router:
+        - "Summary: the user discussed async Rust, tokio, trait objects, and error handling."
+
+scenarios:
+  - id: memory-agent-compacting-with-budget
+    name: Full memory config responds after compaction under budget
+    tags: [mock, examples, yaml, memory, compacting, budget]
+    language: en
+    turns:
+      - input: Tell me about async Rust.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "async"
+      - input: Tell me about the tokio runtime.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "tokio"
+      - input: Tell me about trait objects.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "trait"
+      - input: Tell me about error handling patterns.
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "error"
+      - input: What did we discuss earlier?
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "compaction"

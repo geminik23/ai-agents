@@ -1,0 +1,64 @@
+name: Context Overflow Mocked Eval
+agent: ../../../yaml/error-recovery/context_overflow.yaml
+
+# Deterministic no-key coverage for context overflow summarization.
+# The first turn exceeds the token limit; summarization starts once enough
+# history exists for keep_recent: 4 to leave an older message to compress.
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, purpose, status]
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "Stored the long context for this conversation."
+        - "The conversation is still active."
+        - "Continued successfully after context summarization."
+      summarizer:
+        - "Compressed prior context for the active conversation."
+
+scenarios:
+  - id: context-overflow-invokes-configured-summarizer
+    name: Context overflow uses the summarizer alias and continues
+    tags: [error-recovery, context-overflow, summarization, mock]
+    language: en
+    turns:
+      - input: |-
+          overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-overflow-evidence-
+        assert:
+          response_contains: "Stored the long context"
+      - input: Continue this conversation.
+        assert:
+          response_contains: "still active"
+      - input: Continue after handling the accumulated context.
+        assert:
+          all:
+            - response_contains: "Continued successfully"
+            - observability:
+                purpose_counts:
+                  summarization:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      alias: summarizer
+                      purpose: summarization
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      alias: default
+                      purpose: main_response
+                      status: success
+                    assert:
+                      path: count
+                      gte: 3

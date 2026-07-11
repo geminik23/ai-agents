@@ -1,0 +1,45 @@
+name: Output Sanitize Mocked Eval
+agent: ../../../yaml/process/output_sanitize.yaml
+
+# Mocked process eval suite.
+# Verifies output sanitization and formatting without a provider key.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/process/output_sanitize_mocked.yaml \
+#     --output target/eval/mocked/process/output_sanitize_mocked
+#
+# Flow: mocked response with PII -> router sanitization -> validation -> format footer -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "I found the account for alice@example.com and phone 010-1234-5678."
+      router:
+        - "I found the account for **** and phone ****."
+        - '{"passes":true,"score":0.9,"issues":[]}'
+
+scenarios:
+  - id: output-sanitize-masks-pii-and-adds-footer
+    name: Output pipeline masks PII and appends footer
+    tags: [mock, examples, yaml, process, sanitization]
+    language: en
+    turns:
+      - input: "My email is alice@example.com and my phone is 010-1234-5678. Can you confirm my account?"
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "****"
+            - response_contains: "Need more help?"
+            - response_not_contains:
+                - "alice@example.com"
+                - "010-1234-5678"
+            - response_contains_any:
+                - "account"
+                - "phone"

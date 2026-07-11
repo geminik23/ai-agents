@@ -1,0 +1,65 @@
+name: Live Example - Tools Delete Review
+agent: ../../../../yaml/tools/delete_review.yaml
+
+# Live eval suite for dry-run delete_path against committed fixture files.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/delete_review_live.yaml \
+#     --output target/eval/live/examples/tools/delete_review \
+#     --real-llm
+#
+# Flow: read fixture -> live model -> delete_path dry run -> summary with no file deleted
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: delete-path-dry-run-only
+    name: Real model dry-runs a delete without applying it
+    tags: [live, examples, yaml, tools, mutation, dry-run, fixture, real-llm, delete_path]
+    language: en
+    turns:
+      - input: "Before answering, call delete_path to dry-run deleting examples/fixtures/tool_examples/edit_target.txt. Keep dry_run true, do not apply the delete, and state that no file was changed."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: delete_path
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: delete_path
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: delete_path
+                result_path:
+                  path: deleted
+                  eq: true
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "Dry-run"
+                - "No file was changed"
+                - "no file was changed"
+            - response_not_contains:
+                - "I deleted the file on disk"
+                - "I applied the delete"
+                - "the delete was applied"
+            - tool_not_called: command

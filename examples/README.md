@@ -34,95 +34,58 @@ cargo run --bin simple-chat
 
 ## Evaluation Examples
 
-Evaluation suites run an agent against declarative scenarios and write reports for CI, debugging, and release checks. These examples use mocked LLM responses, so they do not require API keys.
+Evaluation suites run an agent against declarative scenarios and write reports for CI, debugging, and release checks. Suites are organized by run mode first, then by the YAML example category.
 
-| File | Description |
-|------|-------------|
-| `eval/basic_chat.yaml` | Minimal mocked-LLM smoke test that verifies one basic response and report generation |
-| `eval/multiturn_mocked.yaml` | Deterministic two-turn conversation suite showing ordered mock responses and composite assertions |
-| `eval/streaming_mocked.yaml` | Streaming eval smoke test that collects `chat_stream()` output before assertions |
-| `eval/observability_mocked.yaml` | No-key observability eval suite that checks LLM telemetry assertions |
-| `eval/runtime_optimization_mocked.yaml` | No-key runtime optimization suite that verifies pre-response guard routing |
-| `eval/runtime_optimization_disabled_mocked.yaml` | No-key baseline suite that verifies default post-response guard routing for comparison |
-| `eval/speculative_parallel_transition_mocked.yaml` | No-key speculative branch suite that verifies a parallel transition can discard a stale draft |
-| `eval/speculative_parallel_transition_miss_mocked.yaml` | No-key speculative branch suite that verifies a transition miss commits the main draft |
-| `eval/speculative_losing_tool_draft_mocked.yaml` | No-key speculative branch suite that verifies tool calls from losing drafts stay inert |
-| `eval/speculative_skill_routing_mocked.yaml` | No-key speculative branch suite that verifies skill selection commits before execution |
-| `eval/speculative_skill_no_match_mocked.yaml` | No-key speculative branch suite that verifies skill no-match commits the main draft |
-| `eval/speculative_reasoning_auto_mocked.yaml` | No-key speculative branch suite that verifies auto reasoning none commits a plain draft |
-| `eval/speculative_reasoning_cot_mocked.yaml` | No-key speculative branch suite that verifies a deeper reasoning decision discards the plain draft |
-| `eval/speculative_reasoning_react_mocked.yaml` | No-key speculative branch suite that verifies ReAct selection discards the plain draft |
-| `eval/speculative_reasoning_plan_mocked.yaml` | No-key speculative branch suite that verifies plan-and-execute selection runs the committed plan path |
-| `eval/speculative_reasoning_judge_failure_mocked.yaml` | No-key speculative branch suite that verifies judge failure commits the plain draft and records a failed branch |
-| `eval/buffered_streaming_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming emits the committed route and records cancelled stale work |
-| `eval/buffered_streaming_main_win_mocked.yaml` | No-key speculative branch suite that verifies buffered streaming can commit the main draft |
-| `eval/real_llm_semantic_judge.yaml` | Live provider suite using real LLM calls and an LLM judge; tagged `live` and requires an API key |
-| `eval/diagnostics_mocked.yaml` | Mocked diagnostics provider suite that verifies the `diagnostics` tool can read host-backed issues deterministically |
-| `eval/code_search_mocked.yaml` | Mocked tool-call suite that verifies read-only code search with `grep` |
-| `eval/file_write_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `file_write` dry-run evidence without writing bytes |
-| `eval/file_edit_review_mocked.yaml` | Mocked tool-call suite that verifies `file_edit` dry-run review output |
-| `eval/file_edit_denied_mocked.yaml` | Mocked tool-call suite that verifies blocked path denial for `file_edit` |
-| `eval/file_edit_approval_rejected_mocked.yaml` | Mocked approval suite that verifies non-approved `file_edit` does not execute |
-| `eval/patch_review_mocked.yaml` | Mocked tool-call suite that verifies `patch` dry-run validation |
-| `eval/ask_user_fallback_mocked.yaml` | Mocked tool-call suite that verifies `ask_user` uses its default answer without a host handler |
-| `eval/command_validation_mocked.yaml` | Mocked command-runner suite that verifies allowlisted `command` execution |
-| `eval/command_blocked_mocked.yaml` | Mocked command-runner suite that verifies non-allowlisted `command` denial |
-| `eval/sleep_wait_mocked.yaml` | Mocked tool-call suite that verifies `sleep` respects policy and timeout caps |
-| `eval/no_tools_explicit_empty_mocked.yaml` | Mocked grant suite that verifies `tools: []` denies ordinary tool calls |
-| `eval/web_fetch_policy_mocked.yaml` | Mocked tool-call suite that verifies blocked local URLs fail under `web_fetch` safety policy |
-| `eval/web_search_mocked.yaml` | Mocked web-search suite that verifies provider-backed search returns bounded cited results |
-| `eval/web_search_unavailable_mocked.yaml` | Mocked web-search suite that verifies unavailable provider records `executed: false` |
-| `eval/copy_path_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `copy_path` dry-run evidence without copying |
-| `eval/move_path_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `move_path` dry-run evidence without moving |
-| `eval/delete_path_dry_run_mocked.yaml` | Mocked tool-call suite that verifies `delete_path` dry-run evidence without deleting |
+```text
+eval/
+├── mocked/              # deterministic no-key suites for CI and regression checks
+├── live/examples/       # intentional real-provider smoke checks for runnable examples
+├── live/quality/        # intentional real-provider semantic or judge checks
+└── replay/              # optional cassette/replay artifacts and notes
+```
 
-### Live example eval suites
+Use `eval/mocked/**/*.yaml` for default no-key checks. Do not glob all of `eval/**/*.yaml` for CI unless live provider calls are intentional.
 
-Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider, structural tool evidence, deterministic response checks, and fixture-backed external dependencies where needed. They require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
+### Mocked no-key suites
 
-Live suites prefer one primary behavior per scenario, concrete prompts for required tool calls, equivalent safe tool paths where appropriate, and stable response checks for minimum useful output. Keep exact multi-tool sequences and response-quality judge gates in mocked or focused suites.
+Mocked suites cover every runnable YAML example category: basic, context, disambiguation, error-recovery, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
 
-See `eval/live/examples/README.md` for the full registry, risk tags, status vocabulary, and run commands.
+Run all mocked suites with the convenience helper:
 
-Examples:
+```sh
+sh examples/eval/mocked/run_mocked_evals.sh
+sh examples/eval/mocked/run_mocked_evals.sh --category state-machine
+sh examples/eval/mocked/run_mocked_evals.sh --list
+```
+
+Or run a single suite directly:
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
-  --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/basic_chat.yaml \
-  --output target/eval/basic_chat
+  --scenarios examples/eval/mocked/basic/simple_chat_mocked.yaml \
+  --output target/eval/mocked/basic/simple_chat_mocked
+```
 
-cargo run -p ai-agents-cli -- eval \
-  --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/multiturn_mocked.yaml \
-  --output target/eval/multiturn_mocked
+### Live suites
 
-cargo run -p ai-agents-cli -- eval \
-  --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/streaming_mocked.yaml \
-  --output target/eval/streaming_mocked
+Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider, structural tool evidence, deterministic response checks, and fixture-backed external dependencies where needed. They require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
 
-cargo run -p ai-agents-cli -- eval \
-  --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/observability_mocked.yaml \
-  --output target/eval/observability_mocked
+Semantic or judge-based live checks live under `eval/live/quality/` so they do not mix with example smoke checks.
 
-cargo run -p ai-agents-cli -- eval \
-  --agent examples/yaml/runtime-optimization/pre_response_transition.yaml \
-  --scenarios examples/eval/runtime_optimization_mocked.yaml \
-  --output target/eval/runtime_optimization_mocked
+See `eval/live/README.md` for the full registry, risk tags, status vocabulary, category helper, and run commands.
 
-# Live provider example. Requires an API key and may incur provider cost.
-cargo run -p ai-agents-cli -- eval \
-  --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/real_llm_semantic_judge.yaml \
-  --output target/eval/real_llm_semantic_judge \
-  --real-llm
-
+```sh
 # Live example eval. The suite declares its own agent path.
 cargo run -p ai-agents-cli -- eval \
-  --scenarios examples/eval/live/examples/tools_code_search_live.yaml \
-  --output target/eval/live/examples/tools_code_search \
+  --scenarios examples/eval/live/examples/tools/code_search_live.yaml \
+  --output target/eval/live/examples/tools/code_search \
+  --real-llm
+
+# Live provider quality example. Requires an API key and may incur provider cost.
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml \
+  --output target/eval/live/quality/basic/simple_chat_semantic_judge \
   --real-llm
 ```
 

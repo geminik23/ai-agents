@@ -1,42 +1,44 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- HITL evaluation: deterministic approval fixtures support approve, reject, modify, timeout, unavailable, and localized decisions without human input
+- Approval assertions: eval suites can verify triggers, raw and effective decisions, localized messages, modified arguments, and execution outcomes
+
+### Changed
+- Evaluation fixtures: mocked built-in tools preserve their schemas, safety classification, and policy behavior while replacing external execution
+- Evaluation errors: failed turns retain partial responses and structural evidence, with explicit expected-error matching for intentional failures
+
 ## 1.0.0-rc.16
 
 ### Added
-- Tool identity: canonical tool IDs, display-name aliases, MCP view IDs, and registry versioning for stable execution records and non-executed attempt evidence
-- Read-only tools: glob, grep, file_read, file_list, file_info, git_status, git_diff, diagnostics, ask_user, todo, sleep, and web_fetch
-- Mutation tools: file_write, file_edit, and patch with dry-run review, read-before-write guards, path policy, and bounded output
-- Command tool: allowlisted argv execution with cwd/env policy, bounded output, and fail-closed missing bindings
-- Tool security: fail-closed domain, path, command, operation, and result-limit policy blocks with unavailable outcomes
-- Context-aware execution: custom and built-in tools receive execution context with limits, custom config, and policy bindings
-- Spawner tools: explicit management_tools opt-in grants for spawn_agent, send_agent_message, list_agents, and remove_agent
-- Runtime control: host-only overrides for tool security, tool scope, emergency denial, and cancellation
-- Host hooks: question handling, diagnostics providers, runtime todo access, and web fetch extraction
-- Web fetch: redirect policy checks, DNS/IP safety, and optional extraction prompt
-- Evaluation coverage: mocked suites for tool success, denial, unavailable, approval, dry-run, and blocked paths
-- Live example eval suites: 17 live suites for read-only tools, grant/scoping, utility tools, host-backed diagnostics, ask-user fallback, bounded sleep, and dry-run mutation
-- Live eval registry: coverage map, status vocabulary, risk tags, and run commands
-- Committed fixtures: dry-run edit and patch fixture files under examples/fixtures/tool_examples
+- Tool identity: canonical IDs, aliases, versioned registries, safety classification, and structured evidence make tool calls stable and auditable
+- Workspace tools: glob, grep, file inspection, diagnostics, and bounded Git status and diff provide safe local investigation
+- Host utilities: ask_user, todo, and sleep support interactive questions, session tasks, and bounded waits with explicit fallback behavior
+- File mutation: write, edit, patch, copy, move, and delete support dry-run review, path policy, read-before-write checks, and bounded traversal
+- Command execution: exact argument allowlists, working-directory and environment policy, and bounded output provide controlled process execution
+- Tool security: domain, path, command, operation, and result limits fail closed when required policy information is unavailable
+- Tool context: custom and built-in tools receive consistent permissions, limits, cancellation, host configuration, and execution evidence
+- Runtime controls: hosts can override tool security, effective scope, emergency denial, and cancellation without changing agent definitions
+- Web retrieval: web fetch and web search provide policy-aware network access, redirect and address safety, bounded results, and unavailable fallbacks
+- Evaluation workflow: deterministic mocked checks and opt-in live smoke checks cover safe tool discovery, denial, fallback, and dry-run behavior
 
 ### Changed
-- Tool grants: omitted or empty top-level tools means no ordinary LLM-callable tools; state-level tools can narrow but not widen the effective grant
-- Tool security: fail-closed policy now also covers result-limit rules that depend on declared bindings
-- Skill execution: direct skill execution is prompt-only and tool steps must use the shared executor path
-- Executor: side-effecting tool calls are serialized per tool/resource key and non-idempotent calls are not retried unless marked safe
-- Todo workflow example: system prompt now instructs the model to call the todo tool before describing task-list changes
-- Live eval suites: committed live suites use structural runtime evidence, concrete prompts, and deterministic response checks instead of judge gates
-- Web fetch: cached responses are now policy-sensitive and re-validated before reuse
+- Tool grants: omitted or empty top-level grants expose no ordinary tools, while states and generated features can only narrow or explicitly opt in
+- Tool execution: model, skill, state, plan, fallback, and manual calls apply the same security, approval, timeout, recovery, and evidence rules
+- Execution safety: side-effecting calls are serialized by resource and non-idempotent calls are not retried unless explicitly safe
+- Web fetch cache: cached responses are revalidated against the active security policy before reuse
+- Tool prompts: compact schemas reduce prompt size without changing the canonical input contract
+- TUI interaction: ask_user calls use the interactive modal flow and return the selected answer to the running agent
 
 ### Fixed
-- file_edit no-match failure returns a clear error instead of a silent no-op
-- patch dry-run delete and parent path policy checks are enforced
-- command tool fails closed when no allowlist binding is configured
-- spawned runtime shares locks with parent runtime for cross-tool safety
-- sleep tool is policy-extensible for max duration overrides
-- HITL-modified tool arguments are rechecked against security policy before execution
-- Raw .git paths are blocked from file tools while bounded VCS tools provide repository inspection
-- Speculative scheduling: deterministic routes no longer consume LLM budget under low caps and exhausted transition reservation falls back to the serial path
-- Stale public example wording that claimed all built-ins while granting only a legacy subset
+- File mutation: edit no-match failures are explicit, and patch dry runs enforce delete and parent-path policy checks
+- Command safety: command execution fails closed when no matching allowlist binding is configured
+- Spawned execution: parent and child runtimes share safety locks for cross-tool serialization
+- HITL modifications: changed tool arguments are rechecked against security policy before execution
+- Repository safety: raw Git metadata paths are blocked while bounded repository tools remain available
+- Speculative scheduling: deterministic routes preserve low budgets and exhausted reservations fall back to the serial path
 
 ## 1.0.0-rc.15
 

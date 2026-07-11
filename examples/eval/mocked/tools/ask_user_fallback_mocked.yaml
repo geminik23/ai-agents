@@ -1,0 +1,21 @@
+name: Ask User Fallback Mocked Eval
+agent: ../../../yaml/tools/interactive_choice.yaml
+settings:
+  timeout_per_turn_ms: 5000
+  isolation: scenario
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"ask_user","arguments":{"question":"Choose a database","options":["sqlite","postgres"],"default":"sqlite"}}'
+      - "SQLite was selected from the fallback answer."
+scenarios:
+  - id: ask-user-default
+    tags: [tools, ask-user, fallback, mock]
+    turns:
+      - input: Help me choose a database.
+        assert:
+          response_contains: "SQLite"
+          tool_called:
+            id: ask_user
+            success: true

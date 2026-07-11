@@ -1,0 +1,217 @@
+name: HITL Conditions Mocked Eval
+agent: ../../../yaml/hitl/hitl_conditions.yaml
+
+# Deterministic coverage for the condition-based HITL example without network or human input.
+# Timeout-to-error requires changing the source agent's on_timeout setting and is covered by Rust tests instead.
+settings:
+  timeout_per_turn_ms: 5000
+  timeout_per_scenario_ms: 30000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/v1/items/42","timeout_ms":2000}}'
+      - "GET completed with HTTP 200 OK and returned the stable mocked item fixture."
+      - '{"tool":"http","arguments":{"method":"POST","url":"https://api.example.test/v1/items","body":"{\"name\":\"approved-item\"}","timeout_ms":2000}}'
+      - "The approved POST executed against the mocked endpoint and returned HTTP 200 OK."
+      - '{"tool":"http","arguments":{"method":"DELETE","url":"https://api.example.test/v1/items/42","timeout_ms":2000}}'
+      - '{"tool":"http","arguments":{"method":"PUT","url":"https://api.example.test/v1/items/42","body":"{\"name\":\"original-item\"}","timeout_ms":2000}}'
+      - "The approved modification executed only with the effective mocked URL and returned HTTP 200 OK."
+      - '{"tool":"http","arguments":{"method":"PATCH","url":"https://api.example.test/v1/items/42","body":"{\"enabled\":false}","timeout_ms":2000}}'
+  tools:
+    http:
+      success: true
+      output:
+        status: 200
+        status_text: OK
+        headers:
+          content-type: application/json
+        body: '{"fixture":"hitl-conditions","stable":true}'
+  approvals:
+    default:
+      outcome: reject
+      reason: "Unexpected approval request"
+    rules:
+      - trigger:
+          type: condition
+          name: state_changing_http
+          matched: "method in [POST, PUT, DELETE, PATCH]"
+        occurrence: 4
+        outcome: timeout
+      - trigger:
+          type: condition
+          name: state_changing_http
+          matched: "method in [POST, PUT, DELETE, PATCH]"
+        occurrence: 3
+        outcome: modify
+        changes:
+          url: "https://api.example.test/v1/safe-items/42"
+          body: '{"name":"safe-item"}'
+      - trigger:
+          type: condition
+          name: state_changing_http
+          matched: "method in [POST, PUT, DELETE, PATCH]"
+        occurrence: 2
+        outcome: reject
+        reason: "Destructive request denied by fixture"
+      - trigger:
+          type: condition
+          name: state_changing_http
+          matched: "method in [POST, PUT, DELETE, PATCH]"
+        occurrence: 1
+        outcome: approve
+
+scenarios:
+  - id: condition-based-http-approval-lifecycle
+    tags: [hitl, conditions, http, approval, safety, mock]
+    turns:
+      - input: Fetch item 42 with GET and summarize the result.
+        assert:
+          all:
+            - response_contains: "GET completed with HTTP 200 OK"
+            - approval_not_requested:
+                trigger:
+                  type: condition
+                  name: state_changing_http
+            - tool_called:
+                id: http
+                count: 1
+                executed: true
+                success: true
+                source_in: [llm, mock]
+            - tool_called:
+                id: http
+                args_executed:
+                  path: method
+                  eq: GET
+            - tool_called:
+                id: http
+                result_path:
+                  path: body
+                  contains: '"stable":true'
+
+      - input: Create approved-item with POST.
+        assert:
+          all:
+            - response_contains: "approved POST executed"
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: condition
+                  name: state_changing_http
+                  matched: "method in [POST, PUT, DELETE, PATCH]"
+                raw_decision: approved
+                effective_decision: approved
+                message: "Approve POST request to https://api.example.test/v1/items?"
+            - tool_called:
+                id: http
+                count: 1
+                executed: true
+                success: true
+            - tool_called:
+                id: http
+                args_original:
+                  path: method
+                  eq: POST
+            - tool_called:
+                id: http
+                args_executed:
+                  path: url
+                  eq: "https://api.example.test/v1/items"
+
+      - input: Delete item 42 with DELETE.
+        assert:
+          all:
+            - response_contains: "Operation cancelled"
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: condition
+                  name: state_changing_http
+                  matched: "method in [POST, PUT, DELETE, PATCH]"
+            - approval_requested:
+                raw_decision: rejected
+                effective_decision: rejected
+            - approval_requested:
+                message: "Approve DELETE request to https://api.example.test/v1/items/42?"
+            - tool_called:
+                id: http
+                count: 1
+                executed: false
+                success: false
+            - tool_called:
+                id: http
+                args_original:
+                  path: method
+                  eq: DELETE
+
+      - input: Replace item 42 with original-item using PUT.
+        assert:
+          all:
+            - response_contains: "effective mocked URL"
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: condition
+                  name: state_changing_http
+                  matched: "method in [POST, PUT, DELETE, PATCH]"
+                raw_decision: modified
+                effective_decision: modified
+                message: "Approve PUT request to https://api.example.test/v1/items/42?"
+            - tool_called:
+                id: http
+                count: 1
+                executed: true
+                success: true
+            - tool_called:
+                id: http
+                args_original:
+                  path: url
+                  eq: "https://api.example.test/v1/items/42"
+            - tool_called:
+                id: http
+                args_original:
+                  path: body
+                  eq: '{"name":"original-item"}'
+            - tool_called:
+                id: http
+                args_executed:
+                  path: url
+                  eq: "https://api.example.test/v1/safe-items/42"
+            - tool_called:
+                id: http
+                args_executed:
+                  path: body
+                  eq: '{"name":"safe-item"}'
+            - tool_called:
+                id: http
+                result_path:
+                  path: body
+                  contains: '"fixture":"hitl-conditions"'
+
+      - input: Disable item 42 with PATCH.
+        assert:
+          all:
+            - response_contains: "Operation cancelled"
+            - response_contains: "Timeout"
+            - approval_requested:
+                count: 1
+                trigger:
+                  type: condition
+                  name: state_changing_http
+                  matched: "method in [POST, PUT, DELETE, PATCH]"
+                raw_decision: timeout
+                effective_decision: rejected
+                message: "Approve PATCH request to https://api.example.test/v1/items/42?"
+            - tool_called:
+                id: http
+                count: 1
+                executed: false
+                success: false
+            - tool_called:
+                id: http
+                args_original:
+                  path: method
+                  eq: PATCH

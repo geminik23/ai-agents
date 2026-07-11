@@ -1,0 +1,55 @@
+name: Context With State Mocked Eval
+agent: ../../../yaml/context/context_with_state.yaml
+
+# Mocked context and state eval suite.
+# Verifies context values persist through an LLM-selected state transition.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/context/context_with_state_mocked.yaml \
+#     --output target/eval/mocked/context/context_with_state_mocked
+#
+# Flow: fixture context -> greeting response -> transition choice -> helping response -> assertions
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  context:
+    user:
+      name: Mina
+      tier: vip
+  llm:
+    mode: mock
+    responses:
+      - "Greeting stale response for Mina."
+      - "1"
+      - "Mina, here is premium help for your subscription issue."
+
+scenarios:
+  - id: context-state-keeps-vip-profile
+    name: Context values persist after transition into helping state
+    tags: [mock, examples, yaml, context, state-machine]
+    language: en
+    turns:
+      - input: I need help with my subscription.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: helping
+            - state_history_contains: helping
+            - context_path:
+                path: user.name
+                eq: "Mina"
+            - context_path:
+                path: user.tier
+                eq: "vip"
+            - context_path:
+                path: time.date
+                exists: true
+            - response_contains: "Mina"
+            - response_contains_any:
+                - "premium"
+                - "subscription"
+            - response_not_contains: "Greeting stale"

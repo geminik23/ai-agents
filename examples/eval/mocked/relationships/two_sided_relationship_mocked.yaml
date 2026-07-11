@@ -1,0 +1,40 @@
+name: Two-Sided Relationship Mocked Eval
+agent: ../../../yaml/relationships/two_sided_relationship.yaml
+
+# Mocked eval for the two-sided relationship agent.
+# Verifies that a two-sided relationship is created for the actor.
+# The router LLM provides relationship evaluation JSON with both perspectives.
+# The eval runner isolates SQLite storage into a temp workspace.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/relationships/two_sided_relationship_mocked.yaml \
+#     --output target/eval/mocked/relationships/two_sided_relationship_mocked
+settings:
+  timeout_per_turn_ms: 5000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      default:
+        - "I appreciate your patience. I can see this has been frustrating, but I am here to help you resolve it."
+      router:
+        - '{"changes":[{"perspective":"agent_to_actor","dimension":"trust","delta":0.1,"confidence":0.8,"reason":"Actor showed patience"},{"perspective":"perceived_actor_to_agent","dimension":"trust","delta":0.15,"confidence":0.7,"reason":"Actor seems to appreciate the help"}],"notable_event":null}'
+
+scenarios:
+  - id: two-sided-relationship-created
+    name: Two-sided relationship is created for actor after a turn
+    tags: [mock, examples, yaml, relationships]
+    language: en
+    actor: user_1
+    turns:
+      - input: I am frustrated because this happened twice, but I appreciate that you are helping.
+        assert:
+          all:
+            - response_not_empty: true
+            - relationship:
+                exists: true
+                actor: user_1

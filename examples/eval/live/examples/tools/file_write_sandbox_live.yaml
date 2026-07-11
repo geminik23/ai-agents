@@ -1,0 +1,66 @@
+name: Live Example - Tools File Write Sandbox
+agent: ../../../../yaml/tools/file_write_sandbox.yaml
+
+# Live eval suite for dry-run file creation inside the example fixture sandbox.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/tools/file_write_sandbox_live.yaml \
+#     --output target/eval/live/examples/tools/file_write_sandbox \
+#     --real-llm
+#
+# Flow: file creation request -> live model -> file_write dry run -> summary with no bytes written
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: file-write-dry-run-only
+    name: Real model dry-runs file creation without writing
+    tags: [live, examples, yaml, tools, mutation, dry-run, fixture, real-llm, file_write]
+    language: en
+    turns:
+      - input: "Before answering, call file_write to dry-run creating examples/fixtures/tool_examples/generated_note.md with a short checklist. Use create_parent_dirs if needed, keep dry_run true, do not apply the write, and state that no file was changed."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: file_write
+                count_gte: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: file_write
+                result_path:
+                  path: dry_run
+                  eq: true
+            - tool_called:
+                id: file_write
+                result_path:
+                  path: bytes_written
+                  eq: 0
+            - response_contains_any:
+                - "dry-run"
+                - "dry run"
+                - "no file was changed"
+                - "No file was changed"
+                - "not written"
+            - response_not_contains:
+                - "I wrote the file"
+                - "I created the file on disk"
+                - "I saved the file"
+                - "File saved"
+            - tool_not_called: command

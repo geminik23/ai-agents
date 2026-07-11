@@ -1,0 +1,45 @@
+name: Customer Support Router Mocked Eval
+agent: ../../../yaml/orchestration/customer_support_router.yaml
+
+# Mocked eval suite for the delegate orchestration pattern.
+# The router state evaluates LLM transitions to pick a specialist.
+# The specialist state delegates to a registry agent (billing or technical).
+# Child agents share the parent LLM registry, so all responses come from "default".
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/mocked/orchestration/customer_support_router_mocked.yaml \
+#     --output target/eval/mocked/orchestration/customer_support_router_mocked
+#
+# Flow: routing (LLM response) -> transition eval ("1" = billing) -> billing_help (delegate to billing agent) -> transition eval ("0" = stay)
+settings:
+  timeout_per_turn_ms: 10000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Routing response assessing your request."
+      - "1"
+      - "Billing specialist response about your invoice."
+      - "0"
+
+scenarios:
+  - id: router-delegates-to-billing
+    name: Router routes billing question to billing specialist via delegate
+    tags: [mock, examples, yaml, orchestration, delegate, router]
+    language: en
+    turns:
+      - input: I have a question about my invoice.
+        assert:
+          all:
+            - response_not_empty: true
+            - state: billing_help
+            - state_history_contains: billing_help
+            - response_contains: "Billing specialist"
+            - response_not_contains: "Routing response"
+            - orchestration:
+                type: delegate
+                agents_include: [billing]

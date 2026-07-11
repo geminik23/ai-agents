@@ -11,33 +11,78 @@ use ai_agents_runtime::{Agent, AgentBuilder, RuntimeAgent, StreamChunk};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant as TokioInstant, timeout, timeout_at};
 
-use crate::assertion::{AssertionEvalContext, AssertionOutcome, evaluate_assertion};
+use crate::assertion::{
+    Assertion, AssertionEvalContext, AssertionOutcome, AssertionResultDetail, evaluate_assertion,
+};
 use crate::compatibility::suite_from_jsonl;
-use crate::evidence::{collect_turn_evidence, relationship_snapshot};
+use crate::evidence::{ApprovalEvidence, collect_turn_evidence, relationship_snapshot};
 use crate::fixtures::{
-    LlmFixtureMode, RecordingToolLog, build_llm_registry, build_tool_registry,
-    resolve_fixture_context, start_mock_server,
+    LlmFixtureMode, RecordingToolLog, build_approval_handler, build_llm_registry,
+    build_tool_registry, resolve_fixture_context, start_mock_server,
 };
 use crate::judge::{JudgeConfig, JudgeResolver};
 use crate::metrics::compute_metrics;
 use crate::redaction::{redact_text, redact_value};
 use crate::suite::{
     AttemptResult, EvalResult, EvalSuite, FailureCategory, IsolationMode, ResetStepConfig,
-    Scenario, ScenarioResult, ScenarioStatus, ScenarioStep, Turn, TurnResult,
+    Scenario, ScenarioResult, ScenarioStatus, ScenarioStep, Turn, TurnResult, turn_expected_error,
+    turn_runtime_context,
 };
 use crate::{EvalError, Result};
 
 /// Eval hook that records executor-level tool evidence, including non-executed attempts.
 struct EvalToolRecordHooks {
-    log: RecordingToolLog,
+    tool_log: RecordingToolLog,
+    approval_log: RecordingApprovalLog,
+}
+
+#[derive(Clone, Default)]
+struct RecordingApprovalLog {
+    records: Arc<Mutex<Vec<ApprovalEvidence>>>,
+}
+
+impl RecordingApprovalLog {
+    fn len(&self) -> usize {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    fn push(&self, evidence: ApprovalEvidence) {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(evidence);
+    }
+
+    fn records_since(&self, start: usize) -> Vec<ApprovalEvidence> {
+        self.records
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(start..)
+            .unwrap_or_default()
+            .to_vec()
+    }
 }
 
 #[async_trait]
 impl AgentHooks for EvalToolRecordHooks {
     async fn on_tool_execution_record(&self, record: &ai_agents_core::ToolExecutionRecord) {
-        self.log.push_executor_record(record);
+        self.tool_log.push_executor_record(record);
+    }
+
+    async fn on_approval_resolved(
+        &self,
+        request: &ai_agents_hitl::ApprovalRequest,
+        raw_result: &ai_agents_hitl::ApprovalResult,
+        outcome: &ai_agents_hitl::ApprovalResolvedOutcome,
+    ) {
+        self.approval_log.push(ApprovalEvidence::from_resolution(
+            request, raw_result, outcome,
+        ));
     }
 }
 
@@ -385,8 +430,22 @@ impl EvalRunner {
         let _env_guard = EnvGuard::apply(&scenario.env)?;
         let mock_server = start_mock_server(self.suite.fixtures.mock_server.as_ref()).await?;
         let tool_log = RecordingToolLog::new();
+        let approval_log = RecordingApprovalLog::default();
+        let approval_handler = self
+            .suite
+            .fixtures
+            .approvals
+            .as_ref()
+            .map(build_approval_handler);
         let mut agent = self
-            .build_agent(agent_path, base_dir, &workspace, tool_log.clone())
+            .build_agent(
+                agent_path,
+                base_dir,
+                &workspace,
+                tool_log.clone(),
+                approval_log.clone(),
+                approval_handler.clone(),
+            )
             .await?;
         apply_base_context(
             &agent,
@@ -400,11 +459,20 @@ impl EvalRunner {
 
         if !scenario.turns.is_empty() {
             for (idx, turn) in scenario.turns.iter().enumerate() {
-                let turn_result = self
-                    .run_turn(&agent, scenario, turn, idx, &tool_log)
+                let turn_execution = self
+                    .run_turn(&agent, scenario, turn, idx, &tool_log, &approval_log)
                     .await?;
-                let turn_failed = turn_result.assertion_results.iter().any(|r| !r.passed);
-                turns.push(turn_result);
+                let turn_failed = turn_execution
+                    .result
+                    .assertion_results
+                    .iter()
+                    .any(|result| !result.passed);
+                let runtime_error = turn_execution.unhandled_runtime_error;
+                turns.push(turn_execution.result);
+                if let Some(message) = runtime_error {
+                    status = ScenarioStatus::Error { message };
+                    break;
+                }
                 if turn_failed {
                     status = ScenarioStatus::Failed {
                         reason: format!("turn {} assertion failed", idx + 1),
@@ -434,11 +502,20 @@ impl EvalRunner {
                 ScenarioStep::Run(run) => {
                     for turn in &run.turns {
                         let idx = turns.len();
-                        let turn_result = self
-                            .run_turn(&agent, scenario, turn, idx, &tool_log)
+                        let turn_execution = self
+                            .run_turn(&agent, scenario, turn, idx, &tool_log, &approval_log)
                             .await?;
-                        let turn_failed = turn_result.assertion_results.iter().any(|r| !r.passed);
-                        turns.push(turn_result);
+                        let turn_failed = turn_execution
+                            .result
+                            .assertion_results
+                            .iter()
+                            .any(|result| !result.passed);
+                        let runtime_error = turn_execution.unhandled_runtime_error;
+                        turns.push(turn_execution.result);
+                        if let Some(message) = runtime_error {
+                            status = ScenarioStatus::Error { message };
+                            break;
+                        }
                         if turn_failed {
                             status = ScenarioStatus::Failed {
                                 reason: format!("turn {} assertion failed", idx + 1),
@@ -446,8 +523,10 @@ impl EvalRunner {
                             break;
                         }
                     }
-                    if let Some(session) = &run.save_session {
-                        agent.save_session(session).await?;
+                    if status.is_passed() {
+                        if let Some(session) = &run.save_session {
+                            agent.save_session(session).await?;
+                        }
                     }
                 }
                 ScenarioStep::ResetAgent(reset) => {
@@ -466,7 +545,14 @@ impl EvalRunner {
                             agent.reset().await?;
                         } else {
                             agent = self
-                                .build_agent(agent_path, base_dir, &workspace, tool_log.clone())
+                                .build_agent(
+                                    agent_path,
+                                    base_dir,
+                                    &workspace,
+                                    tool_log.clone(),
+                                    approval_log.clone(),
+                                    approval_handler.clone(),
+                                )
                                 .await?;
                         }
                         if options.preserve_host_context {
@@ -519,6 +605,8 @@ impl EvalRunner {
         base_dir: &Path,
         workspace: &Path,
         tool_log: RecordingToolLog,
+        approval_log: RecordingApprovalLog,
+        approval_handler: Option<Arc<dyn ai_agents_hitl::ApprovalHandler>>,
     ) -> Result<RuntimeAgent> {
         let content = std::fs::read_to_string(agent_path)?;
         let mut spec: AgentSpec = serde_yaml::from_str(&content)?;
@@ -532,12 +620,19 @@ impl EvalRunner {
             .map_err(|error| EvalError::Config(error.to_string()))?
             .llm_registry(llm_registry)
             .tools(tool_registry)
-            .hooks(Arc::new(EvalToolRecordHooks { log: tool_log }))
+            .hooks(Arc::new(EvalToolRecordHooks {
+                tool_log,
+                approval_log,
+            }))
             .auto_configure_features()
             .map_err(|error| EvalError::Config(error.to_string()))?
             .auto_configure_mcp()
             .await
             .map_err(|error| EvalError::Config(error.to_string()))?;
+
+        if let Some(approval_handler) = approval_handler {
+            builder = builder.approval_handler(approval_handler);
+        }
 
         let storage_override = isolated_storage_config(&spec, workspace);
         if let Some(storage) = storage_override {
@@ -596,48 +691,54 @@ impl EvalRunner {
         turn: &Turn,
         index: usize,
         tool_log: &RecordingToolLog,
-    ) -> Result<TurnResult> {
-        apply_context_value(agent, &turn.context)?;
+        approval_log: &RecordingApprovalLog,
+    ) -> Result<TurnExecution> {
+        apply_context_value(agent, &turn_runtime_context(turn))?;
         if let Some(actor) = &turn.actor {
             agent.set_actor_id(actor)?;
         }
         let before_relationship = relationship_snapshot(agent);
         let tool_start = tool_log.len();
+        let approval_start = approval_log.len();
         let start = Instant::now();
         let timeout_ms = turn
             .timeout_ms
             .unwrap_or(self.suite.settings.timeout_per_turn_ms);
-        let (response_content, response_metadata) = if turn.stream.unwrap_or(false) {
-            timeout(
-                Duration::from_millis(timeout_ms),
-                collect_stream_response(agent, &turn.input),
-            )
-            .await
-            .map_err(|_| EvalError::Runtime(format!("turn timed out after {}ms", timeout_ms)))??
+        let mut operation = if turn.stream.unwrap_or(false) {
+            collect_stream_response(agent, &turn.input, timeout_ms).await
         } else {
-            let response = timeout(Duration::from_millis(timeout_ms), agent.chat(&turn.input))
-                .await
-                .map_err(|_| {
-                    EvalError::Runtime(format!("turn timed out after {}ms", timeout_ms))
-                })??;
-            (response.content, response.metadata)
+            match timeout(Duration::from_millis(timeout_ms), agent.chat(&turn.input)).await {
+                Ok(Ok(response)) => TurnOperation {
+                    response_content: response.content,
+                    response_metadata: response.metadata,
+                    response_present: true,
+                    runtime_error: None,
+                },
+                Ok(Err(error)) => TurnOperation::error(error.to_string()),
+                Err(_) => TurnOperation::error(format!("turn timed out after {}ms", timeout_ms)),
+            }
         };
-        agent.flush_background_tasks().await?;
+        if let Err(error) = agent.flush_background_tasks().await {
+            if operation.runtime_error.is_none() {
+                operation.runtime_error = Some(error.to_string());
+            }
+        }
         let latency_ms = start.elapsed().as_millis() as u64;
-        let evidence = collect_turn_evidence(
+        let mut evidence = collect_turn_evidence(
             agent,
-            response_metadata.clone(),
+            operation.response_metadata.clone(),
             tool_log,
             tool_start,
             before_relationship,
         );
+        evidence.approvals = approval_log.records_since(approval_start);
         let judge = self.build_judge(agent);
         let mut assertion_results = if let Some(assertion) = &turn.assertions {
             match evaluate_assertion(
                 assertion,
                 AssertionEvalContext {
                     evidence: &evidence,
-                    response: &response_content,
+                    response: &operation.response_content,
                     user_input: Some(&turn.input),
                     scenario_id: Some(&scenario.id),
                     language: scenario.language.as_deref(),
@@ -652,6 +753,59 @@ impl EvalRunner {
         } else {
             Vec::new()
         };
+        if !operation.response_present
+            && turn
+                .assertions
+                .as_ref()
+                .is_some_and(assertion_uses_response)
+        {
+            assertion_results.push(AssertionResultDetail {
+                assertion: "response_present".to_string(),
+                passed: false,
+                actual: json!(false),
+                expected: json!(true),
+                message: Some("response assertions require a runtime response".to_string()),
+            });
+        }
+
+        let expected_error = turn_expected_error(turn);
+        let unhandled_runtime_error = match (&expected_error, &operation.runtime_error) {
+            (Some(expected), Some(error)) if expected.matches(error) => {
+                assertion_results.push(AssertionResultDetail {
+                    assertion: "expect_error".to_string(),
+                    passed: true,
+                    actual: json!(error),
+                    expected: json!(expected.items()),
+                    message: None,
+                });
+                None
+            }
+            (Some(expected), Some(error)) => {
+                assertion_results.push(AssertionResultDetail {
+                    assertion: "expect_error".to_string(),
+                    passed: false,
+                    actual: json!(error),
+                    expected: json!(expected.items()),
+                    message: Some("runtime error did not match any expected substring".to_string()),
+                });
+                Some(format!(
+                    "runtime error did not match expect_error: {}",
+                    error
+                ))
+            }
+            (Some(expected), None) => {
+                assertion_results.push(AssertionResultDetail {
+                    assertion: "expect_error".to_string(),
+                    passed: false,
+                    actual: Value::Null,
+                    expected: json!(expected.items()),
+                    message: Some("expected a runtime error but the turn completed".to_string()),
+                });
+                None
+            }
+            (None, Some(error)) => Some(error.clone()),
+            (None, None) => None,
+        };
         if self.suite.settings.redact_outputs {
             redact_assertion_details(&mut assertion_results);
         }
@@ -659,20 +813,41 @@ impl EvalRunner {
             .observability
             .as_ref()
             .and_then(|obs| obs.span_ids.last().cloned());
-        Ok(TurnResult {
-            index,
-            input: redact_text(&turn.input, self.suite.settings.redact_outputs, 0),
-            response: redact_text(&response_content, self.suite.settings.redact_outputs, 0),
-            state: evidence.state.clone(),
-            metadata: if self.suite.settings.redact_outputs {
-                None
-            } else {
-                response_metadata.and_then(|m| serde_json::to_value(m).ok())
+        let runtime_error = operation
+            .runtime_error
+            .as_deref()
+            .map(|error| redact_text(error, self.suite.settings.redact_outputs, 0));
+        let unhandled_runtime_error = unhandled_runtime_error
+            .map(|error| redact_text(&error, self.suite.settings.redact_outputs, 0).value);
+        Ok(TurnExecution {
+            result: TurnResult {
+                index,
+                input: redact_text(&turn.input, self.suite.settings.redact_outputs, 0),
+                response: if operation.response_present {
+                    redact_text(
+                        &operation.response_content,
+                        self.suite.settings.redact_outputs,
+                        0,
+                    )
+                } else {
+                    crate::redaction::RedactedString::plain("")
+                },
+                response_present: operation.response_present,
+                runtime_error,
+                state: evidence.state.clone(),
+                metadata: if self.suite.settings.redact_outputs {
+                    None
+                } else {
+                    operation
+                        .response_metadata
+                        .and_then(|metadata| serde_json::to_value(metadata).ok())
+                },
+                evidence,
+                assertion_results,
+                latency_ms,
+                observability_span_id,
             },
-            evidence,
-            assertion_results,
-            latency_ms,
-            observability_span_id,
+            unhandled_runtime_error,
         })
     }
 
@@ -681,21 +856,110 @@ impl EvalRunner {
     }
 }
 
+struct TurnExecution {
+    result: TurnResult,
+    unhandled_runtime_error: Option<String>,
+}
+
+struct TurnOperation {
+    response_content: String,
+    response_metadata: Option<HashMap<String, Value>>,
+    response_present: bool,
+    runtime_error: Option<String>,
+}
+
+impl TurnOperation {
+    fn error(message: String) -> Self {
+        Self {
+            response_content: String::new(),
+            response_metadata: None,
+            response_present: false,
+            runtime_error: Some(message),
+        }
+    }
+}
+
 async fn collect_stream_response(
     agent: &RuntimeAgent,
     input: &str,
-) -> Result<(String, Option<HashMap<String, Value>>)> {
-    let mut stream = agent.chat_stream(input).await?;
+    timeout_ms: u64,
+) -> TurnOperation {
+    let deadline = TokioInstant::now() + Duration::from_millis(timeout_ms);
+    let stream = match timeout_at(deadline, agent.chat_stream(input)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(error)) => return TurnOperation::error(error.to_string()),
+        Err(_) => return TurnOperation::error(format!("turn timed out after {}ms", timeout_ms)),
+    };
+    consume_stream_response(stream, deadline, timeout_ms).await
+}
+
+async fn consume_stream_response<S>(
+    mut stream: S,
+    deadline: TokioInstant,
+    timeout_ms: u64,
+) -> TurnOperation
+where
+    S: futures::Stream<Item = StreamChunk> + Unpin,
+{
     let mut content = String::new();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            StreamChunk::Content { text } => content.push_str(&text),
-            StreamChunk::Done {} => break,
-            StreamChunk::Error { message } => return Err(EvalError::Runtime(message)),
-            _ => {}
+    let mut content_seen = false;
+    let mut runtime_error = None;
+    let mut done = false;
+    loop {
+        match timeout_at(deadline, stream.next()).await {
+            Ok(Some(StreamChunk::Content { text })) => {
+                content_seen = true;
+                content.push_str(&text);
+            }
+            Ok(Some(StreamChunk::Done {})) => {
+                done = true;
+                break;
+            }
+            Ok(Some(StreamChunk::Error { message })) => {
+                if runtime_error.is_none() {
+                    runtime_error = Some(message);
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                if runtime_error.is_none() {
+                    runtime_error = Some(format!("turn timed out after {}ms", timeout_ms));
+                }
+                break;
+            }
         }
     }
-    Ok((content, None))
+    if !done && runtime_error.is_none() {
+        runtime_error = Some("stream ended before Done".to_string());
+    }
+    TurnOperation {
+        response_content: content,
+        response_metadata: None,
+        response_present: content_seen || (done && runtime_error.is_none()),
+        runtime_error,
+    }
+}
+
+fn assertion_uses_response(assertion: &Assertion) -> bool {
+    assertion.response_contains.is_some()
+        || assertion.response_contains_any.is_some()
+        || assertion.response_not_contains.is_some()
+        || assertion.response_not_empty.is_some()
+        || assertion.response_semantic.is_some()
+        || assertion.judge.is_some()
+        || assertion
+            .all
+            .as_ref()
+            .is_some_and(|children| children.iter().any(assertion_uses_response))
+        || assertion
+            .any
+            .as_ref()
+            .is_some_and(|children| children.iter().any(assertion_uses_response))
+        || assertion
+            .not
+            .as_deref()
+            .is_some_and(assertion_uses_response)
 }
 
 fn isolated_storage_config(spec: &AgentSpec, workspace: &Path) -> Option<StorageConfig> {
@@ -882,6 +1146,170 @@ impl Drop for EnvGuard {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn streaming_error_retains_partial_content_and_consumes_until_done() {
+        let chunks = stream::iter(vec![
+            StreamChunk::Content {
+                text: "before ".to_string(),
+            },
+            StreamChunk::Error {
+                message: "stream failed".to_string(),
+            },
+            StreamChunk::Content {
+                text: "after".to_string(),
+            },
+            StreamChunk::Done {},
+        ]);
+        let operation =
+            consume_stream_response(chunks, TokioInstant::now() + Duration::from_secs(1), 1_000)
+                .await;
+        assert_eq!(operation.response_content, "before after");
+        assert!(operation.response_present);
+        assert_eq!(operation.runtime_error.as_deref(), Some("stream failed"));
+    }
+
+    fn write_test_agent(dir: &Path) {
+        std::fs::write(
+            dir.join("agent.yaml"),
+            r#"
+name: TestAgent
+system_prompt: "You are helpful."
+llm:
+  provider: openai
+  model: gpt-4.1-nano
+"#,
+        )
+        .unwrap();
+    }
+
+    async fn run_test_suite(dir: &Path, name: &str, yaml: &str) -> EvalResult {
+        let suite_path = dir.join(name);
+        std::fs::write(&suite_path, yaml).unwrap();
+        let options = EvalRunnerOptions {
+            output: dir.join("out"),
+            ..Default::default()
+        };
+        EvalRunner::from_file(&suite_path, options)
+            .unwrap()
+            .run()
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn runtime_error_expectations_retain_turns_and_control_retries() {
+        std::thread::Builder::new()
+            .name("eval-runtime-error-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let dir = std::env::temp_dir().join(format!(
+                        "ai_agents_eval_runtime_error_test_{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    write_test_agent(&dir);
+                    let errors = run_test_suite(
+                        &dir,
+                        "errors.yaml",
+                        r#"
+name: Runtime Errors
+agent: agent.yaml
+settings:
+  retries: 1
+  retry_delay_ms: 0
+  redact_outputs: false
+fixtures:
+  llm:
+    mode: mock
+    errors_by_alias:
+      default: provider exploded
+scenarios:
+  - id: expected
+    turns:
+      - input: Hello
+        expect_error: [timeout, provider exploded]
+  - id: mismatched
+    turns:
+      - input: Hello
+        expect_error: permission denied
+  - id: unexpected
+    turns:
+      - input: Hello
+"#,
+                    )
+                    .await;
+
+                    let expected = &errors.scenarios[0];
+                    assert!(expected.status.is_passed());
+                    assert_eq!(expected.attempts.len(), 1);
+                    let expected_turn = &expected.attempts[0].turns[0];
+                    assert!(!expected_turn.response_present);
+                    assert!(expected_turn.runtime_error.is_some());
+                    assert!(
+                        expected_turn
+                            .assertion_results
+                            .iter()
+                            .any(|detail| detail.assertion == "expect_error" && detail.passed)
+                    );
+
+                    for scenario in &errors.scenarios[1..] {
+                        assert!(scenario.status.is_error());
+                        assert_eq!(scenario.attempts.len(), 2);
+                        assert!(
+                            scenario
+                                .attempts
+                                .iter()
+                                .all(|attempt| attempt.turns.len() == 1)
+                        );
+                        assert!(
+                            scenario
+                                .attempts
+                                .iter()
+                                .all(|attempt| attempt.turns[0].runtime_error.is_some())
+                        );
+                    }
+
+                    let missing = run_test_suite(
+                        &dir,
+                        "missing.yaml",
+                        r#"
+name: Missing Runtime Error
+agent: agent.yaml
+settings:
+  retry_delay_ms: 0
+  redact_outputs: false
+fixtures:
+  llm:
+    mode: mock
+    responses: [ok]
+scenarios:
+  - id: missing
+    turns:
+      - input: Hello
+        expect_error: timeout
+"#,
+                    )
+                    .await;
+                    let missing = &missing.scenarios[0];
+                    assert!(missing.status.is_failed());
+                    let turn = &missing.attempts[0].turns[0];
+                    assert!(turn.response_present);
+                    assert!(turn.runtime_error.is_none());
+                    assert!(
+                        turn.assertion_results
+                            .iter()
+                            .any(|detail| detail.assertion == "expect_error" && !detail.passed)
+                    );
+                    let _ = std::fs::remove_dir_all(dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     #[test]
     fn runner_executes_mocked_suite_and_redacts_outputs() {
         std::thread::Builder::new()
@@ -895,18 +1323,7 @@ mod tests {
                         uuid::Uuid::new_v4()
                     ));
                     std::fs::create_dir_all(&dir).unwrap();
-                    let agent_path = dir.join("agent.yaml");
-                    std::fs::write(
-                        &agent_path,
-                        r#"
-name: TestAgent
-system_prompt: "You are helpful."
-llm:
-  provider: openai
-  model: gpt-4.1-nano
-"#,
-                    )
-                    .unwrap();
+                    write_test_agent(&dir);
                     let suite_path = dir.join("suite.yaml");
                     std::fs::write(
                         &suite_path,
