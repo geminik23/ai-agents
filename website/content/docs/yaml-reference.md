@@ -2963,7 +2963,7 @@ Evaluation suites are separate YAML files used by `ai-agents-cli eval`. They are
 
 ```yaml
 name: Basic Chat Eval
-agent: ../yaml/basic/simple_chat.yaml
+agent: ../../../yaml/basic/simple_chat.yaml
 settings:
   timeout_per_turn_ms: 5000
   retries: 0
@@ -3059,8 +3059,12 @@ fixtures:
 | `tools` | map | `{}` | Mock tool outputs keyed by tool ID |
 | `llm.mode` | enum | `real` | `real`, `mock`, `replay`, or `record` |
 | `llm.responses` | list | `[]` | Ordered mock responses for `mock` mode |
+| `llm.responses_by_alias` | map | `{}` | Ordered responses for each configured LLM alias |
+| `llm.outcomes_by_alias` | map | `{}` | Ordered response/error outcomes per alias; error entries accept optional HTTP `status` |
 | `llm.cassette` | path? | `null` | JSONL cassette path for `replay` or `record` mode |
-| `mock_server` | map | disabled | Start a lightweight local HTTP server and inject `mock_server.base_url` into runtime context |
+| `mock_server` | map | disabled | Start an attempt-local HTTP server and expose `mock_server.base_url` |
+| `workspace_policy` | map? | `null` | Add the attempt workspace to named existing read/write tool policies |
+| `web_fetch_transport` | map? | `null` | Exact-URL no-socket routes executed through the real web-fetch implementation |
 | `diagnostics` | map? | `null` | Static diagnostics provider for deterministic `diagnostics` tool evals |
 | `commands` | map? | `null` | Static command-runner responses for deterministic `command` tool evals |
 
@@ -3085,7 +3089,11 @@ fixtures:
         status: cancellable
 ```
 
-`mock_server.routes` entries accept `method`, `path`, `status`, optional `headers`, and `body`. The runner chooses a dynamic port when `port` is omitted.
+`mock_server.routes` entries accept `method`, `path`, `status`, optional `headers`, and `body`. The runner chooses a dynamic port when `port` is omitted. Mock LLM responses may interpolate only `{{ mock_server.base_url }}` and `{{ eval.workspace }}`. Interpolation is JSON-safe, unrelated template expressions remain unchanged, and referencing the server token without an enabled server is an error.
+
+Every attempt exposes `eval.workspace` in runtime context and isolates parent and spawner file, SQLite, or Redis storage. `workspace_policy.read_tools` and `workspace_policy.write_tools` may add that workspace only to named existing policies; unknown tool policies are rejected.
+
+`web_fetch_transport.routes` use exact public-style URLs with `status`, optional `headers`, and `body`. They do not open sockets and do not bypass the real web-fetch URL, address, redirect, byte, cache, or policy checks.
 
 ```yaml
 fixtures:
@@ -3138,9 +3146,10 @@ scenarios:
 | `turn.actor` | `string?` | `null` | Actor override for a single turn |
 | `turn.context` | object | `null` | Turn-level context overlay |
 | `turn.stream` | `bool?` | `null` | Use `chat_stream()`, collect all content chunks into a final response string, then run assertions against that final text |
+| `turn.expect_error` | string/list? | `null` | Runtime error substring or alternatives expected for this turn |
 | `turn.assert` | object | `null` | Assertions evaluated after the turn |
 
-Context overlay order is: `fixtures.context_file` -> `fixtures.context` -> `mock_server.base_url` -> `scenario.context` -> `turn.context`. Later values replace earlier values at the same top-level key.
+Context overlay order is: `fixtures.context_file` -> `fixtures.context` -> generated `eval.workspace` and optional `mock_server.base_url` -> `scenario.context` -> `turn.context`. Later values replace earlier values at the same top-level key. Fixture interpolation always uses immutable generated attempt values, not overridable runtime context.
 
 Advanced step example:
 

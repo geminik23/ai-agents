@@ -638,7 +638,7 @@ A suite is separate from the agent YAML. The suite chooses fixtures, scenarios, 
 
 ```yaml
 name: Basic Chat Eval
-agent: ../yaml/basic/simple_chat.yaml
+agent: ../../../yaml/basic/simple_chat.yaml
 fixtures:
   llm:
     mode: mock

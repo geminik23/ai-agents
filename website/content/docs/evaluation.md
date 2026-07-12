@@ -35,8 +35,8 @@ The fastest eval suite uses a mocked LLM response. This tests the runner, agent 
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/basic_chat.yaml \
-  --output target/eval/basic_chat
+  --scenarios examples/eval/mocked/basic/simple_chat_mocked.yaml \
+  --output target/eval/mocked/basic/simple_chat_mocked
 ```
 
 Expected output summary:
@@ -48,7 +48,7 @@ Eval complete: 1/1 passed, 0 failed, 0 skipped.
 The runner writes:
 
 ```text
-target/eval/basic_chat/
+target/eval/mocked/basic/simple_chat_mocked/
   summary.md
   summary.json
   per_scenario.jsonl
@@ -155,7 +155,7 @@ failed assertion
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/basic_chat.yaml \
+  --scenarios examples/eval/mocked/basic/simple_chat_mocked.yaml \
   --id hello-smoke \
   --output target/eval/debug_one
 ```
@@ -271,7 +271,7 @@ scenarios:
 
 Branch raw events also carry both `speculative` and `runtime.speculative` dimensions for export and debugging. Dimension-count assertions operate on configured aggregate dimensions, so include `speculative` when you want to match speculative branch metrics. Branch telemetry is the stable way to inspect speculative LLM work because losing branches do not fire final response hooks.
 
-Runtime optimization can schedule background actor memory maintenance. The eval runner flushes background runtime tasks before collecting turn evidence, so facts, relationships, and observability assertions see the completed post-turn state. The example suite `examples/eval/runtime_optimization_mocked.yaml` shows a no-key regression check for pre-response guard routing, and the speculative suites cover committed, discarded, failed, and cancelled branch status dimensions.
+Runtime optimization can schedule background actor memory maintenance. The eval runner flushes background runtime tasks before collecting turn evidence, so facts, relationships, and observability assertions see the completed post-turn state. The example suite `examples/eval/mocked/runtime-optimization/pre_response_transition_mocked.yaml` shows a no-key regression check for pre-response guard routing, and the speculative suites cover committed, discarded, failed, and cancelled branch status dimensions.
 
 ---
 
@@ -279,7 +279,7 @@ Runtime optimization can schedule background actor memory maintenance. The eval 
 
 ```yaml
 name: Basic Chat Eval
-agent: ../yaml/basic/simple_chat.yaml
+agent: ../../../yaml/basic/simple_chat.yaml
 settings:
   timeout_per_turn_ms: 5000
   retries: 0
@@ -307,7 +307,7 @@ Important parts:
 | `name` | Report name. |
 | `agent` | Agent YAML path, resolved relative to the suite file. CLI `--agent` can override it. |
 | `settings` | Timeouts, retries, isolation, parallelism, and redaction. |
-| `fixtures` | Mock/replay/record/real LLM modes, optional per-alias mock delays, mock tools, context, mock server, mocked diagnostics providers, and mocked command-runner responses. |
+| `fixtures` | Mock/replay/record/real LLM modes, sequenced outcomes, attempt-local values, mock or real-tool transports, context, diagnostics, commands, and deterministic HITL approvals. |
 | `scenarios` | Test cases with direct turns or advanced steps. |
 | `assert` | Assertions evaluated after a turn. |
 
@@ -352,6 +352,71 @@ fixtures:
 ```
 
 Delays are in milliseconds and apply to mocked or replay fallback providers for the named alias.
+
+### Sequenced LLM outcomes
+
+Use `fixtures.llm.outcomes_by_alias` to mix deterministic responses and provider errors for one alias. This is useful for retry and recovery contracts.
+
+```yaml
+fixtures:
+  llm:
+    mode: mock
+    outcomes_by_alias:
+      default:
+        - type: error
+          message: transient provider outage
+          status: 503
+        - type: response
+          content: Recovered response.
+```
+
+Each alias has an independent cursor. The last outcome repeats after exhaustion. Error `status` is optional; status values such as `503` preserve the runtime recovery classification.
+
+### Attempt-local values and real-tool fixtures
+
+Each scenario attempt receives an opaque absolute workspace. Runtime context includes `eval.workspace` and includes `mock_server.base_url` when the local server is enabled. Parent and spawner file, SQLite, and Redis storage are isolated per attempt.
+
+Mock response strings can interpolate only `{{ eval.workspace }}` and `{{ mock_server.base_url }}`. JSON tool calls are rewritten as parsed JSON, so native path separators remain valid. Other template expressions remain unchanged, and a mock-server token without an enabled server is a configuration error.
+
+```yaml
+fixtures:
+  mock_server:
+    enabled: true
+    routes:
+      - method: GET
+        path: /status
+        status: 200
+        body: { healthy: true }
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"http","arguments":{"method":"GET","url":"{{ mock_server.base_url }}/status"}}'
+```
+
+Use `workspace_policy` only when the source agent already has an explicit tool policy and a real tool must access the isolated workspace:
+
+```yaml
+fixtures:
+  workspace_policy:
+    write_tools: [file_write]
+```
+
+The overlay adds only the generated workspace to the listed existing policies. It does not disable fail-closed behavior, blocked paths, confirmation, or unrelated policy rules.
+
+Use `web_fetch_transport` to execute the real `web_fetch` implementation through exact-URL in-memory routes without opening a socket:
+
+```yaml
+fixtures:
+  web_fetch_transport:
+    routes:
+      - url: https://docs.example.test/article
+        status: 200
+        headers:
+          content-type: text/html
+        body: "<h1>Fixture article</h1>"
+```
+
+The real URL, domain, address, redirect, byte, cache, and output checks still run. Localhost and private-network targets remain blocked.
 
 ### Mocked diagnostics fixture
 
@@ -409,25 +474,190 @@ When no command fixture or host runner is installed, the shared executor records
 
 Tool evidence comes from executor-level `ToolExecutionRecord` values. Assertions can check successful calls, denied calls, unavailable tools, approval rejection, approval timeout, cancellation, and missing policy bindings because non-executed attempts are still recorded and can be matched with `executed: false`.
 
+### Deterministic HITL approval fixtures
+
+Use `fixtures.approvals` to run approval paths without a person, real HTTP, or another live approval service. Rules are evaluated in declaration order and the first matching rule whose optional `occurrence` matches supplies the outcome. `occurrence` is 1-based and counted separately for each rule when evaluation reaches that rule and its trigger predicate matches; later rules are not visited after a winner is selected. If no rule matches, `default` is used; omitting `default` is equivalent to `outcome: unavailable`.
+
+This example uses the exact fixture shape from `examples/eval/mocked/hitl/hitl_basic_mocked.yaml`:
+
+```yaml
+fixtures:
+  approvals:
+    preferred_language: en
+    supported_languages: [en]
+    rules:
+      - trigger: { type: tool, name: http }
+        occurrence: 3
+        outcome: timeout
+      - trigger: { type: tool, name: http }
+        occurrence: 2
+        outcome: reject
+        reason: fixture rejection
+      - trigger: { type: tool, name: http }
+        occurrence: 1
+        outcome: approve
+    default:
+      outcome: reject
+      reason: unexpected approval request
+```
+
+A tool trigger can also require exact arguments. The complete `args` value must equal the request arguments:
+
+```yaml
+- trigger:
+    type: tool
+    name: http
+    args:
+      method: GET
+      url: "https://api.example.test/en"
+  outcome: approve
+```
+
+Current trigger forms are:
+
+```yaml
+# Tool name, with optional exact args.
+trigger: { type: tool, name: http }
+
+# Condition name, with optional exact matched expression.
+trigger:
+  type: condition
+  name: state_changing_http
+  matched: "method in [POST, PUT, DELETE, PATCH]"
+
+# State transition. from is optional; to is required.
+trigger: { type: state_transition, from: review, to: complete }
+
+# Disambiguation escalation, with an optional exact reason.
+trigger: { type: disambiguation_escalation, reason: unclear }
+```
+
+Current outcome forms are:
+
+```yaml
+default:
+  outcome: approve
+
+default:
+  outcome: reject
+  reason: "Unexpected approval request"
+
+default:
+  outcome: modify
+  changes:
+    url: "https://api.example.test/v1/safe-items/42"
+    body: '{"name":"safe-item"}'
+
+default:
+  outcome: timeout
+
+default:
+  outcome: unavailable
+```
+
+`changes` is a top-level argument patch. The runtime applies its entries to the original tool argument object to produce the complete modified and effective arguments. `unavailable` is deliberately fail-closed: the fixture handler returns a rejection with reason `Approval fixture unavailable`; it does not permit execution or wait for a person.
+
+`preferred_language` and `supported_languages` are advertised by the fixture handler to the HITL message resolver. They control the localized approval message generated by the agent's HITL configuration; assertions can then check that exact message. For example, the multilingual suite verifies English, Korean, and Japanese messages:
+
+```yaml
+approval_requested:
+  count: 1
+  trigger:
+    type: tool
+    name: http
+  message: "https://api.example.test/ko에 POST 요청을 승인하시겠습니까?"
+  raw_decision: rejected
+  effective_decision: rejected
+  rejection_reason: "Mocked Korean rejection"
+```
+
+Each scenario attempt builds a fresh fixture handler and fresh occurrence counters. Counters are shared across turns and agent resets within that attempt, but retries and concurrently running scenario attempts cannot consume one another's occurrences. This makes ordered multi-turn rules deterministic while keeping retries isolated.
+
+These fixtures replace only approval input. Mock the LLM and the approved tool too when a suite must remain deterministic and side-effect-free. Real HTTP and real human input remain excluded from mocked HITL evals.
+
+### HITL evidence and assertions
+
+Every fully resolved approval request is retained as turn evidence with its normalized trigger, raw and effective decisions, original/modified/effective arguments, localized message, rejection reason, and resolution error. Use `approval_requested` to require a matching record and `approval_not_requested` to prove that no record matches the optional filters.
+
+```yaml
+assert:
+  approval_requested:
+    count: 1
+    trigger:
+      type: condition
+      name: state_changing_http
+      matched: "method in [POST, PUT, DELETE, PATCH]"
+    raw_decision: modified
+    effective_decision: modified
+    message: "Approve PUT request to https://api.example.test/v1/items/42?"
+    original_args:
+      path: url
+      eq: "https://api.example.test/v1/items/42"
+    modified_args:
+      path: url
+      eq: "https://api.example.test/v1/safe-items/42"
+    effective_args:
+      path: body
+      eq: '{"name":"safe-item"}'
+```
+
+`approval_requested` accepts `true`/`false` or an object. Object filters include `count`, `count_gte`, `count_lte`, `trigger`, `raw_decision`, `effective_decision`, `message`, `message_contains`, `rejection_reason`, `rejection_reason_contains`, `error`, `error_contains`, `original_args`, `modified_args`, and `effective_args`. Argument fields are path assertions; aliases `args_original`, `args_modified`, and `args_effective` are also accepted. All filters in one object must match the same approval record before its count is included.
+
+```yaml
+assert:
+  approval_not_requested:
+    trigger:
+      type: condition
+      name: state_changing_http
+```
+
+For `approval_not_requested`, boolean form checks whether the turn has no approval records; object form passes only when no record matches its filters. Assertion trigger types are normalized as `tool`, `condition`, or `state` (state assertions use optional `from` and `to`), even though the fixture rule spelling is `state_transition`.
+
+Raw and effective decisions are intentionally distinct. `raw_decision` is what the handler returned: `approved`, `rejected`, `modified`, or `timeout`. `effective_decision` is what the runtime resolved: `approved`, `rejected`, `modified`, or `error`. For example, the supplied HITL agents resolve timeout to rejection, so suites assert `raw_decision: timeout` with `effective_decision: rejected`; another timeout policy can resolve to `error`. Rejected, timed-out, and errored requests have no effective executable arguments. Pair approval assertions with `tool_called.executed` to prove whether the wrapped tool ran.
+
+A turn that is expected to end in a runtime error can declare one substring or a list of alternatives:
+
+```yaml
+turns:
+  - input: Trigger the approval error path.
+    expect_error: "approval timed out"
+    assert:
+      approval_requested:
+        raw_decision: timeout
+        effective_decision: error
+        error_contains: "timed out"
+```
+
+```yaml
+expect_error: [timeout, unavailable]
+```
+
+`expect_error` is per turn and uses substring matching; list form passes when any entry matches. A matching error adds a passing `expect_error` assertion instead of marking the scenario as a runtime error. A missing or non-matching error fails that assertion. The runner collects and retains the errored turn before stopping, so approval records, tool records, state, latency, and other evidence produced during that turn remain available to assertions and metrics. Errors that happen before a turn result exists, such as setup failure or an outer scenario-attempt timeout, cannot retain turn evidence.
+
+Approval evidence is evaluated in memory before report redaction. Raw `TurnEvidence` is never serialized to JSON or JSONL, and sensitive approval fields such as arguments, localized messages, rejection reasons, and errors are marked non-serializing. With default `settings.redact_outputs: true`, assertion `actual` and `expected` values are redacted too. `settings.redact_outputs: false` can expose ordinary assertion and runtime-error detail for trusted local debugging, but it still does not serialize raw approval evidence.
+
 ### Focused built-in tool evals
 
 The examples directory includes no-key suites for both success and denial paths:
 
 ```text
-examples/eval/code_search_mocked.yaml              -> grep search
-examples/eval/file_write_dry_run_mocked.yaml       -> file_write dry run
-examples/eval/file_edit_review_mocked.yaml         -> file_edit dry run
-examples/eval/file_edit_denied_mocked.yaml         -> blocked write path
-examples/eval/file_edit_approval_rejected_mocked.yaml -> approval rejected before execution
-examples/eval/patch_review_mocked.yaml             -> patch dry run
-examples/eval/ask_user_fallback_mocked.yaml        -> ask_user default fallback
-examples/eval/web_fetch_policy_mocked.yaml         -> blocked URL policy
-examples/eval/diagnostics_mocked.yaml              -> diagnostics fixture
-examples/eval/command_validation_mocked.yaml       -> command allowlist
-examples/eval/command_blocked_mocked.yaml          -> blocked command
-examples/eval/sleep_wait_mocked.yaml               -> bounded sleep wait
-examples/eval/no_tools_explicit_empty_mocked.yaml  -> tools: [] denies calls
-examples/eval/speculative_losing_tool_draft_mocked.yaml -> losing branch tool call stays inert
+examples/eval/mocked/hitl/hitl_basic_mocked.yaml                -> ordered approve, reject, and timeout outcomes
+examples/eval/mocked/hitl/hitl_conditions_mocked.yaml           -> bypass, approve, reject, modify, and timeout by condition
+examples/eval/mocked/hitl/hitl_multilingual_mocked.yaml         -> localized English, Korean, and Japanese approval messages
+examples/eval/mocked/tools/code_search_mocked.yaml              -> grep search
+examples/eval/mocked/tools/file_write_dry_run_mocked.yaml       -> file_write dry run
+examples/eval/mocked/tools/file_edit_review_mocked.yaml         -> file_edit dry run
+examples/eval/mocked/tools/file_edit_denied_mocked.yaml         -> blocked write path
+examples/eval/mocked/tools/file_edit_approval_rejected_mocked.yaml -> approval rejected before execution
+examples/eval/mocked/tools/patch_review_mocked.yaml             -> patch dry run
+examples/eval/mocked/tools/ask_user_fallback_mocked.yaml        -> ask_user default fallback
+examples/eval/mocked/tools/web_fetch_policy_mocked.yaml         -> blocked URL policy
+examples/eval/mocked/tools/diagnostics_mocked.yaml              -> diagnostics fixture
+examples/eval/mocked/tools/command_validation_mocked.yaml       -> command allowlist
+examples/eval/mocked/tools/command_blocked_mocked.yaml          -> blocked command
+examples/eval/mocked/tools/sleep_wait_mocked.yaml               -> bounded sleep wait
+examples/eval/mocked/basic/no_tools_explicit_empty_mocked.yaml  -> tools: [] denies calls
+examples/eval/mocked/runtime-optimization/speculative_losing_tool_draft_mocked.yaml -> losing branch tool call stays inert
 ```
 
 Use these as templates for permission-denial, approval, host-fixture, and no-tools regression coverage.
@@ -473,7 +703,7 @@ Use `record` when you want to capture real provider behavior once, then replay i
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/real_llm_semantic_judge.yaml \
+  --scenarios examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml \
   --output target/eval/record_live \
   --record target/eval/cassettes/live.jsonl
 ```
@@ -504,7 +734,7 @@ Use `replay` to run without live provider calls after recording.
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/real_llm_semantic_judge.yaml \
+  --scenarios examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml \
   --output target/eval/replay_live \
   --replay target/eval/cassettes/live.jsonl
 ```
@@ -542,8 +772,8 @@ Or force real mode from the CLI:
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/real_llm_semantic_judge.yaml \
-  --output target/eval/real_llm_semantic_judge \
+  --scenarios examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml \
+  --output target/eval/live/quality/basic/simple_chat_semantic_judge \
   --real-llm
 ```
 
@@ -555,12 +785,12 @@ The examples tree also contains live suites that exercise runnable YAML examples
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
-  --scenarios examples/eval/live/examples/tools_code_search_live.yaml \
-  --output target/eval/live/examples/tools_code_search \
+  --scenarios examples/eval/live/examples/tools/code_search_live.yaml \
+  --output target/eval/live/examples/tools/code_search \
   --real-llm
 ```
 
-These suites declare their own `agent` path. Use `examples/eval/live/examples/README.md` as the registry for status, risk tags, and deferred high-risk examples.
+These suites declare their own `agent` path. Use `examples/eval/live/README.md` as the registry for status, risk tags, and deferred high-risk examples.
 
 Live suites should usually check one primary behavior per scenario. If several safe tools can satisfy the same read-only request, use `any` over structural `tool_called` assertions. Prefer concrete prompts such as "Before answering, call the file_read tool ..." when the suite requires tool evidence. Add deterministic response checks for stable result values, requested symbols, fixture details, and dry-run wording so the suite verifies minimum useful user-visible output. Keep exact multi-tool sequences, denial paths, unavailable providers, approval behavior, and response-quality judges in mocked or focused suites where the model output is deterministic.
 
@@ -665,6 +895,8 @@ Common deterministic assertions:
 | `metadata_contains` | Top-level response metadata. |
 | `metadata_path` / `context_path` | Dot-path assertions. |
 | `tool_called` | Tool ID, executed flag, success, source, arguments, output. |
+| `llm_request` | In-memory role-specific message content and request counts without serializing prompts. |
+| `approval_requested` / `approval_not_requested` | Approval trigger, raw/effective decision, localized message, reasons/errors, argument versions, and counts. |
 | `facts_include` | Actor facts by actor/category and optional semantic judge. |
 | `relationship` | Relationship dimensions and counts. |
 | `orchestration` | Pattern, final agent, included agents, stage count. |
@@ -705,6 +937,7 @@ input.value = [redacted]
 response.value = [redacted]
 string assertion actual/expected = [redacted]
 raw TurnEvidence is omitted from JSON and JSONL
+approval arguments, messages, reasons, and errors remain in-memory-only
 response metadata is omitted from JSON and JSONL
 ```
 
@@ -721,7 +954,7 @@ Use CLI parallelism for independent scenario-isolated suites:
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/multiturn_mocked.yaml \
+  --scenarios examples/eval/mocked/basic/simple_chat_multiturn_mocked.yaml \
   --output target/eval/parallel \
   --parallel 4
 ```
@@ -739,26 +972,29 @@ Rules:
 
 | Example | What it demonstrates |
 |---------|----------------------|
-| `examples/eval/basic_chat.yaml` | Small no-key mock smoke test. |
-| `examples/eval/multiturn_mocked.yaml` | Ordered mock responses across multiple turns. |
-| `examples/eval/streaming_mocked.yaml` | Streaming turn collection. |
-| `examples/eval/observability_mocked.yaml` | Observability assertions without API keys. |
-| `examples/eval/runtime_optimization_mocked.yaml` | Pre-response guard routing without API keys. |
-| `examples/eval/speculative_parallel_transition_mocked.yaml` | Parallel transition winner with stale draft discard. |
-| `examples/eval/speculative_parallel_transition_miss_mocked.yaml` | Parallel transition miss with main draft commit. |
-| `examples/eval/speculative_losing_tool_draft_mocked.yaml` | Losing draft tool call stays inert. |
-| `examples/eval/speculative_skill_routing_mocked.yaml` | Skill selection branch commit before skill execution. |
-| `examples/eval/speculative_skill_no_match_mocked.yaml` | Skill no-match branch with main draft commit. |
-| `examples/eval/speculative_reasoning_auto_mocked.yaml` | Auto reasoning none decision with plain draft commit. |
-| `examples/eval/speculative_reasoning_cot_mocked.yaml` | Auto reasoning deeper decision with plain draft discard. |
-| `examples/eval/speculative_reasoning_react_mocked.yaml` | Auto reasoning ReAct decision with plain draft discard. |
-| `examples/eval/speculative_reasoning_plan_mocked.yaml` | Auto reasoning plan-and-execute decision with committed plan path. |
-| `examples/eval/speculative_reasoning_judge_failure_mocked.yaml` | Auto reasoning judge failure with plain draft fallback and failed branch status. |
-| `examples/eval/buffered_streaming_mocked.yaml` | Buffered streaming route winner. |
-| `examples/eval/buffered_streaming_main_win_mocked.yaml` | Buffered streaming main draft winner. |
-| `examples/eval/real_llm_semantic_judge.yaml` | Live provider response and live judge. |
-| `examples/eval/live/examples/tools_code_search_live.yaml` | Live read-only tool-use smoke test for a runnable YAML example. |
-| `examples/eval/live/examples/README.md` | Registry for live example eval suites, risk tags, and run commands. |
+| `examples/eval/mocked/basic/simple_chat_mocked.yaml` | Small no-key mock smoke test. |
+| `examples/eval/mocked/basic/simple_chat_multiturn_mocked.yaml` | Ordered mock responses across multiple turns. |
+| `examples/eval/mocked/basic/simple_chat_streaming_mocked.yaml` | Streaming turn collection. |
+| `examples/eval/mocked/basic/simple_chat_observability_mocked.yaml` | Observability assertions without API keys. |
+| `examples/eval/mocked/hitl/hitl_basic_mocked.yaml` | Ordered approve, reject, and timeout behavior across turns. |
+| `examples/eval/mocked/hitl/hitl_conditions_mocked.yaml` | Condition bypass plus approve, reject, modify, and timeout behavior. |
+| `examples/eval/mocked/hitl/hitl_multilingual_mocked.yaml` | Localized English, Korean, and Japanese approval messages and outcomes. |
+| `examples/eval/mocked/runtime-optimization/pre_response_transition_mocked.yaml` | Pre-response guard routing without API keys. |
+| `examples/eval/mocked/runtime-optimization/speculative_parallel_transition_mocked.yaml` | Parallel transition winner with stale draft discard. |
+| `examples/eval/mocked/runtime-optimization/speculative_parallel_transition_miss_mocked.yaml` | Parallel transition miss with main draft commit. |
+| `examples/eval/mocked/runtime-optimization/speculative_losing_tool_draft_mocked.yaml` | Losing draft tool call stays inert. |
+| `examples/eval/mocked/runtime-optimization/speculative_skill_routing_mocked.yaml` | Skill selection branch commit before skill execution. |
+| `examples/eval/mocked/runtime-optimization/speculative_skill_no_match_mocked.yaml` | Skill no-match branch with main draft commit. |
+| `examples/eval/mocked/runtime-optimization/speculative_reasoning_auto_mocked.yaml` | Auto reasoning none decision with plain draft commit. |
+| `examples/eval/mocked/runtime-optimization/speculative_reasoning_cot_mocked.yaml` | Auto reasoning deeper decision with plain draft discard. |
+| `examples/eval/mocked/runtime-optimization/speculative_reasoning_react_mocked.yaml` | Auto reasoning ReAct decision with plain draft discard. |
+| `examples/eval/mocked/runtime-optimization/speculative_reasoning_plan_mocked.yaml` | Auto reasoning plan-and-execute decision with committed plan path. |
+| `examples/eval/mocked/runtime-optimization/speculative_reasoning_judge_failure_mocked.yaml` | Auto reasoning judge failure with plain draft fallback and failed branch status. |
+| `examples/eval/mocked/runtime-optimization/buffered_streaming_mocked.yaml` | Buffered streaming route winner. |
+| `examples/eval/mocked/runtime-optimization/buffered_streaming_main_win_mocked.yaml` | Buffered streaming main draft winner. |
+| `examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml` | Live provider response and live judge. |
+| `examples/eval/live/examples/tools/code_search_live.yaml` | Live read-only tool-use smoke test for a runnable YAML example. |
+| `examples/eval/live/README.md` | Registry for live example eval suites, risk tags, and run commands. |
 
 See [Examples](@/examples/_index.md) for the full examples catalog.
 

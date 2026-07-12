@@ -830,14 +830,14 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let output = PathBuf::from("target/eval/basic_chat");
+    let output = PathBuf::from("target/eval/mocked/basic/simple_chat_mocked");
     let options = EvalRunnerOptions {
         agent: Some(PathBuf::from("examples/yaml/basic/simple_chat.yaml")),
         output: output.clone(),
         ..Default::default()
     };
 
-    let runner = EvalRunner::from_file("examples/eval/basic_chat.yaml", options)?;
+    let runner = EvalRunner::from_file("examples/eval/mocked/basic/simple_chat_mocked.yaml", options)?;
     let result = runner.run().await?;
     write_outputs(&result, &output, true)?;
 

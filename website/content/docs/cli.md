@@ -95,8 +95,8 @@ Example:
 ```sh
 cargo run -p ai-agents-cli -- eval \
   --agent examples/yaml/basic/simple_chat.yaml \
-  --scenarios examples/eval/basic_chat.yaml \
-  --output target/eval/basic_chat
+  --scenarios examples/eval/mocked/basic/simple_chat_mocked.yaml \
+  --output target/eval/mocked/basic/simple_chat_mocked
 ```
 
 Exit codes: `0` all non-skipped scenarios passed, `1` one or more scenario assertions failed or errored, `2` suite parsing, fixture setup, or runtime setup failed before a useful result was produced.
@@ -107,7 +107,7 @@ A suite can be a YAML file with `name`, optional `agent`, `settings`, `fixtures`
 
 ```yaml
 name: Basic Chat Eval
-agent: ../yaml/basic/simple_chat.yaml
+agent: ../../../yaml/basic/simple_chat.yaml
 settings:
   timeout_per_turn_ms: 5000
   retries: 0
