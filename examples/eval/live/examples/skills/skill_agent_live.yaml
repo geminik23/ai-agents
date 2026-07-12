@@ -1,0 +1,60 @@
+name: Live Example - Skill Agent
+agent: ../../../../yaml/skills/skill_agent.yaml
+
+# Live eval suite for combined inline and external skills through the parent agent.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/skills/skill_agent_live.yaml \
+#     --output target/eval/live/examples/skills/skill_agent \
+#     --real-llm
+#
+# Flow: clothing request -> live skill router -> external weather skill -> local echo -> recommendation
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: skill-agent-recommends-weather-clothes
+    name: Real model executes the external weather skill through the combined parent
+    tags: [live, examples, yaml, skills, routing, tools, utility, real-llm]
+    language: en
+    turns:
+      - input: "What should I wear for today's weather? Give me a concise recommendation."
+        assert:
+          all:
+            - response_not_empty: true
+            - skill_triggered: weather_clothes
+            - tool_called:
+                id: echo
+                count_gte: 1
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: message
+                  contains: "temperature=18"
+            - response_contains_any:
+                - "Seoul"
+                - "18"
+                - "sunny"
+            - response_contains_any:
+                - "jacket"
+                - "layer"
+                - "shirt"
+                - "sweater"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

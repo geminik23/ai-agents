@@ -1,0 +1,50 @@
+name: Live Example - Disambiguation Agent
+agent: ../../../../yaml/disambiguation/disambiguation_agent.yaml
+
+# Live eval suite for vague-reference detection in the full disambiguation config.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/disambiguation/disambiguation_agent_live.yaml \
+#     --output target/eval/live/examples/disambiguation/disambiguation_agent \
+#     --real-llm
+#
+# Flow: vague reference -> live full-config detection -> clarification without tool execution
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: full-disambiguation-asks-about-vague-reference
+    name: Real model clarifies a vague reference under the full config
+    tags: [live, examples, yaml, disambiguation, routing, no-tools, real-llm]
+    language: en
+    turns:
+      - input: "Do that again."
+        assert:
+          all:
+            - response_not_empty: true
+            - disambiguation: triggered
+            - response_contains_any:
+                - "again"
+                - "what"
+                - "which"
+                - "that"
+            - tool_not_called: calculator
+            - tool_not_called: datetime
+            - tool_not_called: math
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

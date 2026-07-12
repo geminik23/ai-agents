@@ -1,0 +1,55 @@
+name: Live Example - Persona Basic
+agent: ../../../../yaml/persona/persona_basic.yaml
+
+# Live eval suite for structured persona identity composition.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/persona/persona_basic_live.yaml \
+#     --output target/eval/live/examples/persona/persona_basic \
+#     --real-llm
+#
+# Flow: public identity request -> composed persona prompt -> public support response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: persona-basic-composes-public-identity
+    name: Real model receives the exact public persona identity
+    tags: [live, examples, yaml, persona, identity, real-llm]
+    language: en
+    turns:
+      - input: "Introduce yourself by name, role, and affiliation, then briefly offer help with my account."
+        assert:
+          all:
+            - response_not_empty: true
+            - llm_request:
+                system_contains:
+                  - "## Identity"
+                  - "You are Jay, Senior Support Representative."
+                  - "Affiliation: AI Agents Company"
+                  - "Help the customer with their account issue."
+                user_contains: "Introduce yourself by name, role, and affiliation"
+                count: 1
+                same_request: true
+            - response_contains_any:
+                - "Jay"
+                - "Senior Support Representative"
+            - response_contains_any:
+                - "AI Agents Company"
+                - "account"
+                - "support"
+            - response_not_contains:
+                - "Identify upsell opportunities"
+                - "upsell opportunities"

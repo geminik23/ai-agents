@@ -8,14 +8,12 @@ Live suites are release smoke tests, not the default no-key CI path. Prefer `exa
 
 ```text
 examples/eval/live/
-├── run_live_example_evals.sh  # convenience helper for live example suites
-├── examples/                  # runnable YAML example smoke checks
-│   ├── basic/
-│   ├── state-machine/
-│   └── tools/
-└── quality/                   # semantic or judge-based live checks
-    └── basic/
+├── run_live_example_evals.sh
+├── examples/<category>/*_live.yaml
+└── quality/<category>/*_live.yaml
 ```
+
+Category folders mirror `examples/yaml/`. Use `--list` for the current discovered suite set instead of maintaining a category tree here.
 
 ## Requirements
 
@@ -63,7 +61,7 @@ Combine category and filename filtering:
 sh examples/eval/live/run_live_example_evals.sh --yes-live --category tools --filter code_search
 ```
 
-Available categories are the folders under `examples/eval/live/examples/`, such as `basic`, `state-machine`, and `tools`.
+Available categories are discovered from the folders under `examples/eval/live/examples/`. Use `--list` to see the current suite set.
 
 ## Run selected tags
 
@@ -119,10 +117,10 @@ Use the same category folder name as `examples/yaml/`, including names such as `
 
 ## Risk tags
 
-Use these tags consistently in live suites and registry rows:
+Use a small set of descriptive tags for filtering and reporting. Common tags include:
 
 ```text
-live examples yaml tools read-only host-backed utility grant scoping denial mutation dry-run command network hitl mcp manual fixture mocked-only
+live real-llm examples yaml basic context disambiguation error-recovery memory observability persona process reasoning relationships session skills state-machine tools read-only no-tools host-backed utility grant scoping routing guard nested lifecycle detection extraction normalization sanitization denial mutation dry-run command network hitl mcp manual fixture mocked-only
 ```
 
 ## Coverage registry
@@ -131,6 +129,55 @@ live examples yaml tools read-only host-backed utility grant scoping denial muta
 |---------|---------------------------|--------|--------------------|--------|
 | `examples/yaml/basic/simple_tools.yaml` | minimal built-in tools | `live-auto` | `examples/eval/live/examples/basic/simple_tools_live.yaml` | Verifies a minimal safe tool grant. |
 | `examples/yaml/state-machine/state_with_tools.yaml` | state-level tool narrowing | `live-auto` | `examples/eval/live/examples/state-machine/state_with_tools_live.yaml` | Verifies state transition evidence and scoped tool execution. |
+| `examples/yaml/state-machine/two_state_greeting.yaml` | minimal conversational state loop | `live-auto` | `examples/eval/live/examples/state-machine/two_state_greeting_live.yaml` | Verifies real-model routing into help and back to greeting. |
+| `examples/yaml/state-machine/guard_transitions.yaml` | extraction-backed context guards | `live-auto` | `examples/eval/live/examples/state-machine/guard_transitions_live.yaml` | Verifies live extraction followed by deterministic guard routing. |
+| `examples/yaml/state-machine/nested_states.yaml` | hierarchical state routing | `live-auto` | `examples/eval/live/examples/state-machine/nested_states_live.yaml` | Verifies a nested troubleshooting route and root-state escape. |
+| `examples/yaml/state-machine/state_lifecycle.yaml` | enter, exit, and reentry actions | `live-auto` | `examples/eval/live/examples/state-machine/state_lifecycle_live.yaml` | Verifies lifecycle context through a bounded revision workflow. |
+| `examples/yaml/state-machine/support_state_machine.yaml` | representative support routing | `live-auto` | `examples/eval/live/examples/state-machine/support_state_machine_live.yaml` | Verifies technical, order, and global escalation routes without external effects. |
+| `examples/yaml/context/builtin_context.yaml` | built-in agent and session context | `live-auto` | `examples/eval/live/examples/context/builtin_context_live.yaml` | Verifies the model uses built-in identity, session, and time context. |
+| `examples/yaml/context/runtime_context.yaml` | host-provided user context | `fixture-live` | `examples/eval/live/examples/context/runtime_context_live.yaml` | Uses safe fixture values to verify personalized real-model output. |
+| `examples/yaml/context/template_context.yaml` | context-driven prompt templates | `fixture-live` | `examples/eval/live/examples/context/template_context_live.yaml` | Verifies a stable customer profile selects the intended template branch. |
+| `examples/yaml/context/context_with_state.yaml` | context retained across state routing | `fixture-live` | `examples/eval/live/examples/context/context_with_state_live.yaml` | Verifies injected profile context remains available after transition. |
+| `examples/yaml/context/env_context.yaml` | environment context | `fixture-live` | `examples/eval/live/examples/context/env_context_live.yaml` | Uses safe scenario-local environment values in a serial suite. |
+| `examples/yaml/process/input_normalize.yaml` | input normalization | `live-auto` | `examples/eval/live/examples/process/input_normalize_live.yaml` | Verifies the real model receives and reflects normalized input. |
+| `examples/yaml/process/detect_language.yaml` | language, sentiment, and intent detection | `live-auto` | `examples/eval/live/examples/process/detect_language_live.yaml` | Uses an unambiguous request to verify detected context and localized output. |
+| `examples/yaml/process/extract_and_validate.yaml` | structured extraction and validation | `live-auto` | `examples/eval/live/examples/process/extract_and_validate_live.yaml` | Verifies stable extracted support fields and a context-aware response; exact validation-stage behavior remains mocked. |
+| `examples/yaml/process/output_sanitize.yaml` | output PII non-disclosure and formatting | `live-auto` | `examples/eval/live/examples/process/output_sanitize_live.yaml` | Verifies useful output while complete synthetic prompt canary values remain absent; exact mask formatting remains mocked. |
+| `examples/yaml/skills/skill_inline_only.yaml` | prompt-only inline skill routing | `live-auto` | `examples/eval/live/examples/skills/skill_inline_only_live.yaml` | Verifies real skill selection and a bounded beginner explanation. |
+| `examples/yaml/skills/skill_external_only.yaml` | external math skill with calculator | `live-auto` | `examples/eval/live/examples/skills/skill_external_only_live.yaml` | Covers the external skill through its runnable parent and verifies calculator execution. |
+| `examples/yaml/skills/skill_with_tools.yaml` | multi-step skill tool pipeline | `live-auto` | `examples/eval/live/examples/skills/skill_with_tools_live.yaml` | Verifies skill selection, calculator execution, and a stable result. |
+| `examples/yaml/skills/skill_agent.yaml` | combined inline and external skills | `live-auto` | `examples/eval/live/examples/skills/skill_agent_live.yaml` | Covers one representative external skill path through the combined parent. |
+| `examples/yaml/disambiguation/disambiguation_basic.yaml` | minimal ambiguous-input clarification | `live-auto` | `examples/eval/live/examples/disambiguation/disambiguation_basic_live.yaml` | Verifies vague input produces structural clarification evidence. |
+| `examples/yaml/disambiguation/disambiguation_agent.yaml` | full-config vague-reference detection | `live-auto` | `examples/eval/live/examples/disambiguation/disambiguation_agent_live.yaml` | Verifies the full detector asks for missing context without tool execution. |
+| `examples/yaml/disambiguation/disambiguation_multilingual.yaml` | Korean clarification | `live-auto` | `examples/eval/live/examples/disambiguation/disambiguation_multilingual_live.yaml` | Verifies multilingual ambiguity evidence and bounded Korean clarification. |
+| `examples/yaml/disambiguation/disambiguation_with_state.yaml` | state-aware clarification | `live-auto` | `examples/eval/live/examples/disambiguation/disambiguation_with_state_live.yaml` | Verifies clarification while the current state remains unchanged. |
+| `examples/yaml/memory/memory_basic.yaml` | in-memory multi-turn recall | `live-auto` | `examples/eval/live/examples/memory/memory_basic_live.yaml` | Uses a stable marker and request evidence to prove recall. |
+| `examples/yaml/memory/memory_agent.yaml` | configured compacting memory | `live-auto` | `examples/eval/live/examples/memory/memory_agent_live.yaml` | Verifies summary injection and bounded marker recall after compaction. |
+| `examples/yaml/memory/memory_budget.yaml` | token-budgeted memory | `live-auto` | `examples/eval/live/examples/memory/memory_budget_live.yaml` | Verifies the generated summary retains an early marker without requiring exact summary wording. |
+| `examples/yaml/memory/memory_compacting.yaml` | compacting memory | `live-auto` | `examples/eval/live/examples/memory/memory_compacting_live.yaml` | Verifies router summarization and useful recall after compaction. |
+| `examples/yaml/session/facts_basic.yaml` | actor-scoped fact extraction | `fixture-live` | `examples/eval/live/examples/session/facts_basic_live.yaml` | Uses isolated storage and structural fact evidence. |
+| `examples/yaml/session/multi_actor.yaml` | actor identity and fact isolation | `fixture-live` | `examples/eval/live/examples/session/multi_actor_live.yaml` | Verifies the configured actor context without cross-attempt storage. |
+| `examples/yaml/session/cross_session.yaml` | isolated persistent fact reuse | `fixture-live` | `examples/eval/live/examples/session/cross_session_live.yaml` | Uses attempt-local SQLite storage; restart persistence remains manual. |
+| `examples/yaml/persona/persona_basic.yaml` | persona prompt composition | `live-auto` | `examples/eval/live/examples/persona/persona_basic_live.yaml` | Verifies identity content reaches the provider and visible response. |
+| `examples/yaml/persona/persona_evolution.yaml` | bounded persona evolution | `live-auto` | `examples/eval/live/examples/persona/persona_evolution_live.yaml` | Verifies stable evolved metadata without asserting subjective drift. |
+| `examples/yaml/persona/persona_secrets.yaml` | conditional secret protection | `live-auto` | `examples/eval/live/examples/persona/persona_secrets_live.yaml` | Requires structural non-reveal evidence and strict response non-disclosure. |
+| `examples/yaml/relationships/support_relationship.yaml` | support relationship update | `live-auto` | `examples/eval/live/examples/relationships/support_relationship_live.yaml` | Verifies actor perspective and bounded relationship evidence. |
+| `examples/yaml/relationships/two_sided_relationship.yaml` | two-sided relationship evidence | `live-auto` | `examples/eval/live/examples/relationships/two_sided_relationship_live.yaml` | Verifies both configured perspectives without exact score deltas. |
+| `examples/yaml/relationships/persona_trust_secret.yaml` | trust-gated persona secret | `live-auto` | `examples/eval/live/examples/relationships/persona_trust_secret_live.yaml` | Verifies relationship evidence while keeping the secret undisclosed. |
+| `examples/yaml/reasoning/reasoning_plan.yaml` | plan-and-execute calculator path | `live-auto` | `examples/eval/live/examples/reasoning/reasoning_plan_live.yaml` | Verifies public plan outcome and calculator result only. |
+| `examples/yaml/reasoning/reasoning_cot.yaml` | visible tagged chain-of-thought | `mocked-only` | mocked reasoning suite | Do not assert or promote private reasoning traces in live smoke coverage. |
+| `examples/yaml/reasoning/reasoning_reflection.yaml` | semantic reflection quality | `mocked-only` | mocked suite or future `live/quality/` suite | Exact reflection lifecycle is deterministic; semantic improvement belongs in quality evaluation. |
+| `examples/yaml/reasoning/reasoning_with_state.yaml` | state plus visible reasoning/reflection | `mocked-only` | mocked reasoning suite | A greeting-only live check would not cover the example's primary behavior. |
+| `examples/yaml/observability/basic_metrics.yaml` | main response telemetry | `live-auto` | `examples/eval/live/examples/observability/basic_metrics_live.yaml` | Verifies stable model, purpose, and success dimensions. |
+| `examples/yaml/observability/cost_by_model.yaml` | skill cost attribution | `live-auto` | `examples/eval/live/examples/observability/cost_by_model_live.yaml` | Verifies stable purpose/model dimensions without exact cost totals. |
+| `examples/yaml/observability/language_breakdown.yaml` | language dimensions | `live-auto` | `examples/eval/live/examples/observability/language_breakdown_live.yaml` | Verifies detected language reaches telemetry. |
+| `examples/yaml/observability/orchestration_metrics.yaml` | delegate telemetry | `live-auto` | `examples/eval/live/examples/observability/orchestration_metrics_live.yaml` | Verifies route, participant, and orchestration dimensions. |
+| `examples/yaml/observability/pricing_file.yaml` | pricing-file configuration | `live-auto` | `examples/eval/live/examples/observability/pricing_file_live.yaml` | Verifies configured model telemetry without exact provider token or cost values. |
+| `examples/yaml/observability/tools_and_skills_metrics.yaml` | skill and tool telemetry | `live-auto` | `examples/eval/live/examples/observability/tools_and_skills_metrics_live.yaml` | Verifies skill purposes, one calculator call, and successful telemetry. |
+| `examples/yaml/observability/pricing.yaml` | pricing data | `support-file` | covered by `pricing_file_live.yaml` | Data file, not a runnable agent. |
+| `examples/yaml/error-recovery/basic_retry.yaml` | bounded retry-enabled operation | `live-auto` | `examples/eval/live/examples/error-recovery/basic_retry_live.yaml` | Verifies normal successful operation without deliberately paying for failed calls. |
+| `examples/yaml/error-recovery/llm_fallback.yaml` | configured provider fallback | `live-auto` | `examples/eval/live/examples/error-recovery/llm_fallback_live.yaml` | Verifies bounded availability; exact failure/fallback sequencing remains mocked. |
+| `examples/yaml/error-recovery/context_overflow.yaml` | overflow summarization recovery | `mocked-only` | mocked context-overflow suite | Reliable live triggering requires large paid inputs and multiple summarization calls. |
 | `examples/yaml/tools/code_search.yaml` | `glob`, `grep`, `file_list`, `file_read`, `file_info` | `live-auto` | `examples/eval/live/examples/tools/code_search_live.yaml` | Read-only repository search with narrow path policy; equivalent safe search paths are accepted. |
 | `examples/yaml/tools/workspace_research.yaml` | read-only workspace search plus `todo` | `live-auto` | `examples/eval/live/examples/tools/workspace_research_live.yaml` | Read-only inspection split into focused discovery and file-read scenarios. |
 | `examples/yaml/tools/repo_review.yaml` | `git_status`, `git_diff`, `file_read`, `todo` | `live-auto` | `examples/eval/live/examples/tools/repo_review_live.yaml` | Read-only VCS inspection; accepts status or diff evidence and avoids exact diff contents. |

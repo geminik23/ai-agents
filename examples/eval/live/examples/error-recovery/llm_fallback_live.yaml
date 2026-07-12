@@ -1,0 +1,44 @@
+name: Live Example - Error Recovery LLM Fallback
+agent: ../../../../yaml/error-recovery/llm_fallback.yaml
+
+# Live eval suite for the fallback-configured agent's normal response path.
+# Requires provider credentials and may incur provider cost.
+# It does not force a paid failure; exact primary-to-fallback behavior remains mocked.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/error-recovery/llm_fallback_live.yaml \
+#     --output target/eval/live/examples/error-recovery/llm_fallback \
+#     --real-llm
+#
+# Flow: bounded request -> configured live primary or bounded fallback -> response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 90000
+  timeout_per_scenario_ms: 120000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: fallback-agent-returns-normal-response
+    name: Fallback-configured agent returns a bounded live response
+    tags: [live, examples, yaml, error-recovery, fallback, real-llm]
+    language: en
+    turns:
+      - input: "Reply in one short sentence that includes the words resilient and ready. Do not call a tool."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains_any:
+                - "resilient"
+                - "Resilient"
+            - response_contains_any:
+                - "ready"
+                - "Ready"
+            - tool_not_called: calculator
+            - tool_not_called: datetime

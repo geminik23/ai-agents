@@ -1,0 +1,47 @@
+name: Live Example - Inline Skill Only
+agent: ../../../../yaml/skills/skill_inline_only.yaml
+
+# Live eval suite for prompt-only inline skill routing.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/skills/skill_inline_only_live.yaml \
+#     --output target/eval/live/examples/skills/skill_inline_only \
+#     --real-llm
+#
+# Flow: beginner explanation request -> live skill router -> inline prompt step -> simple answer
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: inline-skill-explains-simply
+    name: Real model routes a beginner explanation to the inline skill
+    tags: [live, examples, yaml, skills, routing, no-tools, real-llm]
+    language: en
+    turns:
+      - input: "Explain photosynthesis simply for a beginner."
+        assert:
+          all:
+            - response_not_empty: true
+            - skill_triggered: explain_simply
+            - response_contains_any:
+                - "sunlight"
+                - "sun"
+                - "plant"
+                - "food"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

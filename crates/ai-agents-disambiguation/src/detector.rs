@@ -206,12 +206,17 @@ Rules:
             r#"Respond in JSON format:
 {
   "is_ambiguous": true/false,
-  "confidence": 0.0-1.0 (how confident the user's intent is clear),
+  "confidence": 0.0-1.0 (confidence that the user's intent is clear and actionable),
   "ambiguity_type": "missing_target|missing_action|missing_parameters|multiple_intents|vague_reference|implicit_context|null",
   "reasoning": "brief explanation",
   "what_is_unclear": ["list", "of", "unclear", "parts"],
   "detected_language": "language code (e.g., en, ko, ja, zh)"
 }
+
+CONFIDENCE CONSISTENCY RULES:
+- If is_ambiguous is true, confidence MUST be below 0.5.
+- If is_ambiguous is false, confidence SHOULD be 0.7 or higher.
+- Confidence measures clarity, not confidence in the ambiguity diagnosis.
 
 IMPORTANT: Output ONLY valid JSON, no other text."#,
         );

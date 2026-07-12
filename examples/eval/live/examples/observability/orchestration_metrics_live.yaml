@@ -1,0 +1,81 @@
+name: Live Example - Observability Orchestration Metrics
+agent: ../../../../yaml/observability/orchestration_metrics.yaml
+
+# Live eval suite for observed support delegation.
+# Requires provider credentials and may incur provider cost.
+# The suite checks stable lifecycle dimensions rather than latency or call totals.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/observability/orchestration_metrics_live.yaml \
+#     --output target/eval/live/examples/observability/orchestration_metrics \
+#     --real-llm
+#
+# Flow: invoice request -> live routing -> billing delegate -> observed lifecycle
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 90000
+  timeout_per_scenario_ms: 150000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true
+    track_orchestration: true
+  aggregation:
+    dimensions: [agent, purpose, state, orchestration_pattern, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: orchestration-metrics-records-billing-delegate
+    name: Real billing delegation records parent and child dimensions
+    tags: [live, examples, yaml, observability, orchestration, delegate, state, real-llm]
+    language: en
+    turns:
+      - input: "I was charged twice for invoice INV-2048. Please route this billing issue to the appropriate specialist and explain the next step."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains_any:
+                - "invoice"
+                - "Invoice"
+                - "charge"
+                - "Charge"
+                - "billing"
+                - "Billing"
+                - "refund"
+                - "Refund"
+            - state: billing_help
+            - state_history_contains: billing_help
+            - orchestration:
+                type: delegate
+                agents_include: [billing]
+            - observability:
+                purpose_counts:
+                  orchestration_routing:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      purpose: orchestration_routing
+                      orchestration_pattern: delegate
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      agent: BillingSpecialist
+                      purpose: main_response
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

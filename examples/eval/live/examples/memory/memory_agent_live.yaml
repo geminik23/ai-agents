@@ -1,0 +1,87 @@
+name: Live Example - Memory Agent
+agent: ../../../../yaml/memory/memory_agent.yaml
+
+# Live smoke suite for the full compacting and budgeted memory example.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/memory/memory_agent_live.yaml \
+#     --output target/eval/live/examples/memory/memory_agent \
+#     --real-llm
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 360000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, status]
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: memory-agent-routes-summary-and-recalls-markers
+    name: Full memory config uses its summarizer and retains bounded details
+    tags: [live, examples, yaml, memory, compacting, budget, routing, no-tools, real-llm]
+    language: en
+    turns:
+      - input: "Remember language marker ASYNC-IVY for a later recall check. Include ASYNC-IVY in a brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "ASYNC-IVY"
+      - input: "Remember runtime marker TOKIO-JADE for the later check. Include TOKIO-JADE in a brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "TOKIO-JADE"
+      - input: "Remember design marker TRAIT-MOSS for the later check. Include TRAIT-MOSS in a brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "TRAIT-MOSS"
+      - input: "Remember reliability marker ERROR-PINE for the later check. Include ERROR-PINE in a brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "ERROR-PINE"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      alias: router
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      alias: default
+                      status: success
+                    assert:
+                      path: count
+                      gte: 4
+      - input: "Return one marker from the first half of our discussion and the reliability marker."
+        assert:
+          all:
+            - response_not_empty: true
+            - llm_request:
+                system_contains: "[Previous conversation summary]"
+                user_contains: "Return one marker from the first half"
+                same_request: true
+                count: 1
+            - response_contains_any:
+                - "ASYNC-IVY"
+                - "TOKIO-JADE"
+            - response_contains: "ERROR-PINE"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

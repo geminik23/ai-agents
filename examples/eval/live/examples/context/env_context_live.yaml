@@ -1,0 +1,59 @@
+name: Live Example - Context Env Context
+agent: ../../../../yaml/context/env_context.yaml
+
+# Live eval suite for safe scenario-local environment context.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/context/env_context_live.yaml \
+#     --output target/eval/live/examples/context/env_context \
+#     --real-llm
+#
+# Flow: serial scenario env -> env context loader -> live model -> mode-aware response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+  parallel: false
+  max_concurrent: 1
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: env-context-controls-response-style
+    name: Real model uses safe environment configuration
+    tags: [live, examples, yaml, context, fixture, real-llm]
+    language: en
+    env:
+      APP_ENV: production
+      GREETING_STYLE: warm
+    turns:
+      - input: "Briefly state the active environment mode and greeting style, then greet me in that style."
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: app_env
+                eq: "production"
+            - context_path:
+                path: greeting_style
+                eq: "warm"
+            - response_contains_any:
+                - "PRODUCTION"
+                - "Production"
+                - "production"
+            - response_contains_any:
+                - "warm"
+                - "Warm"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

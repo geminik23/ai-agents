@@ -1,0 +1,56 @@
+name: Live Example - Memory Basic
+agent: ../../../../yaml/memory/memory_basic.yaml
+
+# Live smoke suite for bounded in-process conversational memory.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/memory/memory_basic_live.yaml \
+#     --output target/eval/live/examples/memory/memory_basic \
+#     --real-llm
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: memory-basic-retains-prior-user-detail
+    name: Real model receives and recalls a prior turn
+    tags: [live, examples, yaml, memory, in-memory, no-tools, real-llm]
+    language: en
+    turns:
+      - input: "Remember this stable project code for our next turn: ORCHID-731. Reply briefly and include the code."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "ORCHID-731"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch
+      - input: "What stable project code did I give you? Return the code."
+        assert:
+          all:
+            - response_not_empty: true
+            - llm_request:
+                user_contains:
+                  - "ORCHID-731"
+                  - "What stable project code did I give you?"
+                same_request: true
+                count: 1
+            - response_contains: "ORCHID-731"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

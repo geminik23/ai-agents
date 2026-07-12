@@ -1,0 +1,62 @@
+name: Live Example - Context Runtime Context
+agent: ../../../../yaml/context/runtime_context.yaml
+
+# Live eval suite for host-provided runtime context.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/context/runtime_context_live.yaml \
+#     --output target/eval/live/examples/context/runtime_context \
+#     --real-llm
+#
+# Flow: runtime context fixture -> rendered prompt -> live model -> personalized response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  context:
+    user:
+      name: Camille
+      language: French
+      role: database architect
+  llm:
+    mode: real
+
+scenarios:
+  - id: runtime-context-personalizes-greeting
+    name: Real model uses the injected user profile
+    tags: [live, examples, yaml, context, fixture, real-llm]
+    language: en
+    turns:
+      - input: "Greet me briefly in my preferred language, address me by name, and mention my professional role."
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: user.name
+                eq: "Camille"
+            - context_path:
+                path: user.language
+                eq: "French"
+            - context_path:
+                path: user.role
+                eq: "database architect"
+            - response_contains: "Camille"
+            - response_contains_any:
+                - "Bonjour"
+                - "Salut"
+            - response_contains_any:
+                - "architecte"
+                - "database architect"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

@@ -1,0 +1,51 @@
+name: Live Example - Support Relationship
+agent: ../../../../yaml/relationships/support_relationship.yaml
+
+# Live eval suite for one-sided relationship creation in isolated eval storage.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/relationships/support_relationship_live.yaml \
+#     --output target/eval/live/examples/relationships/support_relationship \
+#     --real-llm
+#
+# Flow: one support turn -> bounded relationship update -> public support response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: support-relationship-creates-one-sided-memory
+    name: Real router creates exact actor relationship evidence
+    tags: [live, examples, yaml, relationships, one-sided, real-llm]
+    language: en
+    actor: live_support_user
+    turns:
+      - input: "I have contacted support three times and billing error BILL-204 is still not fixed. Please acknowledge the frustration and give me a concise next step."
+        assert:
+          all:
+            - response_not_empty: true
+            - relationship:
+                exists: true
+                actor: live_support_user
+                perspective: agent_to_actor
+                dimension: trust
+                gte: -1.0
+                lte: 1.0
+                interaction_count_gte: 1
+            - response_contains_any:
+                - "BILL-204"
+                - "billing"
+                - "frustrat"
+                - "next step"
+                - "support"

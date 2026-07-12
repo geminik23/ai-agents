@@ -48,7 +48,7 @@ Use `eval/mocked/**/*.yaml` for default no-key checks. Do not glob all of `eval/
 
 ### Mocked no-key suites
 
-Mocked suites cover every runnable YAML example category: basic, context, disambiguation, error-recovery, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
+Mocked suites cover every runnable YAML example category: basic, context, disambiguation, error-recovery, HITL, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
 
 Run all mocked suites with the convenience helper:
 
@@ -68,14 +68,20 @@ cargo run -p ai-agents-cli -- eval \
 
 ### Live suites
 
-Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider, structural tool evidence, deterministic response checks, and fixture-backed external dependencies where needed. They require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
+Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider and combine meaningful response checks with structural evidence for tools, skills, disambiguation, memory, sessions, personas, relationships, public reasoning outcomes, observability, recovery, state transitions, context injection, and input/output processing. External dependencies remain read-only, fixture-backed, or dry-run-only. These suites require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
 
 Semantic or judge-based live checks live under `eval/live/quality/` so they do not mix with example smoke checks.
 
 See `eval/live/README.md` for the full registry, risk tags, status vocabulary, category helper, and run commands.
 
 ```sh
-# Live example eval. The suite declares its own agent path.
+# Parse-check one live category without provider calls.
+sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category context
+
+# Run one category intentionally with a real provider.
+sh examples/eval/live/run_live_example_evals.sh --yes-live --category process
+
+# Run one suite directly.
 cargo run -p ai-agents-cli -- eval \
   --scenarios examples/eval/live/examples/tools/code_search_live.yaml \
   --output target/eval/live/examples/tools/code_search \

@@ -1,0 +1,105 @@
+name: Live Example - State Machine Customer Support
+agent: ../../../../yaml/state-machine/support_state_machine.yaml
+
+# Live eval suite for representative customer support routing paths.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/state-machine/support_state_machine_live.yaml \
+#     --output target/eval/live/examples/state-machine/support_state_machine \
+#     --real-llm
+#
+# Flow: isolated support request -> representative branch -> useful branch-specific response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: support-state-machine-routes-technical
+    name: Real model routes a login error to nested technical support
+    tags: [live, examples, yaml, state-machine, support, nested, technical, real-llm]
+    language: en
+    turns:
+      - input: "I cannot log in from Chrome on Windows 11. The account page shows LOGIN-403 even after I reset my password. What detail do you need next?"
+        assert:
+          all:
+            - response_not_empty: true
+            - state: technical_support.gathering_info
+            - state_history_contains: technical_support.gathering_info
+            - response_contains_any:
+                - "LOGIN-403"
+                - "login"
+                - "account"
+                - "Chrome"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch
+
+  - id: support-state-machine-routes-order
+    name: Real model routes a delayed delivery to order support
+    tags: [live, examples, yaml, state-machine, support, order, real-llm]
+    language: en
+    turns:
+      - input: "My order ORD-4821 was due yesterday, but tracking still says in transit. Without claiming access to a carrier or order system, explain the safest next step."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: order_support
+            - state_history_contains: order_support
+            - response_contains_any:
+                - "ORD-4821"
+                - "order"
+                - "tracking"
+                - "delivery"
+                - "carrier"
+                - "seller"
+            - response_not_contains:
+                - "I checked your order"
+                - "I contacted the carrier"
+                - "I looked up your order"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch
+
+  - id: support-state-machine-routes-global-escalation
+    name: Real model honors a manager request through global escalation
+    tags: [live, examples, yaml, state-machine, support, escalation, global-transition, real-llm]
+    language: en
+    turns:
+      - input: "I am furious that this issue has happened three times. Prepare a concise escalation summary, but do not claim that a manager has already been contacted."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: escalation
+            - state_history_contains: escalation
+            - response_contains_any:
+                - "three times"
+                - "recurring"
+                - "repeated"
+            - response_contains_any:
+                - "summary"
+                - "escalat"
+                - "priority"
+            - response_not_contains:
+                - "A manager has been notified"
+                - "I sent this to a manager"
+                - "I contacted a manager"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

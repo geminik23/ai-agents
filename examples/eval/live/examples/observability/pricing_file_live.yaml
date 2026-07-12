@@ -1,0 +1,74 @@
+name: Live Example - Observability Pricing File
+agent: ../../../../yaml/observability/pricing_file.yaml
+
+# Live eval suite for loading shared pricing and recording model dimensions.
+# Requires provider credentials and may incur provider cost.
+# Exact token and cost values remain intentionally unasserted.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/observability/pricing_file_live.yaml \
+#     --output target/eval/live/examples/observability/pricing_file \
+#     --real-llm
+#
+# Flow: pricing file load -> live model -> stable model and purpose dimensions
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 90000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    pricing_file: ../../../../yaml/observability/pricing.yaml
+    unknown_price_policy: omit
+    pricing:
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+  aggregation:
+    dimensions: [model, purpose, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: pricing-file-records-priced-model
+    name: Shared pricing loads before a real observed response
+    tags: [live, examples, yaml, observability, pricing, real-llm]
+    language: en
+    turns:
+      - input: "In one short sentence, explain what a shared pricing table is used for."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains_any:
+                - "cost"
+                - "Cost"
+                - "price"
+                - "Price"
+                - "pricing"
+                - "Pricing"
+                - "model"
+                - "Model"
+            - observability:
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      model: gpt-5.4-nano
+                      purpose: main_response
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

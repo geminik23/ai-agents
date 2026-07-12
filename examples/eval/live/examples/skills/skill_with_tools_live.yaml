@@ -1,0 +1,53 @@
+name: Live Example - Skill With Tools
+agent: ../../../../yaml/skills/skill_with_tools.yaml
+
+# Live eval suite for a multi-step skill that invokes a local utility tool.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/skills/skill_with_tools_live.yaml \
+#     --output target/eval/live/examples/skills/skill_with_tools \
+#     --real-llm
+#
+# Flow: arithmetic request -> live skill router -> extraction prompt -> calculator -> answer prompt
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: tool-skill-calculates-expression
+    name: Real model executes the quick math skill pipeline
+    tags: [live, examples, yaml, skills, routing, tools, utility, real-llm]
+    language: en
+    turns:
+      - input: "Use the quick calculation skill to compute 42 * 17 + 3 and report the result."
+        assert:
+          all:
+            - response_not_empty: true
+            - skill_triggered: quick_math
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: result
+                  gte: 717
+                  lte: 717
+            - response_contains: "717"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

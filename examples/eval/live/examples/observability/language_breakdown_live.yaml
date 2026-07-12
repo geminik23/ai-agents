@@ -1,0 +1,67 @@
+name: Live Example - Observability Language Breakdown
+agent: ../../../../yaml/observability/language_breakdown.yaml
+
+# Live eval suite for detected-language observability dimensions.
+# Requires provider credentials and may incur provider cost.
+# Report export is disabled because assertions use attempt-local in-memory evidence.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/observability/language_breakdown_live.yaml \
+#     --output target/eval/live/examples/observability/language_breakdown \
+#     --real-llm
+#
+# Flow: English request -> live language detection -> response -> language dimension
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  language:
+    paths: [detected_language, user.language]
+    fallback: unknown
+  aggregation:
+    dimensions: [language, model, purpose]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: language-breakdown-records-english
+    name: Real detection records the English main response dimension
+    tags: [live, examples, yaml, observability, language, process, real-llm]
+    language: en
+    turns:
+      - input: "Hello, please reply in English with a brief greeting."
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: detected_language
+                eq: en
+            - response_contains_any:
+                - "Hello"
+                - "Hi"
+                - "Welcome"
+                - "Greetings"
+            - observability:
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      language: en
+                      purpose: main_response
+                    assert:
+                      path: count
+                      gte: 1

@@ -1,0 +1,71 @@
+name: Live Example - Observability Cost by Model
+agent: ../../../../yaml/observability/cost_by_model.yaml
+
+# Live eval suite for model and purpose observability on the math skill path.
+# Requires provider credentials and may incur provider cost.
+# Exact token and cost values remain intentionally unasserted.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/observability/cost_by_model_live.yaml \
+#     --output target/eval/live/examples/observability/cost_by_model \
+#     --real-llm
+#
+# Flow: arithmetic request -> live skill routing -> router answer -> stable dimensions
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    unknown_price_policy: omit
+    pricing:
+      openai/gpt-5.4-mini:
+        input_per_1k: 0.00075
+        output_per_1k: 0.0045
+      openai/gpt-5.4-nano:
+        input_per_1k: 0.0002
+        output_per_1k: 0.00125
+  aggregation:
+    dimensions: [model, purpose, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: cost-by-model-records-router-skill
+    name: Real math skill records router model purposes
+    tags: [live, examples, yaml, observability, cost, model, skills, real-llm]
+    language: en
+    turns:
+      - input: "Use the quick math capability to calculate 18 percent of 245. Include the numeric result."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "44.1"
+            - observability:
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      model: gpt-5.4-nano
+                      purpose: skill_prompt
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

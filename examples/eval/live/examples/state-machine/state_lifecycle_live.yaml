@@ -1,0 +1,106 @@
+name: Live Example - State Machine State Lifecycle
+agent: ../../../../yaml/state-machine/state_lifecycle.yaml
+
+# Live eval suite for enter, exit, and reenter lifecycle context updates.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/state-machine/state_lifecycle_live.yaml \
+#     --output target/eval/live/examples/state-machine/state_lifecycle \
+#     --real-llm
+#
+# Flow: writing request -> drafting -> review -> revise guard -> drafting reentry
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 240000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: state-lifecycle-reenters-drafting
+    name: Real model exposes lifecycle context during revision
+    tags: [live, examples, yaml, state-machine, lifecycle, context, real-llm]
+    language: en
+    turns:
+      - input: "Write a short formal announcement for the Q1 sales meeting on April 15 at 10 AM. Include that the team will review results and next-quarter priorities."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: drafting
+            - state_history_contains: drafting
+            - context_path:
+                path: phase
+                eq: "drafting"
+            - context_path:
+                path: intake_completed
+                eq: true
+            - context_path:
+                path: draft_version
+                gte: 1
+                lte: 2
+            - response_contains_any:
+                - "Q1"
+                - "April 15"
+                - "sales meeting"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+      - input: "The draft is ready for review. Present it and tell me how to approve it or request a revision."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: review
+            - state_history_contains: review
+            - context_path:
+                path: phase
+                eq: "review"
+            - context_path:
+                path: drafting_completed
+                eq: true
+            - response_contains_any:
+                - "approve"
+                - "Approve"
+                - "approval"
+            - response_contains_any:
+                - "revise"
+                - "Revise"
+                - "revision"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+      - input: "revise: make the opening more formal and keep the Q1 meeting details"
+        assert:
+          all:
+            - response_not_empty: true
+            - state: drafting
+            - state_history_contains: drafting
+            - context_path:
+                path: phase
+                eq: "drafting"
+            - context_path:
+                path: draft_version
+                eq: 2
+            - context_path:
+                path: review.action
+                eq: "revise"
+            - response_contains_any:
+                - "Q1"
+                - "April 15"
+                - "10 AM"
+                - "10:00"
+                - "formal"
+                - "sales meeting"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit

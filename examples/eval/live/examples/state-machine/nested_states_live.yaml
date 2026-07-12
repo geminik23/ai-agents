@@ -1,0 +1,63 @@
+name: Live Example - State Machine Nested States
+agent: ../../../../yaml/state-machine/nested_states.yaml
+
+# Live eval suite for hierarchical routing and root-level state escape.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/state-machine/nested_states_live.yaml \
+#     --output target/eval/live/examples/state-machine/nested_states \
+#     --real-llm
+#
+# Flow: detailed issue -> troubleshooting.fixing -> confirmed fix -> root resolved
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 180000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: nested-states-fix-and-resolve
+    name: Real model routes through a nested state and escapes to resolved
+    tags: [live, examples, yaml, state-machine, nested, routing, real-llm]
+    language: en
+    turns:
+      - input: "My Windows 11 laptop disconnects from Wi-Fi every five minutes while other devices stay connected. I already restarted the router and laptop, and the adapter reports error code 10. Give me a specific next fix."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: troubleshooting.fixing
+            - state_history_contains: troubleshooting.fixing
+            - response_contains_any:
+                - "Wi-Fi"
+                - "wifi"
+                - "adapter"
+                - "driver"
+                - "network"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+      - input: "Updating the Wi-Fi adapter driver fixed it, and the connection is now stable. Thanks."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: resolved
+            - state_history_contains: resolved
+            - response_contains_any:
+                - "resolved"
+                - "fixed"
+                - "stable"
+                - "anything else"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit

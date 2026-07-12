@@ -1,0 +1,68 @@
+name: Live Example - Session Cross Session
+agent: ../../../../yaml/session/cross_session.yaml
+
+# Live smoke suite for isolated actor facts stored in SQLite and reused on a later turn.
+# The eval runner rewrites the configured database into a scenario temp workspace.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/session/cross_session_live.yaml \
+#     --output target/eval/live/examples/session/cross_session \
+#     --real-llm
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 120000
+  timeout_per_scenario_ms: 300000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+  parallel: false
+  max_concurrent: 1
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: cross-session-agent-extracts-isolated-actor-context
+    name: Real extractor stores actor context and injects it later
+    tags: [live, examples, yaml, session, cross-session, facts, sqlite, persistence, real-llm]
+    language: en
+    actor: live_cross_session_actor
+    turns:
+      - input: "For my profile, I work as a data scientist on project NORTHSTAR-42 in Korea. Include NORTHSTAR-42 in your brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "NORTHSTAR-42"
+            - facts_include:
+                actor: live_cross_session_actor
+                category: user_context
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch
+      - input: "Using what you remember about my profile, return my project code and country."
+        assert:
+          all:
+            - response_not_empty: true
+            - llm_request:
+                system_contains: "Here is what you remember about this person from previous conversations:"
+                user_contains: "Using what you remember about my profile"
+                same_request: true
+                count: 1
+            - facts_include:
+                actor: live_cross_session_actor
+                category: user_context
+            - response_contains: "NORTHSTAR-42"
+            - response_contains_any:
+                - "Korea"
+                - "Korean"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

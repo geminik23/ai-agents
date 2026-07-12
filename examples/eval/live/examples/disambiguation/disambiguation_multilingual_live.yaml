@@ -1,0 +1,49 @@
+name: Live Example - Disambiguation Multilingual
+agent: ../../../../yaml/disambiguation/disambiguation_multilingual.yaml
+
+# Live eval suite for multilingual ambiguous-input clarification.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/disambiguation/disambiguation_multilingual_live.yaml \
+#     --output target/eval/live/examples/disambiguation/disambiguation_multilingual \
+#     --real-llm
+#
+# Flow: vague Korean request -> live ambiguity detection -> Korean clarification without skill execution
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: multilingual-disambiguation-asks-in-korean
+    name: Real model clarifies vague Korean input in Korean
+    tags: [live, examples, yaml, disambiguation, multilingual, routing, no-tools, real-llm]
+    language: ko
+    turns:
+      - input: "그거 보내줘"
+        assert:
+          all:
+            - response_not_empty: true
+            - disambiguation: triggered
+            - response_contains_any:
+                - "무엇"
+                - "어떤"
+                - "뭘"
+                - "보내"
+            - tool_not_called: calculator
+            - tool_not_called: datetime
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

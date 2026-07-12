@@ -93,7 +93,7 @@ enum SkillRouteResult {
     /// No skill matched, continue to normal LLM chat.
     NoMatch,
     /// Skill executed successfully.
-    Response(String),
+    Response { skill_id: String, content: String },
     /// Skill matched but needs disambiguation first.
     NeedsClarification(AgentResponse),
 }
@@ -4255,15 +4255,17 @@ impl RuntimeAgent {
                         }
                         DisambiguationResult::Clarified { enriched_input, .. } => {
                             info!(skill_id = %skill_id, enriched = %enriched_input, "Skill disambiguation clarified");
-                            return Ok(SkillRouteResult::Response(
-                                self.execute_skill(&skill, &enriched_input).await?,
-                            ));
+                            return Ok(SkillRouteResult::Response {
+                                skill_id,
+                                content: self.execute_skill(&skill, &enriched_input).await?,
+                            });
                         }
                         DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
                             info!(skill_id = %skill_id, "Skill disambiguation best guess");
-                            return Ok(SkillRouteResult::Response(
-                                self.execute_skill(&skill, &enriched_input).await?,
-                            ));
+                            return Ok(SkillRouteResult::Response {
+                                skill_id,
+                                content: self.execute_skill(&skill, &enriched_input).await?,
+                            });
                         }
                         DisambiguationResult::GiveUp { reason } => {
                             warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
@@ -4303,9 +4305,10 @@ impl RuntimeAgent {
                 }
             }
         }
-        Ok(SkillRouteResult::Response(
-            self.execute_skill(&skill, input).await?,
-        ))
+        Ok(SkillRouteResult::Response {
+            skill_id,
+            content: self.execute_skill(&skill, input).await?,
+        })
     }
 
     /// Result of skill routing.
@@ -5260,8 +5263,8 @@ OVERALL: PASS/FAIL"#,
                     .commit_skill_candidate_route_result(candidate, processed_input)
                     .await?
                 {
-                    SkillRouteResult::Response(skill_response) => self
-                        .handle_skill_response(processed_input, skill_response, input_context)
+                    SkillRouteResult::Response { skill_id, content } => self
+                        .handle_skill_response(processed_input, &skill_id, content, input_context)
                         .await
                         .map(Some),
                     SkillRouteResult::NeedsClarification(response) => {
@@ -7060,6 +7063,7 @@ Respond in JSON format:
                                 return self
                                     .handle_skill_response(
                                         &re_enriched,
+                                        skill_id,
                                         skill_response,
                                         &HashMap::new(),
                                     )
@@ -7078,6 +7082,7 @@ Respond in JSON format:
                                 return self
                                     .handle_skill_response(
                                         &re_enriched,
+                                        skill_id,
                                         skill_response,
                                         &HashMap::new(),
                                     )
@@ -7151,7 +7156,7 @@ Respond in JSON format:
         self.memory
             .add_message(ChatMessage::user(enriched_input))
             .await?;
-        self.handle_skill_response(enriched_input, skill_response, &HashMap::new())
+        self.handle_skill_response(enriched_input, skill_id, skill_response, &HashMap::new())
             .await
     }
 
@@ -7160,6 +7165,7 @@ Respond in JSON format:
     async fn handle_skill_response(
         &self,
         processed_input: &str,
+        skill_id: &str,
         skill_response: String,
         input_context: &HashMap<String, Value>,
     ) -> Result<AgentResponse> {
@@ -7176,7 +7182,8 @@ Respond in JSON format:
         self.evaluate_transitions(processed_input, &final_response)
             .await?;
 
-        let response = AgentResponse::new(final_response);
+        let response = AgentResponse::new(final_response)
+            .with_metadata("skill_id", serde_json::json!(skill_id));
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
@@ -8671,10 +8678,10 @@ Respond in JSON format:
         }
 
         match self.try_skill_route(processed_input).await? {
-            SkillRouteResult::Response(skill_response) => {
+            SkillRouteResult::Response { skill_id, content } => {
                 self.commit_root_user_message(processed_input).await?;
                 return self
-                    .handle_skill_response(processed_input, skill_response, &input_data.context)
+                    .handle_skill_response(processed_input, &skill_id, content, &input_data.context)
                     .await;
             }
             SkillRouteResult::NeedsClarification(response) => {
@@ -9262,12 +9269,12 @@ Respond in JSON format:
 
             // Skill routing
             match self.try_skill_route(processed_input).await {
-                Ok(SkillRouteResult::Response(skill_response)) => {
+                Ok(SkillRouteResult::Response { skill_id, content }) => {
                     if let Err(e) = self.commit_root_user_message(processed_input).await {
                         yield StreamChunk::error(e.to_string());
                         return;
                     }
-                    match self.handle_skill_response(processed_input, skill_response, &input_data.context).await {
+                    match self.handle_skill_response(processed_input, &skill_id, content, &input_data.context).await {
                         Ok(resp) => {
                             yield StreamChunk::content(&resp.content);
                             yield StreamChunk::Done {};

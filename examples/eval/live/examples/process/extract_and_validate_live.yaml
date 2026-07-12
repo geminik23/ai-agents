@@ -1,0 +1,62 @@
+name: Live Example - Process Extract And Validate
+agent: ../../../../yaml/process/extract_and_validate.yaml
+
+# Live eval suite for structured support entity extraction.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/process/extract_and_validate_live.yaml \
+#     --output target/eval/live/examples/process/extract_and_validate \
+#     --real-llm
+#
+# Flow: explicit support request -> live extraction -> context-aware support response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: extract-shipping-request-fields
+    name: Real model extracts explicit shipping support fields
+    tags: [live, examples, yaml, process, extraction, real-llm]
+    language: en
+    turns:
+      - input: "This is a high urgency shipping support request. Order SHIP-4827 has not arrived, and my contact email is casey.rivera@example.com. Confirm the order and email you will use to help."
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: extracted.email
+                eq: "casey.rivera@example.com"
+            - context_path:
+                path: extracted.order_number
+                eq: "SHIP-4827"
+            - context_path:
+                path: extracted.urgency
+                eq: "high"
+            - context_path:
+                path: extracted.issue_type
+                eq: "shipping"
+            - response_contains: "SHIP-4827"
+            - response_contains_any:
+                - "email"
+                - "contact"
+                - "casey.rivera"
+            - response_contains_any:
+                - "shipping"
+                - "shipment"
+                - "delivery"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

@@ -1,0 +1,60 @@
+name: Live Example - Persona Evolution
+agent: ../../../../yaml/persona/persona_evolution.yaml
+
+# Live eval suite for safe LLM-triggered persona evolution.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/persona/persona_evolution_live.yaml \
+#     --output target/eval/live/examples/persona/persona_evolution \
+#     --real-llm
+#
+# Flow: genuine kindness -> exact allowed persona mutation -> public acknowledgement
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: persona-evolution-updates-speaking-style
+    name: Real model applies one exact whitelisted persona mutation
+    tags: [live, examples, yaml, persona, evolution, safe-mutation, real-llm]
+    language: en
+    turns:
+      - input: "I brought firewood from the Gift and stacked every crate for the Watch. Treat this as genuine kindness: call persona_evolve exactly once, set traits.speaking_style to the exact string 'still dry but genuinely friendly', and then acknowledge the help briefly."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: persona_evolve
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: field
+                  eq: "traits.speaking_style"
+            - tool_called:
+                id: persona_evolve
+                count: 1
+                executed: true
+                success: true
+                args_executed:
+                  path: value
+                  eq: "still dry but genuinely friendly"
+            - response_contains_any:
+                - "firewood"
+                - "crates"
+                - "Watch"
+                - "help"
+                - "thank"
+            - tool_not_called: calculator
+            - tool_not_called: datetime

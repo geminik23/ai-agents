@@ -1,0 +1,49 @@
+name: Live Example - Process Input Normalize
+agent: ../../../../yaml/process/input_normalize.yaml
+
+# Live eval suite for rule-based input normalization before a real model call.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/process/input_normalize_live.yaml \
+#     --output target/eval/live/examples/process/input_normalize \
+#     --real-llm
+#
+# Flow: irregular whitespace -> deterministic normalization -> live model request -> useful echo
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: input-normalize-cleans-model-input
+    name: Real model receives trimmed and collapsed input
+    tags: [live, examples, yaml, process, normalization, real-llm]
+    language: en
+    turns:
+      - input: "   Normalization     marker   alpha     beta.   "
+        assert:
+          all:
+            - response_not_empty: true
+            - llm_request:
+                user_contains: "Normalization marker alpha beta."
+                count: 1
+            - response_contains_any:
+                - "Normalization marker"
+                - "alpha beta"
+                - "normalized"
+            - response_not_contains: "Normalization     marker   alpha     beta."
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

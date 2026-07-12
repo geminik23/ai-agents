@@ -1,0 +1,62 @@
+name: Live Example - State Machine Two State Greeting
+agent: ../../../../yaml/state-machine/two_state_greeting.yaml
+
+# Live eval suite for the minimal two-state conversation loop.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/state-machine/two_state_greeting_live.yaml \
+#     --output target/eval/live/examples/state-machine/two_state_greeting \
+#     --real-llm
+#
+# Flow: concrete support question -> helping -> resolved thanks -> greeting
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 180000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: two-state-greeting-completes-help-loop
+    name: Real model enters helping and returns to greeting
+    tags: [live, examples, yaml, state-machine, routing, real-llm]
+    language: en
+    turns:
+      - input: "My printer shows error code E42 and will not print. Help me troubleshoot it."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: helping
+            - state_history_contains: helping
+            - response_contains_any:
+                - "E42"
+                - "printer"
+                - "print"
+                - "troubleshoot"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+      - input: "Restarting the printer cleared E42 and it prints again. Thanks, that is all."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: greeting
+            - state_history_contains: greeting
+            - response_contains_any:
+                - "glad"
+                - "welcome"
+                - "help"
+                - "anything else"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit

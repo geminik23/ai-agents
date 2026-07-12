@@ -1,0 +1,66 @@
+name: Live Example - Observability Basic Metrics
+agent: ../../../../yaml/observability/basic_metrics.yaml
+
+# Live eval suite for basic LLM observability.
+# Requires provider credentials and may incur provider cost.
+# Report export is disabled because assertions use attempt-local in-memory evidence.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/observability/basic_metrics_live.yaml \
+#     --output target/eval/live/examples/observability/basic_metrics \
+#     --real-llm
+#
+# Flow: concise request -> live model -> stable purpose and status metrics
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 90000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [model, purpose, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: basic-metrics-records-main-response
+    name: Real model call records main response metrics
+    tags: [live, examples, yaml, observability, metrics, real-llm]
+    language: en
+    turns:
+      - input: "In one short sentence, explain why concise answers are useful."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains_any:
+                - "clear"
+                - "Clear"
+                - "quick"
+                - "Quick"
+                - "understand"
+                - "Understand"
+                - "time"
+                - "Time"
+            - observability:
+                purpose_counts:
+                  main_response:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      model: gpt-5.4-nano
+                      purpose: main_response
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1

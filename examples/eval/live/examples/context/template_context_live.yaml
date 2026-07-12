@@ -1,0 +1,63 @@
+name: Live Example - Context Template Context
+agent: ../../../../yaml/context/template_context.yaml
+
+# Live eval suite for context-driven prompt templates.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/context/template_context_live.yaml \
+#     --output target/eval/live/examples/context/template_context \
+#     --real-llm
+#
+# Flow: profile context -> Pro template branch -> live model -> tier-aware response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  context:
+    user:
+      name: Rowan
+      tier: pro
+      company: Northstar Systems
+  llm:
+    mode: real
+
+scenarios:
+  - id: template-context-renders-pro-branch
+    name: Real model uses the rendered Pro customer profile
+    tags: [live, examples, yaml, context, fixture, real-llm]
+    language: en
+    turns:
+      - input: "In one concise sentence, confirm who you are assisting, their company, and the support tier active for this conversation."
+        assert:
+          all:
+            - response_not_empty: true
+            - context_path:
+                path: user.name
+                eq: "Rowan"
+            - context_path:
+                path: user.tier
+                eq: "pro"
+            - context_path:
+                path: user.company
+                eq: "Northstar Systems"
+            - context_path:
+                path: time.date
+                exists: true
+            - response_contains: "Rowan"
+            - response_contains: "Northstar Systems"
+            - response_contains_any:
+                - "Pro"
+                - "pro"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

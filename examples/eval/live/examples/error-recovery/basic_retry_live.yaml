@@ -1,0 +1,46 @@
+name: Live Example - Error Recovery Basic Retry
+agent: ../../../../yaml/error-recovery/basic_retry.yaml
+
+# Live eval suite for the retry-configured agent's normal success path.
+# Requires provider credentials and may incur provider cost.
+# It does not manufacture provider failures; exact retry sequencing remains mocked.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/error-recovery/basic_retry_live.yaml \
+#     --output target/eval/live/examples/error-recovery/basic_retry \
+#     --real-llm
+#
+# Flow: bounded calculation request -> live model -> calculator -> useful response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 90000
+  timeout_per_scenario_ms: 120000
+  retries: 0
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: basic-retry-agent-completes-bounded-tool-call
+    name: Retry-configured agent completes a normal calculator request
+    tags: [live, examples, yaml, error-recovery, retry, tools, real-llm]
+    language: en
+    turns:
+      - input: "Call the calculator tool once to calculate 42 multiplied by 17, then include the result in a short answer."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "714"
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: result
+                  gte: 714
+                  lte: 714

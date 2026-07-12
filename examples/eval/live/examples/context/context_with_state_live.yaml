@@ -1,0 +1,63 @@
+name: Live Example - Context With State
+agent: ../../../../yaml/context/context_with_state.yaml
+
+# Live eval suite for context retained through a state transition.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/context/context_with_state_live.yaml \
+#     --output target/eval/live/examples/context/context_with_state \
+#     --real-llm
+#
+# Flow: VIP profile -> live transition selection -> helping state -> personalized response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  context:
+    user:
+      name: Sora
+      tier: vip
+  llm:
+    mode: real
+
+scenarios:
+  - id: context-persists-into-helping-state
+    name: Real model keeps VIP context after entering helping
+    tags: [live, examples, yaml, context, fixture, state-machine, real-llm]
+    language: en
+    turns:
+      - input: "I need help understanding audit log retention. Address me by name and identify my support tier before giving a brief answer."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: helping
+            - state_history_contains: helping
+            - context_path:
+                path: user.name
+                eq: "Sora"
+            - context_path:
+                path: user.tier
+                eq: "vip"
+            - context_path:
+                path: time.date
+                exists: true
+            - response_contains: "Sora"
+            - response_contains_any:
+                - "VIP"
+                - "vip"
+            - response_contains_any:
+                - "audit log"
+                - "retention"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

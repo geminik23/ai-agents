@@ -1,0 +1,89 @@
+name: Live Example - Memory Compacting
+agent: ../../../../yaml/memory/memory_compacting.yaml
+
+# Live smoke suite for automatic compacting memory summarization.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/memory/memory_compacting_live.yaml \
+#     --output target/eval/live/examples/memory/memory_compacting \
+#     --real-llm
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 360000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [alias, status]
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: memory-compacting-preserves-bounded-topic-markers
+    name: Real summarizer compacts history and retains requested markers
+    tags: [live, examples, yaml, memory, compacting, no-tools, real-llm]
+    language: en
+    turns:
+      - input: "For a later recall check, associate topic label RUST-FERN with ownership. Include RUST-FERN in your brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "RUST-FERN"
+      - input: "For the same later check, associate topic label PYTHON-EMBER with scripting. Include PYTHON-EMBER in your brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "PYTHON-EMBER"
+      - input: "For the same later check, associate topic label DATA-HARBOR with databases. Include DATA-HARBOR in your brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "DATA-HARBOR"
+      - input: "For the same later check, associate topic label CLOUD-LANTERN with cloud systems. Include CLOUD-LANTERN in your brief reply."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "CLOUD-LANTERN"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      alias: router
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
+                  - match_dimensions:
+                      alias: default
+                      status: success
+                    assert:
+                      path: count
+                      gte: 4
+      - input: "Recall the topic labels from earlier. Include at least one label associated with the first two topics and one associated with the last two topics."
+        assert:
+          all:
+            - response_not_empty: true
+            - llm_request:
+                system_contains: "[Previous conversation summary]"
+                user_contains: "Recall the topic labels from earlier."
+                same_request: true
+                count: 1
+            - response_contains_any:
+                - "RUST-FERN"
+                - "PYTHON-EMBER"
+            - response_contains_any:
+                - "DATA-HARBOR"
+                - "CLOUD-LANTERN"
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write
+            - tool_not_called: file_edit
+            - tool_not_called: patch

@@ -222,7 +222,7 @@ Mocked HITL suites must also mock the LLM and approved tools. Real HTTP and real
 
 ## Live provider suites
 
-Live suites are opt-in release smoke checks. They require provider credentials, network access, and acceptance of provider cost and nondeterminism.
+Live suites are opt-in release smoke checks for real-model tool and skill use, disambiguation, memory and session behavior, personas and relationships, public reasoning outcomes, observability and recovery, state routing, context use, and input/output processing. They require provider credentials, network access, and acceptance of provider cost and nondeterminism.
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
@@ -234,7 +234,8 @@ cargo run -p ai-agents-cli -- eval \
 For convenience, `examples/eval/live/run_live_example_evals.sh` can list, parse-check, or run live example suites by category:
 
 ```sh
-sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category tools
+sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category context
+sh examples/eval/live/run_live_example_evals.sh --yes-live --category process
 ```
 
 Do not glob all of `examples/eval/**/*.yaml` in default CI because that includes live suites. Use one of these narrower globs instead:
@@ -272,7 +273,7 @@ Use the same category folder names as `examples/yaml/`, such as `state-machine` 
 
 - Mock exact tool-call sequences, denial paths, unavailable providers, deterministic HITL approvals, blocked commands, and blocked network behavior.
 - Keep live example suites focused on one primary behavior per scenario.
-- Keep real shell commands, public network calls, MCP child processes, real HTTP approval effects, human input, and actual file mutation out of automatic live suites until their safety boundary is explicit.
+- Keep real shell commands, tool-initiated public network calls, MCP child processes, real HTTP approval effects, human input, and actual file mutation out of automatic live suites until their safety boundary is explicit. Intentional LLM-provider traffic is the expected exception for live suites.
 - Keep semantic judge suites under `live/quality/`, separate from example smoke checks.
 
 See `examples/eval/live/README.md` for the live suite registry and risk tags.

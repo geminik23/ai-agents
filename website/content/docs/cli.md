@@ -53,10 +53,10 @@ ai-agents-cli run <agent.yaml> [OPTIONS]
 ### `eval`
 
 ```sh
-ai-agents-cli eval --agent <agent.yaml> --scenarios <suite.yaml> [OPTIONS]
+ai-agents-cli eval [--agent <agent.yaml>] --scenarios <suite.yaml> [OPTIONS]
 ```
 
-Runs YAML or JSONL scenario suites, evaluates assertions from structured turn evidence, and writes `summary.md`, schema-versioned `summary.json`, `per_scenario.jsonl`, `failures.md`, and optionally `junit.xml`.
+Runs YAML or JSONL scenario suites, evaluates assertions from structured turn evidence, and writes `summary.md`, schema-versioned `summary.json`, `per_scenario.jsonl`, `failures.md`, and optionally `junit.xml`. `--agent` is required only when the suite does not declare `agent:`; when supplied, it overrides the suite path.
 
 ### `validate`
 

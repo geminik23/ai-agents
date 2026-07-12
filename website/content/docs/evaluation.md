@@ -781,7 +781,7 @@ Real mode needs provider credentials such as `OPENAI_API_KEY`, network access, a
 
 ### Live example suites
 
-The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, or dry-run-only.
+The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, or dry-run-only. Current suites cover tools, skills, disambiguation, memory and sessions, personas and relationships, public reasoning outcomes, observability and recovery, state transitions, context injection and rendering, and input/output process behavior.
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
@@ -790,9 +790,19 @@ cargo run -p ai-agents-cli -- eval \
   --real-llm
 ```
 
-These suites declare their own `agent` path. Use `examples/eval/live/README.md` as the registry for status, risk tags, and deferred high-risk examples.
+These suites declare their own `agent` path. The helper can list suites, parse-check configuration, or intentionally run real-provider checks by category:
+
+```sh
+sh examples/eval/live/run_live_example_evals.sh --list
+sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category context
+sh examples/eval/live/run_live_example_evals.sh --yes-live --category process
+```
+
+Implemented categories currently include `basic`, `context`, `disambiguation`, `error-recovery`, `memory`, `observability`, `persona`, `process`, `reasoning`, `relationships`, `session`, `skills`, `state-machine`, and `tools`. Use `examples/eval/live/README.md` as the authoritative registry instead of maintaining a category tree in public documentation.
 
 Live suites should usually check one primary behavior per scenario. If several safe tools can satisfy the same read-only request, use `any` over structural `tool_called` assertions. Prefer concrete prompts such as "Before answering, call the file_read tool ..." when the suite requires tool evidence. Add deterministic response checks for stable result values, requested symbols, fixture details, and dry-run wording so the suite verifies minimum useful user-visible output. Keep exact multi-tool sequences, denial paths, unavailable providers, approval behavior, and response-quality judges in mocked or focused suites where the model output is deterministic.
+
+Exact retry and fallback sequences, context-overflow recovery, chain-of-thought traces, subjective reflection improvement, and restart-based persistence remain mocked, quality-only, or manual where live execution would be costly, private, or misleading.
 
 ---
 

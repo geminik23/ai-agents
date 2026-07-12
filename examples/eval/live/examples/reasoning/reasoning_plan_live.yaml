@@ -1,0 +1,47 @@
+name: Live Example - Reasoning Plan
+agent: ../../../../yaml/reasoning/reasoning_plan.yaml
+
+# Live eval suite for bounded plan-and-execute tool behavior.
+# Requires provider credentials and may incur provider cost.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/reasoning/reasoning_plan_live.yaml \
+#     --output target/eval/live/examples/reasoning/reasoning_plan \
+#     --real-llm
+#
+# Flow: one calculation request -> live plan -> safe calculator step -> public answer
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 180000
+  retries: 1
+  retry_delay_ms: 1000
+  isolation: scenario
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: reasoning-plan-runs-calculator-step
+    name: Real planner executes one safe calculator step
+    tags: [live, examples, yaml, reasoning, plan, utility, real-llm]
+    language: en
+    turns:
+      - input: "Create a short plan that uses the calculator tool to calculate 18 * 7, execute it, and give only the public result in the final answer."
+        assert:
+          all:
+            - response_not_empty: true
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                result_path:
+                  path: result
+                  gte: 126
+                  lte: 126
+            - response_contains: "126"
+            - tool_not_called: datetime

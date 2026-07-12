@@ -1,0 +1,74 @@
+name: Live Example - Observability Tools and Skills Metrics
+agent: ../../../../yaml/observability/tools_and_skills_metrics.yaml
+
+# Live eval suite for skill and calculator observability.
+# Requires provider credentials and may incur provider cost.
+# The contract is one bounded math path with stable tool and purpose evidence.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/observability/tools_and_skills_metrics_live.yaml \
+#     --output target/eval/live/examples/observability/tools_and_skills_metrics \
+#     --real-llm
+#
+# Flow: math request -> live skill routing -> calculator -> observed explanation
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 120000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true
+    track_tools: true
+    track_skills: true
+  aggregation:
+    dimensions: [purpose, tool, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: tools-skills-metrics-records-calculator
+    name: Real measured math skill records calculator metrics
+    tags: [live, examples, yaml, observability, skills, tools, calculator, real-llm]
+    language: en
+    turns:
+      - input: "Use the measured math skill to calculate 42 multiplied by 17, and include the result in one short sentence."
+        assert:
+          all:
+            - response_not_empty: true
+            - response_contains: "714"
+            - tool_called:
+                id: calculator
+                count_gte: 1
+                executed: true
+                success: true
+                source_in: [skill]
+                result_path:
+                  path: result
+                  gte: 714
+                  lte: 714
+            - observability:
+                total_tool_calls_lte: 1
+                purpose_counts:
+                  skill_routing:
+                    path: count
+                    gte: 1
+                  skill_prompt:
+                    path: count
+                    gte: 1
+                dimension_counts:
+                  - match_dimensions:
+                      status: success
+                    assert:
+                      path: count
+                      gte: 1
