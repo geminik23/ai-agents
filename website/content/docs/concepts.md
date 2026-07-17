@@ -139,7 +139,7 @@ Agents can have a hierarchical state machine that controls behavior. Each state 
 
 Transitions between states happen in two ways. **Condition-based** transitions use a `when` clause that the LLM evaluates each turn ("when the user has provided their email"). **Guard-based** transitions check context values deterministically without an LLM call. You can also define global transitions that apply from any state, and sub-states for nested workflows.
 
-States support lifecycle actions (`on_enter`, `on_reenter`, `on_exit`) for setting context, and `extract` for pulling structured data from user input.
+States support lifecycle actions (`on_enter`, `on_reenter`, `on_exit`) for setting context, and `extract` for pulling structured data from user input. The runtime classifies entry from transition history captured before the transition: the first arrival at a state runs `on_enter`, while a later return runs `on_reenter` when configured.
 
 ```yaml
 tools:

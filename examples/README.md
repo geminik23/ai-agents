@@ -68,7 +68,7 @@ cargo run -p ai-agents-cli -- eval \
 
 ### Live suites
 
-Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider and combine meaningful response checks with structural evidence for tools, skills, disambiguation, memory, sessions, personas, relationships, public reasoning outcomes, observability, recovery, state transitions, context injection, and input/output processing. External dependencies remain read-only, fixture-backed, or dry-run-only. These suites require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
+Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider and combine meaningful response checks with structural evidence for tools, skills, threshold-aware disambiguation, cross-runtime fact persistence, multi-actor isolation, public plan-and-execute outcomes, exact state lifecycle behavior, observability, recovery, context injection, and input/output processing. External dependencies remain read-only, fixture-backed, no-socket, or dry-run-only. These suites require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
 
 Semantic or judge-based live checks live under `eval/live/quality/` so they do not mix with example smoke checks.
 

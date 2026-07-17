@@ -6,6 +6,8 @@ agent: ../../../../yaml/tools/web_search_research.yaml
 #
 # Without a host web-search provider installed, the tool records unavailable.
 # The live model should recognize unavailability and suggest web_fetch for known URLs.
+# web_fetch keeps its built-in contract but uses an empty in-memory transport fixture,
+# so any unintended call fails deterministically without public network access.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -13,7 +15,7 @@ agent: ../../../../yaml/tools/web_search_research.yaml
 #     --output target/eval/live/examples/tools/web_search_research \
 #     --real-llm
 #
-# Flow: search request -> live model -> web_search unavailable -> model suggests fallback
+# Flow: search request -> live model -> web_search unavailable -> model suggests fallback only
 settings:
   temperature: 0.0
   seed: 1
@@ -28,6 +30,8 @@ fixtures:
     mode: real
   web_search:
     available: false
+  web_fetch_transport:
+    routes: []
 
 scenarios:
   - id: web-search-unavailable-fallback
@@ -35,16 +39,22 @@ scenarios:
     tags: [live, examples, yaml, tools, web_search, unavailable, real-llm]
     language: en
     turns:
-      - input: "Search the web for recent Rust async ecosystem news using web_search. If web_search is unavailable, say so and suggest using web_fetch for a known URL."
+      - input: "Search the web for recent Rust async ecosystem news using web_search. If web_search is unavailable, say so and suggest using web_fetch for a known URL, but do not call web_fetch."
         assert:
           all:
             - response_not_empty: true
             - tool_called:
                 id: web_search
+                count: 1
                 executed: false
                 success: false
             - response_contains_any:
                 - "unavailable"
                 - "cannot search"
+                - "unable to search"
+            - response_contains_any:
                 - "web_fetch"
                 - "web fetch"
+                - "known URL"
+                - "known url"
+            - tool_not_called: web_fetch

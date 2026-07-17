@@ -127,15 +127,19 @@ pub enum ToolCalledAssertion {
 }
 
 /// Object form for checking tool execution evidence.
+///
+/// Every configured record predicate must match the same execution. `count` and
+/// `count_gte` are evaluated against the number of executions that satisfy all
+/// configured record predicates; `tool_called` still requires at least one match.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ToolCalledObject {
-    /// Stable identifier for this item.
+    /// Tool ID or requested name required on each matching execution.
     #[serde(default)]
     pub id: Option<String>,
-    /// Exact number of matching items required.
+    /// Exact number of executions satisfying every configured record predicate.
     #[serde(default)]
     pub count: Option<usize>,
-    /// Minimum number of matching items required.
+    /// Minimum number of executions satisfying every configured record predicate.
     #[serde(default)]
     pub count_gte: Option<usize>,
     /// Whether the wrapped tool implementation was invoked.
@@ -144,7 +148,7 @@ pub struct ToolCalledObject {
     /// Whether the operation succeeded.
     #[serde(default)]
     pub success: Option<bool>,
-    /// Allowed source labels for matching records.
+    /// Allowed snake_case source labels, including `llm`, `skill`, and `plan`.
     #[serde(default)]
     pub source_in: Option<Vec<String>>,
     /// Alias for checking executed tool arguments.
@@ -883,26 +887,11 @@ fn evaluate_tool_called(
         ToolCalledAssertion::Id(id) => (Some(id.as_str()), None),
         ToolCalledAssertion::Object(object) => (object.id.as_deref(), Some(object)),
     };
-    let mut records: Vec<&ToolExecutionRecord> = evidence.tool_executions.iter().collect();
-    if let Some(id) = id {
-        records.retain(|record| record.tool_id == id || record.requested_name == id);
-    }
-    if let Some(object) = object {
-        if let Some(executed) = object.executed {
-            records.retain(|record| record.executed == executed);
-        }
-        if let Some(success) = object.success {
-            records.retain(|record| record.success == success);
-        }
-        if let Some(sources) = &object.source_in {
-            records.retain(|record| {
-                sources
-                    .iter()
-                    .any(|source| *source == serde_plain_source(&record.source))
-            });
-        }
-    }
-    let count = records.len();
+    let count = evidence
+        .tool_executions
+        .iter()
+        .filter(|record| tool_execution_matches(record, id, object))
+        .count();
     let mut passed = count > 0;
     if let Some(object) = object {
         if let Some(expected) = object.count {
@@ -910,24 +899,6 @@ fn evaluate_tool_called(
         }
         if let Some(expected) = object.count_gte {
             passed &= count >= expected;
-        }
-        if let Some(path) = object.args.as_ref().or(object.args_executed.as_ref()) {
-            passed &= records
-                .iter()
-                .any(|record| path_matches(&record.arguments_executed, path));
-        }
-        if let Some(path) = &object.args_original {
-            passed &= records
-                .iter()
-                .any(|record| path_matches(&record.arguments_original, path));
-        }
-        if let Some(path) = &object.result_path {
-            passed &= records.iter().any(|record| {
-                record
-                    .output
-                    .as_ref()
-                    .is_some_and(|value| path_matches(value, path))
-            });
         }
     }
     push_bool(
@@ -937,6 +908,48 @@ fn evaluate_tool_called(
         json!(assertion),
         details,
     );
+}
+
+fn tool_execution_matches(
+    record: &ToolExecutionRecord,
+    id: Option<&str>,
+    object: Option<&ToolCalledObject>,
+) -> bool {
+    if id.is_some_and(|id| record.tool_id != id && record.requested_name != id) {
+        return false;
+    }
+    let Some(object) = object else {
+        return true;
+    };
+
+    object
+        .executed
+        .is_none_or(|executed| record.executed == executed)
+        && object
+            .success
+            .is_none_or(|success| record.success == success)
+        && object.source_in.as_ref().is_none_or(|sources| {
+            let actual = serde_plain_source(&record.source);
+            sources.iter().any(|source| source == &actual)
+        })
+        && object
+            .args
+            .as_ref()
+            .is_none_or(|path| path_matches(&record.arguments_executed, path))
+        && object
+            .args_executed
+            .as_ref()
+            .is_none_or(|path| path_matches(&record.arguments_executed, path))
+        && object
+            .args_original
+            .as_ref()
+            .is_none_or(|path| path_matches(&record.arguments_original, path))
+        && object.result_path.as_ref().is_none_or(|path| {
+            record
+                .output
+                .as_ref()
+                .is_some_and(|value| path_matches(value, path))
+        })
 }
 
 fn evaluate_llm_request(
@@ -1838,6 +1851,150 @@ mod tests {
         )
         .await;
         assert!(matches!(result, AssertionOutcome::Passed(_)));
+    }
+
+    #[test]
+    fn tool_called_exposes_plan_as_a_distinct_source_label() {
+        let mut evidence = evidence();
+        evidence.tool_executions[0].source = ToolExecutionSource::Plan;
+        let assertion = ToolCalledAssertion::Object(ToolCalledObject {
+            id: Some("lookup_order".to_string()),
+            count: Some(1),
+            source_in: Some(vec!["plan".to_string()]),
+            ..Default::default()
+        });
+        let mut details = Vec::new();
+
+        evaluate_tool_called(&assertion, &evidence, &mut details);
+
+        assert!(details[0].passed);
+        assert_eq!(details[0].actual, json!(1));
+
+        let llm_assertion = ToolCalledAssertion::Object(ToolCalledObject {
+            id: Some("lookup_order".to_string()),
+            source_in: Some(vec!["llm".to_string()]),
+            ..Default::default()
+        });
+        let mut llm_details = Vec::new();
+        evaluate_tool_called(&llm_assertion, &evidence, &mut llm_details);
+        assert!(!llm_details[0].passed);
+    }
+
+    #[test]
+    fn tool_called_path_predicates_do_not_match_across_execution_records() {
+        let mut evidence = evidence();
+        let first = &mut evidence.tool_executions[0];
+        first.tool_id = "calculator".to_string();
+        first.requested_name = "calculator".to_string();
+        first.source = ToolExecutionSource::Plan;
+        first.arguments_original = json!({"expression":"18 * 7"});
+        first.arguments_executed = json!({"expression":"1 + 1"});
+        first.output = Some(json!({"result":2}));
+
+        let mut second = first.clone();
+        second.call_id = "call-2".to_string();
+        second.arguments_original = json!({"expression":"2 + 2"});
+        second.arguments_executed = json!({"expression":"18 * 7"});
+        second.output = Some(json!({"result":126}));
+        evidence.tool_executions.push(second);
+
+        let assertion = ToolCalledAssertion::Object(ToolCalledObject {
+            id: Some("calculator".to_string()),
+            executed: Some(true),
+            success: Some(true),
+            source_in: Some(vec!["plan".to_string()]),
+            args_original: Some(PathAssertion {
+                path: "expression".to_string(),
+                eq: Some(json!("18 * 7")),
+                ..Default::default()
+            }),
+            args_executed: Some(PathAssertion {
+                path: "expression".to_string(),
+                eq: Some(json!("18 * 7")),
+                ..Default::default()
+            }),
+            result_path: Some(PathAssertion {
+                path: "result".to_string(),
+                eq: Some(json!(126)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut details = Vec::new();
+
+        evaluate_tool_called(&assertion, &evidence, &mut details);
+
+        assert!(!details[0].passed);
+        assert_eq!(details[0].actual, json!(0));
+    }
+
+    #[test]
+    fn tool_called_checks_both_executed_argument_aliases_when_both_are_configured() {
+        let mut evidence = evidence();
+        let record = &mut evidence.tool_executions[0];
+        record.arguments_executed = json!({"expression":"18 * 7"});
+
+        let assertion = ToolCalledAssertion::Object(ToolCalledObject {
+            id: Some("lookup_order".to_string()),
+            args: Some(PathAssertion {
+                path: "expression".to_string(),
+                eq: Some(json!("18 * 7")),
+                ..Default::default()
+            }),
+            args_executed: Some(PathAssertion {
+                path: "expression".to_string(),
+                eq: Some(json!("2 + 2")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut details = Vec::new();
+
+        evaluate_tool_called(&assertion, &evidence, &mut details);
+
+        assert!(!details[0].passed);
+        assert_eq!(details[0].actual, json!(0));
+    }
+
+    #[test]
+    fn tool_called_count_counts_complete_record_matches() {
+        let mut evidence = evidence();
+        let first = &mut evidence.tool_executions[0];
+        first.tool_id = "calculator".to_string();
+        first.requested_name = "calculator".to_string();
+        first.arguments_original = json!({"expression":"18 * 7"});
+        first.arguments_executed = json!({"expression":"18 * 7"});
+        first.output = Some(json!({"result":126}));
+
+        let mut second = first.clone();
+        second.call_id = "call-2".to_string();
+        second.arguments_executed = json!({"expression":"2 + 2"});
+        second.output = Some(json!({"result":4}));
+        evidence.tool_executions.push(second);
+
+        let assertion = ToolCalledAssertion::Object(ToolCalledObject {
+            id: Some("calculator".to_string()),
+            count: Some(1),
+            executed: Some(true),
+            success: Some(true),
+            args_executed: Some(PathAssertion {
+                path: "expression".to_string(),
+                eq: Some(json!("18 * 7")),
+                ..Default::default()
+            }),
+            result_path: Some(PathAssertion {
+                path: "result".to_string(),
+                eq: Some(json!(126)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut details = Vec::new();
+
+        evaluate_tool_called(&assertion, &evidence, &mut details);
+
+        assert!(details[0].passed);
+        assert_eq!(details[0].actual, json!(1));
     }
 
     #[tokio::test]

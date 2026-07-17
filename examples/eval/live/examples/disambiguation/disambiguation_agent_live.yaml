@@ -35,6 +35,13 @@ scenarios:
           all:
             - response_not_empty: true
             - disambiguation: triggered
+            - metadata_path:
+                path: disambiguation.detection.type
+                in: [missing_target, missing_action, missing_parameters, multiple_intents, vague_reference, implicit_context]
+            - metadata_path:
+                path: disambiguation.detection.confidence
+                gte: 0.0
+                lt: 0.7
             - response_contains_any:
                 - "again"
                 - "what"

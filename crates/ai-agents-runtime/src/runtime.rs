@@ -2184,10 +2184,14 @@ impl RuntimeAgent {
     pub async fn transition_to(&self, state: &str) -> Result<()> {
         if let Some(ref sm) = self.state_machine {
             let from_state = sm.current();
+            let history_before = sm.history();
             self.execute_state_exit_actions(&from_state).await;
             sm.transition_to(state, "manual transition")?;
-            self.execute_state_enter_actions(state).await;
-            info!(to = %state, "Manual state transition");
+            let entered = sm.current();
+            let is_reentry =
+                Self::state_was_previously_entered(&entered, &from_state, &history_before);
+            self.execute_state_enter_actions(&entered, is_reentry).await;
+            info!(to = %entered, "Manual state transition");
         }
         Ok(())
     }
@@ -4626,10 +4630,14 @@ OVERALL: PASS/FAIL"#,
         if let Some(ref sm) = self.state_machine {
             if let Some(timeout_state) = sm.check_timeout() {
                 let from_state = sm.current();
+                let history_before = sm.history();
                 self.execute_state_exit_actions(&from_state).await;
                 sm.transition_to(&timeout_state, "max_turns exceeded")?;
-                self.execute_state_enter_actions(&timeout_state).await;
-                info!(to = %timeout_state, "Timeout transition");
+                let entered = sm.current();
+                let is_reentry =
+                    Self::state_was_previously_entered(&entered, &from_state, &history_before);
+                self.execute_state_enter_actions(&entered, is_reentry).await;
+                info!(to = %entered, "Timeout transition");
             }
         }
         Ok(())
@@ -4785,6 +4793,7 @@ OVERALL: PASS/FAIL"#,
             return Ok(false);
         };
 
+        let history_before = sm.history();
         self.execute_state_exit_actions(from_state).await;
         sm.transition_to(target, reason)?;
         sm.reset_no_transition();
@@ -4792,7 +4801,8 @@ OVERALL: PASS/FAIL"#,
             self.commit_staged_context_writes(staged).await;
         }
         let entered = sm.current();
-        self.execute_state_enter_actions(&entered).await;
+        let is_reentry = Self::state_was_previously_entered(&entered, from_state, &history_before);
+        self.execute_state_enter_actions(&entered, is_reentry).await;
         self.hooks
             .on_state_transition(Some(from_state), &entered, reason)
             .await;
@@ -5701,13 +5711,22 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
+    /// Returns whether a transition target had already been entered before this transition.
+    fn state_was_previously_entered(
+        state_path: &str,
+        from_state: &str,
+        history_before: &[StateTransitionEvent],
+    ) -> bool {
+        state_path == from_state
+            || history_before
+                .iter()
+                .any(|event| event.from == state_path || event.to == state_path)
+    }
+
     /// Execute on_enter (or on_reenter) actions for a state being entered.
-    async fn execute_state_enter_actions(&self, state_path: &str) {
+    async fn execute_state_enter_actions(&self, state_path: &str, is_reentry: bool) {
         if let Some(ref sm) = self.state_machine {
             if let Some(def) = sm.get_definition(state_path) {
-                // Check if this state was previously visited
-                let is_reentry = sm.history().iter().any(|e| e.to == state_path);
-
                 if is_reentry && !def.on_reenter.is_empty() {
                     debug!(state = %state_path, count = def.on_reenter.len(), "Executing on_reenter actions");
                     self.execute_state_actions(&def.on_reenter).await;
@@ -12574,6 +12593,202 @@ states:
         let ctx = agent.get_context();
         assert_eq!(ctx.get("step1_exited"), Some(&serde_json::json!(true)));
         assert_eq!(ctx.get("step2_entered"), Some(&serde_json::json!(true)));
+    }
+
+    #[tokio::test]
+    async fn test_ordinary_transition_uses_on_enter_then_on_reenter() {
+        let yaml = r#"
+name: OrdinaryLifecycleAgent
+system_prompt: "You are helpful."
+states:
+  initial: intake
+  regenerate_on_transition: false
+  states:
+    intake:
+      prompt: "Intake"
+      transitions:
+        - to: drafting
+          guard:
+            context:
+              route:
+                eq: drafting
+    drafting:
+      prompt: "Drafting"
+      on_enter:
+        - set_context:
+            draft_version: 1
+      on_reenter:
+        - set_context:
+            draft_version: 2
+      transitions:
+        - to: review
+          guard:
+            context:
+              route:
+                eq: review
+    review:
+      prompt: "Review"
+      on_enter:
+        - set_context:
+            review_entry: first
+      transitions:
+        - to: drafting
+          guard:
+            context:
+              route:
+                eq: drafting
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_responses(vec![
+                "Intake response",
+                "Draft response",
+                "Review response",
+            ])))
+            .build()
+            .unwrap();
+
+        agent
+            .set_context("route", serde_json::json!("drafting"))
+            .unwrap();
+        agent.chat("Start a draft").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("drafting"));
+        assert_eq!(
+            agent.get_context().get("draft_version"),
+            Some(&serde_json::json!(1))
+        );
+
+        agent
+            .set_context("route", serde_json::json!("review"))
+            .unwrap();
+        agent.chat("Review this").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("review"));
+        assert_eq!(
+            agent.get_context().get("review_entry"),
+            Some(&serde_json::json!("first"))
+        );
+
+        agent
+            .set_context("route", serde_json::json!("drafting"))
+            .unwrap();
+        agent.chat("Revise this").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("drafting"));
+        assert_eq!(
+            agent.get_context().get("draft_version"),
+            Some(&serde_json::json!(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manual_transition_uses_on_enter_then_on_reenter() {
+        let yaml = r#"
+name: ManualLifecycleAgent
+system_prompt: "You are helpful."
+states:
+  initial: intake
+  states:
+    intake:
+      prompt: "Intake"
+    drafting:
+      prompt: "Drafting"
+      on_enter:
+        - set_context:
+            draft_version: 1
+      on_reenter:
+        - set_context:
+            draft_version: 2
+    review:
+      prompt: "Review"
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("unused")))
+            .build()
+            .unwrap();
+
+        assert!(!agent.get_context().contains_key("draft_version"));
+        agent.transition_to("drafting").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("drafting"));
+        assert_eq!(
+            agent.get_context().get("draft_version"),
+            Some(&serde_json::json!(1))
+        );
+
+        agent.transition_to("review").await.unwrap();
+        agent.transition_to("drafting").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("drafting"));
+        assert_eq!(
+            agent.get_context().get("draft_version"),
+            Some(&serde_json::json!(2))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_transition_uses_on_enter_then_on_reenter() {
+        let yaml = r#"
+name: TimeoutLifecycleAgent
+system_prompt: "You are helpful."
+states:
+  initial: intake
+  regenerate_on_transition: false
+  states:
+    intake:
+      prompt: "Intake"
+      max_turns: 1
+      timeout_to: drafting
+    drafting:
+      prompt: "Drafting"
+      max_turns: 1
+      timeout_to: review
+      on_enter:
+        - set_context:
+            draft_version: 1
+      on_reenter:
+        - set_context:
+            draft_version: 2
+    review:
+      prompt: "Review"
+      max_turns: 1
+      timeout_to: drafting
+      on_enter:
+        - set_context:
+            review_entry: first
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_responses(vec![
+                "Intake",
+                "First draft",
+                "Review",
+                "Revised draft",
+            ])))
+            .build()
+            .unwrap();
+
+        agent.chat("First turn").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("intake"));
+        assert!(!agent.get_context().contains_key("draft_version"));
+
+        agent.chat("Second turn").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("drafting"));
+        assert_eq!(
+            agent.get_context().get("draft_version"),
+            Some(&serde_json::json!(1))
+        );
+
+        agent.chat("Third turn").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("review"));
+        assert_eq!(
+            agent.get_context().get("review_entry"),
+            Some(&serde_json::json!("first"))
+        );
+
+        agent.chat("Fourth turn").await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("drafting"));
+        assert_eq!(
+            agent.get_context().get("draft_version"),
+            Some(&serde_json::json!(2))
+        );
     }
 
     // Process pipeline transforms input

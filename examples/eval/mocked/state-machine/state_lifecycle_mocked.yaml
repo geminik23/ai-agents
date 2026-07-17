@@ -51,8 +51,7 @@ scenarios:
                 eq: true
             - context_path:
                 path: draft_version
-                gte: 1
-                lte: 2
+                eq: 1
             - response_contains: "First draft"
       - input: The draft is ready for review.
         assert:

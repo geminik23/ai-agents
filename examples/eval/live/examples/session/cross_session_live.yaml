@@ -1,8 +1,9 @@
 name: Live Example - Session Cross Session
 agent: ../../../../yaml/session/cross_session.yaml
 
-# Live smoke suite for isolated actor facts stored in SQLite and reused on a later turn.
+# Live smoke suite for isolated actor facts persisted across a full runtime rebuild.
 # The eval runner rewrites the configured database into a scenario temp workspace.
+# The reset preserves that storage and actor identity while clearing conversation state.
 # Requires provider credentials and may incur provider cost.
 #
 # Usage:
@@ -30,39 +31,54 @@ scenarios:
     name: Real extractor stores actor context and injects it later
     tags: [live, examples, yaml, session, cross-session, facts, sqlite, persistence, real-llm]
     language: en
-    actor: live_cross_session_actor
-    turns:
-      - input: "For my profile, I work as a data scientist on project NORTHSTAR-42 in Korea. Include NORTHSTAR-42 in your brief reply."
-        assert:
-          all:
-            - response_not_empty: true
-            - response_contains: "NORTHSTAR-42"
-            - facts_include:
-                actor: live_cross_session_actor
-                category: user_context
-            - tool_not_called: command
-            - tool_not_called: http
-            - tool_not_called: file_write
-            - tool_not_called: file_edit
-            - tool_not_called: patch
-      - input: "Using what you remember about my profile, return my project code and country."
-        assert:
-          all:
-            - response_not_empty: true
-            - llm_request:
-                system_contains: "Here is what you remember about this person from previous conversations:"
-                user_contains: "Using what you remember about my profile"
-                same_request: true
-                count: 1
-            - facts_include:
-                actor: live_cross_session_actor
-                category: user_context
-            - response_contains: "NORTHSTAR-42"
-            - response_contains_any:
-                - "Korea"
-                - "Korean"
-            - tool_not_called: command
-            - tool_not_called: http
-            - tool_not_called: file_write
-            - tool_not_called: file_edit
-            - tool_not_called: patch
+    steps:
+      - !set_actor
+        actor: live_cross_session_actor
+      - !run
+        turns:
+          - input: "For my profile, my stable project code is NORTHSTAR-42 and my stable country is Korea. Include NORTHSTAR-42 in your brief reply."
+            assert:
+              all:
+                - response_not_empty: true
+                - response_contains: "NORTHSTAR-42"
+                - facts_include:
+                    actor: live_cross_session_actor
+                    category: user_context
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: full_runtime
+        preserve_storage: true
+        preserve_actor_id: true
+      - !run
+        turns:
+          - input: "Using only persisted profile memory, return my project code and country."
+            assert:
+              all:
+                - response_not_empty: true
+                - llm_request:
+                    system_contains:
+                      - "Here is what you remember about this person from previous conversations:"
+                      - "NORTHSTAR-42"
+                      - "Korea"
+                    user_contains: "Using only persisted profile memory"
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      user_contains: "For my profile, my stable project code is NORTHSTAR-42"
+                - facts_include:
+                    actor: live_cross_session_actor
+                    category: user_context
+                - response_contains: "NORTHSTAR-42"
+                - response_contains_any:
+                    - "Korea"
+                    - "Korean"
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch

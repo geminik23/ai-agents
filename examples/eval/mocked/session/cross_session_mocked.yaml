@@ -1,10 +1,9 @@
 name: Cross-Session Mocked Eval
 agent: ../../../yaml/session/cross_session.yaml
 
-# Mocked eval for the cross-session agent.
-# Tests single-session fact extraction with SQLite storage.
-# The router LLM provides fact extraction JSON.
-# The eval runner isolates SQLite storage into a temp workspace.
+# Mocked eval for cross-session persistence across a full runtime rebuild.
+# The router deterministically extracts exact stable facts into isolated SQLite storage.
+# The reset preserves storage and actor identity while clearing conversation state.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -20,21 +19,61 @@ fixtures:
     mode: mock
     responses_by_alias:
       default:
-        - "Nice to meet you, Jay! I will remember that you work as a data scientist in Korea."
+        - "NORTHSTAR-42; Korea."
       router:
-        - '[{"category":"user_context","content":"User works as a data scientist in Korea","confidence":0.9,"actor_id":"customer_42"}]'
+        - '[{"category":"user_context","content":"Stable project code is NORTHSTAR-42 and stable country is Korea","confidence":0.99,"actor_id":"customer_42"}]'
 
 scenarios:
-  - id: cross-session-facts-extracted
-    name: Facts are extracted and stored in a single session
-    tags: [mock, examples, yaml, session, cross-session]
+  - id: cross-session-facts-survive-runtime-rebuild
+    name: Exact facts survive a runtime rebuild without conversation history
+    tags: [mock, examples, yaml, session, cross-session, persistence]
     language: en
-    actor: customer_42
-    turns:
-      - input: My name is Jay. I work as a data scientist in Korea.
-        assert:
-          all:
-            - response_not_empty: true
-            - facts_include:
-                actor: customer_42
-                category: user_context
+    steps:
+      - !set_actor
+        actor: customer_42
+      - !run
+        turns:
+          - input: "My stable project code is NORTHSTAR-42 and my stable country is Korea."
+            assert:
+              all:
+                - response_not_empty: true
+                - response_contains: "NORTHSTAR-42"
+                - facts_include:
+                    actor: customer_42
+                    category: user_context
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: full_runtime
+        preserve_storage: true
+        preserve_actor_id: true
+      - !run
+        turns:
+          - input: "Return my persisted project code and country."
+            assert:
+              all:
+                - response_not_empty: true
+                - llm_request:
+                    system_contains:
+                      - "Here is what you remember about this person from previous conversations:"
+                      - "NORTHSTAR-42"
+                      - "Korea"
+                    user_contains: "Return my persisted project code and country."
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      user_contains: "My stable project code is NORTHSTAR-42"
+                - facts_include:
+                    actor: customer_42
+                    category: user_context
+                - response_contains: "NORTHSTAR-42"
+                - response_contains: "Korea"
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch

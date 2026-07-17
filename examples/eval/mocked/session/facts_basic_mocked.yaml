@@ -1,10 +1,9 @@
 name: Facts Basic Mocked Eval
 agent: ../../../yaml/session/facts_basic.yaml
 
-# Mocked eval for the facts basic agent.
-# Verifies that facts are extracted from the conversation and stored.
-# The router LLM provides fact extraction JSON.
-# The eval runner isolates SQLite storage into a temp workspace.
+# Mocked eval for exact fact persistence and system-prompt injection.
+# The router deterministically extracts COBALT-17 into isolated SQLite storage.
+# A full runtime reset prevents conversation history from satisfying recall.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -20,21 +19,59 @@ fixtures:
     mode: mock
     responses_by_alias:
       default:
-        - "Nice to meet you, Alex! I will remember that you work as a backend engineer."
+        - "COBALT-17."
       router:
-        - '[{"category":"user_context","content":"User works as a backend engineer","confidence":0.9,"actor_id":"user_1"}]'
+        - '[{"category":"user_preference","content":"Stable editor theme code is COBALT-17","confidence":0.99,"actor_id":"user_1"}]'
 
 scenarios:
-  - id: facts-basic-extracted
-    name: Facts are extracted from conversation
-    tags: [mock, examples, yaml, session, facts]
+  - id: facts-basic-exact-fact-injected-after-reset
+    name: COBALT-17 is persisted and injected after a runtime reset
+    tags: [mock, examples, yaml, session, facts, persistence]
     language: en
-    actor: user_1
-    turns:
-      - input: My name is Alex and I work as a backend engineer.
-        assert:
-          all:
-            - response_not_empty: true
-            - facts_include:
-                actor: user_1
-                category: user_context
+    steps:
+      - !set_actor
+        actor: user_1
+      - !run
+        turns:
+          - input: "My stable editor preference is theme code COBALT-17."
+            assert:
+              all:
+                - response_not_empty: true
+                - response_contains: "COBALT-17"
+                - facts_include:
+                    actor: user_1
+                    category: user_preference
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: full_runtime
+        preserve_storage: true
+        preserve_actor_id: true
+      - !run
+        turns:
+          - input: "Return my persisted editor theme code."
+            assert:
+              all:
+                - response_not_empty: true
+                - llm_request:
+                    system_contains:
+                      - "Known facts about this person:"
+                      - "COBALT-17"
+                    user_contains: "Return my persisted editor theme code."
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      user_contains: "My stable editor preference is theme code COBALT-17"
+                - facts_include:
+                    actor: user_1
+                    category: user_preference
+                - response_contains: "COBALT-17"
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch

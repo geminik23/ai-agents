@@ -94,11 +94,8 @@ impl DisambiguationManager {
         state_override: Option<&StateDisambiguationOverride>,
         skill_override: Option<&SkillDisambiguationOverride>,
     ) -> Result<DisambiguationResult> {
-        if !self.is_enabled() && state_override.is_none() && skill_override.is_none() {
-            return Ok(DisambiguationResult::Clear);
-        }
-
-        // Check if we're handling a clarification response.
+        // Handle a pending clarification before applying new-turn enablement so an
+        // existing exchange remains resolvable if the active configuration layer changes.
         // ISSUE: Solved
         // Clone and drop the read guard before entering the async block to avoid deadlocking with the write lock inside handle_clarification_response.
         let pending = self.pending_clarification.read().await.clone();
@@ -112,6 +109,11 @@ impl DisambiguationManager {
                 .await;
         }
 
+        if !self.get_effective_enabled(state_override, skill_override) {
+            debug!("Disambiguation disabled by effective layered configuration");
+            return Ok(DisambiguationResult::Clear);
+        }
+
         // Check skip conditions
         if self
             .detector
@@ -121,24 +123,28 @@ impl DisambiguationManager {
             return Ok(DisambiguationResult::Clear);
         }
 
-        // Determine effective threshold
+        // Resolve layered controls before detection so both prompt guidance and the
+        // final decision use the same authoritative threshold and required fields.
         let threshold = self.get_effective_threshold(state_override, skill_override);
-
-        // Populate required_clarity on context so the detector prompt knows
-        // which domain-required fields to check for in the user's message.
+        let required_clarity =
+            self.get_required_clarity(&context.required_clarity, state_override, skill_override);
         let mut context = context.clone();
-        let rc = self.get_required_clarity(state_override, skill_override);
-        if !rc.is_empty() {
-            context.required_clarity = rc;
-        }
+        context.required_clarity = required_clarity.clone();
 
-        // Detect ambiguity
-        let detection = self.detector.detect(input, &context).await?;
+        // Preserve the detector's raw payload, then normalize only the effective
+        // boolean. Confidence and all structured evidence remain unchanged.
+        let mut detection = self
+            .detector
+            .detect_with_threshold(input, &context, threshold)
+            .await?;
+        let detector_is_ambiguous = detection.is_ambiguous;
+        detection.is_ambiguous = detection.confidence < threshold;
 
         info!(
+            detector_is_ambiguous,
             is_ambiguous = detection.is_ambiguous,
             confidence = detection.confidence,
-            threshold = threshold,
+            threshold,
             ambiguity_type = ?detection.ambiguity_type,
             "Ambiguity detection complete"
         );
@@ -146,7 +152,6 @@ impl DisambiguationManager {
         // Check required clarity fields BEFORE the threshold check.
         // required_clarity is a hard gate: if any required field appears in what_is_unclear, force clarification regardless of confidence score.
         // This handles domain ambiguity ("transfer money" is linguistically clear but missing recipient/amount for the operation).
-        let required_clarity = self.get_required_clarity(state_override, skill_override);
         if !required_clarity.is_empty() {
             let missing: Vec<_> = required_clarity
                 .iter()
@@ -215,8 +220,9 @@ impl DisambiguationManager {
             }
         }
 
-        // Check against effective threshold
-        if !detection.is_ambiguous && detection.confidence >= threshold {
+        // The effective confidence threshold is authoritative when no required-field
+        // hard gate fired. The model's raw boolean cannot override this decision.
+        if detection.confidence >= threshold {
             return Ok(DisambiguationResult::Clear);
         }
 
@@ -257,7 +263,6 @@ impl DisambiguationManager {
         });
 
         // Generate clarification question
-        let required_clarity = self.get_required_clarity(state_override, skill_override);
         let question = self
             .clarifier
             .generate(
@@ -406,6 +411,17 @@ impl DisambiguationManager {
         }
     }
 
+    fn get_effective_enabled(
+        &self,
+        state_override: Option<&StateDisambiguationOverride>,
+        skill_override: Option<&SkillDisambiguationOverride>,
+    ) -> bool {
+        skill_override
+            .and_then(|skill| skill.enabled)
+            .or_else(|| state_override.and_then(|state| state.enabled))
+            .unwrap_or(self.config.enabled)
+    }
+
     fn get_effective_threshold(
         &self,
         state_override: Option<&StateDisambiguationOverride>,
@@ -431,18 +447,28 @@ impl DisambiguationManager {
 
     fn get_required_clarity(
         &self,
+        context_required: &[String],
         state_override: Option<&StateDisambiguationOverride>,
         skill_override: Option<&SkillDisambiguationOverride>,
     ) -> Vec<String> {
-        // Combine required clarity from both overrides
+        // Preserve every source in layered order while avoiding duplicate prompt/evidence entries.
         let mut required = Vec::new();
-
-        if let Some(state) = state_override {
-            required.extend(state.required_clarity.iter().cloned());
-        }
-
-        if let Some(skill) = skill_override {
-            required.extend(skill.required_clarity.iter().cloned());
+        for field in context_required
+            .iter()
+            .chain(
+                state_override
+                    .into_iter()
+                    .flat_map(|state| state.required_clarity.iter()),
+            )
+            .chain(
+                skill_override
+                    .into_iter()
+                    .flat_map(|skill| skill.required_clarity.iter()),
+            )
+        {
+            if !required.contains(field) {
+                required.push(field.clone());
+            }
         }
 
         required
@@ -515,6 +541,49 @@ impl DisambiguationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_agents_llm::mock::MockLLMProvider;
+
+    const CLARIFICATION_RESPONSE: &str = r#"{"question":"Please clarify.","options":null}"#;
+
+    fn manager_with_responses(
+        threshold: f32,
+        responses: Vec<&str>,
+    ) -> (DisambiguationManager, MockLLMProvider) {
+        manager_with_enabled_and_responses(true, threshold, responses)
+    }
+
+    fn manager_with_enabled_and_responses(
+        enabled: bool,
+        threshold: f32,
+        responses: Vec<&str>,
+    ) -> (DisambiguationManager, MockLLMProvider) {
+        let mut mock = MockLLMProvider::new("disambiguation-test");
+        mock.set_responses(responses.into_iter().map(String::from).collect(), false);
+        let observer = mock.clone();
+
+        let mut registry = LLMRegistry::new();
+        registry.register("router", Arc::new(mock));
+
+        let config = DisambiguationConfig {
+            enabled,
+            detection: super::super::config::DetectionConfig {
+                threshold,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        (
+            DisambiguationManager::new(config, Arc::new(registry)),
+            observer,
+        )
+    }
+
+    fn detection_response(is_ambiguous: bool, confidence: f32) -> String {
+        format!(
+            r#"{{"is_ambiguous":{is_ambiguous},"confidence":{confidence},"ambiguity_type":"missing_target","reasoning":"raw detector reasoning","what_is_unclear":["target"],"detected_language":"en"}}"#
+        )
+    }
 
     #[test]
     fn test_disambiguation_context_builder() {
@@ -559,32 +628,263 @@ mod tests {
         assert!(ctx.previous_questions.is_empty());
     }
 
-    #[test]
-    fn test_get_effective_threshold() {
-        let config = DisambiguationConfig {
-            enabled: true,
-            detection: super::super::config::DetectionConfig {
-                threshold: 0.7,
-                ..Default::default()
-            },
+    #[tokio::test]
+    async fn state_disable_overrides_enabled_base() {
+        let detection = detection_response(true, 0.1);
+        let (manager, mock) = manager_with_responses(0.7, vec![detection.as_str()]);
+        let state_override = StateDisambiguationOverride {
+            enabled: Some(false),
             ..Default::default()
         };
 
-        // We can't fully test this without LLMRegistry, but we can test the threshold logic
+        let result = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_clear());
+        assert_eq!(mock.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn skill_disable_overrides_enabled_state_and_base() {
+        let detection = detection_response(true, 0.1);
+        let (manager, mock) = manager_with_responses(0.7, vec![detection.as_str()]);
+        let state_override = StateDisambiguationOverride {
+            enabled: Some(true),
+            ..Default::default()
+        };
+        let skill_override = SkillDisambiguationOverride {
+            enabled: Some(false),
+            ..Default::default()
+        };
+
+        let result = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                Some(&skill_override),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_clear());
+        assert_eq!(mock.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn state_enable_overrides_disabled_base() {
+        let detection = detection_response(false, 0.6);
+        let (manager, mock) = manager_with_enabled_and_responses(
+            false,
+            0.7,
+            vec![detection.as_str(), CLARIFICATION_RESPONSE],
+        );
+        let state_override = StateDisambiguationOverride {
+            enabled: Some(true),
+            ..Default::default()
+        };
+
+        let result = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.needs_clarification());
+        assert_eq!(mock.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn skill_enable_overrides_disabled_state_and_base() {
+        let detection = detection_response(false, 0.6);
+        let (manager, mock) = manager_with_enabled_and_responses(
+            false,
+            0.7,
+            vec![detection.as_str(), CLARIFICATION_RESPONSE],
+        );
+        let state_override = StateDisambiguationOverride {
+            enabled: Some(false),
+            ..Default::default()
+        };
+        let skill_override = SkillDisambiguationOverride {
+            enabled: Some(true),
+            ..Default::default()
+        };
+
+        let result = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                Some(&skill_override),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.needs_clarification());
+        assert_eq!(mock.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn base_threshold_is_authoritative_and_preserves_raw_detection_fields() {
+        let detection = detection_response(false, 0.69);
+        let (manager, _) =
+            manager_with_responses(0.7, vec![detection.as_str(), CLARIFICATION_RESPONSE]);
+
+        let result = manager
+            .process_input("Send it", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        let DisambiguationResult::NeedsClarification { detection, .. } = result else {
+            panic!("confidence below the base threshold must trigger clarification");
+        };
+        assert!(detection.is_ambiguous);
+        assert!((detection.confidence - 0.69).abs() < f32::EPSILON);
+        assert_eq!(
+            detection.ambiguity_type,
+            Some(super::super::types::AmbiguityType::MissingTarget)
+        );
+        assert_eq!(detection.reasoning, "raw detector reasoning");
+        assert_eq!(detection.what_is_unclear, vec!["target"]);
+        assert_eq!(detection.detected_language.as_deref(), Some("en"));
+    }
+
+    #[tokio::test]
+    async fn stricter_state_threshold_overrides_base_threshold() {
+        let detection = detection_response(false, 0.8);
+        let (manager, mock) =
+            manager_with_responses(0.7, vec![detection.as_str(), CLARIFICATION_RESPONSE]);
         let state_override = StateDisambiguationOverride {
             threshold: Some(0.9),
             ..Default::default()
         };
 
+        let result = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.needs_clarification());
+        let prompt = &mock.call_history()[0].messages[1].content;
+        assert!(prompt.contains("confidence MUST be below 0.9"));
+    }
+
+    #[tokio::test]
+    async fn stricter_skill_threshold_overrides_state_and_base_thresholds() {
+        let detection = detection_response(false, 0.92);
+        let (manager, mock) =
+            manager_with_responses(0.7, vec![detection.as_str(), CLARIFICATION_RESPONSE]);
+        let state_override = StateDisambiguationOverride {
+            threshold: Some(0.9),
+            ..Default::default()
+        };
         let skill_override = SkillDisambiguationOverride {
             threshold: Some(0.95),
             ..Default::default()
         };
 
-        // Skill takes precedence over state
-        assert_eq!(skill_override.threshold.unwrap(), 0.95);
-        assert_eq!(state_override.threshold.unwrap(), 0.9);
-        assert_eq!(config.detection.threshold, 0.7);
+        let result = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                Some(&skill_override),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.needs_clarification());
+        let prompt = &mock.call_history()[0].messages[1].content;
+        assert!(prompt.contains("confidence MUST be below 0.95"));
+    }
+
+    #[tokio::test]
+    async fn required_clarity_merges_all_sources_and_forces_clarification_without_losing_evidence()
+    {
+        let response = r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"operation is clear","what_is_unclear":["account"],"detected_language":"en"}"#;
+        let (manager, mock) = manager_with_responses(0.7, vec![response, CLARIFICATION_RESPONSE]);
+        let context = DisambiguationContext {
+            required_clarity: vec!["account".to_string()],
+            ..Default::default()
+        };
+        let state_override = StateDisambiguationOverride {
+            required_clarity: vec!["recipient".to_string()],
+            ..Default::default()
+        };
+        let skill_override = SkillDisambiguationOverride {
+            required_clarity: vec!["amount".to_string(), "recipient".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            manager.get_required_clarity(
+                &context.required_clarity,
+                Some(&state_override),
+                Some(&skill_override),
+            ),
+            vec!["account", "recipient", "amount"]
+        );
+
+        let result = manager
+            .process_input_with_override(
+                "Make the payment",
+                &context,
+                Some(&state_override),
+                Some(&skill_override),
+            )
+            .await
+            .unwrap();
+
+        let DisambiguationResult::NeedsClarification {
+            question,
+            detection,
+        } = result
+        else {
+            panic!("a missing required field must override high confidence");
+        };
+        assert!(detection.is_ambiguous);
+        assert!((detection.confidence - 0.99).abs() < f32::EPSILON);
+        assert_eq!(
+            detection.ambiguity_type,
+            Some(super::super::types::AmbiguityType::MissingParameters)
+        );
+        assert_eq!(detection.reasoning, "operation is clear");
+        assert_eq!(detection.what_is_unclear, vec!["account"]);
+        assert_eq!(question.clarifying, vec!["account"]);
+
+        let prompt = &mock.call_history()[0].messages[1].content;
+        assert!(prompt.contains("account, recipient, amount"));
+    }
+
+    #[tokio::test]
+    async fn confidence_wins_when_detector_boolean_is_inconsistent() {
+        let detection = detection_response(true, 0.8);
+        let (manager, mock) = manager_with_responses(0.7, vec![detection.as_str()]);
+
+        let result = manager
+            .process_input("Send it", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        assert!(result.is_clear());
+        assert_eq!(mock.call_count(), 1);
     }
 }
 //

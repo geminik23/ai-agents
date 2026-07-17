@@ -84,11 +84,28 @@ impl AmbiguityDetector {
         Ok(false)
     }
 
-    /// Detect if input is ambiguous
+    /// Detect if input is ambiguous using the configured base threshold.
     pub async fn detect(
         &self,
         input: &str,
         context: &DisambiguationContext,
+    ) -> Result<AmbiguityDetectionResult> {
+        let mut detection = self
+            .detect_with_threshold(input, context, self.config.threshold)
+            .await?;
+        detection.is_ambiguous = detection.confidence < self.config.threshold;
+        Ok(detection)
+    }
+
+    /// Detect ambiguity while describing the manager-resolved threshold to the model.
+    ///
+    /// The returned payload preserves the model's raw boolean, confidence, and structured fields.
+    /// The manager remains responsible for applying the effective threshold.
+    pub(crate) async fn detect_with_threshold(
+        &self,
+        input: &str,
+        context: &DisambiguationContext,
+        effective_threshold: f32,
     ) -> Result<AmbiguityDetectionResult> {
         let llm = self.llm_registry.get(&self.config.llm).map_err(|_| {
             AgentError::Config(format!(
@@ -97,7 +114,7 @@ impl AmbiguityDetector {
             ))
         })?;
 
-        let prompt = self.build_detection_prompt(input, context);
+        let prompt = self.build_detection_prompt(input, context, effective_threshold);
         let messages = vec![
             ChatMessage::system(
                 "You are an expert at analyzing user intent clarity. Respond only with valid JSON.",
@@ -113,9 +130,14 @@ impl AmbiguityDetector {
         self.parse_detection_response(&response.content)
     }
 
-    fn build_detection_prompt(&self, input: &str, context: &DisambiguationContext) -> String {
+    fn build_detection_prompt(
+        &self,
+        input: &str,
+        context: &DisambiguationContext,
+        effective_threshold: f32,
+    ) -> String {
         if let Some(ref custom_prompt) = self.config.prompt {
-            return self.render_custom_prompt(custom_prompt, input, context);
+            return self.render_custom_prompt(custom_prompt, input, context, effective_threshold);
         }
 
         let aspects_desc: Vec<&str> = self
@@ -194,32 +216,32 @@ Rules:
 - Add every missing field name to what_is_unclear.
 - Set is_ambiguous to true if ANY required field is missing.
 - Set ambiguity_type to "missing_parameters" if ANY required field is missing.
-- Set confidence below 0.5 if ANY required field is missing.
+- Set confidence below {effective_threshold} if ANY required field is missing.
 - NEVER return an empty what_is_unclear when required fields are missing.
 
-"# // "Required fields for this operation: {}\nEven if the message intent is clear, check whether each required field is EXPLICITLY present in the user's message. Report any missing required fields in what_is_unclear. If any required fields are missing, set ambiguity_type to \"missing_parameters\".\n\n",
-                   // context.required_clarity.join(", ")
+"#
             ));
         }
 
-        prompt.push_str(
+        prompt.push_str(&format!(
             r#"Respond in JSON format:
-{
+{{
   "is_ambiguous": true/false,
   "confidence": 0.0-1.0 (confidence that the user's intent is clear and actionable),
   "ambiguity_type": "missing_target|missing_action|missing_parameters|multiple_intents|vague_reference|implicit_context|null",
   "reasoning": "brief explanation",
   "what_is_unclear": ["list", "of", "unclear", "parts"],
   "detected_language": "language code (e.g., en, ko, ja, zh)"
-}
+}}
 
 CONFIDENCE CONSISTENCY RULES:
-- If is_ambiguous is true, confidence MUST be below 0.5.
-- If is_ambiguous is false, confidence SHOULD be 0.7 or higher.
+- If is_ambiguous is true, confidence MUST be below {effective_threshold}.
+- If is_ambiguous is false, confidence SHOULD be {effective_threshold} or higher.
 - Confidence measures clarity, not confidence in the ambiguity diagnosis.
+- The runtime uses the confidence cutoff above as the authoritative ambiguity decision.
 
 IMPORTANT: Output ONLY valid JSON, no other text."#,
-        );
+        ));
 
         prompt
     }
@@ -229,7 +251,10 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
         template: &str,
         input: &str,
         context: &DisambiguationContext,
+        effective_threshold: f32,
     ) -> String {
+        // Preserve custom-prompt compatibility: do not append the default schema or guidance.
+        // Existing templates render exactly as before; threshold/required_clarity are opt-in placeholders.
         let mut result = template.to_string();
         result = result.replace("{{ user_input }}", input);
         result = result.replace("{{ recent_messages }}", &context.recent_messages.join("\n"));
@@ -241,6 +266,15 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
             "{{ current_state }}",
             context.current_state.as_deref().unwrap_or("none"),
         );
+        result = result.replace("{{ threshold }}", &effective_threshold.to_string());
+        result = result.replace(
+            "{{ effective_threshold }}",
+            &effective_threshold.to_string(),
+        );
+        result = result.replace(
+            "{{ required_clarity }}",
+            &context.required_clarity.join(", "),
+        );
         result
     }
 
@@ -251,30 +285,18 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
             AgentError::Other(format!("Failed to parse disambiguation response: {}", e))
         })?;
 
-        let _is_ambiguous = parsed["is_ambiguous"].as_bool().unwrap_or(false);
+        let is_ambiguous = parsed["is_ambiguous"].as_bool().unwrap_or(false);
         let confidence = parsed["confidence"].as_f64().unwrap_or(1.0) as f32;
 
-        // Threshold is the sole decision: confidence below threshold = ambiguous.
-        // The LLM's is_ambiguous boolean is kept in the result for logging/hooks
-        // but does not override the user-configured threshold.
-        let is_ambiguous = confidence < self.config.threshold;
-
-        if !is_ambiguous {
-            return Ok(AmbiguityDetectionResult::clear());
-        }
-
-        let ambiguity_type = parsed["ambiguity_type"]
-            .as_str()
-            .and_then(|s| match s {
-                "missing_target" => Some(AmbiguityType::MissingTarget),
-                "missing_action" => Some(AmbiguityType::MissingAction),
-                "missing_parameters" => Some(AmbiguityType::MissingParameters),
-                "multiple_intents" => Some(AmbiguityType::MultipleIntents),
-                "vague_reference" => Some(AmbiguityType::VagueReference),
-                "implicit_context" => Some(AmbiguityType::ImplicitContext),
-                _ => None,
-            })
-            .unwrap_or(AmbiguityType::Unknown);
+        let ambiguity_type = parsed["ambiguity_type"].as_str().map(|s| match s {
+            "missing_target" => AmbiguityType::MissingTarget,
+            "missing_action" => AmbiguityType::MissingAction,
+            "missing_parameters" => AmbiguityType::MissingParameters,
+            "multiple_intents" => AmbiguityType::MultipleIntents,
+            "vague_reference" | "vague_references" => AmbiguityType::VagueReference,
+            "implicit_context" => AmbiguityType::ImplicitContext,
+            _ => AmbiguityType::Unknown,
+        });
 
         let reasoning = parsed["reasoning"]
             .as_str()
@@ -292,17 +314,14 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
 
         let detected_language = parsed["detected_language"].as_str().map(String::from);
 
-        let mut result = AmbiguityDetectionResult::ambiguous(
+        Ok(AmbiguityDetectionResult {
+            is_ambiguous,
             confidence,
             ambiguity_type,
             reasoning,
             what_is_unclear,
-        );
-        if let Some(lang) = detected_language {
-            result = result.with_language(lang);
-        }
-
-        Ok(result)
+            detected_language,
+        })
     }
 
     /// LLM-based check for whether the user's input answers the assistant's last question.
@@ -437,10 +456,99 @@ Answer only "yes" or "no"."#,
 mod tests {
     use super::*;
 
+    fn make_detector(config: DetectionConfig) -> AmbiguityDetector {
+        AmbiguityDetector::new(config, Arc::new(LLMRegistry::new()))
+    }
+
     #[test]
     fn test_extract_json_via_util() {
         assert_eq!(extract_json(r#"{"ok": true}"#), r#"{"ok": true}"#);
         let md = "```json\n{\"ok\": true}\n```";
         assert_eq!(extract_json(md), r#"{"ok": true}"#);
+    }
+
+    #[test]
+    fn parse_preserves_raw_confidence_and_structured_fields_for_clear_boolean() {
+        let detector = make_detector(DetectionConfig::default());
+        let result = detector
+            .parse_detection_response(
+                r#"{
+                    "is_ambiguous": false,
+                    "confidence": 0.82,
+                    "ambiguity_type": "missing_parameters",
+                    "reasoning": "Intent is known but details are incomplete",
+                    "what_is_unclear": ["recipient", "amount"],
+                    "detected_language": "en"
+                }"#,
+            )
+            .unwrap();
+
+        assert!(!result.is_ambiguous);
+        assert!((result.confidence - 0.82).abs() < f32::EPSILON);
+        assert_eq!(
+            result.ambiguity_type,
+            Some(AmbiguityType::MissingParameters)
+        );
+        assert_eq!(
+            result.reasoning,
+            "Intent is known but details are incomplete"
+        );
+        assert_eq!(result.what_is_unclear, vec!["recipient", "amount"]);
+        assert_eq!(result.detected_language.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn default_prompt_uses_effective_threshold_for_confidence_guidance() {
+        let detector = make_detector(DetectionConfig::default());
+        let context = DisambiguationContext {
+            required_clarity: vec!["recipient".to_string()],
+            ..Default::default()
+        };
+
+        let prompt = detector.build_detection_prompt("Send money", &context, 0.93);
+
+        assert!(prompt.contains("confidence below 0.93"));
+        assert!(prompt.contains("confidence MUST be below 0.93"));
+        assert!(prompt.contains("confidence SHOULD be 0.93 or higher"));
+        assert!(!prompt.contains("confidence below 0.5"));
+        assert!(!prompt.contains("confidence SHOULD be 0.7 or higher"));
+    }
+
+    #[test]
+    fn custom_prompt_preserves_legacy_rendering_and_supports_opt_in_control_placeholders() {
+        let config = DetectionConfig {
+            prompt: Some(
+                "Input={{ user_input }}; state={{ current_state }}; recent={{ recent_messages }}"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let detector = make_detector(config);
+        let context = DisambiguationContext::new()
+            .with_state("payment")
+            .with_recent_messages(vec!["Earlier".to_string()]);
+
+        assert_eq!(
+            detector.build_detection_prompt("Pay Alice", &context, 0.95),
+            "Input=Pay Alice; state=payment; recent=Earlier"
+        );
+
+        let config = DetectionConfig {
+            prompt: Some(
+                "threshold={{ threshold }}; effective={{ effective_threshold }}; required={{ required_clarity }}"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+        let detector = make_detector(config);
+        let context = DisambiguationContext {
+            required_clarity: vec!["recipient".to_string(), "amount".to_string()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            detector.build_detection_prompt("Pay Alice", &context, 0.95),
+            "threshold=0.95; effective=0.95; required=recipient, amount"
+        );
     }
 }

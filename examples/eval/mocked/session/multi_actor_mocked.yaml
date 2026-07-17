@@ -1,10 +1,9 @@
 name: Multi-Actor Mocked Eval
 agent: ../../../yaml/session/multi_actor.yaml
 
-# Mocked eval for the multi-actor agent.
-# Actor identity is resolved from the context path player.id.
-# Fixture context sets the player identity before the first turn.
-# The eval runner isolates SQLite storage into a temp workspace.
+# Mocked regression for context-derived actor isolation and return recall.
+# Conversation resets bracket context switches so ordinary history cannot leak markers.
+# The eval runner isolates deterministic per-actor facts in SQLite storage.
 #
 # Usage:
 #   cargo run -p ai-agents-cli -- eval \
@@ -24,21 +23,121 @@ fixtures:
     mode: mock
     responses_by_alias:
       default:
-        - "Greetings, Mira Vale. I am Guard Elian. State your business at the harbor gate of Saltmere."
+        - "TIDE-908 moon-salt acknowledged."
+        - "EMBER-224 blackglass acknowledged."
+        - "TIDE-908 moon-salt."
       router:
-        - '[{"category":"user_context","content":"Visitor is Mira Vale, a merchant from the coast","confidence":0.85,"actor_id":"player_1"}]'
+        - '[{"category":"contraband","content":"Restricted moon-salt cargo code is TIDE-908","confidence":0.99,"actor_id":"player_1"}]'
+        - '[{"category":"contraband","content":"Restricted blackglass cargo code is EMBER-224","confidence":0.99,"actor_id":"player_2"}]'
+        - '[]'
 
 scenarios:
-  - id: multi-actor-context-identity
-    name: Actor identity resolved from context and facts extracted
-    tags: [mock, examples, yaml, session, multi-actor]
+  - id: multi-actor-context-isolation-and-return
+    name: Context actor switch isolates markers and restores the returning actor
+    tags: [mock, examples, yaml, session, multi-actor, isolation, persistence]
     language: en
-    turns:
-      - input: I am Mira Vale, a merchant from the coast. I carry wool and salted fish.
-        assert:
-          all:
-            - response_not_empty: true
-            - response_contains: "Mira"
-            - facts_include:
-                actor: player_1
-                category: user_context
+    steps:
+      - !run
+        turns:
+          - input: "I carry restricted moon-salt with cargo code TIDE-908."
+            assert:
+              all:
+                - response_not_empty: true
+                - context_path:
+                    path: player.id
+                    eq: "player_1"
+                - response_contains: "TIDE-908"
+                - facts_include:
+                    actor: player_1
+                    category: contraband
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: conversation
+        preserve_storage: true
+        preserve_actor_id: false
+      - !set_context
+        values:
+          player:
+            id: player_2
+            name: "Rowan Pike"
+      - !run
+        turns:
+          - input: "I carry restricted blackglass with cargo code EMBER-224."
+            assert:
+              all:
+                - response_not_empty: true
+                - context_path:
+                    path: player.id
+                    eq: "player_2"
+                - context_path:
+                    path: player.name
+                    eq: "Rowan Pike"
+                - llm_request:
+                    user_contains: "EMBER-224"
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      system_contains: "TIDE-908"
+                - not:
+                    llm_request:
+                      user_contains: "I carry restricted moon-salt with cargo code TIDE-908."
+                - response_contains: "EMBER-224"
+                - response_not_contains: "TIDE-908"
+                - facts_include:
+                    actor: player_2
+                    category: contraband
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: conversation
+        preserve_storage: true
+        preserve_actor_id: false
+      - !set_context
+        values:
+          player:
+            id: player_1
+            name: "Mira Vale"
+      - !run
+        turns:
+          - input: "Return Mira Vale's stored cargo code and restricted item."
+            assert:
+              all:
+                - response_not_empty: true
+                - context_path:
+                    path: player.id
+                    eq: "player_1"
+                - context_path:
+                    path: player.name
+                    eq: "Mira Vale"
+                - llm_request:
+                    system_contains:
+                      - "What you remember about Mira Vale:"
+                      - "TIDE-908"
+                    user_contains: "Return Mira Vale's stored cargo code and restricted item."
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      system_contains: "EMBER-224"
+                - not:
+                    llm_request:
+                      user_contains: "I carry restricted blackglass with cargo code EMBER-224."
+                - facts_include:
+                    actor: player_1
+                    category: contraband
+                - response_contains: "TIDE-908"
+                - response_contains: "moon-salt"
+                - response_not_contains: "EMBER-224"
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch

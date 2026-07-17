@@ -2121,7 +2121,7 @@ Detect ambiguous user messages and ask clarifying questions before proceeding.
 
 > **Note:** Disambiguation relies on the router LLM to detect ambiguity, classify the type, and generate clarification questions. Fast lower-cost models such as `gpt-5.4-nano` may misclassify ambiguity types or ignore style instructions. Use `gpt-5.4-mini` or a stronger model for the router if disambiguation quality matters.
 
-The threshold is the sole decision for ambiguity. The detector LLM returns a confidence score (0.0-1.0) for how clear the user's intent is. Messages scoring below the threshold trigger clarification.
+The detector LLM returns a confidence score (0.0-1.0) for how clear and actionable the user's intent is. The runtime preserves that raw score and applies the effective threshold after resolving layered overrides: skill, then state, then the agent-level detection threshold. Messages scoring below the effective threshold trigger clarification. `required_clarity` remains a separate hard gate when the detector reports a configured field as missing.
 
 ### `disambiguation.enabled`
 
@@ -2135,9 +2135,9 @@ The threshold is the sole decision for ambiguity. The detector LLM returns a con
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `llm` | `string` | `"router"` | LLM alias for detection |
-| `threshold` | `f64` | `0.7` | Confidence cutoff (0.0-1.0). Messages below this trigger clarification. Lower = more sensitive |
+| `threshold` | `f64` | `0.7` | Confidence cutoff (0.0-1.0). Messages below this trigger clarification. Higher = more sensitive and asks more often. |
 | `aspects` | `list` | `[missing_target, missing_action, missing_parameters, vague_references]` | Which ambiguity types to check for |
-| `prompt` | `string` | _(none)_ | Optional custom detection prompt. Replaces the built-in prompt sent to the detection LLM. Omit to use the default |
+| `prompt` | `string` | _(none)_ | Optional custom detection prompt. Replaces the built-in prompt sent to the detection LLM. Supports `{{ threshold }}`, `{{ effective_threshold }}`, and `{{ required_clarity }}` placeholders in addition to the existing context placeholders. |
 
 Available aspects:
 - `missing_target` - unclear what the user is referring to ("Send it" - send what?)
@@ -2210,6 +2210,7 @@ A state can override agent-level disambiguation settings. Useful for sensitive s
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `enabled` | `bool` | Enable or disable disambiguation in this state when the manager is active |
 | `threshold` | `f64` | Override the agent-level confidence cutoff |
 | `require_confirmation` | `bool` | Ask "Did you mean X?" even after clarification resolves |
 | `required_clarity` | `list` | Fields that must be explicitly stated. If any are missing, clarification is forced regardless of confidence |
@@ -2227,7 +2228,7 @@ states:
           - recipient
 ```
 
-`required_clarity` is a hard gate: if the detector reports any of these fields in `what_is_unclear`, clarification is forced even if confidence is above the threshold.
+`required_clarity` values from runtime context, state, and skill configuration are merged and deduplicated. It is a hard gate: if the detector reports any configured field in `what_is_unclear`, clarification is forced even if confidence is above the threshold.
 
 ### Skill-Level Disambiguation Override
 
@@ -2264,6 +2265,8 @@ Template key lookup order:
 3. No match: fall through to LLM-generated question
 
 > **Note:** Templates are static strings with a fixed language. When a template matches, it is used as-is with no LLM call. For multilingual clarification, omit templates and let the clarifier LLM generate the question instead.
+>
+> A custom detection prompt fully replaces the built-in schema and confidence instructions. To preserve threshold and required-field behavior, it must request the same structured JSON fields, especially `confidence` and `what_is_unclear`, and should use the effective-threshold and required-clarity placeholders where applicable.
 
 ### Full Example
 
@@ -3155,26 +3158,24 @@ Advanced step example:
 
 ```yaml
 steps:
-  - run:
-      turns:
-        - input: My preferred language is Korean.
-      save_session: first
-  - reset_agent:
-      profile: full_runtime
-      preserve_storage: true
-      preserve_host_context: true
-      preserve_actor_id: true
-  - load_session: first
-  - set_actor:
-      actor: customer_42
-  - run:
-      turns:
-        - input: What do you remember?
-          assert:
-            response_not_empty: true
+  - !set_actor
+    actor: customer_42
+  - !run
+    turns:
+      - input: My preferred language is Korean.
+  - !reset_agent
+    profile: full_runtime
+    preserve_storage: true
+    preserve_host_context: true
+    preserve_actor_id: true
+  - !run
+    turns:
+      - input: What do you remember?
+        assert:
+          response_not_empty: true
 ```
 
-`reset_agent: true` uses the default full-runtime reset behavior. Object form lets you choose a profile and preservation flags. `profile: conversation` calls the runtime conversation reset without rebuilding the agent; other profiles rebuild the eval runtime. `preserve_storage` keeps the temp persistence path, `preserve_host_context` reapplies fixture and scenario context, `preserve_actor_id` reapplies the active actor, and `delete_persistence` removes temp persistence before rebuilding.
+`!reset_agent true` uses the default full-runtime reset behavior. Object form lets you choose a profile and preservation flags. `profile: conversation` calls the runtime conversation reset without rebuilding the agent; other profiles rebuild the eval runtime. `preserve_storage` keeps the attempt-local persistence path, `preserve_host_context` reapplies fixture and scenario context, `preserve_actor_id` reapplies and reloads the active actor, and `delete_persistence` removes temp persistence before rebuilding. Use full-runtime reset plus preserved storage and actor identity to prove cross-runtime fact persistence without ordinary conversation history.
 
 ### Common assertions
 
@@ -3248,14 +3249,18 @@ Tool assertion object fields:
 | Field | Description |
 |-------|-------------|
 | `id` | Tool ID or requested tool name to match. String form `tool_called: lookup_order` is shorthand for this. |
-| `count` | Exact number of matching calls. |
-| `count_gte` | Minimum number of matching calls. |
+| `count` | Exact number of calls that satisfy every configured predicate on the same execution record. |
+| `count_gte` | Minimum number of calls that satisfy every configured predicate on the same execution record. |
 | `executed` | Filter to calls where the wrapped tool implementation did or did not run. Use `false` for denied, unavailable, approval-rejected, or timeout paths. |
 | `success` | Filter to successful or failed calls before counting. |
-| `source_in` | Allowed source labels such as `llm`, `skill`, `state_action`, `on_enter`, `on_exit`, `post_transition`, `spawner`, `orchestration`, or `mock`. |
+| `source_in` | Allowed source labels such as `llm`, `skill`, `plan`, `state_action`, `on_enter`, `on_exit`, `post_transition`, `spawner`, `orchestration`, or `mock`. Plan-and-execute tool steps use `plan`. |
 | `args` / `args_executed` | Path assertion against the arguments actually executed. |
 | `args_original` | Path assertion against original arguments before any wrapper or normalization behavior. |
 | `result_path` | Path assertion against parsed tool output. String outputs are treated as strings; JSON outputs are parsed when possible. |
+
+All object-form predicates are evaluated against one execution record. Argument and result predicates cannot be satisfied by different calls. `tool_called` always requires at least one complete match; use `tool_not_called` to assert absence.
+
+Plan-origin calls previously appeared under the broad `llm` source. They now use `plan`, so suites that explicitly filter plan-and-execute tool steps should migrate to `source_in: [plan]`.
 
 Example facts, relationship, orchestration, and observability assertions:
 

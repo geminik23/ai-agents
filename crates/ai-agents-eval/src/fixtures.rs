@@ -599,12 +599,12 @@ impl From<&ai_agents_core::ToolCallSource> for ToolExecutionSource {
         match source {
             ai_agents_core::ToolCallSource::Model => Self::Llm,
             ai_agents_core::ToolCallSource::Skill { .. } => Self::Skill,
+            ai_agents_core::ToolCallSource::Plan { .. } => Self::Plan,
             ai_agents_core::ToolCallSource::StateAction { .. } => Self::StateAction,
             ai_agents_core::ToolCallSource::Orchestration => Self::Orchestration,
             ai_agents_core::ToolCallSource::Spawner => Self::Spawner,
             ai_agents_core::ToolCallSource::EvalFixture => Self::Mock,
-            ai_agents_core::ToolCallSource::Plan { .. }
-            | ai_agents_core::ToolCallSource::Fallback { .. }
+            ai_agents_core::ToolCallSource::Fallback { .. }
             | ai_agents_core::ToolCallSource::Task
             | ai_agents_core::ToolCallSource::Manual => Self::Llm,
         }
@@ -1655,6 +1655,55 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_tool_sources_preserve_existing_labels_and_distinguish_plan() {
+        use ai_agents_core::ToolCallSource;
+
+        let mappings = [
+            (ToolCallSource::Model, ToolExecutionSource::Llm),
+            (
+                ToolCallSource::Skill {
+                    skill_id: "skill".to_string(),
+                    step_index: 0,
+                },
+                ToolExecutionSource::Skill,
+            ),
+            (
+                ToolCallSource::Plan { step_index: 0 },
+                ToolExecutionSource::Plan,
+            ),
+            (
+                ToolCallSource::StateAction {
+                    state: Some("ready".to_string()),
+                    action_index: 0,
+                },
+                ToolExecutionSource::StateAction,
+            ),
+            (
+                ToolCallSource::Orchestration,
+                ToolExecutionSource::Orchestration,
+            ),
+            (ToolCallSource::Spawner, ToolExecutionSource::Spawner),
+            (
+                ToolCallSource::Fallback {
+                    original_tool: "missing".to_string(),
+                },
+                ToolExecutionSource::Llm,
+            ),
+            (ToolCallSource::Task, ToolExecutionSource::Llm),
+            (ToolCallSource::Manual, ToolExecutionSource::Llm),
+            (ToolCallSource::EvalFixture, ToolExecutionSource::Mock),
+        ];
+
+        for (source, expected) in mappings {
+            assert_eq!(ToolExecutionSource::from(&source), expected);
+        }
+        assert_eq!(
+            serde_json::to_value(ToolExecutionSource::Plan).unwrap(),
+            json!("plan")
+        );
+    }
 
     #[test]
     fn llm_fixture_parses_tagged_outcomes_by_alias() {

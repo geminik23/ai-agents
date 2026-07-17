@@ -8,6 +8,8 @@
 - Eval isolation: each attempt receives isolated workspace and storage values that fixtures can use without touching configured source paths
 - Eval network fixtures: real HTTP and web fetch behavior can run through attempt-local or no-socket routes while retaining security checks
 - LLM eval evidence: sequenced provider outcomes and non-serializing request assertions verify retry, memory, persona, and reasoning behavior
+- Plan eval evidence: plan-and-execute tool steps expose a distinct plan source, and tool assertions bind all predicates to one execution record
+- Live persistence evaluation: reset steps preserve attempt-local storage and actor identity so suites can prove cross-runtime fact reuse and multi-actor isolation
 - Live example evaluation: opt-in provider smoke suites cover skills, disambiguation, memory, sessions, personas, relationships, public reasoning outcomes, observability, and bounded recovery
 
 ### Changed
@@ -15,7 +17,9 @@
 - Evaluation errors: failed turns retain partial responses and structural evidence, with explicit expected-error matching for intentional failures
 - Agent construction: rewritten specifications retain their original resource directory for relative skills, templates, and spawned agents
 - Skill responses: successful skill routes preserve the selected skill ID in response metadata for eval and host observability
-- Disambiguation detection: the router prompt now defines confidence as intent clarity and requires ambiguity-consistent scores
+- Disambiguation detection: the router prompt defines confidence as intent clarity, preserves raw structured detector evidence, and applies effective skill/state/base thresholds consistently
+- State lifecycle: first arrival at a transition target runs `on_enter`; later returns use `on_reenter`
+- Live web-search safety: fallback WebFetch remains no-socket and suggestion-only when the search provider is unavailable
 
 ## 1.0.0-rc.16
 

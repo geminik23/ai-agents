@@ -16,6 +16,8 @@ use crate::fixtures::RecordingToolLog;
 pub enum ToolExecutionSource {
     Llm,
     Skill,
+    /// Tool step requested by the plan-and-execute runtime.
+    Plan,
     StateAction,
     OnEnter,
     OnExit,

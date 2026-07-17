@@ -1,8 +1,9 @@
 name: Live Example - Session Multi Actor
 agent: ../../../../yaml/session/multi_actor.yaml
 
-# Live smoke suite for context-resolved actor identity and custom fact extraction.
+# Live smoke suite for context-resolved actor isolation and custom fact extraction.
 # The eval runner rewrites the configured database into a scenario temp workspace.
+# Conversation resets bracket actor switches so history cannot mask isolation.
 # Requires provider credentials and may incur provider cost.
 #
 # Usage:
@@ -34,50 +35,113 @@ scenarios:
     name: Real extractor keys a custom fact to the context actor
     tags: [live, examples, yaml, session, multi-actor, context, facts, sqlite, persistence, real-llm]
     language: en
-    turns:
-      - input: "I am carrying restricted moon-salt marked cargo code TIDE-908. Treat the moon-salt as contraband and mention TIDE-908 in your brief response."
-        assert:
-          all:
-            - response_not_empty: true
-            - context_path:
-                path: player.id
-                eq: "live_player_mira"
-            - context_path:
-                path: player.name
-                eq: "Mira Vale"
-            - response_contains: "TIDE-908"
-            - facts_include:
-                actor: live_player_mira
-                category: contraband
-            - tool_not_called: command
-            - tool_not_called: http
-            - tool_not_called: file_write
-            - tool_not_called: file_edit
-            - tool_not_called: patch
-      - input: "What cargo code and restricted item do you remember for Mira Vale?"
-        assert:
-          all:
-            - response_not_empty: true
-            - context_path:
-                path: player.id
-                eq: "live_player_mira"
-            - context_path:
-                path: player.name
-                eq: "Mira Vale"
-            - llm_request:
-                system_contains: "What you remember about Mira Vale:"
-                user_contains: "What cargo code and restricted item do you remember for Mira Vale?"
-                same_request: true
-                count: 1
-            - facts_include:
-                actor: live_player_mira
-                category: contraband
-            - response_contains: "TIDE-908"
-            - response_contains_any:
-                - "moon-salt"
-                - "moon salt"
-            - tool_not_called: command
-            - tool_not_called: http
-            - tool_not_called: file_write
-            - tool_not_called: file_edit
-            - tool_not_called: patch
+    steps:
+      - !run
+        turns:
+          - input: "I am carrying restricted moon-salt marked cargo code TIDE-908. Treat the moon-salt as contraband and mention TIDE-908 in your brief response."
+            assert:
+              all:
+                - response_not_empty: true
+                - context_path:
+                    path: player.id
+                    eq: "live_player_mira"
+                - context_path:
+                    path: player.name
+                    eq: "Mira Vale"
+                - response_contains: "TIDE-908"
+                - facts_include:
+                    actor: live_player_mira
+                    category: contraband
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: conversation
+        preserve_storage: true
+        preserve_actor_id: false
+      - !set_context
+        values:
+          player:
+            id: live_player_rowan
+            name: "Rowan Pike"
+      - !run
+        turns:
+          - input: "I am carrying restricted blackglass marked cargo code EMBER-224. Treat the blackglass as contraband and mention EMBER-224 in your brief response."
+            assert:
+              all:
+                - response_not_empty: true
+                - context_path:
+                    path: player.id
+                    eq: "live_player_rowan"
+                - context_path:
+                    path: player.name
+                    eq: "Rowan Pike"
+                - llm_request:
+                    user_contains: "EMBER-224"
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      system_contains: "TIDE-908"
+                - not:
+                    llm_request:
+                      user_contains: "I am carrying restricted moon-salt marked cargo code TIDE-908"
+                - response_contains: "EMBER-224"
+                - response_not_contains: "TIDE-908"
+                - facts_include:
+                    actor: live_player_rowan
+                    category: contraband
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch
+      - !reset_agent
+        profile: conversation
+        preserve_storage: true
+        preserve_actor_id: false
+      - !set_context
+        values:
+          player:
+            id: live_player_mira
+            name: "Mira Vale"
+      - !run
+        turns:
+          - input: "Using only stored memory for Mira Vale, return her cargo code and restricted item."
+            assert:
+              all:
+                - response_not_empty: true
+                - context_path:
+                    path: player.id
+                    eq: "live_player_mira"
+                - context_path:
+                    path: player.name
+                    eq: "Mira Vale"
+                - llm_request:
+                    system_contains:
+                      - "What you remember about Mira Vale:"
+                      - "TIDE-908"
+                    user_contains: "Using only stored memory for Mira Vale"
+                    same_request: true
+                    count: 1
+                - not:
+                    llm_request:
+                      system_contains: "EMBER-224"
+                - not:
+                    llm_request:
+                      user_contains: "I am carrying restricted blackglass marked cargo code EMBER-224"
+                - facts_include:
+                    actor: live_player_mira
+                    category: contraband
+                - response_contains: "TIDE-908"
+                - response_contains_any:
+                    - "moon-salt"
+                    - "moon salt"
+                - response_not_contains: "EMBER-224"
+                - tool_not_called: command
+                - tool_not_called: http
+                - tool_not_called: file_write
+                - tool_not_called: file_edit
+                - tool_not_called: patch

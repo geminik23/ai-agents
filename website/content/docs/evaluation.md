@@ -781,7 +781,7 @@ Real mode needs provider credentials such as `OPENAI_API_KEY`, network access, a
 
 ### Live example suites
 
-The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, or dry-run-only. Current suites cover tools, skills, disambiguation, memory and sessions, personas and relationships, public reasoning outcomes, observability and recovery, state transitions, context injection and rendering, and input/output process behavior.
+The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, no-socket, or dry-run-only. Current suites cover tools, skills, threshold-aware disambiguation, memory and cross-runtime session persistence, actor isolation, personas and relationships, public plan-and-execute outcomes, observability and recovery, exact state lifecycle transitions, context injection and rendering, and input/output process behavior.
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
@@ -800,7 +800,30 @@ sh examples/eval/live/run_live_example_evals.sh --yes-live --category process
 
 Implemented categories currently include `basic`, `context`, `disambiguation`, `error-recovery`, `memory`, `observability`, `persona`, `process`, `reasoning`, `relationships`, `session`, `skills`, `state-machine`, and `tools`. Use `examples/eval/live/README.md` as the authoritative registry instead of maintaining a category tree in public documentation.
 
-Live suites should usually check one primary behavior per scenario. If several safe tools can satisfy the same read-only request, use `any` over structural `tool_called` assertions. Prefer concrete prompts such as "Before answering, call the file_read tool ..." when the suite requires tool evidence. Add deterministic response checks for stable result values, requested symbols, fixture details, and dry-run wording so the suite verifies minimum useful user-visible output. Keep exact multi-tool sequences, denial paths, unavailable providers, approval behavior, and response-quality judges in mocked or focused suites where the model output is deterministic.
+Live suites should usually check one primary behavior per scenario. If several safe tools can satisfy the same read-only request, use `any` over structural `tool_called` assertions. Prefer concrete prompts such as "Before answering, call the file_read tool ..." when the suite requires tool evidence. Add deterministic response checks for stable result values, requested symbols, fixture details, and dry-run wording so the suite verifies minimum useful user-visible output. Persistence suites should reset or rebuild the runtime with attempt-local storage preserved so ordinary conversation history cannot satisfy recall. Keep exact multi-tool sequences, denial paths, unavailable providers, approval behavior, and response-quality judges in mocked or focused suites where the model output is deterministic.
+
+Advanced `steps` support persistence and actor-isolation checks:
+
+```yaml
+steps:
+  - !set_actor
+    actor: customer_42
+  - !run
+    turns:
+      - input: My project code is NORTHSTAR-42.
+  - !reset_agent
+    profile: full_runtime
+    preserve_storage: true
+    preserve_actor_id: true
+  - !run
+    turns:
+      - input: Return my persisted project code.
+        assert:
+          llm_request:
+            system_contains: NORTHSTAR-42
+```
+
+`profile: conversation` clears ordinary conversation state without rebuilding. `profile: full_runtime` rebuilds the agent; with `preserve_storage` and `preserve_actor_id`, it can prove that actor facts are loaded from isolated persistence rather than recalled from the prior message list. Use `!set_context` between conversation resets for context-derived multi-actor identity.
 
 Exact retry and fallback sequences, context-overflow recovery, chain-of-thought traces, subjective reflection improvement, and restart-based persistence remain mocked, quality-only, or manual where live execution would be costly, private, or misleading.
 
@@ -904,7 +927,7 @@ Common deterministic assertions:
 | `state_history_contains` | Transition history. |
 | `metadata_contains` | Top-level response metadata. |
 | `metadata_path` / `context_path` | Dot-path assertions. |
-| `tool_called` | Tool ID, executed flag, success, source, arguments, output. |
+| `tool_called` | Tool ID, executed flag, success, source, arguments, and output matched on one execution record. Plan steps use source `plan`. |
 | `llm_request` | In-memory role-specific message content and request counts without serializing prompts. |
 | `approval_requested` / `approval_not_requested` | Approval trigger, raw/effective decision, localized message, reasons/errors, argument versions, and counts. |
 | `facts_include` | Actor facts by actor/category and optional semantic judge. |
@@ -917,14 +940,20 @@ Tool assertion example:
 ```yaml
 assert:
   tool_called:
-    id: lookup_order
-    count_gte: 1
+    id: calculator
+    count: 1
     executed: true
     success: true
+    source_in: [plan]
+    args_executed:
+      path: expression
+      eq: "18 * 7"
     result_path:
-      path: status
-      eq: cancellable
+      path: result
+      eq: 126
 ```
+
+Every configured object predicate must match the same execution record. `count` and `count_gte` count complete matches after ID, source, execution status, arguments, and result predicates are applied. Plan-and-execute tool steps use `source_in: [plan]`; existing model-origin calls continue to use `llm`. Use `tool_not_called` rather than `count: 0` for absence.
 
 Denied, unavailable, approval-rejected, and approval-timeout calls should usually assert `executed: false` so the eval proves that the wrapped tool implementation did not run.
 
