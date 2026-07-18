@@ -1,0 +1,84 @@
+name: Live Example - Orchestration Content Pipeline
+agent: ../../../../yaml/orchestration/content_pipeline.yaml
+
+# Live eval suite for the fixed writer -> reviewer -> editor pipeline.
+# Requires provider credentials and may incur provider cost.
+# Variable-round orchestration and dynamic spawner lifecycles remain mocked or deferred.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/orchestration/content_pipeline_live.yaml \
+#     --output target/eval/live/examples/orchestration/content_pipeline \
+#     --real-llm
+#
+# Flow: request -> writer -> reviewer -> editor -> transition -> done response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 120000
+  timeout_per_scenario_ms: 150000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true
+    track_orchestration: true
+  cost:
+    enabled: true
+    pricing_file: ../../../../yaml/observability/pricing.yaml
+    unknown_price_policy: error
+  aggregation:
+    dimensions: [agent, purpose, state, orchestration_pattern, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  llm:
+    mode: real
+
+scenarios:
+  - id: content-pipeline-runs-bounded-stages
+    name: Writer reviewer and editor preserve the requested product markers
+    tags: [live, examples, yaml, orchestration, pipeline, bounded, real-llm]
+    language: en
+    budget:
+      max_llm_calls: 5
+      max_total_tokens: 60000
+      max_cost_usd: 0.03
+    turns:
+      - input: "Write a concise two-sentence product description for a travel notebook. Preserve the exact product code AURORA-17 and the exact phrase offline mode in the final edited version."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: done
+            - state_history_contains: done
+            - response_contains_any:
+                - "AURORA-17"
+                - "offline mode"
+                - "final"
+                - "Final"
+                - "ready"
+                - "Ready"
+                - "complete"
+                - "Complete"
+            - metadata_path:
+                path: orchestration.result
+                contains: "AURORA-17"
+            - metadata_path:
+                path: orchestration.result
+                contains: "offline mode"
+            - orchestration:
+                type: pipeline
+                stages: 3
+                agents_include: [writer, reviewer, editor]
+            - observability:
+                purpose_counts:
+                  orchestration_routing:
+                    path: count
+                    gte: 1
+            - tool_not_called: command
+            - tool_not_called: http
+            - tool_not_called: file_write

@@ -308,8 +308,41 @@ Important parts:
 | `agent` | Agent YAML path, resolved relative to the suite file. CLI `--agent` can override it. |
 | `settings` | Timeouts, retries, isolation, parallelism, and redaction. |
 | `fixtures` | Mock/replay/record/real LLM modes, sequenced outcomes, attempt-local values, mock or real-tool transports, context, diagnostics, commands, and deterministic HITL approvals. |
-| `scenarios` | Test cases with direct turns or advanced steps. |
+| `scenarios` | Test cases with optional hard provider budgets and direct turns or advanced steps. |
 | `assert` | Assertions evaluated after a turn. |
+
+---
+
+## Scenario provider budgets
+
+Use a scenario `budget` for live or otherwise provider-backed flows that can make more than one LLM call:
+
+```yaml
+settings:
+  retries: 0
+
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    pricing_file: ../../../../yaml/observability/pricing.yaml
+    unknown_price_policy: error
+
+scenarios:
+  - id: bounded-pipeline
+    budget:
+      max_llm_calls: 5
+      max_total_tokens: 60000
+      max_cost_usd: 0.03
+    turns:
+      - input: Run the bounded pipeline.
+```
+
+`max_llm_calls` limits calls across every alias, child agent using the shared registry, turn, agent reset, and retry in that scenario. Token and cost limits reserve a conservative maximum before each provider call, then settle against provider usage or a fallback estimate. A call is rejected before it starts when its reservation would exceed a configured limit; if reported usage exceeds the reservation, the response fails and no later provider call may start.
+
+`max_cost_usd` requires suite-level `observability.cost` pricing for every provider/model alias that may execute. Missing pricing fails before the provider call. Budget values must be finite and greater than zero. Scenario retries share the same budget rather than receiving a fresh allowance, but multi-call live smoke suites should still set `retries: 0` to avoid unnecessary rebuilds and nondeterministic amplification.
+
+Post-run assertions such as `observability.total_llm_calls_lte` remain useful evidence, but they do not replace a protective scenario budget because they run after usage has occurred.
 
 ---
 
@@ -781,7 +814,7 @@ Real mode needs provider credentials such as `OPENAI_API_KEY`, network access, a
 
 ### Live example suites
 
-The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, no-socket, or dry-run-only. Current suites cover tools, skills, threshold-aware disambiguation, memory and cross-runtime session persistence, actor isolation, personas and relationships, public plan-and-execute outcomes, observability and recovery, exact state lifecycle transitions, context injection and rendering, and input/output process behavior.
+The examples tree also contains live suites that exercise runnable YAML examples through real model behavior while keeping external effects read-only, fixture-backed, no-socket, dry-run-only, or protected by hard provider budgets. Current suites cover tools, skills, threshold-aware disambiguation, memory and cross-runtime session persistence, actor isolation, personas and relationships, public plan-and-execute outcomes, observability and recovery, exact state lifecycle transitions, selected runtime optimizations, one fixed orchestration pipeline, context injection and rendering, and input/output process behavior.
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
@@ -798,7 +831,7 @@ sh examples/eval/live/run_live_example_evals.sh --dry-config-check --category co
 sh examples/eval/live/run_live_example_evals.sh --yes-live --category process
 ```
 
-Implemented categories currently include `basic`, `context`, `disambiguation`, `error-recovery`, `memory`, `observability`, `persona`, `process`, `reasoning`, `relationships`, `session`, `skills`, `state-machine`, and `tools`. Use `examples/eval/live/README.md` as the authoritative registry instead of maintaining a category tree in public documentation.
+Implemented categories currently include `basic`, `context`, `disambiguation`, `error-recovery`, `memory`, `observability`, `orchestration`, `persona`, `process`, `reasoning`, `relationships`, `runtime-optimization`, `session`, `skills`, `state-machine`, and `tools`. Use `examples/eval/live/README.md` as the authoritative registry instead of maintaining a category tree in public documentation.
 
 Live suites should usually check one primary behavior per scenario. If several safe tools can satisfy the same read-only request, use `any` over structural `tool_called` assertions. Prefer concrete prompts such as "Before answering, call the file_read tool ..." when the suite requires tool evidence. Add deterministic response checks for stable result values, requested symbols, fixture details, and dry-run wording so the suite verifies minimum useful user-visible output. Persistence suites should reset or rebuild the runtime with attempt-local storage preserved so ordinary conversation history cannot satisfy recall. Keep exact multi-tool sequences, denial paths, unavailable providers, approval behavior, and response-quality judges in mocked or focused suites where the model output is deterministic.
 

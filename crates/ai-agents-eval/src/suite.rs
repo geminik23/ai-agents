@@ -80,6 +80,32 @@ impl EvalSuite {
                 "scenario.env cannot be used with parallel execution".into(),
             ));
         }
+        if self
+            .scenarios
+            .iter()
+            .any(|scenario| scenario.budget.max_cost_usd.is_some())
+        {
+            let cost = self
+                .observability
+                .as_ref()
+                .map(|observability| &observability.cost)
+                .ok_or_else(|| {
+                    EvalError::Config(
+                        "budget.max_cost_usd requires suite observability.cost pricing".into(),
+                    )
+                })?;
+            if !cost.enabled {
+                return Err(EvalError::Config(
+                    "budget.max_cost_usd requires observability.cost.enabled: true".into(),
+                ));
+            }
+            if cost.pricing.is_empty() && cost.pricing_file.is_none() {
+                return Err(EvalError::Config(
+                    "budget.max_cost_usd requires observability.cost.pricing or pricing_file"
+                        .into(),
+                ));
+            }
+        }
         let mut ids = std::collections::HashSet::new();
         for scenario in &self.scenarios {
             if scenario.id.trim().is_empty() {
@@ -98,6 +124,7 @@ impl EvalSuite {
                     scenario.id
                 )));
             }
+            scenario.budget.validate(&scenario.id)?;
         }
         Ok(())
     }
@@ -196,12 +223,58 @@ pub struct Scenario {
     /// skip value for Scenario.
     #[serde(default)]
     pub skip: SkipConfig,
+    /// Protective limits shared by all attempts, turns, resets, and LLM aliases.
+    #[serde(default)]
+    pub budget: ScenarioBudget,
     /// Turns executed by this scenario or step.
     #[serde(default)]
     pub turns: Vec<Turn>,
     /// Advanced steps executed after direct turns.
     #[serde(default)]
     pub steps: Vec<ScenarioStep>,
+}
+
+/// Hard provider-usage limits for one scenario, shared across retries and resets.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct ScenarioBudget {
+    /// Maximum provider calls that may start for this scenario.
+    #[serde(default)]
+    pub max_llm_calls: Option<u64>,
+    /// Maximum provider-reported or conservatively estimated tokens.
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Maximum estimated provider cost in US dollars.
+    #[serde(default)]
+    pub max_cost_usd: Option<f64>,
+}
+
+impl ScenarioBudget {
+    pub(crate) fn is_configured(&self) -> bool {
+        self.max_llm_calls.is_some()
+            || self.max_total_tokens.is_some()
+            || self.max_cost_usd.is_some()
+    }
+
+    fn validate(&self, scenario_id: &str) -> Result<()> {
+        if self.max_llm_calls == Some(0) {
+            return Err(EvalError::Config(format!(
+                "scenario '{scenario_id}' budget.max_llm_calls must be greater than zero"
+            )));
+        }
+        if self.max_total_tokens == Some(0) {
+            return Err(EvalError::Config(format!(
+                "scenario '{scenario_id}' budget.max_total_tokens must be greater than zero"
+            )));
+        }
+        if let Some(max_cost_usd) = self.max_cost_usd
+            && (!max_cost_usd.is_finite() || max_cost_usd <= 0.0)
+        {
+            return Err(EvalError::Config(format!(
+                "scenario '{scenario_id}' budget.max_cost_usd must be finite and greater than zero"
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// One user input and assertion block inside a scenario.
@@ -539,6 +612,7 @@ mod tests {
                 context: Value::Null,
                 env: HashMap::new(),
                 skip: SkipConfig::default(),
+                budget: ScenarioBudget::default(),
                 turns: vec![Turn {
                     input: "hello".to_string(),
                     actor: None,
@@ -591,5 +665,38 @@ mod tests {
             .insert("TOKEN".to_string(), "secret".to_string());
         let error = suite.validate(None).unwrap_err().to_string();
         assert!(error.contains("scenario.env"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_scenario_budgets() {
+        let mut suite = suite();
+        suite.scenarios[0].budget.max_llm_calls = Some(0);
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("budget.max_llm_calls"));
+
+        suite.scenarios[0].budget.max_llm_calls = Some(1);
+        suite.scenarios[0].budget.max_total_tokens = Some(0);
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("budget.max_total_tokens"));
+
+        suite.scenarios[0].budget.max_total_tokens = Some(1);
+        suite.scenarios[0].budget.max_cost_usd = Some(f64::NAN);
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("budget.max_cost_usd"));
+    }
+
+    #[test]
+    fn validation_requires_pricing_for_cost_budgets() {
+        let mut suite = suite();
+        suite.scenarios[0].budget.max_cost_usd = Some(0.01);
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("observability.cost pricing"));
+
+        suite.observability = Some(ObservabilityConfig::default());
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("pricing or pricing_file"));
+
+        suite.observability.as_mut().unwrap().cost.pricing_file = Some("pricing.yaml".to_string());
+        assert!(suite.validate(None).is_ok());
     }
 }

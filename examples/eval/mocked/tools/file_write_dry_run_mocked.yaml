@@ -26,6 +26,8 @@ scenarios:
             - tool_called:
                 id: file_write
                 count: 1
+            - tool_called:
+                id: file_write
                 executed: true
                 success: true
                 source_in: [llm, mock]

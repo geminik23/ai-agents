@@ -31,6 +31,8 @@ scenarios:
     name: Pipeline processes content through writer, reviewer, and editor
     tags: [mock, examples, yaml, orchestration, pipeline]
     language: en
+    budget:
+      max_llm_calls: 5
     turns:
       - input: Write a short blog post about Rust error handling.
         assert:

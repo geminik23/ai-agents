@@ -41,7 +41,9 @@ scenarios:
                 success: true
             - tool_called:
                 id: file_edit
-                count_gte: 1
+                count: 1
+            - tool_called:
+                id: file_edit
                 executed: true
                 success: true
                 args_executed:
@@ -60,9 +62,10 @@ scenarios:
             - response_contains_any:
                 - "dry-run"
                 - "dry run"
-                - "Status: reviewed"
                 - "no file was changed"
                 - "No file was changed"
+                - "not changed"
+                - "not applied"
             - response_not_contains:
                 - "I changed the file on disk"
                 - "I edited the file on disk"

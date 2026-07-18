@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 
 use ai_agents_hooks::AgentHooks;
-use ai_agents_observability::ObservabilityConfig;
 use ai_agents_observability::config::ExportFormat;
+use ai_agents_observability::{CostEstimator, ObservabilityConfig};
 use ai_agents_runtime::spec::{AgentSpec, LLMConfigOrSelector, StorageConfig};
 use ai_agents_runtime::{Agent, AgentBuilder, RuntimeAgent, StreamChunk};
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ use tokio::time::{Duration, Instant as TokioInstant, timeout, timeout_at};
 use crate::assertion::{
     Assertion, AssertionEvalContext, AssertionOutcome, AssertionResultDetail, evaluate_assertion,
 };
+use crate::budget::{BudgetProviderConfig, ScenarioBudgetTracker};
 use crate::compatibility::suite_from_jsonl;
 use crate::evidence::{
     ApprovalEvidence, LlmRequestEvidence, collect_turn_evidence, relationship_snapshot,
@@ -384,9 +385,18 @@ impl EvalRunner {
         };
         let mut category = Some(FailureCategory::AssertionFailed);
         let max_attempt = self.suite.settings.retries + 1;
+        let budget = if scenario.budget.is_configured() {
+            Some(ScenarioBudgetTracker::new(
+                scenario.budget.clone(),
+                self.budget_cost_estimator(base_dir, scenario)?,
+            ))
+        } else {
+            None
+        };
 
         for attempt_idx in 0..max_attempt {
-            let attempt_future = self.run_attempt(agent_path, base_dir, scenario, attempt_idx);
+            let attempt_future =
+                self.run_attempt(agent_path, base_dir, scenario, attempt_idx, budget.clone());
             let attempt = if let Some(timeout_ms) = self.suite.settings.timeout_per_scenario_ms {
                 match timeout(Duration::from_millis(timeout_ms), attempt_future).await {
                     Ok(result) => result,
@@ -430,6 +440,12 @@ impl EvalRunner {
                     });
                 }
             }
+            if budget
+                .as_ref()
+                .is_some_and(ScenarioBudgetTracker::has_failed)
+            {
+                break;
+            }
             if attempt_idx + 1 < max_attempt {
                 tokio::time::sleep(Duration::from_millis(self.suite.settings.retry_delay_ms)).await;
             }
@@ -456,6 +472,7 @@ impl EvalRunner {
         base_dir: &Path,
         scenario: &Scenario,
         attempt: u32,
+        budget: Option<ScenarioBudgetTracker>,
     ) -> Result<AttemptResult> {
         let start = Instant::now();
         let _env_guard = EnvGuard::apply(&scenario.env)?;
@@ -479,6 +496,7 @@ impl EvalRunner {
                 approval_log.clone(),
                 llm_log.clone(),
                 approval_handler.clone(),
+                budget.clone(),
             )
             .await?;
         apply_base_context(&agent, &self.suite, base_dir, scenario, &attempt_context)?;
@@ -591,6 +609,7 @@ impl EvalRunner {
                                     approval_log.clone(),
                                     llm_log.clone(),
                                     approval_handler.clone(),
+                                    budget.clone(),
                                 )
                                 .await?;
                         }
@@ -649,6 +668,7 @@ impl EvalRunner {
         approval_log: RecordingApprovalLog,
         llm_log: RecordingLlmLog,
         approval_handler: Option<Arc<dyn ai_agents_hitl::ApprovalHandler>>,
+        budget: Option<ScenarioBudgetTracker>,
     ) -> Result<RuntimeAgent> {
         let content = std::fs::read_to_string(agent_path)?;
         let mut spec: AgentSpec = serde_yaml::from_str(&content)?;
@@ -662,7 +682,21 @@ impl EvalRunner {
         spec.validate()
             .map_err(|error| EvalError::Config(error.to_string()))?;
         let llm_fixture = attempt_context.interpolate_llm_fixture(&self.suite.fixtures.llm)?;
-        let (llm_registry, _judge_llm) = build_llm_registry(&spec, &llm_fixture, base_dir)?;
+        let provider_configs = budget_provider_configs(&spec);
+        let (mut llm_registry, _judge_llm) = build_llm_registry(&spec, &llm_fixture, base_dir)?;
+        if let Some(budget) = budget {
+            llm_registry =
+                llm_registry.map_providers(|alias, provider| {
+                    let config = provider_configs.get(alias).cloned().unwrap_or_else(|| {
+                        BudgetProviderConfig {
+                            provider: provider.provider_name().to_string(),
+                            model: alias.to_string(),
+                            max_output_tokens: 2_000,
+                        }
+                    });
+                    budget.wrap(provider, config)
+                });
+        }
         let tool_registry = build_tool_registry(&self.suite.fixtures, tool_log.clone())?;
         let agent_base_dir = agent_path.parent().unwrap_or_else(|| Path::new("."));
         let mut builder = AgentBuilder::from_spec_with_base_dir(spec, agent_base_dir)
@@ -726,6 +760,32 @@ impl EvalRunner {
             .validate()
             .map_err(|error| EvalError::Config(error.to_string()))?;
         Ok(Some(config))
+    }
+
+    fn budget_cost_estimator(
+        &self,
+        base_dir: &Path,
+        scenario: &Scenario,
+    ) -> Result<Option<CostEstimator>> {
+        if scenario.budget.max_cost_usd.is_none() {
+            return Ok(None);
+        }
+        let config = self.suite.observability.clone().ok_or_else(|| {
+            EvalError::Config(format!(
+                "scenario '{}' budget.max_cost_usd requires suite observability.cost pricing",
+                scenario.id
+            ))
+        })?;
+        let config = config
+            .with_pricing_file_loaded(Some(base_dir))
+            .map_err(|error| EvalError::Config(error.to_string()))?;
+        if !config.cost.enabled {
+            return Err(EvalError::Config(format!(
+                "scenario '{}' budget.max_cost_usd requires observability.cost.enabled: true",
+                scenario.id
+            )));
+        }
+        Ok(Some(CostEstimator::new(config.cost)))
     }
 
     async fn run_turn(
@@ -1201,6 +1261,33 @@ fn apply_eval_llm_settings(spec: &mut AgentSpec, settings: &crate::suite::EvalSe
     }
 }
 
+fn budget_provider_configs(spec: &AgentSpec) -> HashMap<String, BudgetProviderConfig> {
+    if spec.llms.is_empty() {
+        let config = spec.llm.as_config().cloned().unwrap_or_default();
+        return HashMap::from([(
+            "default".to_string(),
+            BudgetProviderConfig {
+                provider: config.provider,
+                model: config.model,
+                max_output_tokens: config.max_tokens,
+            },
+        )]);
+    }
+    spec.llms
+        .iter()
+        .map(|(alias, config)| {
+            (
+                alias.clone(),
+                BudgetProviderConfig {
+                    provider: config.provider.clone(),
+                    model: config.model.clone(),
+                    max_output_tokens: config.max_tokens,
+                },
+            )
+        })
+        .collect()
+}
+
 fn apply_llm_config_settings(
     config: &mut ai_agents_runtime::spec::LLMConfig,
     settings: &crate::suite::EvalSettings,
@@ -1514,6 +1601,7 @@ scenarios:
                 approval_log.clone(),
                 llm_log.clone(),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1539,6 +1627,7 @@ scenarios:
                 tool_log,
                 approval_log,
                 llm_log,
+                None,
                 None,
             )
             .await
@@ -1707,6 +1796,102 @@ scenarios:
                         turn.assertion_results
                             .iter()
                             .any(|detail| detail.assertion == "expect_error" && !detail.passed)
+                    );
+                    let _ = std::fs::remove_dir_all(dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn scenario_budget_is_shared_across_retries_and_agent_resets() {
+        std::thread::Builder::new()
+            .name("eval-budget-lifecycle-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let dir = std::env::temp_dir().join(format!(
+                        "ai_agents_eval_budget_lifecycle_test_{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    write_test_agent(&dir);
+
+                    let retried = run_test_suite(
+                        &dir,
+                        "budget-retry.yaml",
+                        r#"
+name: Retry Budget
+agent: agent.yaml
+settings:
+  retries: 1
+  retry_delay_ms: 0
+  redact_outputs: false
+fixtures:
+  llm:
+    mode: mock
+    responses: [wrong]
+scenarios:
+  - id: retry
+    budget:
+      max_llm_calls: 1
+    turns:
+      - input: Hello
+        assert:
+          response_contains: right
+"#,
+                    )
+                    .await;
+                    let retried = &retried.scenarios[0];
+                    assert!(retried.status.is_error());
+                    assert_eq!(retried.attempts.len(), 2);
+                    assert!(
+                        retried.attempts[1].turns[0]
+                            .runtime_error
+                            .as_ref()
+                            .is_some_and(|error| error.value.contains("max_llm_calls=1"))
+                    );
+
+                    let reset = run_test_suite(
+                        &dir,
+                        "budget-reset.yaml",
+                        r#"
+name: Reset Budget
+agent: agent.yaml
+settings:
+  retries: 0
+  redact_outputs: false
+fixtures:
+  llm:
+    mode: mock
+    responses: [ok]
+scenarios:
+  - id: reset
+    budget:
+      max_llm_calls: 1
+    steps:
+      - !run
+        turns:
+          - input: First
+      - !reset_agent true
+      - !run
+        turns:
+          - input: Second
+"#,
+                    )
+                    .await;
+                    let reset = &reset.scenarios[0];
+                    assert!(reset.status.is_error());
+                    assert_eq!(reset.attempts.len(), 1);
+                    assert_eq!(reset.attempts[0].turns.len(), 2);
+                    assert!(
+                        reset.attempts[0].turns[1]
+                            .runtime_error
+                            .as_ref()
+                            .is_some_and(|error| error.value.contains("max_llm_calls=1"))
                     );
                     let _ = std::fs::remove_dir_all(dir);
                 });

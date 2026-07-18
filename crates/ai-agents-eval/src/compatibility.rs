@@ -47,6 +47,7 @@ pub fn suite_from_jsonl(name: String, content: &str) -> Result<EvalSuite> {
             context: row.context,
             env: Default::default(),
             skip: Default::default(),
+            budget: Default::default(),
             turns: vec![Turn {
                 input: row.input,
                 actor: None,

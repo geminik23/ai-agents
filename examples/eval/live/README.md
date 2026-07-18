@@ -110,6 +110,7 @@ Use the same category folder name as `examples/yaml/`, including names such as `
 |--------|---------|
 | `live-auto` | Safe to run intentionally with `--real-llm` and no extra local service. |
 | `fixture-live` | Uses a real LLM while external systems are deterministic fixtures or dry-run paths. |
+| `quality-only` | Uses a separate semantic or judge suite rather than a runnable-example smoke contract. |
 | `mocked-only` | Should stay deterministic and no-key for now. |
 | `manual-only` | Requires a human, local service, secrets, custom Rust, or risky side effects. |
 | `support-file` | Fixture or helper file, not a primary runnable suite. |
@@ -134,6 +135,9 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 | `examples/yaml/state-machine/nested_states.yaml` | hierarchical state routing | `live-auto` | `examples/eval/live/examples/state-machine/nested_states_live.yaml` | Verifies a nested troubleshooting route and root-state escape. |
 | `examples/yaml/state-machine/state_lifecycle.yaml` | enter, exit, and reentry actions | `live-auto` | `examples/eval/live/examples/state-machine/state_lifecycle_live.yaml` | Verifies exact first-entry `on_enter` and later `on_reenter` context through a bounded revision workflow. |
 | `examples/yaml/state-machine/support_state_machine.yaml` | representative support routing | `live-auto` | `examples/eval/live/examples/state-machine/support_state_machine_live.yaml` | Verifies technical, order, and global escalation routes without external effects. |
+| `examples/yaml/runtime-optimization/pre_response_transition.yaml` | deterministic pre-response routing | `live-auto` | `examples/eval/live/examples/runtime-optimization/pre_response_transition_live.yaml` | Uses one committed provider call and a hard scenario budget to prove the stale state is skipped. |
+| `examples/yaml/runtime-optimization/buffered_streaming.yaml` | speculative buffered streaming | `live-auto` | `examples/eval/live/examples/runtime-optimization/buffered_streaming_live.yaml` | Verifies committed technical output, terminal loser evidence, disabled report export, and a two-call hard limit. |
+| Remaining `runtime-optimization/*.yaml` examples | exact branch, maintenance, voting, and speculative decisions | `mocked-only` | mocked runtime-optimization suites | Exact winner/loser order, background effects, private reasoning decisions, and losing-tool behavior remain deterministic. |
 | `examples/yaml/context/builtin_context.yaml` | built-in agent and session context | `live-auto` | `examples/eval/live/examples/context/builtin_context_live.yaml` | Verifies the model uses built-in identity, session, and time context. |
 | `examples/yaml/context/runtime_context.yaml` | host-provided user context | `fixture-live` | `examples/eval/live/examples/context/runtime_context_live.yaml` | Uses safe fixture values to verify personalized real-model output. |
 | `examples/yaml/context/template_context.yaml` | context-driven prompt templates | `fixture-live` | `examples/eval/live/examples/context/template_context_live.yaml` | Verifies a stable customer profile selects the intended template branch. |
@@ -175,6 +179,15 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 | `examples/yaml/observability/pricing_file.yaml` | pricing-file configuration | `live-auto` | `examples/eval/live/examples/observability/pricing_file_live.yaml` | Verifies configured model telemetry without exact provider token or cost values. |
 | `examples/yaml/observability/tools_and_skills_metrics.yaml` | skill and tool telemetry | `live-auto` | `examples/eval/live/examples/observability/tools_and_skills_metrics_live.yaml` | Verifies skill purposes, one calculator call, and successful telemetry. |
 | `examples/yaml/observability/pricing.yaml` | pricing data | `support-file` | covered by `pricing_file_live.yaml` | Data file, not a runnable agent. |
+| `examples/yaml/orchestration/content_pipeline.yaml` | fixed writer -> reviewer -> editor pipeline | `live-auto` | `examples/eval/live/examples/orchestration/content_pipeline_live.yaml` | Uses structural stage evidence, preserved output markers, and a five-call hard limit. |
+| `examples/yaml/orchestration/customer_support_router.yaml` | support delegation | `live-auto` | `examples/eval/live/examples/observability/orchestration_metrics_live.yaml` | Existing observed delegate coverage already exercises the representative billing route. |
+| `examples/yaml/orchestration/stock_analysis_concurrent.yaml` | concurrent analysts and synthesis | `deferred` | mocked orchestration suite | At least three child calls plus synthesis make provider usage disproportionately expensive. |
+| `examples/yaml/orchestration/support_handoff.yaml` | LLM-directed handoffs | `deferred` | mocked orchestration suite | The number of handoffs is model-dependent. |
+| `examples/yaml/orchestration/code_review_group_chat.yaml` | multi-round group discussion | `deferred` | mocked orchestration suite | Participant and round multiplication remains too costly for routine live smoke coverage. |
+| `examples/yaml/orchestration/team_coordinator.yaml` | model-selected orchestration tools | `deferred` | mocked orchestration suites | The selected pattern and provider-call path are variable. |
+| `examples/yaml/spawner/team_manager.yaml` | dynamic agent lifecycle | `deferred` | complete mocked lifecycle suite | A meaningful live contract requires spawn -> list -> message -> remove -> final list and remains too expensive despite hard budgets. |
+| `examples/yaml/spawner/game_master.yaml` | high-capacity dynamic spawning | `deferred` | complete mocked lifecycle suite | Dynamic child count and lifecycle cost remain unsuitable for live smoke coverage. |
+| `examples/yaml/hitl/*.yaml` | approve, reject, modify, timeout, localization | `manual-only` | deterministic mocked HITL suites | Automatic coverage uses scripted handlers; real human approval remains an explicit manual boundary. |
 | `examples/yaml/error-recovery/basic_retry.yaml` | bounded retry-enabled operation | `live-auto` | `examples/eval/live/examples/error-recovery/basic_retry_live.yaml` | Verifies normal successful operation without deliberately paying for failed calls. |
 | `examples/yaml/error-recovery/llm_fallback.yaml` | configured provider fallback | `live-auto` | `examples/eval/live/examples/error-recovery/llm_fallback_live.yaml` | Verifies bounded availability; exact failure/fallback sequencing remains mocked. |
 | `examples/yaml/error-recovery/context_overflow.yaml` | overflow summarization recovery | `mocked-only` | mocked context-overflow suite | Reliable live triggering requires large paid inputs and multiple summarization calls. |
@@ -201,6 +214,10 @@ live real-llm examples yaml basic context disambiguation error-recovery memory o
 | `examples/yaml/tools/http_tool.yaml` | `http`, `json` | `deferred` | mock-server coverage needed | Raw HTTP coverage needs public-network or mock-server policy. |
 | `examples/yaml/tools/mcp_agent.yaml` | MCP filesystem views plus built-ins | `manual-only` | manual workflow | Requires local `npx` process startup and a filesystem sandbox. |
 | `examples/yaml/tools/file_and_template.yaml` | legacy/general `file`, `template` | `deferred` | sandbox coverage needed | Legacy file behavior needs sandbox clarification before live automation. |
+| `examples/yaml/basic/simple_chat.yaml` | unconstrained basic conversation quality | `quality-only` | `examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml` | Semantic quality is kept separate from runnable-example smoke coverage. |
+| `examples/yaml/basic/simple_chat_stream.yaml` | basic streaming transport | `mocked-only` | `examples/eval/mocked/basic/simple_chat_streaming_mocked.yaml` | Deterministic runtime streaming coverage is sufficient; buffered routing has the targeted live streaming check. |
+| `examples/yaml/basic/ollama_chat.yaml` | local Ollama provider | `manual-only` | manual workflow | Requires a separately managed local Ollama service and model. |
+| `examples/yaml/basic/openai_compatible.yaml` | configurable compatible endpoint | `manual-only` | manual workflow | Requires an operator-selected endpoint, credentials, and service lifecycle. |
 | `examples/fixtures/tool_examples/edit_target.txt` | dry-run edit fixture | `support-file` | fixture | Used by `examples/eval/live/examples/tools/file_edit_review_live.yaml`. |
 | `examples/fixtures/tool_examples/patch_target.txt` | dry-run patch fixture | `support-file` | fixture | Used by `examples/eval/live/examples/tools/patch_review_live.yaml`. |
 
@@ -243,6 +260,8 @@ examples/eval/mocked/basic/no_tools_explicit_empty_mocked.yaml
 - Prefer one primary live behavior per scenario; split multi-tool coverage across scenarios instead of requiring a long exact sequence in one turn.
 - Prefer structural evidence for runtime behavior: `tool_called`, `tool_not_called`, `state`, `state_history_contains`, `context_path`, `metadata_path`, and `observability`.
 - Add deterministic response checks for minimum useful output, such as stable arithmetic results, requested symbols, fixture details, or dry-run wording.
+- For mutation tools, add a separate unfiltered exact `tool_called` count before filtered dry-run/result assertions so an extra unsafe attempt cannot be hidden by a later matching call.
+- Give multi-call live scenarios hard `budget` limits and set `retries: 0`; cost budgets require configured pricing for every model alias that may run.
 - Use `result_path` for deterministic tool output fields such as `result`, `length`, `value`, `uuid`, `dry_run`, `bytes_written`, `available`, and `count`.
 - Use `any` when several safe tools can satisfy the same read-only behavior.
 - Use `response_contains_any` for bounded wording choices and `response_not_contains` for complete overclaim phrases.

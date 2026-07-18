@@ -562,7 +562,9 @@ pub use tool_security::{
     SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
 };
 
-pub use eval::{EvalResult, EvalRunner, EvalRunnerOptions, EvalSettings, EvalSuite};
+pub use eval::{
+    EvalResult, EvalRunner, EvalRunnerOptions, EvalSettings, EvalSuite, ScenarioBudget,
+};
 pub use observability::{ObservabilityConfig, ObservabilityManager, ObservabilityReport};
 
 pub use context::{

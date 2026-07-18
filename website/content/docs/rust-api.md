@@ -846,7 +846,7 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
-Core types are re-exported under `ai_agents::eval`: `EvalSuite`, `EvalSettings`, `EvalRunner`, `EvalRunnerOptions`, `EvalResult`, `ScenarioResult`, `ScenarioStatus`, `FixturesConfig`, `TurnEvidence`, `ToolExecutionRecord`, `LLMJudge`, `JudgeConfig`, `ResetOptions`, and `ResetProfile`.
+Core types are re-exported under `ai_agents::eval`: `EvalSuite`, `EvalSettings`, `ScenarioBudget`, `EvalRunner`, `EvalRunnerOptions`, `EvalResult`, `ScenarioResult`, `ScenarioStatus`, `FixturesConfig`, `TurnEvidence`, `ToolExecutionRecord`, `LLMJudge`, `JudgeConfig`, `ResetOptions`, and `ResetProfile`.
 
 The runner builds agents through `AgentBuilder`, so the same YAML features used by the CLI are available. Eval fixtures can replace LLMs and tools for deterministic tests, and reports can be written with `write_outputs()`.
 

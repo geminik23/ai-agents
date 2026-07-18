@@ -37,6 +37,8 @@ scenarios:
             - tool_called:
                 id: persona_evolve
                 count: 1
+            - tool_called:
+                id: persona_evolve
                 executed: true
                 success: true
                 args_executed:
@@ -44,7 +46,6 @@ scenarios:
                   eq: "traits.speaking_style"
             - tool_called:
                 id: persona_evolve
-                count: 1
                 executed: true
                 success: true
                 args_executed:

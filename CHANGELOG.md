@@ -11,6 +11,8 @@
 - Plan eval evidence: plan-and-execute tool steps expose a distinct plan source, and tool assertions bind all predicates to one execution record
 - Live persistence evaluation: reset steps preserve attempt-local storage and actor identity so suites can prove cross-runtime fact reuse and multi-actor isolation
 - Live example evaluation: opt-in provider smoke suites cover skills, disambiguation, memory, sessions, personas, relationships, public reasoning outcomes, observability, and bounded recovery
+- Eval provider budgets: scenarios can enforce shared hard limits for LLM calls, tokens, and configured provider cost across aliases, resets, and retries
+- Bounded live workflows: provider smoke coverage includes pre-response routing, buffered streaming, and the fixed writer-reviewer-editor pipeline
 
 ### Changed
 - Evaluation fixtures: mocked built-in tools preserve their schemas, safety classification, and policy behavior while replacing external execution
@@ -20,6 +22,7 @@
 - Disambiguation detection: the router prompt defines confidence as intent clarity, preserves raw structured detector evidence, and applies effective skill/state/base thresholds consistently
 - State lifecycle: first arrival at a transition target runs `on_enter`; later returns use `on_reenter`
 - Live web-search safety: fallback WebFetch remains no-socket and suggestion-only when the search provider is unavailable
+- Live mutation evidence: dry-run suites require one total mutation call and mandatory no-apply disclosure so an extra unsafe attempt cannot be masked
 
 ## 1.0.0-rc.16
 

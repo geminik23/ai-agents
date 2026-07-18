@@ -1,0 +1,77 @@
+name: Live Example - Runtime Optimization Pre-response Transition
+agent: ../../../../yaml/runtime-optimization/pre_response_transition.yaml
+
+# Live eval suite for deterministic routing before the stale state's response starts.
+# Requires provider credentials and may incur provider cost.
+# The scenario budget is shared across aliases, turns, resets, and retries.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/runtime-optimization/pre_response_transition_live.yaml \
+#     --output target/eval/live/examples/runtime-optimization/pre_response_transition \
+#     --real-llm
+#
+# Flow: billing context -> pre-response guard -> billing state -> one committed provider response
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 60000
+  timeout_per_scenario_ms: 90000
+  retries: 0
+  isolation: scenario
+
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    pricing_file: ../../../../yaml/observability/pricing.yaml
+    unknown_price_policy: error
+  aggregation:
+    dimensions: [purpose, state, status]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  context:
+    request:
+      topic: billing
+  llm:
+    mode: real
+
+scenarios:
+  - id: pre-response-route-commits-billing
+    name: Billing guard skips the greeting response before the provider call
+    tags: [live, examples, yaml, runtime, optimization, pre-response, state, real-llm]
+    language: en
+    budget:
+      max_llm_calls: 1
+      max_total_tokens: 6000
+      max_cost_usd: 0.02
+    turns:
+      - input: "I need help understanding a duplicate invoice charge."
+        assert:
+          all:
+            - response_not_empty: true
+            - state: billing
+            - state_history_contains: billing
+            - llm_request:
+                system_contains: "Help with billing"
+                user_contains: "duplicate invoice charge"
+                same_request: true
+                count: 1
+            - response_contains_any:
+                - "billing"
+                - "Billing"
+                - "invoice"
+                - "Invoice"
+                - "charge"
+                - "Charge"
+                - "payment"
+                - "Payment"
+            - response_not_contains:
+                - "what kind of support"
+                - "which support area"
+            - tool_not_called: command
+            - tool_not_called: http
+

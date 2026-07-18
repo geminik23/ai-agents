@@ -1,0 +1,100 @@
+name: Live Example - Runtime Optimization Buffered Streaming
+agent: ../../../../yaml/runtime-optimization/buffered_streaming.yaml
+
+# Live eval suite for hiding a speculative stale stream until routing commits.
+# Requires provider credentials and may incur provider cost.
+# Exact loser timing may be cancelled or discarded, so the suite accepts either terminal status.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- eval \
+#     --scenarios examples/eval/live/examples/runtime-optimization/buffered_streaming_live.yaml \
+#     --output target/eval/live/examples/runtime-optimization/buffered_streaming \
+#     --real-llm
+#
+# Flow: technical context -> buffered triage draft + parallel guard -> technical response only
+settings:
+  temperature: 0.0
+  seed: 1
+  timeout_per_turn_ms: 90000
+  timeout_per_scenario_ms: 120000
+  retries: 0
+  isolation: scenario
+
+# Override the example's report export so concurrent or repeated evals do not share a file.
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    pricing_file: ../../../../yaml/observability/pricing.yaml
+    unknown_price_policy: error
+  aggregation:
+    dimensions: [branch_status, runtime_optimization, commit_behavior, speculative]
+  export:
+    formats: [json]
+    write_report: false
+
+fixtures:
+  context:
+    request:
+      topic: technical
+  llm:
+    mode: real
+
+scenarios:
+  - id: buffered-stream-commits-technical-route
+    name: Buffered streaming exposes only the committed technical response
+    tags: [live, examples, yaml, runtime, optimization, branch, streaming, state, real-llm]
+    language: en
+    budget:
+      max_llm_calls: 2
+      max_total_tokens: 12000
+      max_cost_usd: 0.04
+    turns:
+      - input: "I cannot log in because the application shows error AUTH-17. Help me troubleshoot it."
+        stream: true
+        assert:
+          all:
+            - response_not_empty: true
+            - state: technical
+            - state_history_contains: technical
+            - response_contains_any:
+                - "AUTH-17"
+                - "error"
+                - "technical"
+                - "environment"
+                - "reproduction"
+                - "steps"
+            - response_not_contains:
+                - "which support area"
+                - "what support area"
+                - "billing or technical"
+            - observability:
+                dimension_counts:
+                  - match_dimensions:
+                      branch_status: committed
+                      optimization: parallel_state_transition
+                      commit_behavior: transition_decision
+                    assert:
+                      path: count
+                      gte: 1
+            - any:
+                - observability:
+                    dimension_counts:
+                      - match_dimensions:
+                          branch_status: cancelled
+                          optimization: buffered_streaming_routing
+                          commit_behavior: final_response
+                        assert:
+                          path: count
+                          gte: 1
+                - observability:
+                    dimension_counts:
+                      - match_dimensions:
+                          branch_status: discarded
+                          optimization: buffered_streaming_routing
+                          commit_behavior: final_response
+                        assert:
+                          path: count
+                          gte: 1
+            - tool_not_called: command
+            - tool_not_called: http

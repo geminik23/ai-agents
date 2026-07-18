@@ -15,11 +15,15 @@ scenarios:
     turns:
       - input: Review an exact edit for the sandbox file.
         assert:
-          response_contains: "Status: reviewed"
-          tool_called:
-            id: file_edit
-            executed: true
-            success: true
-            result_path:
-              path: dry_run
-              eq: true
+          all:
+            - response_contains: "Status: reviewed"
+            - tool_called:
+                id: file_edit
+                count: 1
+            - tool_called:
+                id: file_edit
+                executed: true
+                success: true
+                result_path:
+                  path: dry_run
+                  eq: true

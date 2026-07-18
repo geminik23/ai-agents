@@ -36,7 +36,9 @@ scenarios:
             - response_not_empty: true
             - tool_called:
                 id: file_write
-                count_gte: 1
+                count: 1
+            - tool_called:
+                id: file_write
                 executed: true
                 success: true
                 args_executed:

@@ -1998,6 +1998,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unfiltered_exact_tool_count_rejects_extra_nonmatching_calls() {
+        let mut evidence = evidence();
+        let first = &mut evidence.tool_executions[0];
+        first.tool_id = "file_write".to_string();
+        first.requested_name = "file_write".to_string();
+        first.executed = false;
+        first.success = false;
+        first.arguments_executed = json!({"dry_run":false});
+        first.output = Some(json!({"dry_run":false,"bytes_written":0}));
+
+        let mut second = first.clone();
+        second.call_id = "call-2".to_string();
+        second.executed = true;
+        second.success = true;
+        second.arguments_executed = json!({"dry_run":true});
+        second.output = Some(json!({"dry_run":true,"bytes_written":0}));
+        evidence.tool_executions.push(second);
+
+        let assertion = Assertion {
+            all: Some(vec![
+                Assertion {
+                    tool_called: Some(ToolCalledAssertion::Object(ToolCalledObject {
+                        id: Some("file_write".to_string()),
+                        count: Some(1),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                Assertion {
+                    tool_called: Some(ToolCalledAssertion::Object(ToolCalledObject {
+                        id: Some("file_write".to_string()),
+                        executed: Some(true),
+                        success: Some(true),
+                        args_executed: Some(PathAssertion {
+                            path: "dry_run".to_string(),
+                            eq: Some(json!(true)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+
+        let result = evaluate_assertion(
+            &assertion,
+            AssertionEvalContext {
+                evidence: &evidence,
+                response: "Dry run only",
+                user_input: None,
+                scenario_id: None,
+                language: None,
+                judge_resolver: None,
+            },
+        )
+        .await;
+
+        assert!(matches!(result, AssertionOutcome::Failed(_)));
+    }
+
+    #[tokio::test]
     async fn llm_request_matches_roles_within_one_request_without_serializing_content() {
         let mut evidence = evidence();
         evidence.llm_requests = vec![

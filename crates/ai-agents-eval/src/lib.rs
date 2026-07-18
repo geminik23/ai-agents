@@ -1,6 +1,7 @@
 //! Declarative evaluation runner for YAML-defined agents.
 
 pub mod assertion;
+mod budget;
 pub mod compatibility;
 pub mod evidence;
 pub mod fixtures;
@@ -20,7 +21,9 @@ pub use output::write_outputs;
 pub use redaction::RedactedString;
 pub use reset::{ResetOptions, ResetProfile};
 pub use runner::{EvalRunner, EvalRunnerOptions};
-pub use suite::{EvalResult, EvalSettings, EvalSuite, ScenarioResult, ScenarioStatus};
+pub use suite::{
+    EvalResult, EvalSettings, EvalSuite, ScenarioBudget, ScenarioResult, ScenarioStatus,
+};
 
 pub type Result<T> = std::result::Result<T, EvalError>;
 

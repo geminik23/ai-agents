@@ -16,11 +16,15 @@ scenarios:
     turns:
       - input: Validate a patch against the sandbox file.
         assert:
-          response_contains: "one file"
-          tool_called:
-            id: patch
-            executed: true
-            success: true
-            result_path:
-              path: dry_run
-              eq: true
+          all:
+            - response_contains: "one file"
+            - tool_called:
+                id: patch
+                count: 1
+            - tool_called:
+                id: patch
+                executed: true
+                success: true
+                result_path:
+                  path: dry_run
+                  eq: true

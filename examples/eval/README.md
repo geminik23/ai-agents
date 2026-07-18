@@ -222,7 +222,7 @@ Mocked HITL suites must also mock the LLM and approved tools. Real HTTP and real
 
 ## Live provider suites
 
-Live suites are opt-in release smoke checks for real-model tool and skill use, threshold-aware disambiguation, memory and cross-runtime session behavior, actor isolation, personas and relationships, public plan-and-execute outcomes, observability and recovery, exact state lifecycle routing, context use, and input/output processing. They require provider credentials, network access, and acceptance of provider cost and nondeterminism.
+Live suites are opt-in release smoke checks for real-model tool and skill use, threshold-aware disambiguation, memory and cross-runtime session behavior, actor isolation, personas and relationships, public plan-and-execute outcomes, observability and recovery, exact state lifecycle routing, selected runtime optimizations, one bounded orchestration pipeline, context use, and input/output processing. They require provider credentials, network access, and acceptance of provider cost and nondeterminism.
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
@@ -279,5 +279,20 @@ Use the same category folder names as `examples/yaml/`, such as `state-machine` 
 For persistence checks, use advanced `!run`, `!reset_agent`, `!set_actor`, and `!set_context` steps. Preserve attempt-local storage and rebuild or clear conversation state so prior messages cannot satisfy a fact-recall assertion.
 
 For object-form `tool_called`, every configured source, argument, result, and execution predicate matches one record. `count` and `count_gte` count those complete matches. Plan-and-execute tool steps use `source_in: [plan]`.
+
+For safety-sensitive tool contracts, use a separate unfiltered exact count in addition to filtered evidence. This rejects extra calls that do not satisfy the safe filter:
+
+```yaml
+assert:
+  all:
+    - tool_called: { id: file_write, count: 1 }
+    - tool_called:
+        id: file_write
+        executed: true
+        success: true
+        args_executed: { path: dry_run, eq: true }
+```
+
+Multi-call live scenarios should also declare a scenario `budget`; see the public evaluation guide for call, token, pricing, and retry semantics.
 
 See `examples/eval/live/README.md` for the live suite registry and risk tags.
