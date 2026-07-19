@@ -51,7 +51,7 @@ fixtures:
 
 Interpolation is JSON-safe and leaves unrelated template expressions unchanged. Referencing `mock_server.base_url` without enabling the mock server is a configuration error.
 
-Parent storage and `spawner.shared_storage` file, SQLite, or Redis backends are isolated per attempt. When a source agent has an existing path policy, `fixtures.workspace_policy` can narrowly add the attempt workspace to named policies without disabling other restrictions:
+Parent storage and `spawner.shared_storage` file, SQLite, or Redis backends are isolated per attempt. The runner removes its temporary attempt workspace after completion, failure, or cancellation. When a source agent has an existing path policy, `fixtures.workspace_policy` can narrowly add the attempt workspace to named policies without disabling other restrictions:
 
 ```yaml
 fixtures:

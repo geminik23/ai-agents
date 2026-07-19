@@ -21,7 +21,7 @@ context:
       email: "unknown"
       tier: "free"
 
-  # Callback context - Rust host provides this via register_context_provider()
+  # Callback context - Rust host registers the provider under the callback name below.
   # The framework calls the registered ContextProvider on every turn.
   # No default: only works when the Rust host registers a provider.
   # When running via CLI without a provider, this key will be absent,

@@ -55,12 +55,24 @@ struct WeatherTool;
 
 #[async_trait]
 impl Tool for WeatherTool {
-    fn id(&self) -> &str { "weather" }
-    fn name(&self) -> &str { "Weather" }
-    fn description(&self) -> &str { "Get current weather for a city." }
-    fn input_schema(&self) -> Value { generate_schema::<WeatherInput>() }
+    fn id(&self) -> &str {
+        "weather"
+    }
+    fn name(&self) -> &str {
+        "Weather"
+    }
+    fn description(&self) -> &str {
+        "Get current weather for a city."
+    }
+    fn input_schema(&self) -> Value {
+        generate_schema::<WeatherInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: WeatherInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -96,12 +108,24 @@ struct StockPriceTool;
 
 #[async_trait]
 impl Tool for StockPriceTool {
-    fn id(&self) -> &str { "stock_price" }
-    fn name(&self) -> &str { "Stock Price" }
-    fn description(&self) -> &str { "Get current stock price by ticker symbol." }
-    fn input_schema(&self) -> Value { generate_schema::<StockPriceInput>() }
+    fn id(&self) -> &str {
+        "stock_price"
+    }
+    fn name(&self) -> &str {
+        "Stock Price"
+    }
+    fn description(&self) -> &str {
+        "Get current stock price by ticker symbol."
+    }
+    fn input_schema(&self) -> Value {
+        generate_schema::<StockPriceInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: StockPriceInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -114,7 +138,11 @@ impl Tool for StockPriceTool {
             "MSFT" => (415.30, true),
             _ => (0.0, false),
         };
-        let output = StockPriceOutput { symbol, price_usd: price, found };
+        let output = StockPriceOutput {
+            symbol,
+            price_usd: price,
+            found,
+        };
         match serde_json::to_string(&output) {
             Ok(json) => ToolResult::ok(json),
             Err(e) => ToolResult::error(format!("Serialization error: {}", e)),
@@ -265,9 +293,7 @@ async fn main() -> ai_agents::Result<()> {
     // Build the agent. auto_configure_features() registers built-in tools (calculator, datetime, etc.).
     // extend_tools() merges the provider's discovered tools alongside built-ins - does NOT replace them.
     let agent = AgentBuilder::new()
-        .system_prompt(
-            "You are a helpful assistant with access to weather and stock market data.",
-        )
+        .system_prompt("You are a helpful assistant with access to weather and stock market data.")
         .llm(Arc::new(llm))
         .auto_configure_features()?
         .extend_tools(provider_registry)

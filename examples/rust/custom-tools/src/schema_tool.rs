@@ -6,8 +6,7 @@
 // Run: cd examples/rust/custom-tools && cargo run --bin schema-tool
 
 use ai_agents::{
-    AgentBuilder, ProviderType, Tool, ToolResult, UnifiedLLMProvider,
-    tools::generate_schema,
+    AgentBuilder, ProviderType, Tool, ToolResult, UnifiedLLMProvider, tools::generate_schema,
 };
 use ai_agents_cli::{CliRepl, init_tracing};
 use async_trait::async_trait;
@@ -48,9 +47,15 @@ impl Tool for UnitConverterTool {
          distance (km/miles), temperature (celsius/fahrenheit), weight (kg/lbs)."
     }
 
-    fn input_schema(&self) -> Value { generate_schema::<ConvertInput>() }
+    fn input_schema(&self) -> Value {
+        generate_schema::<ConvertInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: ConvertInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -70,7 +75,7 @@ impl Tool for UnitConverterTool {
                 return ToolResult::error(format!(
                     "Unknown conversion: {} -> {}. Supported: km/miles, celsius/fahrenheit, kg/lbs",
                     input.from, input.to
-                ))
+                ));
             }
         };
 

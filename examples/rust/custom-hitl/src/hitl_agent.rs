@@ -7,17 +7,15 @@
 
 mod tools;
 
-use ai_agents::{
-    AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result,
-};
+use ai_agents::{AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
 use async_trait::async_trait;
+use serde_json::json;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
-use serde_json::json;
 
-use tools::{SendPaymentTool, DeleteRecordTool};
+use tools::{DeleteRecordTool, SendPaymentTool};
 
 /// Interactive CLI handler with approve, reject, and modify support.
 struct CliApprovalHandler;

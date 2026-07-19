@@ -13,6 +13,7 @@
 - Live example evaluation: opt-in provider smoke suites cover skills, disambiguation, memory, sessions, personas, relationships, public reasoning outcomes, observability, and bounded recovery
 - Eval provider budgets: scenarios can enforce shared hard limits for LLM calls, tokens, and configured provider cost across aliases, resets, and retries
 - Bounded live workflows: provider smoke coverage includes pre-response routing, buffered streaming, and the fixed writer-reviewer-editor pipeline
+- Eval attempt cleanup: runner-owned temporary workspaces are removed after completion, failure, or cancellation
 
 ### Changed
 - Evaluation fixtures: mocked built-in tools preserve their schemas, safety classification, and policy behavior while replacing external execution
@@ -23,6 +24,7 @@
 - State lifecycle: first arrival at a transition target runs `on_enter`; later returns use `on_reenter`
 - Live web-search safety: fallback WebFetch remains no-socket and suggestion-only when the search provider is unavailable
 - Live mutation evidence: dry-run suites require one total mutation call and mandatory no-apply disclosure so an extra unsafe attempt cannot be masked
+- Rust context injection: callback providers register by the YAML callback name so per-turn values are rendered into the request
 
 ## 1.0.0-rc.16
 

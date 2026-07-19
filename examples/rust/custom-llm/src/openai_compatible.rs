@@ -10,8 +10,8 @@
 //! Run: cargo run --bin openai-compatible
 
 use ai_agents::llm::{
-    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
-    LLMResponse, Role, TokenUsage,
+    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    Role, TokenUsage,
 };
 use ai_agents::{AgentBuilder, Result};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
@@ -88,7 +88,11 @@ struct OpenAICompatibleProvider {
 }
 
 impl OpenAICompatibleProvider {
-    fn new(base_url: impl Into<String>, model: impl Into<String>, api_key: impl Into<String>) -> Self {
+    fn new(
+        base_url: impl Into<String>,
+        model: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             base_url: base_url.into(),
@@ -99,7 +103,8 @@ impl OpenAICompatibleProvider {
 
     fn from_env() -> Self {
         Self::new(
-            std::env::var("LOCAL_LLM_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
+            std::env::var("LOCAL_LLM_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
             std::env::var("LOCAL_LLM_MODEL").unwrap_or_else(|_| "qwen3:8b".to_string()),
             std::env::var("LOCAL_LLM_API_KEY").unwrap_or_else(|_| "not-needed".to_string()),
         )
@@ -245,9 +250,10 @@ impl LLMProvider for OpenAICompatibleProvider {
                 let chunk = match chunk {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        return std::future::ready(Some(vec![Err(LLMError::Network(
-                            format!("Stream read error: {}", e),
-                        ))]));
+                        return std::future::ready(Some(vec![Err(LLMError::Network(format!(
+                            "Stream read error: {}",
+                            e
+                        )))]));
                     }
                 };
 
@@ -265,11 +271,7 @@ impl LLMProvider for OpenAICompatibleProvider {
 
                     if let Some(data) = line.strip_prefix("data: ") {
                         if data == "[DONE]" {
-                            results.push(Ok(LLMChunk::final_chunk(
-                                "",
-                                FinishReason::Stop,
-                                None,
-                            )));
+                            results.push(Ok(LLMChunk::final_chunk("", FinishReason::Stop, None)));
                             continue;
                         }
 
@@ -279,8 +281,10 @@ impl LLMProvider for OpenAICompatibleProvider {
                                     if let Some(ref delta) = choice.delta {
                                         if let Some(ref content) = delta.content {
                                             if !content.is_empty() {
-                                                results
-                                                    .push(Ok(LLMChunk::new(content.clone(), false)));
+                                                results.push(Ok(LLMChunk::new(
+                                                    content.clone(),
+                                                    false,
+                                                )));
                                             }
                                         }
                                     }
@@ -312,8 +316,10 @@ async fn main() -> Result<()> {
     init_tracing();
 
     let provider = OpenAICompatibleProvider::from_env();
-    println!("Connecting to: {} (model: {})",
-        std::env::var("LOCAL_LLM_BASE_URL").unwrap_or_else(|_| "http://localhost:1234/v1".to_string()),
+    println!(
+        "Connecting to: {} (model: {})",
+        std::env::var("LOCAL_LLM_BASE_URL")
+            .unwrap_or_else(|_| "http://localhost:1234/v1".to_string()),
         std::env::var("LOCAL_LLM_MODEL").unwrap_or_else(|_| "local-model".to_string()),
     );
 

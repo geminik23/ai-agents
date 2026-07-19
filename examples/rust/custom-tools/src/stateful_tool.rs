@@ -15,8 +15,8 @@
 //
 // Run: cd examples/rust/custom-tools && cargo run --bin stateful-tool
 
-use ai_agents::{AgentBuilder, ProviderType, Tool, ToolResult, UnifiedLLMProvider};
 use ai_agents::tools::generate_schema;
+use ai_agents::{AgentBuilder, ProviderType, Tool, ToolResult, UnifiedLLMProvider};
 use ai_agents_cli::{CliRepl, init_tracing};
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -78,16 +78,26 @@ impl NoteTool {
 
 #[async_trait]
 impl Tool for NoteTool {
-    fn id(&self) -> &str { "notes" }
-    fn name(&self) -> &str { "Notes" }
+    fn id(&self) -> &str {
+        "notes"
+    }
+    fn name(&self) -> &str {
+        "Notes"
+    }
     fn description(&self) -> &str {
         "Store and retrieve personal notes. \
          Operations: add (save a note), get (retrieve by title), \
          list (show all titles), get_all (show all notes), delete (remove a note)."
     }
-    fn input_schema(&self) -> Value { generate_schema::<NoteInput>() }
+    fn input_schema(&self) -> Value {
+        generate_schema::<NoteInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: NoteInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),

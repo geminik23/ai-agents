@@ -10,8 +10,5 @@ async fn main() -> Result<()> {
         .auto_configure_features()?
         .build()?;
 
-    CliRepl::new(agent)
-        .show_state()
-        .run()
-        .await
+    CliRepl::new(agent).show_state().run().await
 }

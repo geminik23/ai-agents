@@ -7,11 +7,11 @@
 // Run: cd examples/rust/custom-tools && cargo run --bin context-tool
 
 use ai_agents::tools::{
-    generate_schema, ResultLimitBinding, ResultLimitKind, ToolCallClassification,
-    ToolExecutionContext, ToolOperationKind, ToolPolicyBindings, ToolSafetyMetadata, ToolResult,
+    ResultLimitBinding, ResultLimitKind, ToolCallClassification, ToolExecutionContext,
+    ToolOperationKind, ToolPolicyBindings, ToolResult, ToolSafetyMetadata, generate_schema,
 };
 use ai_agents::{AgentBuilder, Result, Tool};
-use ai_agents_cli::{init_tracing, CliRepl};
+use ai_agents_cli::{CliRepl, init_tracing};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

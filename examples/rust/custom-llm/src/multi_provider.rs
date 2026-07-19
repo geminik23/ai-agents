@@ -8,15 +8,15 @@
 //! Run: cargo run --bin multi-provider
 
 use ai_agents::llm::{
-    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
-    LLMResponse, MultiLLMRouter, TokenUsage,
+    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    MultiLLMRouter, TokenUsage,
 };
 use ai_agents::{AgentBuilder, LLMRegistry, ProviderType, Result, UnifiedLLMProvider};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
 
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A cheap, fast provider for internal routing tasks.
 ///
@@ -48,10 +48,7 @@ impl LLMProvider for CheapRouterProvider {
     ) -> std::result::Result<LLMResponse, LLMError> {
         self.call_count.fetch_add(1, Ordering::Relaxed);
 
-        let last_msg = messages
-            .last()
-            .map(|m| m.content.as_str())
-            .unwrap_or("");
+        let last_msg = messages.last().map(|m| m.content.as_str()).unwrap_or("");
 
         // The framework sends structured prompts for internal tasks.
         // This cheap provider returns minimal valid responses.
@@ -83,11 +80,7 @@ impl LLMProvider for CheapRouterProvider {
     > {
         // Router tasks don't need streaming — fall back to single-chunk response
         let response = self.complete(messages, config).await?;
-        let chunk = LLMChunk::final_chunk(
-            response.content,
-            response.finish_reason,
-            response.usage,
-        );
+        let chunk = LLMChunk::final_chunk(response.content, response.finish_reason, response.usage);
         Ok(Box::new(futures::stream::iter(vec![Ok(chunk)])))
     }
 

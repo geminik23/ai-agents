@@ -15,8 +15,7 @@
 // Run: cd examples/rust/custom-tools && cargo run --bin simple-tool
 
 use ai_agents::{
-    AgentBuilder, ProviderType, Tool, ToolResult, UnifiedLLMProvider,
-    tools::generate_schema,
+    AgentBuilder, ProviderType, Tool, ToolResult, UnifiedLLMProvider, tools::generate_schema,
 };
 use ai_agents_cli::{CliRepl, init_tracing};
 use async_trait::async_trait;
@@ -41,8 +40,12 @@ struct WordCountTool;
 
 #[async_trait]
 impl Tool for WordCountTool {
-    fn id(&self) -> &str { "word_count" }
-    fn name(&self) -> &str { "Word Counter" }
+    fn id(&self) -> &str {
+        "word_count"
+    }
+    fn name(&self) -> &str {
+        "Word Counter"
+    }
 
     // A clear description is the single most important factor for reliable
     // tool selection - it tells the LLM when and why to call this tool.
@@ -50,9 +53,15 @@ impl Tool for WordCountTool {
         "Count the number of words in a text string."
     }
 
-    fn input_schema(&self) -> Value { generate_schema::<WordCountInput>() }
+    fn input_schema(&self) -> Value {
+        generate_schema::<WordCountInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: WordCountInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),

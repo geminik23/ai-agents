@@ -1,10 +1,10 @@
 use ai_agents::{AgentBuilder, ContextProvider, Result};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
     Arc,
+    atomic::{AtomicU32, Ordering},
 };
 
 // This implements the `type: callback` context source declared in the YAML.
@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
     //    The framework calls provider.get() on every turn, so the system prompt
     //    always shows up-to-date usage statistics.
     let usage_provider = Arc::new(UsageStatsProvider::new());
-    agent.register_context_provider("usage_stats", usage_provider);
+    agent.register_context_provider("get_usage_stats", usage_provider);
 
     // 4. Run the interactive REPL.
     //    Context is now fully injected — the agent knows the user's name,

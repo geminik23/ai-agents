@@ -10,15 +10,13 @@
 
 mod tools;
 
-use ai_agents::{
-    AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result,
-};
+use ai_agents::{AgentBuilder, ApprovalHandler, ApprovalRequest, ApprovalResult, Result};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};
 use async_trait::async_trait;
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use tools::{SendPaymentTool, DeleteRecordTool};
+use tools::{DeleteRecordTool, SendPaymentTool};
 
 /// Minimal approval handler -- y/N only, no modify.
 struct YesNoHandler;

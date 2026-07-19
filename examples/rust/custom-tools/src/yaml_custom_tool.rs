@@ -19,8 +19,8 @@
 //
 // Run: cd examples/rust/custom-tools && cargo run --bin yaml-custom-tool
 
-use ai_agents::{AgentBuilder, Tool, ToolResult, Result};
 use ai_agents::tools::generate_schema;
+use ai_agents::{AgentBuilder, Result, Tool, ToolResult};
 use ai_agents_cli::{CliRepl, init_tracing};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -55,7 +55,11 @@ impl Tool for OrderLookupTool {
         generate_schema::<OrderLookupInput>()
     }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: OrderLookupInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -115,8 +119,5 @@ async fn main() -> Result<()> {
         .build()?;
 
     // CliRepl picks up welcome/hints/show_tools from the YAML metadata.cli block, so we only need .show_tool_calls() here for runtime tool-call display.
-    CliRepl::new(agent)
-        .show_tool_calls()
-        .run()
-        .await
+    CliRepl::new(agent).show_tool_calls().run().await
 }

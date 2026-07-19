@@ -1,6 +1,6 @@
 use ai_agents::llm::{
-    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
-    LLMResponse, TokenUsage,
+    ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    TokenUsage,
 };
 use ai_agents::{AgentBuilder, Result};
 use ai_agents_cli::{CliRepl as Repl, init_tracing};

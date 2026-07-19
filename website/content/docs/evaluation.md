@@ -436,6 +436,8 @@ fixtures:
 
 The overlay adds only the generated workspace to the listed existing policies. It does not disable fail-closed behavior, blocked paths, confirmation, or unrelated policy rules.
 
+The runner owns the temporary attempt workspace and removes it after completion, failure, or cancellation.
+
 Use `web_fetch_transport` to execute the real `web_fetch` implementation through exact-URL in-memory routes without opening a socket:
 
 ```yaml

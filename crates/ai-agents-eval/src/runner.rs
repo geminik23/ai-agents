@@ -22,9 +22,9 @@ use crate::evidence::{
     ApprovalEvidence, LlmRequestEvidence, collect_turn_evidence, relationship_snapshot,
 };
 use crate::fixtures::{
-    AttemptFixtureContext, LlmFixtureMode, RecordingToolLog, WorkspacePolicyFixtureConfig,
-    build_approval_handler, build_llm_registry, build_tool_registry, resolve_fixture_context,
-    start_mock_server,
+    AttemptFixtureContext, AttemptWorkspace, LlmFixtureMode, RecordingToolLog,
+    WorkspacePolicyFixtureConfig, build_approval_handler, build_llm_registry, build_tool_registry,
+    resolve_fixture_context, start_mock_server,
 };
 use crate::judge::{JudgeConfig, JudgeResolver};
 use crate::metrics::compute_metrics;
@@ -477,7 +477,7 @@ impl EvalRunner {
         let start = Instant::now();
         let _env_guard = EnvGuard::apply(&scenario.env)?;
         let mock_server = start_mock_server(self.suite.fixtures.mock_server.as_ref()).await?;
-        let attempt_context = AttemptFixtureContext::create(mock_server.as_ref())?;
+        let attempt_context = AttemptWorkspace::create(mock_server.as_ref())?;
         let tool_log = RecordingToolLog::new();
         let approval_log = RecordingApprovalLog::default();
         let llm_log = RecordingLlmLog::default();

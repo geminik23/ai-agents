@@ -487,6 +487,41 @@ pub struct AttemptFixtureContext {
     pub mock_server_base_url: Option<String>,
 }
 
+/// Runner-owned attempt context that removes its temporary workspace on drop.
+pub(crate) struct AttemptWorkspace {
+    context: AttemptFixtureContext,
+}
+
+impl AttemptWorkspace {
+    pub(crate) fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
+        Ok(Self {
+            context: AttemptFixtureContext::create(mock_server)?,
+        })
+    }
+}
+
+impl std::ops::Deref for AttemptWorkspace {
+    type Target = AttemptFixtureContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl Drop for AttemptWorkspace {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.context.workspace)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                workspace = %self.context.workspace.display(),
+                error = %error,
+                "failed to clean eval attempt workspace"
+            );
+        }
+    }
+}
+
 impl AttemptFixtureContext {
     pub fn create(mock_server: Option<&MockServerHandle>) -> Result<Self> {
         let isolation_id = uuid::Uuid::new_v4().to_string();
@@ -2090,6 +2125,46 @@ workspace_policy:
             first.runtime_context()["eval"]["workspace"],
             json!(first.workspace.display().to_string())
         );
+
+        std::fs::remove_dir_all(&first.workspace).unwrap();
+        std::fs::remove_dir_all(&second.workspace).unwrap();
+    }
+
+    #[test]
+    fn owned_attempt_workspace_cleans_up_after_drop_and_early_error() {
+        let workspace = AttemptWorkspace::create(None).unwrap();
+        let success_path = workspace.workspace.clone();
+        std::fs::write(success_path.join("artifact.txt"), "temporary").unwrap();
+        drop(workspace);
+        assert!(!success_path.exists());
+
+        let captured = Arc::new(Mutex::new(None));
+        let result: Result<()> = (|| {
+            let workspace = AttemptWorkspace::create(None)?;
+            *captured.lock() = Some(workspace.workspace.clone());
+            Err(EvalError::Config("intentional early error".to_string()))
+        })();
+        assert!(result.is_err());
+        assert!(!captured.lock().as_ref().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn owned_attempt_workspace_cleans_up_when_future_is_cancelled() {
+        let captured = Arc::new(Mutex::new(None));
+        let future_captured = captured.clone();
+        let pending = async move {
+            let workspace = AttemptWorkspace::create(None).unwrap();
+            *future_captured.lock() = Some(workspace.workspace.clone());
+            std::future::pending::<()>().await;
+            drop(workspace);
+        };
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), pending)
+                .await
+                .is_err()
+        );
+        assert!(!captured.lock().as_ref().unwrap().exists());
     }
 
     #[test]

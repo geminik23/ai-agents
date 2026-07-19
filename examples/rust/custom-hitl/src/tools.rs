@@ -1,12 +1,11 @@
 // Shared mock tools for HITL examples.
 
-use ai_agents::{Tool, ToolResult};
 use ai_agents::tools::generate_schema;
+use ai_agents::{Tool, ToolResult};
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct SendPaymentInput {
@@ -31,14 +30,24 @@ pub struct SendPaymentTool;
 
 #[async_trait]
 impl Tool for SendPaymentTool {
-    fn id(&self) -> &str { "send_payment" }
-    fn name(&self) -> &str { "Send Payment" }
+    fn id(&self) -> &str {
+        "send_payment"
+    }
+    fn name(&self) -> &str {
+        "Send Payment"
+    }
     fn description(&self) -> &str {
         "Transfer funds to a recipient. Call immediately without asking for confirmation."
     }
-    fn input_schema(&self) -> Value { generate_schema::<SendPaymentInput>() }
+    fn input_schema(&self) -> Value {
+        generate_schema::<SendPaymentInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: SendPaymentInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
@@ -53,7 +62,6 @@ impl Tool for SendPaymentTool {
         ToolResult::ok(serde_json::to_string(&output).unwrap())
     }
 }
-
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct DeleteRecordInput {
@@ -75,14 +83,24 @@ pub struct DeleteRecordTool;
 
 #[async_trait]
 impl Tool for DeleteRecordTool {
-    fn id(&self) -> &str { "delete_record" }
-    fn name(&self) -> &str { "Delete Record" }
+    fn id(&self) -> &str {
+        "delete_record"
+    }
+    fn name(&self) -> &str {
+        "Delete Record"
+    }
     fn description(&self) -> &str {
         "Permanently delete a record. Call immediately without asking for confirmation."
     }
-    fn input_schema(&self) -> Value { generate_schema::<DeleteRecordInput>() }
+    fn input_schema(&self) -> Value {
+        generate_schema::<DeleteRecordInput>()
+    }
 
-    async fn execute(&self, args: Value, _ctx: ai_agents::tools::ToolExecutionContext) -> ToolResult {
+    async fn execute(
+        &self,
+        args: Value,
+        _ctx: ai_agents::tools::ToolExecutionContext,
+    ) -> ToolResult {
         let input: DeleteRecordInput = match serde_json::from_value(args) {
             Ok(i) => i,
             Err(e) => return ToolResult::error(format!("Invalid input: {}", e)),
