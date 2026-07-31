@@ -52,8 +52,13 @@ scenarios:
             - tool_called:
                 id: copy_path
                 result_path:
+                  path: mutation_performed
+                  eq: false
+            - tool_called:
+                id: copy_path
+                result_path:
                   path: copied
-                  eq: true
+                  eq: false
             - response_contains_any:
                 - "dry-run"
                 - "dry run"

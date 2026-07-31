@@ -5,7 +5,7 @@ description: "Delete a file or directory with dry-run review, recursive-delete g
 # Delete path review example.
 #
 # Use this when the agent should delete files with a review step before applying.
-# Dry-run is the default so the model previews the operation without touching the filesystem.
+# Request dry_run explicitly so the model previews the operation without touching the filesystem.
 # Directories require recursive true.
 # The tool is marked destructive in safety metadata, so approval is required by default for non-dry-run calls.
 # The framework auto-injects tool schemas into the prompt,
@@ -27,9 +27,7 @@ llm:
   provider: openai
   model: gpt-5.4-mini
 
-# file_read provides target context. delete_path performs the deletion with
-# dry-run defaults and recursive-delete gating. todo tracks multi-step cleanup
-# workflows.
+# file_read provides target context. delete_path performs the deletion, dry_run true requests a preview, and todo tracks multi-step cleanup workflows.
 tools:
   - file_read
   - delete_path

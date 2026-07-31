@@ -19,7 +19,7 @@ pub enum BuiltinSource {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
 pub enum ContextSource {
     Runtime {
         #[serde(default)]
@@ -194,5 +194,15 @@ refresh: per_session
         } else {
             panic!("Expected Callback source");
         }
+    }
+
+    #[test]
+    fn test_context_source_rejects_variant_field_typo() {
+        let yaml = r#"
+type: http
+url: "https://api.example.com"
+timeout_mz: 5000
+"#;
+        assert!(serde_yaml::from_str::<ContextSource>(yaml).is_err());
     }
 }

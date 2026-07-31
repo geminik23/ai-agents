@@ -68,3 +68,19 @@ pub fn suite_from_jsonl(name: String, content: &str) -> Result<EvalSuite> {
         scenarios,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jsonl_rows_ignore_unknown_compatibility_fields() {
+        let suite = suite_from_jsonl(
+            "compatibility".to_string(),
+            r#"{"id":"row","input":"hello","future_field":{"version":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(suite.scenarios.len(), 1);
+        assert_eq!(suite.scenarios[0].id, "row");
+    }
+}

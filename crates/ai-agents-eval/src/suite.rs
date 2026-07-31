@@ -15,6 +15,7 @@ use crate::{EvalError, Result};
 
 /// Top-level evaluation suite loaded from YAML or JSONL.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalSuite {
     /// Human-readable name or criterion name.
     pub name: String,
@@ -47,6 +48,12 @@ impl EvalSuite {
                 "agent path is required in suite or CLI".into(),
             ));
         }
+        if self.scenarios.is_empty() {
+            return Err(EvalError::Config(
+                "eval suite must contain at least one scenario".into(),
+            ));
+        }
+        self.fixtures.validate()?;
         if self.settings.max_concurrent == 0 {
             return Err(EvalError::Config(
                 "settings.max_concurrent must be greater than zero".into(),
@@ -125,6 +132,20 @@ impl EvalSuite {
                 )));
             }
             scenario.budget.validate(&scenario.id)?;
+            for (turn_index, turn) in scenario.turns.iter().enumerate() {
+                validate_turn_assertion(turn, &scenario.id, &format!("turns[{turn_index}]"))?;
+            }
+            for (step_index, step) in scenario.steps.iter().enumerate() {
+                if let ScenarioStep::Run(run) = step {
+                    for (turn_index, turn) in run.turns.iter().enumerate() {
+                        validate_turn_assertion(
+                            turn,
+                            &scenario.id,
+                            &format!("steps[{step_index}].run.turns[{turn_index}]"),
+                        )?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -132,6 +153,7 @@ impl EvalSuite {
 
 /// Execution policy for an evaluation suite.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EvalSettings {
     /// Optional temperature override for eval LLMs.
     #[serde(default)]
@@ -199,6 +221,7 @@ pub enum IsolationMode {
 
 /// One test case inside an evaluation suite.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Scenario {
     /// Stable identifier for this item.
     pub id: String,
@@ -236,6 +259,7 @@ pub struct Scenario {
 
 /// Hard provider-usage limits for one scenario, shared across retries and resets.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ScenarioBudget {
     /// Maximum provider calls that may start for this scenario.
     #[serde(default)]
@@ -246,6 +270,13 @@ pub struct ScenarioBudget {
     /// Maximum estimated provider cost in US dollars.
     #[serde(default)]
     pub max_cost_usd: Option<f64>,
+}
+
+fn validate_turn_assertion(turn: &Turn, scenario_id: &str, location: &str) -> Result<()> {
+    if let Some(assertion) = &turn.assertions {
+        assertion.validate(&format!("scenario '{scenario_id}' {location}.assert"))?;
+    }
+    Ok(())
 }
 
 impl ScenarioBudget {
@@ -297,6 +328,7 @@ pub struct Turn {
 const EXPECT_ERROR_CONTEXT_KEY: &str = "__ai_agents_eval_expect_error";
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TurnDefinition {
     input: String,
     #[serde(default)]
@@ -414,7 +446,7 @@ impl SkipConfig {
 
 /// Advanced scenario action used outside direct turn lists.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ScenarioStep {
     Run(RunStep),
     ResetAgent(ResetStepConfig),
@@ -427,6 +459,7 @@ pub enum ScenarioStep {
 
 /// Advanced step that runs turns and can save a session.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunStep {
     /// Turns executed by this scenario or step.
     #[serde(default)]
@@ -632,11 +665,210 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_empty_suite() {
+        let mut suite = suite();
+        suite.scenarios.clear();
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("at least one scenario"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_deferred_mock_routes() {
+        let mut suite = suite();
+        suite.fixtures.mock_server = Some(crate::fixtures::MockServerConfig {
+            enabled: true,
+            port: None,
+            routes: vec![serde_json::json!({
+                "method": "GET",
+                "path": "/ok",
+                "statuz": 200
+            })],
+        });
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("fixtures.mock_server.routes[0]"));
+        assert!(error.contains("statuz"));
+    }
+
+    #[test]
     fn validation_rejects_duplicate_ids() {
         let mut suite = suite();
         suite.scenarios.push(suite.scenarios[0].clone());
         let error = suite.validate(None).unwrap_err().to_string();
         assert!(error.contains("duplicate scenario id"));
+    }
+
+    #[test]
+    fn yaml_rejects_unknown_suite_and_assertion_fields() {
+        let suite_error = serde_yaml::from_str::<EvalSuite>(
+            "name: strict\nagent: agent.yaml\nunknown_setting: true\nscenarios: []\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(suite_error.contains("unknown field `unknown_setting`"));
+
+        let assertion_error = serde_yaml::from_str::<EvalSuite>(
+            r#"
+name: strict
+agent: agent.yaml
+scenarios:
+  - id: strict
+    turns:
+      - input: hello
+        assert:
+          response_contians: hello
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(assertion_error.contains("response_contians"));
+    }
+
+    #[test]
+    fn validation_rejects_empty_assertion_trees() {
+        let mut suite = suite();
+        suite.scenarios[0].turns[0].assertions = Some(Assertion::default());
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("assert must not be empty"));
+
+        suite.scenarios[0].turns[0].assertions = Some(Assertion {
+            all: Some(Vec::new()),
+            ..Default::default()
+        });
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("assert.all must contain at least one assertion"));
+
+        suite.scenarios[0].turns[0].assertions = Some(Assertion {
+            any: Some(vec![Assertion {
+                all: Some(vec![Assertion::default()]),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let error = suite.validate(None).unwrap_err().to_string();
+        assert!(error.contains("assert.any[0].all[0] must not be empty"));
+    }
+
+    #[test]
+    fn validation_rejects_empty_nested_assertion_collections() {
+        use crate::assertion::{
+            ApprovalAssertion, ApprovalAssertionObject, LlmRequestAssertion,
+            OrchestrationAssertion, PathAssertion, StringList, ToolCalledAssertion,
+            ToolCalledObject,
+        };
+        use crate::judge::JudgeAssertion;
+
+        let cases = [
+            (
+                Assertion {
+                    response_contains: Some(StringList::Many(Vec::new())),
+                    ..Default::default()
+                },
+                "response_contains",
+            ),
+            (
+                Assertion {
+                    state_in: Some(Vec::new()),
+                    ..Default::default()
+                },
+                "state_in",
+            ),
+            (
+                Assertion {
+                    llm_request: Some(LlmRequestAssertion {
+                        system_contains: Some(StringList::Many(Vec::new())),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "llm_request.system_contains",
+            ),
+            (
+                Assertion {
+                    approval_requested: Some(ApprovalAssertion::Object(ApprovalAssertionObject {
+                        message_contains: Some(StringList::Many(Vec::new())),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                "approval_requested.message_contains",
+            ),
+            (
+                Assertion {
+                    tool_called: Some(ToolCalledAssertion::Object(ToolCalledObject {
+                        source_in: Some(Vec::new()),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+                "tool_called.source_in",
+            ),
+            (
+                Assertion {
+                    metadata_path: Some(PathAssertion {
+                        path: "value".to_string(),
+                        in_values: Some(Vec::new()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "metadata_path.in",
+            ),
+            (
+                Assertion {
+                    orchestration: Some(OrchestrationAssertion {
+                        agents_include: Some(Vec::new()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                "orchestration.agents_include",
+            ),
+            (
+                Assertion {
+                    metadata_contains: Some(HashMap::new()),
+                    ..Default::default()
+                },
+                "metadata_contains",
+            ),
+            (
+                Assertion {
+                    judge: Some(JudgeAssertion {
+                        llm: None,
+                        pass_threshold: 0.75,
+                        criteria: Vec::new(),
+                    }),
+                    ..Default::default()
+                },
+                "judge.criteria",
+            ),
+        ];
+
+        for (assertion, expected) in cases {
+            let mut suite = suite();
+            suite.scenarios[0].turns[0].assertions = Some(assertion);
+            let error = suite.validate(None).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn yaml_rejects_explicit_empty_observability_collections() {
+        let error = serde_yaml::from_str::<EvalSuite>(
+            r#"
+name: strict
+agent: agent.yaml
+scenarios:
+  - id: strict
+    turns:
+      - input: hello
+        assert:
+          observability:
+            dimension_counts: []
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("assertion collection must contain at least one value"));
     }
 
     #[test]

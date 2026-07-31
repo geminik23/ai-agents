@@ -14,6 +14,7 @@
 - Eval provider budgets: scenarios can enforce shared hard limits for LLM calls, tokens, and configured provider cost across aliases, resets, and retries
 - Bounded live workflows: provider smoke coverage includes pre-response routing, buffered streaming, and the fixed writer-reviewer-editor pipeline
 - Eval attempt cleanup: runner-owned temporary workspaces are removed after completion, failure, or cancellation
+- Mutation evidence: filesystem mutation results expose `mutation_performed`, while past-tense effect fields are true only when the operation changed the filesystem
 
 ### Changed
 - Evaluation fixtures: mocked built-in tools preserve their schemas, safety classification, and policy behavior while replacing external execution
@@ -25,6 +26,10 @@
 - Live web-search safety: fallback WebFetch remains no-socket and suggestion-only when the search provider is unavailable
 - Live mutation evidence: dry-run suites require one total mutation call and mandatory no-apply disclosure so an extra unsafe attempt cannot be masked
 - Rust context injection: callback providers register by the YAML callback name so per-turn values are rendered into the request
+- YAML validation: fixed framework-owned agent and eval objects reject unknown fields while documented provider and compatibility extension data remains supported
+- Evaluation safety: empty assertions and zero selections fail, numeric bounds require numbers, replay misses error, and real or record modes require explicit CLI authorization
+- Mutation defaults: filesystem mutation tools execute when `dry_run` is omitted; callers request review-only behavior explicitly with `dry_run: true`
+- Compacting memory: recent-message retention is enforced with deterministic batch-progress clamping, serialized mutations, and snapshot-preserved summary accounting
 
 ## 1.0.0-rc.16
 
@@ -54,6 +59,11 @@
 - Spawned execution: parent and child runtimes share safety locks for cross-tool serialization
 - HITL modifications: changed tool arguments are rechecked against security policy before execution
 - Repository safety: raw Git metadata paths are blocked while bounded repository tools remain available
+- Tool admission: approved calls are re-prepared and revalidated against current identity, scope, policy, availability, control generation, and resource locks before atomic rate admission
+- Tool fallback: primary resource locks are released before fallback re-enters the shared authorization and execution path
+- Resource locking: path mutations and unbound side effects use conservative shared locks with deterministic acquisition, cancellation cleanup, spawned-runtime sharing, and hook-safe release
+- Patch transactions: pre-apply conflicts and rollback conflicts preserve external changes instead of silently overwriting them
+- Eval recording: cassette destinations are preflighted before provider calls and shared writers serialize JSONL records across aliases
 - Speculative scheduling: deterministic routes preserve low budgets and exhausted reservations fall back to the serial path
 
 ## 1.0.0-rc.15

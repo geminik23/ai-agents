@@ -136,6 +136,10 @@ pub struct EvalArgs {
     #[arg(long, action = ArgAction::SetTrue)]
     pub observability: bool,
 
+    /// Validate the suite and referenced agent without executing scenarios or providers
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub dry_config_check: bool,
+
     /// Record real LLM responses to a cassette JSONL file
     #[arg(long, value_name = "FILE")]
     pub record: Option<PathBuf>,

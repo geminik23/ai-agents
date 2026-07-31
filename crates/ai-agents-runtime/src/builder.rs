@@ -219,7 +219,7 @@ impl AgentBuilder {
     }
 
     pub fn from_yaml(yaml_content: &str) -> Result<Self> {
-        let spec: AgentSpec = serde_yaml::from_str(yaml_content)?;
+        let spec = AgentSpec::from_yaml_strict(yaml_content)?;
         spec.validate()?;
         Ok(Self::from_spec(spec))
     }
@@ -238,7 +238,7 @@ impl AgentBuilder {
     pub fn from_yaml_file(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(AgentError::IoError)?;
-        let spec: AgentSpec = serde_yaml::from_str(&content)?;
+        let spec = AgentSpec::from_yaml_strict(&content)?;
         spec.validate()?;
         Ok(match path.parent() {
             Some(parent) => Self::from_spec_with_base_dir(spec, parent),
@@ -262,7 +262,7 @@ impl AgentBuilder {
 
         let rendered_root = load_and_render(template_name)?;
         let processed = TemplateInheritance::process(&rendered_root, load_and_render)?;
-        let spec: AgentSpec = serde_yaml::from_str(&processed)?;
+        let spec = AgentSpec::from_yaml_strict(&processed)?;
         spec.validate()?;
         Ok(Self::from_spec(spec))
     }
@@ -926,38 +926,36 @@ impl AgentBuilder {
                         .auto_configure_llms()
                         .and_then(|b| b.auto_configure_features())
                     {
-                        Ok(configured) => match configured.build() {
-                            Ok(agent) => {
-                                let spec_yaml =
-                                    std::fs::read_to_string(&yaml_path).unwrap_or_default();
-                                let spec: crate::spec::AgentSpec =
-                                    serde_yaml::from_str(&spec_yaml).unwrap_or_default();
+                        Ok(configured) => {
+                            let spec = configured.spec.clone().unwrap_or_default();
+                            match configured.build() {
+                                Ok(agent) => {
+                                    let spawned = crate::spawner::spawner::SpawnedAgent {
+                                        id: entry.id.clone(),
+                                        agent: Arc::new(agent),
+                                        spec,
+                                        spawned_at: chrono::Utc::now(),
+                                    };
 
-                                let spawned = crate::spawner::spawner::SpawnedAgent {
-                                    id: entry.id.clone(),
-                                    agent: Arc::new(agent),
-                                    spec,
-                                    spawned_at: chrono::Utc::now(),
-                                };
-
-                                if let Err(e) = registry.register(spawned).await {
+                                    if let Err(e) = registry.register(spawned).await {
+                                        tracing::warn!(
+                                            id = %entry.id,
+                                            error = %e,
+                                            "Failed to register auto-spawned agent"
+                                        );
+                                    } else {
+                                        tracing::info!(id = %entry.id, "Auto-spawned agent registered");
+                                    }
+                                }
+                                Err(e) => {
                                     tracing::warn!(
                                         id = %entry.id,
                                         error = %e,
-                                        "Failed to register auto-spawned agent"
+                                        "Failed to build auto-spawn agent"
                                     );
-                                } else {
-                                    tracing::info!(id = %entry.id, "Auto-spawned agent registered");
                                 }
                             }
-                            Err(e) => {
-                                tracing::warn!(
-                                    id = %entry.id,
-                                    error = %e,
-                                    "Failed to build auto-spawn agent"
-                                );
-                            }
-                        },
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 id = %entry.id,
@@ -1571,6 +1569,25 @@ llm:
         let builder = AgentBuilder::from_yaml(yaml).unwrap();
         assert!(builder.spec.is_some());
         assert_eq!(builder.spec.as_ref().unwrap().name, "TestAgent");
+    }
+
+    #[test]
+    fn test_builder_from_yaml_rejects_nested_unknown_path() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: test
+runtime:
+  optimization:
+    max_parallel_runtime_task: 4
+"#;
+        let error = match AgentBuilder::from_yaml(yaml) {
+            Ok(_) => panic!("expected strict parse failure"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains("runtime.optimization.max_parallel_runtime_task"),
+            "{error}"
+        );
     }
 
     #[test]

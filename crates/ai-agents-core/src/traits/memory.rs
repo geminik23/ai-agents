@@ -12,6 +12,8 @@ pub struct MemorySnapshot {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub summarized_count: usize,
 }
 
 impl MemorySnapshot {
@@ -19,12 +21,42 @@ impl MemorySnapshot {
         Self {
             messages,
             summary: None,
+            summarized_count: 0,
         }
     }
 
     pub fn with_summary(mut self, summary: String) -> Self {
         self.summary = Some(summary);
         self
+    }
+
+    pub fn with_summarized_count(mut self, summarized_count: usize) -> Self {
+        self.summarized_count = summarized_count;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_snapshot_defaults_summarized_count() {
+        let json = r#"{"messages":[],"summary":"existing"}"#;
+        let snapshot: MemorySnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.summary.as_deref(), Some("existing"));
+        assert_eq!(snapshot.summarized_count, 0);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_summarized_count() {
+        let snapshot = MemorySnapshot::new(Vec::new())
+            .with_summary("existing".to_string())
+            .with_summarized_count(12);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: MemorySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.summary.as_deref(), Some("existing"));
+        assert_eq!(restored.summarized_count, 12);
     }
 }
 

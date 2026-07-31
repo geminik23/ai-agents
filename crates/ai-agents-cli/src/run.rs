@@ -97,7 +97,7 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
     // Tracing calls during build_agent() are silently dropped.
     // The TUI installs a channel-based subscriber inside run_tui().
 
-    let agent = build_agent(&options.agent_path).await?;
+    let agent = build_agent_from_spec(&options.agent_path, spec.clone()).await?;
     agent.set_command_runner(Arc::new(ProcessCommandRunner));
     if !is_tui && std::io::stdin().is_terminal() {
         agent.set_question_handler(Some(CliQuestionHandler::new()));
@@ -190,7 +190,7 @@ pub fn load_spec(path: &Path) -> Result<AgentSpec> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read agent file: {}", path.display()))?;
 
-    let spec: AgentSpec = serde_yaml::from_str(&content)
+    let spec = AgentSpec::from_yaml_strict(&content)
         .with_context(|| format!("failed to parse YAML agent file: {}", path.display()))?;
 
     spec.validate()
@@ -201,9 +201,12 @@ pub fn load_spec(path: &Path) -> Result<AgentSpec> {
 
 pub async fn build_agent(path: &Path) -> Result<RuntimeAgent> {
     let spec = load_spec(path)?;
+    build_agent_from_spec(path, spec).await
+}
 
-    let mut builder = AgentBuilder::from_yaml_file(path)
-        .with_context(|| format!("failed to load YAML from {}", path.display()))?
+async fn build_agent_from_spec(path: &Path, spec: AgentSpec) -> Result<RuntimeAgent> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut builder = AgentBuilder::from_spec_with_base_dir(spec.clone(), base_dir)
         .auto_configure_llms()
         .context("failed to auto-configure LLMs from environment")?
         .auto_configure_features()
@@ -258,5 +261,33 @@ pub fn resolve_cli_config(spec: &AgentSpec, metadata: &ResolvedCliMetadata) -> C
         show_timing: metadata.show_timing.unwrap_or(false),
         builtin_commands: !metadata.disable_builtin_commands.unwrap_or(false),
         hints: metadata.hints.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_spec_rejects_nested_unknown_path() {
+        let path = std::env::temp_dir().join(format!(
+            "ai-agents-cli-strict-spec-{}.yaml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"
+name: TestAgent
+system_prompt: test
+tool_security:
+  enabeld: true
+"#,
+        )
+        .unwrap();
+
+        let error = load_spec(&path).unwrap_err();
+        let _ = fs::remove_file(&path);
+        let message = format!("{error:#}");
+        assert!(message.contains("tool_security.enabeld"), "{message}");
     }
 }

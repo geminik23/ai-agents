@@ -46,7 +46,7 @@ scenarios:
                 purpose_counts:
                   main_response:
                     path: count
-                    count: 2
+                    eq: 2
                 dimension_counts:
                   - match_dimensions:
                       alias: default
@@ -54,11 +54,11 @@ scenarios:
                       status: error
                     assert:
                       path: count
-                      count: 1
+                      eq: 1
                   - match_dimensions:
                       alias: default
                       purpose: main_response
                       status: success
                     assert:
                       path: count
-                      count: 1
+                      eq: 1

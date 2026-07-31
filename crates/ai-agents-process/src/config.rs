@@ -1,9 +1,10 @@
 //! Process configuration types for input/output transformation
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessConfig {
     #[serde(default)]
     pub input: Vec<ProcessStage>,
@@ -14,7 +15,7 @@ pub struct ProcessConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProcessStage {
     Normalize(NormalizeStage),
     Detect(DetectStage),
@@ -58,6 +59,7 @@ impl ProcessStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizeStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -68,6 +70,7 @@ pub struct NormalizeStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NormalizeConfig {
     #[serde(default = "default_true")]
     pub trim: bool,
@@ -100,6 +103,7 @@ pub enum UnicodeNormalization {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DetectStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -110,6 +114,7 @@ pub struct DetectStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DetectConfig {
     #[serde(default)]
     pub llm: Option<String>,
@@ -133,12 +138,14 @@ pub enum DetectionType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IntentDefinition {
     pub id: String,
     pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -149,6 +156,7 @@ pub struct ExtractStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExtractConfig {
     #[serde(default)]
     pub llm: Option<String>,
@@ -159,6 +167,7 @@ pub struct ExtractConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FieldSchema {
     #[serde(rename = "type", default)]
     pub field_type: FieldType,
@@ -185,6 +194,7 @@ pub enum FieldType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SanitizeStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -195,6 +205,7 @@ pub struct SanitizeStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SanitizeConfig {
     #[serde(default)]
     pub llm: Option<String>,
@@ -207,6 +218,7 @@ pub struct SanitizeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PIISanitizeConfig {
     #[serde(default)]
     pub action: PIIAction,
@@ -248,6 +260,7 @@ pub enum PIIType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct HarmfulContentConfig {
     #[serde(default)]
     pub detect: Vec<HarmfulContentType>,
@@ -276,6 +289,7 @@ pub enum HarmfulAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TransformStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -286,6 +300,7 @@ pub struct TransformStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TransformConfig {
     #[serde(default)]
     pub llm: Option<String>,
@@ -296,6 +311,7 @@ pub struct TransformConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ValidateStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -306,6 +322,7 @@ pub struct ValidateStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ValidateConfig {
     #[serde(default)]
     pub rules: Vec<ValidationRule>,
@@ -320,7 +337,7 @@ pub struct ValidateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum ValidationRule {
     MinLength {
         min_length: usize,
@@ -340,6 +357,7 @@ pub enum ValidationRule {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationAction {
     #[serde(default)]
     pub action: ValidationActionType,
@@ -357,6 +375,7 @@ pub enum ValidationActionType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ValidationFailAction {
     #[serde(default)]
     pub action: ValidationFailType,
@@ -376,6 +395,7 @@ pub enum ValidationFailType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FormatStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -386,6 +406,7 @@ pub struct FormatStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FormatConfig {
     #[serde(default)]
     pub template: Option<String>,
@@ -396,6 +417,7 @@ pub struct FormatConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ChannelFormat {
     #[serde(default)]
     pub template: Option<String>,
@@ -418,6 +440,7 @@ pub enum OutputFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EnrichStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -428,6 +451,7 @@ pub struct EnrichStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct EnrichConfig {
     #[serde(default)]
     pub source: EnrichSource,
@@ -438,7 +462,7 @@ pub struct EnrichConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(tag = "source", rename_all = "snake_case")]
+#[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EnrichSource {
     #[default]
     None,
@@ -475,6 +499,7 @@ pub enum EnrichErrorAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConditionalStage {
     #[serde(default)]
     pub id: Option<String>,
@@ -483,6 +508,7 @@ pub struct ConditionalStage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConditionalConfig {
     #[serde(default)]
     pub condition: Option<ConditionExpr>,
@@ -492,12 +518,50 @@ pub struct ConditionalConfig {
     pub else_stages: Vec<ProcessStage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum ConditionExpr {
     All { all: Vec<ConditionExpr> },
     Any { any: Vec<ConditionExpr> },
     Simple(HashMap<String, serde_json::Value>),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AllConditionExpr {
+    all: Vec<ConditionExpr>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnyConditionExpr {
+    any: Vec<ConditionExpr>,
+}
+
+impl<'de> Deserialize<'de> for ConditionExpr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let fields = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("condition must be a map"))?;
+
+        if fields.contains_key("all") {
+            let condition =
+                serde_json::from_value::<AllConditionExpr>(value).map_err(D::Error::custom)?;
+            return Ok(Self::All { all: condition.all });
+        }
+
+        if fields.contains_key("any") {
+            let condition =
+                serde_json::from_value::<AnyConditionExpr>(value).map_err(D::Error::custom)?;
+            return Ok(Self::Any { any: condition.any });
+        }
+
+        Ok(Self::Simple(fields.clone().into_iter().collect()))
+    }
 }
 
 impl Default for ConditionExpr {
@@ -507,6 +571,7 @@ impl Default for ConditionExpr {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessSettings {
     #[serde(default)]
     pub on_stage_error: StageErrorConfig,
@@ -530,6 +595,7 @@ impl Default for ProcessSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StageErrorConfig {
     #[serde(default)]
     pub default: StageErrorAction,
@@ -547,6 +613,7 @@ pub enum StageErrorAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageRetryConfig {
     #[serde(default = "default_retry")]
     pub max_retries: u32,
@@ -564,6 +631,7 @@ impl Default for StageRetryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessCacheConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -574,6 +642,7 @@ pub struct ProcessCacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessDebugConfig {
     #[serde(default)]
     pub log_stages: bool,
@@ -668,6 +737,82 @@ settings:
     }
 
     #[test]
+    fn test_yaml_rejects_unknown_process_field() {
+        let yaml = r#"
+input: []
+unexpected: true
+"#;
+
+        assert!(serde_yaml::from_str::<ProcessConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn test_yaml_rejects_unknown_stage_field() {
+        let yaml = r#"
+input:
+  - type: normalize
+    config: {}
+    unexpected: true
+"#;
+
+        assert!(serde_yaml::from_str::<ProcessConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn test_yaml_rejects_unknown_config_field() {
+        let yaml = r#"
+input:
+  - type: normalize
+    config:
+      unexpected: true
+"#;
+
+        assert!(serde_yaml::from_str::<ProcessConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn test_yaml_rejects_unknown_nested_config_field() {
+        let yaml = r#"
+input:
+  - type: sanitize
+    config:
+      pii:
+        action: mask
+        unexpected: true
+"#;
+
+        assert!(serde_yaml::from_str::<ProcessConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn test_yaml_rejects_unknown_dynamic_map_value_field() {
+        let yaml = r#"
+input:
+  - type: extract
+    config:
+      schema:
+        dynamic_field_name:
+          type: string
+          unexpected: true
+"#;
+
+        assert!(serde_yaml::from_str::<ProcessConfig>(yaml).is_err());
+    }
+
+    #[test]
+    fn test_yaml_rejects_unknown_condition_group_field() {
+        let yaml = r#"
+input:
+  - type: normalize
+    condition:
+      all: []
+      unexpected: true
+"#;
+
+        assert!(serde_yaml::from_str::<ProcessConfig>(yaml).is_err());
+    }
+
+    #[test]
     fn test_normalize_config() {
         let config = NormalizeConfig::default();
         assert!(config.trim);
@@ -701,8 +846,8 @@ config:
     user_name:
       type: string
 "#;
-        let stage: ExtractStage = serde_yaml::from_str(yaml).unwrap();
-        assert!(stage.condition.is_some());
+        let stage: ProcessStage = serde_yaml::from_str(yaml).unwrap();
+        assert!(stage.condition().is_some());
     }
 
     #[test]
@@ -717,9 +862,8 @@ condition:
         exists: false
 config: {}
 "#;
-        let stage: EnrichStage = serde_yaml::from_str(yaml).unwrap();
-        assert!(stage.condition.is_some());
-        match stage.condition.unwrap() {
+        let stage: ProcessStage = serde_yaml::from_str(yaml).unwrap();
+        match stage.condition().unwrap() {
             ConditionExpr::All { all } => assert_eq!(all.len(), 2),
             _ => panic!("Expected All condition"),
         }
@@ -738,9 +882,8 @@ config:
   detect:
     - language
 "#;
-        let stage: DetectStage = serde_yaml::from_str(yaml).unwrap();
-        assert!(stage.condition.is_some());
-        match stage.condition.unwrap() {
+        let stage: ProcessStage = serde_yaml::from_str(yaml).unwrap();
+        match stage.condition().unwrap() {
             ConditionExpr::Any { any } => assert_eq!(any.len(), 2),
             _ => panic!("Expected Any condition"),
         }

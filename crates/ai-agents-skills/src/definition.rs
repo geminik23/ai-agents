@@ -5,6 +5,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillDefinition {
     #[serde(alias = "skill")]
     pub id: String,
@@ -23,7 +24,7 @@ pub struct SkillDefinition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SkillStep {
     Tool {
         tool: String,
@@ -50,7 +51,7 @@ impl SkillStep {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum SkillRef {
     Name(String),
     File { file: PathBuf },
@@ -79,6 +80,7 @@ pub struct SkillContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StepResult {
     pub step_index: usize,
     pub args: Option<Value>,
@@ -162,6 +164,13 @@ steps:
         let yaml = r#"file: ./skills/my_skill.yaml"#;
         let skill_ref: SkillRef = serde_yaml::from_str(yaml).unwrap();
         assert!(matches!(skill_ref, SkillRef::File { .. }));
+    }
+
+    #[test]
+    fn test_skill_ref_rejects_null_non_string_and_field_typos() {
+        for yaml in ["null", "42", "file: ./skills/my_skill.yaml\nflie: true\n"] {
+            assert!(serde_yaml::from_str::<SkillRef>(yaml).is_err(), "{yaml}");
+        }
     }
 
     #[test]
@@ -257,6 +266,25 @@ steps:
                 .unwrap(),
             "누구에게 보내시겠습니까?"
         );
+    }
+
+    #[test]
+    fn test_skill_definition_accepts_alias_and_empty_disambiguation_fields() {
+        let yaml = r#"
+skill: transfer_money
+description: "Transfer money"
+trigger: "When user wants to transfer money"
+disambiguation:
+  required_clarity: []
+  clarification_templates: {}
+steps: []
+"#;
+        let def: SkillDefinition = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(def.id, "transfer_money");
+        let disambiguation = def.disambiguation.unwrap();
+        assert!(disambiguation.required_clarity.is_empty());
+        assert!(disambiguation.clarification_templates.is_empty());
+        assert!(def.steps.is_empty());
     }
 
     #[test]

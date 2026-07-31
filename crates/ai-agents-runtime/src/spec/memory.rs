@@ -1,7 +1,6 @@
 //! Memory configuration types
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 use ai_agents_facts::{ActorMemoryConfig, FactsConfig, SessionConfig};
 use ai_agents_memory::{CompactingMemoryConfig, MemoryTokenBudget};
@@ -45,9 +44,6 @@ pub struct MemoryConfig {
     /// Actor-scoped relationship memory configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationships: Option<RelationshipConfig>,
-
-    #[serde(flatten)]
-    pub extra: HashMap<String, serde_json::Value>,
 }
 
 fn default_memory_type() -> String {
@@ -72,7 +68,6 @@ impl Default for MemoryConfig {
             facts: None,
             session: None,
             relationships: None,
-            extra: HashMap::new(),
         }
     }
 }
@@ -144,17 +139,6 @@ type: sqlite
         let config: MemoryConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.memory_type, "sqlite");
         assert_eq!(config.max_messages, 100);
-    }
-
-    #[test]
-    fn test_memory_config_extra_fields() {
-        let yaml = r#"
-type: sqlite
-max_messages: 200
-db_path: "/path/to/db.sqlite"
-"#;
-        let config: MemoryConfig = serde_yaml::from_str(yaml).unwrap();
-        assert!(config.extra.contains_key("db_path"));
     }
 
     #[test]

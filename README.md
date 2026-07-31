@@ -24,8 +24,8 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
 - **Built-in tools + MCP** - calculator, datetime, echo, file, glob, grep, file_read, file_write, file_edit, file_list, file_info, patch, copy_path, move_path, delete_path, git_status, git_diff, diagnostics, ask_user, todo, sleep, web_fetch, web_search, command, JSON, text, template, math, random, and HTTP; connect any MCP server for hundreds more
-- **Tool scoping, policy, and context** - explicit top-level tool grants, state-level narrowing, policy bindings, effective execution limits, context-aware custom tools, read-before-write guards, command allowlists, multi-language aliases, and safe parallel execution
-- **Input/output process pipeline** - normalize, detect, extract, sanitize, validate, transform, format - all LLM-based, works across languages
+- **Tool scoping, policy, and context** - explicit top-level tool grants, state-level narrowing, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
+- **Input/output process pipeline** - deterministic normalization and formatting plus optional LLM-backed detection, extraction, sanitization, validation, and transformation
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
 - **Memory stack** - CompactingMemory, token budgeting, SQLite/Redis/file persistence, session metadata, actor facts, and relationship memory
 - **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
@@ -64,7 +64,7 @@ llm:
 #   model: qwen3:8b
 #   base_url: http://localhost:11434/v1
 
-# Provider-specific extra params are also allowed.
+# Fixed framework fields are strict; provider-specific extra params are allowed inside llm configs.
 # Example for OpenAI reasoning-capable models:
 # llms:
 #   default:
@@ -144,7 +144,7 @@ ai-agents-cli validate agent.yaml                      # check YAML without star
 ai-agents-cli eval --agent agent.yaml --scenarios eval/suite.yaml --output eval_results/
 ```
 
-Use `eval` to run YAML or JSONL scenario suites with mock/replay/record fixtures, rule-based assertions, optional LLM judge checks, retries, strict default redaction, JSON/Markdown/JUnit outputs, and observability reports when enabled.
+Use `eval` to run YAML or JSONL scenario suites with strict fail-closed assertions, exact replay, synchronized record fixtures, optional LLM judge checks, retries, strict default redaction, JSON/Markdown/JUnit outputs, and observability reports when enabled. Real and record modes require explicit `--real-llm` or `--record` authorization.
 
 See the [CLI Guide](https://ai-agents.rs/docs/cli/) for REPL commands, evaluation options, metadata configuration, and full reference.
 

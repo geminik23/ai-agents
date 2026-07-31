@@ -199,7 +199,7 @@ impl AgentSpawner {
 
     /// Spawn an agent from a YAML string.
     pub async fn spawn_from_yaml(&self, yaml: &str) -> Result<SpawnedAgent> {
-        let mut spec: AgentSpec = serde_yaml::from_str(yaml)?;
+        let mut spec = AgentSpec::from_yaml_strict(yaml)?;
         spec.validate()?;
         self.enforce_tool_allowlist(&mut spec);
         self.spawn_from_spec(spec).await

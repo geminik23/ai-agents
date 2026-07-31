@@ -13,6 +13,7 @@ pub enum ResetProfile {
 
 /// Options controlling an eval reset step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResetOptions {
     /// Reset profile applied by the reset step.
     #[serde(default = "default_profile")]

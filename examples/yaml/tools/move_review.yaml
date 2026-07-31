@@ -5,7 +5,7 @@ description: "Move or rename a file or directory with dry-run review and explici
 # Move path review example.
 #
 # Use this when the agent should move or rename files with a review step before applying.
-# Dry-run is the default so the model previews the operation without touching the filesystem.
+# Request dry_run explicitly so the model previews the operation without touching the filesystem.
 # Move checks both source and destination write policy.
 # The framework auto-injects tool schemas into the prompt, so the system prompt does not list tool names.
 #
@@ -25,8 +25,7 @@ llm:
   provider: openai
   model: gpt-5.4-mini
 
-# file_read provides source context. move_path performs the move with dry-run
-# defaults. todo tracks multi-step move workflows.
+# file_read provides source context. move_path performs the move, dry_run true requests a preview, and todo tracks multi-step move workflows.
 tools:
   - file_read
   - move_path

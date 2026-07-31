@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use ai_agents_core::{AgentError, Result};
 
@@ -9,6 +9,7 @@ use crate::types::{RelationshipDimensionDefinition, RelationshipModel};
 
 /// Top-level configuration for actor-scoped relationship memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelationshipConfig {
     /// Enables relationship loading, prompt injection, evaluation, and persistence.
     #[serde(default)]
@@ -127,13 +128,56 @@ fn validate_definitions(
 }
 
 /// Dimension configuration accepted by the `memory.relationships.dimensions` YAML field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum RelationshipDimensionsConfig {
     /// Shorthand list of dimension names using built-in definitions when available.
     Shorthand(Vec<String>),
     /// Explicit map of dimension names to full dimension definitions.
     Explicit(HashMap<String, RelationshipDimensionDefinition>),
+}
+
+impl<'de> Deserialize<'de> for RelationshipDimensionsConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged, deny_unknown_fields)]
+        enum StrictDimensions {
+            Shorthand(Vec<String>),
+            Explicit(HashMap<String, StrictDimensionDefinition>),
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct StrictDimensionDefinition {
+            description: String,
+            min: f64,
+            max: f64,
+            default: f64,
+        }
+
+        match StrictDimensions::deserialize(deserializer)? {
+            StrictDimensions::Shorthand(names) => Ok(Self::Shorthand(names)),
+            StrictDimensions::Explicit(definitions) => Ok(Self::Explicit(
+                definitions
+                    .into_iter()
+                    .map(|(name, definition)| {
+                        (
+                            name,
+                            RelationshipDimensionDefinition {
+                                description: definition.description,
+                                min: definition.min,
+                                max: definition.max,
+                                default: definition.default,
+                            },
+                        )
+                    })
+                    .collect(),
+            )),
+        }
+    }
 }
 
 impl Default for RelationshipDimensionsConfig {
@@ -144,6 +188,7 @@ impl Default for RelationshipDimensionsConfig {
 
 /// Configuration for automatic relationship updates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutoUpdateConfig {
     /// Enables the relationship evaluator after successful turns.
     #[serde(default = "default_true")]
@@ -176,6 +221,7 @@ impl Default for AutoUpdateConfig {
 
 /// Configuration for relationship context and prompt injection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InjectionConfig {
     /// Enables relationship context and prompt variable injection.
     #[serde(default = "default_true")]
@@ -221,6 +267,7 @@ pub enum InjectionFormat {
 
 /// Configuration for actor-keyed relationship persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PersistenceConfig {
     /// Enables saving and loading relationship rows through configured storage.
     #[serde(default = "default_true")]
@@ -235,6 +282,7 @@ impl Default for PersistenceConfig {
 
 /// Configuration for compact relationship-relevant event storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NotableEventsConfig {
     /// Enables recording significant relationship events.
     #[serde(default = "default_true")]
@@ -351,6 +399,26 @@ dimensions:
         let config: RelationshipConfig = serde_yaml::from_str(yaml).unwrap();
         let defs = config.dimension_definitions().unwrap();
         assert_eq!(defs["motivation"].default, 0.5);
+    }
+
+    #[test]
+    fn test_parse_explicit_empty_dimensions() {
+        let config: RelationshipConfig = serde_yaml::from_str("dimensions: {}\n").unwrap();
+        let defs = config.dimension_definitions().unwrap();
+        assert!(defs.contains_key("trust"));
+    }
+
+    #[test]
+    fn test_dimension_definition_rejects_field_typo() {
+        let yaml = r#"
+dimensions:
+  trust:
+    description: "Trust"
+    min: -1.0
+    max: 1.0
+    defualt: 0.0
+"#;
+        assert!(serde_yaml::from_str::<RelationshipConfig>(yaml).is_err());
     }
 
     #[test]

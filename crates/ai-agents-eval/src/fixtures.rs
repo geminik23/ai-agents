@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,6 +38,7 @@ use crate::{EvalError, Result};
 
 /// Fixture configuration used to replace external dependencies during eval.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FixturesConfig {
     /// Runtime or fixture context value.
     #[serde(default)]
@@ -76,6 +77,7 @@ pub struct FixturesConfig {
 
 /// Existing tool policies that receive the isolated attempt workspace.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspacePolicyFixtureConfig {
     /// Tool policies that receive the workspace in read_paths.
     #[serde(default)]
@@ -87,6 +89,7 @@ pub struct WorkspacePolicyFixtureConfig {
 
 /// Deterministic approval behavior for one eval handler instance.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalFixtureConfig {
     /// Rules evaluated in declaration order.
     #[serde(default)]
@@ -117,7 +120,7 @@ pub struct ApprovalFixtureRule {
 
 /// Approval trigger predicate used by an eval fixture rule.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalFixtureTrigger {
     Tool {
         name: String,
@@ -142,7 +145,7 @@ pub enum ApprovalFixtureTrigger {
 
 /// Approval result produced by a fixture rule or fallback.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ApprovalFixtureOutcome {
     Approve,
     Reject {
@@ -272,6 +275,7 @@ pub fn build_approval_handler(config: &ApprovalFixtureConfig) -> Arc<dyn Approva
 
 /// Diagnostics fixture configuration for host-backed diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DiagnosticsFixtureConfig {
     /// Whether the provider is available.
     #[serde(default = "default_true")]
@@ -283,6 +287,7 @@ pub struct DiagnosticsFixtureConfig {
 
 /// Command-runner fixture configuration for process-backed validation tools.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandsFixtureConfig {
     /// Whether the command runner is available.
     #[serde(default = "default_true")]
@@ -294,6 +299,7 @@ pub struct CommandsFixtureConfig {
 
 /// One exact-argv mocked command response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandFixtureEntry {
     /// Full argv vector used for exact matching.
     #[serde(default)]
@@ -305,6 +311,7 @@ pub struct CommandFixtureEntry {
 
 /// One exact-query mocked web-search response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebSearchFixtureEntry {
     /// Query string matched exactly by the static provider.
     pub query: String,
@@ -315,6 +322,7 @@ pub struct WebSearchFixtureEntry {
 
 /// Web-search fixture configuration for provider-neutral search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebSearchFixtureConfig {
     /// Whether the provider is available.
     #[serde(default = "default_true")]
@@ -326,6 +334,7 @@ pub struct WebSearchFixtureConfig {
 
 /// Exact-URL responses served in memory to the real web_fetch tool.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WebFetchTransportFixtureConfig {
     /// Routes matched against the normalized URL requested by web_fetch.
     #[serde(default)]
@@ -334,6 +343,7 @@ pub struct WebFetchTransportFixtureConfig {
 
 /// One no-socket web_fetch transport response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WebFetchTransportFixtureRoute {
     /// Absolute URL matched exactly after URL normalization.
     pub url: String,
@@ -350,6 +360,7 @@ pub struct WebFetchTransportFixtureRoute {
 
 /// Static output configuration for an eval mock tool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolMockConfig {
     /// Whether the operation succeeded.
     #[serde(default = "default_true")]
@@ -370,6 +381,7 @@ impl Default for ToolMockConfig {
 
 /// LLM fixture mode and data used by the eval runner.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LlmFixtureConfig {
     /// LLM fixture mode used for configured aliases.
     #[serde(default)]
@@ -377,7 +389,7 @@ pub struct LlmFixtureConfig {
     /// Optional cassette JSONL file for replay or record mode.
     #[serde(default)]
     pub cassette: Option<PathBuf>,
-    /// Ordered text responses used by mock mode and fallback replay.
+    /// Ordered text responses used by mock mode.
     #[serde(default)]
     pub responses: Vec<String>,
     /// Per-LLM alias ordered responses for deterministic multi-branch evals.
@@ -396,7 +408,7 @@ pub struct LlmFixtureConfig {
 
 /// One response or error in an ordered mock LLM sequence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LlmFixtureOutcome {
     Response {
         content: String,
@@ -421,6 +433,7 @@ pub enum LlmFixtureMode {
 
 /// Local HTTP mock server configuration for eval scenarios.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct MockServerConfig {
     /// Whether this feature is enabled.
     #[serde(default)]
@@ -435,6 +448,7 @@ pub struct MockServerConfig {
 
 /// One route served by the lightweight eval mock server.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MockRoute {
     /// HTTP method matched by this route.
     method: String,
@@ -449,6 +463,22 @@ struct MockRoute {
     /// JSON or string body returned by this route.
     #[serde(default)]
     body: Value,
+}
+
+impl FixturesConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(mock_server) = &self.mock_server {
+            for (index, route) in mock_server.routes.iter().cloned().enumerate() {
+                serde_json::from_value::<MockRoute>(route).map_err(|error| {
+                    EvalError::Config(format!(
+                        "fixtures.mock_server.routes[{}] is invalid: {}",
+                        index, error
+                    ))
+                })?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Running mock server handle that stops the server on drop.
@@ -1155,16 +1185,31 @@ pub fn build_llm_registry(
             .collect()
     };
 
-    let cassette_records = load_cassette_records(fixtures, base_dir)?;
+    let cassette_records = if fixtures.mode == LlmFixtureMode::Replay {
+        load_cassette_records(fixtures, base_dir)?
+    } else {
+        Vec::new()
+    };
+    let cassette_writer = if fixtures.mode == LlmFixtureMode::Record {
+        let path = fixtures
+            .cassette
+            .as_ref()
+            .map(|path| resolve_path(base_dir, path))
+            .unwrap_or_else(|| base_dir.join("llm_cassette.jsonl"));
+        Some(CassetteWriter::shared(path)?)
+    } else {
+        None
+    };
     let mut judge_provider = None;
 
     for (alias, config) in aliases {
-        let fixture_responses = load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
-        let fixture_outcomes =
-            load_fixture_outcomes_for_alias(fixtures, &alias, &fixture_responses);
         let fixture_delay_ms = fixtures.delays_by_alias.get(&alias).copied().unwrap_or(0);
         let provider = match fixtures.mode {
             LlmFixtureMode::Mock => {
+                let fixture_responses =
+                    load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
+                let fixture_outcomes =
+                    load_fixture_outcomes_for_alias(fixtures, &alias, &fixture_responses);
                 Arc::new(SequenceLLMProvider::new(fixture_outcomes, fixture_delay_ms))
                     as Arc<dyn LLMProvider>
             }
@@ -1172,22 +1217,20 @@ pub fn build_llm_registry(
                 alias.clone(),
                 config.model.clone(),
                 cassette_records.clone(),
-                fixture_responses.clone(),
                 fixture_delay_ms,
             )) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Real => build_real_provider(&config)?,
             LlmFixtureMode::Record => {
                 let inner = build_real_provider(&config)?;
-                let path = fixtures
-                    .cassette
-                    .as_ref()
-                    .map(|p| resolve_path(base_dir, p))
-                    .unwrap_or_else(|| base_dir.join("llm_cassette.jsonl"));
                 Arc::new(RecordingLLMProvider::new(
                     inner,
                     alias.clone(),
                     config.model.clone(),
-                    path,
+                    Arc::clone(
+                        cassette_writer
+                            .as_ref()
+                            .expect("record mode preflights a cassette writer"),
+                    ),
                 )) as Arc<dyn LLMProvider>
             }
         };
@@ -1375,8 +1418,6 @@ struct ReplayLLMProvider {
     model: String,
     /// Cassette records available for hash matching.
     records: Arc<Vec<CassetteRecord>>,
-    /// Ordered text responses used by mock mode and fallback replay.
-    responses: SequenceLLMProvider,
     /// Fixed delay before returning a replayed response.
     delay_ms: u64,
 }
@@ -1414,24 +1455,11 @@ impl SequenceLLMProvider {
 }
 
 impl ReplayLLMProvider {
-    fn new(
-        alias: String,
-        model: String,
-        records: Vec<CassetteRecord>,
-        fallback: Vec<LLMResponse>,
-        delay_ms: u64,
-    ) -> Self {
+    fn new(alias: String, model: String, records: Vec<CassetteRecord>, delay_ms: u64) -> Self {
         Self {
             alias,
             model,
             records: Arc::new(records),
-            responses: SequenceLLMProvider::new(
-                fallback
-                    .into_iter()
-                    .map(SequenceOutcome::Response)
-                    .collect(),
-                delay_ms,
-            ),
             delay_ms,
         }
     }
@@ -1442,18 +1470,27 @@ impl ReplayLLMProvider {
         }
     }
 
-    fn response_for(&self, messages: &[ChatMessage], config: Option<&LLMConfig>) -> LLMResponse {
+    fn response_for(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+    ) -> std::result::Result<LLMResponse, LLMError> {
         let request_hash = hash_request(messages, config);
-        if let Some(record) = self.records.iter().find(|record| {
-            record.alias == self.alias
-                && record.request_hash == request_hash
-                && (record.model == self.model || record.model.is_empty())
-        }) {
-            return record.response.clone();
-        }
-        self.responses
-            .next_outcome()
-            .unwrap_or_else(|_| LLMResponse::new("Mock response", FinishReason::Stop))
+        self.records
+            .iter()
+            .find(|record| {
+                record.alias == self.alias
+                    && record.request_hash == request_hash
+                    && (record.model == self.model || record.model.is_empty())
+            })
+            .map(|record| record.response.clone())
+            .ok_or_else(|| LLMError::API {
+                message: format!(
+                    "replay cassette miss for alias '{}' model '{}' request {}",
+                    self.alias, self.model, request_hash
+                ),
+                status: None,
+            })
     }
 }
 
@@ -1465,7 +1502,7 @@ impl LLMProvider for ReplayLLMProvider {
         config: Option<&LLMConfig>,
     ) -> std::result::Result<LLMResponse, LLMError> {
         self.wait_if_configured().await;
-        Ok(self.response_for(messages, config))
+        self.response_for(messages, config)
     }
 
     async fn complete_stream(
@@ -1477,7 +1514,7 @@ impl LLMProvider for ReplayLLMProvider {
         LLMError,
     > {
         self.wait_if_configured().await;
-        let response = self.response_for(messages, config);
+        let response = self.response_for(messages, config)?;
         Ok(Box::new(futures::stream::iter(chunks_from_response(
             response,
         ))))
@@ -1583,6 +1620,70 @@ fn split_stream_content(content: &str) -> Vec<String> {
         .collect()
 }
 
+/// Synchronized writer shared by every provider targeting one cassette path.
+struct CassetteWriter {
+    path: PathBuf,
+    file: Mutex<File>,
+}
+
+impl CassetteWriter {
+    fn shared(path: PathBuf) -> Result<Arc<Self>> {
+        static WRITERS: OnceLock<Mutex<HashMap<PathBuf, Weak<CassetteWriter>>>> = OnceLock::new();
+        let writers = WRITERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut writers = writers.lock();
+        if let Some(writer) = writers.get(&path).and_then(Weak::upgrade) {
+            return Ok(writer);
+        }
+        let writer = Arc::new(Self::open(path.clone())?);
+        writers.insert(path, Arc::downgrade(&writer));
+        Ok(writer)
+    }
+
+    fn open(path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                EvalError::Runtime(format!(
+                    "failed to prepare LLM cassette '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| {
+                EvalError::Runtime(format!(
+                    "failed to open LLM cassette '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        Ok(Self {
+            path,
+            file: Mutex::new(file),
+        })
+    }
+
+    fn append(&self, record: &CassetteRecord) -> std::result::Result<(), LLMError> {
+        let encoded = serde_json::to_string(record).map_err(|error| self.write_error(error))?;
+        let mut file = self.file.lock();
+        writeln!(file, "{encoded}").map_err(|error| self.write_error(error))?;
+        file.flush().map_err(|error| self.write_error(error))
+    }
+
+    fn write_error(&self, error: impl std::fmt::Display) -> LLMError {
+        LLMError::API {
+            message: format!(
+                "failed to write LLM cassette '{}': {error}",
+                self.path.display()
+            ),
+            status: None,
+        }
+    }
+}
+
 /// LLM provider wrapper appending responses to a cassette file.
 struct RecordingLLMProvider {
     /// Wrapped implementation or shared storage.
@@ -1591,17 +1692,22 @@ struct RecordingLLMProvider {
     alias: String,
     /// Model or relationship model name.
     model: String,
-    /// Path used for file lookup, HTTP routing, or dot-path checks.
-    path: PathBuf,
+    /// Synchronized cassette destination shared across aliases.
+    writer: Arc<CassetteWriter>,
 }
 
 impl RecordingLLMProvider {
-    fn new(inner: Arc<dyn LLMProvider>, alias: String, model: String, path: PathBuf) -> Self {
+    fn new(
+        inner: Arc<dyn LLMProvider>,
+        alias: String,
+        model: String,
+        writer: Arc<CassetteWriter>,
+    ) -> Self {
         Self {
             inner,
             alias,
             model,
-            path,
+            writer,
         }
     }
 }
@@ -1621,20 +1727,7 @@ impl LLMProvider for RecordingLLMProvider {
             request_hash_version: Some("sha256-v1".to_string()),
             response: response.clone(),
         };
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-        {
-            let _ = writeln!(
-                file,
-                "{}",
-                serde_json::to_string(&record).unwrap_or_default()
-            );
-        }
+        self.writer.append(&record)?;
         Ok(response)
     }
 
@@ -1646,7 +1739,12 @@ impl LLMProvider for RecordingLLMProvider {
         Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
         LLMError,
     > {
-        self.inner.complete_stream(messages, config).await
+        let _ = (messages, config);
+        Err(LLMError::API {
+            message: "record mode does not support streaming because the stream cannot be recorded atomically"
+                .to_string(),
+            status: None,
+        })
     }
 
     fn provider_name(&self) -> &str {
@@ -1654,7 +1752,7 @@ impl LLMProvider for RecordingLLMProvider {
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
-        self.inner.supports(feature)
+        feature != LLMFeature::Streaming && self.inner.supports(feature)
     }
 }
 
@@ -1690,6 +1788,46 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CountingProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LLMResponse::new("counted response", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LLMError::API {
+                message: "unexpected stream call".to_string(),
+                status: None,
+            })
+        }
+
+        fn provider_name(&self) -> &str {
+            "counting"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            true
+        }
+    }
 
     #[test]
     fn runtime_tool_sources_preserve_existing_labels_and_distinguish_plan() {
@@ -2399,6 +2537,228 @@ web_fetch_transport:
         let chunks = split_stream_content("Hello");
         assert!(chunks.len() > 1);
         assert_eq!(chunks.join(""), "Hello");
+    }
+
+    #[test]
+    fn fixture_yaml_rejects_unknown_fields() {
+        let error =
+            serde_yaml::from_str::<FixturesConfig>("llm:\n  mode: mock\n  resposes: [fallback]\n")
+                .unwrap_err()
+                .to_string();
+        assert!(error.contains("resposes"));
+    }
+
+    #[tokio::test]
+    async fn replay_miss_rejects_configured_fallback_responses() {
+        let spec: AgentSpec = serde_yaml::from_str(
+            r#"
+name: ReplayAgent
+system_prompt: test
+llm:
+  provider: openai
+  model: replay-model
+"#,
+        )
+        .unwrap();
+        let fixtures = LlmFixtureConfig {
+            mode: LlmFixtureMode::Replay,
+            responses: vec!["must not be used".to_string()],
+            ..Default::default()
+        };
+        let (registry, _) = build_llm_registry(&spec, &fixtures, Path::new(".")).unwrap();
+        let provider = registry.default().unwrap();
+
+        let error = provider
+            .complete(&[ChatMessage::user("uncassetted request")], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("replay cassette miss"));
+        assert!(!error.to_string().contains("must not be used"));
+    }
+
+    #[test]
+    fn cassette_records_accept_unknown_persisted_fields() {
+        let record: CassetteRecord = serde_json::from_value(json!({
+            "alias": "default",
+            "model": "model",
+            "request_hash": "hash",
+            "request_hash_version": "sha256-v1",
+            "response": LLMResponse::new("response", FinishReason::Stop),
+            "future_metadata": {"version": 2}
+        }))
+        .unwrap();
+        assert_eq!(record.alias, "default");
+    }
+
+    #[tokio::test]
+    async fn recording_preflight_failure_skips_inner_provider() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_record_preflight_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocked_parent = dir.join("not-a-directory");
+        std::fs::write(&blocked_parent, "file").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner = Arc::new(CountingProvider {
+            calls: Arc::clone(&calls),
+        });
+
+        let provider =
+            CassetteWriter::shared(blocked_parent.join("cassette.jsonl")).map(|writer| {
+                RecordingLLMProvider::new(inner, "default".to_string(), "model".to_string(), writer)
+            });
+
+        assert!(provider.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recording_write_errors_are_returned() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_record_error_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("read-only-cassette.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let file = OpenOptions::new().read(true).open(&path).unwrap();
+        let writer = Arc::new(CassetteWriter {
+            path: path.clone(),
+            file: Mutex::new(file),
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RecordingLLMProvider::new(
+            Arc::new(CountingProvider {
+                calls: Arc::clone(&calls),
+            }),
+            "default".to_string(),
+            "model".to_string(),
+            writer,
+        );
+
+        let error = provider
+            .complete(&[ChatMessage::user("record me")], None)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("failed to write LLM cassette"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(provider);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aliases_share_synchronized_cassette_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_shared_writer_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cassette.jsonl");
+        let first_writer = CassetteWriter::shared(path.clone()).unwrap();
+        let second_writer = CassetteWriter::shared(path.clone()).unwrap();
+        assert!(Arc::ptr_eq(&first_writer, &second_writer));
+        let first = Arc::new(RecordingLLMProvider::new(
+            Arc::new(SequenceLLMProvider::new(
+                vec![SequenceOutcome::Response(LLMResponse::new(
+                    "first",
+                    FinishReason::Stop,
+                ))],
+                0,
+            )),
+            "first".to_string(),
+            "model".to_string(),
+            first_writer,
+        ));
+        let second = Arc::new(RecordingLLMProvider::new(
+            Arc::new(SequenceLLMProvider::new(
+                vec![SequenceOutcome::Response(LLMResponse::new(
+                    "second",
+                    FinishReason::Stop,
+                ))],
+                0,
+            )),
+            "second".to_string(),
+            "model".to_string(),
+            second_writer,
+        ));
+
+        let first_calls = tokio::spawn(async move {
+            for index in 0..50 {
+                first
+                    .complete(&[ChatMessage::user(format!("first {index}"))], None)
+                    .await
+                    .unwrap();
+            }
+        });
+        let second_calls = tokio::spawn(async move {
+            for index in 0..50 {
+                second
+                    .complete(&[ChatMessage::user(format!("second {index}"))], None)
+                    .await
+                    .unwrap();
+            }
+        });
+        let (first_result, second_result) = tokio::join!(first_calls, second_calls);
+        first_result.unwrap();
+        second_result.unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<CassetteRecord> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 100);
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.alias == "first")
+                .count(),
+            50
+        );
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.alias == "second")
+                .count(),
+            50
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recording_streaming_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_record_stream_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let writer = CassetteWriter::shared(dir.join("cassette.jsonl")).unwrap();
+        let inner = Arc::new(SequenceLLMProvider::new(
+            vec![SequenceOutcome::Response(LLMResponse::new(
+                "streamed response",
+                FinishReason::Stop,
+            ))],
+            0,
+        ));
+        let provider =
+            RecordingLLMProvider::new(inner, "default".to_string(), "model".to_string(), writer);
+
+        let result = provider
+            .complete_stream(&[ChatMessage::user("stream me")], None)
+            .await;
+
+        let error = match result {
+            Ok(_) => panic!("record streaming must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not support streaming"));
+        assert!(!provider.supports(LLMFeature::Streaming));
+        drop(provider);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

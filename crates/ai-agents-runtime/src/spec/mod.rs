@@ -247,7 +247,115 @@ impl Default for AgentSpec {
     }
 }
 
+fn normalize_unknown_path(path: &str) -> String {
+    path.replace(".?.", ".")
+        .trim_start_matches("?.")
+        .to_string()
+}
+
+fn unknown_fields_error(mut paths: Vec<String>) -> AgentError {
+    paths.sort();
+    paths.dedup();
+    AgentError::InvalidSpec(format!("Unknown AgentSpec field(s): {}", paths.join(", ")))
+}
+
+fn detailed_error_path(path: &str, error: &str) -> String {
+    let unknown_field = error
+        .split_once("unknown field `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(field, _)| field);
+    match (path.is_empty(), unknown_field) {
+        (_, None) => path.to_string(),
+        (true, Some(field)) => field.to_string(),
+        (false, Some(field)) => format!("{path}.{field}"),
+    }
+}
+
+fn collect_unsupported_yaml_keys(
+    value: &serde_yaml::Value,
+    path: &str,
+    unsupported_paths: &mut Vec<String>,
+) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            for (key, child) in mapping {
+                let Some(key) = key.as_str() else {
+                    unsupported_paths.push(if path.is_empty() {
+                        "<non-string-key>".to_string()
+                    } else {
+                        format!("{path}.<non-string-key>")
+                    });
+                    continue;
+                };
+                let child_path = if path.is_empty() {
+                    key.to_string()
+                } else {
+                    format!("{path}.{key}")
+                };
+                if key == "<<" {
+                    unsupported_paths.push(child_path);
+                    continue;
+                }
+                collect_unsupported_yaml_keys(child, &child_path, unsupported_paths);
+            }
+        }
+        serde_yaml::Value::Sequence(values) => {
+            for (index, child) in values.iter().enumerate() {
+                collect_unsupported_yaml_keys(
+                    child,
+                    &format!("{path}[{index}]"),
+                    unsupported_paths,
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
 impl AgentSpec {
+    pub fn from_yaml_strict(yaml: &str) -> Result<Self> {
+        let input_value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        let mut unsupported_paths = Vec::new();
+        collect_unsupported_yaml_keys(&input_value, "", &mut unsupported_paths);
+        if !unsupported_paths.is_empty() {
+            return Err(AgentError::InvalidSpec(format!(
+                "Unsupported AgentSpec YAML key(s): {}",
+                unsupported_paths.join(", ")
+            )));
+        }
+
+        let mut unknown_paths = Vec::new();
+        let deserializer = serde_yaml::Deserializer::from_str(yaml);
+        let spec = match serde_ignored::deserialize(deserializer, |path| {
+            unknown_paths.push(normalize_unknown_path(&path.to_string()));
+        }) {
+            Ok(spec) => spec,
+            Err(error) => {
+                let deserializer = serde_yaml::Deserializer::from_str(yaml);
+                let detailed = serde_path_to_error::deserialize::<_, AgentSpec>(deserializer)
+                    .map_err(|path_error| {
+                        let path = normalize_unknown_path(&path_error.path().to_string());
+                        let error = path_error.inner().to_string();
+                        AgentError::InvalidSpec(format!(
+                            "Invalid AgentSpec field at '{}': {}",
+                            detailed_error_path(&path, &error),
+                            error
+                        ))
+                    });
+                return match detailed {
+                    Ok(_) => Err(error.into()),
+                    Err(error) => Err(error),
+                };
+            }
+        };
+
+        if !unknown_paths.is_empty() {
+            return Err(unknown_fields_error(unknown_paths));
+        }
+
+        Ok(spec)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.name.is_empty() {
             return Err(AgentError::InvalidSpec(
@@ -403,6 +511,11 @@ impl AgentSpec {
 mod tests {
     use super::*;
 
+    fn assert_unknown_path(yaml: &str, expected_path: &str) {
+        let error = AgentSpec::from_yaml_strict(yaml).unwrap_err().to_string();
+        assert!(error.contains(expected_path), "{error}");
+    }
+
     #[test]
     fn test_agent_spec_minimal() {
         let yaml = r#"
@@ -417,6 +530,258 @@ llm:
         assert_eq!(spec.version, "1.0.0");
         assert_eq!(spec.max_iterations, 10);
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_spec_rejects_top_level_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: "You are a helpful assistant."
+max_iteratons: 20
+"#;
+        assert_unknown_path(yaml, "max_iteratons");
+    }
+
+    #[test]
+    fn test_agent_spec_rejects_nested_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: "You are a helpful assistant."
+storage:
+  type: redis
+  url: redis://localhost:6379
+  ttl_second: 60
+"#;
+        assert_unknown_path(yaml, "storage.ttl_second");
+    }
+
+    #[test]
+    fn test_agent_spec_rejects_memory_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: "You are a helpful assistant."
+memory:
+  type: compacting
+  compress_thresold: 30
+"#;
+        assert_unknown_path(yaml, "memory.compress_thresold");
+    }
+
+    #[test]
+    fn test_agent_spec_preserves_llm_provider_extras() {
+        let yaml = r#"
+name: OllamaAgent
+system_prompt: "You are a helpful assistant."
+llm:
+  provider: ollama
+  model: llama3.1
+  num_ctx: 8192
+  keep_alive: 5m
+"#;
+        let spec = AgentSpec::from_yaml_strict(yaml).unwrap();
+        let llm = spec.llm.as_config().unwrap();
+        assert_eq!(llm.extra.get("num_ctx"), Some(&serde_json::json!(8192)));
+        assert_eq!(llm.extra.get("keep_alive"), Some(&serde_json::json!("5m")));
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_runtime_optimization_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: test
+runtime:
+  optimization:
+    max_parallel_runtime_task: 4
+"#;
+        assert_unknown_path(yaml, "runtime.optimization.max_parallel_runtime_task");
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_tool_security_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: test
+tool_security:
+  enabeld: true
+"#;
+        assert_unknown_path(yaml, "tool_security.enabeld");
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_process_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: test
+process:
+  input:
+    - type: normalize
+      config:
+        trm: true
+"#;
+        let error = AgentSpec::from_yaml_strict(yaml).unwrap_err().to_string();
+        assert!(error.contains("process.input[0]"), "{error}");
+        assert!(error.contains("trm"), "{error}");
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_state_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: test
+states:
+  initial: start
+  states:
+    start:
+      promt: hello
+"#;
+        assert_unknown_path(yaml, "states.states.start.promt");
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_hitl_typo() {
+        let yaml = r#"
+name: TestAgent
+system_prompt: test
+hitl:
+  default_timeout_second: 30
+"#;
+        assert_unknown_path(yaml, "hitl.default_timeout_second");
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_memory_and_storage_typos() {
+        let memory_yaml = r#"
+name: TestAgent
+system_prompt: test
+memory:
+  type: compacting
+  compress_thresold: 30
+"#;
+        assert_unknown_path(memory_yaml, "memory.compress_thresold");
+
+        let storage_yaml = r#"
+name: TestAgent
+system_prompt: test
+storage:
+  type: redis
+  url: redis://localhost:6379
+  ttl_second: 60
+"#;
+        let error = AgentSpec::from_yaml_strict(storage_yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("storage"), "{error}");
+        assert!(error.contains("ttl_second"), "{error}");
+    }
+
+    #[test]
+    fn test_strict_yaml_preserves_structured_tool_extensions() {
+        let yaml = r#"
+name: ToolAgent
+system_prompt: test
+tools:
+  - name: github
+    type: mcp
+    transport: stdio
+    command: npx
+    args: ["-y", "@modelcontextprotocol/server-github"]
+    env:
+      GITHUB_TOKEN: test
+  - name: http
+    custom_header: X-Test
+provider_security:
+  custom_provider:
+    tools:
+      custom_tool:
+        require_approval: true
+tool_aliases:
+  custom_tool:
+    names:
+      en: Custom Tool
+metadata:
+  custom:
+    arbitrary: true
+tool_security:
+  tools:
+    dangerous:
+      require_approval: true
+"#;
+        let spec = AgentSpec::from_yaml_strict(yaml).unwrap();
+        let tools = spec.tools.unwrap();
+        assert!(tools[0].is_mcp());
+        match &tools[1] {
+            ToolEntry::Structured(tool) => {
+                assert_eq!(
+                    tool.extra.get("custom_header"),
+                    Some(&serde_json::json!("X-Test"))
+                );
+            }
+            ToolEntry::Simple(_) => panic!("expected structured tool"),
+        }
+        assert!(
+            spec.provider_security
+                .providers
+                .contains_key("custom_provider")
+        );
+        assert!(spec.tool_aliases.tools.contains_key("custom_tool"));
+        assert!(spec.tool_security.tools["dangerous"].require_confirmation);
+        assert_eq!(
+            spec.metadata.as_ref().unwrap()["custom"]["arbitrary"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn test_strict_yaml_accepts_explicit_empty_known_fields() {
+        let yaml = r#"
+name: EmptyFieldsAgent
+system_prompt: test
+skills:
+  - id: inline
+    description: test
+    trigger: test
+    steps:
+      - prompt: hello
+    disambiguation:
+      required_clarity: []
+      clarification_templates: {}
+"#;
+        AgentSpec::from_yaml_strict(yaml).unwrap();
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_null_and_non_string_skill_keys() {
+        let null_typo = r#"
+name: NullTypoAgent
+system_prompt: test
+skills:
+  - file: child.yaml
+    typo:
+"#;
+        assert_unknown_path(null_typo, "skills[0]");
+
+        let non_string_key = r#"
+name: NumericKeyAgent
+system_prompt: test
+skills:
+  - file: child.yaml
+    1: ignored
+"#;
+        assert_unknown_path(non_string_key, "skills[0].<non-string-key>");
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_merge_keys_everywhere() {
+        let yaml = r#"
+name: MergeAgent
+system_prompt: test
+llm:
+  provider: ollama
+  model: llama3.1
+  <<:
+    num_ctx: 8192
+"#;
+        assert_unknown_path(yaml, "llm.<<");
     }
 
     #[test]
@@ -737,10 +1102,6 @@ providers:
       - id: custom_search
         name: Custom Search
         description: Search custom API
-        implementation:
-          type: http
-          url: https://api.example.com/search
-          method: GET
 "#;
         let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.has_providers());

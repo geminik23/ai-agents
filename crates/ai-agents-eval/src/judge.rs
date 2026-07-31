@@ -9,6 +9,7 @@ use crate::{EvalError, Result};
 
 /// Semantic judge assertion declared in an eval suite.
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct JudgeAssertion {
     /// Optional LLM alias or provider used for judge calls.
     #[serde(default)]
@@ -23,7 +24,7 @@ pub struct JudgeAssertion {
 
 /// Text or weighted object form for judge criteria.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum JudgeCriterion {
     Text(String),
     Object {
@@ -36,6 +37,7 @@ pub enum JudgeCriterion {
 
 /// Default behavior for LLM judge evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JudgeConfig {
     /// Whether this feature is enabled.
     #[serde(default = "default_true")]

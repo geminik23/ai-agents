@@ -17,6 +17,24 @@ pub async fn run_eval(args: EvalArgs) -> Result<()> {
         eprintln!("Eval configuration error: use only one of --record, --replay, or --real-llm");
         std::process::exit(2);
     }
+    if args.dry_config_check {
+        if override_count > 0 {
+            eprintln!(
+                "Eval configuration error: --dry-config-check cannot be combined with --record, --replay, or --real-llm"
+            );
+            std::process::exit(2);
+        }
+        match ai_agents_eval::EvalRunner::validate_file(&args.scenarios, args.agent.clone()) {
+            Ok(()) => {
+                println!("Eval configuration valid: {}", args.scenarios.display());
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!("Eval configuration error: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
     let (llm_mode, cassette) = if let Some(path) = &args.record {
         (Some(LlmFixtureMode::Record), Some(path.clone()))
     } else if let Some(path) = &args.replay {

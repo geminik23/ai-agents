@@ -21,26 +21,19 @@ struct ToolCallTracker {
 }
 
 impl ToolCallTracker {
-    fn record_call(&mut self, tool_id: &str) {
-        self.calls
-            .entry(tool_id.to_string())
-            .or_default()
-            .push(Instant::now());
-    }
-
-    fn get_calls_in_window(&self, tool_id: &str, window_seconds: u64) -> usize {
+    fn admit(&mut self, tool_id: &str, rate_limit: Option<u32>) -> bool {
+        let Some(rate_limit) = rate_limit else {
+            return true;
+        };
         let now = Instant::now();
-        let window = std::time::Duration::from_secs(window_seconds);
-
-        self.calls
-            .get(tool_id)
-            .map(|calls| {
-                calls
-                    .iter()
-                    .filter(|t| now.duration_since(**t) < window)
-                    .count()
-            })
-            .unwrap_or(0)
+        let window = std::time::Duration::from_secs(60);
+        let calls = self.calls.entry(tool_id.to_string()).or_default();
+        calls.retain(|timestamp| now.duration_since(*timestamp) < window);
+        if calls.len() >= rate_limit as usize {
+            return false;
+        }
+        calls.push(now);
+        true
     }
 
     fn reset(&mut self) {
@@ -57,10 +50,14 @@ pub struct ToolSecurityEngine {
 
 impl ToolSecurityEngine {
     pub fn new(config: ToolSecurityConfig) -> Self {
+        Self::new_with_policy_version(config, 1)
+    }
+
+    pub fn new_with_policy_version(config: ToolSecurityConfig, policy_version: u64) -> Self {
         Self {
             config,
             tool_call_tracker: Arc::new(RwLock::new(ToolCallTracker::default())),
-            policy_version: 1,
+            policy_version,
         }
     }
 
@@ -213,6 +210,25 @@ impl ToolSecurityEngine {
         args: &serde_json::Value,
         bindings: &ToolPolicyBindings,
     ) -> Result<SecurityCheckResult> {
+        let validation = self
+            .validate_tool_execution_with_bindings(tool_id, args, bindings)
+            .await?;
+        if validation.is_allowed() {
+            let admission = self.admit_tool_execution(tool_id);
+            if !admission.is_allowed() {
+                return Ok(admission);
+            }
+        }
+        Ok(validation)
+    }
+
+    /// Validates policy without consuming rate-limit admission.
+    pub async fn validate_tool_execution_with_bindings(
+        &self,
+        tool_id: &str,
+        args: &serde_json::Value,
+        bindings: &ToolPolicyBindings,
+    ) -> Result<SecurityCheckResult> {
         if !self.config.enabled {
             return Ok(SecurityCheckResult::Allow);
         }
@@ -225,7 +241,6 @@ impl ToolSecurityEngine {
                 });
             }
             None => {
-                self.tool_call_tracker.write().record_call(tool_id);
                 debug!(tool_id = %tool_id, "Tool execution allowed by legacy open policy");
                 return Ok(SecurityCheckResult::Allow);
             }
@@ -235,21 +250,6 @@ impl ToolSecurityEngine {
             return Ok(SecurityCheckResult::Unavailable {
                 reason: format!("Tool '{}' is disabled", tool_id),
             });
-        }
-
-        if let Some(rate_limit) = tool_config.rate_limit {
-            let calls = self
-                .tool_call_tracker
-                .read()
-                .get_calls_in_window(tool_id, 60);
-            if calls >= rate_limit as usize {
-                return Ok(SecurityCheckResult::Block {
-                    reason: format!(
-                        "Rate limit exceeded for tool '{}': {} calls per minute",
-                        tool_id, rate_limit
-                    ),
-                });
-            }
         }
 
         if let Some(result) =
@@ -282,10 +282,43 @@ impl ToolSecurityEngine {
             return Ok(SecurityCheckResult::RequireConfirmation { message });
         }
 
-        self.tool_call_tracker.write().record_call(tool_id);
-        debug!(tool_id = %tool_id, "Tool execution allowed");
-
+        debug!(tool_id = %tool_id, "Tool execution allowed by policy validation");
         Ok(SecurityCheckResult::Allow)
+    }
+
+    pub fn admit_tool_execution(&self, tool_id: &str) -> SecurityCheckResult {
+        if !self.config.enabled {
+            return SecurityCheckResult::Allow;
+        }
+        let tool_config = match self.config.tools.get(tool_id) {
+            Some(config) => config,
+            None if self.config.fail_closed => {
+                return SecurityCheckResult::Block {
+                    reason: format!("Tool '{}' has no explicit security policy", tool_id),
+                };
+            }
+            None => {
+                self.tool_call_tracker.write().admit(tool_id, None);
+                return SecurityCheckResult::Allow;
+            }
+        };
+        if !tool_config.enabled {
+            return SecurityCheckResult::Unavailable {
+                reason: format!("Tool '{}' is disabled", tool_id),
+            };
+        }
+        let mut tracker = self.tool_call_tracker.write();
+        if !tracker.admit(tool_id, tool_config.rate_limit) {
+            let rate_limit = tool_config.rate_limit.unwrap_or_default();
+            return SecurityCheckResult::Block {
+                reason: format!(
+                    "Rate limit exceeded for tool '{}': {} calls per minute",
+                    tool_id, rate_limit
+                ),
+            };
+        }
+        debug!(tool_id = %tool_id, "Tool execution admitted");
+        SecurityCheckResult::Allow
     }
 
     pub fn check_command_execution(
@@ -462,7 +495,7 @@ impl ToolSecurityEngine {
                 .iter()
                 .chain(tool_config.paths.deny.iter())
             {
-                if path_matches_bound(pattern, &value.path, &normalized) {
+                if path_matches_restricted(pattern, &value.path, &normalized) {
                     return Some(SecurityCheckResult::Block {
                         reason: format!("Path is blocked for tool '{}'", tool_id),
                     });
@@ -470,7 +503,7 @@ impl ToolSecurityEngine {
             }
 
             for pattern in tool_config.paths.unavailable.iter() {
-                if path_matches_bound(pattern, &value.path, &normalized) {
+                if path_matches_restricted(pattern, &value.path, &normalized) {
                     return Some(SecurityCheckResult::Unavailable {
                         reason: format!("Path is unavailable for tool '{}'", tool_id),
                     });
@@ -478,7 +511,7 @@ impl ToolSecurityEngine {
             }
 
             for pattern in tool_config.paths.requires_approval.iter() {
-                if path_matches_bound(pattern, &value.path, &normalized) {
+                if path_matches_restricted(pattern, &value.path, &normalized) {
                     return Some(SecurityCheckResult::RequireConfirmation {
                         message: format!(
                             "Confirm access to path '{}' for tool '{}' ?",
@@ -498,7 +531,7 @@ impl ToolSecurityEngine {
                 let dry_run = args
                     .get("dry_run")
                     .and_then(Value::as_bool)
-                    .unwrap_or_else(|| default_dry_run_for_tool(tool_id));
+                    .unwrap_or(false);
                 if matches!(tool_config.no_write_policy, NoWritePolicyBehavior::Deny) || !dry_run {
                     return Some(SecurityCheckResult::Block {
                         reason: format!(
@@ -521,7 +554,7 @@ impl ToolSecurityEngine {
             if !allowed.is_empty()
                 && !allowed
                     .iter()
-                    .any(|pattern| path_matches_bound(pattern, &value.path, &normalized))
+                    .any(|pattern| path_matches_allowed(pattern, &value.path, &normalized))
             {
                 return Some(SecurityCheckResult::Block {
                     reason: format!("Path not in allowed list for tool '{}'", tool_id),
@@ -866,6 +899,24 @@ fn legacy_policy_bindings(tool_id: &str) -> ToolPolicyBindings {
                 ResultLimitBinding::new("max_changed_files", ResultLimitKind::MaxChangedFiles),
                 ResultLimitBinding::new("max_changed_lines", ResultLimitKind::MaxChangedLines),
             ],
+            ..Default::default()
+        },
+        "copy_path" => ToolPolicyBindings {
+            path_fields: vec![
+                PathPolicyBinding::read("source_path"),
+                PathPolicyBinding::write("destination_path"),
+            ],
+            ..Default::default()
+        },
+        "move_path" => ToolPolicyBindings {
+            path_fields: vec![
+                PathPolicyBinding::read_write("source_path"),
+                PathPolicyBinding::write("destination_path"),
+            ],
+            ..Default::default()
+        },
+        "delete_path" => ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::write("path")],
             ..Default::default()
         },
         "command" => ToolPolicyBindings {
@@ -1316,22 +1367,38 @@ fn path_matches(pattern: &str, path: &Path) -> bool {
     path.starts_with(pattern)
 }
 
-fn path_matches_bound(pattern: &str, raw_path: &str, normalized: &Path) -> bool {
+fn path_matches_allowed(pattern: &str, raw_path: &str, normalized: &Path) -> bool {
     if !path_matches(pattern, normalized) {
         return false;
     }
-    let raw = Path::new(raw_path);
     let pattern_path = Path::new(pattern);
-    let Ok(resolved) = resolve_existing_or_parent(raw) else {
+    if !pattern_path.exists() {
+        return true;
+    }
+    let Ok(resolved) = resolve_existing_or_parent(Path::new(raw_path)) else {
         return false;
     };
-    if pattern_path.exists() {
-        let Ok(resolved_pattern) = pattern_path.canonicalize() else {
-            return false;
-        };
-        return resolved.starts_with(resolved_pattern.components().collect::<PathBuf>());
+    let Ok(resolved_pattern) = pattern_path.canonicalize() else {
+        return false;
+    };
+    resolved.starts_with(resolved_pattern.components().collect::<PathBuf>())
+}
+
+fn path_matches_restricted(pattern: &str, raw_path: &str, normalized: &Path) -> bool {
+    if path_matches(pattern, normalized) {
+        return true;
     }
-    true
+    let pattern_path = Path::new(pattern);
+    if !pattern_path.exists() {
+        return false;
+    }
+    let Ok(resolved) = resolve_existing_or_parent(Path::new(raw_path)) else {
+        return false;
+    };
+    let Ok(resolved_pattern) = pattern_path.canonicalize() else {
+        return false;
+    };
+    resolved.starts_with(resolved_pattern.components().collect::<PathBuf>())
 }
 
 fn resolve_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
@@ -1357,10 +1424,6 @@ fn resolve_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
         resolved.push(component);
     }
     Ok(resolved.components().collect())
-}
-
-fn default_dry_run_for_tool(tool_id: &str) -> bool {
-    tool_id == "patch"
 }
 
 fn contains_casefold(values: &[String], needle: &str) -> bool {
@@ -1721,6 +1784,45 @@ mod tests {
         assert!(blocked.is_blocked());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn blocked_path_cannot_be_reached_through_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("private");
+        let public = root.path().join("public");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&public).unwrap();
+        symlink(&private, public.join("alias")).unwrap();
+
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        config.fail_closed = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.read_paths = vec![root.path().to_string_lossy().into_owned()];
+        tool_config.blocked_paths = vec![private.to_string_lossy().into_owned()];
+        config
+            .tools
+            .insert("custom_search".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+        let bindings = ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("root")],
+            ..Default::default()
+        };
+
+        let result = engine
+            .check_tool_execution_with_bindings(
+                "custom_search",
+                &serde_json::json!({"root": public.join("alias/secret.txt")}),
+                &bindings,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_blocked());
+    }
+
     #[test]
     fn custom_config_is_exposed_separately() {
         let mut config = ToolSecurityConfig::default();
@@ -1928,6 +2030,113 @@ mod tests {
             .await
             .unwrap();
         assert!(blocked.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn validation_does_not_consume_rate_limit_admission() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.rate_limit = Some(1);
+        config.tools.insert("limited".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+        let bindings = legacy_policy_bindings("limited");
+
+        for _ in 0..3 {
+            let result = engine
+                .validate_tool_execution_with_bindings("limited", &serde_json::json!({}), &bindings)
+                .await
+                .unwrap();
+            assert!(result.is_allowed());
+        }
+        assert!(engine.admit_tool_execution("limited").is_allowed());
+        assert!(engine.admit_tool_execution("limited").is_blocked());
+    }
+
+    #[tokio::test]
+    async fn public_check_preserves_rate_limit_admission() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.rate_limit = Some(1);
+        config.tools.insert("limited".to_string(), tool_config);
+        let engine = ToolSecurityEngine::new(config);
+
+        let first = engine
+            .check_tool_execution("limited", &serde_json::json!({}))
+            .await
+            .unwrap();
+        let second = engine
+            .check_tool_execution("limited", &serde_json::json!({}))
+            .await
+            .unwrap();
+
+        assert!(first.is_allowed());
+        assert!(second.is_blocked());
+    }
+
+    #[test]
+    fn concurrent_rate_limit_admission_is_atomic() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        let mut tool_config = ToolPolicyConfig::default();
+        tool_config.rate_limit = Some(1);
+        config.tools.insert("limited".to_string(), tool_config);
+        let engine = Arc::new(ToolSecurityEngine::new_with_policy_version(config, 17));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let engine = Arc::clone(&engine);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    engine.admit_tool_execution("limited").is_allowed()
+                })
+            })
+            .collect::<Vec<_>>();
+        let admitted = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|admitted| *admitted)
+            .count();
+
+        assert_eq!(admitted, 1);
+        assert_eq!(engine.policy_version(), 17);
+    }
+
+    #[tokio::test]
+    async fn omitted_dry_run_is_treated_as_actual_mutation() {
+        let mut config = ToolSecurityConfig::default();
+        config.enabled = true;
+        for tool_id in ["file_edit", "copy_path"] {
+            let mut tool_config = ToolPolicyConfig::default();
+            tool_config.no_write_policy = NoWritePolicyBehavior::DryRunOnly;
+            config.tools.insert(tool_id.to_string(), tool_config);
+        }
+        let engine = ToolSecurityEngine::new(config);
+
+        let edit = engine
+            .check_tool_execution_with_bindings(
+                "file_edit",
+                &serde_json::json!({"path": "./note.txt"}),
+                &legacy_policy_bindings("file_edit"),
+            )
+            .await
+            .unwrap();
+        assert!(edit.is_blocked());
+
+        let copy = engine
+            .check_tool_execution_with_bindings(
+                "copy_path",
+                &serde_json::json!({
+                    "source_path": "./source.txt",
+                    "destination_path": "./destination.txt"
+                }),
+                &legacy_policy_bindings("copy_path"),
+            )
+            .await
+            .unwrap();
+        assert!(copy.is_blocked());
     }
 
     #[tokio::test]

@@ -42,6 +42,44 @@ struct BudgetReservation {
     cost_usd: f64,
 }
 
+// Provider futures can be dropped at any await, so reservation cleanup must be owned by a drop guard.
+struct PendingBudgetReservation {
+    tracker: ScenarioBudgetTracker,
+    reservation: Option<BudgetReservation>,
+}
+
+impl PendingBudgetReservation {
+    fn new(tracker: ScenarioBudgetTracker, reservation: BudgetReservation) -> Self {
+        Self {
+            tracker,
+            reservation: Some(reservation),
+        }
+    }
+
+    fn finish(
+        &mut self,
+        provider: &BudgetProviderConfig,
+        usage: TokenUsage,
+    ) -> Result<(), LLMError> {
+        let Some(reservation) = self.reservation.take() else {
+            return Ok(());
+        };
+        self.tracker.finish(provider, reservation, usage)
+    }
+
+    fn finish_unknown(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            self.tracker.finish_unknown(reservation);
+        }
+    }
+}
+
+impl Drop for PendingBudgetReservation {
+    fn drop(&mut self) {
+        self.finish_unknown();
+    }
+}
+
 impl ScenarioBudgetTracker {
     pub(crate) fn new(budget: ScenarioBudget, estimator: Option<CostEstimator>) -> Self {
         Self {
@@ -140,11 +178,17 @@ impl ScenarioBudgetTracker {
     ) -> Result<(), LLMError> {
         let tokens = usage.total_tokens as u64;
         let cost_usd = if self.budget.max_cost_usd.is_some() {
-            self.estimate_cost(
+            match self.estimate_cost(
                 provider,
                 usage.prompt_tokens as u64,
                 usage.completion_tokens as u64,
-            )?
+            ) {
+                Ok(cost_usd) => cost_usd,
+                Err(error) => {
+                    self.finish_unknown(reservation);
+                    return Err(error);
+                }
+            }
         } else {
             0.0
         };
@@ -243,16 +287,17 @@ impl LLMProvider for BudgetedLlmProvider {
         config: Option<&LLMConfig>,
     ) -> Result<LLMResponse, LLMError> {
         let reservation = self.tracker.reserve(&self.provider, messages, config)?;
+        let mut pending = PendingBudgetReservation::new(self.tracker.clone(), reservation);
         match self.inner.complete(messages, config).await {
             Ok(response) => {
                 let usage = response
                     .usage
                     .unwrap_or_else(|| estimate_usage(messages, &response.content));
-                self.tracker.finish(&self.provider, reservation, usage)?;
+                pending.finish(&self.provider, usage)?;
                 Ok(response)
             }
             Err(error) => {
-                self.tracker.finish_unknown(reservation);
+                pending.finish_unknown();
                 Err(error)
             }
         }
@@ -264,18 +309,18 @@ impl LLMProvider for BudgetedLlmProvider {
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError> {
         let reservation = self.tracker.reserve(&self.provider, messages, config)?;
+        let mut pending = PendingBudgetReservation::new(self.tracker.clone(), reservation);
         match self.inner.complete_stream(messages, config).await {
             Ok(stream) => Ok(Box::new(BudgetedLlmStream {
                 inner: stream,
-                tracker: self.tracker.clone(),
                 provider: self.provider.clone(),
-                reservation: Some(reservation),
+                pending,
                 input_tokens: estimate_message_tokens(messages),
                 output_chars: 0,
                 done: false,
             })),
             Err(error) => {
-                self.tracker.finish_unknown(reservation);
+                pending.finish_unknown();
                 Err(error)
             }
         }
@@ -292,9 +337,8 @@ impl LLMProvider for BudgetedLlmProvider {
 
 struct BudgetedLlmStream {
     inner: Box<dyn Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>,
-    tracker: ScenarioBudgetTracker,
     provider: BudgetProviderConfig,
-    reservation: Option<BudgetReservation>,
+    pending: PendingBudgetReservation,
     input_tokens: u64,
     output_chars: usize,
     done: bool,
@@ -302,9 +346,6 @@ struct BudgetedLlmStream {
 
 impl BudgetedLlmStream {
     fn finish(&mut self, usage: Option<TokenUsage>) -> Result<(), LLMError> {
-        let Some(reservation) = self.reservation.take() else {
-            return Ok(());
-        };
         let usage = usage.unwrap_or_else(|| TokenUsage {
             prompt_tokens: self.input_tokens.min(u32::MAX as u64) as u32,
             completion_tokens: estimate_chars(self.output_chars).min(u32::MAX as u64) as u32,
@@ -313,13 +354,11 @@ impl BudgetedLlmStream {
                 .saturating_add(estimate_chars(self.output_chars))
                 .min(u32::MAX as u64) as u32,
         });
-        self.tracker.finish(&self.provider, reservation, usage)
+        self.pending.finish(&self.provider, usage)
     }
 
     fn finish_unknown(&mut self) {
-        if let Some(reservation) = self.reservation.take() {
-            self.tracker.finish_unknown(reservation);
-        }
+        self.pending.finish_unknown();
     }
 }
 
@@ -397,6 +436,7 @@ mod tests {
     use ai_agents_observability::{CostConfig, ModelPricing};
     use futures::StreamExt;
     use std::collections::HashMap;
+    use tokio::sync::Notify;
 
     use super::*;
 
@@ -412,6 +452,83 @@ mod tests {
             model: "test".to_string(),
             max_output_tokens: 10,
         }
+    }
+
+    struct PendingProvider {
+        started: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PendingProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<LLMResponse, LLMError> {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<Box<dyn Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
+        {
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        fn provider_name(&self) -> &str {
+            "pending"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    struct PendingStreamProvider;
+
+    #[async_trait]
+    impl LLMProvider for PendingStreamProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<LLMResponse, LLMError> {
+            Ok(LLMResponse::new("ok", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<Box<dyn Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
+        {
+            Ok(Box::new(futures::stream::pending()))
+        }
+
+        fn provider_name(&self) -> &str {
+            "pending-stream"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    fn cost_estimator() -> CostEstimator {
+        CostEstimator::new(CostConfig {
+            pricing: HashMap::from([(
+                "openai/test".to_string(),
+                ModelPricing {
+                    input_per_1k: 1.0,
+                    output_per_1k: 1.0,
+                },
+            )]),
+            ..Default::default()
+        })
     }
 
     #[tokio::test]
@@ -502,6 +619,147 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_error_finalizes_reservation_once() {
+        let tracker = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_llm_calls: Some(1),
+                max_total_tokens: Some(100),
+                ..Default::default()
+            },
+            None,
+        );
+        let mut inner = MockLLMProvider::new("budget-error");
+        inner.set_error("provider failed");
+        let wrapped = tracker.wrap(Arc::new(inner), provider_config());
+        let messages = [ChatMessage::user("hello")];
+        let expected_tokens = upper_bound_message_tokens(&messages) + 10;
+
+        assert!(wrapped.complete(&messages, None).await.is_err());
+
+        let state = tracker.lock_state();
+        assert_eq!(state.llm_calls, 1);
+        assert_eq!(state.tokens_reserved, 0);
+        assert_eq!(state.tokens_used, expected_tokens);
+    }
+
+    #[tokio::test]
+    async fn blocking_cancellation_finalizes_reservation_once() {
+        let tracker = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_llm_calls: Some(2),
+                max_total_tokens: Some(1_000),
+                max_cost_usd: Some(10.0),
+            },
+            Some(cost_estimator()),
+        );
+        let started = Arc::new(Notify::new());
+        let wrapped = tracker.wrap(
+            Arc::new(PendingProvider {
+                started: Arc::clone(&started),
+            }),
+            provider_config(),
+        );
+        let task =
+            tokio::spawn(
+                async move { wrapped.complete(&[ChatMessage::user("hello")], None).await },
+            );
+        started.notified().await;
+        let (reserved_tokens, reserved_cost) = {
+            let state = tracker.lock_state();
+            assert_eq!(state.llm_calls, 1);
+            assert!(state.tokens_reserved > 0);
+            assert!(state.cost_reserved_usd > 0.0);
+            (state.tokens_reserved, state.cost_reserved_usd)
+        };
+
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+
+        let state = tracker.lock_state();
+        assert_eq!(state.llm_calls, 1);
+        assert_eq!(state.tokens_reserved, 0);
+        assert_eq!(state.cost_reserved_usd, 0.0);
+        assert_eq!(state.tokens_used, reserved_tokens);
+        assert!((state.cost_used_usd - reserved_cost).abs() < f64::EPSILON);
+        drop(state);
+
+        let next = tracker.wrap(provider(), provider_config());
+        assert!(
+            next.complete(&[ChatMessage::user("next")], None)
+                .await
+                .is_ok()
+        );
+        assert_eq!(tracker.lock_state().tokens_reserved, 0);
+    }
+
+    #[tokio::test]
+    async fn stream_creation_cancellation_finalizes_reservation_once() {
+        let tracker = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_llm_calls: Some(2),
+                max_total_tokens: Some(1_000),
+                max_cost_usd: Some(10.0),
+            },
+            Some(cost_estimator()),
+        );
+        let started = Arc::new(Notify::new());
+        let wrapped = tracker.wrap(
+            Arc::new(PendingProvider {
+                started: Arc::clone(&started),
+            }),
+            provider_config(),
+        );
+        let task = tokio::spawn(async move {
+            wrapped
+                .complete_stream(&[ChatMessage::user("hello")], None)
+                .await
+        });
+        started.notified().await;
+        let (reserved_tokens, reserved_cost) = {
+            let state = tracker.lock_state();
+            assert_eq!(state.llm_calls, 1);
+            assert!(state.tokens_reserved > 0);
+            assert!(state.cost_reserved_usd > 0.0);
+            (state.tokens_reserved, state.cost_reserved_usd)
+        };
+
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+
+        let state = tracker.lock_state();
+        assert_eq!(state.llm_calls, 1);
+        assert_eq!(state.tokens_reserved, 0);
+        assert_eq!(state.cost_reserved_usd, 0.0);
+        assert_eq!(state.tokens_used, reserved_tokens);
+        assert!((state.cost_used_usd - reserved_cost).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn dropping_returned_stream_finalizes_reservation_once() {
+        let tracker = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_llm_calls: Some(1),
+                max_total_tokens: Some(100),
+                ..Default::default()
+            },
+            None,
+        );
+        let wrapped = tracker.wrap(Arc::new(PendingStreamProvider), provider_config());
+        let stream = wrapped
+            .complete_stream(&[ChatMessage::user("hello")], None)
+            .await
+            .unwrap();
+        let reserved_tokens = tracker.lock_state().tokens_reserved;
+        assert!(reserved_tokens > 0);
+
+        drop(stream);
+
+        let state = tracker.lock_state();
+        assert_eq!(state.tokens_reserved, 0);
+        assert_eq!(state.tokens_used, reserved_tokens);
+    }
+
+    #[tokio::test]
     async fn streaming_call_finishes_within_budget() {
         let tracker = ScenarioBudgetTracker::new(
             ScenarioBudget {
@@ -519,6 +777,11 @@ mod tests {
         while let Some(chunk) = stream.next().await {
             chunk.unwrap();
         }
+        let used_after_completion = tracker.lock_state().tokens_used;
+        assert!(used_after_completion > 0);
+        assert_eq!(tracker.lock_state().tokens_reserved, 0);
+        drop(stream);
+        assert_eq!(tracker.lock_state().tokens_used, used_after_completion);
         assert!(!tracker.has_failed());
     }
 }

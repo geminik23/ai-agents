@@ -47,7 +47,7 @@ tool_security:
       timeout_ms: 10000        # provider call timeout. default: 10000
       rate_limit: 10           # max calls per minute. default: unlimited
     web_fetch:
-      max_chars: 12000
+      max_output_chars: 12000
       timeout_ms: 10000
 
 metadata:

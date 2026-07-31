@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 
@@ -133,8 +134,8 @@ struct PatchInput {
     /// Base path for relative patch paths. Defaults to current directory.
     #[serde(default)]
     base_path: Option<String>,
-    /// Validate and return a summary without applying. Defaults to true.
-    #[serde(default = "default_true")]
+    /// Validate and return a summary without applying.
+    #[serde(default)]
     dry_run: bool,
     /// Permit creating new files when policy allows it.
     #[serde(default)]
@@ -148,6 +149,7 @@ struct PatchInput {
 struct MutationOutput {
     path: Option<String>,
     dry_run: bool,
+    mutation_performed: bool,
     changed_files: usize,
     changed_lines: usize,
     replacements: usize,
@@ -298,15 +300,18 @@ impl Tool for FileWriteTool {
                 "mutation exceeds configured changed-file or changed-line cap",
             );
         }
-        let diff_summary = if exists {
-            format!(
-                "overwrite {} with {} bytes",
-                input.path,
-                input.content.len()
-            )
-        } else {
-            format!("create {} with {} bytes", input.path, input.content.len())
+        let action = match (input.dry_run, exists) {
+            (true, true) => "plan to overwrite",
+            (true, false) => "plan to create",
+            (false, true) => "overwrote",
+            (false, false) => "created",
         };
+        let diff_summary = format!(
+            "{} {} with {} bytes",
+            action,
+            input.path,
+            input.content.len()
+        );
         let version = if input.dry_run {
             None
         } else {
@@ -324,6 +329,7 @@ impl Tool for FileWriteTool {
         json_result(&MutationOutput {
             path: Some(input.path.clone()),
             dry_run: input.dry_run,
+            mutation_performed: !input.dry_run,
             changed_files: 1,
             changed_lines,
             replacements: 0,
@@ -332,8 +338,8 @@ impl Tool for FileWriteTool {
             } else {
                 input.content.len()
             },
-            created: !exists,
-            overwritten: exists,
+            created: !input.dry_run && !exists,
+            overwritten: !input.dry_run && exists,
             truncated: false,
             approval_required: !input.dry_run && policy.approval_required(),
             diff_summary,
@@ -406,6 +412,7 @@ impl Tool for FileEditTool {
             let output = MutationOutput {
                 path: Some(input.path),
                 dry_run: input.dry_run,
+                mutation_performed: false,
                 changed_files: 0,
                 changed_lines: 0,
                 replacements: 0,
@@ -477,12 +484,13 @@ impl Tool for FileEditTool {
         json_result(&MutationOutput {
             path: Some(input.path.clone()),
             dry_run: input.dry_run,
+            mutation_performed: !input.dry_run,
             changed_files: 1,
             changed_lines,
             replacements,
             bytes_written: if input.dry_run { 0 } else { edited.len() },
             created: false,
-            overwritten: true,
+            overwritten: !input.dry_run,
             truncated: diff_summary.chars().count() >= DEFAULT_MAX_OUTPUT_CHARS,
             approval_required: !input.dry_run && policy.approval_required(),
             diff_summary,
@@ -561,6 +569,7 @@ impl Tool for PatchTool {
         }
         let mut changed_lines = 0usize;
         let mut changed_paths = Vec::new();
+        let mut target_paths = HashSet::new();
         let mut outputs = Vec::new();
         for file in &files {
             changed_lines += file.changed_lines();
@@ -582,15 +591,39 @@ impl Tool for PatchTool {
             if let Err(reason) = ensure_write_allowed(&path, input.dry_run, &policy) {
                 return ToolResult::error(reason);
             }
+            if !target_paths.insert(normalize_path(&path)) {
+                return ToolResult::error("patch contains duplicate target paths");
+            }
             let exists = path.exists();
+            if exists {
+                match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        return ToolResult::error("patch targets must not be symbolic links");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return ToolResult::error(format!("Patch metadata error: {}", error));
+                    }
+                }
+            }
             if file.is_delete() && !exists {
                 return ToolResult::error("patch deletes a file that does not exist");
             }
-            if file.is_new_file() && !input.allow_new_files.unwrap_or(false) {
-                return ToolResult::error("patch creates a file but allow_new_files is false");
+            if file.is_new_file() {
+                if !input.allow_new_files.unwrap_or(false) {
+                    return ToolResult::error("patch creates a file but allow_new_files is false");
+                }
+                if exists {
+                    return ToolResult::error("new-file patch target already exists");
+                }
+            } else if !file.is_delete() && !exists {
+                return ToolResult::error("patch updates a file that does not exist");
             }
             if let Some(parent) = path.parent() {
-                if !parent.exists() && !policy.create_parent_dirs && !input.dry_run {
+                if parent.exists() && !parent.is_dir() {
+                    return ToolResult::error("patch target parent is not a directory");
+                }
+                if !parent.exists() && !policy.create_parent_dirs {
                     return ToolResult::error(
                         "patch parent directory creation is not allowed by policy",
                     );
@@ -601,13 +634,20 @@ impl Tool for PatchTool {
                     return ToolResult::error(reason);
                 }
             }
-            let original = if exists {
-                match fs::read_to_string(&path) {
-                    Ok(content) => content,
+            let (original, expected) = if exists {
+                let snapshot = match read_file_snapshot(&path) {
+                    Ok(snapshot) => snapshot,
                     Err(error) => return ToolResult::error(format!("Read error: {}", error)),
-                }
+                };
+                let content = match String::from_utf8(snapshot.bytes.clone()) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        return ToolResult::error(format!("Read error: {}", error));
+                    }
+                };
+                (content, ExpectedPathState::Present(snapshot))
             } else {
-                String::new()
+                (String::new(), ExpectedPathState::Absent)
             };
             let edited = match apply_file_patch(&original, file) {
                 Ok(edited) => edited,
@@ -615,41 +655,26 @@ impl Tool for PatchTool {
             };
             changed_paths.push(path.to_string_lossy().to_string());
             if file.is_delete() {
-                outputs.push(PatchApply::Delete(path));
+                let ExpectedPathState::Present(expected) = expected else {
+                    return ToolResult::error("patch delete target disappeared during preflight");
+                };
+                outputs.push(PatchApply::Delete { path, expected });
             } else {
-                outputs.push(PatchApply::Write(path, edited));
+                outputs.push(PatchApply::Write {
+                    path,
+                    content: edited,
+                    expected,
+                });
             }
         }
         if !input.dry_run {
+            if let Err(error) = apply_patch_transaction(&outputs) {
+                return ToolResult::error(error);
+            }
             for output in &outputs {
-                match output {
-                    PatchApply::Delete(path) => {
-                        if let Err(error) = fs::remove_file(path) {
-                            return ToolResult::error(format!("Patch delete error: {}", error));
-                        }
-                    }
-                    PatchApply::Write(path, content) => {
-                        if let Some(parent) = path.parent() {
-                            if !parent.exists() {
-                                if !policy.create_parent_dirs {
-                                    return ToolResult::error(
-                                        "patch parent directory creation is not allowed by policy",
-                                    );
-                                }
-                                if let Err(error) = fs::create_dir_all(parent) {
-                                    return ToolResult::error(format!(
-                                        "Create parent directory error: {}",
-                                        error
-                                    ));
-                                }
-                            }
-                        }
-                        if let Err(error) = atomic_write(path, content.as_bytes()) {
-                            return ToolResult::error(format!("Patch write error: {}", error));
-                        }
-                        if let Ok(version) = file_version_evidence(path, content.as_bytes()) {
-                            self.versions.record(version);
-                        }
+                if let Some((path, content)) = output.written_file() {
+                    if let Ok(version) = file_version_evidence(path, content.as_bytes()) {
+                        self.versions.record(version);
                     }
                 }
             }
@@ -658,22 +683,20 @@ impl Tool for PatchTool {
         json_result(&MutationOutput {
             path: Some(base_path.to_string_lossy().to_string()),
             dry_run: input.dry_run,
+            mutation_performed: !input.dry_run && !files.is_empty(),
             changed_files: files.len(),
             changed_lines,
             replacements: 0,
             bytes_written: if input.dry_run {
                 0
             } else {
-                outputs
-                    .iter()
-                    .map(|output| match output {
-                        PatchApply::Write(_, content) => content.len(),
-                        PatchApply::Delete(_) => 0,
-                    })
-                    .sum()
+                outputs.iter().map(PatchApply::bytes_written).sum()
             },
-            created: false,
-            overwritten: !outputs.is_empty(),
+            created: !input.dry_run && files.iter().any(PatchFile::is_new_file),
+            overwritten: !input.dry_run
+                && files
+                    .iter()
+                    .any(|file| !file.is_new_file() && !file.is_delete()),
             truncated: diff_summary.chars().count() >= DEFAULT_MAX_OUTPUT_CHARS,
             approval_required: !input.dry_run && policy.approval_required(),
             diff_summary,
@@ -718,9 +741,373 @@ impl PatchFile {
 }
 
 #[derive(Debug, Clone)]
+struct FileSnapshot {
+    bytes: Vec<u8>,
+    permissions: fs::Permissions,
+}
+
+#[derive(Debug, Clone)]
+enum ExpectedPathState {
+    Absent,
+    Present(FileSnapshot),
+}
+
+#[derive(Debug, Clone)]
 enum PatchApply {
-    Write(PathBuf, String),
-    Delete(PathBuf),
+    Write {
+        path: PathBuf,
+        content: String,
+        expected: ExpectedPathState,
+    },
+    Delete {
+        path: PathBuf,
+        expected: FileSnapshot,
+    },
+}
+
+impl PatchApply {
+    fn bytes_written(&self) -> usize {
+        match self {
+            Self::Write { content, .. } => content.len(),
+            Self::Delete { .. } => 0,
+        }
+    }
+
+    fn written_file(&self) -> Option<(&Path, &str)> {
+        match self {
+            Self::Write { path, content, .. } => Some((path, content)),
+            Self::Delete { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PatchRollback {
+    RestoreWrite {
+        path: PathBuf,
+        original: FileSnapshot,
+        written: Vec<u8>,
+        written_permissions: fs::Permissions,
+    },
+    RestoreDelete {
+        path: PathBuf,
+        original: FileSnapshot,
+    },
+    RemoveCreated {
+        path: PathBuf,
+        written: Vec<u8>,
+    },
+}
+
+fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
+    let mut rollbacks = Vec::new();
+    let mut created_directories = Vec::new();
+    for output in outputs {
+        match output {
+            PatchApply::Delete { path, expected } => {
+                if let Err(error) = verify_present_snapshot(path, expected, "pre-apply") {
+                    return fail_patch_transaction(error, &rollbacks, &created_directories);
+                }
+                if let Err(error) = fs::remove_file(path) {
+                    return fail_patch_transaction(
+                        format!("Patch delete error: {}", error),
+                        &rollbacks,
+                        &created_directories,
+                    );
+                }
+                rollbacks.push(PatchRollback::RestoreDelete {
+                    path: path.clone(),
+                    original: expected.clone(),
+                });
+            }
+            PatchApply::Write {
+                path,
+                content,
+                expected,
+            } => {
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() {
+                        let missing = missing_directories(parent);
+                        if let Err(error) = fs::create_dir_all(parent) {
+                            let cleanup_error = cleanup_created_directories(&missing).err();
+                            let error = match cleanup_error {
+                                Some(cleanup_error) => format!(
+                                    "Create parent directory error: {}; partial directory creation may remain: {}",
+                                    error, cleanup_error
+                                ),
+                                None => format!("Create parent directory error: {}", error),
+                            };
+                            return fail_patch_transaction(error, &rollbacks, &created_directories);
+                        }
+                        created_directories.extend(missing);
+                    }
+                }
+                if let Err(error) = verify_expected_state(path, expected, "pre-apply") {
+                    return fail_patch_transaction(error, &rollbacks, &created_directories);
+                }
+                if let Err(error) = atomic_write(path, content.as_bytes()) {
+                    return fail_patch_transaction(
+                        format!("Patch write error: {}", error),
+                        &rollbacks,
+                        &created_directories,
+                    );
+                }
+                let written = content.as_bytes().to_vec();
+                match expected {
+                    ExpectedPathState::Present(original) => {
+                        let rollback = PatchRollback::RestoreWrite {
+                            path: path.clone(),
+                            original: original.clone(),
+                            written,
+                            written_permissions: original.permissions.clone(),
+                        };
+                        if let Err(error) = fs::set_permissions(path, original.permissions.clone())
+                        {
+                            rollbacks.push(rollback);
+                            return fail_patch_transaction(
+                                format!("Patch permission restore error: {}", error),
+                                &rollbacks,
+                                &created_directories,
+                            );
+                        }
+                        rollbacks.push(rollback);
+                    }
+                    ExpectedPathState::Absent => {
+                        rollbacks.push(PatchRollback::RemoveCreated {
+                            path: path.clone(),
+                            written,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn fail_patch_transaction(
+    error: String,
+    rollbacks: &[PatchRollback],
+    created_directories: &[PathBuf],
+) -> Result<(), String> {
+    match rollback_patch(rollbacks, created_directories) {
+        Ok(()) => Err(format!("{}; no patch changes were retained", error)),
+        Err(rollback_error) => Err(format!(
+            "{}; partial patch application may remain because rollback failed: {}",
+            error, rollback_error
+        )),
+    }
+}
+
+fn rollback_patch(
+    rollbacks: &[PatchRollback],
+    created_directories: &[PathBuf],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for rollback in rollbacks.iter().rev() {
+        let result = match rollback {
+            PatchRollback::RestoreWrite {
+                path,
+                original,
+                written,
+                written_permissions,
+            } => verify_present_content_and_permissions(
+                path,
+                written,
+                written_permissions,
+                "rollback",
+            )
+            .and_then(|_| restore_file_snapshot(path, original)),
+            PatchRollback::RestoreDelete { path, original } => {
+                verify_absent(path, "rollback").and_then(|_| restore_file_snapshot(path, original))
+            }
+            PatchRollback::RemoveCreated { path, written } => {
+                verify_present_content(path, written, "rollback").and_then(|_| {
+                    fs::remove_file(path).map_err(|error| {
+                        format!(
+                            "Patch rollback remove error for {}: {}",
+                            path.display(),
+                            error
+                        )
+                    })
+                })
+            }
+        };
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = cleanup_created_directories(created_directories) {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn read_file_snapshot(path: &Path) -> std::io::Result<FileSnapshot> {
+    let mut file = fs::File::open(path)?;
+    let permissions = file.metadata()?.permissions();
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(FileSnapshot { bytes, permissions })
+}
+
+fn verify_expected_state(
+    path: &Path,
+    expected: &ExpectedPathState,
+    stage: &str,
+) -> Result<(), String> {
+    match expected {
+        ExpectedPathState::Absent => verify_absent(path, stage),
+        ExpectedPathState::Present(expected) => verify_present_snapshot(path, expected, stage),
+    }
+}
+
+fn verify_absent(path: &Path, stage: &str) -> Result<(), String> {
+    if path.exists() {
+        Err(format!(
+            "Patch {} conflict for {}: expected path to be absent",
+            stage,
+            path.display()
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_present_snapshot(
+    path: &Path,
+    expected: &FileSnapshot,
+    stage: &str,
+) -> Result<(), String> {
+    let current = read_file_snapshot(path).map_err(|error| {
+        format!(
+            "Patch {} conflict for {}: expected file could not be read: {}",
+            stage,
+            path.display(),
+            error
+        )
+    })?;
+    if current.bytes != expected.bytes
+        || !permissions_match(&current.permissions, &expected.permissions)
+    {
+        return Err(format!(
+            "Patch {} conflict for {}: file changed since the expected state",
+            stage,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_present_content(path: &Path, expected: &[u8], stage: &str) -> Result<(), String> {
+    let current = fs::read(path).map_err(|error| {
+        format!(
+            "Patch {} conflict for {}: expected file could not be read: {}",
+            stage,
+            path.display(),
+            error
+        )
+    })?;
+    if current != expected {
+        return Err(format!(
+            "Patch {} conflict for {}: file content changed since the transaction write",
+            stage,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_present_content_and_permissions(
+    path: &Path,
+    expected: &[u8],
+    expected_permissions: &fs::Permissions,
+    stage: &str,
+) -> Result<(), String> {
+    verify_present_content(path, expected, stage)?;
+    let current = fs::metadata(path).map_err(|error| {
+        format!(
+            "Patch {} conflict for {}: expected file metadata could not be read: {}",
+            stage,
+            path.display(),
+            error
+        )
+    })?;
+    if !permissions_match(&current.permissions(), expected_permissions) {
+        return Err(format!(
+            "Patch {} conflict for {}: file permissions changed since the transaction write",
+            stage,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn restore_file_snapshot(path: &Path, snapshot: &FileSnapshot) -> Result<(), String> {
+    atomic_write(path, &snapshot.bytes).map_err(|error| {
+        format!(
+            "Patch rollback restore error for {}: {}",
+            path.display(),
+            error
+        )
+    })?;
+    fs::set_permissions(path, snapshot.permissions.clone()).map_err(|error| {
+        format!(
+            "Patch rollback permission restore error for {}: {}",
+            path.display(),
+            error
+        )
+    })
+}
+
+fn permissions_match(left: &fs::Permissions, right: &fs::Permissions) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        left.mode() == right.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        left.readonly() == right.readonly()
+    }
+}
+
+fn missing_directories(path: &Path) -> Vec<PathBuf> {
+    let mut missing = Vec::new();
+    let mut current = path;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        current = parent;
+    }
+    missing.reverse();
+    missing
+}
+
+fn cleanup_created_directories(paths: &[PathBuf]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for path in paths.iter().rev() {
+        if let Err(error) = fs::remove_dir(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                errors.push(format!(
+                    "Patch rollback directory cleanup conflict for {}: {}",
+                    path.display(),
+                    error
+                ));
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -753,7 +1140,7 @@ fn mutation_metadata(operation: ToolOperationKind) -> ToolSafetyMetadata {
         open_world: false,
         host_dependent: false,
         requires_user_interaction: false,
-        supports_cancellation: true,
+        supports_cancellation: false,
         default_requires_approval: true,
         should_defer_schema: false,
         max_output_chars: Some(DEFAULT_MAX_OUTPUT_CHARS),
@@ -762,16 +1149,16 @@ fn mutation_metadata(operation: ToolOperationKind) -> ToolSafetyMetadata {
 }
 
 fn mutation_classification(metadata: &ToolSafetyMetadata, args: &Value) -> ToolCallClassification {
-    let default_dry_run = matches!(metadata.operation, ToolOperationKind::Patch);
     let dry_run = args
         .get("dry_run")
         .and_then(Value::as_bool)
-        .unwrap_or(default_dry_run);
+        .unwrap_or(false);
     let mut classification = ToolCallClassification::from_metadata(metadata);
     classification.safely_retryable = dry_run;
     if dry_run {
         classification.read_only = true;
         classification.concurrency_safe = true;
+        classification.destructive = false;
         classification.side_effect_level = ToolSideEffectLevel::None;
         classification.requires_approval = false;
     }
@@ -786,7 +1173,7 @@ fn ensure_write_allowed(
     let normalized = normalize_path(path);
     let resolved = resolve_existing_or_parent(path)?;
     for blocked in &policy.blocked_paths {
-        if path_matches_policy(blocked, &normalized, &resolved)? {
+        if path_matches_restricted_policy(blocked, &normalized, &resolved)? {
             return Err("path is blocked by policy".to_string());
         }
     }
@@ -800,7 +1187,9 @@ fn ensure_write_allowed(
         .write_paths
         .iter()
         .chain(policy.allowed_paths.iter())
-        .any(|allowed| path_matches_policy(allowed, &normalized, &resolved).unwrap_or(false))
+        .any(|allowed| {
+            path_matches_allowed_policy(allowed, &normalized, &resolved).unwrap_or(false)
+        })
     {
         return Err("path is not under an allowed write root".to_string());
     }
@@ -832,12 +1221,16 @@ fn enforce_read_before_write(
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4()));
-    {
+    let result = (|| {
         let mut file = fs::File::create(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
     }
-    fs::rename(temp, path)
+    result
 }
 
 fn validate_safe_target(path: &Path) -> Result<(), String> {
@@ -1112,27 +1505,46 @@ fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
     Ok(resolved.components().collect())
 }
 
-fn path_matches_policy(pattern: &str, normalized: &Path, resolved: &Path) -> Result<bool, String> {
+fn path_matches_allowed_policy(
+    pattern: &str,
+    normalized: &Path,
+    resolved: &Path,
+) -> Result<bool, String> {
     let pattern_path = Path::new(pattern);
     let normalized_pattern = normalize_path(pattern_path);
     if !normalized.starts_with(&normalized_pattern) {
         return Ok(false);
     }
-    if pattern_path.exists() {
-        let resolved_pattern = pattern_path
-            .canonicalize()
-            .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
-        return Ok(resolved.starts_with(resolved_pattern.components().collect::<PathBuf>()));
+    if !pattern_path.exists() {
+        return Ok(true);
     }
-    Ok(true)
+    let resolved_pattern = pattern_path
+        .canonicalize()
+        .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
+    Ok(resolved.starts_with(resolved_pattern.components().collect::<PathBuf>()))
+}
+
+fn path_matches_restricted_policy(
+    pattern: &str,
+    normalized: &Path,
+    resolved: &Path,
+) -> Result<bool, String> {
+    let pattern_path = Path::new(pattern);
+    let normalized_pattern = normalize_path(pattern_path);
+    if normalized.starts_with(&normalized_pattern) {
+        return Ok(true);
+    }
+    if !pattern_path.exists() {
+        return Ok(false);
+    }
+    let resolved_pattern = pattern_path
+        .canonicalize()
+        .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
+    Ok(resolved.starts_with(resolved_pattern.components().collect::<PathBuf>()))
 }
 
 fn exceeds(limit: Option<usize>, value: usize) -> bool {
     limit.is_some_and(|limit| value > limit)
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn json_result<T: Serialize>(output: &T) -> ToolResult {
@@ -1203,7 +1615,7 @@ struct CopyPathInput {
     #[serde(default)]
     create_parent_dirs: bool,
     /// Validate and return a summary without copying.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     dry_run: bool,
 }
 
@@ -1220,7 +1632,7 @@ struct MovePathInput {
     #[serde(default)]
     create_parent_dirs: bool,
     /// Validate and return a summary without moving.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     dry_run: bool,
 }
 
@@ -1232,7 +1644,7 @@ struct DeletePathInput {
     #[serde(default)]
     recursive: bool,
     /// Validate and return a summary without deleting.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     dry_run: bool,
 }
 
@@ -1242,6 +1654,7 @@ struct PathMutationOutput {
     destination_path: Option<String>,
     path: Option<String>,
     dry_run: bool,
+    mutation_performed: bool,
     copied: bool,
     moved: bool,
     deleted: bool,
@@ -1276,7 +1689,7 @@ impl Tool for CopyPathTool {
     }
 
     fn classify_call(&self, args: &Value) -> ToolCallClassification {
-        path_mutation_classification(args)
+        path_mutation_classification(&self.safety_metadata(), args)
     }
 
     fn policy_bindings(&self) -> ToolPolicyBindings {
@@ -1311,6 +1724,13 @@ impl Tool for CopyPathTool {
         if !source.exists() {
             return ToolResult::error(format!("source path does not exist: {}", input.source_path));
         }
+        if let Err(reason) = validate_copy_destination(&source, &destination) {
+            return ToolResult::error(reason);
+        }
+        let (bytes_affected, items_affected, recursive) = match inspect_copy_source(&source) {
+            Ok(details) => details,
+            Err(error) => return ToolResult::error(format!("Copy source error: {}", error)),
+        };
         let destination_exists = destination.exists();
         if destination_exists && !input.overwrite {
             return ToolResult::error("overwrite must be true to replace an existing destination");
@@ -1335,8 +1755,6 @@ impl Tool for CopyPathTool {
                 }
             }
         }
-        let bytes_affected = path_size(&source).unwrap_or(0);
-        let items_affected = path_item_count(&source).unwrap_or(1);
         if !input.dry_run {
             if let Err(error) = copy_path(&source, &destination) {
                 return ToolResult::error(format!("Copy error: {}", error));
@@ -1347,17 +1765,25 @@ impl Tool for CopyPathTool {
             destination_path: Some(input.destination_path.clone()),
             path: None,
             dry_run: input.dry_run,
-            copied: true,
+            mutation_performed: !input.dry_run,
+            copied: !input.dry_run,
             moved: false,
             deleted: false,
-            recursive: source.is_dir(),
-            overwritten: destination_exists,
+            recursive,
+            overwritten: !input.dry_run && destination_exists,
             bytes_affected,
             items_affected,
             approval_required: !input.dry_run && policy.approval_required(),
             diff_summary: format!(
-                "copy {} -> {} ({} bytes)",
-                input.source_path, input.destination_path, bytes_affected
+                "{} {} -> {} ({} bytes)",
+                if input.dry_run {
+                    "plan to copy"
+                } else {
+                    "copied"
+                },
+                input.source_path,
+                input.destination_path,
+                bytes_affected
             ),
         })
     }
@@ -1386,7 +1812,7 @@ impl Tool for MovePathTool {
     }
 
     fn classify_call(&self, args: &Value) -> ToolCallClassification {
-        path_mutation_classification(args)
+        path_mutation_classification(&self.safety_metadata(), args)
     }
 
     fn policy_bindings(&self) -> ToolPolicyBindings {
@@ -1421,6 +1847,17 @@ impl Tool for MovePathTool {
         if !source.exists() {
             return ToolResult::error(format!("source path does not exist: {}", input.source_path));
         }
+        let resolved_source = match source.canonicalize() {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(format!("Source path error: {}", error)),
+        };
+        let resolved_destination = match resolve_existing_or_parent(&destination) {
+            Ok(path) => path,
+            Err(error) => return ToolResult::error(error),
+        };
+        if resolved_source == resolved_destination {
+            return ToolResult::error("source and destination resolve to the same path");
+        }
         let destination_exists = destination.exists();
         if destination_exists && !input.overwrite {
             return ToolResult::error("overwrite must be true to replace an existing destination");
@@ -1445,6 +1882,7 @@ impl Tool for MovePathTool {
                 }
             }
         }
+        let recursive = source.is_dir();
         let bytes_affected = path_size(&source).unwrap_or(0);
         let items_affected = path_item_count(&source).unwrap_or(1);
         if !input.dry_run {
@@ -1457,17 +1895,25 @@ impl Tool for MovePathTool {
             destination_path: Some(input.destination_path.clone()),
             path: None,
             dry_run: input.dry_run,
+            mutation_performed: !input.dry_run,
             copied: false,
-            moved: true,
+            moved: !input.dry_run,
             deleted: false,
-            recursive: source.is_dir(),
-            overwritten: destination_exists,
+            recursive,
+            overwritten: !input.dry_run && destination_exists,
             bytes_affected,
             items_affected,
             approval_required: !input.dry_run && policy.approval_required(),
             diff_summary: format!(
-                "move {} -> {} ({} bytes)",
-                input.source_path, input.destination_path, bytes_affected
+                "{} {} -> {} ({} bytes)",
+                if input.dry_run {
+                    "plan to move"
+                } else {
+                    "moved"
+                },
+                input.source_path,
+                input.destination_path,
+                bytes_affected
             ),
         })
     }
@@ -1496,7 +1942,7 @@ impl Tool for DeletePathTool {
     }
 
     fn classify_call(&self, args: &Value) -> ToolCallClassification {
-        path_mutation_classification(args)
+        path_mutation_classification(&self.safety_metadata(), args)
     }
 
     fn policy_bindings(&self) -> ToolPolicyBindings {
@@ -1525,6 +1971,7 @@ impl Tool for DeletePathTool {
         if path.is_dir() && !input.recursive {
             return ToolResult::error("recursive must be true to delete a directory");
         }
+        let recursive = path.is_dir();
         let bytes_affected = path_size(&path).unwrap_or(0);
         let items_affected = path_item_count(&path).unwrap_or(1);
         if !input.dry_run {
@@ -1542,17 +1989,25 @@ impl Tool for DeletePathTool {
             destination_path: None,
             path: Some(input.path.clone()),
             dry_run: input.dry_run,
+            mutation_performed: !input.dry_run,
             copied: false,
             moved: false,
-            deleted: true,
-            recursive: path.is_dir(),
+            deleted: !input.dry_run,
+            recursive,
             overwritten: false,
             bytes_affected,
             items_affected,
             approval_required: !input.dry_run && policy.approval_required(),
             diff_summary: format!(
-                "delete {} ({} bytes, {} items)",
-                input.path, bytes_affected, items_affected
+                "{} {} ({} bytes, {} items)",
+                if input.dry_run {
+                    "plan to delete"
+                } else {
+                    "deleted"
+                },
+                input.path,
+                bytes_affected,
+                items_affected
             ),
         })
     }
@@ -1573,7 +2028,7 @@ fn path_mutation_metadata(operation: ToolOperationKind) -> ToolSafetyMetadata {
         open_world: false,
         host_dependent: false,
         requires_user_interaction: false,
-        supports_cancellation: true,
+        supports_cancellation: false,
         default_requires_approval: true,
         should_defer_schema: false,
         max_output_chars: Some(DEFAULT_MAX_OUTPUT_CHARS),
@@ -1581,14 +2036,20 @@ fn path_mutation_metadata(operation: ToolOperationKind) -> ToolSafetyMetadata {
     }
 }
 
-fn path_mutation_classification(args: &Value) -> ToolCallClassification {
-    let dry_run = args.get("dry_run").and_then(Value::as_bool).unwrap_or(true);
-    let mut classification =
-        ToolCallClassification::from_metadata(&path_mutation_metadata(ToolOperationKind::Write));
+fn path_mutation_classification(
+    metadata: &ToolSafetyMetadata,
+    args: &Value,
+) -> ToolCallClassification {
+    let dry_run = args
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut classification = ToolCallClassification::from_metadata(metadata);
     classification.safely_retryable = dry_run;
     if dry_run {
         classification.read_only = true;
         classification.concurrency_safe = true;
+        classification.destructive = false;
         classification.side_effect_level = ToolSideEffectLevel::None;
         classification.requires_approval = false;
     }
@@ -1599,11 +2060,45 @@ fn ensure_read_allowed(path: &Path, policy: &MutationPolicySnapshot) -> Result<(
     let normalized = normalize_path(path);
     let resolved = resolve_existing_or_parent(path)?;
     for blocked in &policy.blocked_paths {
-        if path_matches_policy(blocked, &normalized, &resolved)? {
+        if path_matches_restricted_policy(blocked, &normalized, &resolved)? {
             return Err("source path is blocked by policy".to_string());
         }
     }
     Ok(())
+}
+
+fn validate_copy_destination(source: &Path, destination: &Path) -> Result<(), String> {
+    let source = source
+        .canonicalize()
+        .map_err(|error| format!("Source canonicalization failed: {}", error))?;
+    let destination = resolve_existing_or_parent(destination)?;
+    if destination == source || source.is_dir() && destination.starts_with(&source) {
+        return Err("destination must not equal or be nested under the source".to_string());
+    }
+    Ok(())
+}
+
+fn inspect_copy_source(path: &Path) -> std::io::Result<(usize, usize, bool)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("symbolic links are not supported: {}", path.display()),
+        ));
+    }
+    if !metadata.is_dir() {
+        return Ok((metadata.len() as usize, 1, false));
+    }
+
+    let mut bytes = 0usize;
+    let mut items = 1usize;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let (entry_bytes, entry_items, _) = inspect_copy_source(&entry.path())?;
+        bytes = bytes.saturating_add(entry_bytes);
+        items = items.saturating_add(entry_items);
+    }
+    Ok((bytes, items, true))
 }
 
 fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -1625,8 +2120,15 @@ fn copy_directory(source: &Path, destination: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let from = entry.path();
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("symbolic links are not supported: {}", from.display()),
+            ));
+        }
         let to = destination.join(entry.file_name());
-        if from.is_dir() {
+        if metadata.is_dir() {
             copy_directory(&from, &to)?;
         } else {
             fs::copy(&from, &to)?;
@@ -1665,6 +2167,21 @@ fn path_item_count(path: &Path) -> std::io::Result<usize> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn mutation_context(tool_id: &str, root: &Path) -> ToolExecutionContext {
+        let mut context = ToolExecutionContext::test(tool_id);
+        context.policy_snapshot = serde_json::json!({
+            "write_paths": [root.to_string_lossy()],
+            "overwrite_existing": true,
+            "create_parent_dirs": true,
+            "allow_without_confirmation": true
+        });
+        context
+    }
+
+    fn result_json(result: &ToolResult) -> Value {
+        serde_json::from_str(&result.output).unwrap()
+    }
 
     #[tokio::test]
     async fn file_edit_dry_run_requires_unique_match() {
@@ -1715,21 +2232,15 @@ mod tests {
         let tool = FileWriteTool::new();
         let result = tool
             .execute(
-                serde_json::json!({"path": path.to_string_lossy(), "content": "hello"}),
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "hello",
+                    "dry_run": false
+                }),
                 ToolExecutionContext::test("file_write"),
             )
             .await;
         assert!(!result.success);
-    }
-
-    #[test]
-    fn patch_omitted_dry_run_classifies_as_read_only() {
-        let tool = PatchTool::new();
-        let classification =
-            tool.classify_call(&serde_json::json!({"patch": "--- a/a\n+++ b/a\n"}));
-        assert!(classification.read_only);
-        assert!(classification.concurrency_safe);
-        assert!(!classification.requires_approval);
     }
 
     #[tokio::test]
@@ -1750,6 +2261,51 @@ mod tests {
             .await;
         assert!(!result.success);
         assert!(result.output.contains("allow_delete is false"));
+    }
+
+    #[tokio::test]
+    async fn patch_delete_dry_run_reports_planned_delete() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("delete.txt");
+        fs::write(&path, "old\n").unwrap();
+        let result = PatchTool::new()
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "allow_delete": true,
+                    "dry_run": true,
+                    "patch": "--- a/delete.txt\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-old\n"
+                }),
+                ToolExecutionContext::test("patch"),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(path.exists());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], false);
+        assert_eq!(output["created"], false);
+        assert_eq!(output["overwritten"], false);
+    }
+
+    #[tokio::test]
+    async fn new_file_patch_rejects_existing_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("existing.txt");
+        fs::write(&path, "original\n").unwrap();
+        let result = PatchTool::new()
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "allow_new_files": true,
+                    "patch": "--- /dev/null\n+++ b/existing.txt\n@@ -0,0 +1,1 @@\n+created\n"
+                }),
+                mutation_context("patch", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("already exists"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "original\n");
     }
 
     #[test]
@@ -1775,7 +2331,8 @@ mod tests {
         assert!(result.success);
         assert!(path.exists(), "dry-run must not remove the file");
         let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["deleted"], true);
+        assert_eq!(output["mutation_performed"], false);
+        assert_eq!(output["deleted"], false);
         assert_eq!(output["dry_run"], true);
     }
 
@@ -1818,7 +2375,457 @@ mod tests {
             "dry-run must not create the destination"
         );
         let output: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["copied"], true);
+        assert_eq!(output["mutation_performed"], false);
+        assert_eq!(output["copied"], false);
         assert_eq!(output["dry_run"], true);
+    }
+
+    #[tokio::test]
+    async fn copy_path_rejects_destination_nested_under_source() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("file.txt"), "hello").unwrap();
+        let destination = source.join("nested");
+
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": true
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("nested under the source"));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_path_rejects_symlinks_inside_source_tree() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let outside = dir.path().join("outside");
+        let destination = dir.path().join("destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), "secret").unwrap();
+        symlink(&outside, source.join("alias")).unwrap();
+
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": true
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("symbolic links are not supported"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn mutation_schemas_default_to_execution() {
+        for schema in [
+            FileWriteTool::new().input_schema(),
+            FileEditTool::new().input_schema(),
+            PatchTool::new().input_schema(),
+            CopyPathTool::new().input_schema(),
+            MovePathTool::new().input_schema(),
+            DeletePathTool::new().input_schema(),
+        ] {
+            assert_eq!(schema["properties"]["dry_run"]["default"], false);
+        }
+    }
+
+    #[test]
+    fn omitted_dry_run_classifies_as_mutation() {
+        for classification in [
+            FileWriteTool::new().classify_call(&serde_json::json!({})),
+            FileEditTool::new().classify_call(&serde_json::json!({})),
+            PatchTool::new().classify_call(&serde_json::json!({})),
+            CopyPathTool::new().classify_call(&serde_json::json!({})),
+            MovePathTool::new().classify_call(&serde_json::json!({})),
+            DeletePathTool::new().classify_call(&serde_json::json!({})),
+        ] {
+            assert!(!classification.read_only);
+            assert!(!classification.concurrency_safe);
+            assert!(!classification.safely_retryable);
+            assert!(classification.requires_approval);
+        }
+    }
+
+    #[test]
+    fn actual_delete_classification_remains_destructive_delete() {
+        let classification =
+            DeletePathTool::new().classify_call(&serde_json::json!({"dry_run": false}));
+        assert!(matches!(
+            classification.operation,
+            ToolOperationKind::Delete
+        ));
+        assert!(matches!(
+            classification.side_effect_level,
+            ToolSideEffectLevel::Destructive
+        ));
+        assert!(classification.destructive);
+        assert!(!classification.read_only);
+    }
+
+    #[tokio::test]
+    async fn file_write_omitted_dry_run_applies_and_records_version() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("missing");
+        let path = parent.join("new.txt");
+        let versions = FileVersionStore::default();
+        let tool = FileWriteTool::with_version_store(versions.clone());
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "hello",
+                    "create_parent_dirs": true
+                }),
+                mutation_context("file_write", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "hello");
+        assert!(versions.get(&path).is_some());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["created"], true);
+        assert_eq!(output["overwritten"], false);
+        assert_eq!(output["bytes_written"], 5);
+    }
+
+    #[tokio::test]
+    async fn file_edit_omitted_dry_run_applies_and_records_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("edit.txt");
+        fs::write(&path, "before\n").unwrap();
+        let versions = FileVersionStore::default();
+        let tool = FileEditTool::with_version_store(versions.clone());
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "old_text": "before",
+                    "new_text": "after"
+                }),
+                mutation_context("file_edit", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "after\n");
+        assert!(versions.get(&path).is_some());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["overwritten"], true);
+    }
+
+    #[tokio::test]
+    async fn omitted_dry_run_copies_moves_and_deletes() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let copy_parent = dir.path().join("copy-parent");
+        let copy_destination = copy_parent.join("copy.txt");
+        let move_parent = dir.path().join("move-parent");
+        let move_destination = move_parent.join("move.txt");
+        fs::write(&source, "content").unwrap();
+
+        let copy_result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": copy_destination.to_string_lossy(),
+                    "create_parent_dirs": true
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+        assert!(copy_result.success, "{}", copy_result.output);
+        assert_eq!(fs::read_to_string(&copy_destination).unwrap(), "content");
+        let copy_output = result_json(&copy_result);
+        assert_eq!(copy_output["mutation_performed"], true);
+        assert_eq!(copy_output["copied"], true);
+
+        let move_result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": move_destination.to_string_lossy(),
+                    "create_parent_dirs": true
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+        assert!(move_result.success, "{}", move_result.output);
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&move_destination).unwrap(), "content");
+        let move_output = result_json(&move_result);
+        assert_eq!(move_output["mutation_performed"], true);
+        assert_eq!(move_output["moved"], true);
+
+        let delete_result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({"path": move_destination.to_string_lossy()}),
+                mutation_context("delete_path", dir.path()),
+            )
+            .await;
+        assert!(delete_result.success, "{}", delete_result.output);
+        assert!(!move_destination.exists());
+        let delete_output = result_json(&delete_result);
+        assert_eq!(delete_output["mutation_performed"], true);
+        assert_eq!(delete_output["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn move_path_rejects_same_source_and_destination() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("same.txt");
+        fs::write(&path, "content").unwrap();
+        let result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": path.to_string_lossy(),
+                    "destination_path": path.to_string_lossy(),
+                    "overwrite": true
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("same path"));
+        assert_eq!(fs::read_to_string(path).unwrap(), "content");
+    }
+
+    #[tokio::test]
+    async fn actual_delete_reports_applied_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("delete.txt");
+        fs::write(&path, "content").unwrap();
+        let result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("delete_path", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert!(!path.exists());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["deleted"], true);
+    }
+
+    #[tokio::test]
+    async fn patch_omitted_dry_run_applies_and_records_version() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("patch.txt");
+        fs::write(&path, "old\n").unwrap();
+        let versions = FileVersionStore::default();
+        let result = PatchTool::with_version_store(versions.clone())
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "patch": "--- a/patch.txt\n+++ b/patch.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+                }),
+                mutation_context("patch", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(versions.get(&path).is_some());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["created"], false);
+        assert_eq!(output["overwritten"], true);
+        assert_eq!(output["bytes_written"], 4);
+    }
+
+    #[tokio::test]
+    async fn patch_actual_apply_reports_applied_mutation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("patch.txt");
+        fs::write(&path, "old\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let result = PatchTool::new()
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "patch": "--- a/patch.txt\n+++ b/patch.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+                    "dry_run": false
+                }),
+                mutation_context("patch", dir.path()),
+            )
+            .await;
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["overwritten"], true);
+    }
+
+    #[test]
+    fn patch_apply_failure_rolls_back_prior_writes() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let invalid_parent = dir.path().join("not-a-directory");
+        fs::write(&first, "old\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&first, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        fs::write(&invalid_parent, "blocker\n").unwrap();
+        let outputs = vec![
+            PatchApply::Write {
+                path: first.clone(),
+                content: "new\n".to_string(),
+                expected: ExpectedPathState::Present(read_file_snapshot(&first).unwrap()),
+            },
+            PatchApply::Write {
+                path: invalid_parent.join("child.txt"),
+                content: "child\n".to_string(),
+                expected: ExpectedPathState::Absent,
+            },
+        ];
+        let error = apply_patch_transaction(&outputs).unwrap_err();
+        assert!(error.contains("no patch changes were retained"));
+        assert_eq!(fs::read_to_string(&first).unwrap(), "old\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(!invalid_parent.join("child.txt").exists());
+    }
+
+    #[test]
+    fn patch_rejects_pre_apply_content_and_absence_conflicts() {
+        let dir = tempdir().unwrap();
+        let existing = dir.path().join("existing.txt");
+        let created = dir.path().join("created.txt");
+        fs::write(&existing, "original\n").unwrap();
+        let existing_output = PatchApply::Write {
+            path: existing.clone(),
+            content: "patched\n".to_string(),
+            expected: ExpectedPathState::Present(read_file_snapshot(&existing).unwrap()),
+        };
+        fs::write(&existing, "external\n").unwrap();
+        let error = apply_patch_transaction(&[existing_output]).unwrap_err();
+        assert!(error.contains("pre-apply conflict"));
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "external\n");
+
+        let created_output = PatchApply::Write {
+            path: created.clone(),
+            content: "patched\n".to_string(),
+            expected: ExpectedPathState::Absent,
+        };
+        fs::write(&created, "external\n").unwrap();
+        let error = apply_patch_transaction(&[created_output]).unwrap_err();
+        assert!(error.contains("pre-apply conflict"));
+        assert_eq!(fs::read_to_string(&created).unwrap(), "external\n");
+    }
+
+    #[test]
+    fn patch_rollback_conflict_preserves_external_content() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        fs::write(&path, "original\n").unwrap();
+        let original = read_file_snapshot(&path).unwrap();
+        fs::write(&path, "external\n").unwrap();
+        let rollback = PatchRollback::RestoreWrite {
+            path: path.clone(),
+            original: original.clone(),
+            written: b"transaction\n".to_vec(),
+            written_permissions: original.permissions,
+        };
+        let error = rollback_patch(&[rollback], &[]).unwrap_err();
+        assert!(error.contains("rollback conflict"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_rollback_conflict_preserves_external_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("target.txt");
+        fs::write(&path, "original\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = read_file_snapshot(&path).unwrap();
+        fs::write(&path, "transaction\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let rollback = PatchRollback::RestoreWrite {
+            path: path.clone(),
+            original: original.clone(),
+            written: b"transaction\n".to_vec(),
+            written_permissions: original.permissions,
+        };
+
+        let error = rollback_patch(&[rollback], &[]).unwrap_err();
+
+        assert!(error.contains("permissions changed"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "transaction\n");
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+
+    #[tokio::test]
+    async fn patch_preflights_every_file_before_mutating_any_target() {
+        let dir = tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        fs::write(&first, "first old\n").unwrap();
+        fs::write(&second, "second old\n").unwrap();
+        let patch = concat!(
+            "--- a/first.txt\n+++ b/first.txt\n@@ -1,1 +1,1 @@\n-first old\n+first new\n",
+            "--- a/second.txt\n+++ b/second.txt\n@@ -1,1 +1,1 @@\n-not present\n+second new\n"
+        );
+        let result = PatchTool::new()
+            .execute(
+                serde_json::json!({
+                    "base_path": dir.path().to_string_lossy(),
+                    "patch": patch,
+                    "dry_run": false
+                }),
+                mutation_context("patch", dir.path()),
+            )
+            .await;
+        assert!(!result.success);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first old\n");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second old\n");
     }
 }

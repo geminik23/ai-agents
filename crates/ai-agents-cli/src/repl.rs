@@ -658,7 +658,7 @@ impl CliRepl {
                 }
 
                 // Recreate from saved spec YAML with the original agent ID.
-                let spec: AgentSpec = match serde_yaml::from_str(&entry.spec_yaml) {
+                let spec = match AgentSpec::from_yaml_strict(&entry.spec_yaml) {
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("  [Warn] Failed to parse spec for {}: {}", entry.id, e);

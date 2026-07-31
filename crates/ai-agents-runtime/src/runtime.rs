@@ -5,13 +5,98 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
 /// Shared lock table used to serialize side-effecting tool calls by canonical resource.
-pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
+
+//
+// Owns every lock acquired for one tool call and removes dead weak entries after release.
+//
+struct ToolResourceGuards {
+    guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
+    locks: ToolResourceLocks,
+}
+
+impl Drop for ToolResourceGuards {
+    fn drop(&mut self) {
+        self.guards.clear();
+        self.locks.write().retain(|_, lock| lock.strong_count() > 0);
+    }
+}
+
+//
+// Captures runtime controls under one read guard so policy and scope belong to the same generation.
+//
+#[derive(Clone)]
+struct RuntimeSafetySnapshot {
+    version: u64,
+    emergency_deny: bool,
+    tool_security: ToolSecurityEngine,
+    tool_scope_override: Option<Vec<String>>,
+}
+
+//
+// Records the generations used by the final authorization decision.
+//
+#[derive(Clone, Copy)]
+struct ToolDecisionVersions {
+    policy: u64,
+    registry: u64,
+    runtime_control: u64,
+}
+
+//
+// Binds human approval to the reviewed action and exact tool implementation.
+//
+#[derive(Clone)]
+struct ToolApprovalBinding {
+    canonical_id: String,
+    arguments: Value,
+    confirmation_required: bool,
+    policy_version: u64,
+    runtime_control_version: u64,
+    reviewed_tool: Arc<dyn ai_agents_core::Tool>,
+}
+
+//
+// A later plain approval must not erase arguments modified by an earlier approval stage.
+//
+fn merge_approved_record(record: &mut Option<ToolApprovalRecord>) {
+    if record
+        .as_ref()
+        .is_some_and(|record| matches!(record.status, ToolApprovalStatus::Modified))
+    {
+        return;
+    }
+    *record = Some(ToolApprovalRecord {
+        status: ToolApprovalStatus::Approved,
+        reason: None,
+        modified_arguments: None,
+    });
+}
+
+impl ToolApprovalBinding {
+    /// Returns true when final authorization no longer matches the reviewed action.
+    fn is_stale(
+        &self,
+        canonical_id: &str,
+        arguments: &Value,
+        confirmation_required: bool,
+        versions: ToolDecisionVersions,
+        resolved_tool: &Arc<dyn ai_agents_core::Tool>,
+    ) -> bool {
+        self.canonical_id != canonical_id
+            || self.arguments != *arguments
+            || self.confirmation_required != confirmation_required
+            || self.policy_version != versions.policy
+            || self.runtime_control_version != versions.runtime_control
+            || !Arc::ptr_eq(&self.reviewed_tool, resolved_tool)
+    }
+}
 
 use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 
@@ -138,12 +223,14 @@ impl Drop for RootTurnCleanup<'_> {
 /// Host-owned runtime control state shared with active agents.
 #[derive(Debug)]
 struct RuntimeControlState {
+    /// Serializes control mutations with exact runtime safety snapshots.
+    snapshot_guard: RwLock<()>,
     /// Monotonic version for runtime-control snapshots.
     version: AtomicU64,
     /// Emergency switch that denies future calls and is shared with active tool contexts.
     emergency_deny: Arc<AtomicBool>,
     /// Optional live replacement for tool security policy.
-    tool_security_override: RwLock<Option<ToolSecurityConfig>>,
+    tool_security_override: RwLock<Option<ToolSecurityEngine>>,
     /// Optional live replacement for the top-level tool scope.
     tool_scope_override: RwLock<Option<Vec<String>>>,
 }
@@ -151,6 +238,7 @@ struct RuntimeControlState {
 impl Default for RuntimeControlState {
     fn default() -> Self {
         Self {
+            snapshot_guard: RwLock::new(()),
             version: AtomicU64::new(1),
             emergency_deny: Arc::new(AtomicBool::new(false)),
             tool_security_override: RwLock::new(None),
@@ -177,30 +265,38 @@ impl RuntimeControlHandle {
 
     /// Overrides tool security for later tool calls.
     pub fn set_tool_security(&self, config: ToolSecurityConfig) -> u64 {
-        *self.state.tool_security_override.write() = Some(config);
-        self.bump()
+        let _guard = self.state.snapshot_guard.write();
+        let generation = self.bump();
+        *self.state.tool_security_override.write() = Some(
+            ToolSecurityEngine::new_with_policy_version(config, generation),
+        );
+        generation
     }
 
     /// Clears the live tool security override.
     pub fn clear_tool_security_override(&self) -> u64 {
+        let _guard = self.state.snapshot_guard.write();
         *self.state.tool_security_override.write() = None;
         self.bump()
     }
 
     /// Overrides the top-level tool scope for later calls.
     pub fn set_tool_scope(&self, tool_ids: Vec<String>) -> u64 {
+        let _guard = self.state.snapshot_guard.write();
         *self.state.tool_scope_override.write() = Some(tool_ids);
         self.bump()
     }
 
     /// Clears the live tool scope override.
     pub fn clear_tool_scope_override(&self) -> u64 {
+        let _guard = self.state.snapshot_guard.write();
         *self.state.tool_scope_override.write() = None;
         self.bump()
     }
 
     /// Enables or disables emergency denial for future tool calls.
     pub fn set_emergency_deny(&self, enabled: bool) -> u64 {
+        let _guard = self.state.snapshot_guard.write();
         self.state.emergency_deny.store(enabled, Ordering::SeqCst);
         self.bump()
     }
@@ -2124,8 +2220,53 @@ impl RuntimeAgent {
             .tool_security_override
             .read()
             .clone()
-            .map(ToolSecurityEngine::new)
             .unwrap_or_else(|| self.tool_security.clone())
+    }
+
+    /// Reads policy, scope, emergency state, and generation as one safety snapshot.
+    fn runtime_safety_snapshot(&self) -> RuntimeSafetySnapshot {
+        let _guard = self.runtime_control.snapshot_guard.read();
+        RuntimeSafetySnapshot {
+            version: self.runtime_control.version.load(Ordering::SeqCst),
+            emergency_deny: self.runtime_control.emergency_deny.load(Ordering::SeqCst),
+            tool_security: self
+                .runtime_control
+                .tool_security_override
+                .read()
+                .clone()
+                .unwrap_or_else(|| self.tool_security.clone()),
+            tool_scope_override: self.runtime_control.tool_scope_override.read().clone(),
+        }
+    }
+
+    /// Performs the single rate admission after locks are held and rejects changed controls.
+    fn admit_tool_execution(
+        &self,
+        expected_runtime_version: u64,
+        expected_policy_version: u64,
+        canonical_id: &str,
+    ) -> SecurityCheckResult {
+        let _guard = self.runtime_control.snapshot_guard.read();
+        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+            return SecurityCheckResult::Block {
+                reason: "runtime emergency deny is enabled".to_string(),
+            };
+        }
+        let runtime_version = self.runtime_control.version.load(Ordering::SeqCst);
+        let security_engine = self
+            .runtime_control
+            .tool_security_override
+            .read()
+            .clone()
+            .unwrap_or_else(|| self.tool_security.clone());
+        if runtime_version != expected_runtime_version
+            || security_engine.policy_version() != expected_policy_version
+        {
+            return SecurityCheckResult::Block {
+                reason: "runtime safety controls changed before admission".to_string(),
+            };
+        }
+        security_engine.admit_tool_execution(canonical_id)
     }
 
     pub fn with_process_processor(mut self, processor: ProcessProcessor) -> Self {
@@ -2580,15 +2721,10 @@ impl RuntimeAgent {
             .render(&self.base_system_prompt, &context)
     }
 
-    fn get_top_level_tool_ids(&self) -> Vec<String> {
-        if let Some(ids) = self.runtime_control.tool_scope_override.read().clone() {
-            return ids
-                .iter()
-                .filter_map(|id| self.tools.canonical_id(id))
-                .collect();
-        }
-        self.declared_tool_ids
-            .as_ref()
+    /// Resolves the exact top-level grant carried by a runtime safety snapshot.
+    fn get_top_level_tool_ids_for_scope(&self, scope_override: Option<&[String]>) -> Vec<String> {
+        scope_override
+            .or(self.declared_tool_ids.as_deref())
             .map(|ids| {
                 ids.iter()
                     .filter_map(|id| self.tools.canonical_id(id))
@@ -2598,7 +2734,17 @@ impl RuntimeAgent {
     }
 
     async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
-        let top_level = self.get_top_level_tool_ids();
+        let scope_override = self.runtime_control.tool_scope_override.read().clone();
+        self.get_available_tool_ids_for_scope(scope_override.as_deref())
+            .await
+    }
+
+    /// Applies state narrowing to the supplied top-level scope instead of reading mutable control again.
+    async fn get_available_tool_ids_for_scope(
+        &self,
+        scope_override: Option<&[String]>,
+    ) -> Result<Vec<String>> {
+        let top_level = self.get_top_level_tool_ids_for_scope(scope_override);
         if top_level.is_empty() {
             return Ok(Vec::new());
         }
@@ -3143,6 +3289,48 @@ impl RuntimeAgent {
         timed_out: bool,
         output_truncated: bool,
     ) -> ToolExecutionRecord {
+        let versions = ToolDecisionVersions {
+            policy: self.active_tool_security().policy_version(),
+            registry: self.tools.version(),
+            runtime_control: self.runtime_control.version.load(Ordering::SeqCst),
+        };
+        self.record_from_parts_at(
+            request,
+            canonical_id,
+            executed_arguments,
+            started_at,
+            start,
+            executed,
+            success,
+            output,
+            metadata,
+            policy,
+            approval,
+            timed_out,
+            output_truncated,
+            versions,
+        )
+    }
+
+    /// Builds evidence with the exact generations used by the corresponding decision.
+    #[allow(clippy::too_many_arguments)]
+    fn record_from_parts_at(
+        &self,
+        request: &ToolExecutionRequest,
+        canonical_id: String,
+        executed_arguments: Value,
+        started_at: chrono::DateTime<chrono::Utc>,
+        start: Instant,
+        executed: bool,
+        success: bool,
+        output: String,
+        metadata: HashMap<String, Value>,
+        policy: ToolPolicyDecisionRecord,
+        approval: Option<ToolApprovalRecord>,
+        timed_out: bool,
+        output_truncated: bool,
+        versions: ToolDecisionVersions,
+    ) -> ToolExecutionRecord {
         ToolExecutionRecord {
             call_id: request.call_id.clone(),
             requested_name: request.requested_name.clone(),
@@ -3150,9 +3338,9 @@ impl RuntimeAgent {
             source: request.source.clone(),
             arguments: request.arguments.clone(),
             executed_arguments,
-            policy_version: self.active_tool_security().policy_version(),
-            registry_version: self.tools.version(),
-            runtime_config_version: self.runtime_control.version.load(Ordering::SeqCst),
+            policy_version: versions.policy,
+            registry_version: versions.registry,
+            runtime_config_version: versions.runtime_control,
             executed,
             success,
             output,
@@ -3191,6 +3379,16 @@ impl RuntimeAgent {
         }
     }
 
+    /// Releases resource locks before hooks run because hooks may invoke another tool.
+    async fn finish_tool_record_after_resource_guards(
+        &self,
+        resource_guards: ToolResourceGuards,
+        record: &ToolExecutionRecord,
+    ) {
+        drop(resource_guards);
+        self.finish_tool_record(record).await;
+    }
+
     /// Invokes a resolved tool once with timeout, cancellation, and actor context.
     async fn execute_resolved_tool_once(
         &self,
@@ -3198,9 +3396,23 @@ impl RuntimeAgent {
         args: Value,
         ctx: ToolExecutionContext,
         timeout_ms: u64,
-    ) -> Result<(ToolResult, bool, bool)> {
+    ) -> Result<(ToolResult, bool, bool, bool)> {
+        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+            return Ok((
+                ToolResult::error("Tool execution cancelled by runtime control"),
+                false,
+                true,
+                false,
+            ));
+        }
+        //
+        // Mark invocation inside the future so cancellation before the first poll remains executed false.
+        //
+        let invoked = Arc::new(AtomicBool::new(false));
+        let invoked_by_future = Arc::clone(&invoked);
         let actor_context = current_turn_actor_context();
         let future = async move {
+            invoked_by_future.store(true, Ordering::SeqCst);
             if let Some(actor_context) = actor_context {
                 scope_actor_context(actor_context, tool.execute(args, ctx)).await
             } else {
@@ -3214,11 +3426,23 @@ impl RuntimeAgent {
 
         loop {
             tokio::select! {
-                result = &mut future => return Ok((result, false, false)),
-                _ = &mut timeout => return Ok((ToolResult::error("Tool execution timed out"), true, false)),
+                result = &mut future => return Ok((result, false, false, true)),
+                _ = &mut timeout => {
+                    return Ok((
+                        ToolResult::error("Tool execution timed out"),
+                        true,
+                        false,
+                        invoked.load(Ordering::SeqCst),
+                    ));
+                }
                 _ = cancel_tick.tick() => {
                     if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
-                        return Ok((ToolResult::error("Tool execution cancelled by runtime control"), false, true));
+                        return Ok((
+                            ToolResult::error("Tool execution cancelled by runtime control"),
+                            false,
+                            true,
+                            invoked.load(Ordering::SeqCst),
+                        ));
                     }
                 }
             }
@@ -3239,25 +3463,48 @@ impl RuntimeAgent {
         }
     }
 
-    /// Acquires a cross-tool lock for side-effecting calls that share a resource.
-    async fn acquire_tool_resource_lock(
-        &self,
-        canonical_id: &str,
-        args: &Value,
-        classification: &ai_agents_core::ToolCallClassification,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if classification.read_only && classification.concurrency_safe {
-            return None;
-        }
-        let key = tool_resource_lock_key(canonical_id, args);
-        let lock = {
-            let mut locks = self.resource_locks.write();
-            locks
-                .entry(key)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
+    /// Acquires all declared resource locks in stable key order and supports emergency cancellation while waiting.
+    async fn acquire_tool_resource_locks(&self, keys: &[String]) -> Option<ToolResourceGuards> {
+        let locks = {
+            let mut table = self.resource_locks.write();
+            table.retain(|_, lock| lock.strong_count() > 0);
+            keys.iter()
+                .map(|key| {
+                    if let Some(lock) = table.get(key).and_then(Weak::upgrade) {
+                        lock
+                    } else {
+                        let lock = Arc::new(tokio::sync::Mutex::new(()));
+                        table.insert(key.clone(), Arc::downgrade(&lock));
+                        lock
+                    }
+                })
+                .collect::<Vec<_>>()
         };
-        Some(lock.lock_owned().await)
+        let mut resource_guards = ToolResourceGuards {
+            guards: Vec::with_capacity(locks.len()),
+            locks: Arc::clone(&self.resource_locks),
+        };
+        let mut locks = locks.into_iter();
+        while let Some(lock) = locks.next() {
+            let mut lock = Box::pin(lock.lock_owned());
+            loop {
+                tokio::select! {
+                    guard = &mut lock => {
+                        resource_guards.guards.push(guard);
+                        break;
+                    }
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+                            drop(lock);
+                            drop(locks);
+                            drop(resource_guards);
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+        Some(resource_guards)
     }
 
     /// Executes a resolved tool with retry policy from recovery settings.
@@ -3269,19 +3516,21 @@ impl RuntimeAgent {
         ctx: ToolExecutionContext,
         timeout_ms: u64,
         max_retries: u32,
-    ) -> Result<(ToolResult, bool, bool)> {
+    ) -> Result<(ToolResult, bool, bool, bool)> {
         let max_retries = if ctx.classification.safely_retryable {
             max_retries
         } else {
             0
         };
         let mut attempts = 0;
+        let mut invoked = false;
         loop {
-            let (result, timed_out, cancelled) = self
+            let (result, timed_out, cancelled, attempt_invoked) = self
                 .execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout_ms)
                 .await?;
+            invoked |= attempt_invoked;
             if result.success || timed_out || cancelled || attempts >= max_retries {
-                return Ok((result, timed_out, cancelled));
+                return Ok((result, timed_out, cancelled, invoked));
             }
             attempts += 1;
             warn!(tool = %canonical_id, attempt = attempts, error = %result.output, "Retrying failed tool call");
@@ -3289,7 +3538,14 @@ impl RuntimeAgent {
     }
 
     /// Executes a tool request through scope, policy, HITL, timeout, recovery, and evidence recording.
-    async fn execute_tool_record(
+    fn execute_tool_record(
+        &self,
+        request: ToolExecutionRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
+        Box::pin(self.execute_tool_record_inner(request))
+    }
+
+    async fn execute_tool_record_inner(
         &self,
         request: ToolExecutionRequest,
     ) -> Result<ToolExecutionRecord> {
@@ -3341,6 +3597,7 @@ impl RuntimeAgent {
         };
 
         let canonical_id = resolved.identity.canonical_id.clone();
+
         let available_tool_ids = self.get_available_tool_ids().await?;
         if !available_tool_ids.iter().any(|id| id == &canonical_id) {
             let record = self.record_from_parts(
@@ -3368,7 +3625,8 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
-        let security_engine = self.active_tool_security();
+        let approval_control_snapshot = self.runtime_safety_snapshot();
+        let security_engine = approval_control_snapshot.tool_security.clone();
         let bindings = resolved.tool.policy_bindings();
         let mut executed_arguments = security_engine.prepare_tool_arguments_with_bindings(
             &canonical_id,
@@ -3403,7 +3661,7 @@ impl RuntimeAgent {
         });
 
         let mut security_result = security_engine
-            .check_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
+            .validate_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
             .await?;
         match &security_result {
             SecurityCheckResult::Allow => {}
@@ -3482,11 +3740,7 @@ impl RuntimeAgent {
                 );
                 match self.request_hitl_approval(check_result).await? {
                     ApprovalResult::Approved => {
-                        approval_record = Some(ToolApprovalRecord {
-                            status: ToolApprovalStatus::Approved,
-                            reason: None,
-                            modified_arguments: None,
-                        });
+                        merge_approved_record(&mut approval_record);
                     }
                     ApprovalResult::Modified { changes } => {
                         if let Some(obj) = executed_arguments.as_object_mut() {
@@ -3495,7 +3749,7 @@ impl RuntimeAgent {
                             }
                         }
                         security_result = security_engine
-                            .check_tool_execution_with_bindings(
+                            .validate_tool_execution_with_bindings(
                                 &canonical_id,
                                 &executed_arguments,
                                 &bindings,
@@ -3503,7 +3757,9 @@ impl RuntimeAgent {
                             .await?;
                         if !matches!(
                             security_result,
-                            SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+                            SecurityCheckResult::Allow
+                                | SecurityCheckResult::Warn { .. }
+                                | SecurityCheckResult::RequireConfirmation { .. }
                         ) {
                             let reason = security_result
                                 .reason()
@@ -3653,11 +3909,7 @@ impl RuntimeAgent {
                 );
                 match self.request_hitl_approval(check_result).await? {
                     ApprovalResult::Approved => {
-                        approval_record = Some(ToolApprovalRecord {
-                            status: ToolApprovalStatus::Approved,
-                            reason: None,
-                            modified_arguments: None,
-                        });
+                        merge_approved_record(&mut approval_record);
                     }
                     ApprovalResult::Modified { changes } => {
                         if let Some(obj) = executed_arguments.as_object_mut() {
@@ -3666,7 +3918,7 @@ impl RuntimeAgent {
                             }
                         }
                         let modified_security = security_engine
-                            .check_tool_execution_with_bindings(
+                            .validate_tool_execution_with_bindings(
                                 &canonical_id,
                                 &executed_arguments,
                                 &bindings,
@@ -3824,11 +4076,7 @@ impl RuntimeAgent {
             if check_result.is_required() {
                 match self.request_hitl_approval(check_result).await? {
                     ApprovalResult::Approved => {
-                        approval_record = Some(ToolApprovalRecord {
-                            status: ToolApprovalStatus::Approved,
-                            reason: None,
-                            modified_arguments: None,
-                        });
+                        merge_approved_record(&mut approval_record);
                     }
                     ApprovalResult::Modified { changes } => {
                         if let Some(obj) = executed_arguments.as_object_mut() {
@@ -3837,7 +4085,7 @@ impl RuntimeAgent {
                             }
                         }
                         let modified_security = security_engine
-                            .check_tool_execution_with_bindings(
+                            .validate_tool_execution_with_bindings(
                                 &canonical_id,
                                 &executed_arguments,
                                 &bindings,
@@ -3942,7 +4190,9 @@ impl RuntimeAgent {
                 .await?;
             if condition_check.is_required() {
                 match self.request_hitl_approval(condition_check).await? {
-                    ApprovalResult::Approved => {}
+                    ApprovalResult::Approved => {
+                        merge_approved_record(&mut approval_record);
+                    }
                     ApprovalResult::Modified { changes } => {
                         if let Some(obj) = executed_arguments.as_object_mut() {
                             for (key, value) in changes {
@@ -3950,7 +4200,7 @@ impl RuntimeAgent {
                             }
                         }
                         let modified_security = security_engine
-                            .check_tool_execution_with_bindings(
+                            .validate_tool_execution_with_bindings(
                                 &canonical_id,
                                 &executed_arguments,
                                 &bindings,
@@ -3982,6 +4232,11 @@ impl RuntimeAgent {
                             self.finish_tool_record(&record).await;
                             return Ok(record);
                         }
+                        approval_record = Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Modified,
+                            reason: None,
+                            modified_arguments: Some(executed_arguments.clone()),
+                        });
                     }
                     ApprovalResult::Rejected { reason } => {
                         let reason = reason.unwrap_or_else(|| "rejected".to_string());
@@ -4034,6 +4289,336 @@ impl RuntimeAgent {
             }
         }
 
+        //
+        // Freeze the action reviewed by HITL after every approved argument change and policy cap.
+        // A later plain approval preserves any earlier Modified evidence.
+        //
+        executed_arguments = security_engine.prepare_tool_arguments_with_bindings(
+            &canonical_id,
+            &executed_arguments,
+            &bindings,
+        );
+        if let Some(record) = approval_record.as_mut() {
+            if matches!(record.status, ToolApprovalStatus::Modified) {
+                record.modified_arguments = Some(executed_arguments.clone());
+            }
+        }
+        let binding_security_result = security_engine
+            .validate_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
+            .await?;
+        let approval_confirmation_required = matches!(
+            binding_security_result,
+            SecurityCheckResult::RequireConfirmation { .. }
+        ) || security_engine
+            .classification_approval_message(
+                &canonical_id,
+                &resolved.tool.classify_call(&executed_arguments),
+            )
+            .is_some();
+        let approval_binding = approval_record.as_ref().and_then(|record| {
+            matches!(
+                record.status,
+                ToolApprovalStatus::Approved | ToolApprovalStatus::Modified
+            )
+            .then(|| ToolApprovalBinding {
+                canonical_id: canonical_id.clone(),
+                arguments: executed_arguments.clone(),
+                confirmation_required: approval_confirmation_required,
+                policy_version: security_engine.policy_version(),
+                runtime_control_version: approval_control_snapshot.version,
+                reviewed_tool: Arc::clone(&resolved.tool),
+            })
+        });
+
+        //
+        // Re-resolve once after HITL because registry, scope, and policy may change while approval waits.
+        // The final Arc must still match the implementation that the approver reviewed.
+        //
+        let control_snapshot = self.runtime_safety_snapshot();
+        let resolved = self.tools.resolve(&request.requested_name);
+        let registry_version = self.tools.version();
+        let versions = ToolDecisionVersions {
+            policy: control_snapshot.tool_security.policy_version(),
+            registry: registry_version,
+            runtime_control: control_snapshot.version,
+        };
+        metadata.insert(
+            "runtime_scope_snapshot".to_string(),
+            serde_json::to_value(&control_snapshot.tool_scope_override).unwrap_or(Value::Null),
+        );
+        let resolved = match resolved {
+            Some(resolved) => resolved,
+            None => {
+                let reason = format!(
+                    "Tool '{}' became unavailable after approval",
+                    request.requested_name
+                );
+                let record = self.record_from_parts_at(
+                    &request,
+                    request.requested_name.clone(),
+                    executed_arguments,
+                    started_at,
+                    start,
+                    false,
+                    false,
+                    reason.clone(),
+                    metadata,
+                    ToolPolicyDecisionRecord::unavailable(reason),
+                    approval_record,
+                    false,
+                    false,
+                    versions,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+        };
+
+        let canonical_id = resolved.identity.canonical_id.clone();
+        let bindings = resolved.tool.policy_bindings();
+        let final_arguments = control_snapshot
+            .tool_security
+            .prepare_tool_arguments_with_bindings(&canonical_id, &executed_arguments, &bindings);
+        if let Some(record) = approval_record.as_mut() {
+            if matches!(record.status, ToolApprovalStatus::Modified) {
+                record.modified_arguments = Some(final_arguments.clone());
+            }
+        }
+        let classification = resolved.tool.classify_call(&final_arguments);
+        let safety = resolved.tool.safety_metadata();
+        let security_engine = control_snapshot.tool_security;
+        let limits = security_engine.effective_limits(&canonical_id, &safety, &classification);
+        let policy_snapshot = security_engine.policy_snapshot(&canonical_id);
+        let resource_lock_keys =
+            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification);
+        metadata.insert(
+            "classification".to_string(),
+            serde_json::to_value(&classification).unwrap_or(Value::Null),
+        );
+        metadata.insert(
+            "effective_limits".to_string(),
+            serde_json::to_value(&limits).unwrap_or(Value::Null),
+        );
+        metadata.insert(
+            "resource_lock_keys".to_string(),
+            serde_json::to_value(&resource_lock_keys).unwrap_or(Value::Null),
+        );
+        if policy_snapshot.is_null() {
+            metadata.remove("policy_snapshot");
+        } else {
+            metadata.insert("policy_snapshot".to_string(), policy_snapshot.clone());
+        }
+
+        let final_denial = |canonical_id: String,
+                            output: String,
+                            policy: ToolPolicyDecisionRecord,
+                            metadata: HashMap<String, Value>| {
+            self.record_from_parts_at(
+                &request,
+                canonical_id,
+                final_arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                output,
+                metadata,
+                policy,
+                approval_record.clone(),
+                false,
+                false,
+                versions,
+            )
+        };
+
+        if control_snapshot.emergency_deny {
+            let reason = "Tool execution is disabled by runtime control".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        let available_tool_ids = self
+            .get_available_tool_ids_for_scope(control_snapshot.tool_scope_override.as_deref())
+            .await?;
+        metadata.insert(
+            "available_tool_ids_snapshot".to_string(),
+            serde_json::to_value(&available_tool_ids).unwrap_or(Value::Null),
+        );
+        if !available_tool_ids
+            .iter()
+            .any(|tool_id| tool_id == &canonical_id)
+        {
+            let reason = format!(
+                "Tool '{}' is not available in the final runtime scope",
+                canonical_id
+            );
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        //
+        // Validation may run more than once, but it must not consume rate capacity.
+        // Rate capacity is consumed once after resource locks are held.
+        //
+        let final_security_result = security_engine
+            .validate_tool_execution_with_bindings(&canonical_id, &final_arguments, &bindings)
+            .await?;
+        match &final_security_result {
+            SecurityCheckResult::Block { reason } => {
+                let record = final_denial(
+                    canonical_id,
+                    format!("Denied: {}", reason),
+                    ToolPolicyDecisionRecord::deny(reason.clone()),
+                    metadata,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+            SecurityCheckResult::Unavailable { reason } => {
+                let record = final_denial(
+                    canonical_id,
+                    format!("Unavailable: {}", reason),
+                    ToolPolicyDecisionRecord::unavailable(reason.clone()),
+                    metadata,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+            SecurityCheckResult::Warn { message } => {
+                warn!(tool = %canonical_id, message = %message, "Tool security warning after approval");
+            }
+            SecurityCheckResult::Allow | SecurityCheckResult::RequireConfirmation { .. } => {}
+        }
+        let final_confirmation_required = matches!(
+            final_security_result,
+            SecurityCheckResult::RequireConfirmation { .. }
+        ) || security_engine
+            .classification_approval_message(&canonical_id, &classification)
+            .is_some();
+        let stale_approval = approval_binding.as_ref().is_some_and(|binding| {
+            binding.is_stale(
+                &canonical_id,
+                &final_arguments,
+                final_confirmation_required,
+                versions,
+                &resolved.tool,
+            )
+        });
+        if stale_approval {
+            let reason = "Approval became stale before final admission".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+        if final_confirmation_required && approval_binding.is_none() {
+            let reason = "Final policy requires fresh approval".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::approval(reason),
+                metadata,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        let unavailable_reason = match canonical_id.as_str() {
+            "command" if !self.tools.command_runner_available() => {
+                Some("command runner is unavailable")
+            }
+            "diagnostics" if !self.tools.diagnostics_available() => {
+                Some("diagnostics provider is unavailable")
+            }
+            "web_search" if !self.tools.web_search_available() => {
+                Some("web search provider is unavailable")
+            }
+            _ => None,
+        };
+        if let Some(reason) = unavailable_reason {
+            let record = final_denial(
+                canonical_id,
+                reason.to_string(),
+                ToolPolicyDecisionRecord::unavailable(reason),
+                metadata,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+
+        //
+        // Hold conflict locks across final generation admission and invocation.
+        // Completion hooks and fallback execution run only after these guards are released.
+        //
+        let Some(resource_guards) = self.acquire_tool_resource_locks(&resource_lock_keys).await
+        else {
+            let reason = "Tool execution cancelled while waiting for resource locks".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        };
+
+        // Policy updates after admission apply to later calls, while emergency cancellation remains live for this call.
+        let admission =
+            self.admit_tool_execution(versions.runtime_control, versions.policy, &canonical_id);
+        if !matches!(admission, SecurityCheckResult::Allow) {
+            let latest_control = self.runtime_safety_snapshot();
+            let reason = admission
+                .reason()
+                .unwrap_or("tool admission was denied")
+                .to_string();
+            let policy = if admission.is_unavailable() {
+                ToolPolicyDecisionRecord::unavailable(reason.clone())
+            } else {
+                ToolPolicyDecisionRecord::deny(reason.clone())
+            };
+            let record = self.record_from_parts_at(
+                &request,
+                canonical_id,
+                final_arguments,
+                started_at,
+                start,
+                false,
+                false,
+                reason,
+                metadata,
+                policy,
+                approval_record,
+                false,
+                false,
+                ToolDecisionVersions {
+                    policy: latest_control.tool_security.policy_version(),
+                    registry: versions.registry,
+                    runtime_control: latest_control.version,
+                },
+            );
+            self.finish_tool_record_after_resource_guards(resource_guards, &record)
+                .await;
+            return Ok(record);
+        }
+        let executed_arguments = final_arguments;
+
         let tool_config = self.recovery_manager.get_tool_config(&canonical_id);
         let timeout_ms = limits
             .timeout_ms
@@ -4057,9 +4642,9 @@ impl RuntimeAgent {
             canonical_id: canonical_id.clone(),
             display_name: resolved.identity.display_name.clone(),
             provider_id: resolved.identity.provider_id.clone(),
-            registry_version: self.tools.version(),
-            policy_version: security_engine.policy_version(),
-            runtime_control_version: self.runtime_control.version.load(Ordering::SeqCst),
+            registry_version: versions.registry,
+            policy_version: versions.policy,
+            runtime_control_version: versions.runtime_control,
             call_id: request.call_id.clone(),
             source: request.source.clone(),
             actor,
@@ -4077,10 +4662,7 @@ impl RuntimeAgent {
             policy_snapshot,
             custom_config: security_engine.custom_config(&canonical_id),
         };
-        let _resource_guard = self
-            .acquire_tool_resource_lock(&canonical_id, &executed_arguments, &classification)
-            .await;
-        let (mut result, timed_out, cancelled) = self
+        let (mut result, timed_out, cancelled, invoked) = self
             .run_tool_with_retries(
                 &canonical_id,
                 resolved.tool.clone(),
@@ -4100,12 +4682,13 @@ impl RuntimeAgent {
                     ));
                 }
                 ToolFailureAction::Fallback { fallback_tool } => {
+                    drop(resource_guards);
                     let fallback_request = ToolExecutionRequest::new(
                         request.call_id.clone(),
                         fallback_tool.clone(),
-                        executed_arguments.clone(),
+                        executed_arguments,
                         ToolCallSource::Fallback {
-                            original_tool: canonical_id.clone(),
+                            original_tool: canonical_id,
                         },
                     );
                     return Box::pin(self.execute_tool_record(fallback_request)).await;
@@ -4120,13 +4703,13 @@ impl RuntimeAgent {
         if let Some(result_metadata) = result.metadata {
             metadata.extend(result_metadata);
         }
-        let mut record = self.record_from_parts(
+        let mut record = self.record_from_parts_at(
             &request,
             canonical_id,
             executed_arguments,
             started_at,
             start,
-            true,
+            invoked,
             result.success,
             output,
             metadata,
@@ -4134,12 +4717,14 @@ impl RuntimeAgent {
             approval_record,
             timed_out,
             output_truncated,
+            versions,
         );
         record.cancelled = cancelled;
         if cancelled {
             record.cancellation_reason = Some("runtime control cancellation".to_string());
         }
-        self.finish_tool_record(&record).await;
+        self.finish_tool_record_after_resource_guards(resource_guards, &record)
+            .await;
         Ok(record)
     }
 
@@ -4824,6 +5409,23 @@ OVERALL: PASS/FAIL"#,
             .await
     }
 
+    /// Applies an approved pre-response transition before redispatch.
+    async fn apply_pre_response_transition_candidate(
+        &self,
+        candidate: &TransitionCandidate,
+        staged: &HashMap<String, Value>,
+        processed_input: &str,
+    ) -> Result<bool> {
+        self.commit_root_user_message(processed_input).await?;
+        self.apply_transition_target(
+            &candidate.from_state,
+            candidate.target(),
+            &candidate.reason,
+            Some(staged),
+        )
+        .await
+    }
+
     /// Commits a pre-response transition after approval and before redispatch.
     async fn commit_pre_response_transition_candidate(
         &self,
@@ -4837,14 +5439,8 @@ OVERALL: PASS/FAIL"#,
         {
             return Ok(false);
         }
-        self.commit_root_user_message(processed_input).await?;
-        self.apply_transition_target(
-            &candidate.from_state,
-            candidate.target(),
-            &candidate.reason,
-            Some(staged),
-        )
-        .await
+        self.apply_pre_response_transition_candidate(candidate, staged, processed_input)
+            .await
     }
 
     /// Handles post-response transition misses with fallback counters.
@@ -5183,20 +5779,11 @@ OVERALL: PASS/FAIL"#,
         loop {
             if let Some(candidate) = transition_candidate.take() {
                 if self
-                    .commit_pre_response_transition_candidate(
-                        &candidate,
-                        &HashMap::new(),
-                        processed_input,
-                    )
+                    .approve_transition_target(&candidate.from_state, candidate.target())
                     .await?
                 {
-                    self.finalize_optional_branch(
-                        &transition_id,
-                        RuntimeOptimizationKind::ParallelStateTransition,
-                        RuntimeCommitBehavior::TransitionDecision,
-                        "committed",
-                        true,
-                    );
+                    // Drop losing provider futures before transition side effects can reuse their shared resources.
+                    self.finalize_pending_branches(branch_set.cancel_pending());
                     if !main_pending {
                         self.finalize_branch_loss(
                             &main_id,
@@ -5224,7 +5811,30 @@ OVERALL: PASS/FAIL"#,
                             Some(false),
                         );
                     }
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    if !self
+                        .apply_pre_response_transition_candidate(
+                            &candidate,
+                            &HashMap::new(),
+                            processed_input,
+                        )
+                        .await?
+                    {
+                        self.finalize_optional_branch(
+                            &transition_id,
+                            RuntimeOptimizationKind::ParallelStateTransition,
+                            RuntimeCommitBehavior::TransitionDecision,
+                            "discarded",
+                            false,
+                        );
+                        return Ok(None);
+                    }
+                    self.finalize_optional_branch(
+                        &transition_id,
+                        RuntimeOptimizationKind::ParallelStateTransition,
+                        RuntimeCommitBehavior::TransitionDecision,
+                        "committed",
+                        true,
+                    );
                     return self
                         .redispatch_current_state(processed_input)
                         .await
@@ -6059,7 +6669,29 @@ OVERALL: PASS/FAIL"#,
                 }
             }
             OverflowStrategy::SummarizeMore => {
-                self.memory.compress(None).await?;
+                let max_attempts = context.total_messages.max(1);
+                for _ in 0..max_attempts {
+                    match self.memory.compress(None).await? {
+                        CompressResult::Compressed {
+                            messages_summarized,
+                            ..
+                        } if messages_summarized > 0 => {
+                            let context = self.memory.get_context().await?;
+                            if context.estimated_tokens() <= budget.total {
+                                return Ok(());
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+                let context = self.memory.get_context().await?;
+                let used_tokens = context.estimated_tokens();
+                if used_tokens > budget.total {
+                    return Err(AgentError::MemoryBudgetExceeded {
+                        used: used_tokens,
+                        budget: budget.total,
+                    });
+                }
             }
             OverflowStrategy::Error => {
                 return Err(AgentError::MemoryBudgetExceeded {
@@ -9030,26 +9662,42 @@ Respond in JSON format:
         loop {
             if let Some(candidate) = transition_candidate.take() {
                 if self
-                    .commit_pre_response_transition_candidate(
-                        &candidate,
-                        &HashMap::new(),
-                        processed_input,
-                    )
+                    .approve_transition_target(&candidate.from_state, candidate.target())
                     .await?
                 {
-                    self.finalize_optional_branch(
-                        &transition_id,
-                        RuntimeOptimizationKind::ParallelStateTransition,
-                        RuntimeCommitBehavior::TransitionDecision,
-                        "committed",
-                        true,
-                    );
+                    // Drop the stale stream future before transition side effects or redispatch reuse the provider.
+                    drop(main_future);
+                    drop(transition_future);
                     self.finalize_branch_loss(
                         &main_id,
                         RuntimeOptimizationKind::BufferedStreamingRouting,
                         RuntimeCommitBehavior::FinalResponse,
                         main_pending,
                         main_result.as_ref().map(|result| result.is_err()),
+                    );
+                    if !self
+                        .apply_pre_response_transition_candidate(
+                            &candidate,
+                            &HashMap::new(),
+                            processed_input,
+                        )
+                        .await?
+                    {
+                        self.finalize_optional_branch(
+                            &transition_id,
+                            RuntimeOptimizationKind::ParallelStateTransition,
+                            RuntimeCommitBehavior::TransitionDecision,
+                            "discarded",
+                            false,
+                        );
+                        return Ok(None);
+                    }
+                    self.finalize_optional_branch(
+                        &transition_id,
+                        RuntimeOptimizationKind::ParallelStateTransition,
+                        RuntimeCommitBehavior::TransitionDecision,
+                        "committed",
+                        true,
                     );
                     let response = self.redispatch_current_state(processed_input).await?;
                     return Ok(Some((
@@ -10402,32 +11050,108 @@ fn new_tool_resource_locks() -> ToolResourceLocks {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-fn tool_resource_lock_key(canonical_id: &str, args: &Value) -> String {
-    let resource = ["path", "base_path", "cwd", "url"]
-        .into_iter()
-        .find_map(|field| args.get(field).and_then(Value::as_str))
-        .map(normalized_resource_key);
-    match resource {
-        Some(value) => format!("resource:{}", value),
-        None => format!("tool:{}", canonical_id),
+//
+// Path-bound mutations share one conservative lock so aliases and parent-child paths cannot bypass serialization.
+// Exact domain keys remain available for non-path side effects, and unbound effects share one fallback lock.
+//
+fn tool_resource_lock_keys(
+    _canonical_id: &str,
+    args: &Value,
+    bindings: &ai_agents_core::ToolPolicyBindings,
+    classification: &ai_agents_core::ToolCallClassification,
+) -> Vec<String> {
+    if classification.concurrency_safe {
+        return Vec::new();
+    }
+
+    let mut keys = Vec::new();
+    let mut has_path_resource = false;
+    for binding in &bindings.path_fields {
+        let value = value_at_argument_path(args, &binding.field)
+            .cloned()
+            .or_else(|| {
+                binding
+                    .default_path
+                    .as_ref()
+                    .map(|path| Value::String(path.clone()))
+            });
+        if let Some(value) = value {
+            collect_resource_strings(&value, |_| {
+                has_path_resource = true;
+            });
+        }
+    }
+    for binding in &bindings.domain_fields {
+        if let Some(value) = value_at_argument_path(args, &binding.field) {
+            collect_resource_strings(value, |domain| {
+                let normalized = if binding.is_url {
+                    normalized_url_resource_key(domain)
+                } else {
+                    domain.trim().trim_end_matches('.').to_ascii_lowercase()
+                };
+                keys.push(format!("domain:{}", normalized));
+            });
+        }
+    }
+    for binding in &bindings.command_fields {
+        if !matches!(binding.kind, ai_agents_core::CommandBindingKind::Cwd) {
+            continue;
+        }
+        if let Some(value) = value_at_argument_path(args, &binding.field) {
+            collect_resource_strings(value, |_| {
+                has_path_resource = true;
+            });
+        }
+    }
+    if has_path_resource {
+        keys.push("path-mutation:global".to_string());
+    }
+    if keys.is_empty() {
+        keys.push("side-effect:unbound".to_string());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn value_at_argument_path<'a>(value: &'a Value, field: &str) -> Option<&'a Value> {
+    let mut current = value;
+    for segment in field.split('.') {
+        if segment.is_empty() {
+            return None;
+        }
+        current = current.get(segment)?;
+    }
+    Some(current)
+}
+
+fn collect_resource_strings(value: &Value, mut collect: impl FnMut(&str)) {
+    match value {
+        Value::String(value) => collect(value),
+        Value::Array(values) => {
+            for value in values {
+                if let Some(value) = value.as_str() {
+                    collect(value);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
-fn normalized_resource_key(value: &str) -> String {
-    if value.starts_with("http://") || value.starts_with("https://") {
+fn normalized_url_resource_key(value: &str) -> String {
+    let value = value.trim();
+    let Some((scheme, remainder)) = value.split_once("://") else {
         return value.to_ascii_lowercase();
-    }
-    let path = std::path::Path::new(value);
-    let path = if path.is_absolute() {
-        path.components().collect::<std::path::PathBuf>()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(path)
-            .components()
-            .collect()
     };
-    path.to_string_lossy().to_string()
+    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
+    let (authority, suffix) = remainder.split_at(authority_end);
+    format!(
+        "{}://{}{}",
+        scheme.to_ascii_lowercase(),
+        authority.to_ascii_lowercase(),
+        suffix
+    )
 }
 
 fn render_concurrent_template(
@@ -10458,6 +11182,7 @@ fn render_concurrent_template(
 mod tests {
     use super::*;
     use crate::AgentBuilder;
+    use ai_agents_core::{LLMChunk, LLMConfig, LLMError, LLMFeature, Tool};
     use ai_agents_llm::mock::MockLLMProvider;
 
     fn mock_with_response(response: &str) -> MockLLMProvider {
@@ -10470,6 +11195,227 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
+    }
+
+    struct ProviderFutureDropSignal {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl Drop for ProviderFutureDropSignal {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct BufferedLockingProvider {
+        lock: Arc<tokio::sync::Mutex<()>>,
+        stream_started: Arc<tokio::sync::Notify>,
+        stream_dropped: Arc<AtomicBool>,
+        committed_after_drop: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for BufferedLockingProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            let _guard = self.lock.lock().await;
+            self.committed_after_drop
+                .store(self.stream_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(LLMResponse::new(
+                "Committed technical response.",
+                FinishReason::Stop,
+            ))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            let _guard = self.lock.lock().await;
+            let _drop_signal = ProviderFutureDropSignal {
+                dropped: Arc::clone(&self.stream_dropped),
+            };
+            self.stream_started.notify_one();
+            std::future::pending().await
+        }
+
+        fn provider_name(&self) -> &str {
+            "buffered-locking"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    struct PendingDropStream {
+        dropped: Arc<AtomicBool>,
+        dropped_notify: Arc<tokio::sync::Notify>,
+    }
+
+    impl Stream for PendingDropStream {
+        type Item = std::result::Result<LLMChunk, LLMError>;
+
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDropStream {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            self.dropped_notify.notify_one();
+        }
+    }
+
+    struct EstablishedStreamProvider {
+        stream_started: Arc<tokio::sync::Notify>,
+        stream_dropped: Arc<AtomicBool>,
+        stream_dropped_notify: Arc<tokio::sync::Notify>,
+        committed_after_drop: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for EstablishedStreamProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            if !self.stream_dropped.load(Ordering::SeqCst) {
+                self.stream_dropped_notify.notified().await;
+            }
+            self.committed_after_drop
+                .store(self.stream_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(LLMResponse::new(
+                "Committed technical response.",
+                FinishReason::Stop,
+            ))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            self.stream_started.notify_one();
+            Ok(Box::new(PendingDropStream {
+                dropped: Arc::clone(&self.stream_dropped),
+                dropped_notify: Arc::clone(&self.stream_dropped_notify),
+            }))
+        }
+
+        fn provider_name(&self) -> &str {
+            "established-stream"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    struct FirstCallLockingProvider {
+        lock: Arc<tokio::sync::Mutex<()>>,
+        first_started: Arc<tokio::sync::Notify>,
+        first_dropped: Arc<AtomicBool>,
+        committed_after_drop: Arc<AtomicBool>,
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl LLMProvider for FirstCallLockingProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            let _guard = self.lock.lock().await;
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                let _drop_signal = ProviderFutureDropSignal {
+                    dropped: Arc::clone(&self.first_dropped),
+                };
+                self.first_started.notify_one();
+                return std::future::pending().await;
+            }
+            self.committed_after_drop
+                .store(self.first_dropped.load(Ordering::SeqCst), Ordering::SeqCst);
+            Ok(LLMResponse::new(
+                "Committed technical response.",
+                FinishReason::Stop,
+            ))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Err(LLMError::Other(
+                "streaming is not used in this test".to_string(),
+            ))
+        }
+
+        fn provider_name(&self) -> &str {
+            "first-call-locking"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    struct RoutingAfterProviderStart {
+        provider_started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RoutingAfterProviderStart {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            self.provider_started.notified().await;
+            Ok(LLMResponse::new("1", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Err(LLMError::Other(
+                "streaming is not used in this test".to_string(),
+            ))
+        }
+
+        fn provider_name(&self) -> &str {
+            "routing-after-start"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
     }
 
     /// Test hook that counts completed responses.
@@ -10539,6 +11485,34 @@ mod tests {
     struct LockedWriteTool {
         active: Arc<std::sync::atomic::AtomicUsize>,
         max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct MultiResourceWriteTool {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct NoBindingWriteTool {
+        active: Arc<std::sync::atomic::AtomicUsize>,
+        max_active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct RecoveryTestTool {
+        id: String,
+        succeeds: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct BlockingApprovalHandler {
+        entered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Notify>,
+        result: ApprovalResult,
+    }
+
+    struct ReentrantToolHooks {
+        agent: parking_lot::Mutex<Option<Weak<RuntimeAgent>>>,
+        invoked: AtomicBool,
+        nested_success: AtomicBool,
     }
 
     #[async_trait]
@@ -10704,6 +11678,186 @@ mod tests {
     }
 
     #[async_trait]
+    impl ai_agents_core::Tool for MultiResourceWriteTool {
+        fn id(&self) -> &str {
+            "multi_resource_write"
+        }
+
+        fn name(&self) -> &str {
+            "Multi Resource Write"
+        }
+
+        fn description(&self) -> &str {
+            "Tracks concurrent execution across source and destination resources."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: vec![
+                    ai_agents_core::PathPolicyBinding::read_write("source_path"),
+                    ai_agents_core::PathPolicyBinding::write("destination_path"),
+                ],
+                ..Default::default()
+            }
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            LockedWriteTool {
+                active: Arc::clone(&self.active),
+                max_active: Arc::clone(&self.max_active),
+            }
+            .safety_metadata()
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ToolResult::ok("done")
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for NoBindingWriteTool {
+        fn id(&self) -> &str {
+            "no_binding_write"
+        }
+
+        fn name(&self) -> &str {
+            "No Binding Write"
+        }
+
+        fn description(&self) -> &str {
+            "Tracks concurrent execution without resource bindings."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            LockedWriteTool {
+                active: Arc::clone(&self.active),
+                max_active: Arc::clone(&self.max_active),
+            }
+            .safety_metadata()
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(75)).await;
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            ToolResult::ok("done")
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for RecoveryTestTool {
+        fn id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            &self.id
+        }
+
+        fn description(&self) -> &str {
+            "Records recovery execution and returns a configured result."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                ..Default::default()
+            }
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            ai_agents_core::ToolSafetyMetadata {
+                read_only: false,
+                concurrency_safe: false,
+                operation: ai_agents_core::ToolOperationKind::Write,
+                side_effect_level: ai_agents_core::ToolSideEffectLevel::LocalWrite,
+                requires_network: false,
+                destructive: false,
+                open_world: false,
+                host_dependent: false,
+                requires_user_interaction: false,
+                supports_cancellation: true,
+                default_requires_approval: false,
+                should_defer_schema: false,
+                max_output_chars: Some(1024),
+                max_result_size_chars: Some(1024),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.succeeds {
+                ToolResult::ok(format!("{} succeeded", self.id))
+            } else {
+                ToolResult::error(format!("{} failed", self.id))
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ApprovalHandler for BlockingApprovalHandler {
+        async fn request_approval(
+            &self,
+            _request: ai_agents_hitl::ApprovalRequest,
+        ) -> ApprovalResult {
+            self.entered.wait().await;
+            self.release.notified().await;
+            self.result.clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for ReentrantToolHooks {
+        async fn on_tool_complete(&self, tool: &str, _result: &ToolResult, _duration_ms: u64) {
+            if tool != "reentrant_write" || self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let agent = self.agent.lock().as_ref().and_then(Weak::upgrade);
+            if let Some(agent) = agent {
+                let result = agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "nested-hook-call",
+                        "reentrant_write",
+                        serde_json::json!({"path": "./hook.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await;
+                self.nested_success
+                    .store(result.is_ok_and(|record| record.success), Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[async_trait]
     impl AgentHooks for ResponseCountingHooks {
         async fn on_response(&self, _response: &AgentResponse) {
             self.responses.fetch_add(1, Ordering::SeqCst);
@@ -10783,6 +11937,45 @@ mod tests {
         assert_eq!(raw[2], raw_status);
         assert_eq!(resolved[2], raw_status);
         assert_eq!(resolved[3], outcome_status);
+    }
+
+    fn approval_security_config(policy_enabled: bool) -> ToolSecurityConfig {
+        let mut security = ToolSecurityConfig::default();
+        security.enabled = true;
+        security.fail_closed = true;
+        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
+        policy.enabled = policy_enabled;
+        policy.write_paths = vec![".".to_string()];
+        policy.require_confirmation = true;
+        security.tools.insert("locked_write".to_string(), policy);
+        security
+    }
+
+    fn recovery_manager_with_fallbacks(
+        fallbacks: impl IntoIterator<Item = (String, String)>,
+    ) -> RecoveryManager {
+        use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
+
+        let per_tool = fallbacks
+            .into_iter()
+            .map(|(tool, fallback_tool)| {
+                (
+                    tool,
+                    ToolRetryConfig {
+                        max_retries: 0,
+                        timeout_ms: Some(1_000),
+                        on_failure: ToolFailureAction::Fallback { fallback_tool },
+                    },
+                )
+            })
+            .collect();
+        RecoveryManager::new(ErrorRecoveryConfig {
+            tools: ToolRecoveryConfig {
+                per_tool,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
     }
 
     fn approval_check() -> HITLCheckResult {
@@ -10920,6 +12113,92 @@ mod tests {
         let messages = agent.memory.get_messages(None).await.unwrap();
         // 3 user + 3 assistant = 6 messages
         assert_eq!(messages.len(), 6);
+    }
+
+    #[test]
+    fn later_approval_preserves_modified_evidence() {
+        let arguments = serde_json::json!({"dry_run": true});
+        let mut record = Some(ToolApprovalRecord {
+            status: ToolApprovalStatus::Modified,
+            reason: None,
+            modified_arguments: Some(arguments.clone()),
+        });
+
+        merge_approved_record(&mut record);
+
+        let record = record.unwrap();
+        assert!(matches!(record.status, ToolApprovalStatus::Modified));
+        assert_eq!(record.modified_arguments, Some(arguments));
+    }
+
+    #[test]
+    fn approval_binding_rejects_replaced_tool_implementation() {
+        let reviewed_tool: Arc<dyn ai_agents_core::Tool> = Arc::new(ContextEchoTool);
+        let same_tool = Arc::clone(&reviewed_tool);
+        let replacement_tool: Arc<dyn ai_agents_core::Tool> = Arc::new(ContextEchoTool);
+        let arguments = serde_json::json!({"path": "."});
+        let versions = ToolDecisionVersions {
+            policy: 2,
+            registry: 3,
+            runtime_control: 4,
+        };
+        let binding = ToolApprovalBinding {
+            canonical_id: "context_echo".to_string(),
+            arguments: arguments.clone(),
+            confirmation_required: true,
+            policy_version: versions.policy,
+            runtime_control_version: versions.runtime_control,
+            reviewed_tool,
+        };
+
+        assert!(!binding.is_stale("context_echo", &arguments, true, versions, &same_tool,));
+        assert!(binding.is_stale(
+            "context_echo",
+            &arguments,
+            true,
+            versions,
+            &replacement_tool,
+        ));
+    }
+
+    #[tokio::test]
+    async fn approved_mutation_to_dry_run_remains_executable() {
+        use ai_agents_hitl::CallbackHandler;
+
+        let handler = CallbackHandler::new(|_| ApprovalResult::Modified {
+            changes: HashMap::from([("dry_run".to_string(), serde_json::json!(true))]),
+        });
+        let agent = AgentBuilder::new()
+            .system_prompt("Test safer approval modifications.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ai_agents_tools::FileWriteTool::new()))
+            .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+            .approval_handler(Arc::new(handler))
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "approved-dry-run",
+                "file_write",
+                serde_json::json!({
+                    "path": "./approval-dry-run.txt",
+                    "content": "not written"
+                }),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.executed);
+        assert!(record.success);
+        assert_eq!(record.executed_arguments["dry_run"], true);
+        assert!(matches!(
+            record.approval.as_ref().map(|approval| &approval.status),
+            Some(ToolApprovalStatus::Modified)
+        ));
+        let output: Value = serde_json::from_str(&record.output).unwrap();
+        assert_eq!(output["mutation_performed"], false);
     }
 
     #[tokio::test]
@@ -11096,6 +12375,640 @@ mod tests {
         assert!(left.success);
         assert!(right.success);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn path_resources_use_shared_global_lock_and_cleanup() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bindings = ai_agents_core::ToolPolicyBindings {
+            path_fields: vec![
+                ai_agents_core::PathPolicyBinding::read_write("source_path"),
+                ai_agents_core::PathPolicyBinding::write("destination_path"),
+            ],
+            ..Default::default()
+        };
+        let classification = ai_agents_core::ToolCallClassification::from_metadata(
+            &MultiResourceWriteTool {
+                active: Arc::clone(&active),
+                max_active: Arc::clone(&max_active),
+            }
+            .safety_metadata(),
+        );
+        let left_args = serde_json::json!({
+            "source_path": "./a/../first.txt",
+            "destination_path": "./second.txt"
+        });
+        let right_args = serde_json::json!({
+            "source_path": "./second.txt",
+            "destination_path": "./first.txt"
+        });
+        let left_keys = tool_resource_lock_keys(
+            "multi_resource_write",
+            &left_args,
+            &bindings,
+            &classification,
+        );
+        let right_keys = tool_resource_lock_keys(
+            "multi_resource_write",
+            &right_args,
+            &bindings,
+            &classification,
+        );
+        assert_eq!(left_keys, right_keys);
+        assert_eq!(left_keys, vec!["path-mutation:global".to_string()]);
+
+        let locks = new_tool_resource_locks();
+        let build_agent = || {
+            AgentBuilder::new()
+                .system_prompt("Test shared resource locks.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(MultiResourceWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .build()
+                .unwrap()
+                .with_shared_resource_locks(Arc::clone(&locks))
+        };
+        let left_agent = Arc::new(build_agent());
+        let right_agent = Arc::new(build_agent());
+        let left = tokio::spawn(async move {
+            left_agent
+                .invoke_tool(ToolExecutionRequest::new(
+                    "multi-left",
+                    "multi_resource_write",
+                    left_args,
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+        let right = tokio::spawn(async move {
+            right_agent
+                .invoke_tool(ToolExecutionRequest::new(
+                    "multi-right",
+                    "multi_resource_write",
+                    right_args,
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+        let (left, right) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(left, right)
+        })
+        .await
+        .expect("reversed resource acquisition must not deadlock");
+
+        assert!(left.unwrap().success);
+        assert!(right.unwrap().success);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert!(locks.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn approval_argument_changes_are_rechecked_against_final_scope() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(BlockingApprovalHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            result: ApprovalResult::Modified {
+                changes: HashMap::from([(
+                    "path".to_string(),
+                    Value::String("./after-approval.txt".to_string()),
+                )]),
+            },
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test final scope validation.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(LockedWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .tool_security(ToolSecurityEngine::new(approval_security_config(true)))
+                .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+                .approval_handler(handler)
+                .build()
+                .unwrap(),
+        );
+        let control = agent.runtime_control();
+        let running = Arc::clone(&agent);
+        let call = tokio::spawn(async move {
+            running
+                .invoke_tool(ToolExecutionRequest::new(
+                    "approval-scope",
+                    "locked_write",
+                    serde_json::json!({"path": "./before-approval.txt"}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+        entered.wait().await;
+        let expected_version = control.set_tool_scope(Vec::new());
+        release.notify_one();
+        let record = call.await.unwrap();
+
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.runtime_config_version, expected_version);
+        assert_eq!(record.executed_arguments["path"], "./after-approval.txt");
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            record.metadata["runtime_scope_snapshot"],
+            serde_json::json!([])
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_is_rechecked_against_final_policy_snapshot() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(BlockingApprovalHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            result: ApprovalResult::Approved,
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test final policy validation.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(LockedWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .tool_security(ToolSecurityEngine::new(approval_security_config(true)))
+                .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+                .approval_handler(handler)
+                .build()
+                .unwrap(),
+        );
+        let control = agent.runtime_control();
+        let running = Arc::clone(&agent);
+        let call = tokio::spawn(async move {
+            running
+                .invoke_tool(ToolExecutionRequest::new(
+                    "approval-policy",
+                    "locked_write",
+                    serde_json::json!({"path": "./policy.txt"}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+        entered.wait().await;
+        let expected_version = control.set_tool_security(approval_security_config(false));
+        release.notify_one();
+        let record = call.await.unwrap();
+
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.runtime_config_version, expected_version);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Unavailable);
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+        assert!(record.metadata.contains_key("policy_snapshot"));
+    }
+
+    #[tokio::test]
+    async fn persistent_override_preserves_rate_history_within_generation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = AgentBuilder::new()
+            .system_prompt("Test persistent policy overrides.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(RecoveryTestTool {
+                id: "limited_override".to_string(),
+                succeeds: true,
+                calls: Arc::clone(&calls),
+            }))
+            .build()
+            .unwrap();
+        let mut security = ToolSecurityConfig::default();
+        security.enabled = true;
+        security.fail_closed = true;
+        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
+        policy.write_paths = vec![".".to_string()];
+        policy.rate_limit = Some(1);
+        security
+            .tools
+            .insert("limited_override".to_string(), policy);
+        let generation = agent.runtime_control().set_tool_security(security);
+
+        let first = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "limited-first",
+                "limited_override",
+                serde_json::json!({"path": "./limited.txt"}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+        let second = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "limited-second",
+                "limited_override",
+                serde_json::json!({"path": "./limited.txt"}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(first.success);
+        assert_eq!(first.policy_version, generation);
+        assert!(!second.executed);
+        assert!(second.output.contains("Rate limit exceeded"));
+        assert_eq!(second.policy_version, generation);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_rate_admission_consumes_capacity_atomically() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = Arc::new(RecoveryTestTool {
+            id: "atomic_rate".to_string(),
+            succeeds: true,
+            calls: Arc::clone(&calls),
+        });
+        let arguments = serde_json::json!({"path": "./atomic-rate.txt"});
+        let bindings = tool.policy_bindings();
+        let classification = tool.classify_call(&arguments);
+        let resource_keys =
+            tool_resource_lock_keys(tool.id(), &arguments, &bindings, &classification);
+        let mut security = ToolSecurityConfig::default();
+        security.enabled = true;
+        security.fail_closed = true;
+        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
+        policy.write_paths = vec![".".to_string()];
+        policy.rate_limit = Some(1);
+        security.tools.insert(tool.id().to_string(), policy);
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test atomic rate admission.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(tool)
+                .tool_security(ToolSecurityEngine::new(security))
+                .build()
+                .unwrap(),
+        );
+        let held = agent
+            .acquire_tool_resource_locks(&resource_keys)
+            .await
+            .unwrap();
+        let left = {
+            let agent = Arc::clone(&agent);
+            let arguments = arguments.clone();
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "atomic-rate-left",
+                        "atomic_rate",
+                        arguments,
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        let right = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "atomic-rate-right",
+                        "atomic_rate",
+                        arguments,
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drop(held);
+        let (left, right) = tokio::join!(left, right);
+        let records = [left.unwrap(), right.unwrap()];
+
+        assert_eq!(records.iter().filter(|record| record.success).count(), 1);
+        assert_eq!(records.iter().filter(|record| record.executed).count(), 1);
+        assert!(
+            records.iter().any(|record| {
+                !record.executed && record.output.contains("Rate limit exceeded")
+            })
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn changed_policy_generation_invalidates_pending_approval() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(BlockingApprovalHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            result: ApprovalResult::Approved,
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test stale approval denial.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(LockedWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .tool_security(ToolSecurityEngine::new(approval_security_config(true)))
+                .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+                .approval_handler(handler)
+                .build()
+                .unwrap(),
+        );
+        let running = Arc::clone(&agent);
+        let call = tokio::spawn(async move {
+            running
+                .invoke_tool(ToolExecutionRequest::new(
+                    "stale-approval",
+                    "locked_write",
+                    serde_json::json!({"path": "./stale.txt"}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+        entered.wait().await;
+        let generation = agent
+            .runtime_control()
+            .set_tool_security(approval_security_config(true));
+        release.notify_one();
+        let record = call.await.unwrap();
+
+        assert!(!record.executed);
+        assert!(record.output.contains("Approval became stale"));
+        assert_eq!(record.policy_version, generation);
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn final_policy_reapplies_argument_caps_after_approval_changes() {
+        use ai_agents_hitl::CallbackHandler;
+
+        let mut security = ToolSecurityConfig::default();
+        security.enabled = true;
+        security.fail_closed = true;
+        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
+        policy.read_paths = vec![".".to_string()];
+        policy.max_results = Some(5);
+        policy.require_confirmation = true;
+        security.tools.insert("context_echo".to_string(), policy);
+        let handler = CallbackHandler::new(|_| ApprovalResult::Modified {
+            changes: HashMap::from([("max_results".to_string(), serde_json::json!(99))]),
+        });
+        let agent = AgentBuilder::new()
+            .system_prompt("Test final argument caps.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ContextEchoTool))
+            .tool_security(ToolSecurityEngine::new(security))
+            .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+            .approval_handler(Arc::new(handler))
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "final-cap",
+                "context_echo",
+                serde_json::json!({"path": ".", "max_results": 1}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.success);
+        assert_eq!(record.executed_arguments["max_results"], 5);
+        assert_eq!(
+            record.approval.unwrap().modified_arguments.unwrap()["max_results"],
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn no_binding_writes_use_canonical_fallback_lock() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test fallback resource locks.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(NoBindingWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .build()
+                .unwrap(),
+        );
+        let left = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "no-binding-left",
+                        "no_binding_write",
+                        serde_json::json!({}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        let right = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "no-binding-right",
+                        "no_binding_write",
+                        serde_json::json!({}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        let (left, right) = tokio::join!(left, right);
+
+        assert!(left.unwrap().success);
+        assert!(right.unwrap().success);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn parent_and_child_paths_share_a_resource_lock() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test parent child resource locks.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(LockedWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .build()
+                .unwrap(),
+        );
+        let parent = format!("./lock-parent-{}", uuid::Uuid::new_v4());
+        let child = format!("{}/child.txt", parent);
+        let left = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "parent-lock",
+                        "locked_write",
+                        serde_json::json!({"path": parent}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        let right = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "child-lock",
+                        "locked_write",
+                        serde_json::json!({"path": child}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        let (left, right) = tokio::join!(left, right);
+
+        assert!(left.unwrap().success);
+        assert!(right.unwrap().success);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_lock_wait_cleans_weak_entries() {
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test lock cancellation cleanup.")
+                .llm(Arc::new(mock_with_response("done")))
+                .build()
+                .unwrap(),
+        );
+        let held_keys = vec!["path:cancelled-lock".to_string()];
+        let waiting_keys = vec![
+            "path:cancelled-lock".to_string(),
+            "path:orphaned-lock".to_string(),
+        ];
+        let held = agent.acquire_tool_resource_locks(&held_keys).await.unwrap();
+        let waiting = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move { agent.acquire_tool_resource_locks(&waiting_keys).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        agent.runtime_control().cancel_all();
+        assert!(waiting.await.unwrap().is_none());
+        assert_eq!(agent.resource_locks.read().len(), 1);
+        drop(held);
+        assert!(agent.resource_locks.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_can_reenter_after_resource_guards_are_dropped() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ReentrantToolHooks {
+            agent: parking_lot::Mutex::new(None),
+            invoked: AtomicBool::new(false),
+            nested_success: AtomicBool::new(false),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test hook reentrancy.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(RecoveryTestTool {
+                    id: "reentrant_write".to_string(),
+                    succeeds: true,
+                    calls: Arc::clone(&calls),
+                }))
+                .hooks(hooks.clone())
+                .build()
+                .unwrap(),
+        );
+        *hooks.agent.lock() = Some(Arc::downgrade(&agent));
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.invoke_tool(ToolExecutionRequest::new(
+                "outer-hook-call",
+                "reentrant_write",
+                serde_json::json!({"path": "./hook.txt"}),
+                ToolCallSource::Manual,
+            )),
+        )
+        .await
+        .expect("tool completion hook must not retain resource guards")
+        .unwrap();
+
+        assert!(record.success);
+        assert!(hooks.nested_success.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn fallback_releases_primary_resource_locks() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = AgentBuilder::new()
+            .system_prompt("Test fallback execution.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(RecoveryTestTool {
+                id: "primary".to_string(),
+                succeeds: false,
+                calls: Arc::clone(&primary_calls),
+            }))
+            .tool(Arc::new(RecoveryTestTool {
+                id: "fallback".to_string(),
+                succeeds: true,
+                calls: Arc::clone(&fallback_calls),
+            }))
+            .recovery_manager(recovery_manager_with_fallbacks([(
+                "primary".to_string(),
+                "fallback".to_string(),
+            )]))
+            .build()
+            .unwrap();
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.invoke_tool(ToolExecutionRequest::new(
+                "fallback-call",
+                "primary",
+                serde_json::json!({"path": "./shared.txt"}),
+                ToolCallSource::Manual,
+            )),
+        )
+        .await
+        .expect("fallback must not retain the primary resource guard")
+        .unwrap();
+
+        assert!(record.success);
+        assert_eq!(record.canonical_id, "fallback");
+        assert_eq!(record.call_id, "fallback-call");
+        assert!(matches!(record.source, ToolCallSource::Fallback { .. }));
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -12202,6 +14115,225 @@ states:
             }
         }
         assert_eq!(call_counter.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn speculative_transition_drops_loser_before_state_actions() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let committed_after_drop = Arc::new(AtomicBool::new(false));
+        let default = Arc::new(FirstCallLockingProvider {
+            lock,
+            first_started: Arc::clone(&first_started),
+            first_dropped: Arc::clone(&first_dropped),
+            committed_after_drop: Arc::clone(&committed_after_drop),
+            calls: AtomicU64::new(0),
+        });
+        let router = Arc::new(RoutingAfterProviderStart {
+            provider_started: first_started,
+        });
+        let yaml = r#"
+name: SpeculativeCancellationAgent
+system_prompt: "Route before committed work."
+llm:
+  default: default
+  router: router
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: technical
+          when: "The request needs technical support"
+          timing: parallel
+    technical:
+      prompt: "Technical state."
+      on_enter:
+        - prompt: "Prepare technical context."
+          llm: default
+          store_as: preparation
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", default)
+            .llm_alias("router", router)
+            .build()
+            .unwrap();
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.chat("I cannot log in because of AUTH-17."),
+        )
+        .await
+        .expect("committed work must not wait on the losing provider future")
+        .unwrap();
+
+        assert_eq!(response.content, "Committed technical response.");
+        assert_eq!(agent.current_state().as_deref(), Some("technical"));
+        assert!(first_dropped.load(Ordering::SeqCst));
+        assert!(committed_after_drop.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn buffered_transition_drops_stale_stream_before_redispatch() {
+        use futures::StreamExt;
+
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let stream_started = Arc::new(tokio::sync::Notify::new());
+        let stream_dropped = Arc::new(AtomicBool::new(false));
+        let committed_after_drop = Arc::new(AtomicBool::new(false));
+        let default = Arc::new(BufferedLockingProvider {
+            lock,
+            stream_started: Arc::clone(&stream_started),
+            stream_dropped: Arc::clone(&stream_dropped),
+            committed_after_drop: Arc::clone(&committed_after_drop),
+        });
+        let router = Arc::new(RoutingAfterProviderStart {
+            provider_started: stream_started,
+        });
+        let yaml = r#"
+name: BufferedCancellationAgent
+system_prompt: "Hide stale streamed output."
+llm:
+  default: default
+  router: router
+streaming:
+  enabled: true
+  buffer_size: 8
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: technical
+          when: "The request needs technical support"
+          timing: parallel
+    technical:
+      prompt: "Technical state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", default)
+            .llm_alias("router", router)
+            .build()
+            .unwrap();
+
+        let content = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut stream = agent
+                .chat_stream("AUTH-17 needs technical help.")
+                .await
+                .unwrap();
+            let mut content = String::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    StreamChunk::Content { text } => content.push_str(&text),
+                    StreamChunk::Done {} => break,
+                    StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                    _ => {}
+                }
+            }
+            content
+        })
+        .await
+        .expect("redispatch must not wait on the stale streaming future");
+
+        assert_eq!(content, "Committed technical response.");
+        assert_eq!(agent.current_state().as_deref(), Some("technical"));
+        assert!(stream_dropped.load(Ordering::SeqCst));
+        assert!(committed_after_drop.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn buffered_transition_drops_established_stream_before_redispatch() {
+        use futures::StreamExt;
+
+        let stream_started = Arc::new(tokio::sync::Notify::new());
+        let stream_dropped = Arc::new(AtomicBool::new(false));
+        let stream_dropped_notify = Arc::new(tokio::sync::Notify::new());
+        let committed_after_drop = Arc::new(AtomicBool::new(false));
+        let default = Arc::new(EstablishedStreamProvider {
+            stream_started: Arc::clone(&stream_started),
+            stream_dropped: Arc::clone(&stream_dropped),
+            stream_dropped_notify,
+            committed_after_drop: Arc::clone(&committed_after_drop),
+        });
+        let router = Arc::new(RoutingAfterProviderStart {
+            provider_started: stream_started,
+        });
+        let yaml = r#"
+name: EstablishedStreamCancellationAgent
+system_prompt: "Hide stale streamed output."
+llm:
+  default: default
+  router: router
+streaming:
+  enabled: true
+  buffer_size: 8
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: technical
+          when: "The request needs technical support"
+          timing: parallel
+    technical:
+      prompt: "Technical state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", default)
+            .llm_alias("router", router)
+            .build()
+            .unwrap();
+
+        let content = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut stream = agent
+                .chat_stream("AUTH-17 needs technical help.")
+                .await
+                .unwrap();
+            let mut content = String::new();
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    StreamChunk::Content { text } => content.push_str(&text),
+                    StreamChunk::Done {} => break,
+                    StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                    _ => {}
+                }
+            }
+            content
+        })
+        .await
+        .expect("redispatch must wait for the established stale stream to be dropped");
+
+        assert_eq!(content, "Committed technical response.");
+        assert_eq!(agent.current_state().as_deref(), Some("technical"));
+        assert!(stream_dropped.load(Ordering::SeqCst));
+        assert!(committed_after_drop.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

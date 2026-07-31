@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use ai_agents_hooks::AgentHooks;
@@ -168,21 +168,64 @@ pub struct EvalRunner {
     options: EvalRunnerOptions,
 }
 
+fn load_eval_suite(path: &Path) -> Result<EvalSuite> {
+    let content = std::fs::read_to_string(path)?;
+    if path.extension().and_then(|extension| extension.to_str()) == Some("jsonl") {
+        suite_from_jsonl(
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("eval")
+                .to_string(),
+            &content,
+        )
+    } else {
+        parse_eval_suite_yaml(&content)
+    }
+}
+
+fn parse_eval_suite_yaml(content: &str) -> Result<EvalSuite> {
+    let mut unknown_fields = Vec::new();
+    let deserializer = serde_yaml::Deserializer::from_str(content);
+    let suite = serde_ignored::deserialize(deserializer, |path| {
+        unknown_fields.push(path.to_string());
+    })?;
+    if !unknown_fields.is_empty() {
+        unknown_fields.sort();
+        unknown_fields.dedup();
+        return Err(EvalError::Config(format!(
+            "unknown eval configuration field(s): {}",
+            unknown_fields.join(", ")
+        )));
+    }
+    Ok(suite)
+}
+
+fn authorize_llm_mode(
+    suite_mode: LlmFixtureMode,
+    override_mode: Option<LlmFixtureMode>,
+) -> Result<()> {
+    if override_mode.is_some()
+        || matches!(suite_mode, LlmFixtureMode::Mock | LlmFixtureMode::Replay)
+    {
+        return Ok(());
+    }
+    match suite_mode {
+        LlmFixtureMode::Real => Err(EvalError::Config(
+            "suite-declared fixtures.llm.mode real requires --real-llm or EvalRunnerOptions.llm_mode = Some(LlmFixtureMode::Real)"
+                .to_string(),
+        )),
+        LlmFixtureMode::Record => Err(EvalError::Config(
+            "suite-declared fixtures.llm.mode record requires --record or EvalRunnerOptions.llm_mode = Some(LlmFixtureMode::Record)"
+                .to_string(),
+        )),
+        LlmFixtureMode::Mock | LlmFixtureMode::Replay => Ok(()),
+    }
+}
+
 impl EvalRunner {
     pub fn from_file(path: impl AsRef<Path>, options: EvalRunnerOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let content = std::fs::read_to_string(&path)?;
-        let mut suite = if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-            suite_from_jsonl(
-                path.file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("eval")
-                    .to_string(),
-                &content,
-            )?
-        } else {
-            serde_yaml::from_str::<EvalSuite>(&content)?
-        };
+        let mut suite = load_eval_suite(&path)?;
         if let Some(agent) = &options.agent {
             suite.agent = Some(agent.clone());
         }
@@ -199,6 +242,7 @@ impl EvalRunner {
         if options.fail_fast {
             suite.settings.fail_fast = true;
         }
+        authorize_llm_mode(suite.fixtures.llm.mode, options.llm_mode)?;
         if let Some(mode) = options.llm_mode {
             suite.fixtures.llm.mode = mode;
         }
@@ -213,11 +257,54 @@ impl EvalRunner {
         })
     }
 
+    pub fn validate_file(path: impl AsRef<Path>, agent_override: Option<PathBuf>) -> Result<()> {
+        let path = path.as_ref();
+        let mut suite = load_eval_suite(path)?;
+        if let Some(agent) = &agent_override {
+            suite.agent = Some(agent.clone());
+        }
+        suite.validate(agent_override.as_ref())?;
+
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let agent_path = if let Some(agent) = agent_override {
+            agent
+        } else {
+            let agent = suite.agent.ok_or_else(|| {
+                EvalError::Config("agent path is required in suite or CLI".into())
+            })?;
+            if agent.is_absolute() {
+                agent
+            } else {
+                base_dir.join(agent)
+            }
+        };
+        let content = std::fs::read_to_string(&agent_path)?;
+        let spec = AgentSpec::from_yaml_strict(&content).map_err(|error| {
+            EvalError::Config(format!(
+                "invalid agent configuration '{}': {}",
+                agent_path.display(),
+                error
+            ))
+        })?;
+        spec.validate().map_err(|error| {
+            EvalError::Config(format!(
+                "invalid agent configuration '{}': {}",
+                agent_path.display(),
+                error
+            ))
+        })
+    }
+
     pub async fn run(&self) -> Result<EvalResult> {
         let start = Instant::now();
         let base_dir = self.suite_path.parent().unwrap_or_else(|| Path::new("."));
-        let agent_path = self.resolve_agent_path(base_dir)?;
         let scenarios = self.filtered_scenarios();
+        if scenarios.is_empty() {
+            return Err(EvalError::Config(
+                "scenario selection matched zero scenarios".to_string(),
+            ));
+        }
+        let agent_path = self.resolve_agent_path(base_dir)?;
         let results = if self.suite.settings.parallel && !self.suite.settings.fail_fast {
             self.run_scenarios_parallel(&agent_path, base_dir, scenarios)
                 .await
@@ -671,7 +758,7 @@ impl EvalRunner {
         budget: Option<ScenarioBudgetTracker>,
     ) -> Result<RuntimeAgent> {
         let content = std::fs::read_to_string(agent_path)?;
-        let mut spec: AgentSpec = serde_yaml::from_str(&content)?;
+        let mut spec = AgentSpec::from_yaml_strict(&content)?;
         apply_eval_llm_settings(&mut spec, &self.suite.settings);
         isolate_spec_storage(&mut spec, attempt_context);
         apply_workspace_policy(
@@ -1300,20 +1387,39 @@ fn apply_llm_config_settings(
     }
 }
 
+/// Process-wide exclusion held for an eval attempt's environment access.
+enum EnvExclusionGuard {
+    Read {
+        _guard: RwLockReadGuard<'static, ()>,
+    },
+    Write {
+        _guard: RwLockWriteGuard<'static, ()>,
+    },
+}
+
 /// Restores process environment variables when an attempt ends.
 struct EnvGuard {
     /// Previous env values restored on drop.
     previous: Vec<(String, Option<String>)>,
-    /// Process-wide env lock held for the attempt.
-    _guard: MutexGuard<'static, ()>,
+    /// Shared access for unchanged env or exclusive access for mutations.
+    _guard: EnvExclusionGuard,
 }
 
 impl EnvGuard {
     fn apply(values: &HashMap<String, String>) -> Result<Self> {
-        static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        let guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
+        static ENV_LOCK: OnceLock<RwLock<()>> = OnceLock::new();
+        let lock = ENV_LOCK.get_or_init(|| RwLock::new(()));
+        if values.is_empty() {
+            let guard = lock.read().map_err(|_| {
+                EvalError::Runtime("failed to lock eval environment guard".to_string())
+            })?;
+            return Ok(Self {
+                previous: Vec::new(),
+                _guard: EnvExclusionGuard::Read { _guard: guard },
+            });
+        }
+        let guard = lock
+            .write()
             .map_err(|_| EvalError::Runtime("failed to lock eval environment guard".to_string()))?;
         let mut previous = Vec::new();
         for (key, value) in values {
@@ -1324,7 +1430,7 @@ impl EnvGuard {
         }
         Ok(Self {
             previous,
-            _guard: guard,
+            _guard: EnvExclusionGuard::Write { _guard: guard },
         })
     }
 }
@@ -1346,6 +1452,26 @@ impl Drop for EnvGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_suite_loader_rejects_nested_observability_typos() {
+        let error = parse_eval_suite_yaml(
+            r#"
+name: strict
+agent: agent.yaml
+observability:
+  enabeld: true
+scenarios:
+  - id: scenario
+    turns:
+      - input: hello
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("enabeld"), "{error}");
+    }
 
     #[test]
     fn storage_isolation_rewrites_parent_and_spawner_backends() {
@@ -1661,6 +1787,211 @@ scenarios:
         assert_eq!(operation.response_content, "before after");
         assert!(operation.response_present);
         assert_eq!(operation.runtime_error.as_deref(), Some("stream failed"));
+    }
+
+    #[test]
+    fn dry_config_check_validates_real_suite_and_agent_without_authorization() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_dry_config_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let suite_path = dir.join("suite.yaml");
+        std::fs::write(
+            &suite_path,
+            r#"
+name: Dry Config
+agent: agent.yaml
+fixtures:
+  llm:
+    mode: real
+scenarios:
+  - id: live
+    turns:
+      - input: hello
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("agent.yaml"),
+            "name: TestAgent\nsystem_prompt: test\n",
+        )
+        .unwrap();
+
+        EvalRunner::validate_file(&suite_path, None).unwrap();
+
+        std::fs::write(
+            dir.join("agent.yaml"),
+            "name: TestAgent\nsystem_prompt: test\nmax_iteratons: 3\n",
+        )
+        .unwrap();
+        let error = EvalRunner::validate_file(&suite_path, None).unwrap_err();
+        assert!(error.to_string().contains("max_iteratons"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn real_and_record_modes_require_explicit_authorization() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_authorization_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let suite_path = dir.join("suite.yaml");
+        std::fs::write(
+            &suite_path,
+            r#"
+name: Authorization
+agent: agent.yaml
+fixtures:
+  llm:
+    mode: real
+scenarios:
+  - id: authorized
+    turns:
+      - input: hello
+"#,
+        )
+        .unwrap();
+
+        let error = EvalRunner::from_file(&suite_path, EvalRunnerOptions::default())
+            .err()
+            .expect("real mode should require authorization");
+        assert!(error.to_string().contains("--real-llm"));
+        assert!(
+            EvalRunner::from_file(
+                &suite_path,
+                EvalRunnerOptions {
+                    llm_mode: Some(LlmFixtureMode::Real),
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+        );
+
+        let record_suite = std::fs::read_to_string(&suite_path)
+            .unwrap()
+            .replace("mode: real", "mode: record");
+        std::fs::write(&suite_path, record_suite).unwrap();
+        let error = EvalRunner::from_file(&suite_path, EvalRunnerOptions::default())
+            .err()
+            .expect("record mode should require authorization");
+        assert!(error.to_string().contains("--record"));
+        assert!(
+            EvalRunner::from_file(
+                &suite_path,
+                EvalRunnerOptions {
+                    llm_mode: Some(LlmFixtureMode::Record),
+                    ..Default::default()
+                },
+            )
+            .is_ok()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn zero_selected_scenarios_is_an_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ai_agents_eval_zero_selection_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let suite_path = dir.join("suite.yaml");
+        std::fs::write(
+            &suite_path,
+            r#"
+name: Selection
+agent: agent.yaml
+fixtures:
+  llm:
+    mode: mock
+    responses: [ok]
+scenarios:
+  - id: present
+    turns:
+      - input: hello
+"#,
+        )
+        .unwrap();
+        let runner = EvalRunner::from_file(
+            &suite_path,
+            EvalRunnerOptions {
+                ids: vec!["missing".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let error = runner.run().await.unwrap_err();
+
+        assert!(error.to_string().contains("matched zero scenarios"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_guard_allows_readers_and_excludes_writer() {
+        use std::sync::{Barrier, mpsc};
+        use std::thread;
+
+        let start = Arc::new(Barrier::new(3));
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let mut releases = Vec::new();
+        let mut readers = Vec::new();
+        for index in 0..2 {
+            let start = Arc::clone(&start);
+            let acquired_tx = acquired_tx.clone();
+            let (release_tx, release_rx) = mpsc::channel();
+            releases.push(release_tx);
+            readers.push(thread::spawn(move || {
+                start.wait();
+                let guard = EnvGuard::apply(&HashMap::new()).unwrap();
+                acquired_tx.send(index).unwrap();
+                release_rx.recv().unwrap();
+                drop(guard);
+            }));
+        }
+        start.wait();
+        let first = acquired_rx.recv_timeout(Duration::from_secs(1));
+        let second = acquired_rx.recv_timeout(Duration::from_secs(1));
+        for release in releases {
+            release.send(()).unwrap();
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_ne!(first.unwrap(), second.unwrap());
+
+        let key = format!("AI_AGENTS_EVAL_ENV_TEST_{}", uuid::Uuid::new_v4());
+        unsafe {
+            std::env::remove_var(&key);
+        }
+        let reader = EnvGuard::apply(&HashMap::new()).unwrap();
+        assert!(matches!(&reader._guard, EnvExclusionGuard::Read { .. }));
+        let writer_start = Arc::new(Barrier::new(2));
+        let writer_start_thread = Arc::clone(&writer_start);
+        let (writer_tx, writer_rx) = mpsc::channel();
+        let writer_key = key.clone();
+        let writer = thread::spawn(move || {
+            writer_start_thread.wait();
+            let guard = EnvGuard::apply(&HashMap::from([(
+                writer_key.clone(),
+                "temporary".to_string(),
+            )]))
+            .unwrap();
+            writer_tx.send(()).unwrap();
+            assert_eq!(std::env::var(&writer_key).as_deref(), Ok("temporary"));
+            drop(guard);
+        });
+        writer_start.wait();
+        let writer_was_blocked = writer_rx.recv_timeout(Duration::from_millis(100)).is_err();
+        drop(reader);
+        if writer_was_blocked {
+            writer_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        writer.join().unwrap();
+        assert!(writer_was_blocked);
+        assert!(std::env::var(&key).is_err());
     }
 
     fn write_test_agent(dir: &Path) {

@@ -350,7 +350,7 @@ pub mod template {
 
             let rendered_root = load_and_render(template_name)?;
             let processed = TemplateInheritance::process(&rendered_root, load_and_render)?;
-            let spec: AgentSpec = serde_yaml::from_str(&processed)?;
+            let spec = AgentSpec::from_yaml_strict(&processed)?;
             spec.validate()?;
 
             Ok(spec)
@@ -607,6 +607,34 @@ mod tests {
         fn assert_type<T>() {}
         assert_type::<crate::llm::MultiLLMRouter>();
         assert_type::<crate::MultiLLMRouter>();
+    }
+
+    #[test]
+    fn test_facade_template_loader_rejects_nested_unknown_path() {
+        let directory = std::env::temp_dir().join(format!(
+            "ai-agents-facade-strict-template-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("strict.yaml"),
+            r#"
+name: TestAgent
+system_prompt: test
+process:
+  inpt: []
+"#,
+        )
+        .unwrap();
+
+        let mut loader = crate::TemplateLoader::new();
+        loader.add_search_path(&directory);
+        let error = loader
+            .load_and_parse("strict.yaml")
+            .unwrap_err()
+            .to_string();
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(error.contains("process.inpt"), "{error}");
     }
 
     #[test]

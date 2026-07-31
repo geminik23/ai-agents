@@ -16,6 +16,7 @@ pub enum PromptMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StateConfig {
     pub initial: String,
     #[serde(default)]
@@ -33,6 +34,7 @@ pub struct StateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StateDefinition {
     #[serde(default)]
     pub prompt: Option<String>,
@@ -140,7 +142,7 @@ fn default_extractor_llm() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum ToolRef {
     Simple(String),
     Conditional {
@@ -166,7 +168,7 @@ impl ToolRef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolCondition {
     Context(HashMap<String, ContextMatcher>),
     State(StateMatcher),
@@ -222,6 +224,7 @@ pub enum CompareOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct StateMatcher {
     #[serde(default)]
     pub name: Option<String>,
@@ -232,6 +235,7 @@ pub struct StateMatcher {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct TimeMatcher {
     #[serde(default)]
     pub hours: Option<CompareOp>,
@@ -259,6 +263,7 @@ impl Default for TransitionTiming {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Transition {
     pub to: String,
     #[serde(default)]
@@ -295,14 +300,14 @@ fn default_auto() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum TransitionGuard {
     Expression(String),
     Conditions(GuardConditions),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum GuardConditions {
     All(Vec<String>),
     Any(Vec<String>),
@@ -310,7 +315,7 @@ pub enum GuardConditions {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum StateAction {
     Tool {
         tool: String,
@@ -334,6 +339,7 @@ pub enum StateAction {
 
 /// Extract structured data from conversation into context via LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContextExtractor {
     /// Context key to store the extracted value.
     pub key: String,
@@ -374,6 +380,7 @@ pub enum DelegateContextMode {
 
 /// Config for running multiple registry agents concurrently.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConcurrentStateConfig {
     /// Agent IDs in the registry (simple list or weighted entries).
     pub agents: Vec<ConcurrentAgentRef>,
@@ -398,7 +405,7 @@ pub struct ConcurrentStateConfig {
 
 /// Either a plain agent ID string or a weighted entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum ConcurrentAgentRef {
     Id(String),
     Weighted { id: String, weight: f64 },
@@ -422,6 +429,7 @@ impl ConcurrentAgentRef {
 
 /// How to aggregate results from concurrent agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AggregationConfig {
     /// Aggregation strategy.
     pub strategy: AggregationStrategy,
@@ -447,6 +455,7 @@ pub enum AggregationStrategy {
 
 /// Voting config for concurrent agent aggregation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VoteConfig {
     #[serde(default)]
     pub method: VoteMethod,
@@ -485,6 +494,7 @@ pub enum PartialFailureAction {
 
 /// Group chat state config for multi-agent conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroupChatStateConfig {
     /// Participant agent IDs with optional roles.
     pub participants: Vec<ChatParticipant>,
@@ -520,6 +530,7 @@ pub struct GroupChatStateConfig {
 
 /// A participant in a group chat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatParticipant {
     /// Agent ID in the registry.
     pub id: String,
@@ -540,6 +551,7 @@ pub enum ChatStyle {
 
 /// Chat manager config for controlling turn order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatManagerConfig {
     /// Registry agent ID for chat management.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,6 +571,7 @@ pub enum TurnMethod {
 
 /// Termination config for group chat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminationConfig {
     #[serde(default)]
     pub method: TerminationMethod,
@@ -586,6 +599,7 @@ pub enum TerminationMethod {
 
 /// Debate-specific config for group chat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DebateStyleConfig {
     #[serde(default = "default_debate_rounds")]
     pub rounds: u32,
@@ -595,6 +609,7 @@ pub struct DebateStyleConfig {
 
 /// Maker-checker-specific config for group chat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MakerCheckerConfig {
     #[serde(default = "default_maker_checker_iterations")]
     pub max_iterations: u32,
@@ -628,6 +643,7 @@ fn default_maker_checker_iterations() -> u32 {
 
 /// Config for a pipeline state type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PipelineStateConfig {
     pub stages: Vec<PipelineStageEntry>,
 
@@ -640,7 +656,7 @@ pub struct PipelineStateConfig {
 
 /// A single stage in a pipeline state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum PipelineStageEntry {
     /// Simple agent ID string.
     Id(String),
@@ -670,6 +686,7 @@ impl PipelineStageEntry {
 
 /// Config for a handoff state type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HandoffStateConfig {
     pub initial_agent: String,
     pub available_agents: Vec<String>,
@@ -1061,6 +1078,44 @@ states:
         assert_eq!(config.initial, "greeting");
         assert_eq!(config.states.len(), 2);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_state_accepts_dynamic_id_and_explicit_empty_disambiguation_fields() {
+        let yaml = r#"
+initial: checkout-v2
+states:
+  checkout-v2:
+    skills: []
+    tools: []
+    disambiguation:
+      required_clarity: []
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let state = config.states.get("checkout-v2").unwrap();
+        assert!(state.skills.is_empty());
+        assert!(state.tools.as_ref().unwrap().is_empty());
+        let disambiguation = state.disambiguation.as_ref().unwrap();
+        assert!(disambiguation.required_clarity.is_empty());
+    }
+
+    #[test]
+    fn test_state_action_rejects_field_typo() {
+        let yaml = r#"
+tool: log_event
+argz:
+  event: "entered"
+"#;
+        assert!(serde_yaml::from_str::<StateAction>(yaml).is_err());
+    }
+
+    #[test]
+    fn test_transition_rejects_field_typo() {
+        let yaml = r#"
+to: done
+priorty: 10
+"#;
+        assert!(serde_yaml::from_str::<Transition>(yaml).is_err());
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Storage configuration types
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// Storage configuration using tagged enum for type safety and extensibility
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type")]
 pub enum StorageConfig {
     #[serde(rename = "none")]
@@ -17,6 +17,51 @@ pub enum StorageConfig {
 
     #[serde(rename = "redis")]
     Redis(RedisStorageConfig),
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+enum StorageConfigWire {
+    None {},
+    File {
+        path: String,
+    },
+    Sqlite {
+        path: String,
+        #[serde(default)]
+        table: Option<String>,
+    },
+    Redis {
+        url: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        #[serde(default)]
+        ttl_seconds: Option<u64>,
+    },
+}
+
+impl<'de> Deserialize<'de> for StorageConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match StorageConfigWire::deserialize(deserializer)? {
+            StorageConfigWire::None {} => Self::None,
+            StorageConfigWire::File { path } => Self::File(FileStorageConfig { path }),
+            StorageConfigWire::Sqlite { path, table } => {
+                Self::Sqlite(SqliteStorageConfig { path, table })
+            }
+            StorageConfigWire::Redis {
+                url,
+                prefix,
+                ttl_seconds,
+            } => Self::Redis(RedisStorageConfig {
+                url,
+                prefix,
+                ttl_seconds,
+            }),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +261,39 @@ mod tests {
         assert!(config.is_none());
     }
 
+    fn assert_unknown_field(yaml: &str, field: &str) {
+        let error = serde_yaml::from_str::<StorageConfig>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("unknown field `{field}`")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_storage_config_rejects_unknown_none_field() {
+        assert_unknown_field("type: none\nunexpected: true\n", "unexpected");
+    }
+
+    #[test]
+    fn test_storage_config_rejects_unknown_file_field() {
+        assert_unknown_field("type: file\npath: ./data\nread_only: true\n", "read_only");
+    }
+
+    #[test]
+    fn test_storage_config_rejects_unknown_sqlite_field() {
+        assert_unknown_field("type: sqlite\npath: ./data.db\ntabl: sessions\n", "tabl");
+    }
+
+    #[test]
+    fn test_storage_config_rejects_unknown_redis_field() {
+        assert_unknown_field(
+            "type: redis\nurl: redis://localhost:6379\nttl_second: 60\n",
+            "ttl_second",
+        );
+    }
+
     #[test]
     fn test_storage_config_file() {
         let yaml = r#"
@@ -356,6 +434,40 @@ url: "redis://localhost:6379"
         let yaml = serde_yaml::to_string(&config).unwrap();
         assert!(yaml.contains("type: redis"));
         assert!(yaml.contains("url: redis://localhost:6379"));
+    }
+
+    #[test]
+    fn test_storage_config_valid_round_trips() {
+        let configs = [
+            StorageConfig::none(),
+            StorageConfig::file("./data/sessions"),
+            StorageConfig::sqlite("./data/sessions.db"),
+            StorageConfig::Sqlite(
+                SqliteStorageConfig {
+                    path: "./data/custom.db".to_string(),
+                    table: None,
+                }
+                .with_table("custom_sessions"),
+            ),
+            StorageConfig::Redis(
+                RedisStorageConfig {
+                    url: "redis://localhost:6379".to_string(),
+                    prefix: None,
+                    ttl_seconds: None,
+                }
+                .with_prefix("custom:")
+                .with_ttl(3600),
+            ),
+        ];
+
+        for config in configs {
+            let yaml = serde_yaml::to_string(&config).unwrap();
+            let restored: StorageConfig = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(
+                serde_yaml::to_value(restored).unwrap(),
+                serde_yaml::to_value(config).unwrap()
+            );
+        }
     }
 
     #[test]

@@ -24,8 +24,7 @@ Usage:
   sh examples/eval/live/run_live_example_evals.sh --yes-live
 
 Options:
-  --dry-config-check       Parse every live suite without running real scenarios.
-                           This uses an unmatched scenario ID, so it does not build agents or call providers.
+  --dry-config-check       Validate every live suite and referenced agent without running scenarios or constructing providers.
   --yes-live              Run real live suites with --real-llm. Requires provider keys and may incur cost.
   --category CATEGORY     Run only one folder under examples/eval/live/examples, such as tools or state-machine.
   --filter TEXT           Run only suites whose category/name contains TEXT. Can be combined with --category.
@@ -157,8 +156,7 @@ for suite in "$suite_dir"/*/*_live.yaml; do
   if [ "$mode" = "dry" ]; then
     if cargo run -q -p ai-agents-cli -- eval \
       --scenarios "$suite" \
-      --id __no_such_scenario__ \
-      --output "$output"; then
+      --dry-config-check; then
       passed=$((passed + 1))
     else
       failed=$((failed + 1))

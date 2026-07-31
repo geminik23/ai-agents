@@ -5,7 +5,7 @@ description: "Copy a file or directory tree with dry-run review and explicit pat
 # Copy path review example.
 #
 # Use this when the agent should copy files or directories with a review step before applying.
-# Dry-run is the default so the model previews the operation without touching the filesystem.
+# Request dry_run explicitly so the model previews the operation without touching the filesystem.
 # The framework auto-injects tool schemas into the prompt, so the system prompt does not list tool names.
 #
 # Flow: read source -> copy_path dry run -> review summary -> approved apply
@@ -24,8 +24,7 @@ llm:
   provider: openai
   model: gpt-5.4-mini
 
-# file_read provides source context. copy_path performs the copy with dry-run
-# defaults. todo tracks multi-step copy workflows.
+# file_read provides source context. copy_path performs the copy, dry_run true requests a preview, and todo tracks multi-step copy workflows.
 tools:
   - file_read
   - copy_path

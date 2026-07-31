@@ -38,6 +38,8 @@ authors = ["Jaemin Kim <geminik23@gmail.com>"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+serde_ignored = "0.1"
+serde_path_to_error = "0.1"
 schemars = "1.0"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"

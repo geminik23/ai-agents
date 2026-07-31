@@ -11,6 +11,7 @@ use crate::judge::{JudgeAssertion, JudgeInput, JudgeResolver};
 
 /// Collection of assertion clauses evaluated against one turn.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Assertion {
     /// Current or expected state name.
     #[serde(default)]
@@ -101,6 +102,208 @@ pub struct Assertion {
     pub not: Option<Box<Assertion>>,
 }
 
+impl Assertion {
+    pub(crate) fn validate(&self, location: &str) -> crate::Result<()> {
+        if !self.has_simple_clause()
+            && self.any.is_none()
+            && self.all.is_none()
+            && self.not.is_none()
+        {
+            return Err(crate::EvalError::Config(format!(
+                "{location} must not be empty"
+            )));
+        }
+        for (name, children) in [("any", &self.any), ("all", &self.all)] {
+            if let Some(children) = children {
+                if children.is_empty() {
+                    return Err(crate::EvalError::Config(format!(
+                        "{location}.{name} must contain at least one assertion"
+                    )));
+                }
+                for (index, child) in children.iter().enumerate() {
+                    child.validate(&format!("{location}.{name}[{index}]"))?;
+                }
+            }
+        }
+        if let Some(child) = &self.not {
+            child.validate(&format!("{location}.not"))?;
+        }
+        for (name, values) in [
+            ("response_contains", self.response_contains.as_ref()),
+            ("response_contains_any", self.response_contains_any.as_ref()),
+            ("response_not_contains", self.response_not_contains.as_ref()),
+        ] {
+            validate_string_list(values, &format!("{location}.{name}"))?;
+        }
+        validate_slice(self.state_in.as_deref(), &format!("{location}.state_in"))?;
+        validate_map(
+            self.metadata_contains.as_ref(),
+            &format!("{location}.metadata_contains"),
+        )?;
+        if let Some(ToolCalledAssertion::Object(tool)) = &self.tool_called {
+            validate_slice(
+                tool.source_in.as_deref(),
+                &format!("{location}.tool_called.source_in"),
+            )?;
+            for (name, path) in [
+                ("args", tool.args.as_ref()),
+                ("args_original", tool.args_original.as_ref()),
+                ("args_executed", tool.args_executed.as_ref()),
+                ("result_path", tool.result_path.as_ref()),
+            ] {
+                validate_path(path, &format!("{location}.tool_called.{name}"))?;
+            }
+        }
+        if let Some(llm_request) = &self.llm_request {
+            for (name, values) in [
+                ("system_contains", llm_request.system_contains.as_ref()),
+                ("user_contains", llm_request.user_contains.as_ref()),
+                (
+                    "assistant_contains",
+                    llm_request.assistant_contains.as_ref(),
+                ),
+                ("any_contains", llm_request.any_contains.as_ref()),
+            ] {
+                validate_string_list(values, &format!("{location}.llm_request.{name}"))?;
+            }
+        }
+        for (name, approval) in [
+            ("approval_requested", self.approval_requested.as_ref()),
+            (
+                "approval_not_requested",
+                self.approval_not_requested.as_ref(),
+            ),
+        ] {
+            if let Some(ApprovalAssertion::Object(approval)) = approval {
+                validate_string_list(
+                    approval.message_contains.as_ref(),
+                    &format!("{location}.{name}.message_contains"),
+                )?;
+                for (path_name, path) in [
+                    ("original_args", approval.original_args.as_ref()),
+                    ("modified_args", approval.modified_args.as_ref()),
+                    ("effective_args", approval.effective_args.as_ref()),
+                ] {
+                    validate_path(path, &format!("{location}.{name}.{path_name}"))?;
+                }
+            }
+        }
+        validate_path(
+            self.metadata_path.as_ref(),
+            &format!("{location}.metadata_path"),
+        )?;
+        validate_path(
+            self.context_path.as_ref(),
+            &format!("{location}.context_path"),
+        )?;
+        if let Some(orchestration) = &self.orchestration {
+            validate_slice(
+                orchestration.final_agent_in.as_deref(),
+                &format!("{location}.orchestration.final_agent_in"),
+            )?;
+            validate_slice(
+                orchestration.agents_include.as_deref(),
+                &format!("{location}.orchestration.agents_include"),
+            )?;
+        }
+        if let Some(observability) = &self.observability {
+            for (name, assertions) in [
+                ("purpose_counts", &observability.purpose_counts),
+                ("status_counts", &observability.status_counts),
+            ] {
+                for (key, assertion) in assertions {
+                    validate_path(
+                        Some(assertion),
+                        &format!("{location}.observability.{name}.{key}"),
+                    )?;
+                }
+            }
+            for (index, assertion) in observability.dimension_counts.iter().enumerate() {
+                validate_path(
+                    Some(&assertion.assertion),
+                    &format!("{location}.observability.dimension_counts[{index}].assert"),
+                )?;
+            }
+        }
+        for (name, judge) in [
+            ("response_semantic", self.response_semantic.as_ref()),
+            ("judge", self.judge.as_ref()),
+        ] {
+            if judge.is_some_and(|judge| judge.criteria.is_empty()) {
+                return Err(crate::EvalError::Config(format!(
+                    "{location}.{name}.criteria must contain at least one value"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn has_simple_clause(&self) -> bool {
+        self.state.is_some()
+            || self.state_in.is_some()
+            || self.state_not.is_some()
+            || self.state_history_contains.is_some()
+            || self.response_contains.is_some()
+            || self.response_contains_any.is_some()
+            || self.response_not_contains.is_some()
+            || self.response_not_empty.is_some()
+            || self.response_semantic.is_some()
+            || self.disambiguation.is_some()
+            || self.no_disambiguation.is_some()
+            || self.tool_called.is_some()
+            || self.llm_request.is_some()
+            || self.approval_requested.is_some()
+            || self.approval_not_requested.is_some()
+            || self.tool_not_called.is_some()
+            || self.skill_triggered.is_some()
+            || self.metadata_contains.is_some()
+            || self.metadata_path.is_some()
+            || self.context_path.is_some()
+            || self.facts_include.is_some()
+            || self.relationship.is_some()
+            || self.persona_secret_revealed.is_some()
+            || self.orchestration.is_some()
+            || self.observability.is_some()
+            || self.judge.is_some()
+    }
+}
+
+fn validate_string_list(values: Option<&StringList>, location: &str) -> crate::Result<()> {
+    if values.is_some_and(StringList::is_empty) {
+        return Err(crate::EvalError::Config(format!(
+            "{location} must contain at least one value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_slice<T>(values: Option<&[T]>, location: &str) -> crate::Result<()> {
+    if values.is_some_and(|values| values.is_empty()) {
+        return Err(crate::EvalError::Config(format!(
+            "{location} must contain at least one value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_map<K, V>(values: Option<&HashMap<K, V>>, location: &str) -> crate::Result<()> {
+    if values.is_some_and(|values| values.is_empty()) {
+        return Err(crate::EvalError::Config(format!(
+            "{location} must contain at least one value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_path(assertion: Option<&PathAssertion>, location: &str) -> crate::Result<()> {
+    if assertion.is_some_and(|assertion| assertion.in_values.as_ref().is_some_and(Vec::is_empty)) {
+        return Err(crate::EvalError::Config(format!(
+            "{location}.in must contain at least one value"
+        )));
+    }
+    Ok(())
+}
+
 /// YAML helper accepting either one string or a list of strings.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -110,6 +313,10 @@ pub enum StringList {
 }
 
 impl StringList {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Many(values) if values.is_empty())
+    }
+
     fn items(&self) -> Vec<String> {
         match self {
             Self::One(value) => vec![value.clone()],
@@ -132,6 +339,7 @@ pub enum ToolCalledAssertion {
 /// `count_gte` are evaluated against the number of executions that satisfy all
 /// configured record predicates; `tool_called` still requires at least one match.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ToolCalledObject {
     /// Tool ID or requested name required on each matching execution.
     #[serde(default)]
@@ -167,6 +375,7 @@ pub struct ToolCalledObject {
 
 /// Filters and counts for matching complete LLM requests.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct LlmRequestAssertion {
     /// Required substrings in system messages.
     #[serde(default)]
@@ -204,6 +413,7 @@ pub enum ApprovalAssertion {
 
 /// Filters and counts for matching approval evidence.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalAssertionObject {
     /// Exact number of matching approval records required.
     #[serde(default)]
@@ -254,6 +464,7 @@ pub struct ApprovalAssertionObject {
 
 /// Filters for normalized approval trigger fields.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalTriggerAssertion {
     /// Normalized trigger type: tool, condition, or state.
     #[serde(default, rename = "type")]
@@ -288,6 +499,7 @@ pub enum DisambiguationExpectation {
 
 /// Dot-path assertion used for metadata, context, tools, and metrics.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PathAssertion {
     /// Path used for file lookup, HTTP routing, or dot-path checks.
     pub path: String,
@@ -322,6 +534,7 @@ pub struct PathAssertion {
 
 /// Assertion over actor facts collected after a turn.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FactsAssertion {
     /// Actor ID used for this scenario, turn, or assertion.
     #[serde(default)]
@@ -336,6 +549,7 @@ pub struct FactsAssertion {
 
 /// Assertion over actor relationship memory evidence.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RelationshipAssertion {
     /// Actor ID used for this scenario, turn, or assertion.
     #[serde(default)]
@@ -382,6 +596,7 @@ pub enum SecretAssertion {
 
 /// Assertion over orchestration metadata attached to a turn.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct OrchestrationAssertion {
     /// Expected orchestration pattern label.
     #[serde(default)]
@@ -402,6 +617,7 @@ pub struct OrchestrationAssertion {
 
 /// Assertion over the observability report for a turn.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityAssertion {
     /// Upper bound for total LLM calls.
     #[serde(default)]
@@ -416,23 +632,72 @@ pub struct ObservabilityAssertion {
     #[serde(default)]
     pub total_cost_usd_lte: Option<f64>,
     /// Path assertions over counts grouped by purpose.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_empty_path_map")]
     pub purpose_counts: HashMap<String, PathAssertion>,
     /// Path assertions over counts grouped by status.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_empty_path_map")]
     pub status_counts: HashMap<String, PathAssertion>,
     /// Path assertions over counts matching configured dimensions.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_empty_dimension_assertions"
+    )]
     pub dimension_counts: Vec<ObservabilityDimensionAssertion>,
 }
 
 /// Assertion over observability metrics matching all listed dimensions.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ObservabilityDimensionAssertion {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_empty_string_map")]
     pub match_dimensions: HashMap<String, String>,
     #[serde(rename = "assert")]
     pub assertion: PathAssertion,
+}
+
+fn deserialize_non_empty_path_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, PathAssertion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = HashMap::deserialize(deserializer)?;
+    if values.is_empty() {
+        return Err(serde::de::Error::custom(
+            "assertion collection must contain at least one value",
+        ));
+    }
+    Ok(values)
+}
+
+fn deserialize_non_empty_dimension_assertions<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<ObservabilityDimensionAssertion>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = Vec::deserialize(deserializer)?;
+    if values.is_empty() {
+        return Err(serde::de::Error::custom(
+            "assertion collection must contain at least one value",
+        ));
+    }
+    Ok(values)
+}
+
+fn deserialize_non_empty_string_map<'de, D>(
+    deserializer: D,
+) -> std::result::Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = HashMap::deserialize(deserializer)?;
+    if values.is_empty() {
+        return Err(serde::de::Error::custom(
+            "assertion collection must contain at least one value",
+        ));
+    }
+    Ok(values)
 }
 
 /// Result detail for one evaluated assertion clause.
@@ -1311,25 +1576,33 @@ fn path_actual_matches(actual: Option<&Value>, assertion: &PathAssertion) -> boo
             return false;
         }
     }
-    if let Some(expected) = assertion.gte {
-        if actual.as_f64().unwrap_or(f64::NAN) < expected {
-            return false;
-        }
+    let has_numeric_bound = assertion.gte.is_some()
+        || assertion.lte.is_some()
+        || assertion.gt.is_some()
+        || assertion.lt.is_some();
+    let actual_number = has_numeric_bound.then(|| actual.as_f64()).flatten();
+    if has_numeric_bound && actual_number.is_none() {
+        return false;
     }
-    if let Some(expected) = assertion.lte {
-        if actual.as_f64().unwrap_or(f64::NAN) > expected {
-            return false;
-        }
+    if let Some(expected) = assertion.gte
+        && actual_number.is_none_or(|actual| actual < expected)
+    {
+        return false;
     }
-    if let Some(expected) = assertion.gt {
-        if actual.as_f64().unwrap_or(f64::NAN) <= expected {
-            return false;
-        }
+    if let Some(expected) = assertion.lte
+        && actual_number.is_none_or(|actual| actual > expected)
+    {
+        return false;
     }
-    if let Some(expected) = assertion.lt {
-        if actual.as_f64().unwrap_or(f64::NAN) >= expected {
-            return false;
-        }
+    if let Some(expected) = assertion.gt
+        && actual_number.is_none_or(|actual| actual <= expected)
+    {
+        return false;
+    }
+    if let Some(expected) = assertion.lt
+        && actual_number.is_none_or(|actual| actual >= expected)
+    {
+        return false;
     }
     true
 }
@@ -2380,5 +2653,33 @@ mod tests {
         .await;
 
         assert!(matches!(result, AssertionOutcome::Passed(_)));
+    }
+
+    #[test]
+    fn numeric_bounds_reject_nonnumeric_actual_values() {
+        for assertion in [
+            PathAssertion {
+                path: "value".to_string(),
+                gte: Some(1.0),
+                ..Default::default()
+            },
+            PathAssertion {
+                path: "value".to_string(),
+                lte: Some(1.0),
+                ..Default::default()
+            },
+            PathAssertion {
+                path: "value".to_string(),
+                gt: Some(1.0),
+                ..Default::default()
+            },
+            PathAssertion {
+                path: "value".to_string(),
+                lt: Some(1.0),
+                ..Default::default()
+            },
+        ] {
+            assert!(!path_matches(&json!({"value": "not-a-number"}), &assertion));
+        }
     }
 }
