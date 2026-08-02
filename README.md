@@ -11,13 +11,13 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 **[ai-agents.rs](https://ai-agents.rs)** - Documentation, guides, and examples
 
-- Declarative behavior - everything in YAML, not code
+- YAML-first behavior - common agent behavior is declarative, with Rust host integrations for custom extensions
 - Language-agnostic semantics - intent, extraction, validation via LLM (no regex)
 - Layered overrides - global → agent → state → skill → turn
-- Safety by default - tool policies, HITL approvals, error recovery
+- Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.0-rc.16** — Under active development. Stable `v1.0.0` is planned for release before August 1, 2026. APIs and YAML schema may change between minor versions.
+> Status: **1.0.0-rc.16** - Stable `v1.0.0` preparation is in progress. Public APIs and YAML may change between release candidates; after `1.0.0`, stable surfaces follow SemVer.
 
 ## Features
 
@@ -29,11 +29,22 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
 - **Memory stack** - CompactingMemory and token budgeting; file and Redis snapshot persistence; SQLite snapshots, session metadata/filtering/cleanup, actor facts, and relationship memory
 - **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
-- **Multi-agent systems** - fail-closed child admission, bounded managed capacity, optional shared LLMs and namespaced storage, agent registry, actor-aware messaging, and router/pipeline/concurrent/group chat/handoff orchestration; active nested spawners are rejected in v1
+- **Dynamic agent spawning + multi-agent systems** - fail-closed child admission, bounded managed capacity, optional shared LLMs and namespaced storage, agent registry, actor-aware messaging, and router/pipeline/concurrent/group chat/handoff orchestration; active nested spawners are rejected in v1
 - **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming, context injection, and actor/relationship inspection
 - **Reasoning, reflection & disambiguation** - chain-of-thought, ReAct, plan-and-execute, self-evaluation, ambiguity detection, and clarification
 - **Evaluation, safety, control & observability** - YAML scenario evals with assertions/judges, runtime latency optimization, speculative branch execution, error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
 - **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`; custom LLM providers remain source-compatible and can opt into native tool requests through additive methods
+
+Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, credentials, custom integrations, and provider-internal I/O.
+
+## v1 Scope and Support
+
+The v1 scope includes YAML-first construction, blocking and streaming chat, strict specs, state, skills, process, context, explicit tool grants and final authorization, memory, capability-aware storage, facts and relationships, spawning and orchestration, evaluation, observability, provider adapters, CLI/TUI, and opt-in runtime optimization.
+
+- **Stable**: builder and blocking chat, strict YAML, state/skills/process/context, built-in tool authorization, and in-memory/compacting memory follow normal v1 SemVer; compatibility changes are recorded in the changelog.
+- **Supported**: streaming, evaluation and observability, provider adapters and MCP, persona, file and SQLite storage, facts and relationships, spawning and orchestration, and runtime optimization are production-usable within their documented operational boundaries.
+- **Experimental**: Redis is snapshot-only for v1, and Noop storage provides no persistence. Both may receive compatibility changes in a minor release with release notes, but may not silently lose data or bypass safety checks.
+- **Future Work**: the Generalized Autonomy Runner, retrieval/evidence/RAG, generalized background scheduling, and Python bindings are not shipped v1 contracts.
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 
@@ -158,6 +169,8 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 |----------|-------------|
 | [Getting Started](https://ai-agents.rs/docs/getting-started/) | Install and run your first agent in under a minute |
 | [YAML Reference](https://ai-agents.rs/docs/yaml-reference/) | Complete spec for agent definition files |
+| [Built-in Tools](https://ai-agents.rs/docs/built-in-tools/) | Inputs, outputs, policy, and host requirements for all built-ins |
+
 | [CLI Guide](https://ai-agents.rs/docs/cli/) | All commands, flags, and REPL features |
 | [Rust API](https://ai-agents.rs/docs/rust-api/) | Embedding agents in your Rust application |
 | [Providers](https://ai-agents.rs/docs/providers/) | Setup for all 12 LLM providers |

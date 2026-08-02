@@ -9,10 +9,7 @@ mod tool;
 
 pub use llm::{CliHitlMetadata, CliHitlStyle, CliMetadata, CliPromptStyle, LLMConfig, LLMSelector};
 pub use memory::MemoryConfig;
-pub use provider::{
-    BuiltinProviderConfig, ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig,
-    ToolAliasesConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
-};
+pub use provider::ToolAliasesConfig;
 pub use spawner::{
     AutoSpawnEntry, ManagementToolsConfig, OrchestrationToolsConfig, SpawnerConfig,
     SpawnerToolGrantConfig, TemplateSource,
@@ -43,6 +40,8 @@ use ai_agents_tools::ToolSecurityConfig;
 pub use super::RuntimeConfig;
 use super::{ParallelToolsConfig, StreamingConfig};
 
+/// Stable agent schema loaded through strict framework-owned YAML boundaries.
+/// Fields remain in this contract only when the runtime implements their effect; removed inert sections such as `providers` and `provider_security` are rejected instead of silently accepted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     pub name: String,
@@ -117,12 +116,6 @@ pub struct AgentSpec {
 
     #[serde(default)]
     pub runtime: RuntimeConfig,
-
-    #[serde(default)]
-    pub providers: ProvidersConfig,
-
-    #[serde(default)]
-    pub provider_security: ProviderSecurityConfig,
 
     #[serde(default)]
     pub tool_aliases: ToolAliasesConfig,
@@ -384,8 +377,6 @@ impl Default for AgentSpec {
             disambiguation: DisambiguationConfig::default(),
             observability: ObservabilityConfig::default(),
             runtime: RuntimeConfig::default(),
-            providers: ProvidersConfig::default(),
-            provider_security: ProviderSecurityConfig::default(),
             tool_aliases: ToolAliasesConfig::default(),
             metadata: None,
             spawner: None,
@@ -720,10 +711,6 @@ impl AgentSpec {
 
     pub fn has_storage(&self) -> bool {
         !self.storage.is_none()
-    }
-
-    pub fn has_providers(&self) -> bool {
-        self.providers.yaml.is_some()
     }
 
     pub fn has_tool_aliases(&self) -> bool {
@@ -1084,11 +1071,7 @@ tools:
       GITHUB_TOKEN: test
   - name: http
     custom_header: X-Test
-provider_security:
-  custom_provider:
-    tools:
-      custom_tool:
-        require_approval: true
+
 tool_aliases:
   custom_tool:
     names:
@@ -1113,17 +1096,21 @@ tool_security:
             }
             ToolEntry::Simple(_) => panic!("expected structured tool"),
         }
-        assert!(
-            spec.provider_security
-                .providers
-                .contains_key("custom_provider")
-        );
+
         assert!(spec.tool_aliases.tools.contains_key("custom_tool"));
         assert!(spec.tool_security.tools["dangerous"].require_confirmation);
         assert_eq!(
             spec.metadata.as_ref().unwrap()["custom"]["arbitrary"],
             serde_json::json!(true)
         );
+    }
+
+    #[test]
+    fn test_strict_yaml_rejects_removed_provider_sections() {
+        for field in ["providers", "provider_security"] {
+            let yaml = format!("name: TestAgent\nsystem_prompt: test\n{field}: {{}}\n");
+            assert_unknown_path(&yaml, field);
+        }
     }
 
     #[test]
@@ -1478,30 +1465,6 @@ storage:
         let spec = AgentSpec::default();
         assert!(!spec.has_storage());
         assert!(spec.storage.is_none());
-    }
-
-    #[test]
-    fn test_agent_spec_with_providers() {
-        let yaml = r#"
-name: ProviderAgent
-system_prompt: "You are helpful."
-llm:
-  provider: openai
-  model: gpt-4
-providers:
-  builtin:
-    enabled: true
-  yaml:
-    enabled: true
-    tools:
-      - id: custom_search
-        name: Custom Search
-        description: Search custom API
-"#;
-        let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
-        assert!(spec.has_providers());
-        assert!(spec.providers.builtin.enabled);
-        assert!(spec.providers.yaml.is_some());
     }
 
     #[test]

@@ -1,0 +1,17 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+ai-agents-eval = { workspace = true }
+
+ai-agents-runtime = { workspace = true }
+ai-agents-skills = { workspace = true }
+ai-agents-tools = { workspace = true }
+anyhow = { workspace = true }
+minijinja = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }

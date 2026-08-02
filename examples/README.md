@@ -202,7 +202,7 @@ Top-level `tools:` is an explicit ordinary-tool grant. Omitted or empty top-leve
 | `copy_review.yaml` | Copy a file or directory with `copy_path`, dry-run review, and explicit write policy |
 | `move_review.yaml` | Move or rename a file or directory with `move_path`, dry-run review, and source/destination policy |
 | `delete_review.yaml` | Delete a file or directory with `delete_path`, recursive-delete gating, dry-run review, and explicit write policy |
-| `web_search_research.yaml` | Provider-neutral web search through a host-provided search provider with `web_fetch` fallback when no provider is installed |
+| `web_search_research.yaml` | Host-provided web search with an unavailable result when no provider is installed; separately grants `web_fetch` for known-URL retrieval |
 | `math_and_random.yaml` | Statistical math and random value generation with required tool selection |
 | `multi_tool_agent.yaml` | Selected general-purpose built-ins with parallel execution and required tool selection |
 | `http_tool.yaml` | Raw HTTP API client tool for external API calls (makes real network requests) |
@@ -524,7 +524,7 @@ Cross-session actor memory and key facts extraction - the agent remembers struct
 | `cross_session.yaml` | Full cross-session memory with `actor_memory` + `facts` + `session` blocks. Demonstrates `injection.mode`, `privacy`, token budget allocation for facts, and session TTL. Run twice with `--actor customer_42` to see prior facts loaded on the second session. |
 | `multi_actor.yaml` | NPC guard that tracks facts about each player independently using `identification.method: from_context`. Custom categories (suspicion, favor, contraband) show how to extend the built-in category set for domain-specific extraction. |
 
-Note: Facts are extracted automatically after each turn by the router LLM and stored in English for consistent cross-language deduplication. SQLite is the only backend that persists facts and session metadata - file and Redis backends accept the configuration but use no-op storage. The `--actor` flag sets the actor ID explicitly; `identification.method: from_context` reads it from a dotted context path on every turn so a game engine or multi-tenant app can switch actors by updating the context value. Use `/facts` or `/actor facts` in the REPL to inspect extracted facts. Use `/cleanup` to remove sessions past their TTL.
+Note: Facts are extracted automatically after each turn by the router LLM and stored in English for consistent cross-language deduplication. SQLite is the only built-in backend that persists facts and generic session metadata. File and Redis are snapshot-only, and configurations requiring unsupported capabilities fail explicitly before execution. The `--actor` flag sets the actor ID explicitly; `identification.method: from_context` reads it from a dotted context path on every turn so a game engine or multi-tenant app can switch actors by updating the context value. Use `/facts` or `/actor facts` in the REPL to inspect extracted facts. Use `/cleanup` to remove sessions past their TTL.
 
 Examples:
 
@@ -547,7 +547,7 @@ cargo run -p ai-agents-cli -- run examples/yaml/session/multi_actor.yaml \
 
 ### `yaml/orchestration/`
 
-Multi-agent orchestration patterns using pre-spawned sub-agents. All five patterns (router, pipeline, concurrent, group chat, handoff) have dedicated state types.
+Multi-agent orchestration patterns using pre-spawned sub-agents. Router uses delegate states plus transitions; pipeline, concurrent, group chat, and handoff have dedicated state configuration.
 
 | File | Description |
 |------|-------------|

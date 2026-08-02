@@ -50,8 +50,6 @@ pub enum ContextSource {
         #[serde(default)]
         refresh: RefreshPolicy,
         #[serde(default)]
-        cache_ttl: Option<u64>,
-        #[serde(default)]
         timeout_ms: Option<u64>,
         #[serde(default)]
         fallback: Option<serde_json::Value>,
@@ -141,7 +139,6 @@ method: GET
 headers:
   Authorization: "Bearer {{ env.API_TOKEN }}"
 refresh: per_session
-cache_ttl: 300
 timeout_ms: 5000
 fallback:
   theme: "default"
@@ -151,7 +148,6 @@ fallback:
             url,
             method,
             headers,
-            cache_ttl,
             timeout_ms,
             ..
         } = source
@@ -159,11 +155,21 @@ fallback:
             assert!(url.contains("{{ context.user.id }}"));
             assert_eq!(method, "GET");
             assert!(headers.contains_key("Authorization"));
-            assert_eq!(cache_ttl, Some(300));
             assert_eq!(timeout_ms, Some(5000));
         } else {
             panic!("Expected Http source");
         }
+    }
+
+    #[test]
+    fn test_http_source_rejects_removed_cache_ttl() {
+        let yaml = r#"
+type: http
+url: "https://api.example.com/context"
+cache_ttl: 300
+"#;
+        let error = serde_yaml::from_str::<ContextSource>(yaml).unwrap_err();
+        assert!(error.to_string().contains("cache_ttl"));
     }
 
     #[test]

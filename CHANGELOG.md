@@ -15,7 +15,7 @@
 
 ### Changed
 - Evaluation execution: mocked built-in tools retain their schemas and safety behavior, while failed turns preserve partial responses and structural evidence
-- YAML and eval validation: fixed framework objects reject unknown fields, empty assertions and zero selections fail, replay misses error, and provider-backed modes require authorization
+- YAML and eval validation: fixed framework objects reject unknown fields, unused provider sections and HTTP context cache settings now error instead of being accepted without effect, empty assertions and zero selections fail, replay misses error, and provider-backed modes require authorization
 - Agent and spawner construction: rewritten specs retain resource directories, shared providers remain authoritative, and all child paths use fail-closed admission and capacity checks
 - Skill and routing results: successful skills retain their selected identity, and disambiguation applies intent clarity and effective subsystem thresholds consistently
 - State lifecycle: first arrival runs entry behavior and later returns run reentry behavior
@@ -23,6 +23,7 @@
 - Mutation and memory defaults: filesystem mutations execute unless preview is explicit, while compacting memory enforces recent retention with deterministic progress
 - Storage and restore contracts: backend tiers are explicit, namespaced data remains isolated and migratable, and parent-child topology commits or rolls back with session identity
 - API compatibility: framework errors are non-exhaustive, invalid child prefixes fail during configuration, and detached child records require explicit construction
+- Configuration API: removed inert provider configuration types, facade exports, and the unused provider-presence helper instead of preserving Rust APIs with no runtime effect
 
 ### Fixed
 - Storage readiness: blocking and streaming turns stop before execution when configured persistence capabilities are unavailable

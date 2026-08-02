@@ -261,13 +261,11 @@ pub mod skill {
 pub mod spec {
     pub use ai_agents_observability::ObservabilityConfig;
     pub use ai_agents_runtime::spec::{
-        AgentSpec, AutoSpawnEntry, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle,
-        CliMetadata, CliPromptStyle, FileStorageConfig, LLMConfig, LLMConfigOrSelector,
-        LLMSelector, ManagementToolsConfig, MemoryConfig, OrchestrationToolsConfig,
-        ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
-        RuntimeConfig, SpawnerConfig, SpawnerToolGrantConfig, SqliteStorageConfig, StorageConfig,
-        StructuredToolEntry, TemplateSource, ToolAliasesConfig, ToolConfig, ToolEntry,
-        ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+        AgentSpec, AutoSpawnEntry, CliHitlMetadata, CliHitlStyle, CliMetadata, CliPromptStyle,
+        FileStorageConfig, LLMConfig, LLMConfigOrSelector, LLMSelector, ManagementToolsConfig,
+        MemoryConfig, OrchestrationToolsConfig, RedisStorageConfig, RuntimeConfig, SpawnerConfig,
+        SpawnerToolGrantConfig, SqliteStorageConfig, StorageConfig, StructuredToolEntry,
+        TemplateSource, ToolAliasesConfig, ToolConfig, ToolEntry,
     };
 }
 
@@ -543,10 +541,9 @@ pub use memory::{
 };
 pub use skill::{SkillDefinition, SkillExecutor, SkillLoader, SkillRef, SkillRouter, SkillStep};
 pub use spec::{
-    AgentSpec, BuiltinProviderConfig, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
-    ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
+    AgentSpec, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig, RedisStorageConfig,
     RuntimeConfig as SpecRuntimeConfig, SqliteStorageConfig, StorageConfig, ToolAliasesConfig,
-    ToolConfig, ToolPolicyConfig as SpecToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
+    ToolConfig,
 };
 pub use template::TemplateLoader;
 pub use tools::HttpTool;
