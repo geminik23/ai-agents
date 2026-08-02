@@ -12578,6 +12578,7 @@ mod tests {
             1
         );
         drop(agent);
+        storage.close().await;
         drop(storage);
 
         let reopened_storage = Arc::new(
@@ -12606,6 +12607,7 @@ mod tests {
         );
 
         drop(restored);
+        reopened_storage.close().await;
         drop(reopened_storage);
         std::fs::remove_dir_all(directory).unwrap();
     }

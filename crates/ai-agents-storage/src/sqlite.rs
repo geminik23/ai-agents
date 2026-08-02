@@ -90,6 +90,11 @@ impl SqliteStorage {
         Self::new(":memory:").await
     }
 
+    /// Closes the SQLite pool and waits for all connections to release their file handles.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
     async fn connect(path: &str) -> Result<sqlx::SqlitePool> {
         // Ensure parent directories exist -- SQLite's create_if_missing only creates the file.
         if path != ":memory:"
@@ -1789,7 +1794,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        storage.pool.close().await;
+        storage.close().await;
 
         let storage = SqliteStorage::new(&path).await.unwrap();
         for &(agent_id, actor_id, content) in &records {

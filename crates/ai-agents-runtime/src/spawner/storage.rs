@@ -976,6 +976,9 @@ mod tests {
             storage.delete("legacy").await.unwrap();
             assert!(storage.load("legacy").await.unwrap().is_none());
             assert!(inner.load(legacy_key).await.unwrap().is_none());
+
+            drop(storage);
+            inner.close().await;
         }
 
         std::fs::remove_dir_all(directory).unwrap();
