@@ -100,7 +100,15 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Install release Rust
-        run: rustup toolchain install "$RELEASE_RUST" --profile minimal
+        timeout-minutes: 10
+        run: |
+          for attempt in 1 2 3; do
+            if timeout 3m rustup toolchain install "$RELEASE_RUST" --profile minimal; then
+              exit 0
+            fi
+            echo "Rust installation attempt ${attempt}/3 failed or timed out"
+          done
+          exit 1
       - name: Validate public contract
         run: cargo +1.97.0 run -p xtask --locked -- public-contract
       - name: Validate live example configuration

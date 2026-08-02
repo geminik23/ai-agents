@@ -1480,6 +1480,10 @@ impl Drop for EnvGuard {
 mod tests {
     use super::*;
 
+    fn attempt_workspace(id: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ai-agents-eval-{id}"))
+    }
+
     #[test]
     fn strict_suite_loader_rejects_nested_observability_typos() {
         let error = parse_eval_suite_yaml(
@@ -1502,9 +1506,10 @@ scenarios:
 
     #[test]
     fn storage_isolation_rewrites_parent_and_spawner_backends() {
+        let workspace = attempt_workspace("attempt-a");
         let context = AttemptFixtureContext {
             isolation_id: "attempt-a".to_string(),
-            workspace: PathBuf::from("/tmp/eval-attempt-a"),
+            workspace: workspace.clone(),
             mock_server_base_url: None,
         };
         let mut file_spec: AgentSpec = serde_yaml::from_str(
@@ -1519,8 +1524,8 @@ spawner:
         .unwrap();
         isolate_spec_storage(&mut file_spec, &context);
         assert_eq!(
-            file_spec.storage.get_path(),
-            Some("/tmp/eval-attempt-a/parent-storage")
+            file_spec.storage.get_path().map(PathBuf::from),
+            Some(workspace.join("parent-storage"))
         );
         let shared = file_spec
             .spawner
@@ -1530,8 +1535,8 @@ spawner:
             .as_ref()
             .unwrap();
         assert_eq!(
-            shared.get_path(),
-            Some("/tmp/eval-attempt-a/spawner-shared-storage.db")
+            shared.get_path().map(PathBuf::from),
+            Some(workspace.join("spawner-shared-storage.db"))
         );
         assert_eq!(shared.get_table(), Some("shared_sessions"));
 
@@ -1561,7 +1566,7 @@ spawner:
 
         let other_context = AttemptFixtureContext {
             isolation_id: "attempt-b".to_string(),
-            workspace: PathBuf::from("/tmp/eval-attempt-b"),
+            workspace: attempt_workspace("attempt-b"),
             mock_server_base_url: None,
         };
         let mut other_redis: AgentSpec = serde_yaml::from_str(
@@ -1604,14 +1609,16 @@ tool_security:
             read_tools: vec!["file_read".to_string()],
             write_tools: vec!["file_write".to_string()],
         };
+        let first_workspace = attempt_workspace("attempt-a");
+        let second_workspace = attempt_workspace("attempt-b");
         let first_context = AttemptFixtureContext {
             isolation_id: "attempt-a".to_string(),
-            workspace: PathBuf::from("/tmp/eval-attempt-a"),
+            workspace: first_workspace.clone(),
             mock_server_base_url: None,
         };
         let second_context = AttemptFixtureContext {
             isolation_id: "attempt-b".to_string(),
-            workspace: PathBuf::from("/tmp/eval-attempt-b"),
+            workspace: second_workspace.clone(),
             mock_server_base_url: None,
         };
 
@@ -1623,11 +1630,17 @@ tool_security:
         assert!(first.tool_security.fail_closed);
         assert_eq!(
             first.tool_security.tools["file_read"].read_paths,
-            vec!["./source", "/tmp/eval-attempt-a"]
+            vec![
+                "./source".to_string(),
+                first_workspace.display().to_string()
+            ]
         );
         assert_eq!(
             first.tool_security.tools["file_write"].write_paths,
-            vec!["./output", "/tmp/eval-attempt-a"]
+            vec![
+                "./output".to_string(),
+                first_workspace.display().to_string()
+            ]
         );
         assert_eq!(
             first.tool_security.tools["file_read"].blocked_paths,
@@ -1643,7 +1656,10 @@ tool_security:
         );
         assert_eq!(
             second.tool_security.tools["file_read"].read_paths,
-            vec!["./source", "/tmp/eval-attempt-b"]
+            vec![
+                "./source".to_string(),
+                second_workspace.display().to_string()
+            ]
         );
         assert_eq!(
             source.tool_security.tools["file_read"].read_paths,
@@ -1677,7 +1693,7 @@ tool_security:
         };
         let context = AttemptFixtureContext {
             isolation_id: "attempt-a".to_string(),
-            workspace: PathBuf::from("/tmp/eval-attempt-a"),
+            workspace: attempt_workspace("attempt-a"),
             mock_server_base_url: None,
         };
 
