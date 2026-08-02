@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0 - 2026-08-02
+
 ### Added
 - HITL evaluation: deterministic fixtures and assertions cover approval, rejection, modification, timeout, unavailable handlers, localized prompts, and execution outcomes
 - Eval isolation: each attempt receives isolated workspace and storage values without touching configured source paths

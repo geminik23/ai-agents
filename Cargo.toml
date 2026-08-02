@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0-rc.16"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -69,28 +69,28 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 clap = { version = "4.5", features = ["derive"] }
 
-ai-agents-core = { path = "crates/ai-agents-core", version = "1.0.0-rc.16" }
-ai-agents-llm = { path = "crates/ai-agents-llm", version = "1.0.0-rc.16" }
-ai-agents-memory = { path = "crates/ai-agents-memory", version = "1.0.0-rc.16" }
-ai-agents-storage = { path = "crates/ai-agents-storage", version = "1.0.0-rc.16" }
-ai-agents-tools = { path = "crates/ai-agents-tools", version = "1.0.0-rc.16" }
-ai-agents-state = { path = "crates/ai-agents-state", version = "1.0.0-rc.16" }
-ai-agents-context = { path = "crates/ai-agents-context", version = "1.0.0-rc.16" }
-ai-agents-process = { path = "crates/ai-agents-process", version = "1.0.0-rc.16" }
-ai-agents-skills = { path = "crates/ai-agents-skills", version = "1.0.0-rc.16" }
-ai-agents-hitl = { path = "crates/ai-agents-hitl", version = "1.0.0-rc.16" }
-ai-agents-hooks = { path = "crates/ai-agents-hooks", version = "1.0.0-rc.16" }
-ai-agents-recovery = { path = "crates/ai-agents-recovery", version = "1.0.0-rc.16" }
-ai-agents-reasoning = { path = "crates/ai-agents-reasoning", version = "1.0.0-rc.16" }
-ai-agents-disambiguation = { path = "crates/ai-agents-disambiguation", version = "1.0.0-rc.16" }
-ai-agents-persona = { path = "crates/ai-agents-persona", version = "1.0.0-rc.16" }
-ai-agents-relationships = { path = "crates/ai-agents-relationships", version = "1.0.0-rc.16" }
-ai-agents-observability = { path = "crates/ai-agents-observability", version = "1.0.0-rc.16" }
-ai-agents-template = { path = "crates/ai-agents-template", version = "1.0.0-rc.16" }
-ai-agents-facts = { path = "crates/ai-agents-facts", version = "1.0.0-rc.16" }
-ai-agents-eval = { path = "crates/ai-agents-eval", version = "1.0.0-rc.16" }
-ai-agents-runtime = { path = "crates/ai-agents-runtime", version = "1.0.0-rc.16" }
-ai-agents = { path = "crates/ai-agents", version = "1.0.0-rc.16" }
+ai-agents-core = { path = "crates/ai-agents-core", version = "1.0.0" }
+ai-agents-llm = { path = "crates/ai-agents-llm", version = "1.0.0" }
+ai-agents-memory = { path = "crates/ai-agents-memory", version = "1.0.0" }
+ai-agents-storage = { path = "crates/ai-agents-storage", version = "1.0.0" }
+ai-agents-tools = { path = "crates/ai-agents-tools", version = "1.0.0" }
+ai-agents-state = { path = "crates/ai-agents-state", version = "1.0.0" }
+ai-agents-context = { path = "crates/ai-agents-context", version = "1.0.0" }
+ai-agents-process = { path = "crates/ai-agents-process", version = "1.0.0" }
+ai-agents-skills = { path = "crates/ai-agents-skills", version = "1.0.0" }
+ai-agents-hitl = { path = "crates/ai-agents-hitl", version = "1.0.0" }
+ai-agents-hooks = { path = "crates/ai-agents-hooks", version = "1.0.0" }
+ai-agents-recovery = { path = "crates/ai-agents-recovery", version = "1.0.0" }
+ai-agents-reasoning = { path = "crates/ai-agents-reasoning", version = "1.0.0" }
+ai-agents-disambiguation = { path = "crates/ai-agents-disambiguation", version = "1.0.0" }
+ai-agents-persona = { path = "crates/ai-agents-persona", version = "1.0.0" }
+ai-agents-relationships = { path = "crates/ai-agents-relationships", version = "1.0.0" }
+ai-agents-observability = { path = "crates/ai-agents-observability", version = "1.0.0" }
+ai-agents-template = { path = "crates/ai-agents-template", version = "1.0.0" }
+ai-agents-facts = { path = "crates/ai-agents-facts", version = "1.0.0" }
+ai-agents-eval = { path = "crates/ai-agents-eval", version = "1.0.0" }
+ai-agents-runtime = { path = "crates/ai-agents-runtime", version = "1.0.0" }
+ai-agents = { path = "crates/ai-agents", version = "1.0.0" }
 
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }

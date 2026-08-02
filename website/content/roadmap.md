@@ -4,7 +4,7 @@ template = "page.html"
 description = "What's shipped, what's next, and where the framework is headed."
 +++
 
-This page tracks what has shipped in each release candidate, the work required for stable v1.0, and planned post-v1 directions. Post-v1 release assignments remain intentionally unfrozen.
+This page tracks what shipped through stable v1.0 and the planned post-v1 directions. Post-v1 release assignments remain intentionally unfrozen.
 
 ---
 
@@ -42,6 +42,7 @@ This page tracks what has shipped in each release candidate, the work required f
 | **rc.14** | Evaluation framework - YAML and JSONL scenario suites, fixtures, assertions, judges, strict redaction, observability overlay, and CI reports |
 | **rc.15** | Runtime latency optimization + speculative branch execution - pre-response routing, background actor-memory maintenance, stable orchestration ordering, parallel transition decisions, speculative skill and reasoning branches, buffered streaming, branch observability, and eval flush support |
 | **rc.16** | Built-in tool expansion - canonical tool identity, read-only discovery tools, mutation tools with dry-run review, command allowlists, interactive questions, session todos, bounded waits, web retrieval, diagnostics, tool policy enforcement, live example eval suites, and committed fixture files |
+| **v1.0.0** | Stable foundation - frozen public contracts, Rust 1.88 MSRV, strict validation, focused safety hardening, release checks, and synchronized documentation |
 
 ---
 
@@ -49,13 +50,11 @@ This page tracks what has shipped in each release candidate, the work required f
 
 | Target | Focus | Summary |
 | --- | --- | --- |
-| **Next RC** | Stable foundation release preparation | Documentation synchronization, validation, and final release packaging on top of the complete built-in tool foundation |
-| **v1.0.0** | Stable Foundation Release | Stable schema/API, release validation, documentation cleanup, examples, and safe built-in tool foundation |
 | **Post-v1, unassigned** | Generalized Autonomy Runner | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events |
 | **Post-v1, unassigned** | Information Lifecycle | Retrieval and evidence contracts, extensible RAG, evidence access policy, and maintenance scheduling implemented in the sequence below |
 | **Post-v1, unassigned** | Python Runtime Bindings | Python package backed by the Rust runtime for loading YAML agents, chat, streaming, sessions, memory, relationships, and observability |
 
-Once the stable foundation is fully released, the roadmap focus shifts toward autonomous task runs, the information lifecycle layer for retrieval/evidence/RAG/scoping/background maintenance, Python access to the Rust runtime, external observability integration, realtime/audio interfaces, deeper persistent memory, and richer multi-agent ecosystems.
+With the stable foundation released, the roadmap focus shifts toward autonomous task runs, the information lifecycle layer for retrieval/evidence/RAG/scoping/background maintenance, Python access to the Rust runtime, external observability integration, realtime/audio interfaces, deeper persistent memory, and richer multi-agent ecosystems.
 
 
 ---
@@ -106,7 +105,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Runtime Latency Optimization** | Pre-response deterministic transitions, background actor-memory maintenance, stable orchestration ordering, branch-aware observability foundations, and eval flushing | ✅ Done | rc.15 |
 | **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | ✅ Done | rc.15 |
 | **Built-in Tool Expansion** | Safe discovery, repository inspection, diagnostics, interactive questions, session todos, bounded waits, web retrieval primitives, context-aware tool policy, file write/edit, patch review, and controlled validation commands | ✅ Done | rc.16 |
-| **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | Planned | v1.0.0 |
+| **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | ✅ Done | v1.0.0 |
 | **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned after v1.0 | Release unassigned |
 | **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, task runs, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned after v1.0 | Release unassigned |
 | **OpenTelemetry Exporter** | Export privacy-safe `ai-agents` runtime traces through OTLP to external observability backends such as LangSmith, Grafana Tempo, Jaeger, and Datadog. Covers LLM calls, tool calls, skill routing, state transitions, memory operations, multi-agent handoffs, speculative branch outcomes, eval metadata, latency, token usage, and cost estimates. | Planned after v1.0 | Release unassigned; builds on existing observability and tracing |
