@@ -14,6 +14,9 @@
 //! async fn main() -> ai_agents::Result<()> {
 //!     let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 //!         .auto_configure_llms()?
+//!         .auto_configure_features()?
+//!         .auto_configure_mcp().await?
+//!         .auto_configure_spawner().await?
 //!         .build()?;
 //!
 //!     let response = agent.chat("Hello!").await?;

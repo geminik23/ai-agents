@@ -50,6 +50,8 @@ See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and
 
 ## Install
 
+The published crates and CLI require Rust 1.88 or newer.
+
 ```toml
 [dependencies]
 ai-agents = "1.0.0-rc.16"

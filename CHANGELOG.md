@@ -24,6 +24,7 @@
 - Storage and restore contracts: backend tiers are explicit, namespaced data remains isolated and migratable, and parent-child topology commits or rolls back with session identity
 - API compatibility: framework errors are non-exhaustive, invalid child prefixes fail during configuration, and detached child records require explicit construction
 - Configuration API: removed inert provider configuration types, facade exports, and the unused provider-presence helper instead of preserving Rust APIs with no runtime effect
+- Minimum Rust version: published crates and the CLI require Rust 1.88 or newer
 
 ### Fixed
 - Storage readiness: blocking and streaming turns stop before execution when configured persistence capabilities are unavailable

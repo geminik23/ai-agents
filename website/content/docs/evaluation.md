@@ -57,6 +57,23 @@ target/eval/mocked/basic/simple_chat_mocked/
 
 Use `--junit` to also write `junit.xml`.
 
+### Fail-closed configuration
+
+Evaluation configuration is strict where a silent mistake could create false evidence:
+
+- fixed suite, nested observability, fixture, and assertion objects reject unknown fields;
+- `assert: {}`, empty `all`/`any`, and empty nested predicate collections are configuration errors;
+- numeric bounds fail when the observed value is not numeric;
+- ID, tag, or language filters that select zero scenarios return an error instead of a `0/0` success;
+- replay requires an exact alias, model, and request-hash match and never falls back to a configured mock response;
+- suite-declared `real` or `record` modes do not authorize provider calls by themselves.
+
+Use `--dry-config-check` to validate the complete non-empty suite, deferred mock routes, and referenced agent without selecting scenarios, constructing providers, or writing reports. Use `--real-llm` or `--record <FILE>` to explicitly authorize provider-backed execution. Record destinations are created and opened before a provider is constructed or called, and aliases targeting the same cassette share one synchronized writer. Record-mode streaming is rejected before the provider call because atomic stream recording is not implemented.
+
+Scenario env overlays mutate the process environment only while holding an exclusive guard and restore all values before releasing it. Attempts without env overlays share a read guard, so they can run together but cannot observe another attempt's temporary env values.
+
+Compatibility JSONL rows and persisted cassette records may contain additional fields so newer producers can remain readable; the human-authored suite schema remains strict.
+
 ---
 
 ## Reading eval results
@@ -384,7 +401,7 @@ fixtures:
       default: 50
 ```
 
-Delays are in milliseconds and apply to mocked or replay fallback providers for the named alias.
+Delays are in milliseconds and apply to mocked or replay providers for the named alias.
 
 ### Sequenced LLM outcomes
 
@@ -452,6 +469,21 @@ fixtures:
 ```
 
 The real URL, domain, address, redirect, byte, cache, and output checks still run. Localhost and private-network targets remain blocked.
+
+Use `fixtures.web_search` to install a deterministic exact-query `WebSearchProvider` without public search traffic. Set `available: false` to exercise the runtime's pre-execution unavailable path; an available fixture with no matching query returns an empty available result.
+
+```yaml
+fixtures:
+  web_search:
+    available: true
+    responses:
+      "ai agents rust":
+        provider: static
+        results:
+          - title: AI Agents Framework
+            url: https://ai-agents.rs/
+            snippet: YAML-first agents in Rust.
+```
 
 ### Mocked diagnostics fixture
 
@@ -551,18 +583,22 @@ A tool trigger can also require exact arguments. The complete `args` value must 
 Current trigger forms are:
 
 ```yaml
+# Each YAML document below is a separate alternative.
 # Tool name, with optional exact args.
 trigger: { type: tool, name: http }
 
+---
 # Condition name, with optional exact matched expression.
 trigger:
   type: condition
   name: state_changing_http
   matched: "method in [POST, PUT, DELETE, PATCH]"
 
+---
 # State transition. from is optional; to is required.
 trigger: { type: state_transition, from: review, to: complete }
 
+---
 # Disambiguation escalation, with an optional exact reason.
 trigger: { type: disambiguation_escalation, reason: unclear }
 ```
@@ -570,22 +606,27 @@ trigger: { type: disambiguation_escalation, reason: unclear }
 Current outcome forms are:
 
 ```yaml
+# Each YAML document below is a separate alternative.
 default:
   outcome: approve
 
+---
 default:
   outcome: reject
   reason: "Unexpected approval request"
 
+---
 default:
   outcome: modify
   changes:
     url: "https://api.example.test/v1/safe-items/42"
     body: '{"name":"safe-item"}'
 
+---
 default:
   outcome: timeout
 
+---
 default:
   outcome: unavailable
 ```
@@ -701,14 +742,20 @@ Use these as templates for permission-denial, approval, host-fixture, and no-too
 
 ## LLM modes
 
+Release-blocking tool-execution smoke suites should use explicit `tool_choice: required` or a specific canonical tool so they prove provider request mapping, normalized calls, and actual shared-executor evidence. A response that merely contains a UUID, JSON value, or other tool-shaped text does not satisfy `tool_called` with `executed: true`. Automatic `tool_choice: auto` discovery measures provider/model behavior and should be reported as quality evidence rather than deterministic framework correctness.
+
+The `examples/eval/live/run_live_example_evals.sh` helper discovers only `examples/eval/live/examples/`. It intentionally excludes `examples/eval/live/quality/`, including judge-based quality suites, which must be run separately. Explicit required/specific choices may add one corrective provider call on a non-native fallback, and that call uses the same scenario call, token, cost, timeout, and cancellation budgets.
+
+A streamed eval turn joins committed chunks into response text, but stream chunks do not carry the final blocking `AgentResponse.metadata` contract. Use blocking turns for `metadata_contains` or `metadata_path` assertions; use tool, state, context, and observability evidence for streamed-turn assertions.
+
 `fixtures.llm.mode` controls how the eval runner supplies LLM providers.
 
 | Mode | Use when | Behavior |
 |------|----------|----------|
 | `mock` | Default CI and deterministic tests | Uses `fixtures.llm.responses` in order. When responses run out, the last response repeats. |
-| `replay` | Stable regression from prior real traffic | Loads a JSONL cassette and matches records by alias, model, and request hash, with ordered fallback. |
-| `record` | Creating or updating a cassette | Calls the real provider and appends responses to a cassette JSONL file. |
-| `real` | Live provider smoke tests | Uses the provider configured by the agent YAML. Requires credentials and may incur cost. |
+| `replay` | Stable regression from prior real traffic | Loads a JSONL cassette and requires an exact alias, model, and request-hash match. A miss is an error. |
+| `record` | Creating or updating a cassette | Requires `--record`, preflights the cassette, calls the real provider, and appends synchronized JSONL records. Streaming is rejected before the call. |
+| `real` | Live provider smoke tests | Requires `--real-llm`, uses the provider configured by the agent YAML, and may incur network cost. |
 
 ### Mock mode
 
@@ -746,10 +793,14 @@ cargo run -p ai-agents-cli -- eval \
 What happens:
 
 ```text
-real provider call
-  -> response returned to eval
-  -> cassette record appended
+open and validate cassette destination
+  -> construct real provider
+  -> real provider call
+  -> append and flush one synchronized cassette record
+  -> return response to eval
 ```
+
+If destination setup or a cassette write fails, the eval returns an error. Multiple aliases writing the same cassette are serialized so records remain valid JSONL. Record mode currently supports blocking completion only; a streaming turn fails before making the provider request.
 
 Cassette records store:
 
@@ -779,9 +830,9 @@ Replay flow:
 ```text
 runtime LLM request
   -> compute request hash from messages and config
-  -> find cassette record with same alias, model, and hash
-  -> return recorded response
-  -> if no hash match, fall back to ordered cassette response
+  -> find cassette record with the same alias, model, and hash
+  -> return the recorded response
+  -> if no exact match exists, return an error
 ```
 
 If replay unexpectedly uses the wrong response, check:
@@ -794,7 +845,7 @@ If replay unexpectedly uses the wrong response, check:
 
 ### Real mode
 
-Use `real` only for live smoke tests.
+Use `real` only for live smoke tests. A suite may declare its intended mode, but that declaration does not authorize provider access:
 
 ```yaml
 fixtures:
@@ -802,7 +853,7 @@ fixtures:
     mode: real
 ```
 
-Or force real mode from the CLI:
+The command must also opt in explicitly:
 
 ```sh
 cargo run -p ai-agents-cli -- eval \
@@ -812,7 +863,7 @@ cargo run -p ai-agents-cli -- eval \
   --real-llm
 ```
 
-Real mode needs provider credentials such as `OPENAI_API_KEY`, network access, and acceptance of provider cost and nondeterminism.
+Real mode needs provider credentials such as `OPENAI_API_KEY`, network access, and acceptance of provider cost and nondeterminism. Without `--real-llm`, a suite that resolves to `mode: real` fails during configuration before constructing the provider.
 
 ### Live example suites
 

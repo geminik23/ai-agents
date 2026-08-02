@@ -64,7 +64,7 @@ Runs YAML or JSONL scenario suites, evaluates assertions from structured turn ev
 ai-agents-cli validate <agent.yaml>
 ```
 
-Parses and validates the YAML spec. Returns exit code `0` on success, `1` on failure. Useful in CI pipelines.
+Parses and validates the YAML spec. Fixed framework-owned configuration objects reject unknown fields, so typos such as `max_iteratons` fail validation; documented provider-specific keys under `llm` remain available through the provider extension map. Returns exit code `0` on success and `1` on failure.
 
 ---
 
@@ -86,9 +86,10 @@ Parses and validates the YAML spec. Returns exit code `0` on success, `1` on fai
 | `--junit` | Write `junit.xml`. |
 | `--json` | Print `summary.json` to stdout. |
 | `--observability` | Attach a safe default observability overlay when the suite does not define `observability:`. |
-| `--record <FILE>` | Force real LLM calls and append cassette JSONL records. |
-| `--replay <FILE>` | Replay LLM responses from a cassette JSONL file. |
-| `--real-llm` | Force real LLM calls even when the suite declares a fixture mode. |
+| `--dry-config-check` | Validate the suite and referenced agent without selecting scenarios, constructing providers, or writing reports. |
+| `--record <FILE>` | Explicitly authorize real LLM calls and append synchronized cassette JSONL records. The destination is opened before provider calls. |
+| `--replay <FILE>` | Replay exact alias, model, and request-hash matches from a cassette. A missing match is an error. |
+| `--real-llm` | Explicitly authorize real LLM calls even when the suite declares another fixture mode. |
 
 Example:
 
@@ -131,9 +132,11 @@ The runner supports mocked, replayed, recorded, and real LLM modes, mock tools, 
 
 Implementation notes:
 
-- `settings.parallel` and `--parallel` run scenario-isolated suites concurrently. `fail_fast`, `env` overlays, and unsupported isolation modes force serial execution or configuration errors.
+- Fixed suite and assertion objects reject unknown fields. Empty assertion trees, empty assertion collections, nonnumeric values used with numeric bounds, and filters that select zero scenarios are configuration or assertion failures rather than successful no-op runs.
+- A suite cannot authorize its own `real` or `record` mode. Use `--real-llm` or `--record` explicitly; without those flags no real provider is constructed.
+- `settings.parallel` and `--parallel` run scenario-isolated suites concurrently. `fail_fast`, `env` overlays, and unsupported isolation modes force serial execution or configuration errors. Attempts without env overrides can run together, while an env-mutating attempt has exclusive process-environment access until restoration completes.
 - Suite-level `observability:` is honored. CLI `--observability` creates a safe default overlay under the eval output directory.
-- `turn.stream: true` uses `chat_stream()` and collects streamed content before assertions run.
+- `turn.stream: true` uses `chat_stream()` and collects streamed content before assertions run. Record mode rejects streaming before invoking the provider because atomic stream recording is not implemented.
 - `fixtures.mock_server.enabled: true` starts a local HTTP server and injects `mock_server.base_url` into runtime context.
 - `settings.redact_outputs: true` stores `[redacted]` for input, response, and string assertion details, and default JSON/JSONL reports omit raw `TurnEvidence` and response metadata.
 - `--tag-mode` must be `any` or `all`; invalid values exit with code `2`.
@@ -247,14 +250,14 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 | `/load self [name]`  | Load parent session only                                             |
 | `/load agent <id>`   | Load one spawned agent's session                                     |
 | `/sessions`          | List saved sessions                                                  |
-| `/sessions --actor <id>` | List sessions for a specific actor (requires session metadata)   |
-| `/sessions --tag <tag>` | List sessions matching a tag (requires session metadata)          |
-| `/cleanup`           | Delete sessions whose TTL has expired                                |
+| `/sessions --actor <id>` | List sessions for an actor (requires `SessionFiltering`; SQLite among built-ins) |
+| `/sessions --tag <tag>` | List sessions matching a tag (requires `SessionFiltering`; SQLite among built-ins) |
+| `/cleanup`           | Delete expired sessions (requires `ExpiryCleanup`; unwrapped SQLite among built-ins) |
 | `/delete <name>`     | Delete a saved session                                               |
 | `/actor`             | Show current actor ID                                                |
 | `/actor set <id>`    | Set actor ID for cross-session memory                                |
 | `/actor facts [cat]` | Show facts for the current actor, optionally filtered by category    |
-| `/actor delete`      | Delete all data for the current actor (GDPR)                         |
+| `/actor delete`      | Atomically delete current-actor data (requires `ActorDataDeletion`; SQLite among built-ins) |
 | `/facts`             | Show all facts for the current actor                                 |
 | `/facts extract [n]` | Manually extract facts from the last N messages (default: 10)        |
 | `/relationship`, `/rel` | Show current actor relationship dimensions                       |
@@ -309,7 +312,7 @@ Press the same key again to close a panel. Press `Esc` to close all panels.
 | `Ctrl+L`        | Clear chat display |
 | `Ctrl+S`        | Quick save session |
 | `PageUp/Down`   | Scroll chat history |
-| `Esc`           | Cancel streaming or close panels |
+| `Esc`           | Close completion/panels, resolve a question modal with its default, or hide current streaming display |
 | `F1` - `F9`     | Toggle side panels |
 | `Ctrl+T`        | Cycle color theme |
 | `/`             | Start a slash command (opens completion popup) |
@@ -362,15 +365,14 @@ When you type `/` in the input area, a floating completion popup appears above t
 
 ### Streaming
 
-When `--stream` is enabled, tokens appear in real time in the chat area.
-Tool calls and state transitions are displayed inline as they happen.
+When `--stream` is enabled, tokens appear in real time in the chat area. Tool calls and state transitions are displayed inline as they happen. Pressing Esc while a turn is active clears the local spinner and visible streaming buffer, but it does not cancel the spawned runtime/provider request; later chunks or the final response may still arrive.
 
 ### `ask_user` behavior
 
 The CLI installs a question handler for the `ask_user` tool:
 
 - Plain REPL - prints the question and numbered options, then reads from stdin.
-- TUI - shows the question as a modal with option buttons. Full multi-select and free-text parity with the plain REPL is deferred.
+- TUI - shows a modal that supports single-choice options, multi-select, free-text input, and configured defaults. Cancel or Esc submits no explicit selection, so the configured default is used when present; otherwise the response is unanswered/unavailable.
 - Non-interactive fallback - if stdin is not interactive, the tool uses its configured `default` when present or returns an unavailable-style result.
 
 This is separate from HITL approval. HITL approves risky actions. `ask_user` is for normal clarification or preference questions inside the conversation flow.

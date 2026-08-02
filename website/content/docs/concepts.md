@@ -16,13 +16,13 @@ This page explains how the framework is organized and how its pieces fit togethe
 
 The dependency layers flow in one direction:
 
-1. **Core** (`ai-agents-core`) - shared types, specs, error types, and trait definitions used everywhere.
+1. **Core** (`ai-agents-core`) - shared dependency-light types, error types, and trait definitions used across the workspace.
 2. **Feature crates** - each layer builds on core: `ai-agents-llm`, `ai-agents-memory`, `ai-agents-tools`, `ai-agents-state`, `ai-agents-skills`, `ai-agents-context`, `ai-agents-process`, `ai-agents-reasoning`, `ai-agents-recovery`, `ai-agents-hitl`, `ai-agents-hooks`, `ai-agents-disambiguation`, `ai-agents-storage`, `ai-agents-template`, `ai-agents-persona`, `ai-agents-facts`, `ai-agents-relationships`, `ai-agents-observability`, and `ai-agents-eval`.
 3. **Runtime** (`ai-agents-runtime`) - wires every feature crate together into a running agent loop. Also contains the dynamic agent spawner module.
-4. **Facade** (`ai-agents`) - re-exports everything behind a single dependency so library users only add one crate.
+4. **Facade** (`ai-agents`) - provides a reviewed, curated user-facing surface for normal embedding and host integration.
 5. **CLI** (`ai-agents-cli`) - a binary crate providing the `ai-agents-cli` command.
 
-You never need to depend on individual crates directly. Just add `ai-agents` to your `Cargo.toml` and everything is available.
+Most applications need only `ai-agents`. A few low-level adapter contracts, such as custom web-fetch transport and resolver types or eval-only static provider helpers, intentionally require their owning subcrate; the [Rust API guide](@/docs/rust-api.md) identifies those boundaries.
 
 ```yaml
 # Conceptual layer diagram
@@ -49,8 +49,23 @@ layers:
     - ai-agents-relationships
     - ai-agents-observability
     - ai-agents-eval
-  core: ai-agents-core         # traits, types, specs
+  core: ai-agents-core         # shared traits and types
 ```
+
+---
+
+## v1 Scope and Support
+
+The v1 scope includes YAML-first construction, blocking and streaming execution, strict specs, state, skills, process, context, explicit tool grants and final authorization, memory, capability-aware persistence, facts and relationships, spawning and orchestration, evaluation, observability, provider adapters, CLI/TUI, and opt-in runtime optimization.
+
+Support maturity is separate from whether a component is shipped:
+
+| Tier | v1 meaning | Components |
+|---|---|---|
+| **Stable** | Normal v1 SemVer applies; compatibility changes are recorded in the changelog. | Builder and blocking chat, strict YAML, state/skills/process/context, built-in tool authorization, in-memory and compacting memory. |
+| **Supported** | Maintained within documented boundaries; external service quality, availability, scheduling, and operational tuning may evolve. | Streaming, evaluation and observability, provider adapters and MCP, persona, file and SQLite storage, facts and relationships, spawning and orchestration, runtime optimization. |
+| **Experimental** | Explicitly opt-in; minor releases may make compatibility changes with release notes, without permitting silent data loss or safety bypass. | Redis snapshot storage and Noop storage. |
+| **Future Work** | Not shipped as a usable Rust or YAML contract. | Generalized Autonomy Runner, retrieval/evidence/RAG, generalized background scheduling, Python bindings. |
 
 ---
 
@@ -58,7 +73,7 @@ layers:
 
 Every agent goes through four stages, whether you run it from the CLI or embed it in Rust code.
 
-1. **Define** - You describe the agent in a YAML file (or build it programmatically with `AgentBuilder`). The YAML covers identity, LLM config, tools, state machine, memory, and everything else.
+1. **Define** - You describe common agent behavior in YAML or build it programmatically with `AgentBuilder`. External skills, child files, templates, MCP services, and host integrations can complement the root spec.
 2. **Build** - `AgentBuilder` parses the spec, connects to LLM providers, registers tools, initializes memory, and validates the full configuration. The result is a ready-to-run `Agent` instance.
 3. **Chat** - Calling `agent.chat()` (or `agent.prompt()`) sends user input through the process pipeline, into the LLM, through any tool calls or skill executions, and back out as a response. This loop repeats until the agent produces a final answer or hits the iteration limit.
 4. **Persist** - Optionally, the session (conversation history, state, context) can be saved to storage and restored later. This lets you build long-running assistants that pick up where they left off.
@@ -82,11 +97,11 @@ storage:
 
 ## The YAML Spec
 
-Everything about an agent lives in one YAML file. The framework parses it into an `AgentSpec`, the central data structure that every subsystem reads from.
+Agent behavior is YAML-first, not YAML-only. The runtime/spec layer parses the root document into `AgentSpec`, while referenced skills, child files, templates, MCP services, and Rust host integrations remain explicit external dependencies.
 
 The major sections of a spec are: identity (`name`, `system_prompt`), LLM configuration (`llm` / `llms`), tools (including MCP servers), skills, state machine, context sources, memory, storage, process pipeline, reasoning, reflection, disambiguation, error recovery, HITL, spawner, and metadata.
 
-You don't need all of them. A minimal spec is just a name, a system prompt, and an LLM block - three lines. Everything else is opt-in. The framework applies sensible defaults for anything you leave out.
+You don't need all of them. A minimal spec has three conceptual fields - a name, a system prompt, and an LLM block - rendered as a small five-line document. Everything else is opt-in. The framework applies sensible defaults for anything you leave out.
 
 For the full list of every field and its options, see the [YAML Reference](@/docs/yaml-reference.md).
 
@@ -103,7 +118,7 @@ llm:
 
 ## LLM System
 
-An agent can use multiple LLMs, each with a name and a role. You define them in the `llms` map, then assign roles with the `llm` selector. Roles include `default` (main chat), `router` (lightweight routing and detection tasks), `evaluator`, and `summarizer`.
+An agent can use multiple named LLMs in the `llms` map. The `llm` selector assigns `default` (main chat) and optional `router` aliases. Evaluator, judge, and summarizer aliases are configured by the subsystems that use them.
 
 If the primary LLM fails, the framework can automatically fall back to another named LLM - no manual retry logic needed. You configure this in the `error_recovery.llm` section. Any supported provider works (OpenAI, Anthropic, Google, Ollama, and 8 more), and you can mix providers freely within a single agent.
 
@@ -197,7 +212,7 @@ skills:
           operation: now
       - tool: random
         args:
-          operation: random_int
+          operation: integer
           min: 1
           max: 100
       - prompt: |
@@ -209,13 +224,15 @@ skills:
 
 ## Tools
 
-Tools give the agent the ability to act - call APIs, read files, inspect repositories, ask the user follow-up questions, keep a todo list, do math, manipulate data, edit files, review patches, and run controlled validation commands. The framework ships with built-in tools such as `calculator`, `datetime`, `echo`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `file_list`, `file_info`, `patch`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `command`, `json`, `http`, `file`, `text`, `template`, `math`, and `random`.
+Tools give the agent the ability to act - call APIs, read files, inspect repositories, ask the user follow-up questions, keep a todo list, do math, manipulate data, edit files, review patches, and run controlled validation commands. The framework ships with built-in tools such as `calculator`, `datetime`, `echo`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `file_list`, `file_info`, `patch`, `copy_path`, `move_path`, `delete_path`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `web_search`, `command`, `json`, `http`, `file`, `text`, `template`, `math`, and `random`.
 
 For external tools, you can connect any MCP (Model Context Protocol) server. MCP tools support `stdio` transport, startup timeouts, security restrictions, and function-level views that let you expose subsets of an MCP server's capabilities to different states.
 
 Tool availability is explicit and fail-closed. Omitted top-level `tools:` means no LLM-callable tools, and `tools: []` also means no tools. The top-level `tools:` list is the normal maximum grant; state-level `tools` can only narrow the effective grant, never widen it to the full registry. Explicit feature flags such as `spawner.management_tools`, `spawner.orchestration_tools`, and `persona.evolution.allow_llm_evolve` are also grants for their generated tools. Security policies, HITL, recovery, observability, and eval evidence use canonical tool IDs after aliases and display names are resolved. `ask_user` is separate from HITL approval: it asks a preference or clarification question through a host question handler instead of approving a risky action.
 
-The split local-file tools block raw `.git` paths, while `git_status` and `git_diff` expose bounded repository inspection. Mutation tools such as `file_write`, `file_edit`, and `patch` require explicit `write_paths` policy, canonicalize existing paths and write-parent ancestors to deny symlink escapes, and use read-before-write version checks when configured. Side-effecting tools share path-like resource locks across model, skill, state, fallback, orchestration, and spawned-runtime paths. The `command` tool is not a shell: it runs exact allowlisted argv commands inside explicit `working_dirs`, starts from an empty environment, filters env through policy, redacts argv evidence, and bounds output. Host-backed tools such as `diagnostics`, `ask_user`, and `command` return explicit unavailable results when their host hooks are absent; `ask_user` can use a configured default answer.
+LLM `tool_choice` controls provider selection only after that grant is known. Omission keeps the existing prompt-JSON automatic-selection behavior; `auto`, `required`, `{ specific: canonical_id }`, and `none` opt into explicit selection. Required or specific choice can narrow visible tools but cannot register, grant, or authorize one. Native calls and prompt-fallback calls both enter the same shared executor, and unsupported native required/specific selection gets at most one budgeted corrective retry.
+
+The split local-file tools block raw `.git` paths, while `git_status` and `git_diff` expose bounded repository inspection. Filesystem mutation tools execute when `dry_run` is omitted. Set `dry_run: true` to request validation or a preview without applying the mutation. Every actual mutation still requires applicable write policy and either approval or an explicit trusted-policy exemption. Results expose `mutation_performed`, while `created`, `overwritten`, `copied`, `moved`, and `deleted` are true only when that effect occurred. Path policy resolves existing paths to prevent allowed-root and blocked-subtree symlink bypasses, recursive copy rejects symlinks and destinations nested under the source, and read-before-write version checks apply when configured. Non-concurrency-safe path operations use one conservative shared mutation lock; unbound side effects use a separate shared lock. Parent and spawned runtimes share the lock table. After HITL approval, the runtime resolves the final tool once, requires the resolved implementation to match the reviewed tool, reapplies current argument caps, and rechecks scope, policy, emergency control, provider availability, and approval binding before locking. After lock acquisition, a changed policy/runtime generation or failed atomic rate admission prevents invocation. The `command` tool is not a shell: it runs exact allowlisted argv commands inside explicit `working_dirs`, starts from an empty environment, filters env through policy, redacts argv evidence, and bounds output. Missing host support for `diagnostics`, `command`, or `web_search` is rejected before implementation invocation and recorded with `executed: false`. `ask_user` is different: its fallback implementation executes and returns a structured unavailable response, using a configured default when present. See [Built-in Tools](@/docs/built-in-tools.md).
 
 ```yaml
 tools:
@@ -242,11 +259,11 @@ tools:
 
 ## Process Pipeline
 
-The process pipeline lets you declare input and output processing stages that run before and after the LLM. All semantic operations (language detection, entity extraction, PII masking, quality checks) use LLM calls - not regex or keyword matching - so they work across languages and edge cases.
+The process pipeline lets you declare input and output processing stages that run before and after the LLM. Semantic stages such as language detection, entity extraction, LLM-backed sanitization, and quality checks use model understanding. Structural normalization, length checks, formatting, ordering, and safety enforcement remain deterministic.
 
 **Input stages** run in order: `normalize` (trim, collapse whitespace), `detect` (language, sentiment, intent), `extract` (entities into context), `sanitize` (PII removal), `validate` (length, content rules). **Output stages** run after the LLM responds: `validate` (quality scoring), `transform` (tone adjustment), `sanitize` (PII masking), `format` (templates, footers).
 
-Each stage can target a specific LLM (typically the lightweight `router`) and store results in context for downstream use.
+LLM-backed stages can target a named alias, typically the lightweight `router`, and store results in context. Deterministic stages do not require an LLM.
 
 ```yaml
 process:
@@ -283,25 +300,28 @@ process:
 
 ## Memory
 
-Memory controls what the agent remembers across turns. **In-memory** mode keeps a rolling window of recent messages - simple and fast. **Compacting** mode adds auto-summarization: when recent messages exceed a threshold, older messages get compressed into summaries by a designated LLM.
+Memory controls what the agent remembers across turns. **In-memory** mode keeps a rolling window of recent messages - simple and fast. **Compacting** mode adds auto-summarization: when recent messages reach a threshold, an eligible older prefix is compressed while the requested recent tail stays verbatim. If `max_recent_messages` would leave no useful batch at the threshold, the protected tail is clamped so compression still makes configured batch progress. Compression and other memory mutations are serialized, and snapshots preserve summary accounting.
 
-Token budgeting makes sure memory fits within LLM context limits. You set a total token budget and allocate percentages to summaries, recent messages, and facts. If the budget overflows, the framework either truncates the oldest content or re-summarizes, depending on your chosen strategy.
+Token budgeting makes sure memory fits within LLM context limits. You set a total token budget and allocate integer token counts to summaries, recent messages, facts, and relationships. If the budget overflows, the framework either truncates the oldest content or re-summarizes, depending on your chosen strategy.
 
-Memory is stored in-process during a session. For persistence across sessions, pair memory with a storage backend (SQLite, Redis, or file).
+Memory is stored in-process during a session. For persistence across sessions, pair memory with a storage backend. File and Redis implement snapshot save/load/list/delete only. SQLite also implements generic session metadata, filtering, expiry cleanup, actor facts, actor relationships, and atomic actor-data deletion. Unsupported operations return a typed capability error rather than an empty result or successful no-op. Redis has backend-native key TTL, but that does not provide the generic metadata or expiry-cleanup capabilities.
+
+Spawned agents can share a backend through `NamespacedStorage`. The wrapper derives safe capabilities from the inner backend and uses reversible flat encoded keys, but it never forwards backend-global expiry cleanup because that operation cannot be scoped to one child.
 
 ```yaml
 memory:
   type: compacting
-  max_recent_messages: 20
+  max_recent_messages: 10
   compress_threshold: 15
   summarize_batch_size: 5
   summarizer_llm: router
   token_budget:
     total: 4000
     allocation:
-      summary: 0.3
-      recent_messages: 0.6
-      facts: 0.1
+      summary: 1000
+      recent_messages: 2500
+      facts: 500
+      relationships: 0
     overflow_strategy: truncate_oldest
     warn_at_percent: 85
 ```
@@ -312,7 +332,7 @@ memory:
 
 Context provides dynamic data that gets injected into the agent's system prompt at render time. The system prompt is a Jinja2 template, and context values are its variables.
 
-Sources include: **runtime** (passed in by the caller at chat time), **builtin** (datetime, session info, agent metadata), **env** (environment variables), **file** (JSON/YAML files on disk), and **callback** (custom provider functions). Each source has a refresh policy - `once` (load at startup), `per_session` (reload each session), or `per_turn` (refresh every turn).
+Sources include: **runtime** (passed in by the caller), **builtin** (datetime, session info, agent metadata), **env**, **file**, optional feature-gated **HTTP** JSON sources, and **callback** providers registered by the host. Each source has a refresh policy - `once` (load at startup), `per_session` (reload each session), or `per_turn` (refresh every turn).
 
 Context values are available in the system prompt template, in state prompts, and in process pipeline stages. The state machine can also write to context via `on_enter` actions and `extract` blocks.
 
@@ -334,9 +354,9 @@ context:
 
 system_prompt: |
   You are a helpful assistant.
-  The user's name is {{ user.name }}.
-  Current time: {{ time.datetime }}.
-  Speak in {{ user.language }}.
+  The user's name is {{ context.user.name }}.
+  Current time: {{ context.time.time }}.
+  Speak in {{ context.user.language }}.
 ```
 
 ---
@@ -439,7 +459,7 @@ persona:
 
 Agents can remember facts about the people they talk to across sessions. The `actor_memory` and `facts` blocks inside `memory:` enable this. An **actor** is any entity the agent interacts with - a customer, a game player, another agent. The framework uses `actor_id` as a universal identifier.
 
-**How it works:** After each conversation turn, the framework runs a fast LLM call to extract structured facts (preferences, context, decisions, agreements) from the messages. Facts are stored in the same storage backend as session snapshots, keyed by `(agent_id, actor_id)`. When the same actor returns in a new session, their facts are loaded and injected into the system prompt via the `{{ actor_facts }}` Jinja2 variable.
+**How it works:** After each conversation turn, the framework runs a fast LLM call to extract structured facts (preferences, context, decisions, agreements) from the messages. Durable facts require a backend with the `ActorFacts` capability, currently SQLite among the built-ins; file and Redis remain snapshot-only. Facts are keyed by `(agent_id, actor_id)`. When the same actor returns in a new session, their facts are loaded and injected into the system prompt via the `{{ actor_facts }}` Jinja2 variable.
 
 **Actor identification** can be explicit (set via `--actor` CLI flag or `set_actor_id()` API) or context-based (read from a context path like `player.id`). Context-based identification is useful for NPC agents where the hosting application sets the current player before each turn.
 
@@ -482,7 +502,7 @@ Relationship memory tracks how an agent relates to each actor over time. It is a
 
 Relationship memory is separate from key facts. Facts answer "what does the agent know about this actor?" Relationships answer "how does this agent currently relate to this actor?" Default dimensions are `trust`, `sentiment`, `familiarity`, and `rapport`, and applications can define custom dimensions such as `motivation`, `suspicion`, `reliability`, or `openness`.
 
-After each successful turn, a router LLM evaluates recent messages and proposes small dimension deltas. The runtime validates confidence, clamps deltas, clamps final scores to each dimension range, stores notable relationship events, and persists the relationship by `(agent_id, actor_id)` when storage supports it.
+After each successful turn, a router LLM evaluates recent messages and proposes small dimension deltas. The runtime validates confidence, clamps deltas, clamps final scores to each dimension range, stores notable relationship events, and persists the relationship by `(agent_id, actor_id)` when storage supports `ActorRelationships`. SQLite is currently the only built-in backend with that capability.
 
 Relationship values are injected into context under `relationships.current_actor.*`, making them available to persona secrets, state guards, tool conditions, and templates. The formatted prompt text is available as `{{ relationship_memory }}`. By default the model is one-sided (`agent_to_actor`), but `model: two_sided` also tracks `perceived_actor_to_agent` and derives read-only `mutual` scores while keeping shortcut paths such as `relationships.current_actor.trust` compatible. Automatic evaluator updates only write the two stored perspectives: `agent_to_actor` and `perceived_actor_to_agent`.
 
@@ -527,7 +547,9 @@ The spawner supports three creation methods: raw YAML strings, `AgentSpec` objec
 
 When `spawner:` is present in the YAML, the framework automatically registers four management tools: `spawn_agent` (create a new agent from a description or template), `send_agent_message` (talk to another agent), `list_agents` (see all registered agents), and `remove_agent` (remove an agent from the registry). Grant them with `spawner.management_tools`, or list them under top-level `tools:` when the parent LLM should call them.
 
-Spawned agents share the parent's LLM connections and storage backend by default. A `NamespacedStorage` adapter isolates each agent's sessions by prefixing keys with the agent ID, so multiple agents can safely share a single SQLite database. An `allowed_tools` list restricts what tools spawned agents can declare, preventing LLM-generated YAML from accessing sensitive network, file mutation, and command tools such as `http`, `web_fetch`, `file`, `file_write`, `file_edit`, `patch`, or `command`.
+LLM and storage sharing are opt-in through `shared_llms` and `shared_storage`. Shared LLM mode treats the inherited parent registry as authoritative and requires every alias referenced by a child. Shared storage wraps each child in `NamespacedStorage`, which uses reversible flat encoded keys and forwards only capabilities that remain safely scoped; namespace-scoped expiry cleanup is unavailable.
+
+Every dynamic, auto-spawned, and restored child passes the same admission checks. `max_agents` limits reserved or registered spawner-managed slots, including in-flight construction; removing a child releases its slot. `allowed_tools` checks canonical built-in IDs and rejects the complete child when its top-level tool declarations exceed the allowlist. It does not strip tools and is not an OS, network, credential, or storage sandbox. Declared auto-spawn fails the parent configuration on any child error, and active nested child spawners are rejected in v1. Management and orchestration tools remain explicit feature grants and still pass through normal tool policy, approval, locking, and observability.
 
 ```yaml
 spawner:
@@ -608,17 +630,17 @@ Delegate states support a `delegate_context` mode (`input_only`, `summary`, `ful
 
 The same context enrichment is available for all orchestration patterns via the `context_mode` field. Set `context_mode: summary` or `context_mode: full` on any `concurrent`, `group_chat`, `pipeline`, or `handoff` block to forward parent conversation history to sub-agents. The enrichment runs before `input` template rendering, so `{{ user_input }}` in templates contains the history-enriched text. When omitted, the default is `input_only` which preserves the original behavior.
 
-Because orchestration runs through the normal `RuntimeAgent` loop, all existing features work automatically: HITL approvals on state transitions, error recovery per delegate, hooks for observability, memory for the parent conversation, and streaming.
+Orchestration uses normal runtime services for policy, approvals, recovery, hooks, memory, actor context, and final response handling. Pattern handlers return a final orchestration response; v1 does not promise incremental child-agent token forwarding through the parent stream.
 
 Actor context is forwarded structurally through registry sends and orchestration calls. When a parent turn has an actor, sub-agents receive `interaction.origin_actor_id` and `interaction.sender_agent_id` in prompt context, and actor-scoped facts and relationship memory use the original actor by default. This avoids relying on text prefixes such as `[From agent]` for memory identity.
 
 When a state transition fires mid-turn and the target state is an orchestration state (`concurrent`, `group_chat`, `pipeline`, `handoff`, or `delegate`), the runtime detects this and re-enters the full dispatch path for the new state in the same turn. The correct orchestration handler activates immediately - the user does not need to send another message to trigger it. Up to three chained transitions are resolved this way before the runtime stops and returns the last available response.
 
-Concurrent states accept a `vote` config to control how individual agent responses are aggregated into a final answer. `vote.method` selects the strategy: `majority` (default), `weighted`, or `unanimous`. `vote.tiebreaker` decides ties: `first` (declaration order), `random`, or `router_decides` (asks the router LLM). Per-agent weights are set via `vote.weights` (a map of agent id to numeric weight, used when method is `weighted`). The `on_partial_failure` field controls behavior when some agents fail: `abort` (default) fails the entire concurrent call, while `proceed_with_available` aggregates only the successful responses.
+Concurrent states use `aggregation.vote` to control how individual agent responses are aggregated into a final answer. `aggregation.vote.method` selects `majority` (default), `weighted`, or `unanimous`. `aggregation.vote.tiebreaker` selects `first` (declaration order), `random`, or `router_decides` (asks the router LLM). Weighted voting reads each `{ id, weight }` entry from `concurrent.agents`; plain string entries use weight `1.0`. The `on_partial_failure` field defaults to `proceed_with_available`, which aggregates successful responses, while `abort` fails the concurrent block when an agent fails.
 
 After each orchestration call the runtime stores the full structured result in `context.orchestration`. Subsequent states can reference the data in prompt templates and guard conditions. The object includes a `type` field (`delegate`, `concurrent`, `group_chat`, `pipeline`, or `handoff`) plus type-specific data such as per-agent responses, the full group chat transcript, pipeline stage outputs, handoff chain events, round counts, and timing. Backward-compatible flat keys (`delegation.<id>.last_response`, `concurrent.result`, `group_chat.conclusion`, `pipeline.result`, `handoff.result`) are also set. The same structure is attached to `response.metadata["orchestration"]` for CLI and hook consumers.
 
-For group chat brainstorm and consensus styles, `response.content` contains the full formatted transcript (`[Round N] speaker: message`) rather than only the last speaker's final line. Debate and maker-checker styles are unaffected because they already produce a synthesized conclusion or final draft. Users on the `InMemoryHistory` backend should be aware that long transcripts consume a ring-buffer slot; `CompactingMemory` handles overflow via summarization. For the maker-checker style, `on_max_iterations` controls what happens when the review loop hits its limit: `accept_last` uses the final draft as-is, `escalate` forwards to a human or parent agent, and `fail` returns an error.
+For group chat brainstorm and consensus styles, `response.content` contains the full formatted transcript (`[Round N] speaker: message`) rather than only the last speaker's final line. Debate and maker-checker styles are unaffected because they already produce a synthesized conclusion or final draft. Users on the `InMemoryStore` backend should be aware that long transcripts consume a ring-buffer slot; `CompactingMemory` handles overflow via summarization. For the maker-checker style, `on_max_iterations` controls what happens when the review loop hits its limit: `accept_last` uses the final draft as-is, `escalate` forwards to a human or parent agent, and `fail` returns an error.
 
 Group chat supports three turn-order methods via `manager.method`. `round_robin` (default) cycles through all participants in declaration order. `random` shuffles each round. `llm_directed` uses the router LLM to pick one speaker at a time after seeing the latest message, capping at `participants.len()` speakers per round for consistent stall detection. `llm_directed` requires a router LLM; the builder returns a config error if none is configured. When `manager.agent` is set to a registry agent id, that agent takes over termination decisions and speaker selection instead of the built-in logic, allowing fully custom orchestration within the group chat loop.
 
@@ -661,7 +683,7 @@ Reports include Markdown, JSON, per-scenario JSONL, failure-focused Markdown, an
 
 ## Safety
 
-The framework provides multiple safety layers to keep agents predictable and secure.
+The framework provides layered controls for agent execution. Explicit grants, policy, and HITL are not an OS, network, credential, or deployment sandbox; the host remains responsible for isolating untrusted code and infrastructure.
 
 **Error recovery** handles transient failures with configurable retry, exponential backoff, fallback LLMs, and fallback responses. Context overflow (too many tokens) can be handled by summarizing or truncating. Each of these is configurable per subsystem - LLM calls, tool calls, and general errors all have separate policies.
 
@@ -812,7 +834,7 @@ Streaming supports a buffered routing policy for response-independent parallel s
 
 The `AgentHooks` trait gives you lifecycle callbacks: before/after chat, before/after tool calls, on state transitions, on errors, and more. Implement the trait and pass your hooks when building the agent to add logging, metrics, custom routing, or any side-effect you need.
 
-Everything in the framework is trait-based and pluggable. You can provide custom implementations of `LLMProvider` (add a new model provider), `Memory` (custom storage or retrieval), `Tool` (any Rust function as a tool), `ApprovalHandler` (custom HITL flow), and `Summarizer` (custom compression logic). The framework doesn't force you into any particular provider, storage, or workflow - it just gives you traits and default implementations.
+Major extension points are trait-based and pluggable. You can provide custom implementations of `LLMProvider` (add a new model provider), `Memory` (custom memory behavior), `Tool` (any Rust function as a tool), `AgentStorage` (custom persistence), `ApprovalHandler` (custom HITL flow), and `Summarizer` (custom compression logic). Other runtime behavior remains governed by the documented builder and YAML contracts.
 
 ```yaml
 # Hooks are configured in Rust code, not YAML.
@@ -853,5 +875,6 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 
 - **[Getting Started](@/docs/getting-started.md)** - build and run your first agent
 - **[YAML Reference](@/docs/yaml-reference.md)** - every field, every option, fully documented
+- **[Built-in Tools](@/docs/built-in-tools.md)** - canonical inputs, outputs, policy bindings, and host requirements
 - **[Rust API](@/docs/rust-api.md)** - use the framework as a library
 - **[Examples](@/examples/_index.md)** - real-world patterns and complete agent specs

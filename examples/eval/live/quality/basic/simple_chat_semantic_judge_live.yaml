@@ -27,6 +27,19 @@ settings:
   retry_delay_ms: 1000        # wait between attempts. default: 1000
   isolation: scenario         # fresh runtime per attempt. default: scenario
 
+observability:
+  enabled: true
+  cost:
+    enabled: true
+    unknown_price_policy: error
+    pricing:
+      openai/gpt-4.1-nano:
+        input_per_1k: 0.0001
+        output_per_1k: 0.0004
+  export:
+    formats: [json]
+    write_report: false
+
 # LLM fixture modes control how eval replaces or uses model providers.
 #
 # mode: mock
@@ -57,6 +70,10 @@ scenarios:
     name: Real model explains what an eval suite does
     tags: [live, real-llm, semantic-judge]
     language: en
+    budget:
+      max_llm_calls: 4
+      max_total_tokens: 24000
+      max_cost_usd: 0.02
     turns:
       - input: "In one short sentence, explain what an AI agent evaluation suite does."
         assert:

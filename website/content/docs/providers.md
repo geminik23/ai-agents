@@ -45,16 +45,19 @@ llm:
 Other model options:
 
 ```yaml
+# Each YAML document below is a separate alternative.
 # Good balance of speed and quality
 llm:
   provider: openai
   model: gpt-5.4-mini
 
+---
 # Most capable
 llm:
   provider: openai
   model: gpt-5.4
 
+---
 # Reasoning-capable model with effort control
 llms:
   default:
@@ -101,7 +104,7 @@ export GOOGLE_API_KEY=AI...
 ```yaml
 llm:
   provider: google
-  model: gemini-3-flash
+  model: gemini-2.5-flash
 ```
 
 Other models:
@@ -109,7 +112,7 @@ Other models:
 ```yaml
 llm:
   provider: google
-  model: gemini-3-pro
+  model: gemini-2.5-pro
 ```
 
 ---
@@ -301,7 +304,7 @@ llm:
   json_mode: true
 ```
 
-These flags affect `supports()` checks only. They are not sent in the provider request body.
+These declarations affect framework capability checks, validation, and routing. They are not copied into the provider request body as model parameters. For OpenAI-compatible servers, `function_calling: true` also allows the framework to choose its native tool-request path.
 
 If your server needs an API key:
 
@@ -373,7 +376,22 @@ llm:
   json_mode: true
 ```
 
-Use them when you know a model/server supports more or less than the provider default. They are declarations for framework routing and validation; they do not enable native tool calling or structured output by themselves.
+Use them when you know a model/server supports more or less than the provider default. They are declarations for framework routing and validation rather than model parameters. For OpenAI-compatible servers, `function_calling: true` explicitly enables the framework's native tool-request path; `false` disables it. The server must actually implement compatible function calling.
+
+### Tool-choice support
+
+`tool_choice` is optional. Omitting it or setting it to YAML `null` preserves the existing prompt-JSON tool protocol. This unset default is different from `tool_choice: none`, which explicitly disables tool exposure and tool-call parsing for that provider decision. `auto` is explicit opt-in rather than the default. Explicit choices have these provider boundaries:
+
+| Provider | Native `auto` | Native `required` / `specific` | Behavior when native choice is unavailable |
+| --- | --- | --- | --- |
+| OpenAI | Yes | Yes | Not applicable |
+| Anthropic | Yes | Yes | Not applicable |
+| OpenRouter | Yes | Yes | Not applicable |
+| Google | Yes | No | One bounded prompt corrective retry |
+| OpenAI-compatible | With `function_calling: true` | With `function_calling: true` | Prompt fallback when not enabled |
+| Other unified or custom providers | No by default | No by default | Prompt fallback unless the provider implements the additive native methods |
+
+`none` is enforced by the runtime by exposing neither native definitions nor prompt tool instructions. `required` and `specific` fail if the provider returns no compliant call; prompt fallback gets at most one corrective retry. Selection never grants or authorizes a tool. Only effective granted tools are visible, and returned calls still pass through the shared policy, approval, locking, rate-admission, execution, and evidence path.
 
 ---
 
@@ -419,7 +437,7 @@ The framework has two roles:
 | Role | Purpose |
 | --- | --- |
 | `default` | Main conversation model - generates user-facing responses |
-| `router` | Lightweight model for internal operations - tool selection, intent classification, state transition evaluation, language detection, disambiguation, reflection, summarization |
+| `router` | Lightweight model for subsystem operations such as skill routing, intent classification, state transition evaluation, language detection, disambiguation, reflection, and summarization |
 
 If `router` is not specified, all operations use `default`. The `router` role is where you save the most cost and latency - internal decisions don't need a frontier model.
 
@@ -451,7 +469,7 @@ tools:
   - web_fetch
 ```
 
-This setup uses Claude for generating responses and Groq for fast internal routing - saving cost and latency on tool selection, guard evaluation, and disambiguation.
+This setup uses Claude for main responses and ordinary model tool selection, while Groq handles configured router and subsystem decisions such as skill routing, semantic transition evaluation, and disambiguation. Deterministic guards do not use either model.
 
 ---
 
@@ -595,9 +613,11 @@ llm:
 
 > **Note:** Full Azure support (dedicated `azure-openai` provider type) is planned for a future release. The extra-based approach above works today.
 
-### OpenAI Web Search
+### OpenAI provider-native web search
 
-For OpenAI models that support web search:
+Provider-native search options modify the LLM provider request. They do not call the canonical `web_search` tool, do not produce tool-execution evidence, and do not pass through built-in tool grants, `WebSearchProvider`, tool policy, or HITL. Use the separately granted built-in when you need the shared tool-execution contract; see [Built-in Tools](@/docs/built-in-tools.md#web-search-versus-web-fetch).
+
+For OpenAI models that support provider-native web search:
 
 ```yaml
 llm:
@@ -607,9 +627,9 @@ llm:
   openai_web_search_context_size: medium
 ```
 
-### xAI Search
+### xAI provider-native search
 
-For xAI (Grok) models with search capabilities:
+For xAI (Grok) models with provider-native search capabilities:
 
 ```yaml
 llm:

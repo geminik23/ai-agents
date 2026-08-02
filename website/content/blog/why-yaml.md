@@ -7,6 +7,8 @@ template = "blog-page.html"
 tags = ["philosophy", "design"]
 +++
 
+> This post describes the design motivation as of its publication date. Current supported behavior and safety boundaries are defined by the [Concepts](@/docs/concepts.md) and [YAML Reference](@/docs/yaml-reference.md) pages.
+
 AI agent frameworks often make a simple idea feel harder than it needs to be.
 
 Most agents are really just a set of decisions. Which LLM do they use? What tools can they call? How do they move between states? What do they remember? How do they recover from failure? What kind of response should they produce?
@@ -60,9 +62,7 @@ That is a real agent. It greets customers, helps them, escalates billing issues,
 
 A common question is how state transitions work without code. Traditional chatbot frameworks usually solve this with regex patterns or keyword matchers. That works up to a point, but it breaks down quickly once people start phrasing the same intent in different ways. "I want to cancel" may not match a pattern written for "please cancel my subscription." And once you go beyond English, the problem gets much worse.
 
-This framework takes a very different approach: it gives the entire transition decision to the LLM.
-
-Not just the ambiguous cases. Every transition, every intent check, every validation. There is no regex fallback for the cases that seem easy enough to hardcode. If a transition depends on understanding meaning, the LLM handles it.
+This framework uses the LLM for transitions that depend on semantic understanding, while guard-based transitions use typed context checks deterministically. Structural normalization, limits, schema checks, and safety enforcement are also deterministic; semantic intent, extraction, and quality decisions can use an LLM where configured.
 
 That means the model reads the conversation itself and decides whether a transition should happen. In practice, this works much better across natural phrasing, indirect wording, and multiple languages. You can write:
 
@@ -108,7 +108,7 @@ states:
 
 Simple agents stay simple. Complex agents get fine-grained control exactly where they need it, and nowhere else.
 
-For most engineers, the next question is: what about the cases that genuinely need custom logic? That is where Rust traits come in. Every extension point in the framework is a trait you implement in Rust: a custom tool that calls an internal API, a memory backend that talks to your own database, an approval handler that posts to Slack.
+For most engineers, the next question is: what about the cases that genuinely need custom logic? That is where Rust traits come in. Major extension points include custom tools, LLM providers, memory behavior, storage backends, hooks, and approval handlers.
 
 The key is that YAML and traits compose cleanly instead of competing. You load the YAML, inject the custom piece, and the rest of the agent behavior stays declarative.
 
@@ -136,9 +136,9 @@ These are the principles behind the framework:
 3. **LLM-first for semantics** - intent detection, entity extraction, validation, and transitions should be driven by the LLM, not by pattern matching.
 4. **Layered overrides** - defaults set globally and overridden only where needed, whether per agent, per state, or per skill.
 5. **Opt-in complexity** - every feature has sensible defaults. A minimal agent stays minimal.
-6. **Safety by default** - error recovery, tool security, human-in-the-loop approvals, and budget control are part of the core design from the start.
+6. **Explicit safety controls** - fail-closed tool grants, tool policy, human-in-the-loop approvals, and error recovery provide layered controls without claiming an OS sandbox.
 7. **Extensible** - `LLMProvider`, `Tool`, `Memory`, `ApprovalHandler`, and `AgentHooks` are easy to extend with small, focused implementations.
-8. **Composability** - agents can be spawned, orchestrated, chained, and federated. One agent is a building block, not a dead end.
+8. **Composability** - agents can be spawned, orchestrated, chained, and handed off within the runtime. One agent is a building block, not a dead end.
 
 If you want to try it:
 

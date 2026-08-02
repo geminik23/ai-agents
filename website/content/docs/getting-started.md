@@ -7,7 +7,7 @@ description = "Install and run your first AI agent in under a minute."
 
 ## Prerequisites
 
-- **Rust toolchain** - install from [rustup.rs](https://rustup.rs) if you don't have it
+- **Rust 1.88 or newer** - install from [rust-lang.org](https://rust-lang.org/tools/install) if you don't have it
 - **An LLM API key** - OpenAI is recommended for the quickstart, but any of the 12 supported providers works
 
 ## Installation
@@ -184,7 +184,7 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ```yaml
 llm:
   provider: google
-  model: gemini-3-flash
+  model: gemini-2.5-flash
 ```
 
 ```sh
@@ -213,7 +213,7 @@ metadata:
     welcome: "=== My Agent ==="
     hints:
       - "Try asking about the weather"
-      - "Type 'help' for commands"
+      - "Type '/help' for commands"
 ```
 
 ---
@@ -221,5 +221,6 @@ metadata:
 ## Next Steps
 
 - **[YAML Reference](@/docs/yaml-reference.md)** - the complete spec for agent definition files
+
 - **[Examples](@/examples/_index.md)** - more patterns: tool use, multi-agent, stateful workflows
 - **[CLI Guide](@/docs/cli.md)** - every command and flag explained

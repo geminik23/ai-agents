@@ -1,5 +1,5 @@
 [workspace]
-resolver = "2"
+resolver = "3"
 members = [
     "crates/ai-agents-core",
     "crates/ai-agents-llm",
@@ -30,6 +30,7 @@ members = [
 [workspace.package]
 version = "1.0.0-rc.16"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 homepage = "https://ai-agents.rs"
 repository = "https://github.com/geminik23/ai-agents"
@@ -55,7 +56,7 @@ async-stream = "0.3"
 parking_lot = "0.12"
 minijinja = { version = "2.10", features = ["builtins"] }
 
-llm = "1.3"
+llm = "=1.3.7"
 evalexpr = "11"
 regex = "1"
 rand = "0.8"

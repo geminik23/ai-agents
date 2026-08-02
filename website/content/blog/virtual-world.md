@@ -7,6 +7,8 @@ template = "blog-page.html"
 tags = ["design", "architecture", "philosophy"]
 +++
 
+> This post describes the design motivation as of its publication date. Current supported behavior and safety boundaries are defined by the [Concepts](@/docs/concepts.md) and [YAML Reference](@/docs/yaml-reference.md) pages.
+
 This framework did not start as an agent framework.
 
 It started with game experiments. The [first version](https://github.com/geminik23/ai-agents/tree/v0-maintenance/examples/find-treasure) was a small treasure-hunt RPG built in April 2024. The model generated towns, NPCs, and dialogue on the fly, and it was enough to prove the idea was interesting. But every character and interaction was hardcoded in Rust. Adding a new kind of NPC meant changing code. Changing behavior meant recompiling.
@@ -79,7 +81,7 @@ That led to the idea of a game master: one agent that observes the world and spa
 
 The game master does not write code. It turns the current world state into a YAML definition and hands it to the framework. The framework builds a running agent from it and registers it.
 
-The spawned agent is small and focused. It has a narrow prompt, a limited set of tools, and a clear role. But that is not the main point. What matters is that the game master decided to create it for this situation; no human had to write code for the encounter in advance. When the encounter is over, the agent can be removed cleanly, with no leftover state and no confusion between one interaction and the next.
+The spawned agent is small and focused. It has a narrow prompt, a limited set of tools, and a clear role. But that is not the main point. What matters is that the game master decided to create it for this situation; no human had to write code for the encounter in advance. Removing an agent releases its managed runtime slot; persisted snapshots remain governed by the configured storage backend and explicit deletion operations.
 
 ## Why Isolated Agents Do Not Make a World
 
@@ -89,7 +91,7 @@ If a guard detects an intruder, one conversation is no longer enough. The guard 
 
 That means the framework needs coordination primitives. Routing messages to the right agent. Running multiple agents in parallel and combining their responses. Letting a group of agents take turns in a conversation. Handing control from one agent to another.
 
-All of them are defined in YAML, and all of them rely on LLM decisions instead of hardcoded routing logic.
+They can be configured in YAML and combine semantic model decisions with deterministic routing, ordering, capacity, policy, and lifecycle checks.
 
 ## Why This Generalizes Beyond Games
 
@@ -103,7 +105,7 @@ Those are general-purpose primitives. The virtual world was just the problem tha
 
 ## Where This Leads
 
-The framework now supports the main pieces the virtual world demanded: declarative behavior in YAML, hierarchical state machines with LLM-evaluated transitions, persistent memory with summarization, multi-agent orchestration, and dynamic spawning from templates. The next step is structured identity: personality, goals, and speaking style as queryable data, separate from the system prompt.
+The framework now supports the main pieces the virtual world demanded: YAML-first behavior, hierarchical state machines with semantic and deterministic transitions, capability-aware persistent memory, structured persona, multi-agent orchestration, and dynamic spawning from templates.
 
 The virtual world is still the long-term goal. But along the way, the same primitives have already proven useful for support workflows, research pipelines, and multi-agent coordination that have nothing to do with games.
 

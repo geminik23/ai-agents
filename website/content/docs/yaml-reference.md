@@ -9,6 +9,8 @@ description = "Complete reference for agent YAML specification fields."
 
 This is the complete reference for every field you can use in an agent YAML file. Each section covers one top-level key, shows its type, default, and a working snippet.
 
+Fixed framework-owned objects reject unknown fields. Misspelled top-level and nested keys therefore fail parsing instead of being ignored. Documented extension maps remain open where values are intentionally provider- or host-specific, including additional provider options inside an `llm` configuration, structured tool and MCP settings, and custom tool settings under `tool_security.tools.<tool_id>.config`. Because those maps intentionally accept provider or host keys, validation cannot distinguish every extension from a nearby framework-field typo. Mapping keys must be strings, and YAML merge keys (`<<`) are rejected rather than being inconsistently retained inside extension maps.
+
 ---
 
 ## Agent Identity
@@ -152,7 +154,8 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `reasoning` | `bool` | `null` | Enable extended thinking / reasoning mode |
 | `reasoning_effort` | `string` | `null` | Reasoning effort: `low`, `medium`, or `high` |
 | `reasoning_budget_tokens` | `u32` | `null` | Max token budget for reasoning |
-| `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)` for this provider |
+| `function_calling` | `bool` | `null` | Override `supports(FunctionCalling)`; `false` disables native tool selection and `true` opts an OpenAI-compatible server into it |
+| `tool_choice` | `auto`, `required`, `none`, or `{ specific: ID }` | `null` | Opt in to native or runtime-enforced tool selection; omission preserves the legacy prompt protocol |
 | `vision` | `bool` | `null` | Override `supports(Vision)` for this provider |
 | `json_mode` | `bool` | `null` | Override `supports(JsonMode)` for this provider |
 | `num_ctx` | `u32` | `null` | Ollama context window; merged under request `options` |
@@ -168,9 +171,9 @@ llm:
   max_tokens: 4000
 ```
 
-Capability override fields (`function_calling`, `vision`, `json_mode`) affect provider `supports()` checks only and are not sent to the model API. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body.
+Capability override fields (`function_calling`, `vision`, `json_mode`) are not sent as model parameters. They control framework capability checks; `function_calling: false` also disables native tool selection, while `function_calling: true` opts an OpenAI-compatible server into the native path. Ollama named fields (`num_ctx`, `keep_alive`, `num_gpu`) are captured as provider extras and merged into the Ollama request body.
 
-Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-specific search (`openai_enable_web_search`, `xai_search_mode`, etc.). See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
+Any field not listed above is captured in an `extra` map via `#[serde(flatten)]` and forwarded to the LLM client when a matching builder method exists. This includes transport-level resilience (`resilient`, `resilient_attempts`, etc.), Azure settings (`api_version`, `deployment_id`), and provider-native search (`openai_enable_web_search`, `xai_search_mode`, etc.). Provider-native search changes the LLM request and is separate from the granted built-in `web_search` tool, its `WebSearchProvider`, shared policy/HITL path, and tool evidence. See [LLM Providers > Extra Parameters](@/docs/providers.md#extra-parameters) for the full list.
 
 ```yaml
 # Reasoning model with timeout
@@ -202,6 +205,51 @@ llm:
   function_calling: true
   json_mode: true
 ```
+
+### Tool choice
+
+`tool_choice` is opt-in and never grants a tool. Provider-visible schemas are derived only from the current top-level grant and any state-level narrowing, and every returned call still passes through registry resolution, policy, HITL, final admission, resource locking, rate admission, execution, and evidence.
+
+The default shown as `null` means that no tool-choice policy is configured. It does not mean `tool_choice: none`.
+
+| YAML | Meaning |
+|---|---|
+| field omitted | Preserve the existing prompt-JSON automatic-selection protocol |
+| `tool_choice: null` | Same as omission; no explicit tool-choice policy |
+| `tool_choice: none` | Explicitly disable tool definitions, tool prompt instructions, and tool-call parsing for this provider decision |
+
+`auto` is also not the default. It explicitly opts into provider-native automatic selection where supported, with prompt fallback elsewhere.
+
+- omitted or `null`: preserve the existing prompt-JSON automatic-selection protocol;
+- `auto`: expose the effective tools and allow the provider to decide whether to call one;
+- `required`: require at least one effective tool call;
+- `{ specific: ID }`: require the named canonical ID, which must already be inside the effective grant;
+- `none`: expose no ordinary tool schema or prompt protocol for that decision and do not parse model text as a tool call.
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+  tool_choice: required
+
+tools:
+  - calculator
+```
+
+```yaml
+llm:
+  provider: openai
+  model: gpt-5.4-mini
+  tool_choice:
+    specific: random
+
+tools:
+  - random
+```
+
+OpenAI, Anthropic, and OpenRouter use native `auto`, `required`, and `specific` selection. Google uses native `auto`; its `required` and `specific` choices use one bounded prompt corrective retry because the pinned provider dependency does not expose those native modes. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+
+With explicit `tool_choice`, `chat_stream()` buffers the provider decision before emitting committed text or existing runtime tool events. The framework does not expose a separate provider-native streaming tool-call API in v1.
 
 ### Named LLMs - `llms`
 
@@ -257,6 +305,7 @@ llm:
 Connect to any OpenAI-compatible server (LM Studio, vLLM, TGI, LocalAI, Ollama `/v1`):
 
 ```yaml
+# Each YAML document below is a separate alternative.
 llm:
   provider: openai-compatible
   model: qwen3:8b
@@ -264,6 +313,7 @@ llm:
   function_calling: true
   json_mode: true
 
+---
 # With authentication:
 llm:
   provider: openai-compatible
@@ -795,7 +845,7 @@ steps:
 
 The top-level `tools` list declares the maximum set of tools the agent can use. The framework auto-injects tool names, descriptions, and argument schemas into the prompt - do **not** list them in `system_prompt`.
 
-Omitting top-level `tools:` means no LLM-callable tools. `tools: []` also means no tools. Registering built-ins, MCP tools, or spawner tools does not grant model access by itself; list each callable tool or view explicitly under top-level `tools:`.
+Omitting top-level `tools:` means no ordinary LLM-callable tools. `tools: []` also means no ordinary tools. Registering built-ins or MCP tools does not grant model access by itself; list each callable ordinary tool or view explicitly under top-level `tools:`. Feature-generated tools use the explicit grant settings described below.
 
 YAML feature flags can also be registration and grant signals: `spawner.management_tools` grants selected agent management tools, `spawner.orchestration_tools` grants selected orchestration tools, and `persona.evolution.allow_llm_evolve: true` grants `persona_evolve`. These are explicit opt-ins, so they apply even when top-level `tools:` is omitted or empty.
 
@@ -823,6 +873,9 @@ tools:
   - name: file_write
   - name: file_edit
   - name: patch
+  - name: copy_path
+  - name: move_path
+  - name: delete_path
   - name: git_status
   - name: git_diff
   - name: diagnostics
@@ -831,6 +884,7 @@ tools:
   - name: todo
   - name: sleep
   - name: web_fetch
+  - name: web_search
 ```
 
 ### Built-in catalog
@@ -854,6 +908,9 @@ Controlled mutation and validation:
 - `file_write` - create or overwrite one file with atomic writes, dry-run review, and write-path policy
 - `file_edit` - replace exact text with uniqueness/no-match checks, dry-run diff summaries, near-match hints, and read-before-write support
 - `patch` - validate or apply bounded unified diffs with per-file policy checks, delete gating, and parent-directory policy
+- `copy_path` - copy a file or directory with source/destination policy checks and explicit dry-run review
+- `move_path` - move or rename a file or directory with source/destination policy checks and explicit dry-run review
+- `delete_path` - delete a file or directory with recursive-delete gating and explicit dry-run review
 - `command` - run exact allowlisted non-interactive argv commands with bounded output, redacted evidence, and explicit working directories
 
 Interaction and session-local helpers:
@@ -865,9 +922,12 @@ Interaction and session-local helpers:
 Network and legacy built-ins:
 
 - `web_fetch` - fetch public web content with scheme, redirect, DNS/IP, byte, output, cache, and optional extraction controls
+- `web_search` - search through a host-provided provider and return bounded results; reports unavailable when no provider is installed
 - `calculator`, `datetime`, `echo`, `json`, `math`, `random`, `text`, `template` - existing compute and text/data helpers
 - `file` - compatibility aggregate file tool; new YAML should prefer split file tools above. Raw `.git` paths are blocked by file tools; use `git_status` or `git_diff` for repository inspection.
 - `http` - raw HTTP API client for GET, POST, PUT, PATCH, DELETE, and HEAD requests. Use domain and method policy for API calls; use `web_fetch` when the goal is public page retrieval and text extraction.
+
+See [Built-in Tools](@/docs/built-in-tools.md) for the complete 30-tool input, output, safety, policy, host-provider, and eval reference.
 
 ### Expanded built-in inputs
 
@@ -888,11 +948,17 @@ These inputs are generated into the model-facing tool schemas when the tool is g
 | `sleep` | `duration_ms` | `reason`; default maximum is 30000 ms and trusted policy can change it with `config.max_duration_ms` plus `timeout_ms` |
 | `file_write` | `path`, `content` | `overwrite: false`, `create_parent_dirs: false`, `dry_run: false` |
 | `file_edit` | `path`, `old_text`, `new_text` | `replace_all: false`, `dry_run: false`, `max_replacements: 20` |
-| `patch` | `patch` | `base_path: "."`, `dry_run: true`, `allow_new_files`, `allow_delete: false`; omitted `dry_run` is treated as true for classification and preflight |
+| `patch` | `patch` | `base_path: "."`, `dry_run: false`, `allow_new_files`, `allow_delete: false` |
+| `copy_path` | `source_path`, `destination_path` | `overwrite: false`, `create_parent_dirs: false`, `dry_run: false` |
+| `move_path` | `source_path`, `destination_path` | `overwrite: false`, `create_parent_dirs: false`, `dry_run: false` |
+| `delete_path` | `path` | `recursive: false`, `dry_run: false` |
 | `command` | `argv` preferred; `command` string is compatibility-only | `cwd: "."`, `env: {}`, `timeout_ms: 30000`, `max_output_chars: 20000`, `reason` |
 | `web_fetch` | `url` | `prompt`, `max_chars: 20000`, `cache_ttl_seconds: 900`, `max_response_bytes: 1048576`, `max_redirects: 5` |
+| `web_search` | `query` | `max_results: 5`, `include_domains: []`, `language`, `region`, `safe_search` (`off`, `moderate`, `strict`) |
 
-`ask_user` uses a host question handler, not HITL approval. Without an interactive handler it uses `default` when present or returns `answered: false` with an unavailable flag. `diagnostics` returns `available: false` unless a host or eval fixture installs a diagnostics provider.
+All filesystem mutation tools execute by default. Set `dry_run: true` explicitly to validate or preview without changing the filesystem. Every actual mutation requires applicable write policy and either approval or an explicit trusted-policy exemption. Results use `mutation_performed` as the authoritative effect flag; `created`, `overwritten`, `copied`, `moved`, and `deleted` are true only when that action was performed. Patch application preflights every target and checks the preflight state again before applying; rollback restores prior content only when doing so will not overwrite an observed external change. Recursive copy rejects symbolic links and destinations equal to or nested under the source.
+
+`ask_user` uses a host question handler, not HITL approval. Without a handler its implementation still executes and returns a structured unavailable response, using `default` when present. Missing providers for `diagnostics`, `command`, and `web_search` are rejected by runtime availability preflight before implementation invocation and recorded with `executed: false`. An unavailable `web_search` does not automatically invoke `web_fetch`; the model can fetch only a separately known URL when `web_fetch` is also granted.
 
 `command` is not a shell. Granting the tool is not enough: the command policy must include an exact `allowed_commands` argv entry or a `command_templates` entry before the built-in can execute. `commands.allow` is legacy command-name matching and does not replace the exact argv allowlist.
 
@@ -1062,6 +1128,35 @@ context:
     path: "./config.json"
 ```
 
+### `type: http`
+
+Load a JSON object from an HTTP endpoint. This source requires the `http-context` crate feature; the CLI's full feature set includes it. Without the feature, the configured `fallback` is returned. Supported methods are `GET` (default), `POST`, `PUT`, and `DELETE`; other values use GET. URL and header templates are rendered from current context, successful responses must decode as JSON, and transport, status, or decode failures return `fallback` when configured.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `url` | string | required | URL template rendered from current context |
+| `method` | string | `GET` | `GET`, `POST`, `PUT`, or `DELETE` |
+| `headers` | map | `{}` | Header value templates |
+| `refresh` | enum | `per_session` | `once`, `per_session`, or `per_turn` |
+| `timeout_ms` | integer | none | Request timeout in milliseconds |
+| `fallback` | JSON value | none | Value returned when HTTP support is unavailable or the request/JSON decode fails |
+
+```yaml
+context:
+  account:
+    type: http
+    url: "https://api.example.com/accounts/{{ context.user.id }}"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ context.auth.token }}"
+    refresh: per_session
+    timeout_ms: 5000
+    fallback:
+      tier: unknown
+```
+
+HTTP context is host/application data loading, not the policy-aware `web_fetch` tool. The source does not expose a cache field in v1.
+
 ### Using Context in Templates
 
 ```yaml
@@ -1106,19 +1201,21 @@ LLM-based summarization compresses old messages into a rolling summary while kee
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `type` | `string` | - | Must be `"compacting"` |
-| `max_recent_messages` | `usize` | `50` | Recent messages always kept in full |
-| `compress_threshold` | `usize` | `30` | Compression kicks in after this many messages |
-| `summarize_batch_size` | `usize` | `10` | How many old messages to summarize at once |
+| `max_recent_messages` | `usize` | `50` | Requested recent messages kept verbatim; clamped when it conflicts with the threshold |
+| `compress_threshold` | `usize` | `30` | Compression runs when the stored message count reaches this value |
+| `summarize_batch_size` | `usize` | `10` | Maximum eligible old messages summarized in one operation; zero is normalized to one |
 | `summarizer_llm` | `string` | `null` | LLM alias for summarization (use a fast/cheap one) |
 
 ```yaml
 memory:
   type: compacting
   max_recent_messages: 6
-  compress_threshold: 8
+  compress_threshold: 10
   summarize_batch_size: 4
   summarizer_llm: router
 ```
+
+When `max_recent_messages < compress_threshold`, the requested recent tail is preserved and only the older eligible prefix is summarized. When the requested tail is at least the threshold, the runtime clamps it to `compress_threshold - min(max(summarize_batch_size, 1), compress_threshold)` so compression still makes batch progress. With the defaults `50 / 30 / 10`, the effective protected tail is 20 and each threshold cycle summarizes 10 messages. Compression, add, restore, clear, snapshot, and eviction operations are serialized so a summarizer cannot remove a stale message prefix. Snapshots preserve both the rolling summary and the summarized-message count.
 
 ### `token_budget`
 
@@ -1154,7 +1251,7 @@ memory:
 
 ### `actor_memory` (Cross-Session Actor Memory)
 
-Track facts about each actor (user, player, other agent) across sessions. When the same actor returns, previously extracted facts are loaded from storage and injected into the system prompt via `{{ actor_facts }}`.
+Track facts about each actor (user, player, other agent) across sessions. When enabled, runtime initialization requires storage with the `ActorFacts` capability, currently SQLite among the built-in backends. When the same actor returns, previously extracted facts are loaded and injected into the system prompt via `{{ actor_facts }}`.
 
 ```yaml
 memory:
@@ -1185,7 +1282,7 @@ memory:
 
 ### `facts` (Key Facts Extraction)
 
-Extract structured facts from conversations using an LLM. Facts persist in the same storage backend as session snapshots. Fact content is always stored in English for consistent cross-language deduplication.
+Extract structured facts from conversations using an LLM. Durable facts require the `ActorFacts` storage capability; file and Redis are snapshot-only, while SQLite supports facts. Fact content is always stored in English for consistent cross-language deduplication.
 
 ```yaml
 memory:
@@ -1224,7 +1321,7 @@ When `token_budget.allocation.facts` is set on the surrounding `memory:` block, 
 
 ### `relationships` (Relationship Memory)
 
-Track how the agent relates to each actor across sessions. Relationship memory is separate from facts: facts describe what the agent knows about an actor, while relationships describe the agent's stance toward that actor.
+Track how the agent relates to each actor across sessions. Relationship memory is separate from facts: facts describe what the agent knows about an actor, while relationships describe the agent's stance toward that actor. `persistence.enabled: true` requires `ActorRelationships`, currently provided only by SQLite among the built-in backends.
 
 ```yaml
 memory:
@@ -1340,11 +1437,15 @@ memory:
     ttl_seconds: 86400               # session expiration (24h). null = no expiry
 ```
 
-Tags and TTL are persisted alongside each session snapshot when `save_session()` is called. The CLI exposes filtered listings and TTL cleanup via `/sessions --actor <id>`, `/sessions --tag <tag>`, and `/cleanup`. Programmatically, use `RuntimeAgent::list_sessions_filtered()` and `RuntimeAgent::cleanup_expired_sessions()`. Session metadata is currently only persisted by the `sqlite` storage backend; `file` and `redis` backends accept the configuration but do not store metadata yet.
+Tags and TTL are persisted alongside each session snapshot when `save_session()` is called and the backend supports `SessionMetadata`. Filtered listings require `SessionFiltering`, and explicit cleanup requires `ExpiryCleanup`; unwrapped SQLite currently provides all three among built-ins. File and Redis save snapshots without generic session metadata. Redis's top-level `storage.ttl_seconds` independently applies native key TTL and does not enable generic filtered listing or cleanup.
 
 ### Complete Actor Memory Example
 
 ```yaml
+storage:
+  type: sqlite
+  path: "./agent_memory.db"
+
 memory:
   type: compacting
   max_recent_messages: 20
@@ -1407,7 +1508,16 @@ system_prompt: |
 
 ## Storage
 
-Persist sessions across restarts. Without storage, conversation history is lost when the process exits.
+Persist sessions across restarts. Without storage, conversation history is lost when the process exits. Unsupported optional operations return a typed storage-capability error rather than a successful no-op or ordinary empty result.
+
+| Backend | Snapshots | Metadata | Filtering | Cleanup | Facts | Relationships | Actor deletion |
+|---------|-----------|----------|-----------|---------|-------|---------------|----------------|
+| File | Yes | No | No | No | No | No | No |
+| Redis | Yes | No | No | No | No | No | No |
+| SQLite | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| `NoopStorage` (Rust test backend) | No | No | No | No | No | No | No |
+
+`NamespacedStorage` is used internally for shared spawned-agent storage. It derives safe capabilities from the inner backend but never forwards backend-global expiry cleanup. File and Redis are snapshot-only in the v1 capability contract. Redis remains Experimental; its native key TTL and backend-specific helpers do not add generic metadata, filtering, or cleanup capabilities.
 
 ### `type: none`
 
@@ -1456,7 +1566,7 @@ Persist sessions in Redis.
 |-------|------|---------|-------------|
 | `url` | `string` | - | Redis connection URL |
 | `prefix` | `string` | `"agent:"` | Key prefix |
-| `ttl_seconds` | `u64` | `null` | Time-to-live for session keys |
+| `ttl_seconds` | `u64` | `null` | Positive time-to-live for session keys; the resulting deadline must fit the Redis index range |
 
 ```yaml
 storage:
@@ -1846,7 +1956,11 @@ Runtime-enforced per-tool policy fields:
 | `max_changed_files` / `max_changed_lines` | Common caps reserved for mutation tools |
 | `config` | Host-supplied custom settings exposed as `ToolExecutionContext.custom_config`; not shown in model-facing schemas. Current built-in config: `sleep.config.max_duration_ms` |
 
-Policy cap fields are applied as upper bounds or defaults before execution for built-ins that support the corresponding input, and they are passed to all tools in `ToolExecutionContext.limits`. Examples: `grep.max_output_chars`, `git_diff.max_output_chars`, `web_fetch.max_response_bytes`, `web_fetch.max_redirects`, `file_edit.max_replacements`, and `patch.max_changed_lines`. Optional-path tools such as `glob`, `grep`, `git_status`, `git_diff`, and `diagnostics` declare `path: "."` for policy checks when the call omits `path`. `patch` declares `base_path: "."` and treats omitted `dry_run` as true during classification and preflight. Path policy canonicalizes existing paths and write-parent ancestors to deny symlink escapes. `web_fetch` re-checks configured scheme, port, and domain policy on redirect targets using the context policy snapshot.
+Policy cap fields are applied as upper bounds or defaults before execution for built-ins that support the corresponding input, and they are passed to all tools in `ToolExecutionContext.limits`. Examples: `grep.max_output_chars`, `git_diff.max_output_chars`, `web_fetch.max_response_bytes`, `web_fetch.max_redirects`, `file_edit.max_replacements`, and `patch.max_changed_lines`. Optional-path tools such as `glob`, `grep`, `git_status`, `git_diff`, and `diagnostics` declare `path: "."` for policy checks when the call omits `path`. `patch` declares `base_path: "."`. Path policy canonicalizes existing paths and write-parent ancestors to deny symlink escapes. `web_fetch` re-checks configured scheme, port, and domain policy on redirect targets using the context policy snapshot.
+
+Approval does not freeze an old authorization decision. After approval, the runtime resolves the final tool once, reapplies current policy caps to the approved arguments, and recomputes classification and resource keys. It then verifies current scope, emergency control, provider availability, policy, and approval binding before lock acquisition. After waiting for locks, a changed policy or runtime generation fails closed and one atomic rate-limit admission occurs immediately before invocation. The runtime executes the same resolved tool object and records the observed registry version as evidence rather than claiming an atomic registry snapshot. An initial hard denial returns immediately and is not revived if policy later becomes permissive; a call that was awaiting approval is denied if the final policy becomes restrictive.
+
+Calls classified as concurrency-safe, including mutation dry runs, do not acquire resource locks. Non-concurrency-safe path operations use one conservative shared path-mutation lock in addition to normalized exact resource keys, so v1 favors correctness over parallel filesystem mutation. Non-concurrency-safe calls without a concrete resource use one shared unbound-side-effect lock. Parent and spawned runtimes share the lock table. Resource guards are released before completion hooks and before fallback re-enters the normal authorization path.
 
 Custom tools should not read `tool_security` YAML directly. Put framework-common policy fields at the top level of the tool policy and put tool-specific settings under `config`. The runtime passes common caps through `ToolExecutionContext.limits` and passes `config` through `ToolExecutionContext.custom_config`. When `fail_closed: true`, a custom tool is denied before execution if configured path, domain, command, operation, or result-limit policy cannot be applied because the tool exposes no matching `policy_bindings()`.
 
@@ -1870,7 +1984,7 @@ For mutation and command built-ins, prefer `tool_security.enabled: true` with `f
 
 Legacy `allowed_domains`, `blocked_domains`, and `allowed_paths` still work for compatibility. New YAML should prefer `domains.*`, `write_paths`, and `working_dirs`.
 
-Migration note: before the explicit-grant change, some projects relied on omitted top-level `tools:` exposing every registered tool. That is no longer true. Omit `tools:` or set `tools: []` for a no-tools agent, and list every ordinary tool explicitly when you want it to be callable.
+Compatibility note: before the explicit-grant change, some release-candidate projects relied on omitted top-level `tools:` exposing every registered tool. That is no longer true. Omit `tools:` or set `tools: []` for a no-tools agent, and list every ordinary tool explicitly when you want it to be callable. User-visible RC-to-stable changes are recorded under `Unreleased` in the project changelog.
 
 ---
 
@@ -2117,7 +2231,7 @@ reflection:
 
 ## Disambiguation
 
-Detect ambiguous user messages and ask clarifying questions before proceeding.
+Detect ambiguous user messages and ask clarifying questions before proceeding. Top-level `disambiguation.enabled: true` must create the base manager; state and skill settings only override an active manager and cannot enable the subsystem by themselves.
 
 > **Note:** Disambiguation relies on the router LLM to detect ambiguity, classify the type, and generate clarification questions. Fast lower-cost models such as `gpt-5.4-nano` may misclassify ambiguity types or ignore style instructions. Use `gpt-5.4-mini` or a stronger model for the router if disambiguation quality matters.
 
@@ -2232,7 +2346,7 @@ states:
 
 ### Skill-Level Disambiguation Override
 
-A skill can declare its own disambiguation settings. After the skill router identifies a matching skill, the runtime runs a second disambiguation pass with the skill's override before executing the skill steps.
+A skill can declare its own disambiguation settings when top-level `disambiguation.enabled: true` has activated the base manager. After the skill router identifies a matching skill, the runtime runs a second disambiguation pass with the skill's override before executing the skill steps.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -2438,10 +2552,11 @@ Prometheus support currently renders text exposition output and writes it to a `
 
 ## Runtime Optimization
 
-The `runtime.optimization` block enables opt-in latency optimizations. It is disabled by default, so existing agents keep the same serial response behavior unless this block is explicitly enabled.
+The `runtime` block controls tool-schema prompt rendering and opt-in latency optimizations. `tool_schema_prompt_mode` defaults to `full`; use `compact` to include only tool names, descriptions, required fields, and property types in the generated prompt. Runtime optimization is disabled by default, so existing agents keep the same serial response behavior unless `runtime.optimization.enabled` is explicitly enabled.
 
 ```yaml
 runtime:
+  tool_schema_prompt_mode: full
   optimization:
     enabled: true
     max_speculative_llm_calls_per_turn: 0
@@ -2474,6 +2589,7 @@ runtime:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
+| `tool_schema_prompt_mode` | enum | `full` | Tool schema rendering for generated prompts: `full` includes complete JSON schema properties; `compact` includes names, descriptions, required fields, and property types |
 | `enabled` | `bool` | `false` | Enable runtime optimization behavior |
 | `max_speculative_llm_calls_per_turn` | `u32` | `0` | Per-turn cap for branch-managed speculative LLM calls; must be greater than zero when speculative flags are enabled and no larger than `max_parallel_runtime_tasks` |
 | `pre_response_deterministic_transitions` | `bool` | `false` | Check transitions explicitly marked `timing: pre_response` before old-state response generation |
@@ -2580,7 +2696,7 @@ Stream LLM tokens to the user in real time instead of waiting for the full respo
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | `bool` | `true` | Enable streaming mode |
+| `enabled` | `bool` | `true` | Declare streaming availability for runtime optimization validation. It does not select the CLI mode or block a Rust host from calling `chat_stream()` directly. |
 | `buffer_size` | `usize` | `256` | Stream chunk buffer size. For `buffer_until_routing_done`, this limits hidden chunks while routing is unresolved |
 | `include_tool_events` | `bool` | `true` | Stream tool call events |
 | `include_state_events` | `bool` | `true` | Stream state transition events |
@@ -2590,9 +2706,9 @@ streaming:
   enabled: true
 ```
 
-> **Note:** Output process pipeline stages (sanitize, format) only run in blocking mode. They are skipped when streaming is enabled.
+> **Note:** Output process pipeline stages (sanitize, format) only run in blocking mode. They are skipped on `chat_stream()` paths.
 
-Also set `metadata.cli.streaming: true` to tell the CLI to use streaming mode.
+`metadata.cli.streaming: true` selects streaming for the CLI, and `--stream` overrides that frontend preference. A Rust host selects streaming by calling `chat_stream()`. Stream chunks expose content, tool, state, completion, and error events but not the final blocking `AgentResponse.metadata`; streamed eval turns therefore cannot use response-metadata assertions.
 
 ### `parallel_tools`
 
@@ -2870,12 +2986,15 @@ spawner:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `management_tools` | `bool` or `list` | `false` | Grant management tools. `true` grants all four; a list grants only selected IDs. |
-| `shared_llms` | `bool` | `false` | Reuse parent's LLM connections for spawned agents |
-| `max_agents` | `u32` | - | Hard limit on total spawned agents |
+| `shared_llms` | `bool` | `false` | Use the inherited parent registry as authoritative. Every child-referenced alias must exist in it. |
+| `shared_storage` | storage object | - | Create one backend and give each child a collision-safe `NamespacedStorage` view. |
+| `max_agents` | integer | - | Limit reserved or registered spawner-managed slots, including in-flight builds. Omitted means unlimited by this counter. |
 | `name_prefix` | `string` | - | Auto-name agents (e.g. `npc_001`, `npc_002`) |
 | `shared_context` | `map` | - | Key-value pairs injected into every spawned agent's template as `context.*` |
-| `allowed_tools` | `list` | - | Restrict which tools spawned agents may declare. Unlisted tools are stripped. |
+| `allowed_tools` | `list` | - | Allow child top-level tool declarations. Any disallowed declaration rejects the complete child. |
 | `templates` | `map` | - | Named YAML templates. Values are either inline strings or `{ path: "..." }` objects. |
+| `auto_spawn` | `list` | `[]` | Child IDs and YAML paths to build and register during parent configuration. Any child failure aborts configuration. |
+| `orchestration_tools` | `bool` or `list` | `false` | Register and grant all five orchestration tools, or only selected IDs. |
 
 ### Spawner Tools
 
@@ -2891,10 +3010,12 @@ spawner:
 `management_tools` registers and grants dynamic agent-management tools. It accepts `true` for all four tools, or a list of selected tool IDs.
 
 ```yaml
+# Each YAML document below is a separate alternative.
 spawner:
   management_tools: true
 
-# or selectively:
+---
+# Or selectively:
 spawner:
   management_tools:
     - spawn_agent
@@ -2908,7 +3029,9 @@ In templates, caller-provided variables are top-level (`{{ name }}`, `{{ role }}
 
 ### Security
 
-The `allowed_tools` list prevents spawned agents from accessing sensitive tools. `spawn_agent` is never injected into spawned agents by default, preventing recursive spawning. LLM-generated YAML that references tools outside the allowlist is stripped before the agent is built.
+`allowed_tools` is a declaration allowlist, not a complete sandbox. Built-in names are compared by canonical ID; any child top-level tool declaration outside the allowlist rejects the child instead of stripping its spec. Hosts still own provider credentials, network and filesystem isolation, storage policy, and generated grants from other features.
+
+Every child ID must be at most 128 bytes, use only ASCII letters, digits, `_`, `-`, or `.`, and must not be empty, `.`, `..`, end in `.`, or use a Windows-reserved first stem. Active nested child spawners are rejected in v1 across dynamic spawn, auto-spawn, and restore paths.
 
 ### Auto-Spawn (Pre-Spawn Agents at Startup)
 
@@ -2931,7 +3054,7 @@ spawner:
 | `auto_spawn[].id` | `string` | Registry ID for this agent (referenced by `delegate`, `concurrent`, etc.) |
 | `auto_spawn[].agent` | `string` | Path to the agent YAML file (resolved relative to the parent YAML directory) |
 
-When `shared_llms: true`, auto-spawned agents inherit the parent's LLM connections. Each agent is built through the standard `AgentBuilder` pipeline with `auto_configure_llms()` and `auto_configure_features()`.
+When `shared_llms: true`, auto-spawned agents use the parent's authoritative LLM registry without constructing child-local providers or reading child provider credentials. Every child-referenced alias must exist in that registry. When false, the child configures its own declared providers. File read, strict parsing, admission, provider, feature, storage-readiness, or registration failure aborts `auto_configure_spawner()`; the parent is not returned with a partial declared topology.
 
 ### Orchestration Tools
 
@@ -3068,6 +3191,7 @@ fixtures:
 | `mock_server` | map | disabled | Start an attempt-local HTTP server and expose `mock_server.base_url` |
 | `workspace_policy` | map? | `null` | Add the attempt workspace to named existing read/write tool policies |
 | `web_fetch_transport` | map? | `null` | Exact-URL no-socket routes executed through the real web-fetch implementation |
+| `web_search` | map? | `null` | Static exact-query search provider; `available: false` installs an unavailable provider, while unmatched queries on an available fixture return an empty available response |
 | `diagnostics` | map? | `null` | Static diagnostics provider for deterministic `diagnostics` tool evals |
 | `commands` | map? | `null` | Static command-runner responses for deterministic `command` tool evals |
 
@@ -3076,7 +3200,7 @@ LLM fixture modes:
 | Mode | Behavior |
 |------|----------|
 | `mock` | Uses `llm.responses` in order. When responses are exhausted, the last response repeats. In streamed turns, mock responses are split into multiple chunks before the eval runner joins them again. Best for default CI. |
-| `replay` | Loads cassette JSONL records and matches by alias, model, and request hash, with ordered fallback. Best for stable regression tests from recorded traffic. |
+| `replay` | Loads cassette JSONL records and requires an exact alias, model, and request-hash match. A miss is an error and never falls back to configured mock responses. |
 | `record` | Calls the real provider and appends cassette JSONL records. Records request hashes and responses, not separate raw prompt fields. |
 | `real` | Calls the provider configured by the agent YAML. Use for live smoke tests only because it needs credentials and may incur cost. |
 
@@ -3193,8 +3317,8 @@ assert:
 |-----------|---------|
 | `state`, `state_in`, `state_not`, `state_history_contains` | Check state-machine evidence |
 | `response_contains`, `response_contains_any`, `response_not_contains`, `response_not_empty` | Literal response checks |
-| `metadata_contains` | Top-level response metadata key/value checks. Use path assertions for nested values. |
-| `metadata_path`, `context_path` | Dot-path checks with `eq`, `neq`, `in`, `contains`, `exists`, `gte`, `lte`, `gt`, `lt`. |
+| `metadata_contains` | Top-level blocking-response metadata key/value checks. Streamed turns do not expose final response metadata. |
+| `metadata_path`, `context_path` | Dot-path checks with `eq`, `neq`, `in`, `contains`, `exists`, `gte`, `lte`, `gt`, `lt`. `metadata_path` requires a blocking turn; `context_path` remains available for streamed turns. |
 | `tool_called`, `tool_not_called` | Tool execution evidence, including count, success, source, args, and result paths. |
 | `skill_triggered` | Skill metadata when available. Useful for skill router regression tests. |
 | `disambiguation`, `no_disambiguation` | Ambiguity flow evidence when available. Checks statuses such as `triggered`, `clarified`, `best_guess`, or `skipped`. |

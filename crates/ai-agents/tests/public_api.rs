@@ -1,17 +1,29 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-use ai_agents::agent::RuntimeControlHandle;
+use ai_agents::agent::{RuntimeAgent, RuntimeControlHandle};
 use ai_agents::persistence::{AgentStorage, NoopStorage, StorageCapability};
 use ai_agents::spec::{
     AgentSpec, AutoSpawnEntry, LLMConfigOrSelector, ManagementToolsConfig,
     OrchestrationToolsConfig, SpawnerConfig, TemplateSource,
 };
 use ai_agents::tools::{
-    CopyPathTool, DeletePathTool, MovePathTool, ToolError, ToolSchemaPromptMode, WebSearchProvider,
-    WebSearchRequest, WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch, WebSearchTool,
+    CommandRunner, CopyPathTool, DeletePathTool, DiagnosticsProvider, MovePathTool,
+    QuestionHandler, ToolError, ToolSchemaPromptMode, WebSearchProvider, WebSearchRequest,
+    WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch, WebSearchTool,
 };
 
-fn accepts_web_search_provider(_provider: &dyn WebSearchProvider) {}
+fn configure_host_integrations(
+    agent: &RuntimeAgent,
+    question_handler: Arc<dyn QuestionHandler>,
+    diagnostics_provider: Arc<dyn DiagnosticsProvider>,
+    command_runner: Arc<dyn CommandRunner>,
+    web_search_provider: Arc<dyn WebSearchProvider>,
+) {
+    agent.set_question_handler(Some(question_handler));
+    agent.set_diagnostics_provider(diagnostics_provider);
+    agent.set_command_runner(command_runner);
+    agent.set_web_search_provider(web_search_provider);
+}
 
 fn supports_snapshots(storage: &dyn AgentStorage) -> bool {
     storage.supports(StorageCapability::Snapshot)
@@ -67,5 +79,11 @@ fn facade_exposes_reviewed_v1_type_closure() {
     let _ = DeletePathTool::new();
     let _ = WebSearchTool::new();
     let _: Option<RuntimeControlHandle> = None;
-    let _: fn(&dyn WebSearchProvider) = accepts_web_search_provider;
+    let _: fn(
+        &RuntimeAgent,
+        Arc<dyn QuestionHandler>,
+        Arc<dyn DiagnosticsProvider>,
+        Arc<dyn CommandRunner>,
+        Arc<dyn WebSearchProvider>,
+    ) = configure_host_integrations;
 }

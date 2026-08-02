@@ -69,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
 - `auto_configure_llms()` reads the `llm:` and `llms:` blocks from the spec, resolves API keys from environment variables, and registers all providers automatically.
 - `auto_configure_features()` wires up error recovery, tool security, process pipeline, and built-in tools from the spec.
 - `auto_configure_mcp()` connects to MCP servers declared in the `tools` list (entries with `type: mcp`), discovers their functions, and registers them.
-- `auto_configure_spawner()` reads the `spawner:` section, creates the spawner and agent registry, resolves file-based templates, and registers the spawner tools.
+- `auto_configure_spawner()` reads the `spawner:` section, creates the spawner and registry, creates optional shared storage, resolves templates, performs fail-closed auto-spawn and child storage readiness, and registers explicitly configured spawner tools.
 
 This is the same builder chain used by the CLI. `auto_configure_mcp()` and `auto_configure_spawner()` are no-ops when the relevant YAML sections are absent, so it is safe to always include them.
 
@@ -140,9 +140,16 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .build()?;
 ```
 
-The full builder chain used by the CLI is: `auto_configure_llms` &#x2192; `auto_configure_features` &#x2192; `auto_configure_mcp` &#x2192; `auto_configure_spawner` &#x2192; `build`. The MCP and spawner steps must come after `auto_configure_features()` so the tool registry exists. Custom `.tool()`, `.hooks()`, and `.system_prompt()` calls can go anywhere before `.build()`.
+The full builder chain used by the CLI is: `auto_configure_llms` &#x2192; `auto_configure_features` &#x2192; `auto_configure_mcp` &#x2192; `auto_configure_spawner` &#x2192; `build`. The MCP and spawner steps must come after `auto_configure_features()` so the tool registry exists. To keep auto-registered built-ins, call `.tool()` or `.extend_tools()` after `auto_configure_features()`; calling either method first creates a custom registry and causes builtin auto-registration to be skipped. `.tools(registry)` intentionally replaces the entire registry, including previously auto-registered built-ins. Configuration-only overrides such as `.hooks()` and `.system_prompt()` can be applied anywhere before `.build()`.
+
+Use one of these orderings:
+
+- Extend built-ins: load YAML -> configure LLMs -> configure features -> configure MCP -> configure spawner -> add `.tool()` or `.extend_tools()` -> build.
+- Supply a complete custom registry: load YAML -> configure LLMs -> call `.tools(registry)` -> configure features -> configure MCP -> configure spawner -> build. Calling `.tools(registry)` after MCP or spawner configuration removes those generated registrations, so only do that when full replacement is intentional and the final YAML grants still resolve.
 
 Registration and availability are separate for ordinary tools. `auto_configure_features()`, `auto_configure_mcp()`, and `auto_configure_spawner()` register tools, but YAML top-level `tools:` decides what the model can call. When loading YAML, omitted top-level `tools:` means no ordinary LLM-callable tools even if Rust registered them. Explicit YAML feature flags such as `spawner.management_tools`, `spawner.orchestration_tools`, and `persona.evolution.allow_llm_evolve` are exceptions because they intentionally register and grant their generated tools. In pure Rust builder flows without YAML, registered tools are treated as the explicit grant.
+
+Spawner restrictions apply equally to YAML, spec, template, auto-spawn, and restore paths. Child IDs use a bounded portable ASCII grammar, active nested child spawners are rejected, allowlist violations reject the complete child, and `max_agents` counts both registered and in-flight spawner-managed children. `shared_llms: true` requires the parent registry to contain every alias referenced by each child; it does not construct child-local providers. Hosts using lower-level detached `SpawnedAgent::from_runtime()` records or direct registry insertion operate outside the spawner capacity counter. A direct `spawn_*` call returns an unregistered child, so the host must register or discard it. Complete topology persistence requires a full parent snapshot and matching child sessions under the same session ID.
 
 ---
 
@@ -217,6 +224,8 @@ while let Some(chunk) = stream.next().await {
     }
 }
 ```
+
+When the selected LLM has explicit `tool_choice`, the runtime buffers that provider decision before emitting committed content or the existing `ToolCallStart`, `ToolCallEnd`, and `ToolResult` events. v1 does not expose provider-native incremental tool-call deltas as a separate API; agents that omit `tool_choice` keep the existing streaming path. `StreamChunk` also does not carry the final blocking `AgentResponse.metadata`; use blocking `chat()` when that metadata is part of the contract.
 
 ### StreamChunk variants
 
@@ -363,14 +372,14 @@ fn classify_call(&self, args: &Value) -> ToolCallClassification {
 }
 ```
 
-The shared runtime resolves names to canonical IDs, checks scope and `tool_security`, applies HITL when needed, builds `ToolExecutionContext`, enforces timeout/cancellation, acquires cross-tool resource locks for side-effecting path-like calls, and records a structured `ToolExecutionRecord`. YAML skills, state actions, fallback, orchestration, generated tools, and spawned runtimes use the same path through `ToolInvoker`, so tool calls do not bypass runtime policy. Direct `SkillExecutor::execute` is prompt-only; use `execute_with_invoker` for skills that contain tool steps.
+The shared runtime resolves names to canonical IDs, checks scope and `tool_security`, and applies HITL when needed. After approval it takes a fresh runtime-control snapshot, resolves the final tool once, reapplies policy caps, recomputes classification and resource keys, and verifies current scope, emergency control, provider availability, policy, confirmation requirement, and final arguments before lock acquisition. After waiting for locks, a changed runtime or policy generation fails closed and one atomic admission records the rate-limited call immediately before invocation. The same resolved tool object is executed. Resource guards cover admission and the tool side effect, then release before completion hooks or fallback re-enters the shared path. YAML skills, state actions, plans, fallback, orchestration, generated tools, and spawned runtimes use the same path through `ToolInvoker`, so tool calls do not bypass runtime policy. Direct `SkillExecutor::execute` is prompt-only; use `execute_with_invoker` for skills that contain tool steps.
 
-Custom tools should use `ctx.limits` for effective framework caps and `ctx.custom_config` for tool-specific settings from `tool_security.tools.<tool_id>.config`. Tool input arguments are model-callable schema fields; `config` is host-supplied and not model-callable. Do not parse `tool_security` YAML directly inside the tool. If `fail_closed: true` and a path, domain, command, operation, or result-limit policy is configured and cannot be enforced by the shared executor alone, custom tools must declare matching `policy_bindings()` or execution is denied before the implementation runs. Side-effecting tools should also set call classification carefully: use `requires_approval` for risky mutation or command calls and set `safely_retryable` only when repeating the exact call cannot duplicate side effects. For path-like resources, the runtime lock key is shared across tools, so custom mutation tools should expose accurate path bindings and argument names when possible.
+Custom tools should use `ctx.limits` for effective framework caps and `ctx.custom_config` for tool-specific settings from `tool_security.tools.<tool_id>.config`. Tool input arguments are model-callable schema fields; `config` is host-supplied and not model-callable. Do not parse `tool_security` YAML directly inside the tool. If `fail_closed: true` and a path, domain, command, operation, or result-limit policy is configured and cannot be enforced by the shared executor alone, custom tools must declare matching `policy_bindings()` or execution is denied before the implementation runs. Side-effecting tools should also set call classification carefully: use `requires_approval` for risky mutation or command calls and set `safely_retryable` only when repeating the exact call cannot duplicate side effects. Declare every path field, including source and destination fields, so the runtime records normalized resources and places non-concurrency-safe path operations under the shared path-mutation lock. Non-concurrency-safe calls without a concrete resource use the shared unbound-side-effect lock.
 
 Host-backed built-in hooks are installed on the built runtime:
 
 ```rust
-use ai_agents::tools::{DiagnosticsProvider, QuestionHandler};
+use ai_agents::tools::{DiagnosticsProvider, QuestionHandler, WebSearchProvider};
 use std::sync::Arc;
 
 let agent = AgentBuilder::from_yaml_file("agent.yaml")?
@@ -381,14 +390,19 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 agent.set_question_handler(Some(my_question_handler as Arc<dyn QuestionHandler>));
 agent.set_diagnostics_provider(my_diagnostics_provider as Arc<dyn DiagnosticsProvider>);
 agent.set_command_runner(Arc::new(ai_agents::tools::ProcessCommandRunner));
+agent.set_web_search_provider(my_search_provider as Arc<dyn WebSearchProvider>);
 
 let todos = agent.todos();
 let control = agent.runtime_control();
 ```
 
-`set_question_handler()` powers `ask_user`, `set_diagnostics_provider()` powers `diagnostics`, `set_command_runner()` powers `command`, and `todos()` returns the current runtime-local task list. `ProcessCommandRunner` runs argv without a shell, starts from an empty environment, applies policy-filtered env values, bounds stdout/stderr while reading, cleans up on timeout, and redacts sensitive argv values in evidence. The runtime-control handle can update tool security with `set_tool_security()`, override the effective tool scope with `set_tool_scope()`, clear those overrides, enable emergency denial with `set_emergency_deny()`, or call `cancel_all()` for future tool calls.
+`set_question_handler()` powers `ask_user`, `set_diagnostics_provider()` powers `diagnostics`, `set_command_runner()` powers `command`, `set_web_search_provider()` powers `web_search`, and `todos()` returns the current runtime-local task list. A missing diagnostics, command, or search provider is rejected before tool invocation and recorded as unavailable; `ask_user` instead executes its structured default/unavailable fallback. `ProcessCommandRunner` runs argv without a shell, starts from an empty environment, applies policy-filtered env values, bounds stdout/stderr while reading, cleans up on timeout, and redacts sensitive argv values in evidence. The runtime-control handle can update tool security with `set_tool_security()`, override the effective tool scope with `set_tool_scope()`, clear those overrides, enable emergency denial with `set_emergency_deny()`, or call `cancel_all()` for future tool calls.
 
-`web_fetch` prompt extraction also uses the runtime LLM registry when a router or default model is available, so nested extraction calls flow through the normal observed provider path.
+`web_fetch` prompt extraction also uses the runtime LLM registry when a router or default model is available, so nested extraction calls flow through the normal observed provider path. The built-in `web_search` is separate from provider-native LLM search options: it requires an explicit tool grant, a host-installed `WebSearchProvider`, and shared-executor evidence.
+
+### Direct subcrate boundaries
+
+The curated `ai-agents` facade exports normal host integration for questions, diagnostics, commands, and web search, including `WebSearchProvider` request and response types. Add a matching direct `ai-agents-tools` dependency only for lower-level custom web-fetch transport or resolver injection (`WebFetchTransport`, `WebFetchResolver`, and their request/response types) or eval-oriented `StaticWebSearchProvider` and `UnavailableWebSearchProvider` helpers.
 
 ---
 
@@ -429,6 +443,8 @@ impl LLMProvider for MyProvider {
     }
 }
 ```
+
+Existing custom providers compile without implementing tool-specific methods. They use the prompt protocol when an agent configures explicit tool choice. A custom provider can opt into native selection by implementing `complete_with_tools()`, returning `true` from `supports_tool_choice()`, and storing normalized calls in `LLMResponse` with `set_tool_calls()` or `with_tool_calls()`. The request uses `LLMToolRequest`, `LLMToolDefinition`, and `ToolChoice`; native calls are still executed only by the runtime's shared executor. `configured_tool_choice()` is optional and returns no override by default.
 
 Wire it in:
 
@@ -475,7 +491,7 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
     .build()?;
 ```
 
-The framework ships with `InMemoryStore` (simple ring buffer) and `CompactingMemory` (LLM-based summarization with token budgets).
+The framework ships with `InMemoryStore` (simple ring buffer) and `CompactingMemory` (serialized LLM-based summarization with token budgets and protected recent-message retention). `MemorySnapshot` includes `messages`, optional `summary`, and a defaulted `summarized_count`; the default keeps snapshots written before this field backward-compatible.
 
 ---
 
@@ -683,6 +699,17 @@ let sessions = agent.list_sessions().await?;
 agent.delete_session("session-abc-123").await?;
 ```
 
+Storage methods advertise support through `AgentStorage::supports(StorageCapability)`. Unsupported extended operations return `AgentError::UnsupportedStorageCapability`.
+
+| Backend | Snapshots | Metadata and filtering | Expiry cleanup | Facts and relationships | Atomic actor deletion |
+|---------|-----------|------------------------|----------------|-------------------------|-----------------------|
+| File | Yes | No | No | No | No |
+| Redis | Yes | No | No | No | No |
+| SQLite | Yes | Yes | Yes | Yes | Yes |
+| `NoopStorage` | No | No | No | No | No |
+
+Redis's `storage.ttl_seconds` expires Redis snapshot keys directly; it does not implement generic session metadata or `ExpiryCleanup`. `NamespacedStorage` derives snapshot, metadata, filtering, facts, relationships, and actor-deletion support from its inner backend, but intentionally does not forward backend-global expiry cleanup.
+
 ---
 
 ## Actor Memory & Key Facts
@@ -732,7 +759,7 @@ let filter = ai_agents::facts::SessionFilter {
 let summaries = agent.list_sessions_filtered(&filter).await?;
 ```
 
-When `auto_extract: true` (the default), extraction runs after every turn - no manual calls needed. Configure via `memory.facts` and `memory.actor_memory` in YAML. See [YAML Reference](@/docs/yaml-reference.md#facts-key-facts-extraction) for the full schema.
+When `auto_extract: true` (the default), extraction runs after every turn - no manual calls needed. Durable facts require `StorageCapability::ActorFacts`, and privacy deletion requires `StorageCapability::ActorDataDeletion`; SQLite is currently the only built-in backend providing both. Configure via `memory.facts` and `memory.actor_memory` in YAML. See [YAML Reference](@/docs/yaml-reference.md#facts-key-facts-extraction) for the full schema.
 
 Switching actors mid-session via `set_actor_id()` (or via `from_context` resolution when the configured context path changes) clears the cached facts and reloads on the next turn, so prompt injection always reflects the current actor.
 
@@ -782,14 +809,10 @@ if let Some(manager) = agent.relationship_manager() {
 
 Automatic updates run after successful turns when `memory.relationships.auto_update.enabled` is true. Relationship context is injected at `relationships.current_actor.*`, and formatted prompt text is available as `{{ relationship_memory }}`.
 
-Session persistence requires a storage backend. Enable one via feature flags:
+Persistent relationship memory requires `StorageCapability::ActorRelationships`, currently provided only by SQLite among the built-in backends. Enable it with the `sqlite` feature:
 
 ```toml
-# SQLite (file-based, good for single-server)
 ai-agents = { version = "1.0.0-rc.16", features = ["sqlite"] }
-
-# Redis (networked, good for distributed setups)
-ai-agents = { version = "1.0.0-rc.16", features = ["redis-storage"] }
 ```
 
 Configure storage in your YAML:
@@ -800,13 +823,7 @@ storage:
   path: "./sessions.db"
 ```
 
-Or for Redis:
-
-```yaml
-storage:
-  type: redis
-  url: "redis://localhost:6379"
-```
+Redis can persist session snapshots but cannot persist dedicated actor relationships through the generic storage trait.
 
 You can also use the lower-level API with any `AgentStorage` implementation:
 
@@ -935,7 +952,7 @@ Some internal feature crates avoid depending on `ai-agents-observability` direct
 
 This page covers the most common patterns. For the complete API - every struct, enum, trait, and function - see the auto-generated docs:
 
-📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/1.0.0-rc.16)**
+📖 **[docs.rs/ai-agents](https://docs.rs/ai-agents/latest/ai_agents/)**
 
 ---
 
@@ -945,3 +962,4 @@ This page covers the most common patterns. For the complete API - every struct, 
 - **[CLI Guide](@/docs/cli.md)** - run agents from the command line
 - **[LLM Providers](@/docs/providers.md)** - setup for all 12 supported providers
 - **[YAML Reference](@/docs/yaml-reference.md)** - the complete agent spec
+- **[Built-in Tools](@/docs/built-in-tools.md)** - built-in schemas, outputs, policy, and host requirements
