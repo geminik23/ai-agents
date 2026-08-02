@@ -11,15 +11,18 @@ pub use error::{AgentError, Result};
 pub use message::{ChatMessage, Role};
 pub use traits::llm::{LLMCapability, LLMError, LLMProvider, TaskContext, ToolSelection};
 pub use traits::memory::{Memory, MemorySnapshot};
-pub use traits::storage::{AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry};
+pub use traits::storage::{
+    AgentSnapshot, AgentStorage, NoopStorage, SpawnedAgentEntry, StorageCapability,
+};
 pub use traits::tool::{Tool, ToolInfo, ToolInvoker, ToolResult};
 pub use types::{
     AgentInfo, AgentResponse, CommandBindingKind, CommandPolicyBinding, DomainPolicyBinding,
     FactCategory, FactFilter, FinishReason, KeyFact, LLMChunk, LLMConfig, LLMFeature, LLMResponse,
-    PathAccessMode, PathBindingKind, PathPolicyBinding, PermissionOutcome, ResultLimitBinding,
-    ResultLimitKind, SessionFilter, SessionMetadata, SessionSummary, StateMachineSnapshot,
-    StateTransitionEvent, TokenUsage, ToolActorContext, ToolApprovalRecord, ToolApprovalStatus,
-    ToolCall, ToolCallClassification, ToolCallSource, ToolCancellationToken, ToolExecutionContext,
-    ToolExecutionLimits, ToolExecutionRecord, ToolExecutionRequest, ToolOperationKind,
-    ToolPolicyBindings, ToolPolicyDecisionRecord, ToolSafetyMetadata, ToolSideEffectLevel,
+    LLMToolDefinition, LLMToolRequest, PathAccessMode, PathBindingKind, PathPolicyBinding,
+    PermissionOutcome, ResultLimitBinding, ResultLimitKind, SessionFilter, SessionMetadata,
+    SessionSummary, StateMachineSnapshot, StateTransitionEvent, TokenUsage, ToolActorContext,
+    ToolApprovalRecord, ToolApprovalStatus, ToolCall, ToolCallClassification, ToolCallSource,
+    ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
+    ToolExecutionRecord, ToolExecutionRequest, ToolOperationKind, ToolPolicyBindings,
+    ToolPolicyDecisionRecord, ToolSafetyMetadata, ToolSideEffectLevel,
 };

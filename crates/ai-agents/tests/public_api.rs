@@ -1,0 +1,71 @@
+use std::collections::HashMap;
+
+use ai_agents::agent::RuntimeControlHandle;
+use ai_agents::persistence::{AgentStorage, NoopStorage, StorageCapability};
+use ai_agents::spec::{
+    AgentSpec, AutoSpawnEntry, LLMConfigOrSelector, ManagementToolsConfig,
+    OrchestrationToolsConfig, SpawnerConfig, TemplateSource,
+};
+use ai_agents::tools::{
+    CopyPathTool, DeletePathTool, MovePathTool, ToolError, ToolSchemaPromptMode, WebSearchProvider,
+    WebSearchRequest, WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch, WebSearchTool,
+};
+
+fn accepts_web_search_provider(_provider: &dyn WebSearchProvider) {}
+
+fn supports_snapshots(storage: &dyn AgentStorage) -> bool {
+    storage.supports(StorageCapability::Snapshot)
+}
+
+#[test]
+fn facade_exposes_reviewed_v1_type_closure() {
+    let mut templates = HashMap::new();
+    templates.insert(
+        "worker".to_string(),
+        TemplateSource::Inline("name: Worker\nsystem_prompt: worker\n".to_string()),
+    );
+    let spawner = SpawnerConfig {
+        templates,
+        auto_spawn: vec![AutoSpawnEntry {
+            id: "worker".to_string(),
+            agent: "worker.yaml".to_string(),
+        }],
+        management_tools: ManagementToolsConfig::default(),
+        orchestration_tools: OrchestrationToolsConfig::default(),
+        ..SpawnerConfig::default()
+    };
+    let spec = AgentSpec {
+        llm: LLMConfigOrSelector::default(),
+        spawner: Some(spawner),
+        ..AgentSpec::default()
+    };
+
+    let request = WebSearchRequest {
+        query: "rust agents".to_string(),
+        safe_search: Some(WebSearchSafeSearch::Moderate),
+        ..WebSearchRequest::default()
+    };
+    let response = WebSearchResponse {
+        available: true,
+        results: vec![WebSearchResultItem {
+            title: "Result".to_string(),
+            url: "https://example.com".to_string(),
+            ..WebSearchResultItem::default()
+        }],
+        ..WebSearchResponse::default()
+    };
+
+    let _ = spec;
+    let _ = request;
+    let _ = response;
+    let storage = NoopStorage;
+    assert!(!supports_snapshots(&storage));
+    let _ = ToolSchemaPromptMode::Compact;
+    let _ = ToolError::NotFound("missing".to_string());
+    let _ = CopyPathTool::new();
+    let _ = MovePathTool::new();
+    let _ = DeletePathTool::new();
+    let _ = WebSearchTool::new();
+    let _: Option<RuntimeControlHandle> = None;
+    let _: fn(&dyn WebSearchProvider) = accepts_web_search_provider;
+}

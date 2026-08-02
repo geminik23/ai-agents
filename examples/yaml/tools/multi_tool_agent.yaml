@@ -8,9 +8,9 @@ description: "Selected general-purpose built-ins with parallel execution"
 # compatibility `file` tool and raw `http` API client. It is useful for demonstrating
 # parallel tool calls without exposing the mutation-oriented tool catalog.
 #
-# NOTE: Do NOT list tool names or descriptions here.
-# The framework auto-injects all granted tool names, descriptions, and argument schemas
-# into the prompt at runtime via generate_tools_prompt().
+# The required choice makes the first model decision use at least one granted tool.
+# Native-capable providers receive schemas through their request; other providers use one bounded prompt correction.
+# Flow: user input -> required tool selection -> shared tool executor -> final response
 system_prompt: |
   You are a versatile assistant.
   Always use the appropriate tool — never guess at computations, string lengths, or time values.
@@ -20,6 +20,7 @@ system_prompt: |
 llm:
   provider: openai
   model: gpt-5.4-mini
+  tool_choice: required
 
 tools:
   - name: calculator

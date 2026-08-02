@@ -23,17 +23,17 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 - **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
-- **Built-in tools + MCP** - calculator, datetime, echo, file, glob, grep, file_read, file_write, file_edit, file_list, file_info, patch, copy_path, move_path, delete_path, git_status, git_diff, diagnostics, ask_user, todo, sleep, web_fetch, web_search, command, JSON, text, template, math, random, and HTTP; connect any MCP server for hundreds more
-- **Tool scoping, policy, and context** - explicit top-level tool grants, state-level narrowing, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
+- **Built-in tools + MCP** - 30 canonical built-in IDs: `calculator`, `echo`, `datetime`, `json`, `random`, `file`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `patch`, `copy_path`, `move_path`, `delete_path`, `file_list`, `file_info`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `web_search`, `command`, `text`, `template`, `math`, and `http`; connect any MCP server for hundreds more
+- **Tool scoping, selection, policy, and context** - explicit top-level grants, state-level narrowing, opt-in `auto`/`required`/`specific`/`none` tool choice, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
 - **Input/output process pipeline** - deterministic normalization and formatting plus optional LLM-backed detection, extraction, sanitization, validation, and transformation
 - **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
-- **Memory stack** - CompactingMemory, token budgeting, SQLite/Redis/file persistence, session metadata, actor facts, and relationship memory
+- **Memory stack** - CompactingMemory and token budgeting; file and Redis snapshot persistence; SQLite snapshots, session metadata/filtering/cleanup, actor facts, and relationship memory
 - **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
-- **Multi-agent systems** - dynamic agent spawning, agent registry, actor-aware inter-agent messaging, and router/pipeline/concurrent/group chat/handoff orchestration
+- **Multi-agent systems** - fail-closed child admission, bounded managed capacity, optional shared LLMs and namespaced storage, agent registry, actor-aware messaging, and router/pipeline/concurrent/group chat/handoff orchestration; active nested spawners are rejected in v1
 - **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming, context injection, and actor/relationship inspection
 - **Reasoning, reflection & disambiguation** - chain-of-thought, ReAct, plan-and-execute, self-evaluation, ambiguity detection, and clarification
 - **Evaluation, safety, control & observability** - YAML scenario evals with assertions/judges, runtime latency optimization, speculative branch execution, error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
-- **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`
+- **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`; custom LLM providers remain source-compatible and can opt into native tool requests through additive methods
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 

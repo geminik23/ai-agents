@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{AgentError, AgentSnapshot, AgentStorage, Result};
+use ai_agents_core::traits::storage::StorageCapability;
 use ai_agents_core::{
     FactCategory, FactFilter, KeyFact, SessionFilter, SessionMetadata, SessionSummary,
 };
@@ -266,23 +267,39 @@ impl SqliteStorage {
         snapshot: &AgentSnapshot,
         metadata: &SqliteMetadata,
     ) -> Result<()> {
+        self.save_record_with_metadata(session_id, snapshot, metadata, &metadata.tags)
+            .await
+    }
+
+    async fn save_record_with_metadata<M: Serialize>(
+        &self,
+        session_id: &str,
+        snapshot: &AgentSnapshot,
+        metadata: &M,
+        tags: &[String],
+    ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let data =
             serde_json::to_string(snapshot).map_err(|e| AgentError::Persistence(e.to_string()))?;
         let metadata_json =
             serde_json::to_string(metadata).map_err(|e| AgentError::Persistence(e.to_string()))?;
-
         let message_count = snapshot.memory.messages.len() as i64;
         let current_state = snapshot
             .state_machine
             .as_ref()
-            .map(|sm| sm.current_state.clone());
+            .map(|state| state.current_state.clone());
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
         sqlx::query(
             r#"
             INSERT INTO sessions (session_id, agent_id, created_at, updated_at, message_count, current_state, data, metadata)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
                 updated_at = excluded.updated_at,
                 message_count = excluded.message_count,
                 current_state = excluded.current_state,
@@ -298,26 +315,28 @@ impl SqliteStorage {
         .bind(&current_state)
         .bind(&data)
         .bind(&metadata_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
         sqlx::query("DELETE FROM session_tags WHERE session_id = ?")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
-
-        for tag in &metadata.tags {
+        for tag in tags {
             sqlx::query("INSERT INTO session_tags (session_id, tag) VALUES (?, ?)")
                 .bind(session_id)
                 .bind(tag)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|e| AgentError::Persistence(e.to_string()))?;
         }
 
-        Ok(())
+        transaction
+            .commit()
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))
     }
 
     pub async fn get_metadata(&self, session_id: &str) -> Result<Option<SqliteMetadata>> {
@@ -569,8 +588,60 @@ impl SqliteStorage {
 #[cfg(feature = "sqlite")]
 #[async_trait]
 impl AgentStorage for SqliteStorage {
+    fn supports(&self, capability: StorageCapability) -> bool {
+        matches!(
+            capability,
+            StorageCapability::Snapshot
+                | StorageCapability::SessionMetadata
+                | StorageCapability::SessionFiltering
+                | StorageCapability::ExpiryCleanup
+                | StorageCapability::ActorFacts
+                | StorageCapability::ActorRelationships
+                | StorageCapability::ActorDataDeletion
+        )
+    }
+
     async fn save(&self, session_id: &str, snapshot: &AgentSnapshot) -> Result<()> {
-        self.save_with_metadata(session_id, snapshot, &SqliteMetadata::default())
+        let now = Utc::now().to_rfc3339();
+        let data =
+            serde_json::to_string(snapshot).map_err(|e| AgentError::Persistence(e.to_string()))?;
+        let message_count = snapshot.memory.messages.len() as i64;
+        let current_state = snapshot
+            .state_machine
+            .as_ref()
+            .map(|state| state.current_state.clone());
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (session_id, agent_id, created_at, updated_at, message_count, current_state, data)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                updated_at = excluded.updated_at,
+                message_count = excluded.message_count,
+                current_state = excluded.current_state,
+                data = excluded.data
+            "#,
+        )
+        .bind(session_id)
+        .bind(&snapshot.agent_id)
+        .bind(&now)
+        .bind(&now)
+        .bind(message_count)
+        .bind(&current_state)
+        .bind(&data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn save_snapshot_with_metadata(
+        &self,
+        session_id: &str,
+        snapshot: &AgentSnapshot,
+        metadata: &SessionMetadata,
+    ) -> Result<()> {
+        self.save_record_with_metadata(session_id, snapshot, metadata, &metadata.tags)
             .await
     }
 
@@ -616,14 +687,44 @@ impl AgentStorage for SqliteStorage {
     async fn save_metadata(&self, session_id: &str, metadata: &SessionMetadata) -> Result<()> {
         let meta_json =
             serde_json::to_string(metadata).map_err(|e| AgentError::Persistence(e.to_string()))?;
-
-        sqlx::query("UPDATE sessions SET metadata = ? WHERE session_id = ?")
-            .bind(&meta_json)
-            .bind(session_id)
-            .execute(&self.pool)
+        let mut transaction = self
+            .pool
+            .begin()
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
 
+        let update = sqlx::query("UPDATE sessions SET metadata = ? WHERE session_id = ?")
+            .bind(&meta_json)
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        if update.rows_affected() == 0 {
+            return Err(AgentError::Persistence(format!(
+                "session not found: {session_id}"
+            )));
+        }
+
+        sqlx::query("DELETE FROM session_tags WHERE session_id = ?")
+            .bind(session_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        for tag in &metadata.tags {
+            sqlx::query("INSERT INTO session_tags (session_id, tag) VALUES (?, ?)")
+                .bind(session_id)
+                .bind(tag)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
         Ok(())
     }
 
@@ -740,6 +841,12 @@ impl AgentStorage for SqliteStorage {
     }
 
     async fn save_facts(&self, agent_id: &str, actor_id: &str, facts: &[KeyFact]) -> Result<()> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
         for fact in facts {
             let category_str = fact.category.to_string();
             let extracted_at = fact.extracted_at.to_rfc3339();
@@ -772,10 +879,15 @@ impl AgentStorage for SqliteStorage {
             .bind(&last_accessed)
             .bind(&fact.source_message_id)
             .bind(&fact.source_language)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
+        }
+
+        transaction
+            .commit()
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
-        }
         Ok(())
     }
 
@@ -944,31 +1056,39 @@ impl AgentStorage for SqliteStorage {
     }
 
     async fn delete_actor_data(&self, agent_id: &str, actor_id: &str) -> Result<()> {
-        // Delete all facts for this actor.
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
         sqlx::query("DELETE FROM actor_facts WHERE agent_id = ? AND actor_id = ?")
             .bind(agent_id)
             .bind(actor_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
 
         sqlx::query("DELETE FROM actor_relationships WHERE agent_id = ? AND actor_id = ?")
             .bind(agent_id)
             .bind(actor_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map_err(|e| AgentError::Persistence(e.to_string()))?;
+            .map_err(|error| AgentError::Persistence(error.to_string()))?;
 
-        // Delete sessions associated with this actor.
         sqlx::query(
             "DELETE FROM sessions WHERE agent_id = ? AND json_extract(metadata, '$.actor_id') = ?",
         )
         .bind(agent_id)
         .bind(actor_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map_err(|e| AgentError::Persistence(e.to_string()))?;
+        .map_err(|error| AgentError::Persistence(error.to_string()))?;
 
+        transaction
+            .commit()
+            .await
+            .map_err(|e| AgentError::Persistence(e.to_string()))?;
         Ok(())
     }
 
@@ -1088,12 +1208,22 @@ impl AgentStorage for SqliteStorage {
             return Ok(None);
         };
 
-        let dimensions: serde_json::Value =
-            serde_json::from_str(&dimensions_json).unwrap_or_else(|_| serde_json::json!({}));
+        let dimensions: serde_json::Value = serde_json::from_str(&dimensions_json).map_err(|error| {
+            AgentError::Persistence(format!(
+                "Malformed relationship dimensions for agent '{agent_id}' actor '{actor_id}': {error}"
+            ))
+        })?;
         let notable_events: serde_json::Value =
-            serde_json::from_str(&notable_events_json).unwrap_or_else(|_| serde_json::json!([]));
-        let mut metadata: serde_json::Value =
-            serde_json::from_str(&metadata_json).unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::from_str(&notable_events_json).map_err(|error| {
+                AgentError::Persistence(format!(
+                    "Malformed relationship events for agent '{agent_id}' actor '{actor_id}': {error}"
+                ))
+            })?;
+        let mut metadata: serde_json::Value = serde_json::from_str(&metadata_json).map_err(|error| {
+            AgentError::Persistence(format!(
+                "Malformed relationship metadata for agent '{agent_id}' actor '{actor_id}': {error}"
+            ))
+        })?;
         let model = metadata
             .as_object_mut()
             .and_then(|obj| obj.remove("__relationship_model"))
@@ -1175,6 +1305,38 @@ mod tests {
         snapshot
     }
 
+    fn create_test_fact(actor_id: &str, content: &str) -> KeyFact {
+        KeyFact {
+            id: "shared-fact".to_string(),
+            actor_id: Some(actor_id.to_string()),
+            category: FactCategory::UserContext,
+            content: content.to_string(),
+            confidence: 0.9,
+            salience: 0.8,
+            extracted_at: Utc::now(),
+            last_accessed: None,
+            source_message_id: None,
+            source_language: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reports_implemented_capabilities() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+
+        for capability in [
+            StorageCapability::Snapshot,
+            StorageCapability::SessionMetadata,
+            StorageCapability::SessionFiltering,
+            StorageCapability::ExpiryCleanup,
+            StorageCapability::ActorFacts,
+            StorageCapability::ActorRelationships,
+            StorageCapability::ActorDataDeletion,
+        ] {
+            assert!(storage.supports(capability));
+        }
+    }
+
     #[tokio::test]
     async fn test_sqlite_crud() {
         let storage = SqliteStorage::in_memory().await.unwrap();
@@ -1206,6 +1368,192 @@ mod tests {
 
         let sessions = storage.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_metadata_synchronizes_tags_and_rejects_missing_sessions() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        storage
+            .save("session-1", &create_test_snapshot().await)
+            .await
+            .unwrap();
+
+        let mut metadata = SessionMetadata {
+            tags: vec!["vip".to_string(), "support".to_string()],
+            ..Default::default()
+        };
+        storage.save_metadata("session-1", &metadata).await.unwrap();
+
+        let vip_filter = SessionFilter {
+            tags: Some(vec!["vip".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .list_sessions_filtered(&vip_filter)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        metadata.tags = vec!["updated".to_string()];
+        storage.save_metadata("session-1", &metadata).await.unwrap();
+
+        assert!(
+            storage
+                .list_sessions_filtered(&vip_filter)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let updated_filter = SessionFilter {
+            tags: Some(vec!["updated".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            storage
+                .list_sessions_filtered(&updated_filter)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .load_metadata("session-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .tags,
+            vec!["updated".to_string()]
+        );
+
+        let error = storage
+            .save_metadata("missing", &SessionMetadata::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Persistence(message) if message == "session not found: missing"
+        ));
+        let orphan_tags: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM session_tags WHERE session_id = ?")
+                .bind("missing")
+                .fetch_one(&storage.pool)
+                .await
+                .unwrap();
+        assert_eq!(orphan_tags.0, 0);
+    }
+
+    #[tokio::test]
+    async fn ordinary_save_preserves_existing_metadata_and_tags() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let mut original = create_test_snapshot().await;
+        original.agent_id = "original".into();
+        let metadata = SessionMetadata {
+            tags: vec!["keep".into()],
+            ..Default::default()
+        };
+        storage
+            .save_snapshot_with_metadata("session", &original, &metadata)
+            .await
+            .unwrap();
+
+        let mut updated = original.clone();
+        updated.agent_id = "updated".into();
+        storage.save("session", &updated).await.unwrap();
+
+        assert_eq!(
+            storage.load("session").await.unwrap().unwrap().agent_id,
+            "updated"
+        );
+        assert_eq!(
+            storage
+                .load_metadata("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .tags,
+            vec!["keep"]
+        );
+        assert_eq!(
+            storage
+                .list_sessions_filtered(&SessionFilter {
+                    tags: Some(vec!["keep".into()]),
+                    ..SessionFilter::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_metadata_and_tags_roll_back_together() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let mut original = create_test_snapshot().await;
+        original.agent_id = "original".into();
+        let original_metadata = SessionMetadata {
+            tags: vec!["original".into()],
+            ..Default::default()
+        };
+        storage
+            .save_snapshot_with_metadata("session", &original, &original_metadata)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_session_tag
+            BEFORE INSERT ON session_tags
+            WHEN NEW.tag = 'reject'
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected tag');
+            END
+            "#,
+        )
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        let mut replacement = original.clone();
+        replacement.agent_id = "replacement".into();
+        let rejected_metadata = SessionMetadata {
+            tags: vec!["reject".into()],
+            ..Default::default()
+        };
+        assert!(
+            storage
+                .save_snapshot_with_metadata("session", &replacement, &rejected_metadata)
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            storage.load("session").await.unwrap().unwrap().agent_id,
+            "original"
+        );
+        assert_eq!(
+            storage
+                .load_metadata("session")
+                .await
+                .unwrap()
+                .unwrap()
+                .tags,
+            vec!["original"]
+        );
+        assert_eq!(
+            storage
+                .list_sessions_filtered(&SessionFilter {
+                    tags: Some(vec!["original".into()]),
+                    ..SessionFilter::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -1303,6 +1651,185 @@ mod tests {
 
         let sessions = storage.list_sessions().await.unwrap();
         assert!(sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn save_facts_rolls_back_the_batch_on_failure() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_fact_insert
+            BEFORE INSERT ON actor_facts
+            WHEN NEW.content = 'reject'
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected fact');
+            END
+            "#,
+        )
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        let mut accepted = create_test_fact("actor", "accepted");
+        accepted.id = "accepted".to_string();
+        let mut rejected = create_test_fact("actor", "reject");
+        rejected.id = "rejected".to_string();
+
+        assert!(
+            storage
+                .save_facts("agent", "actor", &[accepted, rejected])
+                .await
+                .is_err()
+        );
+        assert!(
+            storage
+                .load_facts("agent", "actor")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_actor_data_rolls_back_all_tables_on_failure() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        let mut snapshot = create_test_snapshot().await;
+        snapshot.agent_id = "agent".to_string();
+        storage.save("session", &snapshot).await.unwrap();
+        storage
+            .save_metadata(
+                "session",
+                &SessionMetadata {
+                    actor_id: Some("actor".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        storage
+            .save_facts("agent", "actor", &[create_test_fact("actor", "fact")])
+            .await
+            .unwrap();
+        storage
+            .save_relationship(
+                "agent",
+                "actor",
+                &serde_json::json!({ "actor_name": "Actor" }),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_relationship_delete
+            BEFORE DELETE ON actor_relationships
+            WHEN OLD.agent_id = 'agent' AND OLD.actor_id = 'actor'
+            BEGIN
+                SELECT RAISE(ABORT, 'rejected relationship deletion');
+            END
+            "#,
+        )
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        assert!(storage.delete_actor_data("agent", "actor").await.is_err());
+        assert_eq!(storage.load_facts("agent", "actor").await.unwrap().len(), 1);
+        assert!(
+            storage
+                .load_relationship("agent", "actor")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(storage.load("session").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn malformed_relationship_data_fails_closed() {
+        let storage = SqliteStorage::in_memory().await.unwrap();
+        storage
+            .save_relationship(
+                "agent",
+                "actor",
+                &serde_json::json!({ "actor_name": "Actor" }),
+            )
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE actor_relationships SET dimensions_json = 'not-json' WHERE agent_id = ? AND actor_id = ?",
+        )
+        .bind("agent")
+        .bind("actor")
+        .execute(&storage.pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            storage.load_relationship("agent", "actor").await,
+            Err(AgentError::Persistence(message)) if message.contains("Malformed relationship dimensions")
+        ));
+    }
+
+    #[tokio::test]
+    async fn actor_data_remains_isolated_after_reopen() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("actor-data.sqlite");
+        let path = path.to_string_lossy().into_owned();
+        let records = [
+            ("agent-a", "actor-1", "agent-a actor-1"),
+            ("agent-a", "actor-2", "agent-a actor-2"),
+            ("agent-b", "actor-1", "agent-b actor-1"),
+        ];
+
+        let storage = SqliteStorage::new(&path).await.unwrap();
+        for &(agent_id, actor_id, content) in &records {
+            storage
+                .save_facts(agent_id, actor_id, &[create_test_fact(actor_id, content)])
+                .await
+                .unwrap();
+            storage
+                .save_relationship(
+                    agent_id,
+                    actor_id,
+                    &serde_json::json!({ "actor_name": content }),
+                )
+                .await
+                .unwrap();
+        }
+        storage.pool.close().await;
+
+        let storage = SqliteStorage::new(&path).await.unwrap();
+        for &(agent_id, actor_id, content) in &records {
+            let facts = storage.load_facts(agent_id, actor_id).await.unwrap();
+            assert_eq!(facts.len(), 1);
+            assert_eq!(facts[0].content, content);
+            assert_eq!(facts[0].actor_id.as_deref(), Some(actor_id));
+
+            let relationship = storage
+                .load_relationship(agent_id, actor_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(relationship["actor_name"], content);
+        }
+        assert!(
+            storage
+                .load_facts("agent-b", "actor-2")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            storage
+                .load_relationship("agent-b", "actor-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            storage.list_relationship_actors("agent-a").await.unwrap(),
+            vec!["actor-1".to_string(), "actor-2".to_string()]
+        );
     }
 
     #[tokio::test]

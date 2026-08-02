@@ -9,6 +9,7 @@ pub mod registry;
 
 pub use ai_agents_core::{
     ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
-    LLMProvider, LLMResponse, Role, TaskContext, TokenUsage, ToolSelection,
+    LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, Role, TaskContext, TokenUsage,
+    ToolChoice, ToolSelection,
 };
 pub use registry::LLMRegistry;

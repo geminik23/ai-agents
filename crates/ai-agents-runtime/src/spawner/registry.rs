@@ -1,6 +1,6 @@
 //! Agent registry for tracking and messaging spawned agents.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -55,21 +55,116 @@ impl AgentRegistry {
 
     /// Register a spawned agent. Returns error if the ID already exists.
     pub async fn register(&self, agent: SpawnedAgent) -> Result<()> {
-        let id = agent.id.clone();
-        let spec_clone = agent.spec.clone();
-        {
+        self.register_batch(vec![agent]).await
+    }
+
+    /// Register all spawned agents atomically after checking every ID under one lock.
+    pub async fn register_batch(&self, batch: Vec<SpawnedAgent>) -> Result<()> {
+        let hook_entries = {
             let mut agents = self.agents.write();
-            if agents.contains_key(&id) {
-                return Err(AgentError::Config(format!(
-                    "Agent already registered: {}",
-                    id
-                )));
+            let mut batch_ids = HashSet::with_capacity(batch.len());
+
+            for agent in &batch {
+                if !batch_ids.insert(agent.id.clone()) {
+                    return Err(AgentError::Config(format!(
+                        "Duplicate agent ID in registration batch: {}",
+                        agent.id
+                    )));
+                }
+                if agents.contains_key(&agent.id) {
+                    return Err(AgentError::Config(format!(
+                        "Agent already registered: {}",
+                        agent.id
+                    )));
+                }
             }
-            agents.insert(id.clone(), Arc::new(agent));
+
+            let hook_entries: Vec<(String, AgentSpec)> = batch
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.spec.clone()))
+                .collect();
+            for agent in batch {
+                agents.insert(agent.id.clone(), Arc::new(agent));
+            }
+            hook_entries
+        };
+
+        for (id, spec) in hook_entries {
+            info!(agent_id = %id, "Agent registered in registry");
+            if let Some(ref hooks) = self.hooks {
+                hooks.on_agent_spawned(&id, &spec).await;
+            }
         }
-        info!(agent_id = %id, "Agent registered in registry");
-        if let Some(ref hooks) = self.hooks {
-            hooks.on_agent_spawned(&id, &spec_clone).await;
+        Ok(())
+    }
+
+    pub(crate) async fn reconcile(
+        &self,
+        target_ids: &HashSet<String>,
+        additions: Vec<SpawnedAgent>,
+    ) -> Result<()> {
+        let (removed, added_hooks) = {
+            let mut agents = self.agents.write();
+            let mut addition_ids = HashSet::with_capacity(additions.len());
+            for addition in &additions {
+                if !target_ids.contains(&addition.id) {
+                    return Err(AgentError::Config(format!(
+                        "Restored agent is absent from target topology: {}",
+                        addition.id
+                    )));
+                }
+                if !addition_ids.insert(addition.id.clone()) || agents.contains_key(&addition.id) {
+                    return Err(AgentError::Config(format!(
+                        "Agent already registered during topology restore: {}",
+                        addition.id
+                    )));
+                }
+            }
+            for id in target_ids {
+                if !agents.contains_key(id) && !addition_ids.contains(id) {
+                    return Err(AgentError::Config(format!(
+                        "Target topology has no retained or staged agent: {}",
+                        id
+                    )));
+                }
+            }
+
+            //
+            // Build the complete replacement map before swapping it so validation failures preserve the prior topology.
+            //
+            let mut next = agents.clone();
+            let removed_ids = next
+                .keys()
+                .filter(|id| !target_ids.contains(*id))
+                .cloned()
+                .collect::<Vec<_>>();
+            let removed = removed_ids
+                .into_iter()
+                .filter_map(|id| next.remove(&id))
+                .collect::<Vec<_>>();
+            let added_hooks = additions
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.spec.clone()))
+                .collect::<Vec<_>>();
+            for addition in additions {
+                next.insert(addition.id.clone(), Arc::new(addition));
+            }
+            *agents = next;
+            (removed, added_hooks)
+        };
+
+        for agent in removed {
+            agent.release_capacity();
+            info!(agent_id = %agent.id, "Agent removed during topology restore");
+            if let Some(ref hooks) = self.hooks {
+                hooks.on_agent_removed(&agent.id).await;
+            }
+        }
+        for (id, spec) in added_hooks {
+            info!(agent_id = %id, "Agent registered during topology restore");
+            if let Some(ref hooks) = self.hooks {
+                hooks.on_agent_spawned(&id, &spec).await;
+            }
         }
         Ok(())
     }
@@ -127,7 +222,9 @@ impl AgentRegistry {
             let mut agents = self.agents.write();
             agents.remove(id)
         };
-        if removed.is_some() {
+        if let Some(agent) = removed.as_ref() {
+            // Registry removal is the ownership boundary for an active slot. The reservation also releases on drop, so external Arc handles cannot double-decrement it.
+            agent.release_capacity();
             info!(agent_id = %id, "Agent removed from registry");
             if let Some(ref hooks) = self.hooks {
                 hooks.on_agent_removed(id).await;
@@ -328,7 +425,8 @@ mod tests {
         LLMResponse,
     };
     use ai_agents_llm::LLMRegistry;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Mutex, Weak};
 
     struct EchoProvider;
 
@@ -382,15 +480,14 @@ mod tests {
 
     fn make_spawned(id: &str) -> SpawnedAgent {
         let agent = make_test_agent(id);
-        SpawnedAgent {
-            id: id.to_string(),
-            agent: Arc::new(agent),
-            spec: AgentSpec {
+        SpawnedAgent::untracked(
+            id.to_string(),
+            agent,
+            AgentSpec {
                 name: id.to_string(),
                 ..AgentSpec::default()
             },
-            spawned_at: Utc::now(),
-        }
+        )
     }
 
     #[tokio::test]
@@ -409,6 +506,97 @@ mod tests {
         registry.register(make_spawned("dup")).await.unwrap();
         let result = registry.register(make_spawned("dup")).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_register_batch_inserts_all_agents() {
+        let registry = AgentRegistry::new();
+        registry
+            .register_batch(vec![make_spawned("a"), make_spawned("b")])
+            .await
+            .unwrap();
+
+        assert!(registry.contains("a"));
+        assert!(registry.contains("b"));
+        assert_eq!(registry.count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_register_batch_rejects_duplicate_ids_without_inserting() {
+        let registry = AgentRegistry::new();
+        let result = registry
+            .register_batch(vec![make_spawned("dup"), make_spawned("dup")])
+            .await;
+
+        assert!(result.is_err());
+        assert!(!registry.contains("dup"));
+        assert_eq!(registry.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_register_batch_rejects_existing_collision_without_inserting() {
+        let registry = AgentRegistry::new();
+        registry.register(make_spawned("existing")).await.unwrap();
+
+        let result = registry
+            .register_batch(vec![make_spawned("new"), make_spawned("existing")])
+            .await;
+
+        assert!(result.is_err());
+        assert!(!registry.contains("new"));
+        assert_eq!(registry.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reconcile_commits_additions_retained_agents_and_removals_together() {
+        let registry = AgentRegistry::new();
+        registry
+            .register_batch(vec![make_spawned("a"), make_spawned("b")])
+            .await
+            .unwrap();
+        let retained = registry.get("b").unwrap();
+
+        registry
+            .reconcile(
+                &HashSet::from(["b".to_string(), "c".to_string()]),
+                vec![make_spawned("c")],
+            )
+            .await
+            .unwrap();
+
+        assert!(!registry.contains("a"));
+        assert!(Arc::ptr_eq(&registry.get("b").unwrap(), &retained));
+        assert!(registry.contains("c"));
+        assert_eq!(registry.count(), 2);
+
+        registry
+            .reconcile(&HashSet::new(), Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(registry.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reconcile_validation_failure_preserves_prior_topology() {
+        let registry = AgentRegistry::new();
+        registry
+            .register_batch(vec![make_spawned("a"), make_spawned("b")])
+            .await
+            .unwrap();
+        let before_a = registry.get("a").unwrap();
+        let before_b = registry.get("b").unwrap();
+
+        let result = registry
+            .reconcile(
+                &HashSet::from(["a".to_string(), "missing".to_string()]),
+                Vec::new(),
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(Arc::ptr_eq(&registry.get("a").unwrap(), &before_a));
+        assert!(Arc::ptr_eq(&registry.get("b").unwrap(), &before_b));
+        assert_eq!(registry.count(), 2);
     }
 
     #[tokio::test]
@@ -460,6 +648,57 @@ mod tests {
         for (_, res) in &results {
             assert!(res.is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn test_batch_hooks_run_only_after_successful_commit() {
+        struct CommitObservingHooks {
+            registry: Mutex<Option<Weak<AgentRegistry>>>,
+            spawned: AtomicU32,
+            observed_full_batch: AtomicBool,
+        }
+
+        #[async_trait]
+        impl RegistryHooks for CommitObservingHooks {
+            async fn on_agent_spawned(&self, _id: &str, _spec: &AgentSpec) {
+                self.spawned.fetch_add(1, Ordering::Relaxed);
+                let registry = self
+                    .registry
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap();
+                if registry.contains("a") && registry.contains("b") {
+                    self.observed_full_batch.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let hooks = Arc::new(CommitObservingHooks {
+            registry: Mutex::new(None),
+            spawned: AtomicU32::new(0),
+            observed_full_batch: AtomicBool::new(false),
+        });
+        let registry = Arc::new(AgentRegistry::new().with_hooks(hooks.clone()));
+        *hooks.registry.lock().unwrap() = Some(Arc::downgrade(&registry));
+
+        assert!(
+            registry
+                .register_batch(vec![make_spawned("dup"), make_spawned("dup")])
+                .await
+                .is_err()
+        );
+        assert_eq!(hooks.spawned.load(Ordering::Relaxed), 0);
+
+        registry
+            .register_batch(vec![make_spawned("a"), make_spawned("b")])
+            .await
+            .unwrap();
+        assert_eq!(registry.count(), 2);
+        assert_eq!(hooks.spawned.load(Ordering::Relaxed), 2);
+        assert!(hooks.observed_full_batch.load(Ordering::Relaxed));
     }
 
     #[tokio::test]

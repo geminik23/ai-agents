@@ -103,10 +103,11 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
         agent.set_question_handler(Some(CliQuestionHandler::new()));
     }
 
-    // Initialize storage eagerly so fact_store is ready before the first turn.
-    // Without this, storage is only created lazily on the first /save or /load,
-    // and fact extraction would silently skip on every turn.
-    let _ = agent.init_storage().await;
+    // Initialize storage before entering either frontend so configuration failures remain visible.
+    agent
+        .init_storage()
+        .await
+        .context("failed to initialize agent storage")?;
 
     // Inject context from --context and --context-file
     inject_context(&agent, &options)?;
@@ -190,8 +191,12 @@ pub fn load_spec(path: &Path) -> Result<AgentSpec> {
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to read agent file: {}", path.display()))?;
 
-    let spec = AgentSpec::from_yaml_strict(&content)
-        .with_context(|| format!("failed to parse YAML agent file: {}", path.display()))?;
+    let spec = AgentSpec::from_yaml_strict(&content).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to parse YAML agent file: {}: {error}",
+            path.display()
+        )
+    })?;
 
     spec.validate()
         .with_context(|| format!("agent spec validation failed: {}", path.display()))?;
@@ -287,7 +292,7 @@ tool_security:
 
         let error = load_spec(&path).unwrap_err();
         let _ = fs::remove_file(&path);
-        let message = format!("{error:#}");
-        assert!(message.contains("tool_security.enabeld"), "{message}");
+        let message = error.to_string();
+        assert!(message.contains("'tool_security.enabeld'"), "{message}");
     }
 }

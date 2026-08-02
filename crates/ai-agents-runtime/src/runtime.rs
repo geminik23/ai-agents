@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures::stream::{Stream, StreamExt};
 use parking_lot::RwLock;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,6 +19,19 @@ pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync:
 struct ToolResourceGuards {
     guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
     locks: ToolResourceLocks,
+}
+
+#[derive(Clone)]
+struct StoredSessionRestore {
+    snapshot: AgentSnapshot,
+    metadata: Option<ai_agents_core::SessionMetadata>,
+}
+
+struct RuntimeSessionRestorePoint {
+    snapshot: AgentSnapshot,
+    metadata: ai_agents_core::SessionMetadata,
+    actor_id: Option<String>,
+    session_id: Option<String>,
 }
 
 impl Drop for ToolResourceGuards {
@@ -101,11 +114,13 @@ impl ToolApprovalBinding {
 use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
+use ai_agents_core::traits::storage::StorageCapability;
 use ai_agents_core::{
-    AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMProvider, LLMResponse,
-    PermissionOutcome, Result, ToolActorContext, ToolApprovalRecord, ToolApprovalStatus,
-    ToolCallSource, ToolCancellationToken, ToolExecutionContext, ToolExecutionRecord,
-    ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
+    AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMError, LLMProvider,
+    LLMResponse, LLMToolDefinition, LLMToolRequest, PermissionOutcome, Result, ToolActorContext,
+    ToolApprovalRecord, ToolApprovalStatus, ToolCallSource, ToolCancellationToken, ToolChoice,
+    ToolExecutionContext, ToolExecutionRecord, ToolExecutionRequest, ToolInvoker,
+    ToolPolicyDecisionRecord, ToolResult,
 };
 use ai_agents_disambiguation::{
     ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
@@ -171,6 +186,18 @@ enum ToolCallOutcome {
     TransitionFired,
     /// HITL rejected a tool call, return this response immediately.
     Rejected(AgentResponse),
+}
+
+#[derive(Clone)]
+struct MainToolProtocol {
+    choice: Option<ToolChoice>,
+    tool_ids: Vec<String>,
+    definitions: Vec<LLMToolDefinition>,
+}
+
+struct MainProviderResponse {
+    response: LLMResponse,
+    used_native_tools: bool,
 }
 
 /// Outcome of skill routing — used by `try_skill_route`.
@@ -336,6 +363,7 @@ pub struct RuntimeAgent {
     approval_handler: Arc<dyn ApprovalHandler>,
     storage_config: StorageConfig,
     storage: RwLock<Option<Arc<dyn AgentStorage>>>,
+    storage_init: tokio::sync::Mutex<()>,
     reasoning_config: ReasoningConfig,
     reflection_config: ReflectionConfig,
     disambiguation_manager: Option<DisambiguationManager>,
@@ -518,6 +546,7 @@ impl RuntimeAgent {
             approval_handler: Arc::new(RejectAllHandler::new()),
             storage_config: StorageConfig::default(),
             storage: RwLock::new(None),
+            storage_init: tokio::sync::Mutex::new(()),
             reasoning_config: ReasoningConfig::default(),
             reflection_config: ReflectionConfig::default(),
             disambiguation_manager: None,
@@ -916,6 +945,12 @@ impl RuntimeAgent {
             }
         }
         Ok(())
+    }
+
+    /// Clear the current actor binding while retaining the session actor roster.
+    pub fn clear_actor_id(&self) {
+        *self.actor_id.write() = None;
+        self.session_metadata.write().actor_id = None;
     }
 
     /// Set the current actor ID. Convenience wrapper around set_actor_id.
@@ -2033,21 +2068,70 @@ impl RuntimeAgent {
     }
 
     pub async fn init_storage(&self) -> Result<()> {
-        if self.storage_config.is_none() {
-            return Ok(());
+        //
+        // One readiness guard prevents concurrent entry points from constructing storage or fact state more than once.
+        //
+        let _guard = self.storage_init.lock().await;
+        let mut storage = self.storage.read().clone();
+        if storage.is_none() && !self.storage_config.is_none() {
+            let storage_config = self.convert_storage_config();
+            storage = create_storage(&storage_config).await?;
+            *self.storage.write() = storage.clone();
         }
-        if self.storage.read().is_some() {
-            return Ok(());
-        }
-        let storage_config = self.convert_storage_config();
-        let storage = create_storage(&storage_config).await?;
-        *self.storage.write() = storage;
-        // Complete facts setup now that storage is available.
+
+        self.validate_storage_requirements(storage.as_deref())?;
         self.complete_facts_init().await;
         Ok(())
     }
 
-    /// Initialize fact store and extractor from stored config + current storage.
+    fn validate_storage_requirements(&self, storage: Option<&dyn AgentStorage>) -> Result<()> {
+        let facts_required = self
+            .facts_config
+            .as_ref()
+            .is_some_and(|config| config.enabled)
+            || self
+                .actor_memory_config
+                .as_ref()
+                .is_some_and(|config| config.enabled);
+        let relationships_required = self
+            .relationship_manager
+            .as_ref()
+            .is_some_and(|manager| manager.config().persistence.enabled);
+
+        let Some(storage) = storage else {
+            let mut requirements = Vec::new();
+            if facts_required {
+                requirements.push("actor facts or actor memory");
+            }
+            if relationships_required {
+                requirements.push("persistent relationships");
+            }
+            if requirements.is_empty() {
+                return Ok(());
+            }
+            return Err(AgentError::Config(format!(
+                "Storage is required for enabled {} but none is configured or injected",
+                requirements.join(" and ")
+            )));
+        };
+
+        //
+        // Durable features must fail before execution instead of degrading to volatile state.
+        //
+        if facts_required && !storage.supports(StorageCapability::ActorFacts) {
+            return Err(AgentError::UnsupportedStorageCapability(
+                StorageCapability::ActorFacts,
+            ));
+        }
+        if relationships_required && !storage.supports(StorageCapability::ActorRelationships) {
+            return Err(AgentError::UnsupportedStorageCapability(
+                StorageCapability::ActorRelationships,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Initialize fact store and extractor from stored config and current storage.
     /// Called from init_storage() so facts are ready before the first turn.
     async fn complete_facts_init(&self) {
         if self.fact_store.read().is_some() {
@@ -2364,8 +2448,15 @@ impl RuntimeAgent {
         }
         let storage = self.storage.read().clone();
         if let Some(storage) = storage {
+            //
+            // Composite support is checked before mutation so privacy deletion cannot become partial.
+            //
+            if !storage.supports(StorageCapability::ActorDataDeletion) {
+                return Err(AgentError::UnsupportedStorageCapability(
+                    StorageCapability::ActorDataDeletion,
+                ));
+            }
             storage.delete_actor_data(&self.info.id, actor_id).await?;
-            storage.delete_relationship(&self.info.id, actor_id).await?;
         } else if let Some(store) = self.fact_store.read().clone() {
             store.delete_actor_data(actor_id).await?;
         }
@@ -2485,13 +2576,122 @@ impl RuntimeAgent {
         storage.save(session_id, &snapshot).await
     }
 
-    pub async fn load_from(&self, storage: &dyn AgentStorage, session_id: &str) -> Result<bool> {
-        if let Some(snapshot) = storage.load(session_id).await? {
-            self.restore_state(snapshot).await?;
-            Ok(true)
+    async fn load_session_restore(
+        storage: &dyn AgentStorage,
+        session_id: &str,
+    ) -> Result<Option<StoredSessionRestore>> {
+        let Some(snapshot) = storage.load(session_id).await? else {
+            return Ok(None);
+        };
+        //
+        // Metadata is restored only when the backend explicitly owns that durable contract.
+        //
+        let metadata = if storage.supports(StorageCapability::SessionMetadata) {
+            storage.load_metadata(session_id).await?
         } else {
-            Ok(false)
+            None
+        };
+        Ok(Some(StoredSessionRestore { snapshot, metadata }))
+    }
+
+    async fn capture_session_restore_point(&self) -> Result<RuntimeSessionRestorePoint> {
+        Ok(RuntimeSessionRestorePoint {
+            snapshot: self.save_state().await?,
+            metadata: self.session_metadata(),
+            actor_id: self.actor_id(),
+            session_id: self.current_session_id.read().clone(),
+        })
+    }
+
+    async fn apply_session_restore_unchecked(
+        &self,
+        session_id: &str,
+        stored: StoredSessionRestore,
+    ) -> Result<()> {
+        self.restore_state(stored.snapshot).await?;
+        let metadata = stored.metadata.unwrap_or_default();
+        if let Some(actor_id) = metadata.actor_id.as_deref() {
+            self.set_actor_id(actor_id)?;
+        } else {
+            self.clear_actor_id();
         }
+        self.set_session_metadata(metadata);
+        *self.current_session_id.write() = Some(session_id.to_string());
+        Ok(())
+    }
+
+    async fn restore_session_restore_point(
+        &self,
+        restore_point: &RuntimeSessionRestorePoint,
+    ) -> Result<()> {
+        self.restore_state(restore_point.snapshot.clone()).await?;
+        if let Some(actor_id) = restore_point.actor_id.as_deref() {
+            self.set_actor_id(actor_id)?;
+        } else {
+            self.clear_actor_id();
+        }
+        self.set_session_metadata(restore_point.metadata.clone());
+        *self.current_session_id.write() = restore_point.session_id.clone();
+        Ok(())
+    }
+
+    async fn apply_session_restore(
+        &self,
+        session_id: &str,
+        stored: StoredSessionRestore,
+    ) -> Result<()> {
+        let before = self.capture_session_restore_point().await?;
+        if let Err(error) = self
+            .apply_session_restore_unchecked(session_id, stored)
+            .await
+        {
+            return match self.restore_session_restore_point(&before).await {
+                Ok(()) => Err(error),
+                Err(rollback_error) => Err(AgentError::Other(format!(
+                    "Session restore failed: {error}; rollback failed: {rollback_error}"
+                ))),
+            };
+        }
+        Ok(())
+    }
+
+    async fn rollback_session_restore_set(
+        parent: Option<(&RuntimeAgent, &RuntimeSessionRestorePoint)>,
+        children: &[(String, Arc<RuntimeAgent>, RuntimeSessionRestorePoint)],
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some((agent, restore_point)) = parent
+            && let Err(error) = agent.restore_session_restore_point(restore_point).await
+        {
+            errors.push(format!("parent: {error}"));
+        }
+        for (id, agent, restore_point) in children {
+            if let Err(error) = agent.restore_session_restore_point(restore_point).await {
+                errors.push(format!("child '{id}': {error}"));
+            }
+        }
+        errors
+    }
+
+    fn restore_failure(error: impl std::fmt::Display, rollback_errors: Vec<String>) -> AgentError {
+        if rollback_errors.is_empty() {
+            AgentError::Other(format!(
+                "Session restore failed: {error}; runtime state was rolled back"
+            ))
+        } else {
+            AgentError::Other(format!(
+                "Session restore failed: {error}; rollback also failed for {}",
+                rollback_errors.join(", ")
+            ))
+        }
+    }
+
+    pub async fn load_from(&self, storage: &dyn AgentStorage, session_id: &str) -> Result<bool> {
+        let Some(stored) = Self::load_session_restore(storage, session_id).await? else {
+            return Ok(false);
+        };
+        self.apply_session_restore(session_id, stored).await?;
+        Ok(true)
     }
 
     pub async fn save_session(&self, session_id: &str) -> Result<()> {
@@ -2525,12 +2725,17 @@ impl RuntimeAgent {
                     }
                 }
 
-                self.save_to(s.as_ref(), session_id).await?;
-
-                // Persist metadata alongside the snapshot.
-                let meta = self.session_metadata.read().clone();
-                let _ = s.save_metadata(session_id, &meta).await;
-                Ok(())
+                let snapshot = self.save_state().await?;
+                //
+                // Metadata-capable backends own atomic snapshot and metadata persistence.
+                //
+                if s.supports(StorageCapability::SessionMetadata) {
+                    let metadata = self.session_metadata.read().clone();
+                    s.save_snapshot_with_metadata(session_id, &snapshot, &metadata)
+                        .await
+                } else {
+                    s.save(session_id, &snapshot).await
+                }
             }
             None => Err(AgentError::Config(
                 "No storage configured. Use with_storage_config() or with_storage() first".into(),
@@ -2541,24 +2746,192 @@ impl RuntimeAgent {
     pub async fn load_session(&self, session_id: &str) -> Result<bool> {
         let storage = self.storage.read().clone();
         match storage {
-            Some(s) => {
-                let loaded = self.load_from(s.as_ref(), session_id).await?;
-                if loaded {
-                    // Restore session metadata alongside the snapshot.
-                    if let Ok(Some(meta)) = s.load_metadata(session_id).await {
-                        if let Some(ref aid) = meta.actor_id {
-                            let _ = self.set_actor_id(aid);
-                        }
-                        *self.session_metadata.write() = meta;
-                    }
-                    *self.current_session_id.write() = Some(session_id.to_string());
-                }
-                Ok(loaded)
-            }
+            Some(storage) => self.load_from(storage.as_ref(), session_id).await,
             None => Err(AgentError::Config(
                 "No storage configured. Use with_storage_config() or with_storage() first".into(),
             )),
         }
+    }
+
+    /// Restore this runtime and its complete saved child topology from one named session.
+    pub async fn restore_session_full(&self, session_id: &str) -> Result<usize> {
+        self.init_storage().await?;
+        let storage = self.storage.read().clone().ok_or_else(|| {
+            AgentError::Config(
+                "No storage configured. Use with_storage_config() or with_storage() first".into(),
+            )
+        })?;
+        let target_parent = Self::load_session_restore(storage.as_ref(), session_id)
+            .await?
+            .ok_or_else(|| AgentError::Persistence(format!("Session not found: {session_id}")))?;
+        let manifest = target_parent
+            .snapshot
+            .spawned_agents
+            .clone()
+            .unwrap_or_default();
+
+        let registry = self.spawner_registry.as_ref().cloned();
+        let spawner = if manifest.is_empty() {
+            self.spawner.as_ref().cloned()
+        } else {
+            Some(self.spawner.as_ref().cloned().ok_or_else(|| {
+                AgentError::Config(
+                    "Saved session contains child agents but this runtime has no spawner".into(),
+                )
+            })?)
+        };
+        let registry = if manifest.is_empty() {
+            registry
+        } else {
+            Some(registry.ok_or_else(|| {
+                AgentError::Config(
+                    "Saved session contains child agents but this runtime has no registry".into(),
+                )
+            })?)
+        };
+
+        let mut target_ids = HashSet::with_capacity(manifest.len());
+        let mut prepared = Vec::with_capacity(manifest.len());
+        for entry in manifest {
+            if !target_ids.insert(entry.id.clone()) {
+                return Err(AgentError::InvalidSpec(format!(
+                    "Saved child manifest contains duplicate ID: {}",
+                    entry.id
+                )));
+            }
+            let spec = crate::spec::AgentSpec::from_yaml_strict(&entry.spec_yaml)?;
+            spawner
+                .as_ref()
+                .expect("non-empty manifests require a spawner")
+                .validate_explicit_child(&entry.id, &spec)?;
+            prepared.push((entry.id, spec));
+        }
+
+        let current_ids = registry
+            .as_ref()
+            .map(|registry| {
+                registry
+                    .list()
+                    .into_iter()
+                    .map(|info| info.id)
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let removal_count = current_ids.difference(&target_ids).count();
+        let additions = prepared
+            .iter()
+            .filter(|(id, _)| !current_ids.contains(id))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut existing = Vec::new();
+        if let Some(registry) = registry.as_ref() {
+            for (id, _) in prepared.iter().filter(|(id, _)| current_ids.contains(id)) {
+                let agent = registry.get(id).ok_or_else(|| {
+                    AgentError::Config(format!("Retained child disappeared during restore: {id}"))
+                })?;
+                let child_storage = agent.storage().ok_or_else(|| {
+                    AgentError::Config(format!("Child '{id}' has no storage for session restore"))
+                })?;
+                let stored = Self::load_session_restore(child_storage.as_ref(), session_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AgentError::Persistence(format!(
+                            "Child '{id}' has no saved session '{session_id}'"
+                        ))
+                    })?;
+                existing.push((id.clone(), agent, stored));
+            }
+        }
+
+        let mut staged = Vec::with_capacity(additions.len());
+        if !additions.is_empty() {
+            let spawner = spawner
+                .as_ref()
+                .expect("restored additions require a spawner");
+            let reservations = spawner.reserve_restore_capacity(additions.len(), removal_count)?;
+            for ((id, spec), reservation) in additions.into_iter().zip(reservations) {
+                let spawned = spawner
+                    .spawn_with_reserved_capacity(id.clone(), spec, reservation)
+                    .await?;
+                let child_storage = spawned.agent.storage().ok_or_else(|| {
+                    AgentError::Config(format!("Child '{id}' has no storage for session restore"))
+                })?;
+                let stored = Self::load_session_restore(child_storage.as_ref(), session_id)
+                    .await?
+                    .ok_or_else(|| {
+                        AgentError::Persistence(format!(
+                            "Child '{id}' has no saved session '{session_id}'"
+                        ))
+                    })?;
+                staged.push((spawned, stored));
+            }
+        } else if let Some(spawner) = spawner.as_ref() {
+            spawner.reserve_restore_capacity(0, removal_count)?;
+        }
+
+        let parent_before = self.capture_session_restore_point().await?;
+        let mut existing_before = Vec::with_capacity(existing.len());
+        for (id, agent, _) in &existing {
+            existing_before.push((
+                id.clone(),
+                Arc::clone(agent),
+                agent.capture_session_restore_point().await?,
+            ));
+        }
+
+        //
+        // Every record is loaded before runtime state changes. Registry replacement is the final topology commit point.
+        //
+        for (_, agent, stored) in &existing {
+            if let Err(error) = agent
+                .apply_session_restore_unchecked(session_id, stored.clone())
+                .await
+            {
+                drop(staged);
+                let rollback_errors =
+                    Self::rollback_session_restore_set(None, &existing_before).await;
+                return Err(Self::restore_failure(error, rollback_errors));
+            }
+        }
+        for (spawned, stored) in &staged {
+            if let Err(error) = spawned
+                .agent
+                .apply_session_restore_unchecked(session_id, stored.clone())
+                .await
+            {
+                drop(staged);
+                let rollback_errors =
+                    Self::rollback_session_restore_set(None, &existing_before).await;
+                return Err(Self::restore_failure(error, rollback_errors));
+            }
+        }
+        if let Err(error) = self
+            .apply_session_restore_unchecked(session_id, target_parent)
+            .await
+        {
+            drop(staged);
+            let rollback_errors =
+                Self::rollback_session_restore_set(Some((self, &parent_before)), &existing_before)
+                    .await;
+            return Err(Self::restore_failure(error, rollback_errors));
+        }
+
+        if let Some(registry) = registry.as_ref()
+            && let Err(error) = registry
+                .reconcile(
+                    &target_ids,
+                    staged.into_iter().map(|(spawned, _)| spawned).collect(),
+                )
+                .await
+        {
+            let rollback_errors =
+                Self::rollback_session_restore_set(Some((self, &parent_before)), &existing_before)
+                    .await;
+            return Err(Self::restore_failure(error, rollback_errors));
+        }
+
+        Ok(target_ids.len())
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<()> {
@@ -2839,6 +3212,7 @@ impl RuntimeAgent {
     async fn get_effective_system_prompt_with_persona_hooks(
         &self,
         fire_persona_hooks: bool,
+        include_tool_prompt: bool,
     ) -> Result<String> {
         let rendered_base = self.render_system_prompt()?;
 
@@ -2909,16 +3283,18 @@ impl RuntimeAgent {
                     format!("{}\n\n{}", persona_prefix, combined)
                 };
 
-                let available_tool_ids = self.get_available_tool_ids().await?;
-                if !available_tool_ids.is_empty() {
-                    let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
-                        &available_tool_ids,
-                        None,
-                        self.parallel_tools.enabled,
-                        self.runtime_config.tool_schema_prompt_mode,
-                    );
-                    if !tools_prompt.is_empty() {
-                        return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
+                if include_tool_prompt {
+                    let available_tool_ids = self.get_available_tool_ids().await?;
+                    if !available_tool_ids.is_empty() {
+                        let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
+                            &available_tool_ids,
+                            None,
+                            self.parallel_tools.enabled,
+                            self.runtime_config.tool_schema_prompt_mode,
+                        );
+                        if !tools_prompt.is_empty() {
+                            return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
+                        }
                     }
                 }
                 return Ok(with_persona);
@@ -2932,18 +3308,19 @@ impl RuntimeAgent {
             format!("{}\n\n{}", persona_prefix, rendered_base)
         };
 
-        let available_tool_ids = self.get_available_tool_ids().await?;
-        let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
-            &available_tool_ids,
-            None,
-            self.parallel_tools.enabled,
-            self.runtime_config.tool_schema_prompt_mode,
-        );
-        if !tools_prompt.is_empty() {
-            Ok(format!("{}\n\n{}", with_persona, tools_prompt))
-        } else {
-            Ok(with_persona)
+        if include_tool_prompt {
+            let available_tool_ids = self.get_available_tool_ids().await?;
+            let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
+                &available_tool_ids,
+                None,
+                self.parallel_tools.enabled,
+                self.runtime_config.tool_schema_prompt_mode,
+            );
+            if !tools_prompt.is_empty() {
+                return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
+            }
         }
+        Ok(with_persona)
     }
 
     fn get_state_llm(&self) -> Result<Arc<dyn LLMProvider>> {
@@ -3070,11 +3447,11 @@ impl RuntimeAgent {
     }
 
     async fn build_messages(&self) -> Result<Vec<ChatMessage>> {
-        self.build_messages_internal(true, None).await
+        self.build_messages_internal(true, None, true).await
     }
 
     async fn build_messages_for_draft(&self, user_message: &str) -> Result<Vec<ChatMessage>> {
-        self.build_messages_internal(false, Some(user_message))
+        self.build_messages_internal(false, Some(user_message), true)
             .await
     }
 
@@ -3082,9 +3459,10 @@ impl RuntimeAgent {
         &self,
         fire_persona_hooks: bool,
         ephemeral_user_message: Option<&str>,
+        include_tool_prompt: bool,
     ) -> Result<Vec<ChatMessage>> {
         let system_prompt = self
-            .get_effective_system_prompt_with_persona_hooks(fire_persona_hooks)
+            .get_effective_system_prompt_with_persona_hooks(fire_persona_hooks, include_tool_prompt)
             .await?;
         let mut messages = vec![ChatMessage::system(&system_prompt)];
 
@@ -3141,6 +3519,454 @@ impl RuntimeAgent {
         Ok(messages)
     }
 
+    async fn main_tool_protocol(
+        &self,
+        llm: &dyn LLMProvider,
+        ephemeral_new_turn: bool,
+    ) -> Result<MainToolProtocol> {
+        let mut choice = llm.configured_tool_choice();
+        if matches!(choice.as_ref(), Some(ToolChoice::None)) {
+            return Ok(MainToolProtocol {
+                choice,
+                tool_ids: Vec::new(),
+                definitions: Vec::new(),
+            });
+        }
+
+        let mut tool_ids = self.get_available_tool_ids().await?;
+        tool_ids.sort();
+        tool_ids.dedup();
+        if let Some(ToolChoice::Specific(expected)) = choice.as_ref() {
+            let canonical = self.tools.canonical_id(expected).ok_or_else(|| {
+                AgentError::Config(format!(
+                    "specific tool choice '{expected}' is not registered"
+                ))
+            })?;
+            if canonical != *expected {
+                return Err(AgentError::Config(format!(
+                    "specific tool choice must use canonical ID '{canonical}', not '{expected}'"
+                )));
+            }
+            if !tool_ids.iter().any(|tool_id| tool_id == expected) {
+                return Err(AgentError::Config(format!(
+                    "specific tool choice '{expected}' is outside the effective tool grant"
+                )));
+            }
+        }
+        if matches!(
+            choice.as_ref(),
+            Some(ToolChoice::Required | ToolChoice::Specific(_))
+        ) && tool_ids.is_empty()
+        {
+            return Err(AgentError::Config(
+                "required tool choice has no tool inside the effective grant".to_string(),
+            ));
+        }
+        if !ephemeral_new_turn
+            && let Some(configured_choice) = choice.as_ref()
+            && matches!(
+                configured_choice,
+                ToolChoice::Required | ToolChoice::Specific(_)
+            )
+            && self
+                .tool_choice_satisfied_in_current_turn(configured_choice, &tool_ids)
+                .await?
+        {
+            choice = Some(ToolChoice::Auto);
+        }
+        if let Some(ToolChoice::Specific(expected)) = choice.as_ref() {
+            tool_ids.retain(|tool_id| tool_id == expected);
+        }
+
+        let definitions = tool_ids
+            .iter()
+            .map(|tool_id| {
+                let tool = self.tools.get(tool_id).ok_or_else(|| {
+                    AgentError::Config(format!(
+                        "effective tool '{tool_id}' disappeared before provider exposure"
+                    ))
+                })?;
+                Ok(LLMToolDefinition {
+                    name: tool_id.clone(),
+                    description: tool.description().to_string(),
+                    input_schema: tool.input_schema(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        //
+        // Provider-visible definitions are derived only from the current effective grant. Tool choice never expands registration, scope, or authorization.
+        //
+        Ok(MainToolProtocol {
+            choice,
+            tool_ids,
+            definitions,
+        })
+    }
+
+    async fn tool_choice_satisfied_in_current_turn(
+        &self,
+        choice: &ToolChoice,
+        effective_tool_ids: &[String],
+    ) -> Result<bool> {
+        let messages = self.memory.get_messages(None).await?;
+        let mut saw_tool_result = false;
+        for message in messages.iter().rev() {
+            match message.role {
+                ai_agents_core::Role::Tool | ai_agents_core::Role::Function => {
+                    saw_tool_result = true;
+                }
+                ai_agents_core::Role::Assistant if saw_tool_result => {
+                    let Some(calls) = self.parse_tool_calls(&message.content) else {
+                        continue;
+                    };
+                    let calls_are_effective = !calls.is_empty()
+                        && calls.iter().all(|call| {
+                            self.tools
+                                .canonical_id(&call.name)
+                                .is_some_and(|canonical| effective_tool_ids.contains(&canonical))
+                        });
+                    return Ok(calls_are_effective
+                        && match choice {
+                            ToolChoice::Required => true,
+                            ToolChoice::Specific(expected) => calls.iter().all(|call| {
+                                self.tools.canonical_id(&call.name).as_deref()
+                                    == Some(expected.as_str())
+                            }),
+                            _ => false,
+                        });
+                }
+                ai_agents_core::Role::User => return Ok(false),
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    fn provider_can_use_native_tools(
+        &self,
+        llm: &dyn LLMProvider,
+        protocol: &MainToolProtocol,
+    ) -> bool {
+        let Some(choice) = protocol.choice.as_ref() else {
+            return false;
+        };
+        if matches!(choice, ToolChoice::None) || protocol.definitions.is_empty() {
+            return false;
+        }
+        llm.supports_tool_choice(choice)
+            && protocol.definitions.iter().all(|definition| {
+                !definition.name.is_empty()
+                    && definition.name.len() <= 64
+                    && definition
+                        .name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+    }
+
+    fn prompt_messages_for_tool_protocol(
+        &self,
+        messages: &[ChatMessage],
+        protocol: &MainToolProtocol,
+        corrective: bool,
+    ) -> Vec<ChatMessage> {
+        let mut messages = messages.to_vec();
+        let Some(choice) = protocol.choice.as_ref() else {
+            return messages;
+        };
+        if matches!(choice, ToolChoice::None) || protocol.tool_ids.is_empty() {
+            return messages;
+        }
+
+        let mut tool_prompt = self.tools.generate_scoped_prompt_with_mode(
+            &protocol.tool_ids,
+            None,
+            self.parallel_tools.enabled,
+            self.runtime_config.tool_schema_prompt_mode,
+        );
+        match choice {
+            ToolChoice::Required => tool_prompt.push_str(
+                "\n\nYou must call at least one listed tool before giving a final answer.",
+            ),
+            ToolChoice::Specific(tool_id) => tool_prompt.push_str(&format!(
+                "\n\nYou must call the '{tool_id}' tool before giving a final answer."
+            )),
+            ToolChoice::Auto => {}
+            ToolChoice::None => return messages,
+            _ => return messages,
+        }
+        if let Some(system) = messages
+            .iter_mut()
+            .find(|message| message.role == ai_agents_core::Role::System)
+        {
+            system.content.push_str("\n\n");
+            system.content.push_str(&tool_prompt);
+        } else {
+            messages.insert(0, ChatMessage::system(tool_prompt));
+        }
+        if corrective {
+            let instruction = match choice {
+                ToolChoice::Required => {
+                    "Your previous response did not call a required tool. Call at least one listed tool now and return only the JSON tool call."
+                }
+                ToolChoice::Specific(tool_id) => {
+                    messages.push(ChatMessage::user(format!(
+                        "Your previous response did not call the required '{tool_id}' tool. Call it now and return only the JSON tool call."
+                    )));
+                    return messages;
+                }
+                _ => return messages,
+            };
+            messages.push(ChatMessage::user(instruction));
+        }
+        messages
+    }
+
+    async fn invoke_main_provider(
+        &self,
+        llm: Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+        protocol: &MainToolProtocol,
+        corrective: bool,
+    ) -> std::result::Result<MainProviderResponse, LLMError> {
+        let use_native = self.provider_can_use_native_tools(llm.as_ref(), protocol);
+        let response = if use_native {
+            let request = LLMToolRequest {
+                tools: protocol.definitions.clone(),
+                choice: protocol
+                    .choice
+                    .clone()
+                    .expect("native tool requests require an explicit choice"),
+            };
+            self.observe_purpose(
+                ObservationPurpose::MainResponse,
+                llm.complete_with_tools(messages, None, &request),
+            )
+            .await?
+        } else {
+            let prompt_messages =
+                self.prompt_messages_for_tool_protocol(messages, protocol, corrective);
+            self.observe_purpose(
+                ObservationPurpose::MainResponse,
+                llm.complete(&prompt_messages, None),
+            )
+            .await?
+        };
+        Ok(MainProviderResponse {
+            response,
+            used_native_tools: use_native,
+        })
+    }
+
+    async fn complete_main_attempt_with_recovery(
+        &self,
+        llm: Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+        protocol: &MainToolProtocol,
+        corrective: bool,
+    ) -> Result<MainProviderResponse> {
+        let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
+            self.recovery_manager
+                .with_retry("llm_call", None, || {
+                    let llm = Arc::clone(&llm);
+                    async move {
+                        self.invoke_main_provider(llm, messages, protocol, corrective)
+                            .await
+                            .map_err(|error| error.classify())
+                    }
+                })
+                .await
+                .map_err(|error| AgentError::LLM(error.to_string()))
+        } else {
+            self.invoke_main_provider(Arc::clone(&llm), messages, protocol, corrective)
+                .await
+                .map_err(|error| AgentError::LLM(error.to_string()))
+        };
+
+        match primary_result {
+            Ok(response) => Ok(response),
+            Err(primary_error) => match &self.recovery_manager.config().llm.on_failure {
+                LLMFailureAction::FallbackLlm { fallback_llm } => {
+                    let fallback = self.llm_registry.get(fallback_llm).map_err(|error| {
+                        AgentError::Config(format!(
+                            "Fallback LLM '{fallback_llm}' not found: {error}"
+                        ))
+                    })?;
+                    self.invoke_main_provider(fallback, messages, protocol, corrective)
+                        .await
+                        .map_err(|error| AgentError::LLM(error.to_string()))
+                }
+                LLMFailureAction::FallbackResponse { message } => {
+                    if matches!(
+                        protocol.choice.as_ref(),
+                        Some(ToolChoice::Required | ToolChoice::Specific(_))
+                    ) {
+                        Err(AgentError::LLM(format!(
+                            "Required tool selection failed and cannot be satisfied by a static fallback response: {primary_error}"
+                        )))
+                    } else {
+                        Ok(MainProviderResponse {
+                            response: LLMResponse::new(message.clone(), FinishReason::Stop),
+                            used_native_tools: false,
+                        })
+                    }
+                }
+                LLMFailureAction::Error => Err(primary_error),
+            },
+        }
+    }
+
+    fn normalize_main_provider_response(
+        &self,
+        mut response: LLMResponse,
+        protocol: &MainToolProtocol,
+    ) -> Result<(LLMResponse, bool)> {
+        let native_calls = response
+            .tool_calls()
+            .map_err(|error| AgentError::LLM(error.to_string()))?;
+        let calls = match native_calls {
+            Some(calls) => {
+                let markers = calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::json!({
+                            "_ai_agents_native_tool_call": true,
+                            "id": call.id,
+                            "tool": call.name,
+                            "arguments": call.arguments,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                response.content = if markers.len() == 1 {
+                    markers[0].to_string()
+                } else {
+                    serde_json::Value::Array(markers).to_string()
+                };
+                Some(calls)
+            }
+            None if !matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) => {
+                self.parse_tool_calls(response.content.trim())
+            }
+            None => None,
+        };
+
+        if protocol.choice.is_some()
+            && let Some(calls) = calls.as_ref()
+            && calls.iter().any(|call| {
+                self.tools
+                    .canonical_id(&call.name)
+                    .map_or(true, |canonical| !protocol.tool_ids.contains(&canonical))
+            })
+        {
+            return Err(AgentError::LLM(
+                "Provider returned a tool call outside the effective grant".to_string(),
+            ));
+        }
+
+        let compliant = match protocol.choice.as_ref() {
+            Some(ToolChoice::Required) => calls.as_ref().is_some_and(|calls| !calls.is_empty()),
+            Some(ToolChoice::Specific(expected)) => calls.as_ref().is_some_and(|calls| {
+                !calls.is_empty()
+                    && calls.iter().all(|call| {
+                        self.tools.canonical_id(&call.name).as_deref() == Some(expected.as_str())
+                    })
+            }),
+            _ => true,
+        };
+        Ok((response, compliant))
+    }
+
+    async fn complete_main_llm_with_recovery(
+        &self,
+        llm: Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+        protocol: &MainToolProtocol,
+    ) -> Result<LLMResponse> {
+        let first = self
+            .complete_main_attempt_with_recovery(Arc::clone(&llm), messages, protocol, false)
+            .await?;
+        let (response, compliant) =
+            self.normalize_main_provider_response(first.response, protocol)?;
+        if compliant {
+            return Ok(response);
+        }
+        if first.used_native_tools {
+            return Err(AgentError::LLM(
+                "Provider returned no compliant native call for required tool choice".to_string(),
+            ));
+        }
+
+        let corrected = self
+            .complete_main_attempt_with_recovery(llm, messages, protocol, true)
+            .await?;
+        let (response, compliant) =
+            self.normalize_main_provider_response(corrected.response, protocol)?;
+        if compliant {
+            return Ok(response);
+        }
+        Err(AgentError::LLM(
+            "Provider returned no compliant tool call after one corrective retry".to_string(),
+        ))
+    }
+
+    fn is_native_tool_call_content(content: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
+            return false;
+        };
+        match value {
+            serde_json::Value::Array(values) => {
+                !values.is_empty()
+                    && values.iter().all(|value| {
+                        value
+                            .get("_ai_agents_native_tool_call")
+                            .and_then(|marker| marker.as_bool())
+                            == Some(true)
+                    })
+            }
+            serde_json::Value::Object(map) => {
+                map.get("_ai_agents_native_tool_call")
+                    .and_then(|marker| marker.as_bool())
+                    == Some(true)
+            }
+            _ => false,
+        }
+    }
+
+    fn tool_result_message(
+        tool_call: &ToolCall,
+        output: &str,
+        native_tool_call: bool,
+    ) -> ChatMessage {
+        if !native_tool_call {
+            return ChatMessage::function(&tool_call.name, output);
+        }
+        let output = serde_json::from_str::<serde_json::Value>(output)
+            .unwrap_or_else(|_| serde_json::Value::String(output.to_string()));
+        ChatMessage::function(
+            &tool_call.name,
+            serde_json::json!({
+                "_ai_agents_native_tool_result": true,
+                "id": tool_call.id,
+                "tool": tool_call.name,
+                "output": output,
+            })
+            .to_string(),
+        )
+    }
+
+    fn parse_main_tool_calls(
+        &self,
+        content: &str,
+        protocol: &MainToolProtocol,
+    ) -> Option<Vec<ToolCall>> {
+        if matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) {
+            None
+        } else {
+            self.parse_tool_calls(content)
+        }
+    }
+
     fn parse_tool_calls(&self, content: &str) -> Option<Vec<ToolCall>> {
         // Try direct JSON parse first
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
@@ -3190,7 +4016,12 @@ impl RuntimeAgent {
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
             return Some(ToolCall {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: parsed
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                 name: tool_name.to_string(),
                 arguments,
             });
@@ -7302,6 +8133,10 @@ Respond in JSON format:
     }
 
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
+        //
+        // Blocking execution must fail before a turn starts when required persistence is unavailable.
+        //
+        self.init_storage().await?;
         self.begin_root_turn();
         let _root_cleanup = RootTurnCleanup::new(self);
         info!(input_len = input.len(), "Starting chat");
@@ -7964,57 +8799,6 @@ Respond in JSON format:
         }
     }
 
-    async fn complete_llm_with_recovery(
-        &self,
-        llm: Arc<dyn LLMProvider>,
-        messages: &[ChatMessage],
-    ) -> Result<LLMResponse> {
-        let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
-            self.recovery_manager
-                .with_retry("llm_call", None, || async {
-                    self.observe_purpose(
-                        ObservationPurpose::MainResponse,
-                        llm.complete(messages, None),
-                    )
-                    .await
-                    .map_err(|e| e.classify())
-                })
-                .await
-                .map_err(|e| AgentError::LLM(e.to_string()))
-        } else {
-            self.observe_purpose(
-                ObservationPurpose::MainResponse,
-                llm.complete(messages, None),
-            )
-            .await
-            .map_err(|e| AgentError::LLM(e.to_string()))
-        };
-
-        match primary_result {
-            Ok(resp) => Ok(resp),
-            Err(primary_err) => match &self.recovery_manager.config().llm.on_failure {
-                LLMFailureAction::FallbackLlm { fallback_llm } => {
-                    let fb = self.llm_registry.get(fallback_llm).map_err(|e| {
-                        AgentError::Config(format!(
-                            "Fallback LLM '{}' not found: {}",
-                            fallback_llm, e
-                        ))
-                    })?;
-                    self.observe_purpose(
-                        ObservationPurpose::MainResponse,
-                        fb.complete(messages, None),
-                    )
-                    .await
-                    .map_err(|e| AgentError::LLM(e.to_string()))
-                }
-                LLMFailureAction::FallbackResponse { message } => {
-                    Ok(LLMResponse::new(message.clone(), FinishReason::Stop))
-                }
-                LLMFailureAction::Error => Err(primary_err),
-            },
-        }
-    }
-
     //
     // Draft generation must not commit user memory or run tools.
     // The current user input is added only as an ephemeral message for this LLM call.
@@ -8025,12 +8809,17 @@ Respond in JSON format:
         reasoning_mode: &ReasoningMode,
     ) -> Result<MainResponseDraft> {
         let llm = self.get_state_llm()?;
-        let mut messages = self.build_messages_for_draft(processed_input).await?;
+        let protocol = self.main_tool_protocol(llm.as_ref(), true).await?;
+        let mut messages = self
+            .build_messages_internal(false, Some(processed_input), protocol.choice.is_none())
+            .await?;
         self.inject_reasoning_prompt(&mut messages, reasoning_mode, true);
-        let response = self.complete_llm_with_recovery(llm, &messages).await?;
+        let response = self
+            .complete_main_llm_with_recovery(llm, &messages, &protocol)
+            .await?;
         let content = response.content.trim().to_string();
         let (thinking, answer) = self.extract_thinking(&content);
-        if let Some(calls) = self.parse_tool_calls(&content) {
+        if let Some(calls) = self.parse_main_tool_calls(&content, &protocol) {
             return Ok(MainResponseDraft::ToolCalls {
                 raw_content: content,
                 calls,
@@ -8045,7 +8834,7 @@ Respond in JSON format:
 
     //
     // This is the only place where a winning draft is allowed to become runtime state.
-    // Parsed tool calls become executable only after this method commits the draft.
+    // Prompt and native tool calls remain inert until this method commits the draft into the shared executor path.
     //
     async fn commit_main_response_draft(
         &self,
@@ -8199,21 +8988,20 @@ Respond in JSON format:
             }
             iterations += 1;
             *self.iteration_count.write() = iterations;
-            let mut messages = self.build_messages().await?;
+            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
+            let mut messages = self
+                .build_messages_internal(true, None, protocol.choice.is_none())
+                .await?;
             self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
             self.hooks.on_llm_start(&messages).await;
             let llm_start = Instant::now();
             let response = self
-                .observe_purpose(
-                    ObservationPurpose::MainResponse,
-                    llm.complete(&messages, None),
-                )
-                .await
-                .map_err(|e| AgentError::LLM(e.to_string()))?;
+                .complete_main_llm_with_recovery(Arc::clone(&llm), &messages, &protocol)
+                .await?;
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.hooks.on_llm_complete(&response, llm_duration_ms).await;
             let content = response.content.trim();
-            if let Some(tool_calls) = self.parse_tool_calls(content) {
+            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol) {
                 match self
                     .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
                     .await?
@@ -8269,6 +9057,7 @@ Respond in JSON format:
         self.memory
             .add_message(ChatMessage::assistant(content))
             .await?;
+        let native_tool_call = Self::is_native_tool_call_content(content);
 
         let results = self.execute_tools_parallel(&tool_calls).await;
 
@@ -8276,7 +9065,11 @@ Respond in JSON format:
             match result {
                 Ok(output) => {
                     self.memory
-                        .add_message(ChatMessage::function(&tool_call.name, &output))
+                        .add_message(Self::tool_result_message(
+                            tool_call,
+                            &output,
+                            native_tool_call,
+                        ))
                         .await?;
                 }
                 Err(e) => {
@@ -8296,9 +9089,10 @@ Respond in JSON format:
                         }));
                     }
                     self.memory
-                        .add_message(ChatMessage::function(
-                            &tool_call.name,
+                        .add_message(Self::tool_result_message(
+                            tool_call,
                             &format!("Error: {}", e),
+                            native_tool_call,
                         ))
                         .await?;
                 }
@@ -8443,7 +9237,10 @@ Respond in JSON format:
         let mut final_content;
 
         for post_iter in 0..self.max_iterations {
-            let new_messages = self.build_messages().await?;
+            let protocol = self.main_tool_protocol(new_llm.as_ref(), false).await?;
+            let new_messages = self
+                .build_messages_internal(true, None, protocol.choice.is_none())
+                .await?;
             if post_iter == 0 {
                 if let Some(system_msg) = new_messages.first() {
                     if system_msg.role == ai_agents_core::Role::System {
@@ -8457,17 +9254,14 @@ Respond in JSON format:
             }
 
             let new_response = self
-                .observe_purpose(
-                    ObservationPurpose::MainResponse,
-                    new_llm.complete(&new_messages, None),
-                )
-                .await
-                .map_err(|e| AgentError::LLM(e.to_string()))?;
+                .complete_main_llm_with_recovery(Arc::clone(&new_llm), &new_messages, &protocol)
+                .await?;
             final_content = new_response.content.trim().to_string();
 
             // Check if the post-transition response contains tool calls.
             // If so, execute them and loop so the LLM can summarize the result.
-            if let Some(tool_calls) = self.parse_tool_calls(&final_content) {
+            if let Some(tool_calls) = self.parse_main_tool_calls(&final_content, &protocol) {
+                let native_tool_call = Self::is_native_tool_call_content(&final_content);
                 debug!(
                     post_iter = post_iter,
                     tools = tool_calls.len(),
@@ -8483,14 +9277,19 @@ Respond in JSON format:
                     match result {
                         Ok(output) => {
                             self.memory
-                                .add_message(ChatMessage::function(&tool_call.name, &output))
+                                .add_message(Self::tool_result_message(
+                                    tool_call,
+                                    &output,
+                                    native_tool_call,
+                                ))
                                 .await?;
                         }
                         Err(e) => {
                             self.memory
-                                .add_message(ChatMessage::function(
-                                    &tool_call.name,
+                                .add_message(Self::tool_result_message(
+                                    tool_call,
                                     &format!("Error: {}", e),
+                                    native_tool_call,
                                 ))
                                 .await?;
                         }
@@ -9404,77 +10203,24 @@ Respond in JSON format:
 
             debug!(iteration = iterations, max = effective_max, "LLM call");
 
-            let mut messages = self.build_messages().await?;
+            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
+            let mut messages = self
+                .build_messages_internal(true, None, protocol.choice.is_none())
+                .await?;
             self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
 
             self.hooks.on_llm_start(&messages).await;
             let llm_start = Instant::now();
-
-            // Try primary LLM (with retry if configured), then apply on_failure policy.
-            let response = {
-                let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
-                    self.recovery_manager
-                        .with_retry("llm_call", None, || async {
-                            self.observe_purpose(
-                                ObservationPurpose::MainResponse,
-                                llm.complete(&messages, None),
-                            )
-                            .await
-                            .map_err(|e| e.classify())
-                        })
-                        .await
-                        .map_err(|e| AgentError::LLM(e.to_string()))
-                } else {
-                    self.observe_purpose(
-                        ObservationPurpose::MainResponse,
-                        llm.complete(&messages, None),
-                    )
-                    .await
-                    .map_err(|e| AgentError::LLM(e.to_string()))
-                };
-
-                match primary_result {
-                    Ok(resp) => resp,
-                    Err(primary_err) => match &self.recovery_manager.config().llm.on_failure {
-                        LLMFailureAction::FallbackLlm { fallback_llm } => {
-                            warn!(
-                                fallback = %fallback_llm,
-                                error = %primary_err,
-                                "Primary LLM failed, attempting fallback LLM"
-                            );
-                            let fb = self.llm_registry.get(fallback_llm).map_err(|e| {
-                                AgentError::Config(format!(
-                                    "Fallback LLM '{}' not found: {}",
-                                    fallback_llm, e
-                                ))
-                            })?;
-                            self.observe_purpose(
-                                ObservationPurpose::MainResponse,
-                                fb.complete(&messages, None),
-                            )
-                            .await
-                            .map_err(|e| AgentError::LLM(e.to_string()))?
-                        }
-                        LLMFailureAction::FallbackResponse { message } => {
-                            warn!(
-                                error = %primary_err,
-                                "Primary LLM failed, using static fallback response"
-                            );
-                            LLMResponse::new(message.clone(), FinishReason::Stop)
-                        }
-                        LLMFailureAction::Error => {
-                            return Err(primary_err);
-                        }
-                    },
-                }
-            };
+            let response = self
+                .complete_main_llm_with_recovery(Arc::clone(&llm), &messages, &protocol)
+                .await?;
 
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.hooks.on_llm_complete(&response, llm_duration_ms).await;
 
             let content = response.content.trim();
 
-            if let Some(tool_calls) = self.parse_tool_calls(content) {
+            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol) {
                 match self
                     .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
                     .await?
@@ -9555,6 +10301,12 @@ Respond in JSON format:
         routing_resolved: Arc<AtomicBool>,
     ) -> Result<StreamingDraftResult> {
         let llm = self.get_state_llm()?;
+        if llm.configured_tool_choice().is_some() {
+            let draft = self
+                .generate_main_response_draft(processed_input, &ReasoningMode::None)
+                .await?;
+            return Ok(StreamingDraftResult::new(draft, Vec::new()));
+        }
         let messages = self.build_messages_for_draft(processed_input).await?;
         let mut stream = self
             .observe_purpose(
@@ -10049,7 +10801,17 @@ Respond in JSON format:
 
                 debug!(iteration = iterations, max = effective_max, "LLM call (stream)");
 
-                let mut messages = match self.build_messages().await {
+                let protocol = match self.main_tool_protocol(llm.as_ref(), false).await {
+                    Ok(protocol) => protocol,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
+                };
+                let mut messages = match self
+                    .build_messages_internal(true, None, protocol.choice.is_none())
+                    .await
+                {
                     Ok(m) => m,
                     Err(e) => {
                         yield StreamChunk::error(e.to_string());
@@ -10068,12 +10830,16 @@ Respond in JSON format:
                     Err(_) => false,
                 };
 
-                let content = if reflection_active {
-                    // Use blocking call so reflection can retry without partial output
+                let buffered_decision = reflection_active || protocol.choice.is_some();
+                let content = if buffered_decision {
+                    //
+                    // Explicit tool choice buffers the provider decision so no text or tool call is visible before the runtime validates and commits it.
+                    //
                     let response = match self
-                        .observe_purpose(
-                            ObservationPurpose::MainResponse,
-                            llm.complete(&messages, None),
+                        .complete_main_llm_with_recovery(
+                            Arc::clone(&llm),
+                            &messages,
+                            &protocol,
                         )
                         .await
                     {
@@ -10126,7 +10892,8 @@ Respond in JSON format:
                 };
 
                 // Tool call handling
-                if let Some(tool_calls) = self.parse_tool_calls(&content) {
+                if let Some(tool_calls) = self.parse_main_tool_calls(&content, &protocol) {
+                    let native_tool_call = Self::is_native_tool_call_content(&content);
                     // Emit tool events for streaming
                     // First check transitions (same as blocking path)
                     let transition_fired = match self.evaluate_transitions(processed_input, &content).await {
@@ -10171,7 +10938,11 @@ Respond in JSON format:
                                     );
                                 }
                                 let _ = self.memory
-                                    .add_message(ChatMessage::function(&tool_call.name, &output))
+                                    .add_message(Self::tool_result_message(
+                                        tool_call,
+                                        &output,
+                                        native_tool_call,
+                                    ))
                                     .await;
                             }
                             Err(e) => {
@@ -10201,9 +10972,10 @@ Respond in JSON format:
                                     );
                                 }
                                 let _ = self.memory
-                                    .add_message(ChatMessage::function(
-                                        &tool_call.name,
+                                    .add_message(Self::tool_result_message(
+                                        tool_call,
                                         &format!("Error: {}", e),
+                                        native_tool_call,
                                     ))
                                     .await;
                             }
@@ -10257,8 +11029,8 @@ Respond in JSON format:
                     &final_content,
                 );
 
-                // If reflection was active (we used blocking call), yield the final content now
-                if reflection_active {
+                // Buffered decisions emit only the accepted final text.
+                if buffered_decision {
                     yield StreamChunk::content(&final_content);
                 }
 
@@ -10896,6 +11668,10 @@ Respond in JSON format:
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>> {
+        //
+        // Streaming readiness is checked before returning a stream so capability failures cannot appear as partial output.
+        //
+        self.init_storage().await?;
         info!(input_len = input.len(), "Starting streaming chat");
         let inner = self.run_loop_stream(input);
         if let Some(context) = self.build_observation_context(None) {
@@ -11184,6 +11960,9 @@ mod tests {
     use crate::AgentBuilder;
     use ai_agents_core::{LLMChunk, LLMConfig, LLMError, LLMFeature, Tool};
     use ai_agents_llm::mock::MockLLMProvider;
+    use ai_agents_tools::{
+        CalculatorTool, CopyPathTool, DeletePathTool, FileWriteTool, MovePathTool,
+    };
 
     fn mock_with_response(response: &str) -> MockLLMProvider {
         let mut mock = MockLLMProvider::new("test");
@@ -11195,6 +11974,637 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
+    }
+
+    #[tokio::test]
+    async fn native_required_choice_executes_through_the_shared_tool_path() {
+        let mut mock = MockLLMProvider::new("native-required");
+        mock.set_tool_choice(Some(ToolChoice::Required));
+        mock.add_response(
+            LLMResponse::new("", FinishReason::ToolCall)
+                .with_tool_calls(vec![ToolCall {
+                    id: "provider-call-1".to_string(),
+                    name: "calculator".to_string(),
+                    arguments: serde_json::json!({"expression": "2 + 2"}),
+                }])
+                .unwrap(),
+        );
+        mock.add_response(LLMResponse::new("The answer is 4.", FinishReason::Stop));
+        let observed = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("Use the calculator when needed.")
+            .llm(Arc::new(mock))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("What is 2 + 2?").await.unwrap();
+
+        assert_eq!(response.content, "The answer is 4.");
+        assert_eq!(
+            response.tool_calls.as_ref().unwrap()[0].id,
+            "provider-call-1"
+        );
+        let calls = observed.call_history();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(
+            calls[0].request.as_ref().map(|request| &request.choice),
+            Some(ToolChoice::Required)
+        ));
+        assert!(matches!(
+            calls[1].request.as_ref().map(|request| &request.choice),
+            Some(ToolChoice::Auto)
+        ));
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_uses_one_corrective_retry() {
+        let mut mock = MockLLMProvider::new("prompt-required");
+        mock.set_tool_choice(Some(ToolChoice::Required));
+        mock.set_native_tool_support(false);
+        mock.set_responses(
+            vec![
+                "I can calculate that.".to_string(),
+                r#"{"tool":"calculator","arguments":{"expression":"2 + 2"}}"#.to_string(),
+                "The answer is 4.".to_string(),
+            ],
+            false,
+        );
+        let observed = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("Use tools.")
+            .llm(Arc::new(mock))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("What is 2 + 2?").await.unwrap();
+
+        assert_eq!(response.content, "The answer is 4.");
+        assert_eq!(observed.call_count(), 3);
+        let corrective = &observed.call_history()[1].messages;
+        assert!(
+            corrective
+                .last()
+                .unwrap()
+                .content
+                .contains("previous response")
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_fallback_fails_after_one_noncompliant_retry() {
+        let mut mock = MockLLMProvider::new("prompt-required-failure");
+        mock.set_tool_choice(Some(ToolChoice::Required));
+        mock.set_native_tool_support(false);
+        mock.set_responses(
+            vec!["No tool.".to_string(), "Still no tool.".to_string()],
+            false,
+        );
+        let observed = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("Use tools.")
+            .llm(Arc::new(mock))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let error = agent.chat("What is 2 + 2?").await.unwrap_err();
+
+        assert!(error.to_string().contains("one corrective retry"));
+        assert_eq!(observed.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn specific_choice_cannot_widen_the_effective_grant() {
+        let mut mock = MockLLMProvider::new("specific-outside-grant");
+        mock.set_tool_choice(Some(ToolChoice::Specific("random".to_string())));
+        let observed = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("Use tools.")
+            .llm(Arc::new(mock))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let error = agent.chat("Generate a value.").await.unwrap_err();
+
+        assert!(error.to_string().contains("is not registered"));
+        assert_eq!(observed.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn none_choice_exposes_no_tool_protocol() {
+        let mut mock = MockLLMProvider::new("no-tools");
+        mock.set_tool_choice(Some(ToolChoice::None));
+        mock.set_response(r#"{"tool":"calculator","arguments":{"expression":"2 + 2"}}"#);
+        let observed = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("Answer directly.")
+            .llm(Arc::new(mock))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Hello").await.unwrap();
+
+        assert!(response.tool_calls.is_none());
+        assert_eq!(observed.call_count(), 1);
+        let call = observed.last_call().unwrap();
+        assert!(call.request.is_none());
+        assert!(
+            call.messages
+                .iter()
+                .all(|message| !message.content.contains("Available tools:"))
+        );
+    }
+
+    struct RuntimeStorage {
+        capabilities: Box<[StorageCapability]>,
+        snapshots: RwLock<HashMap<String, AgentSnapshot>>,
+        metadata: RwLock<HashMap<String, ai_agents_core::SessionMetadata>>,
+        metadata_save_calls: AtomicU64,
+        metadata_load_calls: AtomicU64,
+        fail_metadata_save: AtomicBool,
+        fail_metadata_load: AtomicBool,
+    }
+
+    impl RuntimeStorage {
+        fn new(capabilities: impl IntoIterator<Item = StorageCapability>) -> Self {
+            Self {
+                capabilities: capabilities.into_iter().collect(),
+                snapshots: RwLock::new(HashMap::new()),
+                metadata: RwLock::new(HashMap::new()),
+                metadata_save_calls: AtomicU64::new(0),
+                metadata_load_calls: AtomicU64::new(0),
+                fail_metadata_save: AtomicBool::new(false),
+                fail_metadata_load: AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl AgentStorage for RuntimeStorage {
+        fn supports(&self, capability: StorageCapability) -> bool {
+            self.capabilities.contains(&capability)
+        }
+
+        async fn save(&self, session_id: &str, snapshot: &AgentSnapshot) -> Result<()> {
+            self.snapshots
+                .write()
+                .insert(session_id.to_string(), snapshot.clone());
+            Ok(())
+        }
+
+        async fn load(&self, session_id: &str) -> Result<Option<AgentSnapshot>> {
+            Ok(self.snapshots.read().get(session_id).cloned())
+        }
+
+        async fn delete(&self, session_id: &str) -> Result<()> {
+            self.snapshots.write().remove(session_id);
+            Ok(())
+        }
+
+        async fn list_sessions(&self) -> Result<Vec<String>> {
+            Ok(self.snapshots.read().keys().cloned().collect())
+        }
+
+        async fn save_snapshot_with_metadata(
+            &self,
+            session_id: &str,
+            snapshot: &AgentSnapshot,
+            metadata: &ai_agents_core::SessionMetadata,
+        ) -> Result<()> {
+            self.metadata_save_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_metadata_save.load(Ordering::SeqCst) {
+                return Err(AgentError::Persistence("metadata save failed".into()));
+            }
+            self.snapshots
+                .write()
+                .insert(session_id.to_string(), snapshot.clone());
+            self.metadata
+                .write()
+                .insert(session_id.to_string(), metadata.clone());
+            Ok(())
+        }
+
+        async fn save_metadata(
+            &self,
+            session_id: &str,
+            metadata: &ai_agents_core::SessionMetadata,
+        ) -> Result<()> {
+            self.metadata_save_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_metadata_save.load(Ordering::SeqCst) {
+                return Err(AgentError::Persistence("metadata save failed".into()));
+            }
+            self.metadata
+                .write()
+                .insert(session_id.to_string(), metadata.clone());
+            Ok(())
+        }
+
+        async fn load_metadata(
+            &self,
+            session_id: &str,
+        ) -> Result<Option<ai_agents_core::SessionMetadata>> {
+            self.metadata_load_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_metadata_load.load(Ordering::SeqCst) {
+                return Err(AgentError::Persistence("metadata load failed".into()));
+            }
+            Ok(self.metadata.read().get(session_id).cloned())
+        }
+    }
+
+    fn runtime_storage_agent() -> RuntimeAgent {
+        AgentBuilder::new()
+            .system_prompt("Test runtime storage integration.")
+            .llm(Arc::new(mock_with_response("done")))
+            .build()
+            .unwrap()
+    }
+
+    fn restore_spec(id: &str) -> crate::spec::AgentSpec {
+        crate::spec::AgentSpec {
+            name: id.to_string(),
+            system_prompt: format!("Restore child {id}."),
+            ..crate::spec::AgentSpec::default()
+        }
+    }
+
+    fn restore_entry(id: &str) -> ai_agents_core::SpawnedAgentEntry {
+        ai_agents_core::SpawnedAgentEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            spec_yaml: serde_yaml::to_string(&restore_spec(id)).unwrap(),
+        }
+    }
+
+    fn restore_spawner(
+        storage: Arc<RuntimeStorage>,
+        max_agents: usize,
+    ) -> (
+        Arc<crate::spawner::AgentSpawner>,
+        Arc<crate::spawner::AgentRegistry>,
+    ) {
+        let mut llms = LLMRegistry::new();
+        llms.register("default", Arc::new(mock_with_response("done")));
+        (
+            Arc::new(
+                crate::spawner::AgentSpawner::new()
+                    .with_shared_llms(llms)
+                    .with_shared_storage(storage)
+                    .with_max_agents(max_agents),
+            ),
+            Arc::new(crate::spawner::AgentRegistry::new()),
+        )
+    }
+
+    async fn save_restore_target(
+        parent: &RuntimeAgent,
+        storage: &RuntimeStorage,
+        session_id: &str,
+        entries: Vec<ai_agents_core::SpawnedAgentEntry>,
+    ) {
+        let mut snapshot = parent.save_state().await.unwrap();
+        snapshot.spawned_agents = Some(entries);
+        storage.save(session_id, &snapshot).await.unwrap();
+        storage
+            .save_metadata(session_id, &ai_agents_core::SessionMetadata::default())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_init_requires_storage_for_actor_facts() {
+        let mut facts = ai_agents_facts::FactsConfig::default();
+        facts.enabled = true;
+        let agent = runtime_storage_agent().with_facts_config(None, Some(facts));
+
+        let error = agent.init_storage().await.unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Config(message)
+                if message.contains("actor facts or actor memory")
+                    && message.contains("none is configured or injected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_init_validates_actor_facts_capability() {
+        let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
+        let mut actor_memory = ai_agents_facts::ActorMemoryConfig::default();
+        actor_memory.enabled = true;
+        let agent = runtime_storage_agent()
+            .with_storage(storage)
+            .with_facts_config(Some(actor_memory), None);
+
+        assert!(matches!(
+            agent.init_storage().await,
+            Err(AgentError::UnsupportedStorageCapability(
+                StorageCapability::ActorFacts
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn blocking_chat_rejects_unsupported_required_storage() {
+        let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
+        let mut facts = ai_agents_facts::FactsConfig::default();
+        facts.enabled = true;
+        let agent = runtime_storage_agent()
+            .with_storage(storage)
+            .with_facts_config(None, Some(facts));
+
+        assert!(matches!(
+            agent.chat("hello").await,
+            Err(AgentError::UnsupportedStorageCapability(
+                StorageCapability::ActorFacts
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_chat_rejects_unsupported_required_storage_before_stream_creation() {
+        let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
+        let mut config = ai_agents_relationships::RelationshipConfig::default();
+        config.enabled = true;
+        config.persistence.enabled = true;
+        let manager = Arc::new(RelationshipManager::from_config(config).unwrap());
+        let agent = runtime_storage_agent()
+            .with_storage(storage)
+            .with_relationships(manager);
+
+        assert!(matches!(
+            agent.chat_stream("hello").await,
+            Err(AgentError::UnsupportedStorageCapability(
+                StorageCapability::ActorRelationships
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_init_completes_facts_for_injected_storage() {
+        let storage = Arc::new(RuntimeStorage::new([
+            StorageCapability::Snapshot,
+            StorageCapability::ActorFacts,
+        ]));
+        let mut facts = ai_agents_facts::FactsConfig::default();
+        facts.enabled = true;
+        let agent = runtime_storage_agent()
+            .with_storage(storage)
+            .with_facts_config(None, Some(facts));
+
+        agent.init_storage().await.unwrap();
+        assert!(agent.fact_store().is_some());
+    }
+
+    #[tokio::test]
+    async fn storage_init_requires_storage_for_persistent_relationships() {
+        let mut config = ai_agents_relationships::RelationshipConfig::default();
+        config.enabled = true;
+        config.persistence.enabled = true;
+        let manager = Arc::new(RelationshipManager::from_config(config).unwrap());
+        let agent = runtime_storage_agent().with_relationships(manager);
+
+        let error = agent.init_storage().await.unwrap_err();
+        assert!(matches!(
+            error,
+            AgentError::Config(message)
+                if message.contains("persistent relationships")
+                    && message.contains("none is configured or injected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn storage_init_validates_persistent_relationships_capability() {
+        let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
+        let mut config = ai_agents_relationships::RelationshipConfig::default();
+        config.enabled = true;
+        config.persistence.enabled = true;
+        let manager = Arc::new(RelationshipManager::from_config(config).unwrap());
+        let agent = runtime_storage_agent()
+            .with_storage(storage)
+            .with_relationships(manager);
+
+        assert!(matches!(
+            agent.init_storage().await,
+            Err(AgentError::UnsupportedStorageCapability(
+                StorageCapability::ActorRelationships
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_restore_updates_identity_and_clears_stale_actor_binding() {
+        let storage = Arc::new(RuntimeStorage::new([
+            StorageCapability::Snapshot,
+            StorageCapability::SessionMetadata,
+        ]));
+        let agent = runtime_storage_agent().with_storage(storage.clone());
+        agent.set_actor_id("old-actor").unwrap();
+        agent.save_session("old").await.unwrap();
+        storage
+            .save("target", &agent.save_state().await.unwrap())
+            .await
+            .unwrap();
+        storage
+            .save_metadata("target", &ai_agents_core::SessionMetadata::default())
+            .await
+            .unwrap();
+
+        assert!(agent.load_session("target").await.unwrap());
+
+        assert_eq!(agent.current_session_id.read().as_deref(), Some("target"));
+        assert_eq!(agent.actor_id(), None);
+    }
+
+    #[tokio::test]
+    async fn complete_restore_reconciles_growth_shrink_and_empty_topologies() {
+        let storage = Arc::new(RuntimeStorage::new([
+            StorageCapability::Snapshot,
+            StorageCapability::SessionMetadata,
+        ]));
+        let (spawner, registry) = restore_spawner(storage.clone(), 3);
+        let parent = runtime_storage_agent()
+            .with_storage(storage.clone())
+            .with_spawner_handles(Arc::clone(&spawner), Arc::clone(&registry));
+
+        for id in ["a", "b"] {
+            let spawned = spawner
+                .spawn_with_id(id.to_string(), restore_spec(id))
+                .await
+                .unwrap();
+            spawned.agent.save_session("grow").await.unwrap();
+            registry.register(spawned).await.unwrap();
+        }
+        let staged_c = crate::spawner::storage::NamespacedStorage::new(storage.clone(), "c");
+        staged_c
+            .save("grow", &AgentSnapshot::new("c".into()))
+            .await
+            .unwrap();
+        staged_c
+            .save_metadata("grow", &ai_agents_core::SessionMetadata::default())
+            .await
+            .unwrap();
+        save_restore_target(
+            &parent,
+            storage.as_ref(),
+            "grow",
+            vec![restore_entry("a"), restore_entry("b"), restore_entry("c")],
+        )
+        .await;
+
+        assert_eq!(parent.restore_session_full("grow").await.unwrap(), 3);
+        assert_eq!(registry.count(), 3);
+        assert!(registry.contains("c"));
+        assert_eq!(spawner.spawned_count(), 3);
+
+        for id in ["a", "b"] {
+            registry
+                .get(id)
+                .unwrap()
+                .save_session("shrink")
+                .await
+                .unwrap();
+        }
+        save_restore_target(
+            &parent,
+            storage.as_ref(),
+            "shrink",
+            vec![restore_entry("a"), restore_entry("b")],
+        )
+        .await;
+
+        assert_eq!(parent.restore_session_full("shrink").await.unwrap(), 2);
+        assert_eq!(registry.count(), 2);
+        assert!(!registry.contains("c"));
+        assert_eq!(spawner.spawned_count(), 2);
+
+        save_restore_target(&parent, storage.as_ref(), "empty", Vec::new()).await;
+
+        assert_eq!(parent.restore_session_full("empty").await.unwrap(), 0);
+        assert_eq!(registry.count(), 0);
+        assert_eq!(spawner.spawned_count(), 0);
+        assert_eq!(parent.current_session_id.read().as_deref(), Some("empty"));
+    }
+
+    #[tokio::test]
+    async fn storage_session_metadata_is_called_only_when_advertised() {
+        let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
+        storage.fail_metadata_save.store(true, Ordering::SeqCst);
+        storage.fail_metadata_load.store(true, Ordering::SeqCst);
+        let agent = runtime_storage_agent().with_storage(storage.clone());
+
+        agent.save_session("session").await.unwrap();
+        assert!(agent.load_session("session").await.unwrap());
+        assert_eq!(storage.metadata_save_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.metadata_load_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_runtime_save_filter_reopen_and_reload_stay_consistent() {
+        let directory =
+            std::env::temp_dir().join(format!("ai-agents-runtime-sqlite-{}", uuid::Uuid::new_v4()));
+        let path = directory.join("sessions.sqlite");
+        let path_string = path.to_string_lossy().into_owned();
+        let storage = Arc::new(
+            ai_agents_storage::SqliteStorage::new(&path_string)
+                .await
+                .unwrap(),
+        );
+        let agent = runtime_storage_agent().with_storage(storage.clone());
+        agent.set_session_metadata(ai_agents_core::SessionMetadata {
+            tags: vec!["initial".into()],
+            ..Default::default()
+        });
+        agent.chat("persist this turn").await.unwrap();
+        agent.save_session("session").await.unwrap();
+
+        agent.set_session_metadata(ai_agents_core::SessionMetadata {
+            tags: vec!["updated".into()],
+            ..Default::default()
+        });
+        agent.save_session("session").await.unwrap();
+        assert!(
+            agent
+                .list_sessions_filtered(&ai_agents_core::SessionFilter {
+                    tags: Some(vec!["initial".into()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            agent
+                .list_sessions_filtered(&ai_agents_core::SessionFilter {
+                    tags: Some(vec!["updated".into()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(agent);
+        drop(storage);
+
+        let reopened_storage = Arc::new(
+            ai_agents_storage::SqliteStorage::new(&path_string)
+                .await
+                .unwrap(),
+        );
+        let restored = runtime_storage_agent().with_storage(reopened_storage.clone());
+        assert!(restored.load_session("session").await.unwrap());
+        assert_eq!(restored.session_metadata().tags, vec!["updated"]);
+        assert_eq!(
+            restored.current_session_id.read().as_deref(),
+            Some("session")
+        );
+        assert!(restored.save_state().await.unwrap().memory.messages.len() >= 2);
+        assert_eq!(
+            restored
+                .list_sessions_filtered(&ai_agents_core::SessionFilter {
+                    tags: Some(vec!["updated".into()]),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        drop(restored);
+        drop(reopened_storage);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_session_metadata_backend_failures_propagate() {
+        let storage = Arc::new(RuntimeStorage::new([
+            StorageCapability::Snapshot,
+            StorageCapability::SessionMetadata,
+        ]));
+        let agent = runtime_storage_agent().with_storage(storage.clone());
+
+        agent.save_session("session").await.unwrap();
+        storage
+            .save("target", &agent.save_state().await.unwrap())
+            .await
+            .unwrap();
+        storage.fail_metadata_load.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            agent.load_session("target").await,
+            Err(AgentError::Persistence(message)) if message == "metadata load failed"
+        ));
+        assert_eq!(agent.current_session_id.read().as_deref(), Some("session"));
+
+        storage.fail_metadata_save.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            agent.save_session("session").await,
+            Err(AgentError::Persistence(message)) if message == "metadata save failed"
+        ));
     }
 
     struct ProviderFutureDropSignal {
@@ -11492,6 +12902,39 @@ mod tests {
         max_active: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    #[derive(Clone)]
+    struct PathMutationGate {
+        entered: Arc<AtomicBool>,
+        entered_notify: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl PathMutationGate {
+        fn new() -> Self {
+            Self {
+                entered: Arc::new(AtomicBool::new(false)),
+                entered_notify: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+
+        async fn wait_until_entered(&self) {
+            if !self.entered.load(Ordering::SeqCst) {
+                self.entered_notify.notified().await;
+            }
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    struct BlockingPathMutationTool {
+        id: &'static str,
+        path_fields: Vec<ai_agents_core::PathPolicyBinding>,
+        gate: PathMutationGate,
+    }
+
     struct NoBindingWriteTool {
         active: Arc<std::sync::atomic::AtomicUsize>,
         max_active: Arc<std::sync::atomic::AtomicUsize>,
@@ -11727,6 +13170,62 @@ mod tests {
     }
 
     #[async_trait]
+    impl ai_agents_core::Tool for BlockingPathMutationTool {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn name(&self) -> &str {
+            self.id
+        }
+
+        fn description(&self) -> &str {
+            "Blocks a path mutation until the test releases it."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: self.path_fields.clone(),
+                ..Default::default()
+            }
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            ai_agents_core::ToolSafetyMetadata {
+                read_only: false,
+                concurrency_safe: false,
+                operation: ai_agents_core::ToolOperationKind::Write,
+                side_effect_level: ai_agents_core::ToolSideEffectLevel::LocalWrite,
+                requires_network: false,
+                destructive: false,
+                open_world: false,
+                host_dependent: false,
+                requires_user_interaction: false,
+                supports_cancellation: true,
+                default_requires_approval: false,
+                should_defer_schema: false,
+                max_output_chars: Some(1024),
+                max_result_size_chars: Some(1024),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            self.gate.entered.store(true, Ordering::SeqCst);
+            self.gate.entered_notify.notify_one();
+            self.gate.release.notified().await;
+            ToolResult::ok("done")
+        }
+    }
+
+    #[async_trait]
     impl ai_agents_core::Tool for NoBindingWriteTool {
         fn id(&self) -> &str {
             "no_binding_write"
@@ -11949,6 +13448,213 @@ mod tests {
         policy.require_confirmation = true;
         security.tools.insert("locked_write".to_string(), policy);
         security
+    }
+
+    struct MutationTestWorkspace {
+        root: std::path::PathBuf,
+    }
+
+    impl MutationTestWorkspace {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "ai-agents-runtime-mutation-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self { root }
+        }
+    }
+
+    impl Drop for MutationTestWorkspace {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    async fn wait_for_resource_lock_strong_count(locks: &ToolResourceLocks, minimum: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let strong_count = locks
+                    .read()
+                    .get("path-mutation:global")
+                    .map_or(0, |lock| lock.strong_count());
+                if strong_count >= minimum {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("path mutation call did not reach the shared lock");
+    }
+
+    async fn assert_path_mutation_pair_serialized(
+        first_id: &'static str,
+        first_fields: Vec<ai_agents_core::PathPolicyBinding>,
+        first_args: Value,
+        second_id: &'static str,
+        second_fields: Vec<ai_agents_core::PathPolicyBinding>,
+        second_args: Value,
+    ) {
+        let locks = new_tool_resource_locks();
+        let first_gate = PathMutationGate::new();
+        let second_gate = PathMutationGate::new();
+        second_gate.release();
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test global path mutation locking.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: first_id,
+                    path_fields: first_fields,
+                    gate: first_gate.clone(),
+                }))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: second_id,
+                    path_fields: second_fields,
+                    gate: second_gate.clone(),
+                }))
+                .build()
+                .unwrap()
+                .with_shared_resource_locks(Arc::clone(&locks)),
+        );
+
+        let first = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        format!("{}-first", first_id),
+                        first_id,
+                        first_args,
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        first_gate.wait_until_entered().await;
+
+        let second = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        format!("{}-second", second_id),
+                        second_id,
+                        second_args,
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_resource_lock_strong_count(&locks, 2).await;
+        assert!(!second_gate.entered.load(Ordering::SeqCst));
+        assert!(!second.is_finished());
+
+        first_gate.release();
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("serialized path mutation calls did not finish");
+        assert!(first.unwrap().success);
+        assert!(second.unwrap().success);
+        assert!(second_gate.entered.load(Ordering::SeqCst));
+        assert!(locks.read().is_empty());
+    }
+
+    #[derive(Clone, Copy)]
+    enum MutationDenial {
+        Policy,
+        Approval,
+    }
+
+    fn mutation_denial_security_config(
+        tool_id: &str,
+        workspace: &std::path::Path,
+        denial: MutationDenial,
+    ) -> ToolSecurityConfig {
+        let workspace = workspace.to_string_lossy().into_owned();
+        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
+        policy.read_paths = vec![workspace.clone()];
+        policy.write_paths = vec![workspace.clone()];
+        match denial {
+            MutationDenial::Policy => policy.blocked_paths = vec![workspace],
+            MutationDenial::Approval => policy.require_confirmation = true,
+        }
+
+        let mut security = ToolSecurityConfig::default();
+        security.enabled = true;
+        security.fail_closed = true;
+        security.tools.insert(tool_id.to_string(), policy);
+        security
+    }
+
+    async fn assert_path_mutation_denied(tool: Arc<dyn Tool>, denial: MutationDenial) {
+        let workspace = MutationTestWorkspace::new();
+        let tool_id = tool.id().to_string();
+        let preserved = workspace.root.join(format!("{}-preserved.txt", tool_id));
+        let destination = workspace.root.join(format!("{}-destination.txt", tool_id));
+        std::fs::write(&preserved, "preserved").unwrap();
+        let arguments = match tool_id.as_str() {
+            "copy_path" | "move_path" => serde_json::json!({
+                "source_path": preserved.to_string_lossy(),
+                "destination_path": destination.to_string_lossy(),
+                "dry_run": false
+            }),
+            "delete_path" => serde_json::json!({
+                "path": preserved.to_string_lossy(),
+                "recursive": false,
+                "dry_run": false
+            }),
+            _ => panic!("unsupported mutation tool: {}", tool_id),
+        };
+        let security = mutation_denial_security_config(&tool_id, &workspace.root, denial);
+        let builder = AgentBuilder::new()
+            .system_prompt("Test mutation denial.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(tool)
+            .tool_security(ToolSecurityEngine::new(security));
+        let builder = match denial {
+            MutationDenial::Policy => builder,
+            MutationDenial::Approval => builder
+                .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+                .approval_handler(Arc::new(RejectAllHandler::new())),
+        };
+        let agent = builder.build().unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                format!("{}-denied", tool_id),
+                tool_id.clone(),
+                arguments,
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(!record.executed, "{} must not be invoked", tool_id);
+        assert!(!record.success);
+        match denial {
+            MutationDenial::Policy => {
+                assert_eq!(record.policy.outcome, PermissionOutcome::Deny);
+                assert!(record.approval.as_ref().is_some_and(|approval| matches!(
+                    &approval.status,
+                    ToolApprovalStatus::NotRequired
+                )));
+            }
+            MutationDenial::Approval => {
+                assert_eq!(record.policy.outcome, PermissionOutcome::RequiresApproval);
+                assert!(record.approval.as_ref().is_some_and(|approval| matches!(
+                    &approval.status,
+                    ToolApprovalStatus::Rejected
+                )));
+            }
+        }
+        assert_eq!(std::fs::read_to_string(&preserved).unwrap(), "preserved");
+        assert!(!destination.exists());
     }
 
     fn recovery_manager_with_fallbacks(
@@ -12468,6 +14174,237 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_path_lock_serializes_copy_destination_with_file_write() {
+        assert_path_mutation_pair_serialized(
+            "copy_path",
+            CopyPathTool::new().policy_bindings().path_fields,
+            serde_json::json!({
+                "source_path": "./source.txt",
+                "destination_path": "./shared.txt"
+            }),
+            "file_write",
+            FileWriteTool::new().policy_bindings().path_fields,
+            serde_json::json!({"path": "./shared.txt"}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn parent_and_spawned_runtime_share_global_path_lock() {
+        let workspace = MutationTestWorkspace::new();
+        let destination = workspace.root.join("spawned.txt");
+        let parent_gate = PathMutationGate::new();
+        let parent = Arc::new(
+            AgentBuilder::from_yaml(
+                r#"
+name: LockParent
+system_prompt: parent
+llm:
+  default: default
+tools:
+  - parent_path_write
+spawner:
+  shared_llms: true
+"#,
+            )
+            .unwrap()
+            .llm(Arc::new(mock_with_response("done")))
+            .auto_configure_spawner()
+            .await
+            .unwrap()
+            .tool(Arc::new(BlockingPathMutationTool {
+                id: "parent_path_write",
+                path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                gate: parent_gate.clone(),
+            }))
+            .build()
+            .unwrap(),
+        );
+
+        let mut child_spec = crate::spec::AgentSpec {
+            name: "LockChild".to_string(),
+            system_prompt: "child".to_string(),
+            tools: Some(vec![crate::spec::ToolEntry::Simple(
+                "file_write".to_string(),
+            )]),
+            ..Default::default()
+        };
+        child_spec.tool_security.enabled = true;
+        child_spec.tool_security.fail_closed = true;
+        let mut file_write_policy = ai_agents_tools::ToolPolicyConfig::default();
+        file_write_policy.write_paths = vec![workspace.root.to_string_lossy().into_owned()];
+        file_write_policy.allow_without_confirmation = true;
+        child_spec
+            .tool_security
+            .tools
+            .insert("file_write".to_string(), file_write_policy);
+        let spawned = parent
+            .spawner()
+            .unwrap()
+            .spawn_from_spec(child_spec)
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(
+            &parent.resource_locks,
+            &spawned.agent.resource_locks
+        ));
+
+        let parent_call = {
+            let parent = Arc::clone(&parent);
+            let destination = destination.clone();
+            tokio::spawn(async move {
+                parent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "parent-lock-holder",
+                        "parent_path_write",
+                        serde_json::json!({"path": destination}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        parent_gate.wait_until_entered().await;
+
+        let child_call = {
+            let child = Arc::clone(&spawned.agent);
+            let destination = destination.clone();
+            tokio::spawn(async move {
+                child
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "spawned-file-write",
+                        "file_write",
+                        serde_json::json!({
+                            "path": destination,
+                            "content": "spawned",
+                            "dry_run": false
+                        }),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_resource_lock_strong_count(&parent.resource_locks, 2).await;
+        assert!(!child_call.is_finished());
+
+        parent_gate.release();
+        let (parent_record, child_record) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(parent_call, child_call)
+            })
+            .await
+            .expect("parent and spawned path mutations did not finish");
+        assert!(parent_record.unwrap().success);
+        assert!(child_record.unwrap().success);
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "spawned");
+        assert!(parent.resource_locks.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_global_path_lock_waiter_does_not_retain_weak_entry() {
+        let locks = new_tool_resource_locks();
+        let holder_gate = PathMutationGate::new();
+        let waiter_gate = PathMutationGate::new();
+        waiter_gate.release();
+        let holder = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Hold the global path lock.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "holder_write",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: holder_gate.clone(),
+                }))
+                .build()
+                .unwrap()
+                .with_shared_resource_locks(Arc::clone(&locks)),
+        );
+        let waiter = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Wait for the global path lock.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "waiter_write",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: waiter_gate.clone(),
+                }))
+                .build()
+                .unwrap()
+                .with_shared_resource_locks(Arc::clone(&locks)),
+        );
+
+        let holder_call = {
+            let holder = Arc::clone(&holder);
+            tokio::spawn(async move {
+                holder
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "holder-call",
+                        "holder_write",
+                        serde_json::json!({"path": "./shared.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        holder_gate.wait_until_entered().await;
+
+        let waiter_call = {
+            let waiter = Arc::clone(&waiter);
+            tokio::spawn(async move {
+                waiter
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "waiter-call",
+                        "waiter_write",
+                        serde_json::json!({"path": "./shared.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        wait_for_resource_lock_strong_count(&locks, 2).await;
+        waiter.runtime_control().cancel_all();
+
+        let waiter_record = tokio::time::timeout(std::time::Duration::from_secs(2), waiter_call)
+            .await
+            .expect("cancelled lock waiter did not finish")
+            .unwrap();
+        assert!(!waiter_record.executed);
+        assert!(!waiter_gate.entered.load(Ordering::SeqCst));
+        assert_eq!(
+            locks
+                .read()
+                .get("path-mutation:global")
+                .map_or(0, |lock| lock.strong_count()),
+            1
+        );
+
+        holder_gate.release();
+        let holder_record = tokio::time::timeout(std::time::Duration::from_secs(2), holder_call)
+            .await
+            .expect("lock holder did not finish")
+            .unwrap();
+        assert!(holder_record.success);
+        assert!(locks.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn path_mutation_policy_and_approval_denials_do_not_invoke_tools() {
+        for denial in [MutationDenial::Policy, MutationDenial::Approval] {
+            let tools: [Arc<dyn Tool>; 3] = [
+                Arc::new(CopyPathTool::new()),
+                Arc::new(MovePathTool::new()),
+                Arc::new(DeletePathTool::new()),
+            ];
+            for tool in tools {
+                assert_path_mutation_denied(tool, denial).await;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn approval_argument_changes_are_rechecked_against_final_scope() {
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -12898,33 +14835,6 @@ mod tests {
         assert!(left.unwrap().success);
         assert!(right.unwrap().success);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn cancelled_lock_wait_cleans_weak_entries() {
-        let agent = Arc::new(
-            AgentBuilder::new()
-                .system_prompt("Test lock cancellation cleanup.")
-                .llm(Arc::new(mock_with_response("done")))
-                .build()
-                .unwrap(),
-        );
-        let held_keys = vec!["path:cancelled-lock".to_string()];
-        let waiting_keys = vec![
-            "path:cancelled-lock".to_string(),
-            "path:orphaned-lock".to_string(),
-        ];
-        let held = agent.acquire_tool_resource_locks(&held_keys).await.unwrap();
-        let waiting = {
-            let agent = Arc::clone(&agent);
-            tokio::spawn(async move { agent.acquire_tool_resource_locks(&waiting_keys).await })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        agent.runtime_control().cancel_all();
-        assert!(waiting.await.unwrap().is_none());
-        assert_eq!(agent.resource_locks.read().len(), 1);
-        drop(held);
-        assert!(agent.resource_locks.read().is_empty());
     }
 
     #[tokio::test]

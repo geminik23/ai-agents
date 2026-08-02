@@ -4,9 +4,9 @@ use crate::event::{
 use crate::manager::ObservabilityManager;
 use crate::span::SpanGuard;
 use ai_agents_core::{
-    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
-    ToolCallClassification, ToolExecutionContext, ToolPolicyBindings, ToolResult,
-    ToolSafetyMetadata,
+    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    LLMToolRequest, Tool, ToolCallClassification, ToolChoice, ToolExecutionContext,
+    ToolPolicyBindings, ToolResult, ToolSafetyMetadata,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -102,6 +102,72 @@ impl LLMProvider for ObservedLLMProvider {
                 Err(error)
             }
         }
+    }
+
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        if !self.manager.config().latency.track_llm {
+            return self
+                .inner
+                .complete_with_tools(messages, config, request)
+                .await;
+        }
+        let mut span = self
+            .manager
+            .start_span(self.event_type(false), current_purpose());
+        if self.manager.config().privacy.include_prompts {
+            span.set_payload(serde_json::json!({"messages": messages}));
+        } else if self.manager.config().privacy.hash_inputs {
+            let text = messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            span.set_payload(
+                serde_json::json!({"input": self.manager.redactor().redact_text(&text)}),
+            );
+        }
+
+        match self
+            .inner
+            .complete_with_tools(messages, config, request)
+            .await
+        {
+            Ok(response) => {
+                if let Some(tokens) = response.usage {
+                    span.set_tokens(ObservationTokenUsage::new(
+                        tokens.prompt_tokens as u64,
+                        tokens.completion_tokens as u64,
+                        TokenUsageSource::Provider,
+                    ));
+                } else if self.manager.config().tokens.estimate_when_missing {
+                    span.set_tokens(estimate_usage(messages, &response.content));
+                }
+                if self.manager.config().privacy.include_responses {
+                    span.set_payload(serde_json::json!({"response": response.content}));
+                }
+                Ok(response)
+            }
+            Err(error) => {
+                span.set_error(ObservationError::new(
+                    llm_error_kind(&error),
+                    error.to_string(),
+                ));
+                Err(error)
+            }
+        }
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.inner.configured_tool_choice()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.inner.supports_tool_choice(choice)
     }
 
     async fn complete_stream(
@@ -339,5 +405,98 @@ fn llm_error_kind(error: &LLMError) -> &'static str {
         LLMError::ContentFiltered(_) => "content_filtered",
         LLMError::Serialization(_) => "serialization",
         LLMError::Other(_) => "other",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ObservabilityConfig;
+    use ai_agents_core::{FinishReason, LLMToolDefinition};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct NativeProvider {
+        called: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LLMProvider for NativeProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<LLMResponse, LLMError> {
+            Ok(LLMResponse::new("plain", FinishReason::Stop))
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+            _request: &LLMToolRequest,
+        ) -> Result<LLMResponse, LLMError> {
+            self.called.store(true, Ordering::SeqCst);
+            Ok(LLMResponse::new("native", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<Box<dyn Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
+        {
+            Ok(Box::new(futures::stream::empty()))
+        }
+
+        fn provider_name(&self) -> &str {
+            "native-test"
+        }
+
+        fn configured_tool_choice(&self) -> Option<ToolChoice> {
+            Some(ToolChoice::Required)
+        }
+
+        fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+            matches!(choice, ToolChoice::Auto | ToolChoice::Required)
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_provider_delegates_native_tool_methods() {
+        let inner = Arc::new(NativeProvider {
+            called: AtomicBool::new(false),
+        });
+        let observed = ObservedLLMProvider::new(
+            inner.clone(),
+            ObservabilityManager::new(ObservabilityConfig::default()),
+            None,
+            "native-test",
+            "test-model",
+        );
+        let request = LLMToolRequest {
+            tools: vec![LLMToolDefinition {
+                name: "calculator".to_string(),
+                description: "Calculate".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            choice: ToolChoice::Auto,
+        };
+
+        let response = observed
+            .complete_with_tools(&[ChatMessage::user("calculate")], None, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.content, "native");
+        assert!(inner.called.load(Ordering::SeqCst));
+        assert_eq!(
+            observed.configured_tool_choice(),
+            Some(ToolChoice::Required)
+        );
+        assert!(observed.supports_tool_choice(&ToolChoice::Auto));
     }
 }

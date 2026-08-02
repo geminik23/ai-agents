@@ -14,13 +14,14 @@ pub use provider::{
     ToolAliasesConfig, ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
 };
 pub use spawner::{
-    AutoSpawnEntry, ManagementToolsConfig, OrchestrationToolsConfig, SpawnerConfig, TemplateSource,
+    AutoSpawnEntry, ManagementToolsConfig, OrchestrationToolsConfig, SpawnerConfig,
+    SpawnerToolGrantConfig, TemplateSource,
 };
 pub use storage::{FileStorageConfig, RedisStorageConfig, SqliteStorageConfig, StorageConfig};
 pub use tool::{StructuredToolEntry, ToolConfig, ToolEntry};
 
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeSet, HashMap};
 
 use ai_agents_context::ContextSource;
 use ai_agents_core::{AgentError, Result};
@@ -28,11 +29,15 @@ use ai_agents_disambiguation::DisambiguationConfig;
 use ai_agents_hitl::HITLConfig;
 use ai_agents_observability::ObservabilityConfig;
 use ai_agents_persona::PersonaConfig;
-use ai_agents_process::ProcessConfig;
+use ai_agents_process::{ProcessConfig, ProcessStage};
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
-use ai_agents_recovery::ErrorRecoveryConfig;
-use ai_agents_skills::SkillRef;
-use ai_agents_state::{StateConfig, StateDefinition, Transition, TransitionTiming};
+use ai_agents_recovery::{
+    ContextOverflowAction, ErrorRecoveryConfig, LLMFailureAction, RateLimitAction,
+};
+use ai_agents_skills::{SkillRef, SkillStep};
+use ai_agents_state::{
+    StateAction, StateConfig, StateDefinition, ToolCondition, Transition, TransitionTiming,
+};
 use ai_agents_tools::ToolSecurityConfig;
 
 pub use super::RuntimeConfig;
@@ -134,11 +139,36 @@ pub struct AgentSpec {
     pub persona: Option<PersonaConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum LLMConfigOrSelector {
     Config(LLMConfig),
     Selector(LLMSelector),
+}
+
+impl<'de> Deserialize<'de> for LLMConfigOrSelector {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let mapping = value.as_mapping().ok_or_else(|| {
+            serde::de::Error::custom("llm must be a provider configuration or alias selector")
+        })?;
+        let has_provider_field = mapping
+            .keys()
+            .any(|key| matches!(key.as_str(), Some("provider") | Some("model")));
+
+        if has_provider_field {
+            serde_yaml::from_value(value)
+                .map(Self::Config)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_yaml::from_value(value)
+                .map(Self::Selector)
+                .map_err(serde::de::Error::custom)
+        }
+    }
 }
 
 impl Default for LLMConfigOrSelector {
@@ -209,6 +239,123 @@ fn transition_is_parallel(transition: &Transition) -> bool {
     matches!(transition.timing, TransitionTiming::Parallel)
 }
 
+fn insert_alias(aliases: &mut BTreeSet<String>, alias: Option<&String>) {
+    if let Some(alias) = alias {
+        aliases.insert(alias.clone());
+    }
+}
+
+fn collect_reasoning_aliases(config: &ReasoningConfig, aliases: &mut BTreeSet<String>) {
+    if !config.is_enabled() {
+        return;
+    }
+    insert_alias(aliases, config.judge_llm.as_ref());
+    if config.needs_planning() {
+        insert_alias(
+            aliases,
+            config
+                .planning
+                .as_ref()
+                .and_then(|plan| plan.planner_llm.as_ref()),
+        );
+    }
+}
+
+fn collect_reflection_aliases(config: &ReflectionConfig, aliases: &mut BTreeSet<String>) {
+    if config.enabled.requires_evaluation() {
+        insert_alias(aliases, config.evaluator_llm.as_ref());
+    }
+}
+
+fn collect_process_aliases(config: &ProcessConfig, aliases: &mut BTreeSet<String>) {
+    fn collect_stage(stage: &ProcessStage, aliases: &mut BTreeSet<String>) {
+        let alias = match stage {
+            ProcessStage::Detect(stage) => stage.config.llm.as_ref(),
+            ProcessStage::Extract(stage) => stage.config.llm.as_ref(),
+            ProcessStage::Sanitize(stage) => stage.config.llm.as_ref(),
+            ProcessStage::Transform(stage) => stage.config.llm.as_ref(),
+            ProcessStage::Validate(stage) => stage.config.llm.as_ref(),
+            ProcessStage::Conditional(stage) => {
+                for nested in stage
+                    .config
+                    .then_stages
+                    .iter()
+                    .chain(&stage.config.else_stages)
+                {
+                    collect_stage(nested, aliases);
+                }
+                None
+            }
+            _ => None,
+        };
+        insert_alias(aliases, alias);
+    }
+
+    for stage in config.input.iter().chain(&config.output) {
+        collect_stage(stage, aliases);
+    }
+}
+
+fn collect_tool_condition_aliases(condition: &ToolCondition, aliases: &mut BTreeSet<String>) {
+    match condition {
+        ToolCondition::Semantic { llm, .. } => {
+            aliases.insert(llm.clone());
+        }
+        ToolCondition::All(conditions) | ToolCondition::Any(conditions) => {
+            for condition in conditions {
+                collect_tool_condition_aliases(condition, aliases);
+            }
+        }
+        ToolCondition::Not(condition) => collect_tool_condition_aliases(condition, aliases),
+        _ => {}
+    }
+}
+
+fn collect_state_aliases(config: &StateConfig, aliases: &mut BTreeSet<String>) {
+    fn collect_definition(definition: &StateDefinition, aliases: &mut BTreeSet<String>) {
+        insert_alias(aliases, definition.llm.as_ref());
+        for extractor in &definition.extract {
+            aliases.insert(extractor.llm.clone());
+        }
+        for action in definition
+            .on_enter
+            .iter()
+            .chain(&definition.on_reenter)
+            .chain(&definition.on_exit)
+        {
+            if let StateAction::Prompt { llm, .. } = action {
+                insert_alias(aliases, llm.as_ref());
+            }
+        }
+        for tool in definition.tools.iter().flatten() {
+            if let Some(condition) = tool.condition() {
+                collect_tool_condition_aliases(condition, aliases);
+            }
+        }
+        if let Some(reasoning) = definition.reasoning.as_ref() {
+            collect_reasoning_aliases(reasoning, aliases);
+        }
+        if let Some(reflection) = definition.reflection.as_ref() {
+            collect_reflection_aliases(reflection, aliases);
+        }
+        if let Some(process) = definition.process.as_ref() {
+            collect_process_aliases(process, aliases);
+        }
+        if let Some(concurrent) = definition.concurrent.as_ref() {
+            insert_alias(aliases, concurrent.aggregation.synthesizer_llm.as_ref());
+        }
+        if let Some(states) = definition.states.as_ref() {
+            for definition in states.values() {
+                collect_definition(definition, aliases);
+            }
+        }
+    }
+
+    for definition in config.states.values() {
+        collect_definition(definition, aliases);
+    }
+}
+
 impl Default for AgentSpec {
     fn default() -> Self {
         Self {
@@ -253,22 +400,53 @@ fn normalize_unknown_path(path: &str) -> String {
         .to_string()
 }
 
-fn unknown_fields_error(mut paths: Vec<String>) -> AgentError {
+fn format_paths(mut paths: Vec<String>) -> String {
     paths.sort();
     paths.dedup();
-    AgentError::InvalidSpec(format!("Unknown AgentSpec field(s): {}", paths.join(", ")))
+    paths
+        .iter()
+        .map(|path| format!("'{path}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unknown_fields_error(paths: Vec<String>) -> AgentError {
+    AgentError::InvalidSpec(format!(
+        "Unknown AgentSpec field(s): {}",
+        format_paths(paths)
+    ))
+}
+
+fn unknown_field_from_error(error: &str) -> Option<&str> {
+    error
+        .split_once("unknown field `")
+        .and_then(|(_, rest)| rest.split_once('`'))
+        .map(|(field, _)| field)
 }
 
 fn detailed_error_path(path: &str, error: &str) -> String {
-    let unknown_field = error
-        .split_once("unknown field `")
-        .and_then(|(_, rest)| rest.split_once('`'))
-        .map(|(field, _)| field);
-    match (path.is_empty(), unknown_field) {
-        (_, None) => path.to_string(),
-        (true, Some(field)) => field.to_string(),
-        (false, Some(field)) => format!("{path}.{field}"),
+    let Some(field) = unknown_field_from_error(error) else {
+        return path.to_string();
+    };
+    if path.is_empty() {
+        field.to_string()
+    } else if path == field || path.ends_with(&format!(".{field}")) {
+        path.to_string()
+    } else {
+        format!("{path}.{field}")
     }
+}
+
+fn serde_error_message(error: &serde_yaml::Error) -> String {
+    let message = error.to_string();
+    let Some(location) = error.location() else {
+        return message;
+    };
+    let suffix = format!(" at line {} column {}", location.line(), location.column());
+    message
+        .strip_suffix(&suffix)
+        .unwrap_or(&message)
+        .to_string()
 }
 
 fn collect_unsupported_yaml_keys(
@@ -313,6 +491,78 @@ fn collect_unsupported_yaml_keys(
 }
 
 impl AgentSpec {
+    pub(crate) fn referenced_llm_aliases(&self) -> BTreeSet<String> {
+        let mut aliases = BTreeSet::new();
+
+        if self.memory.memory_type == "compacting" {
+            insert_alias(&mut aliases, self.memory.summarizer_llm.as_ref());
+        }
+        if let Some(facts) = self.memory.facts.as_ref()
+            && facts.enabled
+        {
+            insert_alias(&mut aliases, facts.extractor_llm.as_ref());
+        }
+        if let Some(relationships) = self.memory.relationships.as_ref()
+            && relationships.enabled
+            && relationships.auto_update.enabled
+        {
+            insert_alias(&mut aliases, relationships.auto_update.llm.as_ref());
+        }
+
+        collect_reasoning_aliases(&self.reasoning, &mut aliases);
+        collect_reflection_aliases(&self.reflection, &mut aliases);
+        collect_process_aliases(&self.process, &mut aliases);
+        if let Some(states) = self.states.as_ref() {
+            collect_state_aliases(states, &mut aliases);
+        }
+
+        match &self.error_recovery.llm.on_failure {
+            LLMFailureAction::FallbackLlm { fallback_llm } => {
+                aliases.insert(fallback_llm.clone());
+            }
+            LLMFailureAction::Error | LLMFailureAction::FallbackResponse { .. } => {}
+        }
+        if let RateLimitAction::SwitchModel { fallback_llm } =
+            &self.error_recovery.llm.on_rate_limit
+        {
+            aliases.insert(fallback_llm.clone());
+        }
+        if let ContextOverflowAction::Summarize { summarizer_llm, .. } =
+            &self.error_recovery.llm.on_context_overflow
+        {
+            insert_alias(&mut aliases, summarizer_llm.as_ref());
+        }
+
+        if self.disambiguation.is_enabled() {
+            aliases.insert(self.disambiguation.detection.llm.clone());
+            insert_alias(&mut aliases, self.disambiguation.clarification.llm.as_ref());
+        }
+        if let Some(hitl) = self.hitl.as_ref()
+            && let Some(generate) = hitl.message_language.llm_generate.as_ref()
+        {
+            aliases.insert(generate.llm.clone());
+        }
+
+        for skill in &self.skills {
+            let SkillRef::Inline(skill) = skill else {
+                continue;
+            };
+            if let Some(reasoning) = skill.reasoning.as_ref() {
+                collect_reasoning_aliases(reasoning, &mut aliases);
+            }
+            if let Some(reflection) = skill.reflection.as_ref() {
+                collect_reflection_aliases(reflection, &mut aliases);
+            }
+            for step in &skill.steps {
+                if let SkillStep::Prompt { llm, .. } = step {
+                    insert_alias(&mut aliases, llm.as_ref());
+                }
+            }
+        }
+
+        aliases
+    }
+
     pub fn from_yaml_strict(yaml: &str) -> Result<Self> {
         let input_value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
         let mut unsupported_paths = Vec::new();
@@ -320,7 +570,7 @@ impl AgentSpec {
         if !unsupported_paths.is_empty() {
             return Err(AgentError::InvalidSpec(format!(
                 "Unsupported AgentSpec YAML key(s): {}",
-                unsupported_paths.join(", ")
+                format_paths(unsupported_paths)
             )));
         }
 
@@ -335,11 +585,21 @@ impl AgentSpec {
                 let detailed = serde_path_to_error::deserialize::<_, AgentSpec>(deserializer)
                     .map_err(|path_error| {
                         let path = normalize_unknown_path(&path_error.path().to_string());
-                        let error = path_error.inner().to_string();
+                        let error = path_error.inner();
+                        let message = serde_error_message(error);
+                        let detailed_path = detailed_error_path(&path, &message);
+                        let location = error
+                            .location()
+                            .map(|location| {
+                                format!(
+                                    " at line {}, column {}",
+                                    location.line(),
+                                    location.column()
+                                )
+                            })
+                            .unwrap_or_default();
                         AgentError::InvalidSpec(format!(
-                            "Invalid AgentSpec field at '{}': {}",
-                            detailed_error_path(&path, &error),
-                            error
+                            "Invalid AgentSpec field '{detailed_path}'{location}: {message}"
                         ))
                     });
                 return match detailed {
@@ -511,8 +771,12 @@ impl AgentSpec {
 mod tests {
     use super::*;
 
+    fn strict_error(yaml: &str) -> String {
+        AgentSpec::from_yaml_strict(yaml).unwrap_err().to_string()
+    }
+
     fn assert_unknown_path(yaml: &str, expected_path: &str) {
-        let error = AgentSpec::from_yaml_strict(yaml).unwrap_err().to_string();
+        let error = strict_error(yaml);
         assert!(error.contains(expected_path), "{error}");
     }
 
@@ -577,11 +841,142 @@ llm:
   model: llama3.1
   num_ctx: 8192
   keep_alive: 5m
+llms:
+  router:
+    provider: openai
+    model: gpt-4.1-nano
+    provider_extension: enabled
 "#;
         let spec = AgentSpec::from_yaml_strict(yaml).unwrap();
         let llm = spec.llm.as_config().unwrap();
         assert_eq!(llm.extra.get("num_ctx"), Some(&serde_json::json!(8192)));
         assert_eq!(llm.extra.get("keep_alive"), Some(&serde_json::json!("5m")));
+        assert_eq!(
+            spec.llms["router"].extra.get("provider_extension"),
+            Some(&serde_json::json!("enabled"))
+        );
+    }
+
+    #[test]
+    fn referenced_llm_aliases_use_typed_active_configuration() {
+        let yaml = r#"
+name: AliasAgent
+system_prompt: test
+llm:
+  provider: openai
+  model: test
+  extension:
+    llm: ignored_extension_value
+memory:
+  type: compacting
+  summarizer_llm: memory_summary
+  facts:
+    enabled: true
+    extractor_llm: fact_extract
+  relationships:
+    enabled: true
+    auto_update:
+      enabled: true
+      llm: relationship_eval
+reasoning:
+  mode: plan_and_execute
+  judge_llm: reasoning_judge
+  planning:
+    planner_llm: reasoning_plan
+reflection:
+  enabled: auto
+  evaluator_llm: reflection_eval
+process:
+  input:
+    - type: transform
+      config:
+        llm: process_transform
+states:
+  initial: active
+  states:
+    active:
+      llm: state_response
+      extract:
+        - key: value
+          description: value
+          llm: state_extract
+      concurrent:
+        agents: [worker]
+        aggregation:
+          strategy: llm_synthesis
+          synthesizer_llm: state_synthesis
+error_recovery:
+  llm:
+    on_failure:
+      action: fallback_llm
+      fallback_llm: recovery_fallback
+    on_rate_limit:
+      action: switch_model
+      fallback_llm: recovery_rate_limit
+    on_context_overflow:
+      action: summarize
+      summarizer_llm: recovery_summary
+disambiguation:
+  enabled: true
+  detection:
+    llm: disambiguation_detect
+  clarification:
+    llm: disambiguation_clarify
+hitl:
+  message_language:
+    strategy: llm_generate
+    llm_generate:
+      llm: hitl_generate
+skills:
+  - id: inline
+    description: inline
+    trigger: always
+    steps:
+      - prompt: test
+        llm: skill_prompt
+"#;
+        let spec = AgentSpec::from_yaml_strict(yaml).unwrap();
+
+        assert_eq!(
+            spec.referenced_llm_aliases(),
+            BTreeSet::from([
+                "disambiguation_clarify".to_string(),
+                "disambiguation_detect".to_string(),
+                "fact_extract".to_string(),
+                "hitl_generate".to_string(),
+                "memory_summary".to_string(),
+                "process_transform".to_string(),
+                "reasoning_judge".to_string(),
+                "reasoning_plan".to_string(),
+                "recovery_fallback".to_string(),
+                "recovery_rate_limit".to_string(),
+                "recovery_summary".to_string(),
+                "reflection_eval".to_string(),
+                "relationship_eval".to_string(),
+                "skill_prompt".to_string(),
+                "state_extract".to_string(),
+                "state_response".to_string(),
+                "state_synthesis".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_strict_yaml_reports_tagged_unknown_field_path() {
+        let yaml = "name: TestAgent\nsystem_prompt: test\nstorage:\n  type: redis\n  url: redis://localhost:6379\n  ttl_second: 60\n";
+        assert_unknown_path(yaml, "storage.ttl_second");
+    }
+
+    #[test]
+    fn test_strict_yaml_reports_untagged_selector_unknown_field_path() {
+        let yaml = "name: TestAgent\nsystem_prompt: test\nllm:\n  defualt: default\n";
+        assert_unknown_path(yaml, "llm.defualt");
+    }
+
+    #[test]
+    fn test_strict_yaml_reports_untagged_template_unknown_field_path() {
+        let yaml = "name: TestAgent\nsystem_prompt: test\nspawner:\n  templates:\n    npc:\n      pat: child.yaml\n";
+        assert_unknown_path(yaml, "spawner.templates.npc.pat");
     }
 
     #[test]

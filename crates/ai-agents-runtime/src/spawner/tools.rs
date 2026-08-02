@@ -412,7 +412,6 @@ impl Tool for ListAgentsTool {
 /// Tool that removes an agent from the registry by ID.
 pub struct RemoveAgentTool {
     registry: Arc<AgentRegistry>,
-    spawner: Option<Arc<AgentSpawner>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -424,16 +423,7 @@ struct RemoveAgentInput {
 
 impl RemoveAgentTool {
     pub fn new(registry: Arc<AgentRegistry>) -> Self {
-        Self {
-            registry,
-            spawner: None,
-        }
-    }
-
-    /// If provided, the spawner's agent count is decremented on removal.
-    pub fn with_spawner(mut self, spawner: Arc<AgentSpawner>) -> Self {
-        self.spawner = Some(spawner);
-        self
+        Self { registry }
     }
 }
 
@@ -462,12 +452,7 @@ impl Tool for RemoveAgentTool {
         };
 
         match self.registry.remove(id).await {
-            Some(removed) => {
-                if let Some(ref spawner) = self.spawner {
-                    spawner.notify_agent_removed();
-                }
-                ToolResult::ok(json!({"removed": true, "id": removed.id}).to_string())
-            }
+            Some(removed) => ToolResult::ok(json!({"removed": true, "id": removed.id}).to_string()),
             None => ToolResult::error(format!("agent not found: {}", id)),
         }
     }

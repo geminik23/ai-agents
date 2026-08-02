@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ai_agents_core::{
     ChatMessage, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
-    LLMResponse, TaskContext, ToolSelection,
+    LLMResponse, LLMToolRequest, TaskContext, ToolChoice, ToolSelection,
 };
 
 use super::capability::DefaultLLMCapability;
@@ -104,6 +104,25 @@ impl LLMProvider for MultiLLMRouter {
         self.primary.complete(messages, config).await
     }
 
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        self.primary
+            .complete_with_tools(messages, config, request)
+            .await
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.primary.configured_tool_choice()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.primary.supports_tool_choice(choice)
+    }
+
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
@@ -181,7 +200,7 @@ impl LLMCapability for MultiLLMRouter {
 mod tests {
     use super::*;
     use crate::mock::MockLLMProvider;
-    use ai_agents_core::{FinishReason, Role};
+    use ai_agents_core::{FinishReason, LLMToolDefinition, LLMToolRequest, Role, ToolChoice};
     use std::collections::HashMap;
 
     #[tokio::test]
@@ -200,6 +219,30 @@ mod tests {
 
         let response = router.complete(&messages, None).await.unwrap();
         assert_eq!(response.content, "Hello from primary");
+    }
+
+    #[tokio::test]
+    async fn test_router_delegates_native_tool_methods() {
+        let mut primary = MockLLMProvider::new("primary");
+        primary.add_response(LLMResponse::new("No call", FinishReason::Stop));
+        let history = primary.clone();
+        let router = MultiLLMRouter::new(Arc::new(primary));
+        let request = LLMToolRequest {
+            tools: vec![LLMToolDefinition {
+                name: "calculator".to_string(),
+                description: "Calculate an expression".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            choice: ToolChoice::Auto,
+        };
+
+        router
+            .complete_with_tools(&[ChatMessage::user("Hello")], None, &request)
+            .await
+            .unwrap();
+
+        assert!(router.supports_tool_choice(&ToolChoice::Required));
+        assert_eq!(history.last_call().unwrap().request, Some(request));
     }
 
     #[tokio::test]

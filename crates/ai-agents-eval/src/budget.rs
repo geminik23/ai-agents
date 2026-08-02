@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use ai_agents_core::{
-    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, TokenUsage,
+    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    LLMToolRequest, TokenUsage, ToolChoice,
 };
 use ai_agents_observability::{CostEstimator, ObservationTokenUsage, TokenUsageSource};
 use async_trait::async_trait;
@@ -111,7 +112,18 @@ impl ScenarioBudgetTracker {
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<BudgetReservation, LLMError> {
-        let input_tokens = upper_bound_message_tokens(messages);
+        self.reserve_with_additional_input(provider, messages, config, 0)
+    }
+
+    fn reserve_with_additional_input(
+        &self,
+        provider: &BudgetProviderConfig,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        additional_input_tokens: u64,
+    ) -> Result<BudgetReservation, LLMError> {
+        let input_tokens =
+            upper_bound_message_tokens(messages).saturating_add(additional_input_tokens);
         let output_tokens = config
             .and_then(|config| config.max_tokens)
             .unwrap_or(provider.max_output_tokens) as u64;
@@ -303,6 +315,47 @@ impl LLMProvider for BudgetedLlmProvider {
         }
     }
 
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        let request_tokens = upper_bound_tool_request_tokens(request);
+        let reservation = self.tracker.reserve_with_additional_input(
+            &self.provider,
+            messages,
+            config,
+            request_tokens,
+        )?;
+        let mut pending = PendingBudgetReservation::new(self.tracker.clone(), reservation);
+        match self
+            .inner
+            .complete_with_tools(messages, config, request)
+            .await
+        {
+            Ok(response) => {
+                let usage = response
+                    .usage
+                    .unwrap_or_else(|| estimate_tool_usage(messages, request, &response));
+                pending.finish(&self.provider, usage)?;
+                Ok(response)
+            }
+            Err(error) => {
+                pending.finish_unknown();
+                Err(error)
+            }
+        }
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.inner.configured_tool_choice()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.inner.supports_tool_choice(choice)
+    }
+
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
@@ -405,6 +458,12 @@ impl Drop for BudgetedLlmStream {
     }
 }
 
+fn upper_bound_tool_request_tokens(request: &LLMToolRequest) -> u64 {
+    serde_json::to_vec(request)
+        .map(|encoded| encoded.len() as u64)
+        .unwrap_or(u64::MAX)
+}
+
 fn upper_bound_message_tokens(messages: &[ChatMessage]) -> u64 {
     messages.iter().fold(0_u64, |total, message| {
         total
@@ -426,6 +485,30 @@ fn estimate_chars(chars: usize) -> u64 {
 fn estimate_usage(messages: &[ChatMessage], output: &str) -> TokenUsage {
     let prompt_tokens = estimate_message_tokens(messages).min(u32::MAX as u64) as u32;
     let completion_tokens = estimate_chars(output.chars().count()).min(u32::MAX as u64) as u32;
+    TokenUsage::new(prompt_tokens, completion_tokens)
+}
+
+fn estimate_tool_usage(
+    messages: &[ChatMessage],
+    request: &LLMToolRequest,
+    response: &LLMResponse,
+) -> TokenUsage {
+    let request_chars = serde_json::to_string(request)
+        .map(|encoded| encoded.chars().count())
+        .unwrap_or(usize::MAX);
+    let response_chars = response.content.chars().count().saturating_add(
+        response
+            .tool_calls()
+            .ok()
+            .flatten()
+            .and_then(|calls| serde_json::to_string(&calls).ok())
+            .map(|encoded| encoded.chars().count())
+            .unwrap_or(0),
+    );
+    let prompt_tokens = estimate_message_tokens(messages)
+        .saturating_add(estimate_chars(request_chars))
+        .min(u32::MAX as u64) as u32;
+    let completion_tokens = estimate_chars(response_chars).min(u32::MAX as u64) as u32;
     TokenUsage::new(prompt_tokens, completion_tokens)
 }
 
@@ -548,6 +631,79 @@ mod tests {
         let error = second.complete(&messages, None).await.unwrap_err();
         assert!(error.to_string().contains("max_llm_calls=1"));
         assert!(tracker.has_failed());
+    }
+
+    #[tokio::test]
+    async fn native_tool_calls_use_the_same_call_budget() {
+        let tracker = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_llm_calls: Some(1),
+                ..Default::default()
+            },
+            None,
+        );
+        let mut native = MockLLMProvider::new("native-budget-test");
+        native.add_response(
+            LLMResponse::new("", FinishReason::ToolCall)
+                .with_tool_calls(vec![ai_agents_core::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "calculator".to_string(),
+                    arguments: serde_json::json!({"expression": "2 + 2"}),
+                }])
+                .unwrap(),
+        );
+        let wrapped = tracker.wrap(Arc::new(native), provider_config());
+        let request = LLMToolRequest {
+            tools: vec![ai_agents_core::LLMToolDefinition {
+                name: "calculator".to_string(),
+                description: "Calculate".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            choice: ToolChoice::Required,
+        };
+        let messages = [ChatMessage::user("calculate")];
+
+        assert!(
+            wrapped
+                .complete_with_tools(&messages, None, &request)
+                .await
+                .is_ok()
+        );
+        let error = wrapped
+            .complete_with_tools(&messages, None, &request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("max_llm_calls=1"));
+    }
+
+    #[tokio::test]
+    async fn native_tool_schema_is_reserved_before_provider_call() {
+        let tracker = ScenarioBudgetTracker::new(
+            ScenarioBudget {
+                max_total_tokens: Some(100),
+                ..Default::default()
+            },
+            None,
+        );
+        let native = MockLLMProvider::new("native-schema-budget-test");
+        let observed = native.clone();
+        let wrapped = tracker.wrap(Arc::new(native), provider_config());
+        let request = LLMToolRequest {
+            tools: vec![ai_agents_core::LLMToolDefinition {
+                name: "large_tool".to_string(),
+                description: "x".repeat(200),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            choice: ToolChoice::Auto,
+        };
+
+        let error = wrapped
+            .complete_with_tools(&[ChatMessage::user("use it")], None, &request)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("projected reserved total"));
+        assert_eq!(observed.call_count(), 0);
     }
 
     #[tokio::test]

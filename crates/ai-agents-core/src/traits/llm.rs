@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 use crate::message::ChatMessage;
-use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse};
+use crate::types::{LLMChunk, LLMConfig, LLMFeature, LLMResponse, LLMToolRequest, ToolChoice};
 
 /// Core LLM provider trait.
 ///
@@ -21,6 +21,29 @@ pub trait LLMProvider: Send + Sync {
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<LLMResponse, LLMError>;
+
+    /// Send messages with provider-native tool definitions.
+    async fn complete_with_tools(
+        &self,
+        _messages: &[ChatMessage],
+        _config: Option<&LLMConfig>,
+        _request: &LLMToolRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        Err(LLMError::Other(format!(
+            "provider '{}' does not support native tool completion",
+            self.provider_name()
+        )))
+    }
+
+    /// Returns a provider-level tool choice override when configured.
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        None
+    }
+
+    /// Reports whether this provider can enforce a native tool choice.
+    fn supports_tool_choice(&self, _choice: &ToolChoice) -> bool {
+        false
+    }
 
     /// Send messages and get a streaming response.
     async fn complete_stream(
@@ -121,5 +144,62 @@ pub enum LLMError {
 impl From<serde_json::Error> for LLMError {
     fn from(err: serde_json::Error) -> Self {
         LLMError::Serialization(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::FinishReason;
+
+    struct LegacyProvider;
+
+    #[async_trait]
+    impl LLMProvider for LegacyProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<LLMResponse, LLMError> {
+            Ok(LLMResponse::new("legacy", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Ok(Box::new(futures::stream::empty()))
+        }
+
+        fn provider_name(&self) -> &str {
+            "legacy"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn additive_tool_methods_preserve_legacy_implementations() {
+        let provider = LegacyProvider;
+        let request = LLMToolRequest {
+            tools: Vec::new(),
+            choice: ToolChoice::Auto,
+        };
+
+        assert!(provider.configured_tool_choice().is_none());
+        assert!(!provider.supports_tool_choice(&ToolChoice::Auto));
+        let error = futures::executor::block_on(provider.complete_with_tools(&[], None, &request))
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not support native tool completion")
+        );
     }
 }

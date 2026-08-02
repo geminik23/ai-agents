@@ -124,7 +124,8 @@ pub mod hooks {
 pub mod llm {
     pub use ai_agents_core::{
         ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
-        LLMProvider, LLMResponse, Role, TaskContext, TokenUsage, ToolSelection,
+        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, Role, TaskContext, TokenUsage,
+        ToolChoice, ToolSelection,
     };
     pub use ai_agents_llm::LLMRegistry;
     pub use ai_agents_llm::multi::MultiLLMRouter;
@@ -206,7 +207,8 @@ pub mod persistence {
     use std::sync::Arc;
 
     pub use ai_agents_core::{
-        AgentSnapshot, AgentStorage, MemorySnapshot, Result, SpawnedAgentEntry,
+        AgentSnapshot, AgentStorage, MemorySnapshot, NoopStorage, Result, SpawnedAgentEntry,
+        StorageCapability,
     };
     #[cfg(feature = "sqlite")]
     pub use ai_agents_storage::SqliteStorage;
@@ -259,12 +261,13 @@ pub mod skill {
 pub mod spec {
     pub use ai_agents_observability::ObservabilityConfig;
     pub use ai_agents_runtime::spec::{
-        AgentSpec, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle, CliMetadata,
-        CliPromptStyle, FileStorageConfig, LLMConfig, LLMSelector, MemoryConfig,
+        AgentSpec, AutoSpawnEntry, BuiltinProviderConfig, CliHitlMetadata, CliHitlStyle,
+        CliMetadata, CliPromptStyle, FileStorageConfig, LLMConfig, LLMConfigOrSelector,
+        LLMSelector, ManagementToolsConfig, MemoryConfig, OrchestrationToolsConfig,
         ProviderPolicyConfig, ProviderSecurityConfig, ProvidersConfig, RedisStorageConfig,
-        RuntimeConfig, SpawnerConfig, SqliteStorageConfig, StorageConfig, StructuredToolEntry,
-        ToolAliasesConfig, ToolConfig, ToolEntry, ToolPolicyConfig, YamlProviderConfig,
-        YamlToolConfig,
+        RuntimeConfig, SpawnerConfig, SpawnerToolGrantConfig, SqliteStorageConfig, StorageConfig,
+        StructuredToolEntry, TemplateSource, ToolAliasesConfig, ToolConfig, ToolEntry,
+        ToolPolicyConfig, YamlProviderConfig, YamlToolConfig,
     };
 }
 
@@ -451,19 +454,21 @@ pub mod tools {
     };
     pub use ai_agents_tools::{
         AskUserTool, CalculatorTool, CommandRequest, CommandResponse, CommandRunner,
-        CommandRunnerSlot, CommandTool, ConditionEvaluator, DateTimeTool, DiagnosticItem,
-        DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
-        DiagnosticsResponse, DiagnosticsTool, EchoTool, EvaluationContext, FileEditTool,
-        FileInfoTool, FileListTool, FileReadTool, FileTool, FileVersionEvidence, FileVersionStore,
-        FileWriteTool, GitDiffTool, GitStatusTool, GlobTool, GrepTool, JsonTool, LLMGetter,
-        MathTool, PatchTool, ProcessCommandRunner, ProviderHealth, QuestionHandler,
-        QuestionHandlerSlot, QuestionRequest, QuestionResponse, RandomTool, ResolvedTool,
-        SimpleLLMGetter, SleepTool, StaticCommandRunner, StaticDiagnosticsProvider, TemplateTool,
-        TextTool, TodoItem, TodoStatus, TodoStore, TodoTool, ToolAliases, ToolCallRecord,
-        ToolContext, ToolDescriptor, ToolIdentity, ToolMetadata, ToolProvider, ToolProviderError,
-        ToolProviderType, ToolRegistry, TrustLevel, UnavailableCommandRunner,
-        UnavailableDiagnosticsProvider, WebFetchTool, create_builtin_registry,
-        file_version_evidence,
+        CommandRunnerSlot, CommandTool, ConditionEvaluator, CopyPathTool, DateTimeTool,
+        DeletePathTool, DiagnosticItem, DiagnosticSeverity, DiagnosticsProvider,
+        DiagnosticsProviderSlot, DiagnosticsRequest, DiagnosticsResponse, DiagnosticsTool,
+        EchoTool, EvaluationContext, FileEditTool, FileInfoTool, FileListTool, FileReadTool,
+        FileTool, FileVersionEvidence, FileVersionStore, FileWriteTool, GitDiffTool, GitStatusTool,
+        GlobTool, GrepTool, JsonTool, LLMGetter, MathTool, MovePathTool, PatchTool,
+        ProcessCommandRunner, ProviderHealth, QuestionHandler, QuestionHandlerSlot,
+        QuestionRequest, QuestionResponse, RandomTool, ResolvedTool, SimpleLLMGetter, SleepTool,
+        StaticCommandRunner, StaticDiagnosticsProvider, TemplateTool, TextTool, TodoItem,
+        TodoStatus, TodoStore, TodoTool, ToolAliases, ToolCallRecord, ToolContext, ToolDescriptor,
+        ToolError, ToolIdentity, ToolMetadata, ToolProvider, ToolProviderError, ToolProviderType,
+        ToolRegistry, ToolSchemaPromptMode, TrustLevel, UnavailableCommandRunner,
+        UnavailableDiagnosticsProvider, WebFetchTool, WebSearchProvider, WebSearchProviderSlot,
+        WebSearchRequest, WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch,
+        WebSearchTool, create_builtin_registry, file_version_evidence,
     };
     pub use ai_agents_tools::{HttpTool, generate_schema};
 }
@@ -551,7 +556,10 @@ pub use tools::{
 };
 
 pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
-pub use llm::{ChatMessage, LLMProvider, LLMRegistry, LLMResponse, MultiLLMRouter, Role};
+pub use llm::{
+    ChatMessage, LLMProvider, LLMRegistry, LLMResponse, LLMToolDefinition, LLMToolRequest,
+    MultiLLMRouter, Role, ToolChoice,
+};
 
 pub use process::{ProcessConfig, ProcessData, ProcessProcessor};
 pub use recovery::{

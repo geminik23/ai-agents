@@ -2,9 +2,9 @@ name: MathAndRandomAgent
 version: "1.0.0"
 description: "Statistical math operations and random value generation"
 
-# NOTE: Do NOT list tool names or descriptions here.
-# The framework auto-injects all tool names, descriptions, and argument schemas
-# into the prompt at runtime via generate_tools_prompt().
+# The required choice makes the first model decision use at least one granted tool.
+# Native-capable providers receive schemas through their request; other providers use one bounded prompt correction.
+# Flow: user input -> required tool selection -> shared tool executor -> final response
 system_prompt: |
   You are a math and statistics assistant.
   Use tools for all numerical analysis — do not estimate or approximate.
@@ -14,6 +14,7 @@ system_prompt: |
 llm:
   provider: openai
   model: gpt-5.4-mini
+  tool_choice: required
 
 tools:
   - name: math

@@ -16,9 +16,21 @@ settings:
   seed: 1
   timeout_per_turn_ms: 60000
   timeout_per_scenario_ms: 120000
-  retries: 1
+  retries: 0
   retry_delay_ms: 1000
   isolation: scenario
+
+observability:
+  enabled: true
+  latency:
+    track_llm: true
+  cost:
+    enabled: true
+    pricing_file: ../../../../yaml/observability/pricing.yaml
+    unknown_price_policy: error
+  export:
+    formats: [json]
+    write_report: false
 
 fixtures:
   llm:
@@ -29,6 +41,10 @@ scenarios:
     name: Real model uses math
     tags: [live, examples, yaml, tools, utility, real-llm, math]
     language: en
+    budget:
+      max_llm_calls: 3
+      max_total_tokens: 15000
+      max_cost_usd: 0.02
     turns:
       - input: "Before answering, call the math tool to compute the average of [10, 20, 30, 40, 50]. Report the result as Average: <value>."
         assert:
@@ -53,6 +69,10 @@ scenarios:
     name: Real model uses random
     tags: [live, examples, yaml, tools, utility, real-llm, random]
     language: en
+    budget:
+      max_llm_calls: 3
+      max_total_tokens: 15000
+      max_cost_usd: 0.02
     turns:
       - input: "Before answering, call the random tool to generate one UUID, and include the word UUID in the answer."
         assert:

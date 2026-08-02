@@ -3,33 +3,34 @@
 ## Unreleased
 
 ### Added
-- HITL evaluation: deterministic approval fixtures support approve, reject, modify, timeout, unavailable, and localized decisions without human input
-- Approval assertions: eval suites can verify triggers, raw and effective decisions, localized messages, modified arguments, and execution outcomes
-- Eval isolation: each attempt receives isolated workspace and storage values that fixtures can use without touching configured source paths
-- Eval network fixtures: real HTTP and web fetch behavior can run through attempt-local or no-socket routes while retaining security checks
-- LLM eval evidence: sequenced provider outcomes and non-serializing request assertions verify retry, memory, persona, and reasoning behavior
-- Plan eval evidence: plan-and-execute tool steps expose a distinct plan source, and tool assertions bind all predicates to one execution record
-- Live persistence evaluation: reset steps preserve attempt-local storage and actor identity so suites can prove cross-runtime fact reuse and multi-actor isolation
-- Live example evaluation: opt-in provider smoke suites cover skills, disambiguation, memory, sessions, personas, relationships, public reasoning outcomes, observability, and bounded recovery
-- Eval provider budgets: scenarios can enforce shared hard limits for LLM calls, tokens, and configured provider cost across aliases, resets, and retries
-- Bounded live workflows: provider smoke coverage includes pre-response routing, buffered streaming, and the fixed writer-reviewer-editor pipeline
-- Eval attempt cleanup: runner-owned temporary workspaces are removed after completion, failure, or cancellation
-- Mutation evidence: filesystem mutation results expose `mutation_performed`, while past-tense effect fields are true only when the operation changed the filesystem
+- HITL evaluation: deterministic fixtures and assertions cover approval, rejection, modification, timeout, unavailable handlers, localized prompts, and execution outcomes
+- Eval isolation: each attempt receives isolated workspace and storage values without touching configured source paths
+- Eval network fixtures: real HTTP and web fetch behavior can use attempt-local or no-socket routes while retaining security checks
+- LLM eval evidence: sequenced outcomes and request assertions cover retry, memory, persona, reasoning, and plan execution without serializing sensitive requests
+- Eval provider budgets: scenarios enforce shared limits for LLM calls, tokens, and configured provider cost across aliases, resets, and retries
+- Eval attempt cleanup: runner-owned temporary workspaces are removed after completion, failure, timeout, or cancellation
+- Mutation evidence: filesystem mutations report whether an operation was performed and keep planned effects separate from applied effects
+- Storage capabilities: backends report supported persistence behavior and unsupported operations fail explicitly instead of returning successful empty results
+- Tool choice: optional auto, required, specific, and none selection uses native provider requests where available and one bounded prompt correction elsewhere
 
 ### Changed
-- Evaluation fixtures: mocked built-in tools preserve their schemas, safety classification, and policy behavior while replacing external execution
-- Evaluation errors: failed turns retain partial responses and structural evidence, with explicit expected-error matching for intentional failures
-- Agent construction: rewritten specifications retain their original resource directory for relative skills, templates, and spawned agents
-- Skill responses: successful skill routes preserve the selected skill ID in response metadata for eval and host observability
-- Disambiguation detection: the router prompt defines confidence as intent clarity, preserves raw structured detector evidence, and applies effective skill/state/base thresholds consistently
-- State lifecycle: first arrival at a transition target runs `on_enter`; later returns use `on_reenter`
-- Live web-search safety: fallback WebFetch remains no-socket and suggestion-only when the search provider is unavailable
-- Live mutation evidence: dry-run suites require one total mutation call and mandatory no-apply disclosure so an extra unsafe attempt cannot be masked
-- Rust context injection: callback providers register by the YAML callback name so per-turn values are rendered into the request
-- YAML validation: fixed framework-owned agent and eval objects reject unknown fields while documented provider and compatibility extension data remains supported
-- Evaluation safety: empty assertions and zero selections fail, numeric bounds require numbers, replay misses error, and real or record modes require explicit CLI authorization
-- Mutation defaults: filesystem mutation tools execute when `dry_run` is omitted; callers request review-only behavior explicitly with `dry_run: true`
-- Compacting memory: recent-message retention is enforced with deterministic batch-progress clamping, serialized mutations, and snapshot-preserved summary accounting
+- Evaluation execution: mocked built-in tools retain their schemas and safety behavior, while failed turns preserve partial responses and structural evidence
+- YAML and eval validation: fixed framework objects reject unknown fields, empty assertions and zero selections fail, replay misses error, and provider-backed modes require authorization
+- Agent and spawner construction: rewritten specs retain resource directories, shared providers remain authoritative, and all child paths use fail-closed admission and capacity checks
+- Skill and routing results: successful skills retain their selected identity, and disambiguation applies intent clarity and effective subsystem thresholds consistently
+- State lifecycle: first arrival runs entry behavior and later returns run reentry behavior
+- Context and web fallback: callback context resolves by its YAML name, and unavailable web search remains no-socket and suggestion-only
+- Mutation and memory defaults: filesystem mutations execute unless preview is explicit, while compacting memory enforces recent retention with deterministic progress
+- Storage and restore contracts: backend tiers are explicit, namespaced data remains isolated and migratable, and parent-child topology commits or rolls back with session identity
+- API compatibility: framework errors are non-exhaustive, invalid child prefixes fail during configuration, and detached child records require explicit construction
+
+### Fixed
+- Storage readiness: blocking and streaming turns stop before execution when configured persistence capabilities are unavailable
+- Namespaced persistence: filtering, deletion, actor data, and legacy sessions no longer leak, collide, or silently lose scoped data
+- SQLite consistency: snapshots, metadata, tags, and privacy deletion commit atomically and survive reopen
+- Redis session indexes: expiration, ownership changes, deletion, and legacy migration remain consistent under one server-side boundary
+- Filesystem replacement: committed copy and move replacements report truthful mutation evidence when backup cleanup fails
+- Speculative streaming: cancelled provider branches are dropped before committed redispatch so they cannot retain shared provider resources
 
 ## 1.0.0-rc.16
 

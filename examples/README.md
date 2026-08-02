@@ -70,7 +70,7 @@ cargo run -p ai-agents-cli -- eval \
 
 Live suites under `eval/live/examples/` drive runnable YAML examples with a real provider and combine meaningful response checks with structural evidence for tools, skills, threshold-aware disambiguation, cross-runtime fact persistence, multi-actor isolation, public plan-and-execute outcomes, exact state lifecycle behavior, observability, recovery, context injection, and input/output processing. External dependencies remain read-only, fixture-backed, no-socket, or dry-run-only. These suites require provider credentials, may incur cost, and are intended for intentional release smoke checks rather than default no-key CI.
 
-Semantic or judge-based live checks live under `eval/live/quality/` so they do not mix with example smoke checks.
+Semantic or judge-based live checks live under `eval/live/quality/` so they do not mix with example smoke checks. The live example helper intentionally excludes that quality directory. Structural tool-execution suites use explicit required tool choice and `executed: true` evidence; automatic tool discovery remains provider/model quality evidence.
 
 See `eval/live/README.md` for the full registry, risk tags, status vocabulary, category helper, and run commands.
 
@@ -203,8 +203,8 @@ Top-level `tools:` is an explicit ordinary-tool grant. Omitted or empty top-leve
 | `move_review.yaml` | Move or rename a file or directory with `move_path`, dry-run review, and source/destination policy |
 | `delete_review.yaml` | Delete a file or directory with `delete_path`, recursive-delete gating, dry-run review, and explicit write policy |
 | `web_search_research.yaml` | Provider-neutral web search through a host-provided search provider with `web_fetch` fallback when no provider is installed |
-| `math_and_random.yaml` | Statistical math and random value generation |
-| `multi_tool_agent.yaml` | Selected general-purpose built-ins with parallel execution |
+| `math_and_random.yaml` | Statistical math and random value generation with required tool selection |
+| `multi_tool_agent.yaml` | Selected general-purpose built-ins with parallel execution and required tool selection |
 | `http_tool.yaml` | Raw HTTP API client tool for external API calls (makes real network requests) |
 | `mcp_agent.yaml` | MCP-backed filesystem tool with views - one MCP server scoped into `fs_read` and `fs_write` view tools for per-state least-privilege access |
 

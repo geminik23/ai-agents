@@ -1,8 +1,6 @@
 use std::io::{self, Write};
-use std::sync::Arc;
 
 use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
-use ai_agents::spec::AgentSpec;
 use ai_agents::{Agent, AgentResponse, RuntimeAgent, StreamChunk};
 use futures::StreamExt;
 use serde_json;
@@ -606,98 +604,23 @@ impl CliRepl {
     }
 
     async fn load_all(&self, name: &str) {
-        // Peek at the parent snapshot to read the registry manifest before restoring.
-        let manifest = {
-            let storage = match self.agent.storage() {
-                Some(s) => s,
-                None => {
-                    eprintln!("No storage available.");
-                    return;
-                }
-            };
-            match storage.load(name).await {
-                Ok(Some(snapshot)) => snapshot.spawned_agents.clone(),
-                Ok(None) => {
-                    eprintln!("Session '{}' not found.", name);
-                    return;
-                }
-                Err(e) => {
-                    eprintln!("[Error] Failed to load session: {}", e);
-                    return;
-                }
+        match self.restore_all(name).await {
+            Ok(child_count) if child_count > 0 => {
+                println!(
+                    "Loaded session '{}' (parent + {} agents)",
+                    name, child_count
+                );
             }
-        };
-
-        // Restore parent state.
-        match self.agent.load_session(name).await {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("Session '{}' not found.", name);
-                return;
-            }
-            Err(e) => {
-                eprintln!("[Error] Failed to load parent session: {}", e);
-                return;
-            }
+            Ok(_) => println!("Loaded session '{}'", name),
+            Err(error) => eprintln!("[Error] Session '{}' was not restored: {}", name, error),
         }
+    }
 
-        // Recreate spawned agents from manifest.
-        let mut child_count = 0;
-        if let (Some(entries), Some(spawner), Some(registry)) = (
-            manifest,
-            self.agent.spawner(),
-            self.agent.spawner_registry(),
-        ) {
-            for entry in &entries {
-                // If agent already exists in registry, just restore its session.
-                if let Some(agent) = registry.get(&entry.id) {
-                    let _ = agent.init_storage().await;
-                    let _ = agent.load_session(name).await;
-                    child_count += 1;
-                    continue;
-                }
-
-                // Recreate from saved spec YAML with the original agent ID.
-                let spec = match AgentSpec::from_yaml_strict(&entry.spec_yaml) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("  [Warn] Failed to parse spec for {}: {}", entry.id, e);
-                        continue;
-                    }
-                };
-                match spawner.spawn_with_id(entry.id.clone(), spec).await {
-                    Ok(agent) => {
-                        let agent_handle = Arc::clone(&agent.agent);
-                        let agent_id = agent.id.clone();
-                        if let Err(e) = registry.register(agent).await {
-                            eprintln!("  [Warn] Failed to register {}: {}", entry.id, e);
-                            continue;
-                        }
-                        // Restore child's session from NamespacedStorage.
-                        let _ = agent_handle.init_storage().await;
-                        match agent_handle.load_session(name).await {
-                            Ok(_) => child_count += 1,
-                            Err(e) => {
-                                eprintln!("  [Warn] Failed to restore {}: {}", agent_id, e);
-                                child_count += 1;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("  [Warn] Failed to recreate {}: {}", entry.id, e);
-                    }
-                }
-            }
-        }
-
-        if child_count > 0 {
-            println!(
-                "Loaded session '{}' (parent + {} agents)",
-                name, child_count
-            );
-        } else {
-            println!("Loaded session '{}'", name);
-        }
+    async fn restore_all(&self, name: &str) -> Result<usize, String> {
+        self.agent
+            .restore_session_full(name)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn load_self(&self, name: &str) {

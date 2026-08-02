@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use ai_agents_core::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
-    TokenUsage,
+    LLMToolRequest, TokenUsage, ToolChoice,
 };
 
 /// Mock LLM provider for testing
@@ -26,12 +26,15 @@ struct MockLLMProviderInner {
     error_message: String,
     latency_ms: u64,
     features: Vec<LLMFeature>,
+    tool_choice: Option<ToolChoice>,
+    native_tool_support: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct MockCall {
     pub messages: Vec<ChatMessage>,
     pub config: Option<LLMConfig>,
+    pub request: Option<LLMToolRequest>,
     pub timestamp: std::time::Instant,
 }
 
@@ -49,6 +52,8 @@ impl MockLLMProvider {
                 error_message: "Mock error".to_string(),
                 latency_ms: 0,
                 features: vec![LLMFeature::Streaming, LLMFeature::SystemMessages],
+                tool_choice: None,
+                native_tool_support: true,
             })),
         }
     }
@@ -100,6 +105,14 @@ impl MockLLMProvider {
         inner.latency_ms = latency_ms;
     }
 
+    pub fn set_tool_choice(&mut self, choice: Option<ToolChoice>) {
+        self.inner.write().tool_choice = choice;
+    }
+
+    pub fn set_native_tool_support(&mut self, supported: bool) {
+        self.inner.write().native_tool_support = supported;
+    }
+
     pub fn call_count(&self) -> usize {
         self.inner.read().call_history.len()
     }
@@ -127,6 +140,8 @@ impl MockLLMProvider {
         inner.should_error = false;
         inner.error_message = "Mock error".to_string();
         inner.latency_ms = 0;
+        inner.tool_choice = None;
+        inner.native_tool_support = true;
     }
 
     fn get_next_response(&self) -> LLMResponse {
@@ -171,11 +186,17 @@ impl MockLLMProvider {
         }
     }
 
-    fn record_call(&self, messages: &[ChatMessage], config: Option<&LLMConfig>) {
+    fn record_call(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: Option<&LLMToolRequest>,
+    ) {
         let mut inner = self.inner.write();
         inner.call_history.push(MockCall {
             messages: messages.to_vec(),
             config: config.cloned(),
+            request: request.cloned(),
             timestamp: std::time::Instant::now(),
         });
     }
@@ -192,6 +213,23 @@ impl MockLLMProvider {
         let total_chars: usize = messages.iter().map(|m| m.content.len()).sum();
         (total_chars / 4) as u32
     }
+
+    fn validate_tool_response(response: &LLMResponse, choice: &ToolChoice) -> Result<(), LLMError> {
+        let calls = response.tool_calls()?.unwrap_or_default();
+        if calls.is_empty() && matches!(choice, ToolChoice::Required | ToolChoice::Specific(_)) {
+            return Err(LLMError::Other(
+                "Mock provider protocol error: required tool choice returned no calls".to_string(),
+            ));
+        }
+        if let ToolChoice::Specific(expected) = choice {
+            if calls.iter().any(|call| call.name != *expected) {
+                return Err(LLMError::Other(format!(
+                    "Mock provider protocol error: expected tool '{expected}'"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for MockLLMProvider {
@@ -207,7 +245,7 @@ impl LLMProvider for MockLLMProvider {
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<LLMResponse, LLMError> {
-        self.record_call(messages, config);
+        self.record_call(messages, config, None);
         self.simulate_latency().await;
 
         let should_error = self.inner.read().should_error;
@@ -227,13 +265,38 @@ impl LLMProvider for MockLLMProvider {
         Ok(response)
     }
 
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        self.record_call(messages, config, Some(request));
+        self.simulate_latency().await;
+
+        let should_error = self.inner.read().should_error;
+        if should_error {
+            let error_message = self.inner.read().error_message.clone();
+            return Err(LLMError::Other(error_message));
+        }
+
+        let mut response = self.get_next_response();
+        Self::validate_tool_response(&response, &request.choice)?;
+        if response.usage.is_none() {
+            let prompt_tokens = Self::estimate_tokens(messages);
+            let completion_tokens = (response.content.len() / 4) as u32;
+            response.usage = Some(TokenUsage::new(prompt_tokens, completion_tokens));
+        }
+        Ok(response)
+    }
+
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
     {
-        self.record_call(messages, config);
+        self.record_call(messages, config, None);
         self.simulate_latency().await;
 
         let should_error = self.inner.read().should_error;
@@ -277,6 +340,21 @@ impl LLMProvider for MockLLMProvider {
 
     fn provider_name(&self) -> &str {
         "mock"
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.inner.read().tool_choice.clone()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.inner.read().native_tool_support
+            && matches!(
+                choice,
+                ToolChoice::Auto
+                    | ToolChoice::Required
+                    | ToolChoice::Specific(_)
+                    | ToolChoice::None
+            )
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
@@ -438,6 +516,39 @@ mod tests {
             usage.total_tokens,
             usage.prompt_tokens + usage.completion_tokens
         );
+    }
+
+    #[tokio::test]
+    async fn test_native_tool_request_capture() {
+        use ai_agents_core::{LLMToolDefinition, ToolCall};
+
+        let mut mock = MockLLMProvider::new("test");
+        mock.add_response(
+            LLMResponse::new("", FinishReason::ToolCall)
+                .with_tool_calls(vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "calculator".to_string(),
+                    arguments: serde_json::json!({"expression": "2 + 2"}),
+                }])
+                .unwrap(),
+        );
+        let request = LLMToolRequest {
+            tools: vec![LLMToolDefinition {
+                name: "calculator".to_string(),
+                description: "Calculate an expression".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            choice: ToolChoice::Required,
+        };
+
+        let response = mock
+            .complete_with_tools(&[ChatMessage::user("Calculate")], None, &request)
+            .await
+            .unwrap();
+
+        assert_eq!(response.tool_calls().unwrap().unwrap()[0].id, "call-1");
+        assert_eq!(mock.last_call().unwrap().request, Some(request));
+        assert!(mock.supports_tool_choice(&ToolChoice::Specific("calculator".to_string())));
     }
 
     #[tokio::test]

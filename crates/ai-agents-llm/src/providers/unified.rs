@@ -1,14 +1,24 @@
 use ai_agents_core::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
-    Role, TokenUsage,
+    LLMToolDefinition, LLMToolRequest, Role, TokenUsage, ToolCall, ToolChoice,
 };
 use async_trait::async_trait;
 use futures::stream::StreamExt;
 use llm::chat::ReasoningEffort;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, hash_map::DefaultHasher};
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_NORMALIZED_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_normalized_tool_call_id() -> String {
+    format!(
+        "ai-tool-call-{}",
+        NEXT_NORMALIZED_TOOL_CALL_ID.fetch_add(1, Ordering::Relaxed)
+    )
+}
 
 /// Provider type enum
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -122,6 +132,7 @@ pub struct UnifiedLLMProvider {
     base_url: Option<String>,
     default_config: LLMConfig,
     feature_overrides: HashMap<LLMFeature, bool>,
+    tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
 }
 
@@ -134,13 +145,19 @@ impl std::fmt::Debug for UnifiedLLMProvider {
             .field("base_url", &self.base_url)
             .field("default_config", &self.default_config)
             .field("feature_overrides", &self.feature_overrides)
+            .field("tool_choice", &self.tool_choice)
             .field("client", &"<cached>")
             .finish()
     }
 }
 
 /// Compute a hash over the config fields that affect the LLM builder, plus the system prompt.
-fn compute_config_hash(config: &LLMConfig, system_prompt: Option<&str>) -> u64 {
+fn compute_config_hash(
+    config: &LLMConfig,
+    system_prompt: Option<&str>,
+    tool_choice: Option<&ToolChoice>,
+    tools: Option<&[LLMToolDefinition]>,
+) -> u64 {
     let mut hasher = DefaultHasher::new();
     // Hash the config fields that affect the builder
     if let Some(t) = config.temperature {
@@ -198,6 +215,14 @@ fn compute_config_hash(config: &LLMConfig, system_prompt: Option<&str>) -> u64 {
     if let Some(sp) = system_prompt {
         sp.hash(&mut hasher);
     }
+    tool_choice.hash(&mut hasher);
+    if let Some(tools) = tools {
+        for tool in tools {
+            tool.name.hash(&mut hasher);
+            tool.description.hash(&mut hasher);
+            tool.input_schema.to_string().hash(&mut hasher);
+        }
+    }
     hasher.finish()
 }
 
@@ -222,6 +247,123 @@ fn extract_system_and_messages(messages: &[ChatMessage]) -> (Option<String>, Vec
     };
 
     (system_prompt, non_system)
+}
+
+fn provider_protocol_error(message: impl Into<String>) -> LLMError {
+    LLMError::API {
+        message: format!("Provider protocol error: {}", message.into()),
+        status: None,
+    }
+}
+
+fn map_tool_definition(definition: &LLMToolDefinition) -> llm::chat::Tool {
+    llm::chat::Tool {
+        tool_type: "function".to_string(),
+        function: llm::chat::FunctionTool {
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            parameters: definition.input_schema.clone(),
+        },
+    }
+}
+
+fn map_tool_choice(choice: &ToolChoice) -> Result<llm::chat::ToolChoice, LLMError> {
+    match choice {
+        ToolChoice::Auto => Ok(llm::chat::ToolChoice::Auto),
+        ToolChoice::Required => Ok(llm::chat::ToolChoice::Any),
+        ToolChoice::Specific(name) => Ok(llm::chat::ToolChoice::Tool(name.clone())),
+        ToolChoice::None => Ok(llm::chat::ToolChoice::None),
+        _ => Err(LLMError::Config(
+            "unsupported native tool choice variant".to_string(),
+        )),
+    }
+}
+
+fn normalize_tool_calls(
+    calls: Option<Vec<llm::ToolCall>>,
+    choice: &ToolChoice,
+) -> Result<Vec<ToolCall>, LLMError> {
+    let calls = calls.unwrap_or_default();
+    if calls.is_empty() && matches!(choice, ToolChoice::Required | ToolChoice::Specific(_)) {
+        return Err(provider_protocol_error(
+            "the provider returned no tool calls for a required tool choice",
+        ));
+    }
+
+    let specific_name = match choice {
+        ToolChoice::Specific(name) => Some(name.as_str()),
+        _ => None,
+    };
+    let mut seen_ids = HashSet::new();
+    let mut normalized = Vec::with_capacity(calls.len());
+
+    for call in calls {
+        if let Some(expected) = specific_name {
+            if call.function.name != expected {
+                return Err(provider_protocol_error(format!(
+                    "specific tool choice '{expected}' returned call for '{}'",
+                    call.function.name
+                )));
+            }
+        }
+
+        let arguments = serde_json::from_str(&call.function.arguments).map_err(|error| {
+            provider_protocol_error(format!(
+                "tool '{}' returned invalid JSON arguments: {error}",
+                call.function.name
+            ))
+        })?;
+        let mut normalized_call = ToolCall {
+            id: next_normalized_tool_call_id(),
+            name: call.function.name,
+            arguments,
+        };
+        if !call.id.is_empty() && seen_ids.insert(call.id.clone()) {
+            normalized_call.id = call.id;
+        } else {
+            while !seen_ids.insert(normalized_call.id.clone()) {
+                normalized_call.id = next_normalized_tool_call_id();
+            }
+        }
+        normalized.push(normalized_call);
+    }
+
+    Ok(normalized)
+}
+
+#[derive(Deserialize)]
+struct NativeToolCallMarker {
+    _ai_agents_native_tool_call: bool,
+    id: String,
+    tool: String,
+    arguments: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct NativeToolResultMarker {
+    _ai_agents_native_tool_result: bool,
+    id: String,
+    tool: String,
+    output: serde_json::Value,
+}
+
+fn marked_json_values(content: &str, marker: &str) -> Option<Vec<serde_json::Value>> {
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let values = match value {
+        serde_json::Value::Array(values) => values,
+        value @ serde_json::Value::Object(_) => vec![value],
+        _ => return None,
+    };
+
+    if !values.is_empty()
+        && values
+            .iter()
+            .all(|value| value.get(marker).and_then(|value| value.as_bool()) == Some(true))
+    {
+        Some(values)
+    } else {
+        None
+    }
 }
 
 fn merged_ollama_extra_body(config: &LLMConfig) -> Result<Option<serde_json::Value>, LLMError> {
@@ -374,6 +516,7 @@ impl UnifiedLLMProvider {
             base_url: actual_base_url,
             default_config,
             feature_overrides: HashMap::new(),
+            tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
@@ -404,6 +547,11 @@ impl UnifiedLLMProvider {
 
     pub fn with_feature_overrides(mut self, overrides: HashMap<LLMFeature, bool>) -> Self {
         self.feature_overrides.extend(overrides);
+        self
+    }
+
+    pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
         self
     }
 
@@ -447,6 +595,116 @@ impl UnifiedLLMProvider {
         }
     }
 
+    fn convert_message_with_tools(
+        &self,
+        msg: &ChatMessage,
+    ) -> Result<llm::chat::ChatMessage, LLMError> {
+        if msg.role == Role::Assistant {
+            if let Some(values) = marked_json_values(&msg.content, "_ai_agents_native_tool_call") {
+                let calls = values
+                    .into_iter()
+                    .map(|value| {
+                        let marker: NativeToolCallMarker =
+                            serde_json::from_value(value).map_err(|error| {
+                                provider_protocol_error(format!(
+                                    "invalid tool call marker: {error}"
+                                ))
+                            })?;
+                        if marker.id.is_empty() || marker.tool.is_empty() {
+                            return Err(provider_protocol_error(
+                                "tool call markers require non-empty id and tool fields",
+                            ));
+                        }
+                        let arguments =
+                            serde_json::to_string(&marker.arguments).map_err(|error| {
+                                provider_protocol_error(format!(
+                                    "failed to encode tool call marker arguments: {error}"
+                                ))
+                            })?;
+                        Ok(llm::ToolCall {
+                            id: marker.id,
+                            call_type: "function".to_string(),
+                            function: llm::FunctionCall {
+                                name: marker.tool,
+                                arguments,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LLMError>>()?;
+                return Ok(llm::chat::ChatMessage::assistant().tool_use(calls).build());
+            }
+        }
+
+        if matches!(msg.role, Role::Tool | Role::Function) {
+            if let Some(values) = marked_json_values(&msg.content, "_ai_agents_native_tool_result")
+            {
+                let results = values
+                    .into_iter()
+                    .map(|value| {
+                        let marker: NativeToolResultMarker = serde_json::from_value(value)
+                            .map_err(|error| {
+                                provider_protocol_error(format!(
+                                    "invalid tool result marker: {error}"
+                                ))
+                            })?;
+                        if marker.id.is_empty() || marker.tool.is_empty() {
+                            return Err(provider_protocol_error(
+                                "tool result markers require non-empty id and tool fields",
+                            ));
+                        }
+                        let output = serde_json::to_string(&marker.output).map_err(|error| {
+                            provider_protocol_error(format!(
+                                "failed to encode tool result marker output: {error}"
+                            ))
+                        })?;
+                        Ok(llm::ToolCall {
+                            id: marker.id,
+                            call_type: "function".to_string(),
+                            function: llm::FunctionCall {
+                                name: marker.tool,
+                                arguments: output,
+                            },
+                        })
+                    })
+                    .collect::<Result<Vec<_>, LLMError>>()?;
+                return Ok(llm::chat::ChatMessage::user().tool_result(results).build());
+            }
+        }
+
+        Ok(self.convert_message(msg))
+    }
+
+    fn convert_messages_with_tools(
+        &self,
+        messages: &[&ChatMessage],
+    ) -> Result<Vec<llm::chat::ChatMessage>, LLMError> {
+        let mut converted = Vec::with_capacity(messages.len());
+        let mut pending_results = Vec::new();
+        for message in messages {
+            let next = self.convert_message_with_tools(message)?;
+            if let llm::chat::MessageType::ToolResult(results) = &next.message_type {
+                pending_results.extend(results.clone());
+                continue;
+            }
+            if !pending_results.is_empty() {
+                converted.push(
+                    llm::chat::ChatMessage::user()
+                        .tool_result(std::mem::take(&mut pending_results))
+                        .build(),
+                );
+            }
+            converted.push(next);
+        }
+        if !pending_results.is_empty() {
+            converted.push(
+                llm::chat::ChatMessage::user()
+                    .tool_result(pending_results)
+                    .build(),
+            );
+        }
+        Ok(converted)
+    }
+
     // LEGACY: kept for potential use by future provider implementations
     #[allow(dead_code)]
     fn map_finish_reason(&self, reason: &str) -> FinishReason {
@@ -464,10 +722,25 @@ impl UnifiedLLMProvider {
         &self,
         config: &LLMConfig,
         system_prompt: Option<&str>,
+        tool_choice: Option<&ToolChoice>,
+        tools: Option<&[LLMToolDefinition]>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
         let mut builder = llm::builder::LLMBuilder::new()
             .backend(self.provider_type.to_llm_backend())
             .model(&self.model);
+
+        if let Some(tools) = tools {
+            for tool in tools {
+                builder = builder.function(
+                    llm::builder::FunctionBuilder::new(&tool.name)
+                        .description(&tool.description)
+                        .json_schema(tool.input_schema.clone()),
+                );
+            }
+        }
+        if let Some(choice) = tool_choice {
+            builder = builder.tool_choice(map_tool_choice(choice)?);
+        }
 
         if let Some(ref key) = self.api_key {
             if !key.is_empty() {
@@ -694,7 +967,7 @@ impl UnifiedLLMProvider {
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn llm::LLMProvider>, LLMError> {
         let cfg = config.unwrap_or(&self.default_config);
-        self.build_llm_with_system(cfg, None)
+        self.build_llm_with_system(cfg, None, None, None)
     }
 
     /// Ensure the cached client is built (or rebuilt) for the given config + system prompt.
@@ -703,9 +976,11 @@ impl UnifiedLLMProvider {
         &self,
         config: Option<&LLMConfig>,
         system_prompt: Option<&str>,
+        tool_choice: Option<&ToolChoice>,
+        tools: Option<&[LLMToolDefinition]>,
     ) -> Result<(), LLMError> {
         let cfg = config.unwrap_or(&self.default_config);
-        let hash = compute_config_hash(cfg, system_prompt);
+        let hash = compute_config_hash(cfg, system_prompt, tool_choice, tools);
 
         let mut lock = self.client.lock().await;
         if let Some(ref cached) = *lock {
@@ -714,7 +989,7 @@ impl UnifiedLLMProvider {
             }
         }
         // Build a new client
-        let llm = self.build_llm_with_system(cfg, system_prompt)?;
+        let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
         *lock = Some(CachedClient {
             llm,
             config_hash: hash,
@@ -739,7 +1014,8 @@ impl LLMProvider for UnifiedLLMProvider {
             .collect();
 
         // Ensure client is built for this config + system prompt
-        self.ensure_client(config, system_prompt.as_deref()).await?;
+        self.ensure_client(config, system_prompt.as_deref(), None, None)
+            .await?;
 
         // Use the cached client
         let lock = self.client.lock().await;
@@ -770,6 +1046,83 @@ impl LLMProvider for UnifiedLLMProvider {
         })
     }
 
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> Result<LLMResponse, LLMError> {
+        let choice = &request.choice;
+        if !self.supports_tool_choice(choice) {
+            return Err(LLMError::Config(format!(
+                "provider '{}' does not support native tool choice {:?}",
+                self.provider_name(),
+                choice
+            )));
+        }
+        if matches!(choice, ToolChoice::Required | ToolChoice::Specific(_))
+            && request.tools.is_empty()
+        {
+            return Err(LLMError::Config(
+                "required native tool choice needs at least one tool definition".to_string(),
+            ));
+        }
+        if let ToolChoice::Specific(name) = choice {
+            if !request.tools.iter().any(|tool| tool.name == *name) {
+                return Err(LLMError::Config(format!(
+                    "specific native tool choice '{name}' is not present in the request"
+                )));
+            }
+        }
+
+        let (system_prompt, non_system_msgs) = extract_system_and_messages(messages);
+        let llm_messages = self.convert_messages_with_tools(&non_system_msgs)?;
+        let tools = request
+            .tools
+            .iter()
+            .map(map_tool_definition)
+            .collect::<Vec<_>>();
+
+        self.ensure_client(
+            config,
+            system_prompt.as_deref(),
+            Some(choice),
+            Some(&request.tools),
+        )
+        .await?;
+        let lock = self.client.lock().await;
+        let cached = lock
+            .as_ref()
+            .expect("client must be built after ensure_client");
+        let response = cached
+            .llm
+            .chat_with_tools(&llm_messages, Some(&tools))
+            .await
+            .map_err(|error| self.map_llm_crate_error(error))?;
+
+        let calls = normalize_tool_calls(response.tool_calls(), choice)?;
+        let usage = response.usage().map(|usage| TokenUsage {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        });
+        let mut normalized_response = LLMResponse {
+            content: response.text().unwrap_or_default(),
+            finish_reason: if calls.is_empty() {
+                FinishReason::Stop
+            } else {
+                FinishReason::ToolCall
+            },
+            usage,
+            model: Some(self.model.clone()),
+            metadata: HashMap::new(),
+        };
+        if !calls.is_empty() {
+            normalized_response.set_tool_calls(calls)?;
+        }
+        Ok(normalized_response)
+    }
+
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
@@ -785,7 +1138,8 @@ impl LLMProvider for UnifiedLLMProvider {
             .collect();
 
         // Ensure client is built for this config + system prompt
-        self.ensure_client(config, system_prompt.as_deref()).await?;
+        self.ensure_client(config, system_prompt.as_deref(), None, None)
+            .await?;
 
         // Acquire lock, call chat_stream, get owned stream, then release lock
         let stream = {
@@ -832,6 +1186,34 @@ impl LLMProvider for UnifiedLLMProvider {
             ProviderType::Mistral => "mistral",
             ProviderType::OpenAICompatible => "openai-compatible",
             ProviderType::OpenRouter => "openrouter",
+        }
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.tool_choice.clone()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        if self.feature_overrides.get(&LLMFeature::FunctionCalling) == Some(&false) {
+            return false;
+        }
+        let known_choice = matches!(
+            choice,
+            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
+        );
+        match self.provider_type {
+            ProviderType::OpenAI | ProviderType::Anthropic | ProviderType::OpenRouter => {
+                known_choice
+            }
+            ProviderType::Google => matches!(choice, ToolChoice::Auto),
+            ProviderType::OpenAICompatible => {
+                self.feature_overrides
+                    .get(&LLMFeature::FunctionCalling)
+                    .copied()
+                    .unwrap_or(false)
+                    && known_choice
+            }
+            _ => false,
         }
     }
 
@@ -1063,14 +1445,14 @@ mod tests {
     fn test_config_hash_stability() {
         let config = LLMConfig::default();
 
-        let hash1 = compute_config_hash(&config, Some("system prompt"));
-        let hash2 = compute_config_hash(&config, Some("system prompt"));
+        let hash1 = compute_config_hash(&config, Some("system prompt"), None, None);
+        let hash2 = compute_config_hash(&config, Some("system prompt"), None, None);
         assert_eq!(hash1, hash2);
 
-        let hash3 = compute_config_hash(&config, Some("different prompt"));
+        let hash3 = compute_config_hash(&config, Some("different prompt"), None, None);
         assert_ne!(hash1, hash3);
 
-        let hash4 = compute_config_hash(&config, None);
+        let hash4 = compute_config_hash(&config, None, None, None);
         assert_ne!(hash1, hash4);
     }
 
@@ -1182,8 +1564,8 @@ mod tests {
         let config_a = LLMConfig::default();
         let config_b = LLMConfig::default().with_timeout_seconds(120);
 
-        let hash_a = compute_config_hash(&config_a, None);
-        let hash_b = compute_config_hash(&config_b, None);
+        let hash_a = compute_config_hash(&config_a, None, None, None);
+        let hash_b = compute_config_hash(&config_b, None, None, None);
         assert_ne!(hash_a, hash_b);
     }
 
@@ -1197,9 +1579,9 @@ mod tests {
         };
         let config_c = LLMConfig::default().with_extra("resilient", serde_json::json!(true));
 
-        let ha = compute_config_hash(&config_a, None);
-        let hb = compute_config_hash(&config_b, None);
-        let hc = compute_config_hash(&config_c, None);
+        let ha = compute_config_hash(&config_a, None, None, None);
+        let hb = compute_config_hash(&config_b, None, None, None);
+        let hc = compute_config_hash(&config_c, None, None, None);
 
         assert_ne!(ha, hb);
         assert_ne!(ha, hc);
@@ -1323,9 +1705,9 @@ mod tests {
         let config_b = LLMConfig::default().with_extra("num_ctx", serde_json::json!(8192));
         let config_c = LLMConfig::default().with_extra("keep_alive", serde_json::json!("5m"));
 
-        let hash_a = compute_config_hash(&config_a, None);
-        let hash_b = compute_config_hash(&config_b, None);
-        let hash_c = compute_config_hash(&config_c, None);
+        let hash_a = compute_config_hash(&config_a, None, None, None);
+        let hash_b = compute_config_hash(&config_b, None, None, None);
+        let hash_c = compute_config_hash(&config_c, None, None, None);
 
         assert_ne!(hash_a, hash_b);
         assert_ne!(hash_a, hash_c);
@@ -1423,5 +1805,245 @@ mod tests {
             ProviderType::OpenRouter.api_key_env_var(),
             Some("OPENROUTER_API_KEY")
         );
+    }
+
+    fn test_provider(provider_type: ProviderType) -> UnifiedLLMProvider {
+        let base_url = (provider_type == ProviderType::OpenAICompatible)
+            .then(|| "http://localhost:1234/v1".to_string());
+        UnifiedLLMProvider::from_spec_config(
+            provider_type,
+            "test-model",
+            Some("test-key".to_string()),
+            base_url,
+            LLMConfig::default(),
+        )
+        .unwrap()
+    }
+
+    fn upstream_tool_call(id: &str, name: &str, arguments: &str) -> llm::ToolCall {
+        llm::ToolCall {
+            id: id.to_string(),
+            call_type: "function".to_string(),
+            function: llm::FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_maps_tool_definition_and_choices() {
+        let definition = LLMToolDefinition {
+            name: "calculator".to_string(),
+            description: "Calculate an expression".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let mapped = map_tool_definition(&definition);
+        assert_eq!(mapped.tool_type, "function");
+        assert_eq!(mapped.function.name, definition.name);
+        assert_eq!(mapped.function.description, definition.description);
+        assert_eq!(mapped.function.parameters, definition.input_schema);
+
+        assert!(matches!(
+            map_tool_choice(&ToolChoice::Auto).unwrap(),
+            llm::chat::ToolChoice::Auto
+        ));
+        assert!(matches!(
+            map_tool_choice(&ToolChoice::Required).unwrap(),
+            llm::chat::ToolChoice::Any
+        ));
+        assert!(matches!(
+            map_tool_choice(&ToolChoice::Specific("calculator".to_string())).unwrap(),
+            llm::chat::ToolChoice::Tool(name) if name == "calculator"
+        ));
+        assert!(matches!(
+            map_tool_choice(&ToolChoice::None).unwrap(),
+            llm::chat::ToolChoice::None
+        ));
+
+        let provider = test_provider(ProviderType::OpenAI);
+        assert!(
+            provider
+                .build_llm_with_system(
+                    &LLMConfig::default(),
+                    None,
+                    Some(&ToolChoice::Specific("calculator".to_string())),
+                    Some(&[definition]),
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_tool_choice_changes_client_identity() {
+        let config = LLMConfig::default();
+        let auto = compute_config_hash(&config, None, Some(&ToolChoice::Auto), None);
+        let required = compute_config_hash(&config, None, Some(&ToolChoice::Required), None);
+        assert_ne!(auto, required);
+    }
+
+    #[test]
+    fn test_native_tool_choice_support_matrix() {
+        for provider_type in [
+            ProviderType::OpenAI,
+            ProviderType::Anthropic,
+            ProviderType::OpenRouter,
+        ] {
+            let provider = test_provider(provider_type);
+            assert!(provider.supports_tool_choice(&ToolChoice::Auto));
+            assert!(provider.supports_tool_choice(&ToolChoice::Required));
+            assert!(provider.supports_tool_choice(&ToolChoice::Specific("tool".to_string())));
+            assert!(provider.supports_tool_choice(&ToolChoice::None));
+        }
+
+        let disabled = test_provider(ProviderType::OpenAI)
+            .with_feature_override(LLMFeature::FunctionCalling, false);
+        assert!(!disabled.supports_tool_choice(&ToolChoice::Auto));
+        assert!(!disabled.supports_tool_choice(&ToolChoice::Required));
+
+        let google = test_provider(ProviderType::Google);
+        assert!(google.supports_tool_choice(&ToolChoice::Auto));
+        assert!(!google.supports_tool_choice(&ToolChoice::Required));
+        assert!(!google.supports_tool_choice(&ToolChoice::None));
+
+        let compatible = test_provider(ProviderType::OpenAICompatible);
+        assert!(!compatible.supports_tool_choice(&ToolChoice::Auto));
+        let compatible = compatible.with_feature_override(LLMFeature::FunctionCalling, true);
+        assert!(compatible.supports_tool_choice(&ToolChoice::Auto));
+        assert!(compatible.supports_tool_choice(&ToolChoice::Required));
+
+        for provider_type in [
+            ProviderType::Ollama,
+            ProviderType::DeepSeek,
+            ProviderType::XAI,
+            ProviderType::Phind,
+            ProviderType::Groq,
+            ProviderType::Cohere,
+            ProviderType::Mistral,
+        ] {
+            assert!(!test_provider(provider_type).supports_tool_choice(&ToolChoice::Auto));
+        }
+    }
+
+    #[test]
+    fn test_configured_tool_choice_is_reported() {
+        let provider = test_provider(ProviderType::OpenAI)
+            .with_tool_choice(ToolChoice::Specific("calculator".to_string()));
+        assert_eq!(
+            provider.configured_tool_choice(),
+            Some(ToolChoice::Specific("calculator".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_tool_call_arguments_are_strict_json() {
+        let error = normalize_tool_calls(
+            Some(vec![upstream_tool_call("call-1", "calculator", "{bad")]),
+            &ToolChoice::Auto,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("invalid JSON arguments"));
+    }
+
+    #[test]
+    fn test_tool_call_ids_preserve_unique_values_and_replace_duplicates() {
+        let calls = normalize_tool_calls(
+            Some(vec![
+                upstream_tool_call("keep", "calculator", "{}"),
+                upstream_tool_call("keep", "calculator", "{}"),
+                upstream_tool_call("", "calculator", "{}"),
+            ]),
+            &ToolChoice::Auto,
+        )
+        .unwrap();
+
+        assert_eq!(calls[0].id, "keep");
+        assert_ne!(calls[1].id, "keep");
+        assert!(!calls[1].id.is_empty());
+        assert!(!calls[2].id.is_empty());
+        assert_ne!(calls[1].id, calls[2].id);
+    }
+
+    #[test]
+    fn test_required_and_specific_tool_call_protocol_validation() {
+        assert!(normalize_tool_calls(None, &ToolChoice::Required).is_err());
+        let error = normalize_tool_calls(
+            Some(vec![upstream_tool_call("call-1", "other", "{}")]),
+            &ToolChoice::Specific("calculator".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("specific tool choice"));
+    }
+
+    #[test]
+    fn test_marker_messages_convert_only_for_native_tool_completion() {
+        let provider = test_provider(ProviderType::OpenAI);
+        let assistant = ChatMessage::assistant(
+            serde_json::json!([{
+                "_ai_agents_native_tool_call": true,
+                "id": "call-1",
+                "tool": "calculator",
+                "arguments": {"expression": "2 + 2"}
+            }])
+            .to_string(),
+        );
+        let converted = provider.convert_message_with_tools(&assistant).unwrap();
+        match converted.message_type {
+            llm::chat::MessageType::ToolUse(calls) => {
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].id, "call-1");
+                assert_eq!(calls[0].function.name, "calculator");
+                assert_eq!(calls[0].function.arguments, r#"{"expression":"2 + 2"}"#);
+            }
+            other => panic!("expected tool use, got {other:?}"),
+        }
+
+        let result = ChatMessage::tool(
+            "calculator",
+            serde_json::json!({
+                "_ai_agents_native_tool_result": true,
+                "id": "call-1",
+                "tool": "calculator",
+                "output": {"value": 4}
+            })
+            .to_string(),
+        );
+        let converted = provider.convert_message_with_tools(&result).unwrap();
+        match converted.message_type {
+            llm::chat::MessageType::ToolResult(results) => {
+                assert_eq!(results[0].id, "call-1");
+                assert_eq!(results[0].function.name, "calculator");
+                assert_eq!(results[0].function.arguments, r#"{"value":4}"#);
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+
+        let second_result = ChatMessage::tool(
+            "calculator",
+            serde_json::json!({
+                "_ai_agents_native_tool_result": true,
+                "id": "call-2",
+                "tool": "calculator",
+                "output": {"value": 6}
+            })
+            .to_string(),
+        );
+        let combined = provider
+            .convert_messages_with_tools(&[&result, &second_result])
+            .unwrap();
+        assert_eq!(combined.len(), 1);
+        assert!(matches!(
+            &combined[0].message_type,
+            llm::chat::MessageType::ToolResult(results) if results.len() == 2
+        ));
+
+        let unmarked = ChatMessage::assistant(r#"{"tool":"calculator"}"#);
+        let converted = provider.convert_message_with_tools(&unmarked).unwrap();
+        assert!(matches!(
+            converted.message_type,
+            llm::chat::MessageType::Text
+        ));
+        let plain = provider.convert_message(&assistant);
+        assert!(matches!(plain.message_type, llm::chat::MessageType::Text));
     }
 }

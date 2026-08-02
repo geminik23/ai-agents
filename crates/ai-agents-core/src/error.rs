@@ -1,6 +1,7 @@
 //! Error types for the AI agents framework
 
 use crate::traits::llm::LLMError;
+use crate::traits::storage::StorageCapability;
 use thiserror::Error;
 
 /// Result type alias for agent operations
@@ -8,6 +9,7 @@ pub type Result<T> = std::result::Result<T, AgentError>;
 
 /// Main error type for the framework
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum AgentError {
     #[error("Parse error: {0}")]
     ParseError(String),
@@ -53,6 +55,9 @@ pub enum AgentError {
 
     #[error("Persistence error: {0}")]
     Persistence(String),
+
+    #[error("Storage capability is not supported: {0}")]
+    UnsupportedStorageCapability(StorageCapability),
 
     #[error("Memory budget exceeded: used {used} tokens, budget {budget} tokens")]
     MemoryBudgetExceeded { used: u32, budget: u32 },

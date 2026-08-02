@@ -309,7 +309,7 @@ impl AgentBuilder {
                     .as_ref()
                     .and_then(|env_var| std::env::var(env_var).ok());
 
-                let provider = UnifiedLLMProvider::from_spec_config(
+                let mut provider = UnifiedLLMProvider::from_spec_config(
                     provider_type,
                     &config.model,
                     api_key,
@@ -318,6 +318,9 @@ impl AgentBuilder {
                 )
                 .map_err(|e| AgentError::LLM(e.to_string()))?
                 .with_feature_overrides(feature_overrides_from_config(config));
+                if let Some(choice) = config.tool_choice.clone() {
+                    provider = provider.with_tool_choice(choice);
+                }
 
                 registry.register(alias, Arc::new(provider));
             }
@@ -365,7 +368,7 @@ impl AgentBuilder {
                 .as_ref()
                 .and_then(|env_var| std::env::var(env_var).ok());
 
-            let provider = UnifiedLLMProvider::from_spec_config(
+            let mut provider = UnifiedLLMProvider::from_spec_config(
                 provider_type,
                 &config.model,
                 api_key,
@@ -374,6 +377,9 @@ impl AgentBuilder {
             )
             .map_err(|e| AgentError::LLM(e.to_string()))?
             .with_feature_overrides(feature_overrides_from_config(config));
+            if let Some(choice) = config.tool_choice.clone() {
+                provider = provider.with_tool_choice(choice);
+            }
 
             self.llm = Some(Arc::new(provider));
             self.llm_registry_observed = false;
@@ -544,10 +550,13 @@ impl AgentBuilder {
         self
     }
 
-    /// Set an LLM registry that has already been wrapped for observability.
-    pub(crate) fn observed_llm_registry(mut self, registry: LLMRegistry) -> Self {
+    pub(crate) fn authoritative_llm_registry(
+        mut self,
+        registry: LLMRegistry,
+        observed: bool,
+    ) -> Self {
         self.llm_registry = Some(registry);
-        self.llm_registry_observed = true;
+        self.llm_registry_observed = observed;
         self
     }
 
@@ -794,6 +803,20 @@ impl AgentBuilder {
             None => return Ok(self),
         };
 
+        if spawner_config.shared_llms && self.llm_registry.is_none() {
+            let provider = self.llm.as_ref().cloned().ok_or_else(|| {
+                AgentError::Config(
+                    "spawner.shared_llms requires the parent LLM provider to be configured"
+                        .to_string(),
+                )
+            })?;
+            let mut registry = LLMRegistry::new();
+            registry.register("default", provider);
+            registry.set_default("default");
+            self.llm_registry = Some(registry);
+            self.llm_registry_observed = false;
+        }
+
         self.wrap_llm_registry_for_observability()?;
         let observability_manager = self.observability_manager.clone();
 
@@ -810,13 +833,17 @@ impl AgentBuilder {
         spawner = spawner.with_resource_locks(self.shared_resource_locks());
 
         if spawner_config.shared_llms {
-            if let Some(ref reg) = self.llm_registry {
-                spawner = if self.llm_registry_observed {
-                    spawner.with_shared_observed_llms(reg.clone())
-                } else {
-                    spawner.with_shared_llms(reg.clone())
-                };
-            }
+            let reg = self.llm_registry.as_ref().ok_or_else(|| {
+                AgentError::Config(
+                    "spawner.shared_llms requires the parent LLM registry to be configured"
+                        .to_string(),
+                )
+            })?;
+            spawner = if self.llm_registry_observed {
+                spawner.with_shared_observed_llms(reg.clone())
+            } else {
+                spawner.with_shared_llms(reg.clone())
+            };
         }
 
         if !spawner_config.shared_context.is_empty() {
@@ -828,7 +855,7 @@ impl AgentBuilder {
         }
 
         if let Some(ref prefix) = spawner_config.name_prefix {
-            spawner = spawner.with_name_prefix(prefix.clone());
+            spawner = spawner.with_name_prefix(prefix.clone())?;
         }
 
         // Resolve file-path templates against the parent YAML directory.
@@ -897,7 +924,6 @@ impl AgentBuilder {
             tracing::info!("Orchestration tools registered");
         }
 
-        // Auto-spawn agents from YAML files and register them.
         for entry in &spawner_config.auto_spawn {
             let yaml_path = if let Some(ref dir) = self.yaml_dir {
                 dir.join(&entry.agent)
@@ -906,74 +932,24 @@ impl AgentBuilder {
             };
 
             tracing::info!(id = %entry.id, path = %yaml_path.display(), "Auto-spawning agent");
-
-            match AgentBuilder::from_yaml_file(&yaml_path) {
-                Ok(mut sub_builder) => {
-                    if spawner_config.shared_llms {
-                        if let Some(ref reg) = self.llm_registry {
-                            sub_builder = if self.llm_registry_observed {
-                                sub_builder.observed_llm_registry(reg.clone())
-                            } else {
-                                sub_builder.llm_registry(reg.clone())
-                            };
-                        }
-                    }
-                    if let Some(ref manager) = observability_manager {
-                        sub_builder = sub_builder.observability(Arc::clone(manager));
-                    }
-                    sub_builder.resource_locks = Some(self.shared_resource_locks());
-                    match sub_builder
-                        .auto_configure_llms()
-                        .and_then(|b| b.auto_configure_features())
-                    {
-                        Ok(configured) => {
-                            let spec = configured.spec.clone().unwrap_or_default();
-                            match configured.build() {
-                                Ok(agent) => {
-                                    let spawned = crate::spawner::spawner::SpawnedAgent {
-                                        id: entry.id.clone(),
-                                        agent: Arc::new(agent),
-                                        spec,
-                                        spawned_at: chrono::Utc::now(),
-                                    };
-
-                                    if let Err(e) = registry.register(spawned).await {
-                                        tracing::warn!(
-                                            id = %entry.id,
-                                            error = %e,
-                                            "Failed to register auto-spawned agent"
-                                        );
-                                    } else {
-                                        tracing::info!(id = %entry.id, "Auto-spawned agent registered");
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        id = %entry.id,
-                                        error = %e,
-                                        "Failed to build auto-spawn agent"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                id = %entry.id,
-                                error = %e,
-                                "Failed to configure auto-spawn agent"
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        id = %entry.id,
-                        path = %yaml_path.display(),
-                        error = %e,
-                        "Failed to load auto-spawn YAML"
-                    );
-                }
-            }
+            let spawned = spawner
+                .spawn_from_yaml_file_with_id(entry.id.clone(), &yaml_path)
+                .await
+                .map_err(|error| {
+                    AgentError::Config(format!(
+                        "Failed to auto-spawn agent '{}' from '{}': {}",
+                        entry.id,
+                        yaml_path.display(),
+                        error
+                    ))
+                })?;
+            registry.register(spawned).await.map_err(|error| {
+                AgentError::Config(format!(
+                    "Failed to register auto-spawned agent '{}': {}",
+                    entry.id, error
+                ))
+            })?;
+            tracing::info!(id = %entry.id, "Auto-spawned agent registered");
         }
 
         // Validate that all orchestration state references have matching agents.
@@ -1742,8 +1718,8 @@ llm:
 name: ChildAgent
 system_prompt: "Child prompt"
 llm:
-  provider: openai
-  model: gpt-4
+  provider: definitely-not-a-provider
+  model: unavailable
 "#,
         )
         .unwrap();
@@ -1764,12 +1740,9 @@ spawner:
       agent: agents/child.yaml
 "#;
         let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
-        let mut registry = LLMRegistry::new();
-        registry.register("default", Arc::new(MockLLMProvider::new("test")));
-        registry.set_default("default");
 
         let builder = AgentBuilder::from_spec_with_base_dir(spec, &base_dir)
-            .llm_registry(registry)
+            .llm(Arc::new(MockLLMProvider::new("test")))
             .auto_configure_spawner()
             .await
             .unwrap();
@@ -1783,6 +1756,52 @@ spawner:
             .unwrap();
         assert_eq!(template.content, template_content);
         assert!(builder.spawner_registry.as_ref().unwrap().contains("child"));
+
+        std::fs::remove_dir_all(base_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_builder_auto_spawn_fails_on_any_declared_child_error() {
+        use ai_agents_llm::mock::MockLLMProvider;
+
+        let base_dir = std::env::temp_dir().join(format!(
+            "ai-agents-builder-child-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base_dir).unwrap();
+        std::fs::write(
+            base_dir.join("valid.yaml"),
+            "name: ValidChild\nsystem_prompt: valid\n",
+        )
+        .unwrap();
+
+        let yaml = r#"
+name: ParentAgent
+system_prompt: parent
+llm:
+  default: default
+spawner:
+  shared_llms: true
+  auto_spawn:
+    - id: valid
+      agent: valid.yaml
+    - id: missing
+      agent: missing.yaml
+"#;
+        let spec = AgentBuilder::from_yaml(yaml).unwrap().spec.unwrap();
+        let mut registry = LLMRegistry::new();
+        registry.register("default", Arc::new(MockLLMProvider::new("test")));
+        registry.set_default("default");
+
+        let error = AgentBuilder::from_spec_with_base_dir(spec, &base_dir)
+            .llm_registry(registry)
+            .auto_configure_spawner()
+            .await
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("missing"), "{error}");
+        assert!(error.contains("missing.yaml"), "{error}");
 
         std::fs::remove_dir_all(base_dir).unwrap();
     }

@@ -1,6 +1,6 @@
 //! Spawner configuration types for YAML deserialization.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use super::StorageConfig;
@@ -133,13 +133,37 @@ pub struct SpawnerConfig {
 /// Untagged:
 /// Serde tries `File` first (object with `path` key), falls back to `Inline` (plain string).
 /// File paths are resolved against the parent YAML directory at config time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum TemplateSource {
     /// File-based template: `{ path: "./templates/npc.yaml" }`.
     File { path: String },
     /// Inline YAML template string (backward compatible).
     Inline(String),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileTemplateSource {
+    path: String,
+}
+
+impl<'de> Deserialize<'de> for TemplateSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(inline) => Ok(Self::Inline(inline)),
+            serde_yaml::Value::Mapping(_) => serde_yaml::from_value::<FileTemplateSource>(value)
+                .map(|source| Self::File { path: source.path })
+                .map_err(serde::de::Error::custom),
+            _ => Err(serde::de::Error::custom(
+                "template source must be an inline YAML string or an object with a path field",
+            )),
+        }
+    }
 }
 
 impl TemplateSource {

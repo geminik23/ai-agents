@@ -1,5 +1,6 @@
 //! LLM configuration types
 
+use ai_agents_core::ToolChoice;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -112,6 +113,10 @@ pub struct LLMConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub function_calling: Option<bool>,
 
+    /// Opt in to provider-native or runtime-enforced tool selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+
     /// Override whether the provider supports vision inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
@@ -148,6 +153,7 @@ impl Default for LLMConfig {
             reasoning_effort: None,
             reasoning_budget_tokens: None,
             function_calling: None,
+            tool_choice: None,
             vision: None,
             json_mode: None,
             extra: HashMap::new(),
@@ -156,6 +162,7 @@ impl Default for LLMConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LLMSelector {
     #[serde(default = "default_alias")]
     pub default: String,
@@ -282,6 +289,24 @@ max_tokens: 1000
         assert_eq!(config.model, "gpt-3.5-turbo");
         assert_eq!(config.temperature, 0.5);
         assert_eq!(config.max_tokens, 1000);
+    }
+
+    #[test]
+    fn test_llm_config_tool_choice_deserialize() {
+        let required: LLMConfig =
+            serde_yaml::from_str("provider: openai\nmodel: gpt-5.1-mini\ntool_choice: required\n")
+                .unwrap();
+        assert_eq!(required.tool_choice, Some(ToolChoice::Required));
+        assert!(!required.extra.contains_key("tool_choice"));
+
+        let specific: LLMConfig = serde_yaml::from_str(
+            "provider: openai\nmodel: gpt-5.1-mini\ntool_choice:\n  specific: random\n",
+        )
+        .unwrap();
+        assert_eq!(
+            specific.tool_choice,
+            Some(ToolChoice::Specific("random".to_string()))
+        );
     }
 
     #[test]

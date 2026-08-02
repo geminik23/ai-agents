@@ -12,8 +12,8 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 use ai_agents_core::{
-    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse, Tool,
-    ToolExecutionContext, ToolPolicyBindings, ToolResult,
+    ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    LLMToolRequest, Tool, ToolChoice, ToolExecutionContext, ToolPolicyBindings, ToolResult,
 };
 use ai_agents_hitl::{ApprovalHandler, ApprovalRequest, ApprovalResult, ApprovalTrigger};
 use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
@@ -1210,15 +1210,20 @@ pub fn build_llm_registry(
                     load_fixture_responses_for_alias(fixtures, base_dir, &alias)?;
                 let fixture_outcomes =
                     load_fixture_outcomes_for_alias(fixtures, &alias, &fixture_responses);
-                Arc::new(SequenceLLMProvider::new(fixture_outcomes, fixture_delay_ms))
-                    as Arc<dyn LLMProvider>
+                Arc::new(
+                    SequenceLLMProvider::new(fixture_outcomes, fixture_delay_ms)
+                        .with_tool_choice(config.tool_choice.clone()),
+                ) as Arc<dyn LLMProvider>
             }
-            LlmFixtureMode::Replay => Arc::new(ReplayLLMProvider::new(
-                alias.clone(),
-                config.model.clone(),
-                cassette_records.clone(),
-                fixture_delay_ms,
-            )) as Arc<dyn LLMProvider>,
+            LlmFixtureMode::Replay => Arc::new(
+                ReplayLLMProvider::new(
+                    alias.clone(),
+                    config.model.clone(),
+                    cassette_records.clone(),
+                    fixture_delay_ms,
+                )
+                .with_tool_choice(config.tool_choice.clone()),
+            ) as Arc<dyn LLMProvider>,
             LlmFixtureMode::Real => build_real_provider(&config)?,
             LlmFixtureMode::Record => {
                 let inner = build_real_provider(&config)?;
@@ -1290,6 +1295,9 @@ fn build_real_provider(
     .map_err(|error| EvalError::Runtime(error.to_string()))?;
     if let Some(value) = config.function_calling {
         provider = provider.with_feature_override(LLMFeature::FunctionCalling, value);
+    }
+    if let Some(choice) = config.tool_choice.clone() {
+        provider = provider.with_tool_choice(choice);
     }
     if let Some(value) = config.vision {
         provider = provider.with_feature_override(LLMFeature::Vision, value);
@@ -1408,6 +1416,7 @@ struct SequenceLLMProvider {
     index: Mutex<usize>,
     /// Fixed delay before returning a response.
     delay_ms: u64,
+    tool_choice: Option<ToolChoice>,
 }
 
 /// LLM provider replaying cassette records by request hash.
@@ -1420,6 +1429,7 @@ struct ReplayLLMProvider {
     records: Arc<Vec<CassetteRecord>>,
     /// Fixed delay before returning a replayed response.
     delay_ms: u64,
+    tool_choice: Option<ToolChoice>,
 }
 
 impl SequenceLLMProvider {
@@ -1428,7 +1438,13 @@ impl SequenceLLMProvider {
             outcomes: Arc::new(outcomes),
             index: Mutex::new(0),
             delay_ms,
+            tool_choice: None,
         }
+    }
+
+    fn with_tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
+        self.tool_choice = tool_choice;
+        self
     }
 
     async fn wait_if_configured(&self) {
@@ -1461,7 +1477,13 @@ impl ReplayLLMProvider {
             model,
             records: Arc::new(records),
             delay_ms,
+            tool_choice: None,
         }
+    }
+
+    fn with_tool_choice(mut self, tool_choice: Option<ToolChoice>) -> Self {
+        self.tool_choice = tool_choice;
+        self
     }
 
     async fn wait_if_configured(&self) {
@@ -1476,6 +1498,23 @@ impl ReplayLLMProvider {
         config: Option<&LLMConfig>,
     ) -> std::result::Result<LLMResponse, LLMError> {
         let request_hash = hash_request(messages, config);
+        self.response_for_hash(request_hash)
+    }
+
+    fn response_for_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        let request_hash = hash_tool_request(messages, config, request);
+        self.response_for_hash(request_hash)
+    }
+
+    fn response_for_hash(
+        &self,
+        request_hash: String,
+    ) -> std::result::Result<LLMResponse, LLMError> {
         self.records
             .iter()
             .find(|record| {
@@ -1503,6 +1542,27 @@ impl LLMProvider for ReplayLLMProvider {
     ) -> std::result::Result<LLMResponse, LLMError> {
         self.wait_if_configured().await;
         self.response_for(messages, config)
+    }
+
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        self.wait_if_configured().await;
+        self.response_for_tools(messages, config, request)
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.tool_choice.clone()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        matches!(
+            choice,
+            ToolChoice::Auto | ToolChoice::Required | ToolChoice::Specific(_) | ToolChoice::None
+        )
     }
 
     async fn complete_stream(
@@ -1538,6 +1598,10 @@ impl LLMProvider for SequenceLLMProvider {
     ) -> std::result::Result<LLMResponse, LLMError> {
         self.wait_if_configured().await;
         self.next_outcome()
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.tool_choice.clone()
     }
 
     async fn complete_stream(
@@ -1731,6 +1795,35 @@ impl LLMProvider for RecordingLLMProvider {
         Ok(response)
     }
 
+    async fn complete_with_tools(
+        &self,
+        messages: &[ChatMessage],
+        config: Option<&LLMConfig>,
+        request: &LLMToolRequest,
+    ) -> std::result::Result<LLMResponse, LLMError> {
+        let response = self
+            .inner
+            .complete_with_tools(messages, config, request)
+            .await?;
+        let record = CassetteRecord {
+            alias: self.alias.clone(),
+            model: self.model.clone(),
+            request_hash: hash_tool_request(messages, config, request),
+            request_hash_version: Some("sha256-v2-tools".to_string()),
+            response: response.clone(),
+        };
+        self.writer.append(&record)?;
+        Ok(response)
+    }
+
+    fn configured_tool_choice(&self) -> Option<ToolChoice> {
+        self.inner.configured_tool_choice()
+    }
+
+    fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
+        self.inner.supports_tool_choice(choice)
+    }
+
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
@@ -1775,6 +1868,21 @@ fn hash_request(messages: &[ChatMessage], config: Option<&LLMConfig>) -> String 
     let encoded = serde_json::to_vec(&canonical).unwrap_or_default();
     let digest = Sha256::digest(encoded);
     format!("sha256-v1:{:x}", digest)
+}
+
+fn hash_tool_request(
+    messages: &[ChatMessage],
+    config: Option<&LLMConfig>,
+    request: &LLMToolRequest,
+) -> String {
+    let canonical = json!({
+        "version": "sha256-v2-tools",
+        "base_request": hash_request(messages, config),
+        "tool_request": request,
+    });
+    let encoded = serde_json::to_vec(&canonical).unwrap_or_default();
+    let digest = Sha256::digest(encoded);
+    format!("sha256-v2-tools:{:x}", digest)
 }
 
 fn default_status() -> u16 {

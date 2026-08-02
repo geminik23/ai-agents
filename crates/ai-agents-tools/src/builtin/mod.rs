@@ -44,6 +44,39 @@ use crate::types::{TodoStore, UnavailableDiagnosticsProvider};
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+const BUILTIN_TOOL_IDS: [&str; 30] = [
+    "calculator",
+    "echo",
+    "datetime",
+    "json",
+    "random",
+    "file",
+    "glob",
+    "grep",
+    "file_read",
+    "file_write",
+    "file_edit",
+    "patch",
+    "copy_path",
+    "move_path",
+    "delete_path",
+    "file_list",
+    "file_info",
+    "git_status",
+    "git_diff",
+    "diagnostics",
+    "ask_user",
+    "todo",
+    "sleep",
+    "web_fetch",
+    "web_search",
+    "command",
+    "text",
+    "template",
+    "math",
+    "http",
+];
+
 pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
     let versions = crate::types::FileVersionStore::default();
     let command_runner = Arc::new(RwLock::new(
@@ -86,6 +119,10 @@ pub fn all_builtin_tools() -> Vec<Arc<dyn Tool>> {
 }
 
 pub fn get_builtin_tool(id: &str) -> Option<Arc<dyn Tool>> {
+    if !BUILTIN_TOOL_IDS.contains(&id) {
+        return None;
+    }
+
     match id {
         "calculator" => Some(Arc::new(CalculatorTool::new())),
         "echo" => Some(Arc::new(EchoTool::new())),
@@ -123,5 +160,29 @@ pub fn get_builtin_tool(id: &str) -> Option<Arc<dyn Tool>> {
         "math" => Some(Arc::new(MathTool::new())),
         "http" => Some(Arc::new(HttpTool::new())),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn builtin_inventory_and_lookup_stay_in_sync() {
+        let tools = all_builtin_tools();
+        let actual: BTreeSet<_> = tools.iter().map(|tool| tool.id()).collect();
+        let expected: BTreeSet<_> = BUILTIN_TOOL_IDS.into_iter().collect();
+
+        assert_eq!(tools.len(), BUILTIN_TOOL_IDS.len());
+        assert_eq!(actual.len(), tools.len(), "built-in IDs must be unique");
+        assert_eq!(actual, expected);
+
+        for id in BUILTIN_TOOL_IDS {
+            let tool =
+                get_builtin_tool(id).unwrap_or_else(|| panic!("missing built-in lookup: {id}"));
+            assert_eq!(tool.id(), id);
+        }
     }
 }

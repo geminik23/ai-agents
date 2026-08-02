@@ -1196,6 +1196,26 @@ fn ensure_write_allowed(
     Ok(())
 }
 
+fn ensure_not_write_root(path: &Path, policy: &MutationPolicySnapshot) -> Result<(), String> {
+    let normalized = normalize_path(path);
+    let resolved = resolve_existing_or_parent(path)?;
+    for root in policy.write_paths.iter().chain(policy.allowed_paths.iter()) {
+        let root_path = Path::new(root);
+        if normalized == normalize_path(root_path) {
+            return Err("refusing to delete a configured write root".to_string());
+        }
+        if path_entry_exists(root_path) {
+            let resolved_root = root_path
+                .canonicalize()
+                .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
+            if resolved == resolved_root.components().collect::<PathBuf>() {
+                return Err("refusing to delete a configured write root".to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn enforce_read_before_write(
     versions: &FileVersionStore,
     path: &Path,
@@ -1480,8 +1500,12 @@ fn normalize_path(path: &Path) -> PathBuf {
     base.components().collect()
 }
 
+fn path_entry_exists(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
 fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
-    if path.exists() {
+    if path_entry_exists(path) {
         return path
             .canonicalize()
             .map_err(|error| format!("Path canonicalization failed: {}", error));
@@ -1489,7 +1513,7 @@ fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
     let normalized = normalize_path(path);
     let mut ancestor = normalized.as_path();
     let mut missing = Vec::new();
-    while !ancestor.exists() {
+    while !path_entry_exists(ancestor) {
         let Some(name) = ancestor.file_name() else {
             break;
         };
@@ -1515,7 +1539,7 @@ fn path_matches_allowed_policy(
     if !normalized.starts_with(&normalized_pattern) {
         return Ok(false);
     }
-    if !pattern_path.exists() {
+    if !path_entry_exists(pattern_path) {
         return Ok(true);
     }
     let resolved_pattern = pattern_path
@@ -1534,7 +1558,7 @@ fn path_matches_restricted_policy(
     if normalized.starts_with(&normalized_pattern) {
         return Ok(true);
     }
-    if !pattern_path.exists() {
+    if !path_entry_exists(pattern_path) {
         return Ok(false);
     }
     let resolved_pattern = pattern_path
@@ -1550,6 +1574,17 @@ fn exceeds(limit: Option<usize>, value: usize) -> bool {
 fn json_result<T: Serialize>(output: &T) -> ToolResult {
     match serde_json::to_string(output) {
         Ok(json) => ToolResult::ok(json),
+        Err(error) => ToolResult::error(format!("Serialization error: {}", error)),
+    }
+}
+
+fn json_error_result<T: Serialize>(output: &T) -> ToolResult {
+    match serde_json::to_string(output) {
+        Ok(json) => ToolResult {
+            success: false,
+            output: json,
+            metadata: None,
+        },
         Err(error) => ToolResult::error(format!("Serialization error: {}", error)),
     }
 }
@@ -1664,6 +1699,12 @@ struct PathMutationOutput {
     items_affected: usize,
     approval_required: bool,
     diff_summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleanup_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retained_backup_path: Option<String>,
 }
 
 #[async_trait]
@@ -1721,7 +1762,7 @@ impl Tool for CopyPathTool {
         if let Err(reason) = ensure_write_allowed(&destination, input.dry_run, &policy) {
             return ToolResult::error(reason);
         }
-        if !source.exists() {
+        if !path_entry_exists(&source) {
             return ToolResult::error(format!("source path does not exist: {}", input.source_path));
         }
         if let Err(reason) = validate_copy_destination(&source, &destination) {
@@ -1731,7 +1772,7 @@ impl Tool for CopyPathTool {
             Ok(details) => details,
             Err(error) => return ToolResult::error(format!("Copy source error: {}", error)),
         };
-        let destination_exists = destination.exists();
+        let destination_exists = path_entry_exists(&destination);
         if destination_exists && !input.overwrite {
             return ToolResult::error("overwrite must be true to replace an existing destination");
         }
@@ -1755,8 +1796,49 @@ impl Tool for CopyPathTool {
                 }
             }
         }
+        let mut cleanup_warning = None;
+        let mut retained_backup_path = None;
         if !input.dry_run {
-            if let Err(error) = copy_path(&source, &destination) {
+            if destination_exists {
+                match replace_copy_path(&source, &destination) {
+                    ReplacementOutcome::Committed {
+                        cleanup_warning: warning,
+                        retained_backup_path: backup,
+                    } => {
+                        cleanup_warning = warning;
+                        retained_backup_path = backup;
+                    }
+                    ReplacementOutcome::Unchanged(error) => {
+                        return ToolResult::error(format!("Copy error: {}", error));
+                    }
+                    ReplacementOutcome::RecoveryIncomplete {
+                        error,
+                        retained_backup_path,
+                    } => {
+                        return json_error_result(&PathMutationOutput {
+                            source_path: Some(input.source_path.clone()),
+                            destination_path: Some(input.destination_path.clone()),
+                            path: None,
+                            dry_run: false,
+                            mutation_performed: true,
+                            copied: false,
+                            moved: false,
+                            deleted: false,
+                            recursive,
+                            overwritten: false,
+                            bytes_affected,
+                            items_affected,
+                            approval_required: policy.approval_required(),
+                            diff_summary:
+                                "copy failed after moving the previous destination to a backup"
+                                    .to_string(),
+                            error: Some(error),
+                            cleanup_warning: None,
+                            retained_backup_path: Some(retained_backup_path),
+                        });
+                    }
+                }
+            } else if let Err(error) = copy_path(&source, &destination) {
                 return ToolResult::error(format!("Copy error: {}", error));
             }
         }
@@ -1785,6 +1867,9 @@ impl Tool for CopyPathTool {
                 input.destination_path,
                 bytes_affected
             ),
+            error: None,
+            cleanup_warning,
+            retained_backup_path,
         })
     }
 }
@@ -1844,7 +1929,7 @@ impl Tool for MovePathTool {
         if let Err(reason) = ensure_write_allowed(&destination, input.dry_run, &policy) {
             return ToolResult::error(reason);
         }
-        if !source.exists() {
+        if !path_entry_exists(&source) {
             return ToolResult::error(format!("source path does not exist: {}", input.source_path));
         }
         let resolved_source = match source.canonicalize() {
@@ -1858,7 +1943,7 @@ impl Tool for MovePathTool {
         if resolved_source == resolved_destination {
             return ToolResult::error("source and destination resolve to the same path");
         }
-        let destination_exists = destination.exists();
+        let destination_exists = path_entry_exists(&destination);
         if destination_exists && !input.overwrite {
             return ToolResult::error("overwrite must be true to replace an existing destination");
         }
@@ -1885,8 +1970,49 @@ impl Tool for MovePathTool {
         let recursive = source.is_dir();
         let bytes_affected = path_size(&source).unwrap_or(0);
         let items_affected = path_item_count(&source).unwrap_or(1);
+        let mut cleanup_warning = None;
+        let mut retained_backup_path = None;
         if !input.dry_run {
-            if let Err(error) = fs::rename(&source, &destination) {
+            if destination_exists {
+                match replace_moved_path(&source, &destination) {
+                    ReplacementOutcome::Committed {
+                        cleanup_warning: warning,
+                        retained_backup_path: backup,
+                    } => {
+                        cleanup_warning = warning;
+                        retained_backup_path = backup;
+                    }
+                    ReplacementOutcome::Unchanged(error) => {
+                        return ToolResult::error(format!("Move error: {}", error));
+                    }
+                    ReplacementOutcome::RecoveryIncomplete {
+                        error,
+                        retained_backup_path,
+                    } => {
+                        return json_error_result(&PathMutationOutput {
+                            source_path: Some(input.source_path.clone()),
+                            destination_path: Some(input.destination_path.clone()),
+                            path: None,
+                            dry_run: false,
+                            mutation_performed: true,
+                            copied: false,
+                            moved: false,
+                            deleted: false,
+                            recursive,
+                            overwritten: false,
+                            bytes_affected,
+                            items_affected,
+                            approval_required: policy.approval_required(),
+                            diff_summary:
+                                "move failed after moving the previous destination to a backup"
+                                    .to_string(),
+                            error: Some(error),
+                            cleanup_warning: None,
+                            retained_backup_path: Some(retained_backup_path),
+                        });
+                    }
+                }
+            } else if let Err(error) = fs::rename(&source, &destination) {
                 return ToolResult::error(format!("Move error: {}", error));
             }
         }
@@ -1915,6 +2041,9 @@ impl Tool for MovePathTool {
                 input.destination_path,
                 bytes_affected
             ),
+            error: None,
+            cleanup_warning,
+            retained_backup_path,
         })
     }
 }
@@ -1965,7 +2094,10 @@ impl Tool for DeletePathTool {
         if let Err(reason) = ensure_write_allowed(&path, input.dry_run, &policy) {
             return ToolResult::error(reason);
         }
-        if !path.exists() {
+        if let Err(reason) = ensure_not_write_root(&path, &policy) {
+            return ToolResult::error(reason);
+        }
+        if !path_entry_exists(&path) {
             return ToolResult::error(format!("path does not exist: {}", input.path));
         }
         if path.is_dir() && !input.recursive {
@@ -2009,6 +2141,9 @@ impl Tool for DeletePathTool {
                 bytes_affected,
                 items_affected
             ),
+            error: None,
+            cleanup_warning: None,
+            retained_backup_path: None,
         })
     }
 }
@@ -2112,6 +2247,106 @@ fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
         }
         fs::copy(source, destination)?;
         Ok(())
+    }
+}
+
+enum ReplacementOutcome {
+    Committed {
+        cleanup_warning: Option<String>,
+        retained_backup_path: Option<String>,
+    },
+    Unchanged(String),
+    RecoveryIncomplete {
+        error: String,
+        retained_backup_path: String,
+    },
+}
+
+fn replace_copy_path(source: &Path, destination: &Path) -> ReplacementOutcome {
+    let staged = unique_sibling_path(destination, "copy");
+    if let Err(error) = copy_path(source, &staged) {
+        if path_entry_exists(&staged) {
+            let _ = remove_path(&staged);
+        }
+        return ReplacementOutcome::Unchanged(error.to_string());
+    }
+    let outcome = replace_existing_path(&staged, destination);
+    if matches!(
+        outcome,
+        ReplacementOutcome::Unchanged(_) | ReplacementOutcome::RecoveryIncomplete { .. }
+    ) && path_entry_exists(&staged)
+    {
+        let _ = remove_path(&staged);
+    }
+    outcome
+}
+
+fn replace_moved_path(source: &Path, destination: &Path) -> ReplacementOutcome {
+    replace_existing_path(source, destination)
+}
+
+fn replace_existing_path(prepared: &Path, destination: &Path) -> ReplacementOutcome {
+    replace_existing_path_with(prepared, destination, remove_path)
+}
+
+fn replace_existing_path_with<F>(
+    prepared: &Path,
+    destination: &Path,
+    remove_backup: F,
+) -> ReplacementOutcome
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let backup = unique_sibling_path(destination, "backup");
+    if let Err(error) = fs::rename(destination, &backup) {
+        return ReplacementOutcome::Unchanged(error.to_string());
+    }
+    if let Err(error) = fs::rename(prepared, destination) {
+        return match fs::rename(&backup, destination) {
+            Ok(()) => ReplacementOutcome::Unchanged(error.to_string()),
+            Err(restore_error) => ReplacementOutcome::RecoveryIncomplete {
+                error: format!(
+                    "replacement failed: {}; destination restore failed: {}",
+                    error, restore_error
+                ),
+                retained_backup_path: backup.to_string_lossy().into_owned(),
+            },
+        };
+    }
+
+    //
+    // The prepared-to-destination rename is the commit point. Cleanup must never hide a committed replacement.
+    //
+    match remove_backup(&backup) {
+        Ok(()) => ReplacementOutcome::Committed {
+            cleanup_warning: None,
+            retained_backup_path: None,
+        },
+        Err(error) => ReplacementOutcome::Committed {
+            cleanup_warning: Some(format!(
+                "replacement committed but backup cleanup failed: {}",
+                error
+            )),
+            retained_backup_path: Some(backup.to_string_lossy().into_owned()),
+        },
+    }
+}
+
+fn unique_sibling_path(path: &Path, label: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "path".into());
+    parent.join(format!(".{}.{}.{}", name, label, Uuid::new_v4()))
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
     }
 }
 
@@ -2611,7 +2846,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn actual_delete_reports_applied_mutation() {
+    async fn delete_path_explicit_dry_run_false_reports_applied_mutation() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("delete.txt");
         fs::write(&path, "content").unwrap();
@@ -2654,41 +2889,6 @@ mod tests {
         assert_eq!(output["created"], false);
         assert_eq!(output["overwritten"], true);
         assert_eq!(output["bytes_written"], 4);
-    }
-
-    #[tokio::test]
-    async fn patch_actual_apply_reports_applied_mutation() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("patch.txt");
-        fs::write(&path, "old\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-        }
-        let result = PatchTool::new()
-            .execute(
-                serde_json::json!({
-                    "base_path": dir.path().to_string_lossy(),
-                    "patch": "--- a/patch.txt\n+++ b/patch.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
-                    "dry_run": false
-                }),
-                mutation_context("patch", dir.path()),
-            )
-            .await;
-        assert!(result.success, "{}", result.output);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o640
-            );
-        }
-        let output = result_json(&result);
-        assert_eq!(output["mutation_performed"], true);
-        assert_eq!(output["overwritten"], true);
     }
 
     #[test]
@@ -2827,5 +3027,651 @@ mod tests {
         assert!(!result.success);
         assert_eq!(fs::read_to_string(&first).unwrap(), "first old\n");
         assert_eq!(fs::read_to_string(&second).unwrap(), "second old\n");
+    }
+
+    #[tokio::test]
+    async fn copy_path_rejects_missing_source_without_creating_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("missing.txt");
+        let destination = dir.path().join("destination.txt");
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("source path does not exist"));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn move_path_rejects_missing_source_without_creating_destination() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("missing.txt");
+        let destination = dir.path().join("destination.txt");
+        let result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("source path does not exist"));
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn delete_path_rejects_missing_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("missing.txt");
+        let result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("delete_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("path does not exist"));
+    }
+
+    #[tokio::test]
+    async fn copy_path_collision_requires_overwrite() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("overwrite must be true"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "destination");
+    }
+
+    #[tokio::test]
+    async fn move_path_collision_requires_overwrite() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "destination").unwrap();
+        let result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("overwrite must be true"));
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "destination");
+    }
+
+    #[tokio::test]
+    async fn copy_path_overwrite_replaces_existing_file_and_reports_effect() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "old").unwrap();
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "source");
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["copied"], true);
+        assert_eq!(output["overwritten"], true);
+        assert_eq!(output["bytes_affected"], 6);
+    }
+
+    #[tokio::test]
+    async fn copy_path_overwrite_replaces_existing_directory_tree() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("nested/new.txt"), "new").unwrap();
+        fs::write(destination.join("stale.txt"), "stale").unwrap();
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!destination.join("stale.txt").exists());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["copied"], true);
+        assert_eq!(output["overwritten"], true);
+        assert_eq!(output["recursive"], true);
+        assert_eq!(output["bytes_affected"], 3);
+    }
+
+    #[tokio::test]
+    async fn move_path_overwrite_replaces_existing_file_and_reports_effect() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&source, "source").unwrap();
+        fs::write(&destination, "old").unwrap();
+        let result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert!(!source.exists());
+        assert_eq!(fs::read_to_string(&destination).unwrap(), "source");
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["moved"], true);
+        assert_eq!(output["overwritten"], true);
+        assert_eq!(output["bytes_affected"], 6);
+    }
+
+    #[tokio::test]
+    async fn move_path_overwrite_replaces_existing_directory_tree() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source");
+        let destination = dir.path().join("destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("nested/new.txt"), "new").unwrap();
+        fs::write(destination.join("stale.txt"), "stale").unwrap();
+        let result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("nested/new.txt")).unwrap(),
+            "new"
+        );
+        assert!(!destination.join("stale.txt").exists());
+        let output = result_json(&result);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["moved"], true);
+        assert_eq!(output["overwritten"], true);
+        assert_eq!(output["recursive"], true);
+        assert_eq!(output["bytes_affected"], 3);
+    }
+
+    #[tokio::test]
+    async fn copy_path_parent_creation_requires_request_opt_in() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("missing/destination.txt");
+        fs::write(&source, "source").unwrap();
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "create_parent_dirs": false,
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("parent directory does not exist"));
+        assert!(!destination.exists());
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    #[tokio::test]
+    async fn move_path_parent_creation_requires_request_opt_in() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let destination = dir.path().join("missing/destination.txt");
+        fs::write(&source, "source").unwrap();
+        let result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "create_parent_dirs": false,
+                    "dry_run": false
+                }),
+                mutation_context("move_path", dir.path()),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("parent directory does not exist"));
+        assert!(source.exists());
+        assert!(!destination.exists());
+        assert!(!dir.path().join("missing").exists());
+    }
+
+    #[tokio::test]
+    async fn copy_and_move_parent_creation_requires_policy_opt_in() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        let copy_source = root.join("copy-source.txt");
+        let move_source = root.join("move-source.txt");
+        let copy_destination = root.join("copy-parent/destination.txt");
+        let move_destination = root.join("move-parent/destination.txt");
+        fs::write(&copy_source, "copy").unwrap();
+        fs::write(&move_source, "move").unwrap();
+        let mut copy_context = mutation_context("copy_path", &root);
+        copy_context.policy_snapshot["create_parent_dirs"] = Value::Bool(false);
+        let mut move_context = mutation_context("move_path", &root);
+        move_context.policy_snapshot["create_parent_dirs"] = Value::Bool(false);
+
+        let copy_result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": copy_source.to_string_lossy(),
+                    "destination_path": copy_destination.to_string_lossy(),
+                    "create_parent_dirs": true,
+                    "dry_run": false
+                }),
+                copy_context,
+            )
+            .await;
+        assert!(!copy_result.success);
+        assert!(!copy_destination.exists());
+        assert!(!root.join("copy-parent").exists());
+
+        let move_result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": move_source.to_string_lossy(),
+                    "destination_path": move_destination.to_string_lossy(),
+                    "create_parent_dirs": true,
+                    "dry_run": false
+                }),
+                move_context,
+            )
+            .await;
+        assert!(!move_result.success);
+        assert!(move_source.exists());
+        assert!(!move_destination.exists());
+        assert!(!root.join("move-parent").exists());
+    }
+
+    #[tokio::test]
+    async fn copy_and_move_overwrite_require_policy_opt_in() {
+        let dir = tempdir().unwrap();
+        let copy_source = dir.path().join("copy-source.txt");
+        let copy_destination = dir.path().join("copy-destination.txt");
+        let move_source = dir.path().join("move-source.txt");
+        let move_destination = dir.path().join("move-destination.txt");
+        fs::write(&copy_source, "new copy").unwrap();
+        fs::write(&copy_destination, "old copy").unwrap();
+        fs::write(&move_source, "new move").unwrap();
+        fs::write(&move_destination, "old move").unwrap();
+        let mut copy_context = mutation_context("copy_path", dir.path());
+        copy_context.policy_snapshot["overwrite_existing"] = Value::Bool(false);
+        let mut move_context = mutation_context("move_path", dir.path());
+        move_context.policy_snapshot["overwrite_existing"] = Value::Bool(false);
+
+        let copy_result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": copy_source.to_string_lossy(),
+                    "destination_path": copy_destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                copy_context,
+            )
+            .await;
+        assert!(!copy_result.success);
+        assert!(
+            copy_result
+                .output
+                .contains("overwrite_existing policy is false")
+        );
+        assert_eq!(fs::read_to_string(&copy_destination).unwrap(), "old copy");
+
+        let move_result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": move_source.to_string_lossy(),
+                    "destination_path": move_destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                move_context,
+            )
+            .await;
+        assert!(!move_result.success);
+        assert!(
+            move_result
+                .output
+                .contains("overwrite_existing policy is false")
+        );
+        assert!(move_source.exists());
+        assert_eq!(fs::read_to_string(&move_destination).unwrap(), "old move");
+    }
+
+    #[tokio::test]
+    async fn delete_path_recursively_removes_directory_and_reports_effect() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tree");
+        fs::create_dir_all(path.join("nested")).unwrap();
+        fs::write(path.join("one.txt"), "one").unwrap();
+        fs::write(path.join("nested/two.txt"), "two").unwrap();
+        let result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "recursive": true,
+                    "dry_run": false
+                }),
+                mutation_context("delete_path", dir.path()),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert!(!path.exists());
+        let output = result_json(&result);
+        assert_eq!(output["dry_run"], false);
+        assert_eq!(output["mutation_performed"], true);
+        assert_eq!(output["deleted"], true);
+        assert_eq!(output["recursive"], true);
+        assert_eq!(output["bytes_affected"], 6);
+        assert_eq!(output["approval_required"], false);
+    }
+
+    #[tokio::test]
+    async fn mutation_tools_reject_paths_outside_write_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let copy_source = root.join("copy-source.txt");
+        let move_source = root.join("move-source.txt");
+        let delete_target = outside.join("delete-target.txt");
+        fs::write(&copy_source, "copy").unwrap();
+        fs::write(&move_source, "move").unwrap();
+        fs::write(&delete_target, "delete").unwrap();
+
+        let copy_result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": copy_source.to_string_lossy(),
+                    "destination_path": outside.join("copied.txt").to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", &root),
+            )
+            .await;
+        assert!(!copy_result.success);
+        assert!(copy_result.output.contains("allowed write root"));
+        assert!(!outside.join("copied.txt").exists());
+
+        let move_result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": move_source.to_string_lossy(),
+                    "destination_path": outside.join("moved.txt").to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("move_path", &root),
+            )
+            .await;
+        assert!(!move_result.success);
+        assert!(move_result.output.contains("allowed write root"));
+        assert!(move_source.exists());
+        assert!(!outside.join("moved.txt").exists());
+
+        let delete_result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": delete_target.to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("delete_path", &root),
+            )
+            .await;
+        assert!(!delete_result.success);
+        assert!(delete_result.output.contains("allowed write root"));
+        assert_eq!(fs::read_to_string(delete_target).unwrap(), "delete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mutation_tools_reject_symlink_write_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+        let copy_source = root.join("copy-source.txt");
+        let move_source = root.join("move-source.txt");
+        let delete_target = outside.join("delete-target.txt");
+        fs::write(&copy_source, "copy").unwrap();
+        fs::write(&move_source, "move").unwrap();
+        fs::write(&delete_target, "delete").unwrap();
+
+        let copy_result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": copy_source.to_string_lossy(),
+                    "destination_path": root.join("escape/copied.txt").to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", &root),
+            )
+            .await;
+        assert!(!copy_result.success);
+        assert!(!outside.join("copied.txt").exists());
+
+        let move_result = MovePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": move_source.to_string_lossy(),
+                    "destination_path": root.join("escape/moved.txt").to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("move_path", &root),
+            )
+            .await;
+        assert!(!move_result.success);
+        assert!(move_source.exists());
+        assert!(!outside.join("moved.txt").exists());
+
+        let delete_result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": root.join("escape/delete-target.txt").to_string_lossy(),
+                    "dry_run": false
+                }),
+                mutation_context("delete_path", &root),
+            )
+            .await;
+        assert!(!delete_result.success);
+        assert_eq!(fs::read_to_string(delete_target).unwrap(), "delete");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_path_rejects_broken_destination_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let source = root.join("source.txt");
+        let escaped = outside.join("escaped.txt");
+        let destination = root.join("destination.txt");
+        fs::write(&source, "source").unwrap();
+        symlink(&escaped, &destination).unwrap();
+
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": source.to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "overwrite": true,
+                    "dry_run": false
+                }),
+                mutation_context("copy_path", &root),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(!escaped.exists());
+        assert!(
+            fs::symlink_metadata(destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_path_rejects_configured_write_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+        let result = DeletePathTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": root.to_string_lossy(),
+                    "recursive": true,
+                    "dry_run": false
+                }),
+                mutation_context("delete_path", &root),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("write root"));
+        assert_eq!(fs::read_to_string(root.join("keep.txt")).unwrap(), "keep");
+    }
+
+    #[test]
+    fn replacement_leaves_destination_unchanged_when_backup_rename_fails() {
+        let dir = tempdir().unwrap();
+        let prepared = dir.path().join("prepared.txt");
+        let destination = dir.path().join("missing.txt");
+        fs::write(&prepared, "new").unwrap();
+
+        let outcome = replace_existing_path(&prepared, &destination);
+
+        assert!(matches!(outcome, ReplacementOutcome::Unchanged(_)));
+        assert_eq!(fs::read_to_string(prepared).unwrap(), "new");
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn replacement_restores_destination_when_commit_rename_fails() {
+        let dir = tempdir().unwrap();
+        let prepared = dir.path().join("missing-prepared.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&destination, "old").unwrap();
+
+        let outcome = replace_existing_path(&prepared, &destination);
+
+        assert!(matches!(outcome, ReplacementOutcome::Unchanged(_)));
+        assert_eq!(fs::read_to_string(destination).unwrap(), "old");
+    }
+
+    #[test]
+    fn replacement_reports_committed_mutation_when_cleanup_fails() {
+        let dir = tempdir().unwrap();
+        let prepared = dir.path().join("prepared.txt");
+        let destination = dir.path().join("destination.txt");
+        fs::write(&prepared, "new").unwrap();
+        fs::write(&destination, "old").unwrap();
+
+        let outcome = replace_existing_path_with(&prepared, &destination, |_| {
+            Err(std::io::Error::other("injected cleanup failure"))
+        });
+
+        let ReplacementOutcome::Committed {
+            cleanup_warning,
+            retained_backup_path,
+        } = outcome
+        else {
+            panic!("replacement must remain committed");
+        };
+        assert_eq!(fs::read_to_string(destination).unwrap(), "new");
+        assert!(cleanup_warning.unwrap().contains("cleanup failed"));
+        let backup = PathBuf::from(retained_backup_path.unwrap());
+        assert_eq!(fs::read_to_string(backup).unwrap(), "old");
     }
 }

@@ -109,11 +109,13 @@ pub fn spawner_from_config(
 ) -> Result<AgentSpawner> {
     let mut spawner = AgentSpawner::new();
 
-    // Shared LLMs: the YAML flag says "reuse parent's LLMs".
     if config.shared_llms {
-        if let Some(reg) = llm_registry {
-            spawner = spawner.with_shared_llms(reg);
-        }
+        let registry = llm_registry.ok_or_else(|| {
+            AgentError::Config(
+                "spawner.shared_llms requires the parent LLM registry to be configured".to_string(),
+            )
+        })?;
+        spawner = spawner.with_shared_llms(registry);
     }
 
     // Shared storage: caller resolves StorageConfig into Arc<dyn AgentStorage>.
@@ -130,7 +132,7 @@ pub fn spawner_from_config(
     }
 
     if let Some(ref prefix) = config.name_prefix {
-        spawner = spawner.with_name_prefix(prefix.clone());
+        spawner = spawner.with_name_prefix(prefix.clone())?;
     }
 
     // Resolve file-path templates and extract metadata before storing.
@@ -161,7 +163,7 @@ pub fn configure_spawner_tools(
         )),
         Arc::new(SendMessageTool::new(Arc::clone(&registry), sender_id)),
         Arc::new(ListAgentsTool::new(Arc::clone(&registry))),
-        Arc::new(RemoveAgentTool::new(Arc::clone(&registry)).with_spawner(spawner)),
+        Arc::new(RemoveAgentTool::new(Arc::clone(&registry))),
     ]
 }
 
@@ -184,9 +186,12 @@ pub async fn auto_configure_spawner(
     let mut spawner = AgentSpawner::new().with_resource_locks(builder.shared_resource_locks());
 
     if spawner_config.shared_llms {
-        if let Some(reg) = llm_registry {
-            spawner = spawner.with_shared_llms(reg.clone());
-        }
+        let registry = llm_registry.ok_or_else(|| {
+            AgentError::Config(
+                "spawner.shared_llms requires the parent LLM registry to be configured".to_string(),
+            )
+        })?;
+        spawner = spawner.with_shared_llms(registry.clone());
     }
 
     if !spawner_config.shared_context.is_empty() {
@@ -198,7 +203,7 @@ pub async fn auto_configure_spawner(
     }
 
     if let Some(ref prefix) = spawner_config.name_prefix {
-        spawner = spawner.with_name_prefix(prefix.clone());
+        spawner = spawner.with_name_prefix(prefix.clone())?;
     }
 
     // Resolve file-path templates and extract metadata before storing.

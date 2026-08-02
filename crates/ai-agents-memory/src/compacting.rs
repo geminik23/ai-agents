@@ -309,6 +309,7 @@ impl Memory for CompactingMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::summarizer::NoopSummarizer;
     use ai_agents_core::{AgentError, Memory as CoreMemory, Role};
     use tokio::time::{Duration, timeout};
@@ -320,6 +321,13 @@ mod tests {
             name: None,
             timestamp: None,
         }
+    }
+
+    fn message_contents(messages: &[ChatMessage]) -> Vec<&str> {
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect()
     }
 
     struct BlockingSummarizer {
@@ -361,6 +369,15 @@ mod tests {
             self.started.notify_one();
             self.release.notified().await;
             Ok(contents.join(" | "))
+        }
+    }
+
+    struct FailingSummarizer;
+
+    #[async_trait]
+    impl Summarizer for FailingSummarizer {
+        async fn summarize(&self, _messages: &[ChatMessage]) -> Result<String> {
+            Err(AgentError::MemoryError("summary failed".to_string()))
         }
     }
 
@@ -521,6 +538,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_multilingual_recent_tail_remains_verbatim() {
+        let config = CompactingMemoryConfig {
+            max_recent_messages: 4,
+            compress_threshold: 6,
+            summarize_batch_size: 3,
+            max_summary_length: 100_000,
+        };
+        let memory = CompactingMemory::new(Arc::new(NoopSummarizer), config);
+        let large_mixed_message = "protected 한국어 日本語 العربية English emoji 🧭".to_string();
+        let source = vec![
+            "Old English context".to_string(),
+            "이전 한국어 문맥".to_string(),
+            "古い日本語の文脈".to_string(),
+            "سياق عربي قديم".to_string(),
+            "पुराना हिंदी संदर्भ".to_string(),
+            "Keep 한국어 and English together".to_string(),
+            "保留する日本語メッセージ".to_string(),
+            "احتفظ بهذه الرسالة العربية".to_string(),
+            large_mixed_message,
+        ];
+        let expected_tail = source[source.len() - 4..].to_vec();
+
+        for content in &source {
+            memory.add_message(make_message(content)).await.unwrap();
+        }
+
+        memory.compress(None).await.unwrap();
+        memory.compress(None).await.unwrap();
+        let remaining = memory.get_messages(None).await.unwrap();
+
+        assert!(!memory.needs_compression());
+        assert_eq!(
+            remaining
+                .iter()
+                .map(|message| message.content.clone())
+                .collect::<Vec<_>>(),
+            expected_tail
+        );
+        assert_eq!(memory.summarized_count() + memory.len(), source.len());
+    }
+
+    #[tokio::test]
     async fn test_compress_clamps_recent_tail_for_configured_batch() {
         let config = CompactingMemoryConfig {
             max_recent_messages: 100,
@@ -633,6 +692,65 @@ mod tests {
             max_summary_length: 500,
         };
         assert_eq!(protected_recent_count(&zero_threshold, 5), 0);
+    }
+
+    #[tokio::test]
+    async fn test_initial_summary_failure_rolls_back_all_accounting() {
+        let config = CompactingMemoryConfig {
+            max_recent_messages: 3,
+            compress_threshold: 5,
+            summarize_batch_size: 2,
+            max_summary_length: 100_000,
+        };
+        let memory = CompactingMemory::new(Arc::new(FailingSummarizer), config);
+        let source = vec![
+            "English before failure".to_string(),
+            "실패 전 한국어".to_string(),
+            "失敗前の日本語".to_string(),
+            "قبل الفشل".to_string(),
+            "large mixed message 한界🙂abc".to_string(),
+        ];
+        for content in &source {
+            memory.add_message(make_message(content)).await.unwrap();
+        }
+
+        let snapshot_before = memory.snapshot().await.unwrap();
+        let context_before = memory.get_context().await.unwrap();
+        let error = memory.compress(None).await.unwrap_err();
+        let snapshot_after = memory.snapshot().await.unwrap();
+        let context_after = memory.get_context().await.unwrap();
+
+        assert!(error.to_string().contains("summary failed"));
+        assert_eq!(
+            message_contents(&snapshot_after.messages),
+            message_contents(&snapshot_before.messages)
+        );
+        assert_eq!(snapshot_after.summary, snapshot_before.summary);
+        assert_eq!(
+            snapshot_after.summarized_count,
+            snapshot_before.summarized_count
+        );
+        assert_eq!(context_after.total_messages, context_before.total_messages);
+        assert_eq!(
+            context_after.summarized_count,
+            context_before.summarized_count
+        );
+        assert_eq!(
+            context_after.estimated_tokens(),
+            context_before.estimated_tokens()
+        );
+        assert!(memory.compression_history().is_empty());
+        assert!(memory.needs_compression());
+
+        let retry = memory.compress(Some(&NoopSummarizer)).await.unwrap();
+        assert!(matches!(
+            retry,
+            CompressResult::Compressed {
+                messages_summarized: 2,
+                ..
+            }
+        ));
+        assert_eq!(memory.summarized_count() + memory.len(), source.len());
     }
 
     #[tokio::test]
@@ -865,9 +983,11 @@ mod tests {
         memory.compress(None).await.unwrap();
         let snapshot = memory.snapshot().await.unwrap();
         assert_eq!(snapshot.summarized_count, 4);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        let persisted: MemorySnapshot = serde_json::from_str(&serialized).unwrap();
 
         memory.clear().await.unwrap();
-        memory.restore(snapshot).await.unwrap();
+        memory.restore(persisted).await.unwrap();
         assert!(memory.summary().is_some());
         assert_eq!(memory.summarized_count(), 4);
         for i in 7..9 {

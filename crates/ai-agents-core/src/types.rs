@@ -807,6 +807,86 @@ impl ToolExecutionRecord {
     }
 }
 
+/// Provider-neutral policy for native tool selection.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ToolChoice {
+    Auto,
+    Required,
+    Specific(String),
+    None,
+}
+
+impl Serialize for ToolChoice {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Auto => serializer.serialize_str("auto"),
+            Self::Required => serializer.serialize_str("required"),
+            Self::None => serializer.serialize_str("none"),
+            Self::Specific(tool_id) => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("specific", tool_id)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolChoice {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::String(value) => match value.as_str() {
+                "auto" => Ok(Self::Auto),
+                "required" => Ok(Self::Required),
+                "none" => Ok(Self::None),
+                _ => Err(serde::de::Error::custom(
+                    "tool_choice must be auto, required, none, or { specific: <canonical_id> }",
+                )),
+            },
+            serde_json::Value::Object(mut map) if map.len() == 1 => {
+                let tool_id = map
+                    .remove("specific")
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .filter(|tool_id| !tool_id.is_empty())
+                    .ok_or_else(|| {
+                        serde::de::Error::custom(
+                            "specific tool_choice requires a non-empty canonical tool ID",
+                        )
+                    })?;
+                Ok(Self::Specific(tool_id))
+            }
+            _ => Err(serde::de::Error::custom(
+                "tool_choice must be auto, required, none, or { specific: <canonical_id> }",
+            )),
+        }
+    }
+}
+
+/// Provider-neutral function tool definition.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LLMToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// Native tool completion request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LLMToolRequest {
+    pub tools: Vec<LLMToolDefinition>,
+    pub choice: ToolChoice,
+}
+
+const LLM_TOOL_CALLS_METADATA_KEY: &str = "_ai_agents_native_tool_calls";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LLMResponse {
     pub content: String,
@@ -843,6 +923,41 @@ impl LLMResponse {
     pub fn with_metadata(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
         self.metadata.insert(key.into(), value);
         self
+    }
+
+    /// Stores normalized native tool calls under the framework-reserved metadata key.
+    pub fn set_tool_calls(
+        &mut self,
+        calls: Vec<ToolCall>,
+    ) -> Result<(), crate::traits::llm::LLMError> {
+        let value = serde_json::to_value(calls).map_err(crate::traits::llm::LLMError::from)?;
+        self.metadata
+            .insert(LLM_TOOL_CALLS_METADATA_KEY.to_string(), value);
+        Ok(())
+    }
+
+    /// Stores normalized native tool calls and returns the response.
+    pub fn with_tool_calls(
+        mut self,
+        calls: Vec<ToolCall>,
+    ) -> Result<Self, crate::traits::llm::LLMError> {
+        self.set_tool_calls(calls)?;
+        Ok(self)
+    }
+
+    /// Reads normalized native tool calls from framework metadata.
+    pub fn tool_calls(&self) -> Result<Option<Vec<ToolCall>>, crate::traits::llm::LLMError> {
+        let Some(value) = self.metadata.get(LLM_TOOL_CALLS_METADATA_KEY) else {
+            return Ok(None);
+        };
+
+        serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| {
+                crate::traits::llm::LLMError::Serialization(format!(
+                    "invalid native tool call metadata: {error}"
+                ))
+            })
     }
 }
 
@@ -1146,7 +1261,7 @@ impl AgentResponse {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -1315,6 +1430,36 @@ pub struct SessionSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_llm_response_tool_calls_round_trip() {
+        let calls = vec![ToolCall {
+            id: "call-1".to_string(),
+            name: "calculator".to_string(),
+            arguments: serde_json::json!({"expression": "2 + 2"}),
+        }];
+        let response = LLMResponse::new("", FinishReason::ToolCall)
+            .with_tool_calls(calls.clone())
+            .unwrap();
+
+        assert_eq!(response.tool_calls().unwrap(), Some(calls));
+    }
+
+    #[test]
+    fn test_llm_response_rejects_corrupt_tool_call_metadata() {
+        let mut response = LLMResponse::new("", FinishReason::ToolCall);
+        response.metadata.insert(
+            LLM_TOOL_CALLS_METADATA_KEY.to_string(),
+            serde_json::json!({"not": "an array"}),
+        );
+
+        let error = response.tool_calls().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid native tool call metadata")
+        );
+    }
 
     #[test]
     fn test_token_usage() {

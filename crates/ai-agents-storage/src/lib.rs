@@ -13,6 +13,7 @@ mod sqlite;
 #[cfg(feature = "redis-storage")]
 mod redis;
 
+pub use ai_agents_core::traits::storage::StorageCapability;
 pub use ai_agents_core::{AgentError, AgentSnapshot, AgentStorage, MemorySnapshot, Result};
 pub use snapshot::StateMachineSnapshot;
 pub use storage::FileStorage;
