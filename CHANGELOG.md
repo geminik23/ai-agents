@@ -27,6 +27,7 @@
 - Minimum Rust version: published crates and the CLI require Rust 1.88 or newer
 
 ### Fixed
+- Web fetch addressing: non-public and special-use destinations are blocked before the default transport binds to validated addresses with proxy-side hostname resolution disabled
 - Storage readiness: blocking and streaming turns stop before execution when configured persistence capabilities are unavailable
 - Namespaced persistence: filtering, deletion, actor data, and legacy sessions no longer leak, collide, or silently lose scoped data
 - SQLite consistency: snapshots, metadata, tags, and privacy deletion commit atomically and survive reopen

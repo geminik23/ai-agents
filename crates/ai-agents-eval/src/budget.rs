@@ -831,13 +831,14 @@ mod tests {
         task.abort();
         assert!(matches!(task.await, Err(error) if error.is_cancelled()));
 
-        let state = tracker.lock_state();
-        assert_eq!(state.llm_calls, 1);
-        assert_eq!(state.tokens_reserved, 0);
-        assert_eq!(state.cost_reserved_usd, 0.0);
-        assert_eq!(state.tokens_used, reserved_tokens);
-        assert!((state.cost_used_usd - reserved_cost).abs() < f64::EPSILON);
-        drop(state);
+        {
+            let state = tracker.lock_state();
+            assert_eq!(state.llm_calls, 1);
+            assert_eq!(state.tokens_reserved, 0);
+            assert_eq!(state.cost_reserved_usd, 0.0);
+            assert_eq!(state.tokens_used, reserved_tokens);
+            assert!((state.cost_used_usd - reserved_cost).abs() < f64::EPSILON);
+        }
 
         let next = tracker.wrap(provider(), provider_config());
         assert!(

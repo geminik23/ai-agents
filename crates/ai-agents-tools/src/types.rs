@@ -38,11 +38,12 @@ impl ToolProviderType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TrustLevel {
     Low,
     Sandboxed,
+    #[default]
     Medium,
     High,
     Full,
@@ -69,12 +70,6 @@ impl TrustLevel {
             TrustLevel::High => 3,
             TrustLevel::Full => 4,
         }
-    }
-}
-
-impl Default for TrustLevel {
-    fn default() -> Self {
-        TrustLevel::Medium
     }
 }
 
@@ -484,18 +479,13 @@ impl DiagnosticsProvider for StaticDiagnosticsProvider {
 pub type DiagnosticsProviderSlot = Arc<RwLock<Arc<dyn DiagnosticsProvider>>>;
 
 /// Safe-search preference for provider-neutral web search.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WebSearchSafeSearch {
     Off,
+    #[default]
     Moderate,
     Strict,
-}
-
-impl Default for WebSearchSafeSearch {
-    fn default() -> Self {
-        Self::Moderate
-    }
 }
 
 /// Search request sent to a host web-search provider.
@@ -654,11 +644,11 @@ impl WebSearchProvider for StaticWebSearchProvider {
                 .retain(|item| result_matches_domains(&item.url, &request.include_domains));
             response.truncated |= response.results.len() != before;
         }
-        if let Some(max_results) = request.max_results {
-            if response.results.len() > max_results {
-                response.results.truncate(max_results);
-                response.truncated = true;
-            }
+        if let Some(max_results) = request.max_results
+            && response.results.len() > max_results
+        {
+            response.results.truncate(max_results);
+            response.truncated = true;
         }
         response
     }
@@ -1043,19 +1033,14 @@ fn redact_argv(argv: &[String]) -> Vec<String> {
 }
 
 /// Status value for one session-local todo item.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    #[default]
     Pending,
     InProgress,
     Completed,
     Cancelled,
-}
-
-impl Default for TodoStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 /// One structured task tracked by the session-local todo tool.
@@ -1127,6 +1112,67 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_command_runner_timeout_helper() {
+        if std::env::var("AI_AGENTS_PROCESS_TIMEOUT_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        let Ok(started_path) = std::env::var("AI_AGENTS_PROCESS_TIMEOUT_STARTED") else {
+            return;
+        };
+        let Ok(completed_path) = std::env::var("AI_AGENTS_PROCESS_TIMEOUT_COMPLETED") else {
+            return;
+        };
+        std::fs::write(started_path, b"started").unwrap();
+        std::thread::sleep(Duration::from_secs(10));
+        std::fs::write(completed_path, b"completed").unwrap();
+    }
+
+    #[tokio::test]
+    async fn process_command_runner_timeout_kills_direct_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let started_path = directory.path().join("started");
+        let completed_path = directory.path().join("completed");
+        let executable = std::env::current_exe().unwrap();
+        let request = CommandRequest {
+            argv: vec![
+                executable.to_string_lossy().into_owned(),
+                "types::tests::process_command_runner_timeout_helper".to_string(),
+                "--exact".to_string(),
+            ],
+            env: HashMap::from([
+                (
+                    "AI_AGENTS_PROCESS_TIMEOUT_HELPER".to_string(),
+                    "1".to_string(),
+                ),
+                (
+                    "AI_AGENTS_PROCESS_TIMEOUT_STARTED".to_string(),
+                    started_path.to_string_lossy().into_owned(),
+                ),
+                (
+                    "AI_AGENTS_PROCESS_TIMEOUT_COMPLETED".to_string(),
+                    completed_path.to_string_lossy().into_owned(),
+                ),
+            ]),
+            timeout_ms: Some(2_000),
+            ..CommandRequest::default()
+        };
+
+        let response = ProcessCommandRunner
+            .run_command(
+                request,
+                ai_agents_core::ToolExecutionContext::test("command"),
+            )
+            .await;
+
+        assert_eq!(response.termination, "timeout");
+        assert!(response.timed_out);
+        assert!(started_path.exists());
+        assert!(!completed_path.exists());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(!completed_path.exists());
+    }
 
     #[test]
     fn test_provider_type_default() {

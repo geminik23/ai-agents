@@ -36,30 +36,6 @@ impl MemorySnapshot {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn old_snapshot_defaults_summarized_count() {
-        let json = r#"{"messages":[],"summary":"existing"}"#;
-        let snapshot: MemorySnapshot = serde_json::from_str(json).unwrap();
-        assert_eq!(snapshot.summary.as_deref(), Some("existing"));
-        assert_eq!(snapshot.summarized_count, 0);
-    }
-
-    #[test]
-    fn snapshot_roundtrip_preserves_summarized_count() {
-        let snapshot = MemorySnapshot::new(Vec::new())
-            .with_summary("existing".to_string())
-            .with_summarized_count(12);
-        let json = serde_json::to_string(&snapshot).unwrap();
-        let restored: MemorySnapshot = serde_json::from_str(&json).unwrap();
-        assert_eq!(restored.summary.as_deref(), Some("existing"));
-        assert_eq!(restored.summarized_count, 12);
-    }
-}
-
 /// Core memory trait for storing conversation history.
 ///
 /// Built-in implementations: `InMemoryStore` (simple) and `CompactingMemory`
@@ -91,5 +67,29 @@ pub trait Memory: Send + Sync {
     /// Remove the oldest N messages. Returns empty vec by default.
     async fn evict_oldest(&self, _count: usize) -> Result<Vec<ChatMessage>> {
         Ok(vec![])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_snapshot_defaults_summarized_count() {
+        let json = r#"{"messages":[],"summary":"existing"}"#;
+        let snapshot: MemorySnapshot = serde_json::from_str(json).unwrap();
+        assert_eq!(snapshot.summary.as_deref(), Some("existing"));
+        assert_eq!(snapshot.summarized_count, 0);
+    }
+
+    #[test]
+    fn snapshot_roundtrip_preserves_summarized_count() {
+        let snapshot = MemorySnapshot::new(Vec::new())
+            .with_summary("existing".to_string())
+            .with_summarized_count(12);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let restored: MemorySnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.summary.as_deref(), Some("existing"));
+        assert_eq!(restored.summarized_count, 12);
     }
 }

@@ -79,11 +79,12 @@ fn facade_exposes_reviewed_v1_type_closure() {
     let _ = DeletePathTool::new();
     let _ = WebSearchTool::new();
     let _: Option<RuntimeControlHandle> = None;
-    let _: fn(
+    type HostIntegrationConfigurator = fn(
         &RuntimeAgent,
         Arc<dyn QuestionHandler>,
         Arc<dyn DiagnosticsProvider>,
         Arc<dyn CommandRunner>,
         Arc<dyn WebSearchProvider>,
-    ) = configure_host_integrations;
+    );
+    let _: HostIntegrationConfigurator = configure_host_integrations;
 }

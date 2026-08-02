@@ -50,6 +50,10 @@ impl SkillStep {
     }
 }
 
+/// A named, file-backed, or inline skill reference.
+///
+/// The inline variant remains unboxed to preserve the frozen public construction and serde shape.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum SkillRef {

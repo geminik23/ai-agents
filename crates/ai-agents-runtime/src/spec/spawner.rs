@@ -85,7 +85,7 @@ pub type OrchestrationToolsConfig = SpawnerToolGrantConfig;
 pub type ManagementToolsConfig = SpawnerToolGrantConfig;
 
 /// Configuration for dynamic agent spawning declared in the `spawner:` YAML section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SpawnerConfig {
     /// When true, spawned agents reuse the parent agent's LLM connections.
     #[serde(default)]
@@ -175,23 +175,6 @@ impl TemplateSource {
     /// Returns true if this is an inline template string.
     pub fn is_inline(&self) -> bool {
         matches!(self, Self::Inline(_))
-    }
-}
-
-impl Default for SpawnerConfig {
-    fn default() -> Self {
-        Self {
-            shared_llms: false,
-            shared_storage: None,
-            shared_context: HashMap::new(),
-            max_agents: None,
-            name_prefix: None,
-            templates: HashMap::new(),
-            allowed_tools: None,
-            auto_spawn: Vec::new(),
-            management_tools: ManagementToolsConfig::default(),
-            orchestration_tools: OrchestrationToolsConfig::default(),
-        }
     }
 }
 

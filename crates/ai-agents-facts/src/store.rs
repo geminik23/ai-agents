@@ -373,8 +373,10 @@ mod tests {
         // Writing more than max_facts must delete the evicted rows from storage,
         // not just skip them in the save set. A follow-up load_facts proves the
         // authoritative count stays at max_facts across reloads.
-        let mut config = FactsConfig::default();
-        config.max_facts = 3;
+        let config = FactsConfig {
+            max_facts: 3,
+            ..Default::default()
+        };
 
         let storage = Arc::new(MemStorage::new());
         let store = FactStore::new(storage.clone(), "agent".to_string(), config);

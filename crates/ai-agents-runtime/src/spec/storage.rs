@@ -3,9 +3,10 @@
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Storage configuration using tagged enum for type safety and extensibility
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 #[serde(tag = "type")]
 pub enum StorageConfig {
+    #[default]
     #[serde(rename = "none")]
     None,
 
@@ -86,12 +87,6 @@ pub struct RedisStorageConfig {
 
     #[serde(default)]
     pub ttl_seconds: Option<u64>,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        StorageConfig::None
-    }
 }
 
 impl StorageConfig {

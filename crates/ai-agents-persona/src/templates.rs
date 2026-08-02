@@ -362,11 +362,13 @@ mod tests {
     #[test]
     fn test_merge_strips_templates_ref() {
         let base = make_guard_template();
-        let mut instance = PersonaConfig::default();
-        instance.templates = Some(PersonaTemplateRef {
-            base: "something".into(),
-            overrides: None,
-        });
+        let instance = PersonaConfig {
+            templates: Some(PersonaTemplateRef {
+                base: "something".into(),
+                overrides: None,
+            }),
+            ..Default::default()
+        };
 
         let merged = PersonaTemplateRegistry::merge_with_instance(&base, &instance).unwrap();
         assert!(merged.templates.is_none());

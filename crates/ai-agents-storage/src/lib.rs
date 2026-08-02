@@ -27,9 +27,10 @@ pub use redis::{RedisSessionMeta, RedisStorage};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "type")]
 pub enum StorageConfig {
+    #[default]
     #[serde(rename = "none")]
     None,
     #[serde(rename = "file")]
@@ -44,12 +45,6 @@ pub enum StorageConfig {
         #[serde(default)]
         ttl_seconds: Option<u64>,
     },
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        StorageConfig::None
-    }
 }
 
 pub async fn create_storage(config: &StorageConfig) -> Result<Option<Arc<dyn AgentStorage>>> {

@@ -428,17 +428,17 @@ impl DisambiguationManager {
         skill_override: Option<&SkillDisambiguationOverride>,
     ) -> f32 {
         // Skill override takes precedence
-        if let Some(skill) = skill_override {
-            if let Some(t) = skill.threshold {
-                return t;
-            }
+        if let Some(skill) = skill_override
+            && let Some(t) = skill.threshold
+        {
+            return t;
         }
 
         // Then state override
-        if let Some(state) = state_override {
-            if let Some(t) = state.threshold {
-                return t;
-            }
+        if let Some(state) = state_override
+            && let Some(t) = state.threshold
+        {
+            return t;
         }
 
         // Default from config

@@ -165,16 +165,16 @@ impl ProcessProcessor {
                 .unwrap_or_else(|| self.get_stage_type_name(stage));
 
             // Check condition before executing stage
-            if let Some(condition) = stage.condition() {
-                if !self.evaluate_condition_expr(condition, &data) {
-                    if self.config.settings.debug.log_stages {
-                        tracing::debug!(
-                            "[Process] Stage skipped (condition not met): {}",
-                            stage_name
-                        );
-                    }
-                    return Ok(data);
+            if let Some(condition) = stage.condition()
+                && !self.evaluate_condition_expr(condition, &data)
+            {
+                if self.config.settings.debug.log_stages {
+                    tracing::debug!(
+                        "[Process] Stage skipped (condition not met): {}",
+                        stage_name
+                    );
                 }
+                return Ok(data);
             }
 
             if self.config.settings.debug.log_stages {
@@ -402,31 +402,31 @@ impl ProcessProcessor {
 
         let mut instructions = Vec::new();
 
-        if let Some(pii_config) = &config.pii {
-            if !pii_config.types.is_empty() {
-                let pii_types: Vec<String> = pii_config
-                    .types
-                    .iter()
-                    .map(|t| format!("{:?}", t).to_lowercase())
-                    .collect();
-                let action = match pii_config.action {
-                    PIIAction::Mask => format!("replace with '{}'", pii_config.mask_char.repeat(4)),
-                    PIIAction::Remove => "remove completely".to_string(),
-                    PIIAction::Flag => "wrap with [PII: type]".to_string(),
-                };
-                instructions.push(format!("PII types to {}: {}", action, pii_types.join(", ")));
-            }
+        if let Some(pii_config) = &config.pii
+            && !pii_config.types.is_empty()
+        {
+            let pii_types: Vec<String> = pii_config
+                .types
+                .iter()
+                .map(|t| format!("{:?}", t).to_lowercase())
+                .collect();
+            let action = match pii_config.action {
+                PIIAction::Mask => format!("replace with '{}'", pii_config.mask_char.repeat(4)),
+                PIIAction::Remove => "remove completely".to_string(),
+                PIIAction::Flag => "wrap with [PII: type]".to_string(),
+            };
+            instructions.push(format!("PII types to {}: {}", action, pii_types.join(", ")));
         }
 
-        if let Some(harmful_config) = &config.harmful {
-            if !harmful_config.detect.is_empty() {
-                let types: Vec<String> = harmful_config
-                    .detect
-                    .iter()
-                    .map(|t| format!("{:?}", t).to_lowercase())
-                    .collect();
-                instructions.push(format!("Detect harmful content: {}", types.join(", ")));
-            }
+        if let Some(harmful_config) = &config.harmful
+            && !harmful_config.detect.is_empty()
+        {
+            let types: Vec<String> = harmful_config
+                .detect
+                .iter()
+                .map(|t| format!("{:?}", t).to_lowercase())
+                .collect();
+            instructions.push(format!("Detect harmful content: {}", types.join(", ")));
         }
 
         if !config.remove.is_empty() {
@@ -542,22 +542,22 @@ impl ProcessProcessor {
                     }
                 }
                 ValidationRule::Pattern { pattern, on_fail } => {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if !re.is_match(&data.content) {
-                            match on_fail.action {
-                                ValidationActionType::Reject => {
-                                    data.metadata.rejected = true;
-                                    data.metadata.rejection_reason =
-                                        Some("Content does not match required pattern".to_string());
-                                    return Ok(data);
-                                }
-                                ValidationActionType::Warn => {
-                                    data.metadata.warnings.push(
-                                        "Content does not match expected pattern".to_string(),
-                                    );
-                                }
-                                ValidationActionType::Truncate => {} // N/A for pattern
+                    if let Ok(re) = regex::Regex::new(pattern)
+                        && !re.is_match(&data.content)
+                    {
+                        match on_fail.action {
+                            ValidationActionType::Reject => {
+                                data.metadata.rejected = true;
+                                data.metadata.rejection_reason =
+                                    Some("Content does not match required pattern".to_string());
+                                return Ok(data);
                             }
+                            ValidationActionType::Warn => {
+                                data.metadata
+                                    .warnings
+                                    .push("Content does not match expected pattern".to_string());
+                            }
+                            ValidationActionType::Truncate => {} // N/A for pattern
                         }
                     }
                 }
@@ -674,14 +674,12 @@ impl ProcessProcessor {
         }
 
         // Apply channel-specific max_length
-        if let Some(channel) = &config.channel {
-            if let Some(channel_config) = config.channels.get(channel) {
-                if let Some(max_len) = channel_config.max_length {
-                    if data.content.len() > max_len {
-                        data.content = data.content.chars().take(max_len).collect();
-                    }
-                }
-            }
+        if let Some(channel) = &config.channel
+            && let Some(channel_config) = config.channels.get(channel)
+            && let Some(max_len) = channel_config.max_length
+            && data.content.len() > max_len
+        {
+            data.content = data.content.chars().take(max_len).collect();
         }
 
         Ok(data)
@@ -736,10 +734,10 @@ impl ProcessProcessor {
             }
         };
 
-        if let Some(value) = result {
-            if let Some(context_path) = &config.store_in_context {
-                data.context.insert(context_path.clone(), value);
-            }
+        if let Some(value) = result
+            && let Some(context_path) = &config.store_in_context
+        {
+            data.context.insert(context_path.clone(), value);
         }
 
         Ok(data)
@@ -793,16 +791,16 @@ impl ProcessProcessor {
             let actual = self.get_nested_value(&data.context, path);
 
             // Handle { exists: true/false }
-            if let Some(obj) = expected.as_object() {
-                if let Some(exists_val) = obj.get("exists") {
-                    let should_exist = exists_val.as_bool().unwrap_or(true);
-                    let does_exist =
-                        actual.is_some() && !matches!(actual, Some(serde_json::Value::Null));
-                    if does_exist != should_exist {
-                        return false;
-                    }
-                    continue;
+            if let Some(obj) = expected.as_object()
+                && let Some(exists_val) = obj.get("exists")
+            {
+                let should_exist = exists_val.as_bool().unwrap_or(true);
+                let does_exist =
+                    actual.is_some() && !matches!(actual, Some(serde_json::Value::Null));
+                if does_exist != should_exist {
+                    return false;
                 }
+                continue;
             }
 
             // Direct value comparison
@@ -889,22 +887,22 @@ fn process_purpose_hint_for_stage(stage: &ProcessStage) -> ProcessPurposeHint {
 fn extract_json(response: &str) -> String {
     let trimmed = response.trim();
 
-    if trimmed.starts_with("```json") {
-        if let Some(end) = trimmed[7..].find("```") {
-            return trimmed[7..7 + end].trim().to_string();
-        }
+    if let Some(json) = trimmed.strip_prefix("```json")
+        && let Some(end) = json.find("```")
+    {
+        return json[..end].trim().to_string();
     }
 
-    if trimmed.starts_with("```") {
-        if let Some(end) = trimmed[3..].find("```") {
-            return trimmed[3..3 + end].trim().to_string();
-        }
+    if let Some(fenced) = trimmed.strip_prefix("```")
+        && let Some(end) = fenced.find("```")
+    {
+        return fenced[..end].trim().to_string();
     }
 
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return trimmed[start..=end].to_string();
-        }
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}')
+    {
+        return trimmed[start..=end].to_string();
     }
 
     trimmed.to_string()

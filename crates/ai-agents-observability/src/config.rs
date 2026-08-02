@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::ObservabilityError;
 
 /// Top-level YAML and Rust configuration for metrics, privacy, aggregation, cost, and export behavior.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ObservabilityConfig {
     /// Enables all observability collection when true.
     #[serde(default)]
@@ -34,22 +34,6 @@ pub struct ObservabilityConfig {
     /// Controls event queue and raw event buffer limits.
     #[serde(default)]
     pub buffer: BufferConfig,
-}
-
-impl Default for ObservabilityConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            latency: LatencyConfig::default(),
-            tokens: TokenConfig::default(),
-            cost: CostConfig::default(),
-            language: LanguageConfig::default(),
-            aggregation: AggregationConfig::default(),
-            privacy: PrivacyConfig::default(),
-            export: ExportConfig::default(),
-            buffer: BufferConfig::default(),
-        }
-    }
 }
 
 impl ObservabilityConfig {

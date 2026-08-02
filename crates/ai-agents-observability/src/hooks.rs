@@ -504,15 +504,23 @@ impl AgentHooks for ObservabilityHooks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ObservabilityConfig;
+    use crate::config::{ExportConfig, LatencyConfig, ObservabilityConfig, PrivacyConfig};
 
     #[tokio::test]
     async fn records_raw_and_effective_approval_results_separately() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.export.write_raw_events = true;
-        config.privacy.hash_inputs = false;
-        config.privacy.max_text_chars = 100;
+        let config = ObservabilityConfig {
+            enabled: true,
+            export: ExportConfig {
+                write_raw_events: true,
+                ..Default::default()
+            },
+            privacy: PrivacyConfig {
+                hash_inputs: false,
+                max_text_chars: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let manager = ObservabilityManager::new(config);
         let hooks = ObservabilityHooks::new(manager.clone());
 
@@ -565,10 +573,18 @@ mod tests {
 
     #[tokio::test]
     async fn records_timeout_policy_errors_as_resolved_events() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.export.write_raw_events = true;
-        config.privacy.max_text_chars = 100;
+        let config = ObservabilityConfig {
+            enabled: true,
+            export: ExportConfig {
+                write_raw_events: true,
+                ..Default::default()
+            },
+            privacy: PrivacyConfig {
+                max_text_chars: 100,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let manager = ObservabilityManager::new(config);
         let hooks = ObservabilityHooks::new(manager.clone());
         let request = ApprovalRequest::new(
@@ -601,9 +617,14 @@ mod tests {
 
     #[tokio::test]
     async fn hitl_tracking_switch_applies_to_resolved_results() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.latency.track_hitl = false;
+        let config = ObservabilityConfig {
+            enabled: true,
+            latency: LatencyConfig {
+                track_hitl: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let manager = ObservabilityManager::new(config);
         let hooks = ObservabilityHooks::new(manager.clone());
 

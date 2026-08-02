@@ -2,6 +2,8 @@
 
 pub mod config;
 pub mod registry;
+// Keep the repeated module name because renaming it would break the public v1 `spawner::spawner` path.
+#[allow(clippy::module_inception)]
 pub mod spawner;
 pub mod storage;
 pub mod tools;

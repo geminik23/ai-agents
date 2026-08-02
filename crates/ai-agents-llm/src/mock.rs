@@ -221,12 +221,12 @@ impl MockLLMProvider {
                 "Mock provider protocol error: required tool choice returned no calls".to_string(),
             ));
         }
-        if let ToolChoice::Specific(expected) = choice {
-            if calls.iter().any(|call| call.name != *expected) {
-                return Err(LLMError::Other(format!(
-                    "Mock provider protocol error: expected tool '{expected}'"
-                )));
-            }
+        if let ToolChoice::Specific(expected) = choice
+            && calls.iter().any(|call| call.name != *expected)
+        {
+            return Err(LLMError::Other(format!(
+                "Mock provider protocol error: expected tool '{expected}'"
+            )));
         }
         Ok(())
     }

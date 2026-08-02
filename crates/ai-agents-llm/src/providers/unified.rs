@@ -79,7 +79,7 @@ impl ProviderType {
         }
     }
 
-    fn to_llm_backend(&self) -> llm::builder::LLMBackend {
+    fn to_llm_backend(self) -> llm::builder::LLMBackend {
         match self {
             Self::OpenAI => llm::builder::LLMBackend::OpenAI,
             Self::Anthropic => llm::builder::LLMBackend::Anthropic,
@@ -298,13 +298,13 @@ fn normalize_tool_calls(
     let mut normalized = Vec::with_capacity(calls.len());
 
     for call in calls {
-        if let Some(expected) = specific_name {
-            if call.function.name != expected {
-                return Err(provider_protocol_error(format!(
-                    "specific tool choice '{expected}' returned call for '{}'",
-                    call.function.name
-                )));
-            }
+        if let Some(expected) = specific_name
+            && call.function.name != expected
+        {
+            return Err(provider_protocol_error(format!(
+                "specific tool choice '{expected}' returned call for '{}'",
+                call.function.name
+            )));
         }
 
         let arguments = serde_json::from_str(&call.function.arguments).map_err(|error| {
@@ -599,76 +599,70 @@ impl UnifiedLLMProvider {
         &self,
         msg: &ChatMessage,
     ) -> Result<llm::chat::ChatMessage, LLMError> {
-        if msg.role == Role::Assistant {
-            if let Some(values) = marked_json_values(&msg.content, "_ai_agents_native_tool_call") {
-                let calls = values
-                    .into_iter()
-                    .map(|value| {
-                        let marker: NativeToolCallMarker =
-                            serde_json::from_value(value).map_err(|error| {
-                                provider_protocol_error(format!(
-                                    "invalid tool call marker: {error}"
-                                ))
-                            })?;
-                        if marker.id.is_empty() || marker.tool.is_empty() {
-                            return Err(provider_protocol_error(
-                                "tool call markers require non-empty id and tool fields",
-                            ));
-                        }
-                        let arguments =
-                            serde_json::to_string(&marker.arguments).map_err(|error| {
-                                provider_protocol_error(format!(
-                                    "failed to encode tool call marker arguments: {error}"
-                                ))
-                            })?;
-                        Ok(llm::ToolCall {
-                            id: marker.id,
-                            call_type: "function".to_string(),
-                            function: llm::FunctionCall {
-                                name: marker.tool,
-                                arguments,
-                            },
-                        })
+        if msg.role == Role::Assistant
+            && let Some(values) = marked_json_values(&msg.content, "_ai_agents_native_tool_call")
+        {
+            let calls = values
+                .into_iter()
+                .map(|value| {
+                    let marker: NativeToolCallMarker =
+                        serde_json::from_value(value).map_err(|error| {
+                            provider_protocol_error(format!("invalid tool call marker: {error}"))
+                        })?;
+                    if marker.id.is_empty() || marker.tool.is_empty() {
+                        return Err(provider_protocol_error(
+                            "tool call markers require non-empty id and tool fields",
+                        ));
+                    }
+                    let arguments = serde_json::to_string(&marker.arguments).map_err(|error| {
+                        provider_protocol_error(format!(
+                            "failed to encode tool call marker arguments: {error}"
+                        ))
+                    })?;
+                    Ok(llm::ToolCall {
+                        id: marker.id,
+                        call_type: "function".to_string(),
+                        function: llm::FunctionCall {
+                            name: marker.tool,
+                            arguments,
+                        },
                     })
-                    .collect::<Result<Vec<_>, LLMError>>()?;
-                return Ok(llm::chat::ChatMessage::assistant().tool_use(calls).build());
-            }
+                })
+                .collect::<Result<Vec<_>, LLMError>>()?;
+            return Ok(llm::chat::ChatMessage::assistant().tool_use(calls).build());
         }
 
-        if matches!(msg.role, Role::Tool | Role::Function) {
-            if let Some(values) = marked_json_values(&msg.content, "_ai_agents_native_tool_result")
-            {
-                let results = values
-                    .into_iter()
-                    .map(|value| {
-                        let marker: NativeToolResultMarker = serde_json::from_value(value)
-                            .map_err(|error| {
-                                provider_protocol_error(format!(
-                                    "invalid tool result marker: {error}"
-                                ))
-                            })?;
-                        if marker.id.is_empty() || marker.tool.is_empty() {
-                            return Err(provider_protocol_error(
-                                "tool result markers require non-empty id and tool fields",
-                            ));
-                        }
-                        let output = serde_json::to_string(&marker.output).map_err(|error| {
-                            provider_protocol_error(format!(
-                                "failed to encode tool result marker output: {error}"
-                            ))
+        if matches!(msg.role, Role::Tool | Role::Function)
+            && let Some(values) = marked_json_values(&msg.content, "_ai_agents_native_tool_result")
+        {
+            let results = values
+                .into_iter()
+                .map(|value| {
+                    let marker: NativeToolResultMarker =
+                        serde_json::from_value(value).map_err(|error| {
+                            provider_protocol_error(format!("invalid tool result marker: {error}"))
                         })?;
-                        Ok(llm::ToolCall {
-                            id: marker.id,
-                            call_type: "function".to_string(),
-                            function: llm::FunctionCall {
-                                name: marker.tool,
-                                arguments: output,
-                            },
-                        })
+                    if marker.id.is_empty() || marker.tool.is_empty() {
+                        return Err(provider_protocol_error(
+                            "tool result markers require non-empty id and tool fields",
+                        ));
+                    }
+                    let output = serde_json::to_string(&marker.output).map_err(|error| {
+                        provider_protocol_error(format!(
+                            "failed to encode tool result marker output: {error}"
+                        ))
+                    })?;
+                    Ok(llm::ToolCall {
+                        id: marker.id,
+                        call_type: "function".to_string(),
+                        function: llm::FunctionCall {
+                            name: marker.tool,
+                            arguments: output,
+                        },
                     })
-                    .collect::<Result<Vec<_>, LLMError>>()?;
-                return Ok(llm::chat::ChatMessage::user().tool_result(results).build());
-            }
+                })
+                .collect::<Result<Vec<_>, LLMError>>()?;
+            return Ok(llm::chat::ChatMessage::user().tool_result(results).build());
         }
 
         Ok(self.convert_message(msg))
@@ -757,10 +751,10 @@ impl UnifiedLLMProvider {
         }
 
         // Pass system prompt via builder.system()
-        if let Some(sp) = system_prompt {
-            if !sp.is_empty() {
-                builder = builder.system(sp);
-            }
+        if let Some(sp) = system_prompt
+            && !sp.is_empty()
+        {
+            builder = builder.system(sp);
         }
 
         // Forward config fields
@@ -790,13 +784,13 @@ impl UnifiedLLMProvider {
                 "presence_penalty is not supported by the llm crate builder; ignoring"
             );
         }
-        if let Some(ref stops) = config.stop_sequences {
-            if !stops.is_empty() {
-                tracing::debug!(
-                    stop_sequences = ?stops,
-                    "stop_sequences is not supported by the llm crate builder; ignoring"
-                );
-            }
+        if let Some(ref stops) = config.stop_sequences
+            && !stops.is_empty()
+        {
+            tracing::debug!(
+                stop_sequences = ?stops,
+                "stop_sequences is not supported by the llm crate builder; ignoring"
+            );
         }
 
         // --- Timeout (first-class, fallback to extra) ---
@@ -983,10 +977,10 @@ impl UnifiedLLMProvider {
         let hash = compute_config_hash(cfg, system_prompt, tool_choice, tools);
 
         let mut lock = self.client.lock().await;
-        if let Some(ref cached) = *lock {
-            if cached.config_hash == hash {
-                return Ok(());
-            }
+        if let Some(ref cached) = *lock
+            && cached.config_hash == hash
+        {
+            return Ok(());
         }
         // Build a new client
         let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
@@ -1067,12 +1061,12 @@ impl LLMProvider for UnifiedLLMProvider {
                 "required native tool choice needs at least one tool definition".to_string(),
             ));
         }
-        if let ToolChoice::Specific(name) = choice {
-            if !request.tools.iter().any(|tool| tool.name == *name) {
-                return Err(LLMError::Config(format!(
-                    "specific native tool choice '{name}' is not present in the request"
-                )));
-            }
+        if let ToolChoice::Specific(name) = choice
+            && !request.tools.iter().any(|tool| tool.name == *name)
+        {
+            return Err(LLMError::Config(format!(
+                "specific native tool choice '{name}' is not present in the request"
+            )));
         }
 
         let (system_prompt, non_system_msgs) = extract_system_and_messages(messages);

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard}
 use std::time::Instant;
 
 use ai_agents_hooks::AgentHooks;
-use ai_agents_observability::config::ExportFormat;
+use ai_agents_observability::config::{ExportConfig, ExportFormat};
 use ai_agents_observability::{CostEstimator, ObservabilityConfig};
 use ai_agents_runtime::spec::{AgentSpec, LLMConfigOrSelector, StorageConfig};
 use ai_agents_runtime::{Agent, AgentBuilder, RuntimeAgent, StreamChunk};
@@ -166,6 +166,29 @@ pub struct EvalRunner {
     suite: EvalSuite,
     /// Runtime options applied to the suite.
     options: EvalRunnerOptions,
+}
+
+// Bundles attempt-local construction state so resets rebuild with the same isolation, logging, approval, and budget inputs.
+struct BuildAgentParams<'a> {
+    agent_path: &'a Path,
+    base_dir: &'a Path,
+    attempt_context: &'a AttemptFixtureContext,
+    tool_log: RecordingToolLog,
+    approval_log: RecordingApprovalLog,
+    llm_log: RecordingLlmLog,
+    approval_handler: Option<Arc<dyn ai_agents_hitl::ApprovalHandler>>,
+    budget: Option<ScenarioBudgetTracker>,
+}
+
+// Bundles the agent, scenario, turn, and attempt-local evidence logs used to produce one turn result.
+struct RunTurnParams<'a> {
+    agent: &'a RuntimeAgent,
+    scenario: &'a Scenario,
+    turn: &'a Turn,
+    index: usize,
+    tool_log: &'a RecordingToolLog,
+    approval_log: &'a RecordingApprovalLog,
+    llm_log: &'a RecordingLlmLog,
 }
 
 fn load_eval_suite(path: &Path) -> Result<EvalSuite> {
@@ -575,16 +598,16 @@ impl EvalRunner {
             .as_ref()
             .map(build_approval_handler);
         let mut agent = self
-            .build_agent(
+            .build_agent(BuildAgentParams {
                 agent_path,
                 base_dir,
-                &attempt_context,
-                tool_log.clone(),
-                approval_log.clone(),
-                llm_log.clone(),
-                approval_handler.clone(),
-                budget.clone(),
-            )
+                attempt_context: &attempt_context,
+                tool_log: tool_log.clone(),
+                approval_log: approval_log.clone(),
+                llm_log: llm_log.clone(),
+                approval_handler: approval_handler.clone(),
+                budget: budget.clone(),
+            })
             .await?;
         apply_base_context(&agent, &self.suite, base_dir, scenario, &attempt_context)?;
         let mut turns = Vec::new();
@@ -593,15 +616,15 @@ impl EvalRunner {
         if !scenario.turns.is_empty() {
             for (idx, turn) in scenario.turns.iter().enumerate() {
                 let turn_execution = self
-                    .run_turn(
-                        &agent,
+                    .run_turn(RunTurnParams {
+                        agent: &agent,
                         scenario,
                         turn,
-                        idx,
-                        &tool_log,
-                        &approval_log,
-                        &llm_log,
-                    )
+                        index: idx,
+                        tool_log: &tool_log,
+                        approval_log: &approval_log,
+                        llm_log: &llm_log,
+                    })
                     .await?;
                 let turn_failed = turn_execution
                     .result
@@ -638,15 +661,15 @@ impl EvalRunner {
                     for turn in &run.turns {
                         let idx = turns.len();
                         let turn_execution = self
-                            .run_turn(
-                                &agent,
+                            .run_turn(RunTurnParams {
+                                agent: &agent,
                                 scenario,
                                 turn,
-                                idx,
-                                &tool_log,
-                                &approval_log,
-                                &llm_log,
-                            )
+                                index: idx,
+                                tool_log: &tool_log,
+                                approval_log: &approval_log,
+                                llm_log: &llm_log,
+                            })
                             .await?;
                         let turn_failed = turn_execution
                             .result
@@ -666,10 +689,10 @@ impl EvalRunner {
                             break;
                         }
                     }
-                    if status.is_passed() {
-                        if let Some(session) = &run.save_session {
-                            agent.save_session(session).await?;
-                        }
+                    if status.is_passed()
+                        && let Some(session) = &run.save_session
+                    {
+                        agent.save_session(session).await?;
                     }
                 }
                 ScenarioStep::ResetAgent(reset) => {
@@ -688,16 +711,16 @@ impl EvalRunner {
                             agent.reset().await?;
                         } else {
                             agent = self
-                                .build_agent(
+                                .build_agent(BuildAgentParams {
                                     agent_path,
                                     base_dir,
-                                    &attempt_context,
-                                    tool_log.clone(),
-                                    approval_log.clone(),
-                                    llm_log.clone(),
-                                    approval_handler.clone(),
-                                    budget.clone(),
-                                )
+                                    attempt_context: &attempt_context,
+                                    tool_log: tool_log.clone(),
+                                    approval_log: approval_log.clone(),
+                                    llm_log: llm_log.clone(),
+                                    approval_handler: approval_handler.clone(),
+                                    budget: budget.clone(),
+                                })
                                 .await?;
                         }
                         if options.preserve_host_context {
@@ -746,17 +769,17 @@ impl EvalRunner {
         })
     }
 
-    async fn build_agent(
-        &self,
-        agent_path: &Path,
-        base_dir: &Path,
-        attempt_context: &AttemptFixtureContext,
-        tool_log: RecordingToolLog,
-        approval_log: RecordingApprovalLog,
-        llm_log: RecordingLlmLog,
-        approval_handler: Option<Arc<dyn ai_agents_hitl::ApprovalHandler>>,
-        budget: Option<ScenarioBudgetTracker>,
-    ) -> Result<RuntimeAgent> {
+    async fn build_agent(&self, params: BuildAgentParams<'_>) -> Result<RuntimeAgent> {
+        let BuildAgentParams {
+            agent_path,
+            base_dir,
+            attempt_context,
+            tool_log,
+            approval_log,
+            llm_log,
+            approval_handler,
+            budget,
+        } = params;
         let content = std::fs::read_to_string(agent_path)?;
         let mut spec = AgentSpec::from_yaml_strict(&content)?;
         apply_eval_llm_settings(&mut spec, &self.suite.settings);
@@ -823,17 +846,21 @@ impl EvalRunner {
         let mut config = if let Some(config) = self.suite.observability.clone() {
             config
         } else if self.options.observability {
-            let mut config = ObservabilityConfig::default();
-            config.enabled = true;
-            config.export.formats = vec![ExportFormat::Json];
-            config.export.path = self
-                .options
-                .output
-                .join("observability")
-                .display()
-                .to_string();
-            config.export.write_report = true;
-            config
+            ObservabilityConfig {
+                enabled: true,
+                export: ExportConfig {
+                    formats: vec![ExportFormat::Json],
+                    path: self
+                        .options
+                        .output
+                        .join("observability")
+                        .display()
+                        .to_string(),
+                    write_report: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
         } else {
             return Ok(None);
         };
@@ -875,16 +902,16 @@ impl EvalRunner {
         Ok(Some(CostEstimator::new(config.cost)))
     }
 
-    async fn run_turn(
-        &self,
-        agent: &RuntimeAgent,
-        scenario: &Scenario,
-        turn: &Turn,
-        index: usize,
-        tool_log: &RecordingToolLog,
-        approval_log: &RecordingApprovalLog,
-        llm_log: &RecordingLlmLog,
-    ) -> Result<TurnExecution> {
+    async fn run_turn(&self, params: RunTurnParams<'_>) -> Result<TurnExecution> {
+        let RunTurnParams {
+            agent,
+            scenario,
+            turn,
+            index,
+            tool_log,
+            approval_log,
+            llm_log,
+        } = params;
         apply_context_value(agent, &turn_runtime_context(turn))?;
         if let Some(actor) = &turn.actor {
             agent.set_actor_id(actor)?;
@@ -911,10 +938,10 @@ impl EvalRunner {
                 Err(_) => TurnOperation::error(format!("turn timed out after {}ms", timeout_ms)),
             }
         };
-        if let Err(error) = agent.flush_background_tasks().await {
-            if operation.runtime_error.is_none() {
-                operation.runtime_error = Some(error.to_string());
-            }
+        if let Err(error) = agent.flush_background_tasks().await
+            && operation.runtime_error.is_none()
+        {
+            operation.runtime_error = Some(error.to_string());
         }
         let latency_ms = start.elapsed().as_millis() as u64;
         let mut evidence = collect_turn_evidence(
@@ -1719,16 +1746,16 @@ scenarios:
         let approval_log = RecordingApprovalLog::default();
         let llm_log = RecordingLlmLog::default();
         let first = runner
-            .build_agent(
-                &dir.join("agent.yaml"),
-                &dir,
-                &attempt_context,
-                tool_log.clone(),
-                approval_log.clone(),
-                llm_log.clone(),
-                None,
-                None,
-            )
+            .build_agent(BuildAgentParams {
+                agent_path: &dir.join("agent.yaml"),
+                base_dir: &dir,
+                attempt_context: &attempt_context,
+                tool_log: tool_log.clone(),
+                approval_log: approval_log.clone(),
+                llm_log: llm_log.clone(),
+                approval_handler: None,
+                budget: None,
+            })
             .await
             .unwrap();
         apply_base_context(&first, &runner.suite, &dir, scenario, &attempt_context).unwrap();
@@ -1746,16 +1773,16 @@ scenarios:
         assert_eq!(first.get_context()["precedence"], "turn");
 
         let reset = runner
-            .build_agent(
-                &dir.join("agent.yaml"),
-                &dir,
-                &attempt_context,
+            .build_agent(BuildAgentParams {
+                agent_path: &dir.join("agent.yaml"),
+                base_dir: &dir,
+                attempt_context: &attempt_context,
                 tool_log,
                 approval_log,
                 llm_log,
-                None,
-                None,
-            )
+                approval_handler: None,
+                budget: None,
+            })
             .await
             .unwrap();
         apply_base_context(&reset, &runner.suite, &dir, scenario, &attempt_context).unwrap();

@@ -32,6 +32,7 @@ version = "1.0.0-rc.16"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
+license-file = "LICENSE-APACHE"
 homepage = "https://ai-agents.rs"
 repository = "https://github.com/geminik23/ai-agents"
 authors = ["Jaemin Kim <geminik23@gmail.com>"]
@@ -56,15 +57,15 @@ async-stream = "0.3"
 parking_lot = "0.12"
 minijinja = { version = "2.10", features = ["builtins"] }
 
-llm = "=1.3.7"
+llm = { version = "=1.3.7", default-features = false, features = ["default-tls", "openai", "anthropic", "ollama", "deepseek", "xai", "phind", "google", "groq", "cohere", "mistral", "openrouter"] }
 evalexpr = "11"
 regex = "1"
 rand = "0.8"
 sha2 = "0.10"
 
 reqwest = { version = "0.12", features = ["json", "stream"] }
-rmcp = { version = "1.2", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+rmcp = { version = "1.4", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 clap = { version = "4.5", features = ["derive"] }
 

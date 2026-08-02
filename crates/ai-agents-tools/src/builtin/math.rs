@@ -658,7 +658,7 @@ mod tests {
             .execute(
                 serde_json::json!({
                     "operation": "round",
-                    "value": 3.14159,
+                    "value": 12.3456,
                     "decimals": 2
                 }),
                 ai_agents_core::ToolExecutionContext::test("test"),
@@ -666,7 +666,7 @@ mod tests {
             .await;
         assert!(result.success);
         let output: SingleOutput = serde_json::from_str(&result.output).unwrap();
-        assert!((output.result - 3.14).abs() < f64::EPSILON);
+        assert!((output.result - 12.35).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

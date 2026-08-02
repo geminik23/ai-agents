@@ -107,10 +107,10 @@ impl ContextManager {
 
     pub async fn refresh_per_turn(&self) -> Result<()> {
         for (key, source) in &self.schema {
-            if source.refresh_policy() == RefreshPolicy::PerTurn {
-                if let Some(value) = self.resolve_source(key, source).await? {
-                    self.values.write().insert(key.clone(), value);
-                }
+            if source.refresh_policy() == RefreshPolicy::PerTurn
+                && let Some(value) = self.resolve_source(key, source).await?
+            {
+                self.values.write().insert(key.clone(), value);
             }
         }
         Ok(())
@@ -133,12 +133,12 @@ impl ContextManager {
     pub async fn initialize(&self) -> Result<()> {
         for (key, source) in &self.schema {
             if let ContextSource::Runtime { default, .. } = source {
-                if let Some(default_value) = default {
-                    if !self.values.read().contains_key(key) {
-                        self.values
-                            .write()
-                            .insert(key.clone(), default_value.clone());
-                    }
+                if let Some(default_value) = default
+                    && !self.values.read().contains_key(key)
+                {
+                    self.values
+                        .write()
+                        .insert(key.clone(), default_value.clone());
                 }
             } else if let Some(value) = self.resolve_source(key, source).await? {
                 self.values.write().insert(key.clone(), value);

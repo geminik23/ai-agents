@@ -320,9 +320,7 @@ impl TextTool {
         let result = if char_count >= width {
             text.to_string()
         } else {
-            let padding: String = std::iter::repeat(pad_char)
-                .take(width - char_count)
-                .collect();
+            let padding: String = std::iter::repeat_n(pad_char, width - char_count).collect();
             format!("{}{}", padding, text)
         };
 
@@ -343,9 +341,7 @@ impl TextTool {
         let result = if char_count >= width {
             text.to_string()
         } else {
-            let padding: String = std::iter::repeat(pad_char)
-                .take(width - char_count)
-                .collect();
+            let padding: String = std::iter::repeat_n(pad_char, width - char_count).collect();
             format!("{}{}", text, padding)
         };
 

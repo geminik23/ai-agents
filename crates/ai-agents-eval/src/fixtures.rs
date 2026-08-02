@@ -692,6 +692,10 @@ impl RecordingToolLog {
         self.inner.lock().len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
+    }
+
     pub fn push(&self, record: ToolExecutionRecord) {
         self.inner.lock().push(record);
     }
@@ -1646,7 +1650,7 @@ fn chunks_from_response(response: LLMResponse) -> Vec<std::result::Result<LLMChu
                 Ok(LLMChunk::final_chunk(
                     delta,
                     response.finish_reason.clone(),
-                    response.usage.clone(),
+                    response.usage,
                 ))
             } else {
                 Ok(LLMChunk::new(delta, false))
@@ -2515,7 +2519,7 @@ workspace_policy:
         let context = resolve_fixture_context(&config, &dir).unwrap();
         assert_eq!(context.get("channel"), Some(&serde_json::json!("inline")));
         assert_eq!(context.get("feature"), Some(&serde_json::json!(true)));
-        assert!(context.get("user").is_some());
+        assert!(context.contains_key("user"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

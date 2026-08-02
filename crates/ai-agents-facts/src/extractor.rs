@@ -325,14 +325,12 @@ fn extract_json_array(text: &str) -> Option<String> {
     }
 
     // Look for the first '[' and last ']'.
-    if let Some(start) = text.find('[') {
-        if let Some(end) = text.rfind(']') {
-            if end > start {
-                let candidate = &text[start..=end];
-                if serde_json::from_str::<Vec<serde_json::Value>>(candidate).is_ok() {
-                    return Some(candidate.to_string());
-                }
-            }
+    if let (Some(start), Some(end)) = (text.find('['), text.rfind(']'))
+        && end > start
+    {
+        let candidate = &text[start..=end];
+        if serde_json::from_str::<Vec<serde_json::Value>>(candidate).is_ok() {
+            return Some(candidate.to_string());
         }
     }
 
@@ -502,10 +500,12 @@ mod tests {
         use ai_agents_core::types::FactCategory;
         use chrono::Utc;
 
-        let mut config = FactsConfig::default();
-        config.dedup = DedupConfig {
-            enabled: true,
-            method: DedupMethod::Llm,
+        let config = FactsConfig {
+            dedup: DedupConfig {
+                enabled: true,
+                method: DedupMethod::Llm,
+            },
+            ..Default::default()
         };
         let extractor = LLMFactExtractor::new(Arc::new(MockLLM), config);
 

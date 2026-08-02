@@ -24,7 +24,7 @@ pub struct PersonaRenderResult {
     pub newly_revealed: Vec<String>,
 }
 
-/// Runtime persona manager held by RuntimeAgent as Arc<PersonaManager>.
+/// Runtime persona manager held by `RuntimeAgent` as `Arc<PersonaManager>`.
 pub struct PersonaManager {
     /// Current persona state.
     config: RwLock<PersonaConfig>,

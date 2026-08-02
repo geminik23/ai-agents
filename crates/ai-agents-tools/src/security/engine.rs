@@ -1223,13 +1223,12 @@ fn collect_command_binding_values(
                     .filter_map(Value::as_str)
                     .map(str::to_string)
                     .collect::<Vec<_>>()
-            }) {
-                if !argv.is_empty() {
-                    values.push(BoundCommandValue {
-                        argv,
-                        is_string: false,
-                    });
-                }
+            }) && !argv.is_empty()
+            {
+                values.push(BoundCommandValue {
+                    argv,
+                    is_string: false,
+                });
             }
         }
         CommandBindingKind::Cwd
@@ -1542,6 +1541,13 @@ fn host_is_private_or_local(host: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn enabled_security_config() -> ToolSecurityConfig {
+        ToolSecurityConfig {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn test_default_engine() {
         let engine = ToolSecurityEngine::default();
@@ -1550,11 +1556,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_domain_blocking() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
 
-        let mut http_config = ToolPolicyConfig::default();
-        http_config.blocked_domains = vec!["evil.com".to_string()];
+        let http_config = ToolPolicyConfig {
+            blocked_domains: vec!["evil.com".to_string()],
+            ..Default::default()
+        };
         config.tools.insert("http".to_string(), http_config);
 
         let engine = ToolSecurityEngine::new(config);
@@ -1570,11 +1577,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_allowed_domains() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
 
-        let mut http_config = ToolPolicyConfig::default();
-        http_config.allowed_domains = vec!["api.example.com".to_string()];
+        let http_config = ToolPolicyConfig {
+            allowed_domains: vec!["api.example.com".to_string()],
+            ..Default::default()
+        };
         config.tools.insert("http".to_string(), http_config);
 
         let engine = ToolSecurityEngine::new(config);
@@ -1590,11 +1598,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_disabled() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
 
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.enabled = false;
+        let tool_config = ToolPolicyConfig {
+            enabled: false,
+            ..Default::default()
+        };
         config.tools.insert("dangerous".to_string(), tool_config);
 
         let engine = ToolSecurityEngine::new(config);
@@ -1609,12 +1618,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_tool_confirmation_required() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
 
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.require_confirmation = true;
-        tool_config.confirmation_message = Some("Are you sure?".to_string());
+        let tool_config = ToolPolicyConfig {
+            require_confirmation: true,
+            confirmation_message: Some("Are you sure?".to_string()),
+            ..Default::default()
+        };
         config.tools.insert("delete".to_string(), tool_config);
 
         let engine = ToolSecurityEngine::new(config);
@@ -1634,11 +1644,15 @@ mod tests {
 
     #[test]
     fn test_get_tool_timeout() {
-        let mut config = ToolSecurityConfig::default();
-        config.default_timeout_ms = 5000;
+        let mut config = ToolSecurityConfig {
+            default_timeout_ms: 5000,
+            ..Default::default()
+        };
 
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.timeout_ms = Some(10000);
+        let tool_config = ToolPolicyConfig {
+            timeout_ms: Some(10000),
+            ..Default::default()
+        };
         config.tools.insert("slow".to_string(), tool_config);
 
         let engine = ToolSecurityEngine::new(config);
@@ -1649,11 +1663,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_path_restrictions() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
 
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.allowed_paths = vec!["/tmp/".to_string(), "/home/user/".to_string()];
+        let tool_config = ToolPolicyConfig {
+            allowed_paths: vec!["/tmp/".to_string(), "/home/user/".to_string()],
+            ..Default::default()
+        };
         config.tools.insert("file_write".to_string(), tool_config);
 
         let engine = ToolSecurityEngine::new(config);
@@ -1675,11 +1690,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_operation_policy() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.operations.deny = vec!["delete".to_string()];
-        tool_config.operations.requires_approval = vec!["write".to_string()];
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            operations: OperationPolicyConfig {
+                deny: vec!["delete".to_string()],
+                requires_approval: vec!["write".to_string()],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         config.tools.insert("file".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -1698,10 +1717,11 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_optional_path_uses_default_for_policy() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.read_paths = vec!["./crates".to_string()];
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            read_paths: vec!["./crates".to_string()],
+            ..Default::default()
+        };
         config.tools.insert("grep".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -1718,11 +1738,14 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closed_requires_path_bindings_for_custom_tools() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        config.fail_closed = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.read_paths = vec!["./allowed".to_string()];
+        let mut config = ToolSecurityConfig {
+            fail_closed: true,
+            ..enabled_security_config()
+        };
+        let tool_config = ToolPolicyConfig {
+            read_paths: vec!["./allowed".to_string()],
+            ..Default::default()
+        };
         config
             .tools
             .insert("custom_search".to_string(), tool_config);
@@ -1748,12 +1771,15 @@ mod tests {
 
     #[tokio::test]
     async fn custom_path_bindings_enforce_blocked_paths() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        config.fail_closed = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.read_paths = vec!["./allowed".to_string()];
-        tool_config.blocked_paths = vec!["./allowed/private".to_string()];
+        let mut config = ToolSecurityConfig {
+            fail_closed: true,
+            ..enabled_security_config()
+        };
+        let tool_config = ToolPolicyConfig {
+            read_paths: vec!["./allowed".to_string()],
+            blocked_paths: vec!["./allowed/private".to_string()],
+            ..Default::default()
+        };
         config
             .tools
             .insert("custom_search".to_string(), tool_config);
@@ -1796,12 +1822,15 @@ mod tests {
         std::fs::create_dir_all(&public).unwrap();
         symlink(&private, public.join("alias")).unwrap();
 
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        config.fail_closed = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.read_paths = vec![root.path().to_string_lossy().into_owned()];
-        tool_config.blocked_paths = vec![private.to_string_lossy().into_owned()];
+        let mut config = ToolSecurityConfig {
+            fail_closed: true,
+            ..enabled_security_config()
+        };
+        let tool_config = ToolPolicyConfig {
+            read_paths: vec![root.path().to_string_lossy().into_owned()],
+            blocked_paths: vec![private.to_string_lossy().into_owned()],
+            ..Default::default()
+        };
         config
             .tools
             .insert("custom_search".to_string(), tool_config);
@@ -1825,8 +1854,7 @@ mod tests {
 
     #[test]
     fn custom_config_is_exposed_separately() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
         let mut tool_config = ToolPolicyConfig::default();
         tool_config
             .config
@@ -1839,12 +1867,13 @@ mod tests {
 
     #[test]
     fn policy_caps_are_applied_as_upper_bounds() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.max_results = Some(5);
-        tool_config.max_file_size_bytes = Some(1024);
-        tool_config.max_output_chars = Some(1000);
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            max_results: Some(5),
+            max_file_size_bytes: Some(1024),
+            max_output_chars: Some(1000),
+            ..Default::default()
+        };
         config.tools.insert("grep".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -1871,11 +1900,14 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closed_blocks_missing_result_limit_bindings() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        config.fail_closed = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.max_results = Some(5);
+        let mut config = ToolSecurityConfig {
+            fail_closed: true,
+            ..enabled_security_config()
+        };
+        let tool_config = ToolPolicyConfig {
+            max_results: Some(5),
+            ..Default::default()
+        };
         config
             .tools
             .insert("custom_search".to_string(), tool_config);
@@ -1896,11 +1928,14 @@ mod tests {
 
     #[tokio::test]
     async fn fail_closed_allows_configured_result_limit_bindings() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        config.fail_closed = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.max_results = Some(5);
+        let mut config = ToolSecurityConfig {
+            fail_closed: true,
+            ..enabled_security_config()
+        };
+        let tool_config = ToolPolicyConfig {
+            max_results: Some(5),
+            ..Default::default()
+        };
         config
             .tools
             .insert("custom_search".to_string(), tool_config);
@@ -1927,11 +1962,12 @@ mod tests {
 
     #[tokio::test]
     async fn read_paths_do_not_authorize_file_write() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.read_paths = vec!["./workspace".to_string()];
-        tool_config.no_write_policy = NoWritePolicyBehavior::Deny;
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            read_paths: vec!["./workspace".to_string()],
+            no_write_policy: NoWritePolicyBehavior::Deny,
+            ..Default::default()
+        };
         config.tools.insert("file_write".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -1949,13 +1985,14 @@ mod tests {
 
     #[tokio::test]
     async fn command_cwd_requires_working_dir_allowlist() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.read_paths = vec![".".to_string()];
-        tool_config.allowed_commands = vec![CommandRuleConfig {
-            argv: vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()],
-        }];
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            read_paths: vec![".".to_string()],
+            allowed_commands: vec![CommandRuleConfig {
+                argv: vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()],
+            }],
+            ..Default::default()
+        };
         config.tools.insert("command".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -1973,11 +2010,12 @@ mod tests {
 
     #[tokio::test]
     async fn command_requires_exact_argv_allowlist() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.allow_without_confirmation = true;
-        tool_config.working_dirs = vec![".".to_string()];
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            allow_without_confirmation: true,
+            working_dirs: vec![".".to_string()],
+            ..Default::default()
+        };
         config.tools.insert("command".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -2001,13 +2039,14 @@ mod tests {
 
     #[tokio::test]
     async fn command_exact_argv_allowlist_is_enforced() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.allowed_commands = vec![CommandRuleConfig {
-            argv: vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()],
-        }];
-        tool_config.working_dirs = vec![".".to_string()];
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            allowed_commands: vec![CommandRuleConfig {
+                argv: vec!["cargo".to_string(), "fmt".to_string(), "--all".to_string()],
+            }],
+            working_dirs: vec![".".to_string()],
+            ..Default::default()
+        };
         config.tools.insert("command".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -2034,10 +2073,11 @@ mod tests {
 
     #[tokio::test]
     async fn validation_does_not_consume_rate_limit_admission() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.rate_limit = Some(1);
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            rate_limit: Some(1),
+            ..Default::default()
+        };
         config.tools.insert("limited".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
         let bindings = legacy_policy_bindings("limited");
@@ -2055,10 +2095,11 @@ mod tests {
 
     #[tokio::test]
     async fn public_check_preserves_rate_limit_admission() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.rate_limit = Some(1);
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            rate_limit: Some(1),
+            ..Default::default()
+        };
         config.tools.insert("limited".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 
@@ -2077,10 +2118,11 @@ mod tests {
 
     #[test]
     fn concurrent_rate_limit_admission_is_atomic() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.rate_limit = Some(1);
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            rate_limit: Some(1),
+            ..Default::default()
+        };
         config.tools.insert("limited".to_string(), tool_config);
         let engine = Arc::new(ToolSecurityEngine::new_with_policy_version(config, 17));
         let barrier = Arc::new(std::sync::Barrier::new(8));
@@ -2106,11 +2148,12 @@ mod tests {
 
     #[tokio::test]
     async fn omitted_dry_run_is_treated_as_actual_mutation() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
+        let mut config = enabled_security_config();
         for tool_id in ["file_edit", "copy_path"] {
-            let mut tool_config = ToolPolicyConfig::default();
-            tool_config.no_write_policy = NoWritePolicyBehavior::DryRunOnly;
+            let tool_config = ToolPolicyConfig {
+                no_write_policy: NoWritePolicyBehavior::DryRunOnly,
+                ..Default::default()
+            };
             config.tools.insert(tool_id.to_string(), tool_config);
         }
         let engine = ToolSecurityEngine::new(config);
@@ -2141,10 +2184,11 @@ mod tests {
 
     #[tokio::test]
     async fn no_write_policy_dry_run_only_allows_dry_run() {
-        let mut config = ToolSecurityConfig::default();
-        config.enabled = true;
-        let mut tool_config = ToolPolicyConfig::default();
-        tool_config.no_write_policy = NoWritePolicyBehavior::DryRunOnly;
+        let mut config = enabled_security_config();
+        let tool_config = ToolPolicyConfig {
+            no_write_policy: NoWritePolicyBehavior::DryRunOnly,
+            ..Default::default()
+        };
         config.tools.insert("file_edit".to_string(), tool_config);
         let engine = ToolSecurityEngine::new(config);
 

@@ -1,0 +1,246 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  MSRV: "1.88.0"
+  RELEASE_RUST: "1.97.0"
+
+jobs:
+  msrv:
+    name: Root workspace MSRV
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust 1.88
+        run: rustup toolchain install "$MSRV" --profile minimal
+      - name: Check default features
+        run: cargo +1.88.0 check --workspace --all-targets --locked
+      - name: Check all features
+        run: cargo +1.88.0 check --workspace --all-targets --all-features --locked
+      - name: Test default features
+        run: cargo +1.88.0 test --workspace --locked
+      - name: Test all features
+        run: cargo +1.88.0 test --workspace --all-features --locked
+
+  quality:
+    name: Formatting, Clippy, and rustdoc
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Install release Rust with quality components
+        run: rustup toolchain install "$RELEASE_RUST" --profile minimal --component rustfmt --component clippy
+      - name: Check root formatting
+        run: cargo +1.97.0 fmt --all -- --check
+      - name: Check examples formatting
+        run: cargo +1.97.0 fmt --manifest-path examples/Cargo.toml --all -- --check
+      - name: Run strict Clippy
+        run: cargo +1.97.0 clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Build strict rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo +1.97.0 doc --workspace --all-features --no-deps --locked
+      - name: Check pull request whitespace
+        if: github.event_name == 'pull_request'
+        run: git diff --check ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+      - name: Check pushed commit range whitespace
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        run: git diff --check ${{ github.event.before }}..${{ github.sha }}
+      - name: Check initial branch push whitespace
+        if: github.event_name == 'push' && github.event.before == '0000000000000000000000000000000000000000'
+        run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ${{ github.sha }}
+      - name: Check manual run whitespace
+        if: github.event_name == 'workflow_dispatch'
+        run: git diff --check 4b825dc642cb6eb9a060e54bf8d69288fbee4904 ${{ github.sha }}
+
+  tests:
+    name: Release toolchain tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install release Rust
+        run: rustup toolchain install "$RELEASE_RUST" --profile minimal
+      - name: Test root workspace
+        run: cargo +1.97.0 test --workspace --all-features --locked
+      - name: Test examples workspace
+        run: cargo +1.97.0 test --manifest-path examples/Cargo.toml --workspace
+
+  public-contract:
+    name: Public contract and live configuration
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      RUSTUP_TOOLCHAIN: "1.97.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install release Rust
+        run: rustup toolchain install "$RELEASE_RUST" --profile minimal
+      - name: Validate public contract
+        run: cargo +1.97.0 run -p xtask --locked -- public-contract
+      - name: Validate live example configuration
+        run: sh examples/eval/live/run_live_example_evals.sh --dry-config-check
+      - name: Validate live quality configuration
+        run: >-
+          cargo +1.97.0 run -p ai-agents-cli --locked -- eval
+          --scenarios examples/eval/live/quality/basic/simple_chat_semantic_judge_live.yaml
+          --dry-config-check
+      - name: Upload public contract report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: public-contract-${{ github.sha }}
+          path: target/public-contract/summary.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  mocked-evals:
+    name: Credential-free mocked evals
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RUSTUP_TOOLCHAIN: "1.97.0"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install release Rust
+        run: rustup toolchain install "$RELEASE_RUST" --profile minimal
+      - name: Run mocked eval registry without provider credentials
+        run: >-
+          env -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u GOOGLE_API_KEY
+          -u OPENROUTER_API_KEY sh examples/eval/mocked/run_mocked_evals.sh
+          --output-root target/eval/mocked/ci
+
+  security:
+    name: Security and release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      RUSTUP_TOOLCHAIN: "1.97.0"
+    steps:
+      - name: Check out full repository history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Install release Rust
+        run: rustup toolchain install "$RELEASE_RUST" --profile minimal
+      - name: Install pinned cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+      - name: Download checksum-verified gitleaks
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz" \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/gitleaks.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks"
+      - name: Scan full history for secrets
+        run: >-
+          "$RUNNER_TEMP/gitleaks/gitleaks" git --redact --verbose
+          --log-opts="--all --full-history" .
+      - name: Audit root lockfile advisories
+        if: ${{ !cancelled() }}
+        run: cargo audit --file Cargo.lock
+      - name: Write and inspect locked dependency metadata
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir -p "target/release-preflight/${GITHUB_SHA}"
+          cargo metadata --locked --format-version 1 \
+            > "target/release-preflight/${GITHUB_SHA}/cargo-metadata.json"
+          python3 - <<'PY'
+          import json
+          import os
+
+          path = f"target/release-preflight/{os.environ['GITHUB_SHA']}/cargo-metadata.json"
+          with open(path, encoding="utf-8") as metadata_file:
+              metadata = json.load(metadata_file)
+
+          workspace_members = set(metadata["workspace_members"])
+          project_packages = [
+              package
+              for package in metadata["packages"]
+              if package["id"] in workspace_members and package.get("publish") != []
+          ]
+          violations = [
+              f"{package['name']} ({package.get('license')})"
+              for package in project_packages
+              if package.get("license") != "Apache-2.0"
+          ]
+          if not project_packages:
+              raise SystemExit("No publishable workspace packages found")
+          if violations:
+              raise SystemExit(
+                  "Publishable workspace packages must use Apache-2.0: "
+                  + ", ".join(violations)
+              )
+          print(f"Verified {len(project_packages)} Apache-2.0 project packages")
+          PY
+
+  website:
+    name: Website build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Download pinned Zola
+        run: |
+          mkdir -p "$RUNNER_TEMP/zola"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --output "$RUNNER_TEMP/zola.tar.gz" \
+            https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz
+          echo "0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef  $RUNNER_TEMP/zola.tar.gz" \
+            | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/zola.tar.gz" -C "$RUNNER_TEMP/zola"
+          echo "$RUNNER_TEMP/zola" >> "$GITHUB_PATH"
+      - name: Build website
+        run: sh website/build.sh build
+      - name: Verify generated examples are synchronized
+        run: git diff --exit-code -- website/content/examples/_index.md
+
+  platform:
+    name: Platform tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install release Rust
+        run: rustup toolchain install ${{ env.RELEASE_RUST }} --profile minimal
+      - name: Run default-feature platform tests
+        run: cargo +1.97.0 test --workspace --locked

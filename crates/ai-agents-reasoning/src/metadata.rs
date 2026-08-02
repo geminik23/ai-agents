@@ -48,7 +48,7 @@ impl Default for ReasoningMetadata {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ReflectionMetadata {
     pub attempts: u32,
     pub final_evaluation: EvaluationResult,
@@ -85,16 +85,6 @@ impl ReflectionMetadata {
 
     pub fn required_retries(&self) -> bool {
         self.attempts > 1
-    }
-}
-
-impl Default for ReflectionMetadata {
-    fn default() -> Self {
-        Self {
-            attempts: 0,
-            final_evaluation: EvaluationResult::default(),
-            history: Vec::new(),
-        }
     }
 }
 

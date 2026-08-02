@@ -145,7 +145,7 @@ async fn evaluate_handoff(
     let agent_list = candidates.join(", ");
 
     let messages = vec![
-        ChatMessage::system(&format!(
+        ChatMessage::system(format!(
             "You are evaluating whether a conversation should be handed off to a different specialist.\n\
              Current agent: {current_agent}\n\
              Available agents: {agent_list}\n\n\
@@ -154,7 +154,7 @@ async fn evaluate_handoff(
              Set action to \"stay\" if the current agent is handling the conversation well.\n\
              Set action to one of the available agent IDs if a handoff is needed."
         )),
-        ChatMessage::user(&format!(
+        ChatMessage::user(format!(
             "User message: {user_input}\n\nAgent response: {agent_response}"
         )),
     ];
@@ -220,10 +220,10 @@ fn try_parse_handoff_json(raw: &str, candidates: &[&str]) -> Option<HandoffDecis
 /// Tries raw parse, markdown code block extraction, then brace extraction.
 fn extract_json_value(raw: &str) -> Option<Value> {
     // Try raw JSON parse first.
-    if let Ok(v) = serde_json::from_str::<Value>(raw) {
-        if v.is_object() {
-            return Some(v);
-        }
+    if let Ok(v) = serde_json::from_str::<Value>(raw)
+        && v.is_object()
+    {
+        return Some(v);
     }
 
     // Try extracting from a markdown code block.
@@ -234,10 +234,10 @@ fn extract_json_value(raw: &str) -> Option<Value> {
         let body = &after_fence[body_start..];
         if let Some(end) = body.find("```") {
             let block = body[..end].trim();
-            if let Ok(v) = serde_json::from_str::<Value>(block) {
-                if v.is_object() {
-                    return Some(v);
-                }
+            if let Ok(v) = serde_json::from_str::<Value>(block)
+                && v.is_object()
+            {
+                return Some(v);
             }
         }
     }
@@ -247,10 +247,10 @@ fn extract_json_value(raw: &str) -> Option<Value> {
     let close = raw.rfind('}')?;
     if close > open {
         let slice = &raw[open..=close];
-        if let Ok(v) = serde_json::from_str::<Value>(slice) {
-            if v.is_object() {
-                return Some(v);
-            }
+        if let Ok(v) = serde_json::from_str::<Value>(slice)
+            && v.is_object()
+        {
+            return Some(v);
         }
     }
 
@@ -277,7 +277,7 @@ fn fuzzy_parse_handoff(raw: &str, candidates: &[&str]) -> HandoffDecision {
 
     // Sort candidates longest-first to avoid substring collisions.
     let mut sorted: Vec<&str> = candidates.to_vec();
-    sorted.sort_by(|a, b| b.len().cmp(&a.len()));
+    sorted.sort_by_key(|candidate| std::cmp::Reverse(candidate.len()));
 
     for candidate in &sorted {
         if lower.contains(&candidate.to_lowercase()) {

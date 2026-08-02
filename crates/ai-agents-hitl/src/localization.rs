@@ -206,16 +206,16 @@ pub fn resolve_best_language(
     handler: &dyn ApprovalHandler,
     context: &HashMap<String, Value>,
 ) -> Option<String> {
-    if let Some(lang) = handler.preferred_language() {
-        if approval_message.get(&lang).is_some() {
-            return Some(lang);
-        }
+    if let Some(lang) = handler.preferred_language()
+        && approval_message.get(&lang).is_some()
+    {
+        return Some(lang);
     }
 
-    if let Some(lang) = get_user_language(context) {
-        if approval_message.get(&lang).is_some() {
-            return Some(lang);
-        }
+    if let Some(lang) = get_user_language(context)
+        && approval_message.get(&lang).is_some()
+    {
+        return Some(lang);
     }
 
     if approval_message.get("en").is_some() {

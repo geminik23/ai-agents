@@ -193,10 +193,10 @@ impl App {
 
     /// Process one incoming event and return whether the app should keep running.
     pub async fn update(&mut self, msg: AppMessage) -> UpdateResult {
-        if self.modal.is_some() {
-            if let AppMessage::Key(key) = msg {
-                return self.handle_modal_key(key);
-            }
+        if self.modal.is_some()
+            && let AppMessage::Key(key) = msg
+        {
+            return self.handle_modal_key(key);
         }
 
         match msg {
@@ -1060,7 +1060,7 @@ impl App {
                 }
                 let raw_value = parts[3..].join(" ");
                 let value: serde_json::Value = serde_json::from_str(&raw_value)
-                    .unwrap_or_else(|_| serde_json::Value::String(raw_value));
+                    .unwrap_or(serde_json::Value::String(raw_value));
                 match self.agent.set_context(key, value) {
                     Ok(()) => self.add_toast(&format!("Set: {}", key)),
                     Err(e) => self.add_system_message(&format!("[Error] {}", e)),
@@ -1252,7 +1252,7 @@ impl App {
                         Some("Use default") => {
                             self.complete_question_response(Vec::new(), None, false);
                         }
-                        Some("Cancel") | _ => {
+                        _ => {
                             self.complete_question_response(Vec::new(), None, false);
                         }
                     }
@@ -1335,11 +1335,11 @@ impl App {
     }
 
     fn show_question_modal(&mut self, question: PendingQuestion) {
-        let default_label = question.request.default.as_ref().and_then(|v| {
+        let default_label = question.request.default.as_ref().map(|v| {
             if let Some(s) = v.as_str() {
-                Some(s.to_string())
+                s.to_string()
             } else {
-                Some(v.to_string())
+                v.to_string()
             }
         });
         let modal = ModalState::question(
@@ -1657,10 +1657,10 @@ impl App {
                 states.push(event.to.clone());
             }
         }
-        if let Some(current) = self.agent.current_state() {
-            if !states.contains(&current) {
-                states.push(current);
-            }
+        if let Some(current) = self.agent.current_state()
+            && !states.contains(&current)
+        {
+            states.push(current);
         }
 
         StatePanelState {

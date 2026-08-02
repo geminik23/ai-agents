@@ -115,11 +115,11 @@ impl StateMachine {
                 AgentError::InvalidSpec(format!("State not found: {}", current_path))
             })?;
 
-            if let (Some(initial_sub), Some(sub_states)) = (&def.initial, &def.states) {
-                if sub_states.contains_key(initial_sub) {
-                    current_path = format!("{}.{}", current_path, initial_sub);
-                    continue;
-                }
+            if let (Some(initial_sub), Some(sub_states)) = (&def.initial, &def.states)
+                && sub_states.contains_key(initial_sub)
+            {
+                current_path = format!("{}.{}", current_path, initial_sub);
+                continue;
             }
             break;
         }
@@ -136,7 +136,7 @@ impl StateMachine {
 
         transitions.extend(self.config.global_transitions.clone());
 
-        transitions.sort_by(|a, b| b.priority.cmp(&a.priority));
+        transitions.sort_by_key(|transition| std::cmp::Reverse(transition.priority));
         transitions
     }
 
@@ -172,10 +172,10 @@ impl StateMachine {
     }
 
     pub fn check_fallback(&self) -> Option<String> {
-        if let Some(max) = self.config.max_no_transition {
-            if self.no_transition_count() >= max {
-                return self.config.fallback.clone();
-            }
+        if let Some(max) = self.config.max_no_transition
+            && self.no_transition_count() >= max
+        {
+            return self.config.fallback.clone();
         }
         None
     }

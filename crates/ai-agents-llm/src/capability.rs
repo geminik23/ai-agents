@@ -22,19 +22,17 @@ impl DefaultLLMCapability {
             return Ok(value);
         }
 
-        if let Some(json_str) = extract_json_from_markdown(content) {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                return Ok(value);
-            }
+        if let Some(json_str) = extract_json_from_markdown(content)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&json_str)
+        {
+            return Ok(value);
         }
 
-        if let Some(start) = content.find('{') {
-            if let Some(end) = content.rfind('}') {
-                let json_str = &content[start..=end];
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    return Ok(value);
-                }
-            }
+        if let Some(start) = content.find('{')
+            && let Some(end) = content.rfind('}')
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&content[start..=end])
+        {
+            return Ok(value);
         }
 
         Err(LLMError::Serialization(format!(

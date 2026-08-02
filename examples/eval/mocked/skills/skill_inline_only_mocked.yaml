@@ -46,4 +46,3 @@ scenarios:
                   skill_prompt:
                     path: count
                     gte: 1
-

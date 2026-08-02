@@ -58,10 +58,10 @@ pub async fn group_chat(
         .unwrap_or(TurnMethod::RoundRobin);
 
     for round in 0..config.max_rounds {
-        if let Some(timeout) = config.timeout_ms {
-            if start.elapsed().as_millis() as u64 >= timeout {
-                return Ok(build_result(&transcript, round, "timeout"));
-            }
+        if let Some(timeout) = config.timeout_ms
+            && start.elapsed().as_millis() as u64 >= timeout
+        {
+            return Ok(build_result(&transcript, round, "timeout"));
         }
 
         let speakers_count = if matches!(method, TurnMethod::LlmDirected) {
@@ -179,21 +179,19 @@ pub async fn group_chat(
             }
         }
 
-        if matches!(config.style, ChatStyle::Consensus)
+        if (matches!(config.style, ChatStyle::Consensus)
             || matches!(
                 config.termination.method,
                 TerminationMethod::ConsensusReached
-            )
+            ))
+            && let Some(llm) = llm
+            && check_consensus(llm, &transcript).await?
         {
-            if let Some(llm) = llm {
-                if check_consensus(llm, &transcript).await? {
-                    return Ok(build_result(
-                        &transcript,
-                        rounds_completed,
-                        "consensus_reached",
-                    ));
-                }
-            }
+            return Ok(build_result(
+                &transcript,
+                rounds_completed,
+                "consensus_reached",
+            ));
         }
     }
 
@@ -255,14 +253,14 @@ async fn select_next_speaker(
     };
 
     let messages = vec![
-        ChatMessage::system(&format!(
+        ChatMessage::system(format!(
             "You are a conversation manager.\n\
              Pick which participant should speak next.\n\
              Respond with only the participant ID, nothing else.\n\n\
              Participants:\n{}",
             participant_list
         )),
-        ChatMessage::user(&format!(
+        ChatMessage::user(format!(
             "Topic: {}\n\nConversation so far:\n{}\n\nWho should speak next?",
             topic, transcript_text
         )),
@@ -293,6 +291,8 @@ async fn select_next_speaker(
 }
 
 /// Run one round where the LLM picks each speaker one at a time.
+/// The separate mutable transcript and context arguments preserve coupled round update ordering.
+#[allow(clippy::too_many_arguments)]
 async fn run_llm_directed_round(
     registry: &AgentRegistry,
     llm: &dyn LLMProvider,
@@ -447,22 +447,21 @@ async fn ask_manager_continue(
     }
 
     // Try extracting JSON from mixed text.
-    if let Some(start) = raw.find('{') {
-        if let Some(end) = raw.rfind('}') {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw[start..=end]) {
-                let action = parsed
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("continue")
-                    .to_string();
-                let reason = parsed
-                    .get("reason")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                return Ok(ManagerDecision { action, reason });
-            }
-        }
+    if let Some(start) = raw.find('{')
+        && let Some(end) = raw.rfind('}')
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&raw[start..=end])
+    {
+        let action = parsed
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("continue")
+            .to_string();
+        let reason = parsed
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        return Ok(ManagerDecision { action, reason });
     }
 
     // Fuzzy text fallback.

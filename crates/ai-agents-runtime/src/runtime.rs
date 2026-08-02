@@ -200,6 +200,33 @@ struct MainProviderResponse {
     used_native_tools: bool,
 }
 
+//
+// Carries one committed model answer through shared output processing and root-turn finalization.
+//
+struct CommittedTextResponse<'a> {
+    processed_input: &'a str,
+    input_context: &'a HashMap<String, Value>,
+    answer: String,
+    reasoning_mode: ReasoningMode,
+    auto_detected: bool,
+    iterations: u32,
+    thinking_content: Option<String>,
+    all_tool_calls: Vec<ToolCall>,
+}
+
+//
+// Carries the finalized response fields into metadata assembly without changing their ownership.
+//
+struct AgentResponseParts {
+    content: String,
+    all_tool_calls: Vec<ToolCall>,
+    reasoning_mode: ReasoningMode,
+    auto_detected: bool,
+    iterations: u32,
+    thinking: Option<String>,
+    reflection_metadata: Option<ReflectionMetadata>,
+}
+
 /// Outcome of skill routing — used by `try_skill_route`.
 enum SkillRouteResult {
     /// No skill matched, continue to normal LLM chat.
@@ -1151,13 +1178,12 @@ impl RuntimeAgent {
                 }
             }
             AwaitBeforeNextTurn::SameActor => {
-                if let Some(actor_id) = actor_id {
-                    if let Err(error) = self
+                if let Some(actor_id) = actor_id
+                    && let Err(error) = self
                         .flush_background_tasks_for_actor_purpose(actor_id, purpose)
                         .await
-                    {
-                        warn!(label = label, actor_id = %actor_id, error = %error, "actor background maintenance flush failed");
-                    }
+                {
+                    warn!(label = label, actor_id = %actor_id, error = %error, "actor background maintenance flush failed");
                 }
             }
         }
@@ -1371,14 +1397,13 @@ impl RuntimeAgent {
                         hooks.on_notable_event(&actor_for_task, event).await;
                     }
                 }
-                if manager.config().persistence.enabled {
-                    if let (Some(storage), Some(value)) =
+                if manager.config().persistence.enabled
+                    && let (Some(storage), Some(value)) =
                         (storage, manager.relationship_as_value(&actor_for_task)?)
-                    {
-                        storage
-                            .save_relationship(&agent_id, &actor_for_task, &value)
-                            .await?;
-                    }
+                {
+                    storage
+                        .save_relationship(&agent_id, &actor_for_task, &value)
+                        .await?;
                 }
                 Ok(())
             };
@@ -1667,27 +1692,25 @@ impl RuntimeAgent {
             return;
         }
 
-        if let Some(ref am_config) = self.actor_memory_config {
-            if am_config.identification.method == ai_agents_facts::IdentificationMethod::FromContext
+        if let Some(ref am_config) = self.actor_memory_config
+            && am_config.identification.method == ai_agents_facts::IdentificationMethod::FromContext
+            && let Some(ref path) = am_config.identification.context_path
+        {
+            // get_path resolves dotted paths; get only handles top-level keys.
+            let val = self
+                .context_manager
+                .get_path(path)
+                .or_else(|| self.context_manager.get(path));
+            if let Some(val) = val
+                && let Some(id_str) = val.as_str()
             {
-                if let Some(ref path) = am_config.identification.context_path {
-                    // get_path resolves dotted paths; get only handles top-level keys.
-                    let val = self
-                        .context_manager
-                        .get_path(path)
-                        .or_else(|| self.context_manager.get(path));
-                    if let Some(val) = val {
-                        if let Some(id_str) = val.as_str() {
-                            let current = self.actor_id.read().clone();
-                            if current.as_deref() != Some(id_str) {
-                                *self.actor_id.write() = Some(id_str.to_string());
-                                let mut meta = self.session_metadata.write();
-                                meta.actor_id = Some(id_str.to_string());
-                                if !meta.actors.iter().any(|a| a == id_str) {
-                                    meta.actors.push(id_str.to_string());
-                                }
-                            }
-                        }
+                let current = self.actor_id.read().clone();
+                if current.as_deref() != Some(id_str) {
+                    *self.actor_id.write() = Some(id_str.to_string());
+                    let mut meta = self.session_metadata.write();
+                    meta.actor_id = Some(id_str.to_string());
+                    if !meta.actors.iter().any(|a| a == id_str) {
+                        meta.actors.push(id_str.to_string());
                     }
                 }
             }
@@ -1786,48 +1809,46 @@ impl RuntimeAgent {
         let mut root = Value::Object(context.clone().into_iter().collect());
 
         if let Some(turn_ctx) = self.current_turn_actor_context() {
-            if let Some(ref origin_actor_id) = turn_ctx.origin_actor_id {
-                if let Ok(updated) = ai_agents_core::set_dot_path(
+            if let Some(ref origin_actor_id) = turn_ctx.origin_actor_id
+                && let Ok(updated) = ai_agents_core::set_dot_path(
                     root.clone(),
                     "interaction.origin_actor_id",
                     serde_json::json!(origin_actor_id),
-                ) {
-                    root = updated;
-                }
+                )
+            {
+                root = updated;
             }
-            if let Some(ref sender_agent_id) = turn_ctx.sender_agent_id {
-                if let Ok(updated) = ai_agents_core::set_dot_path(
+            if let Some(ref sender_agent_id) = turn_ctx.sender_agent_id
+                && let Ok(updated) = ai_agents_core::set_dot_path(
                     root.clone(),
                     "interaction.sender_agent_id",
                     serde_json::json!(sender_agent_id),
-                ) {
-                    root = updated;
-                }
-            }
-        }
-
-        if let Some(ref actor_id) = self.effective_actor_id() {
-            if let Ok(updated) = ai_agents_core::set_dot_path(
-                root.clone(),
-                "interaction.actor_id",
-                serde_json::json!(actor_id),
-            ) {
+                )
+            {
                 root = updated;
             }
         }
 
-        if let Some(manager) = self.relationship_manager.as_ref() {
-            if let Some(actor_id) = self.effective_actor_id() {
-                if let Some(value) = manager.to_context_value(&actor_id) {
-                    if let Ok(updated) = ai_agents_core::set_dot_path(
-                        root.clone(),
-                        &manager.config().injection.context_path,
-                        value,
-                    ) {
-                        root = updated;
-                    }
-                }
-            }
+        if let Some(ref actor_id) = self.effective_actor_id()
+            && let Ok(updated) = ai_agents_core::set_dot_path(
+                root.clone(),
+                "interaction.actor_id",
+                serde_json::json!(actor_id),
+            )
+        {
+            root = updated;
+        }
+
+        if let Some(manager) = self.relationship_manager.as_ref()
+            && let Some(actor_id) = self.effective_actor_id()
+            && let Some(value) = manager.to_context_value(&actor_id)
+            && let Ok(updated) = ai_agents_core::set_dot_path(
+                root.clone(),
+                &manager.config().injection.context_path,
+                value,
+            )
+        {
+            root = updated;
         }
 
         if let Value::Object(obj) = root {
@@ -1839,10 +1860,10 @@ impl RuntimeAgent {
 
     fn resolve_actor_name_from_context(&self) -> Option<String> {
         for path in ["actor.name", "user.name", "player.name", "customer.name"] {
-            if let Some(value) = self.context_manager.get_path(path) {
-                if let Some(name) = value.as_str() {
-                    return Some(name.to_string());
-                }
+            if let Some(value) = self.context_manager.get_path(path)
+                && let Some(name) = value.as_str()
+            {
+                return Some(name.to_string());
             }
         }
         None
@@ -2457,8 +2478,14 @@ impl RuntimeAgent {
                 ));
             }
             storage.delete_actor_data(&self.info.id, actor_id).await?;
-        } else if let Some(store) = self.fact_store.read().clone() {
-            store.delete_actor_data(actor_id).await?;
+        } else {
+            //
+            // Clone the fallback store before awaiting so backend I/O never holds the runtime read guard.
+            //
+            let store = { self.fact_store.read().clone() };
+            if let Some(store) = store {
+                store.delete_actor_data(actor_id).await?;
+            }
         }
         if let Some(manager) = self.relationship_manager.as_ref() {
             manager.remove(actor_id);
@@ -2547,10 +2574,10 @@ impl RuntimeAgent {
     pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {
         self.memory.restore(snapshot.memory).await?;
 
-        if let (Some(sm), Some(sm_snapshot)) = (&self.state_machine, snapshot.state_machine) {
-            if !sm_snapshot.current_state.is_empty() {
-                sm.restore(sm_snapshot)?;
-            }
+        if let (Some(sm), Some(sm_snapshot)) = (&self.state_machine, snapshot.state_machine)
+            && !sm_snapshot.current_state.is_empty()
+        {
+            sm.restore(sm_snapshot)?;
         }
 
         self.context_manager.restore(snapshot.context);
@@ -3057,7 +3084,7 @@ impl RuntimeAgent {
             )
             .await?;
 
-        let summary_message = ChatMessage::system(&format!(
+        let summary_message = ChatMessage::system(format!(
             "[Previous conversation summary]\n{}",
             response.content
         ));
@@ -3172,12 +3199,12 @@ impl RuntimeAgent {
     /// (including `Some([])` for "no tools"), or `None` if the state doesn't
     /// specify tools (meaning: fall back to agent-level declared_tool_ids).
     fn get_current_tool_refs(&self) -> Option<Vec<ToolRef>> {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(state_def) = sm.current_definition() {
-                let parent_def = sm.get_parent_definition();
-                if let Some(effective) = state_def.get_effective_tools(parent_def.as_ref()) {
-                    return Some(effective.into_iter().cloned().collect());
-                }
+        if let Some(ref sm) = self.state_machine
+            && let Some(state_def) = sm.current_definition()
+        {
+            let parent_def = sm.get_parent_definition();
+            if let Some(effective) = state_def.get_effective_tools(parent_def.as_ref()) {
+                return Some(effective.into_iter().cloned().collect());
             }
         }
         None
@@ -3231,74 +3258,74 @@ impl RuntimeAgent {
             String::new()
         };
 
-        if let Some(ref sm) = self.state_machine {
-            if let Some(state_def) = sm.current_definition() {
-                let state_prompt = if let Some(ref prompt) = state_def.prompt {
-                    let context = self.build_context_with_overlays();
-                    self.template_renderer.render_with_state(
-                        prompt,
-                        &context,
-                        &sm.current(),
-                        sm.previous().as_deref(),
-                        sm.turn_count(),
-                        state_def.max_turns,
-                    )?
-                } else {
-                    String::new()
-                };
+        if let Some(ref sm) = self.state_machine
+            && let Some(state_def) = sm.current_definition()
+        {
+            let state_prompt = if let Some(ref prompt) = state_def.prompt {
+                let context = self.build_context_with_overlays();
+                self.template_renderer.render_with_state(
+                    prompt,
+                    &context,
+                    &sm.current(),
+                    sm.previous().as_deref(),
+                    sm.turn_count(),
+                    state_def.max_turns,
+                )?
+            } else {
+                String::new()
+            };
 
-                let combined = match state_def.prompt_mode {
-                    PromptMode::Append => {
-                        if state_prompt.is_empty() {
-                            rendered_base
-                        } else {
-                            format!(
-                                "{}\n\n[Current State: {}]\n{}",
-                                rendered_base,
-                                sm.current(),
-                                state_prompt
-                            )
-                        }
-                    }
-                    PromptMode::Replace => {
-                        if state_prompt.is_empty() {
-                            rendered_base
-                        } else {
+            let combined = match state_def.prompt_mode {
+                PromptMode::Append => {
+                    if state_prompt.is_empty() {
+                        rendered_base
+                    } else {
+                        format!(
+                            "{}\n\n[Current State: {}]\n{}",
+                            rendered_base,
+                            sm.current(),
                             state_prompt
-                        }
-                    }
-                    PromptMode::Prepend => {
-                        if state_prompt.is_empty() {
-                            rendered_base
-                        } else {
-                            format!("{}\n\n{}", state_prompt, rendered_base)
-                        }
-                    }
-                };
-
-                // Persona always prepended regardless of prompt_mode.
-                let with_persona = if persona_prefix.is_empty() {
-                    combined
-                } else {
-                    format!("{}\n\n{}", persona_prefix, combined)
-                };
-
-                if include_tool_prompt {
-                    let available_tool_ids = self.get_available_tool_ids().await?;
-                    if !available_tool_ids.is_empty() {
-                        let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
-                            &available_tool_ids,
-                            None,
-                            self.parallel_tools.enabled,
-                            self.runtime_config.tool_schema_prompt_mode,
-                        );
-                        if !tools_prompt.is_empty() {
-                            return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
-                        }
+                        )
                     }
                 }
-                return Ok(with_persona);
+                PromptMode::Replace => {
+                    if state_prompt.is_empty() {
+                        rendered_base
+                    } else {
+                        state_prompt
+                    }
+                }
+                PromptMode::Prepend => {
+                    if state_prompt.is_empty() {
+                        rendered_base
+                    } else {
+                        format!("{}\n\n{}", state_prompt, rendered_base)
+                    }
+                }
+            };
+
+            // Persona always prepended regardless of prompt_mode.
+            let with_persona = if persona_prefix.is_empty() {
+                combined
+            } else {
+                format!("{}\n\n{}", persona_prefix, combined)
+            };
+
+            if include_tool_prompt {
+                let available_tool_ids = self.get_available_tool_ids().await?;
+                if !available_tool_ids.is_empty() {
+                    let tools_prompt = self.tools.generate_scoped_prompt_with_mode(
+                        &available_tool_ids,
+                        None,
+                        self.parallel_tools.enabled,
+                        self.runtime_config.tool_schema_prompt_mode,
+                    );
+                    if !tools_prompt.is_empty() {
+                        return Ok(format!("{}\n\n{}", with_persona, tools_prompt));
+                    }
+                }
             }
+            return Ok(with_persona);
         }
 
         // No state machine - prepend persona to base.
@@ -3324,15 +3351,14 @@ impl RuntimeAgent {
     }
 
     fn get_state_llm(&self) -> Result<Arc<dyn LLMProvider>> {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(state_def) = sm.current_definition() {
-                if let Some(ref llm_alias) = state_def.llm {
-                    return self
-                        .llm_registry
-                        .get(llm_alias)
-                        .map_err(|e| AgentError::Config(e.to_string()));
-                }
-            }
+        if let Some(ref sm) = self.state_machine
+            && let Some(state_def) = sm.current_definition()
+            && let Some(ref llm_alias) = state_def.llm
+        {
+            return self
+                .llm_registry
+                .get(llm_alias)
+                .map_err(|e| AgentError::Config(e.to_string()));
         }
         self.llm_registry
             .default()
@@ -3340,23 +3366,21 @@ impl RuntimeAgent {
     }
 
     fn get_effective_reasoning_config(&self) -> ReasoningConfig {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(state_def) = sm.current_definition() {
-                if let Some(ref state_reasoning) = state_def.reasoning {
-                    return state_reasoning.clone();
-                }
-            }
+        if let Some(ref sm) = self.state_machine
+            && let Some(state_def) = sm.current_definition()
+            && let Some(ref state_reasoning) = state_def.reasoning
+        {
+            return state_reasoning.clone();
         }
         self.reasoning_config.clone()
     }
 
     fn get_effective_reflection_config(&self) -> ReflectionConfig {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(state_def) = sm.current_definition() {
-                if let Some(ref state_reflection) = state_def.reflection {
-                    return state_reflection.clone();
-                }
-            }
+        if let Some(ref sm) = self.state_machine
+            && let Some(state_def) = sm.current_definition()
+            && let Some(ref state_reflection) = state_def.reflection
+        {
+            return state_reflection.clone();
         }
         self.reflection_config.clone()
     }
@@ -3430,17 +3454,17 @@ impl RuntimeAgent {
     }
 
     fn get_available_skills(&self) -> Vec<&SkillDefinition> {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(state_def) = sm.current_definition() {
-                let parent_def = sm.get_parent_definition();
-                let effective_skills = state_def.get_effective_skills(parent_def.as_ref());
-                if !effective_skills.is_empty() {
-                    return self
-                        .skills
-                        .iter()
-                        .filter(|s| effective_skills.contains(&&s.id))
-                        .collect();
-                }
+        if let Some(ref sm) = self.state_machine
+            && let Some(state_def) = sm.current_definition()
+        {
+            let parent_def = sm.get_parent_definition();
+            let effective_skills = state_def.get_effective_skills(parent_def.as_ref());
+            if !effective_skills.is_empty() {
+                return self
+                    .skills
+                    .iter()
+                    .filter(|s| effective_skills.contains(&&s.id))
+                    .collect();
             }
         }
         self.skills.iter().collect()
@@ -3856,7 +3880,7 @@ impl RuntimeAgent {
             && calls.iter().any(|call| {
                 self.tools
                     .canonical_id(&call.name)
-                    .map_or(true, |canonical| !protocol.tool_ids.contains(&canonical))
+                    .is_none_or(|canonical| !protocol.tool_ids.contains(&canonical))
             })
         {
             return Err(AgentError::LLM(
@@ -3987,22 +4011,22 @@ impl RuntimeAgent {
         }
 
         // Try to extract JSON from content (handles extra text/braces from LLM)
-        if let Some(json_str) = self.extract_json_from_content(content) {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                // Handle JSON array of tool calls (parallel tool calling)
-                if let Some(arr) = parsed.as_array() {
-                    let calls: Vec<ToolCall> = arr
-                        .iter()
-                        .filter_map(|v| self.extract_tool_call_from_value(v))
-                        .collect();
-                    if !calls.is_empty() {
-                        return Some(calls);
-                    }
+        if let Some(json_str) = self.extract_json_from_content(content)
+            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str)
+        {
+            // Handle JSON array of tool calls (parallel tool calling)
+            if let Some(arr) = parsed.as_array() {
+                let calls: Vec<ToolCall> = arr
+                    .iter()
+                    .filter_map(|v| self.extract_tool_call_from_value(v))
+                    .collect();
+                if !calls.is_empty() {
+                    return Some(calls);
                 }
-                // Handle single JSON object
-                if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
-                    return Some(vec![tool_call]);
-                }
+            }
+            // Handle single JSON object
+            if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
+                return Some(vec![tool_call]);
             }
         }
 
@@ -4104,6 +4128,9 @@ impl RuntimeAgent {
     }
 
     /// Builds a structured record from executor state.
+    ///
+    /// The explicit fields preserve one audit boundary for execution, policy, approval, timing, and generation evidence.
+    #[allow(clippy::too_many_arguments)]
     fn record_from_parts(
         &self,
         request: &ToolExecutionRequest,
@@ -4704,16 +4731,94 @@ impl RuntimeAgent {
         if approval_record
             .as_ref()
             .is_some_and(|record| matches!(record.status, ToolApprovalStatus::NotRequired))
-        {
-            if let Some(message) =
+            && let Some(message) =
                 security_engine.classification_approval_message(&canonical_id, &classification)
-            {
-                if self.hitl_engine.is_none() {
+        {
+            if self.hitl_engine.is_none() {
+                approval_record = Some(ToolApprovalRecord {
+                    status: ToolApprovalStatus::Unavailable,
+                    reason: Some("No HITL engine configured".to_string()),
+                    modified_arguments: None,
+                });
+                let record = self.record_from_parts(
+                    &request,
+                    canonical_id,
+                    executed_arguments,
+                    started_at,
+                    start,
+                    false,
+                    false,
+                    format!("Approval unavailable: {}", message),
+                    metadata,
+                    ToolPolicyDecisionRecord::approval(message),
+                    approval_record,
+                    false,
+                    false,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+            let check_result = HITLCheckResult::required(
+                ApprovalTrigger::tool(&canonical_id, executed_arguments.clone()),
+                HashMap::new(),
+                message.clone(),
+                None,
+            );
+            match self.request_hitl_approval(check_result).await? {
+                ApprovalResult::Approved => {
+                    merge_approved_record(&mut approval_record);
+                }
+                ApprovalResult::Modified { changes } => {
+                    if let Some(obj) = executed_arguments.as_object_mut() {
+                        for (key, value) in changes {
+                            obj.insert(key, value);
+                        }
+                    }
+                    let modified_security = security_engine
+                        .validate_tool_execution_with_bindings(
+                            &canonical_id,
+                            &executed_arguments,
+                            &bindings,
+                        )
+                        .await?;
+                    if !matches!(
+                        modified_security,
+                        SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+                    ) {
+                        let reason = modified_security
+                            .reason()
+                            .unwrap_or("modified arguments failed policy")
+                            .to_string();
+                        let record = self.record_from_parts(
+                            &request,
+                            canonical_id,
+                            executed_arguments.clone(),
+                            started_at,
+                            start,
+                            false,
+                            false,
+                            reason.clone(),
+                            metadata,
+                            ToolPolicyDecisionRecord::deny(reason),
+                            Some(ToolApprovalRecord {
+                                status: ToolApprovalStatus::Modified,
+                                reason: None,
+                                modified_arguments: Some(executed_arguments),
+                            }),
+                            false,
+                            false,
+                        );
+                        self.finish_tool_record(&record).await;
+                        return Ok(record);
+                    }
                     approval_record = Some(ToolApprovalRecord {
-                        status: ToolApprovalStatus::Unavailable,
-                        reason: Some("No HITL engine configured".to_string()),
-                        modified_arguments: None,
+                        status: ToolApprovalStatus::Modified,
+                        reason: None,
+                        modified_arguments: Some(executed_arguments.clone()),
                     });
+                }
+                ApprovalResult::Rejected { reason } => {
+                    let reason = reason.unwrap_or_else(|| "rejected".to_string());
                     let record = self.record_from_parts(
                         &request,
                         canonical_id,
@@ -4722,122 +4827,42 @@ impl RuntimeAgent {
                         start,
                         false,
                         false,
-                        format!("Approval unavailable: {}", message),
+                        format!("Approval rejected: {}", reason),
                         metadata,
-                        ToolPolicyDecisionRecord::approval(message),
-                        approval_record,
+                        ToolPolicyDecisionRecord::approval(reason.clone()),
+                        Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Rejected,
+                            reason: Some(reason),
+                            modified_arguments: None,
+                        }),
                         false,
                         false,
                     );
                     self.finish_tool_record(&record).await;
                     return Ok(record);
                 }
-                let check_result = HITLCheckResult::required(
-                    ApprovalTrigger::tool(&canonical_id, executed_arguments.clone()),
-                    HashMap::new(),
-                    message.clone(),
-                    None,
-                );
-                match self.request_hitl_approval(check_result).await? {
-                    ApprovalResult::Approved => {
-                        merge_approved_record(&mut approval_record);
-                    }
-                    ApprovalResult::Modified { changes } => {
-                        if let Some(obj) = executed_arguments.as_object_mut() {
-                            for (key, value) in changes {
-                                obj.insert(key, value);
-                            }
-                        }
-                        let modified_security = security_engine
-                            .validate_tool_execution_with_bindings(
-                                &canonical_id,
-                                &executed_arguments,
-                                &bindings,
-                            )
-                            .await?;
-                        if !matches!(
-                            modified_security,
-                            SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
-                        ) {
-                            let reason = modified_security
-                                .reason()
-                                .unwrap_or("modified arguments failed policy")
-                                .to_string();
-                            let record = self.record_from_parts(
-                                &request,
-                                canonical_id,
-                                executed_arguments.clone(),
-                                started_at,
-                                start,
-                                false,
-                                false,
-                                reason.clone(),
-                                metadata,
-                                ToolPolicyDecisionRecord::deny(reason),
-                                Some(ToolApprovalRecord {
-                                    status: ToolApprovalStatus::Modified,
-                                    reason: None,
-                                    modified_arguments: Some(executed_arguments),
-                                }),
-                                false,
-                                false,
-                            );
-                            self.finish_tool_record(&record).await;
-                            return Ok(record);
-                        }
-                        approval_record = Some(ToolApprovalRecord {
-                            status: ToolApprovalStatus::Modified,
-                            reason: None,
-                            modified_arguments: Some(executed_arguments.clone()),
-                        });
-                    }
-                    ApprovalResult::Rejected { reason } => {
-                        let reason = reason.unwrap_or_else(|| "rejected".to_string());
-                        let record = self.record_from_parts(
-                            &request,
-                            canonical_id,
-                            executed_arguments,
-                            started_at,
-                            start,
-                            false,
-                            false,
-                            format!("Approval rejected: {}", reason),
-                            metadata,
-                            ToolPolicyDecisionRecord::approval(reason.clone()),
-                            Some(ToolApprovalRecord {
-                                status: ToolApprovalStatus::Rejected,
-                                reason: Some(reason),
-                                modified_arguments: None,
-                            }),
-                            false,
-                            false,
-                        );
-                        self.finish_tool_record(&record).await;
-                        return Ok(record);
-                    }
-                    ApprovalResult::Timeout => {
-                        let record = self.record_from_parts(
-                            &request,
-                            canonical_id,
-                            executed_arguments,
-                            started_at,
-                            start,
-                            false,
-                            false,
-                            "Approval timed out".to_string(),
-                            metadata,
-                            ToolPolicyDecisionRecord::approval("approval timeout"),
-                            Some(ToolApprovalRecord {
-                                status: ToolApprovalStatus::Timeout,
-                                reason: Some("approval timeout".to_string()),
-                                modified_arguments: None,
-                            }),
-                            false,
-                            false,
-                        );
-                        self.finish_tool_record(&record).await;
-                        return Ok(record);
-                    }
+                ApprovalResult::Timeout => {
+                    let record = self.record_from_parts(
+                        &request,
+                        canonical_id,
+                        executed_arguments,
+                        started_at,
+                        start,
+                        false,
+                        false,
+                        "Approval timed out".to_string(),
+                        metadata,
+                        ToolPolicyDecisionRecord::approval("approval timeout"),
+                        Some(ToolApprovalRecord {
+                            status: ToolApprovalStatus::Timeout,
+                            reason: Some("approval timeout".to_string()),
+                            modified_arguments: None,
+                        }),
+                        false,
+                        false,
+                    );
+                    self.finish_tool_record(&record).await;
+                    return Ok(record);
                 }
             }
         }
@@ -5129,10 +5154,10 @@ impl RuntimeAgent {
             &executed_arguments,
             &bindings,
         );
-        if let Some(record) = approval_record.as_mut() {
-            if matches!(record.status, ToolApprovalStatus::Modified) {
-                record.modified_arguments = Some(executed_arguments.clone());
-            }
+        if let Some(record) = approval_record.as_mut()
+            && matches!(record.status, ToolApprovalStatus::Modified)
+        {
+            record.modified_arguments = Some(executed_arguments.clone());
         }
         let binding_security_result = security_engine
             .validate_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
@@ -5210,10 +5235,10 @@ impl RuntimeAgent {
         let final_arguments = control_snapshot
             .tool_security
             .prepare_tool_arguments_with_bindings(&canonical_id, &executed_arguments, &bindings);
-        if let Some(record) = approval_record.as_mut() {
-            if matches!(record.status, ToolApprovalStatus::Modified) {
-                record.modified_arguments = Some(final_arguments.clone());
-            }
+        if let Some(record) = approval_record.as_mut()
+            && matches!(record.status, ToolApprovalStatus::Modified)
+        {
+            record.modified_arguments = Some(final_arguments.clone());
         }
         let classification = resolved.tool.classify_call(&final_arguments);
         let safety = resolved.tool.safety_metadata();
@@ -5620,76 +5645,77 @@ impl RuntimeAgent {
     ) -> Result<SkillRouteResult> {
         let skill_id = candidate.skill_id;
         let skill = candidate.skill;
-        if let Some(ref skill_disambig) = skill.disambiguation {
-            if skill_disambig.enabled.unwrap_or(false) {
-                if let Some(ref disambiguator) = self.disambiguation_manager {
-                    let context = self.build_disambiguation_context().await?;
-                    let state_override = self
-                        .state_machine
-                        .as_ref()
-                        .and_then(|sm| sm.current_definition())
-                        .and_then(|def| def.disambiguation.clone());
+        if let Some(ref skill_disambig) = skill.disambiguation
+            && skill_disambig.enabled.unwrap_or(false)
+            && let Some(ref disambiguator) = self.disambiguation_manager
+        {
+            let context = self.build_disambiguation_context().await?;
+            let state_override = self
+                .state_machine
+                .as_ref()
+                .and_then(|sm| sm.current_definition())
+                .and_then(|def| def.disambiguation.clone());
 
-                    match self
-                        .observe_purpose(
-                            ObservationPurpose::DisambiguationDetection,
-                            disambiguator.process_input_with_override(
-                                input,
-                                &context,
-                                state_override.as_ref(),
-                                Some(skill_disambig),
-                            ),
-                        )
-                        .await?
-                    {
-                        DisambiguationResult::Clear => {
-                            debug!(skill_id = %skill_id, "Skill disambiguation: clear");
-                        }
-                        DisambiguationResult::NeedsClarification {
-                            question,
-                            detection,
-                        } => {
-                            info!(
-                                skill_id = %skill_id,
-                                ambiguity_type = ?detection.ambiguity_type,
-                                confidence = detection.confidence,
-                                "Skill requires clarification before execution"
-                            );
-                            *self.pending_skill_id.write() = Some(skill_id.clone());
-                            return Ok(SkillRouteResult::NeedsClarification(
-                                AgentResponse::new(&question.question).with_metadata(
-                                    "disambiguation",
-                                    serde_json::json!({
-                                        "status": "awaiting_clarification",
-                                        "skill_id": skill_id,
-                                        "options": question.options,
-                                        "clarifying": question.clarifying,
-                                        "detection": {
-                                            "type": detection.ambiguity_type,
-                                            "confidence": detection.confidence,
-                                            "what_is_unclear": detection.what_is_unclear,
-                                        }
-                                    }),
-                                ),
-                            ));
-                        }
-                        DisambiguationResult::Clarified { enriched_input, .. } => {
-                            info!(skill_id = %skill_id, enriched = %enriched_input, "Skill disambiguation clarified");
-                            return Ok(SkillRouteResult::Response {
-                                skill_id,
-                                content: self.execute_skill(&skill, &enriched_input).await?,
-                            });
-                        }
-                        DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
-                            info!(skill_id = %skill_id, "Skill disambiguation best guess");
-                            return Ok(SkillRouteResult::Response {
-                                skill_id,
-                                content: self.execute_skill(&skill, &enriched_input).await?,
-                            });
-                        }
-                        DisambiguationResult::GiveUp { reason } => {
-                            warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
-                            let apology = self
+            match self
+                .observe_purpose(
+                    ObservationPurpose::DisambiguationDetection,
+                    disambiguator.process_input_with_override(
+                        input,
+                        &context,
+                        state_override.as_ref(),
+                        Some(skill_disambig),
+                    ),
+                )
+                .await?
+            {
+                DisambiguationResult::Clear => {
+                    debug!(skill_id = %skill_id, "Skill disambiguation: clear");
+                }
+                DisambiguationResult::NeedsClarification {
+                    question,
+                    detection,
+                } => {
+                    info!(
+                        skill_id = %skill_id,
+                        ambiguity_type = ?detection.ambiguity_type,
+                        confidence = detection.confidence,
+                        "Skill requires clarification before execution"
+                    );
+                    *self.pending_skill_id.write() = Some(skill_id.clone());
+                    return Ok(SkillRouteResult::NeedsClarification(
+                        AgentResponse::new(&question.question).with_metadata(
+                            "disambiguation",
+                            serde_json::json!({
+                                "status": "awaiting_clarification",
+                                "skill_id": skill_id,
+                                "options": question.options,
+                                "clarifying": question.clarifying,
+                                "detection": {
+                                    "type": detection.ambiguity_type,
+                                    "confidence": detection.confidence,
+                                    "what_is_unclear": detection.what_is_unclear,
+                                }
+                            }),
+                        ),
+                    ));
+                }
+                DisambiguationResult::Clarified { enriched_input, .. } => {
+                    info!(skill_id = %skill_id, enriched = %enriched_input, "Skill disambiguation clarified");
+                    return Ok(SkillRouteResult::Response {
+                        skill_id,
+                        content: self.execute_skill(&skill, &enriched_input).await?,
+                    });
+                }
+                DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                    info!(skill_id = %skill_id, "Skill disambiguation best guess");
+                    return Ok(SkillRouteResult::Response {
+                        skill_id,
+                        content: self.execute_skill(&skill, &enriched_input).await?,
+                    });
+                }
+                DisambiguationResult::GiveUp { reason } => {
+                    warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
+                    let apology = self
                                 .generate_localized_apology(
                                     "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
                                     &reason,
@@ -5698,13 +5724,13 @@ impl RuntimeAgent {
                                 .unwrap_or_else(|_| {
                                     format!("I'm sorry, I couldn't understand your request: {}", reason)
                                 });
-                            return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
-                                &apology,
-                            )));
-                        }
-                        DisambiguationResult::Escalate { reason } => {
-                            info!(skill_id = %skill_id, reason = %reason, "Skill disambiguation escalating");
-                            let apology = self
+                    return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
+                        &apology,
+                    )));
+                }
+                DisambiguationResult::Escalate { reason } => {
+                    info!(skill_id = %skill_id, reason = %reason, "Skill disambiguation escalating");
+                    let apology = self
                                 .generate_localized_apology(
                                     "Explain briefly that you're transferring the user to a human agent for help.",
                                     &reason,
@@ -5713,15 +5739,13 @@ impl RuntimeAgent {
                                 .unwrap_or_else(|_| {
                                     format!("I need human assistance to help with your request: {}", reason)
                                 });
-                            return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
-                                &apology,
-                            )));
-                        }
-                        DisambiguationResult::Abandoned { .. } => {
-                            debug!(skill_id = %skill_id, "Skill disambiguation abandoned");
-                            return Ok(SkillRouteResult::NoMatch);
-                        }
-                    }
+                    return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
+                        &apology,
+                    )));
+                }
+                DisambiguationResult::Abandoned { .. } => {
+                    debug!(skill_id = %skill_id, "Skill disambiguation abandoned");
+                    return Ok(SkillRouteResult::NoMatch);
                 }
             }
         }
@@ -6043,18 +6067,18 @@ OVERALL: PASS/FAIL"#,
     }
 
     async fn check_turn_timeout(&self) -> Result<()> {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(timeout_state) = sm.check_timeout() {
-                let from_state = sm.current();
-                let history_before = sm.history();
-                self.execute_state_exit_actions(&from_state).await;
-                sm.transition_to(&timeout_state, "max_turns exceeded")?;
-                let entered = sm.current();
-                let is_reentry =
-                    Self::state_was_previously_entered(&entered, &from_state, &history_before);
-                self.execute_state_enter_actions(&entered, is_reentry).await;
-                info!(to = %entered, "Timeout transition");
-            }
+        if let Some(ref sm) = self.state_machine
+            && let Some(timeout_state) = sm.check_timeout()
+        {
+            let from_state = sm.current();
+            let history_before = sm.history();
+            self.execute_state_exit_actions(&from_state).await;
+            sm.transition_to(&timeout_state, "max_turns exceeded")?;
+            let entered = sm.current();
+            let is_reentry =
+                Self::state_was_previously_entered(&entered, &from_state, &history_before);
+            self.execute_state_enter_actions(&entered, is_reentry).await;
+            info!(to = %entered, "Timeout transition");
         }
         Ok(())
     }
@@ -6151,14 +6175,14 @@ OVERALL: PASS/FAIL"#,
         let context = self.build_transition_context(user_message, "", current_state, Some(staged));
 
         for transition in transitions {
-            if let Some(guard) = transition.guard.as_ref() {
-                if evaluate_guard(guard, &context) {
-                    return Some(TransitionCandidate::new(
-                        current_state,
-                        transition.clone(),
-                        Self::transition_reason(transition),
-                    ));
-                }
+            if let Some(guard) = transition.guard.as_ref()
+                && evaluate_guard(guard, &context)
+            {
+                return Some(TransitionCandidate::new(
+                    current_state,
+                    transition.clone(),
+                    Self::transition_reason(transition),
+                ));
             }
         }
 
@@ -6402,10 +6426,10 @@ OVERALL: PASS/FAIL"#,
         let mut reasoning_enabled = optimization.speculative_reasoning_auto
             && matches!(effective_reasoning_mode, ReasoningMode::Auto);
 
-        if matches!(effective_reasoning_mode, ReasoningMode::Auto) {
-            if !reasoning_enabled || optimization.max_speculative_llm_calls_per_turn < 2 {
-                return Ok(None);
-            }
+        if matches!(effective_reasoning_mode, ReasoningMode::Auto)
+            && (!reasoning_enabled || optimization.max_speculative_llm_calls_per_turn < 2)
+        {
+            return Ok(None);
         }
 
         if !transition_enabled && !skill_enabled && !reasoning_enabled {
@@ -6738,42 +6762,11 @@ OVERALL: PASS/FAIL"#,
                 };
             }
 
-            if transition_finalized && skill_finalized {
-                if let Some(reasoning_mode) = reasoning_decision.take() {
-                    if !matches!(reasoning_mode, ReasoningMode::None) {
-                        self.finalize_optional_branch(
-                            &reasoning_id,
-                            RuntimeOptimizationKind::SpeculativeReasoningAuto,
-                            RuntimeCommitBehavior::ReasoningDecision,
-                            "committed",
-                            true,
-                        );
-                        if !main_pending {
-                            self.finalize_branch_loss(
-                                &main_id,
-                                main_kind,
-                                RuntimeCommitBehavior::FinalResponse,
-                                false,
-                                main_result.as_ref().map(|result| result.is_err()),
-                            );
-                        }
-                        self.finalize_pending_branches(branch_set.cancel_pending());
-                        self.commit_root_user_message(processed_input).await?;
-                        return if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
-                            self.handle_plan_and_execute(processed_input, input_context, true)
-                                .await
-                                .map(Some)
-                        } else {
-                            self.run_committed_response_loop_with_reasoning(
-                                processed_input,
-                                input_context,
-                                reasoning_mode,
-                                true,
-                            )
-                            .await
-                            .map(Some)
-                        };
-                    }
+            if transition_finalized
+                && skill_finalized
+                && let Some(reasoning_mode) = reasoning_decision.take()
+            {
+                if !matches!(reasoning_mode, ReasoningMode::None) {
                     self.finalize_optional_branch(
                         &reasoning_id,
                         RuntimeOptimizationKind::SpeculativeReasoningAuto,
@@ -6781,8 +6774,40 @@ OVERALL: PASS/FAIL"#,
                         "committed",
                         true,
                     );
-                    reasoning_finalized = true;
+                    if !main_pending {
+                        self.finalize_branch_loss(
+                            &main_id,
+                            main_kind,
+                            RuntimeCommitBehavior::FinalResponse,
+                            false,
+                            main_result.as_ref().map(|result| result.is_err()),
+                        );
+                    }
+                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    self.commit_root_user_message(processed_input).await?;
+                    return if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
+                        self.handle_plan_and_execute(processed_input, input_context, true)
+                            .await
+                            .map(Some)
+                    } else {
+                        self.run_committed_response_loop_with_reasoning(
+                            processed_input,
+                            input_context,
+                            reasoning_mode,
+                            true,
+                        )
+                        .await
+                        .map(Some)
+                    };
                 }
+                self.finalize_optional_branch(
+                    &reasoning_id,
+                    RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                    RuntimeCommitBehavior::ReasoningDecision,
+                    "committed",
+                    true,
+                );
+                reasoning_finalized = true;
             }
 
             if transition_finalized && skill_finalized && reasoning_finalized {
@@ -7142,13 +7167,12 @@ OVERALL: PASS/FAIL"#,
 
     /// Execute on_exit actions for a state being left.
     async fn execute_state_exit_actions(&self, state_path: &str) {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(def) = sm.get_definition(state_path) {
-                if !def.on_exit.is_empty() {
-                    debug!(state = %state_path, count = def.on_exit.len(), "Executing on_exit actions");
-                    self.execute_state_actions(&def.on_exit).await;
-                }
-            }
+        if let Some(ref sm) = self.state_machine
+            && let Some(def) = sm.get_definition(state_path)
+            && !def.on_exit.is_empty()
+        {
+            debug!(state = %state_path, count = def.on_exit.len(), "Executing on_exit actions");
+            self.execute_state_actions(&def.on_exit).await;
         }
     }
 
@@ -7166,15 +7190,15 @@ OVERALL: PASS/FAIL"#,
 
     /// Execute on_enter (or on_reenter) actions for a state being entered.
     async fn execute_state_enter_actions(&self, state_path: &str, is_reentry: bool) {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(def) = sm.get_definition(state_path) {
-                if is_reentry && !def.on_reenter.is_empty() {
-                    debug!(state = %state_path, count = def.on_reenter.len(), "Executing on_reenter actions");
-                    self.execute_state_actions(&def.on_reenter).await;
-                } else if !def.on_enter.is_empty() {
-                    debug!(state = %state_path, count = def.on_enter.len(), "Executing on_enter actions");
-                    self.execute_state_actions(&def.on_enter).await;
-                }
+        if let Some(ref sm) = self.state_machine
+            && let Some(def) = sm.get_definition(state_path)
+        {
+            if is_reentry && !def.on_reenter.is_empty() {
+                debug!(state = %state_path, count = def.on_reenter.len(), "Executing on_reenter actions");
+                self.execute_state_actions(&def.on_reenter).await;
+            } else if !def.on_enter.is_empty() {
+                debug!(state = %state_path, count = def.on_enter.len(), "Executing on_enter actions");
+                self.execute_state_actions(&def.on_enter).await;
             }
         }
     }
@@ -7771,55 +7795,55 @@ Respond in JSON format:
 
         let mut plan = Plan::new(input);
 
-        if let Some(json_start) = response.content.find('{') {
-            if let Some(json_end) = response.content.rfind('}') {
-                let json_str = &response.content[json_start..=json_end];
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                    if let Some(steps) = parsed.get("steps").and_then(|s| s.as_array()) {
-                        for step_value in steps {
-                            let id = step_value
-                                .get("id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("step");
-                            let desc = step_value
-                                .get("description")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let action_type = step_value
-                                .get("action_type")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("think");
-                            let action_target = step_value
-                                .get("action_target")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let args = step_value
-                                .get("args")
-                                .cloned()
-                                .unwrap_or(serde_json::json!({}));
-                            let deps: Vec<String> = step_value
-                                .get("dependencies")
-                                .and_then(|v| v.as_array())
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+        if let Some(json_start) = response.content.find('{')
+            && let Some(json_end) = response.content.rfind('}')
+        {
+            let json_str = &response.content[json_start..=json_end];
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str)
+                && let Some(steps) = parsed.get("steps").and_then(|s| s.as_array())
+            {
+                for step_value in steps {
+                    let id = step_value
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("step");
+                    let desc = step_value
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let action_type = step_value
+                        .get("action_type")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("think");
+                    let action_target = step_value
+                        .get("action_target")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let args = step_value
+                        .get("args")
+                        .cloned()
+                        .unwrap_or(serde_json::json!({}));
+                    let deps: Vec<String> = step_value
+                        .get("dependencies")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                            let action = match action_type {
-                                "tool" => PlanAction::tool(action_target, args),
-                                "skill" => PlanAction::skill(action_target),
-                                "respond" => PlanAction::respond(action_target),
-                                _ => PlanAction::think(desc),
-                            };
+                    let action = match action_type {
+                        "tool" => PlanAction::tool(action_target, args),
+                        "skill" => PlanAction::skill(action_target),
+                        "respond" => PlanAction::respond(action_target),
+                        _ => PlanAction::think(desc),
+                    };
 
-                            let step = PlanStep::new(desc, action)
-                                .with_id(id)
-                                .with_dependencies(deps);
-                            plan.add_step(step);
-                        }
-                    }
+                    let step = PlanStep::new(desc, action)
+                        .with_id(id)
+                        .with_dependencies(deps);
+                    plan.add_step(step);
                 }
             }
         }
@@ -8102,12 +8126,12 @@ Respond in JSON format:
     }
 
     fn extract_thinking(&self, content: &str) -> (Option<String>, String) {
-        if let Some(start) = content.find("<thinking>") {
-            if let Some(end) = content.find("</thinking>") {
-                let thinking = content[start + 10..end].trim().to_string();
-                let answer = content[end + 11..].trim().to_string();
-                return (Some(thinking), answer);
-            }
+        if let Some(start) = content.find("<thinking>")
+            && let Some(end) = content.find("</thinking>")
+        {
+            let thinking = content[start + 10..end].trim().to_string();
+            let answer = content[end + 11..].trim().to_string();
+            return (Some(thinking), answer);
         }
         (None, content.to_string())
     }
@@ -8470,113 +8494,111 @@ Respond in JSON format:
             .and_then(|r| r.get_skill(skill_id).cloned());
 
         // If the skill has disambiguation enabled, re-run it on the enriched input.
-        if let Some(ref skill) = skill {
-            if let Some(ref skill_disambig) = skill.disambiguation {
-                if skill_disambig.enabled.unwrap_or(false) {
-                    if let Some(ref disambiguator) = self.disambiguation_manager {
-                        let context = self.build_disambiguation_context().await?;
-                        let state_override = self
-                            .state_machine
-                            .as_ref()
-                            .and_then(|sm| sm.current_definition())
-                            .and_then(|def| def.disambiguation.clone());
+        if let Some(ref skill) = skill
+            && let Some(ref skill_disambig) = skill.disambiguation
+            && skill_disambig.enabled.unwrap_or(false)
+            && let Some(ref disambiguator) = self.disambiguation_manager
+        {
+            let context = self.build_disambiguation_context().await?;
+            let state_override = self
+                .state_machine
+                .as_ref()
+                .and_then(|sm| sm.current_definition())
+                .and_then(|def| def.disambiguation.clone());
 
-                        match self
-                            .observe_purpose(
-                                ObservationPurpose::DisambiguationDetection,
-                                disambiguator.process_input_with_override(
-                                    enriched_input,
-                                    &context,
-                                    state_override.as_ref(),
-                                    Some(skill_disambig),
-                                ),
-                            )
-                            .await?
-                        {
-                            DisambiguationResult::Clear => {
-                                debug!(skill_id = %skill_id, "Skill re-check: all fields present");
-                            }
-                            DisambiguationResult::NeedsClarification {
-                                question,
-                                detection,
-                            } => {
-                                info!(
-                                    skill_id = %skill_id,
-                                    ambiguity_type = ?detection.ambiguity_type,
-                                    what_is_unclear = ?detection.what_is_unclear,
-                                    "Skill re-check: still missing fields, asking again"
-                                );
-                                // Keep pending_skill_id set (do NOT clear it).
-                                // The next turn will resolve this new clarification and
-                                // re-enter this method until all fields are present.
-                                self.memory
-                                    .add_message(ChatMessage::user(enriched_input))
-                                    .await?;
-                                self.memory
-                                    .add_message(ChatMessage::assistant(&question.question))
-                                    .await?;
+            match self
+                .observe_purpose(
+                    ObservationPurpose::DisambiguationDetection,
+                    disambiguator.process_input_with_override(
+                        enriched_input,
+                        &context,
+                        state_override.as_ref(),
+                        Some(skill_disambig),
+                    ),
+                )
+                .await?
+            {
+                DisambiguationResult::Clear => {
+                    debug!(skill_id = %skill_id, "Skill re-check: all fields present");
+                }
+                DisambiguationResult::NeedsClarification {
+                    question,
+                    detection,
+                } => {
+                    info!(
+                        skill_id = %skill_id,
+                        ambiguity_type = ?detection.ambiguity_type,
+                        what_is_unclear = ?detection.what_is_unclear,
+                        "Skill re-check: still missing fields, asking again"
+                    );
+                    // Keep pending_skill_id set (do NOT clear it).
+                    // The next turn will resolve this new clarification and
+                    // re-enter this method until all fields are present.
+                    self.memory
+                        .add_message(ChatMessage::user(enriched_input))
+                        .await?;
+                    self.memory
+                        .add_message(ChatMessage::assistant(&question.question))
+                        .await?;
 
-                                let response = AgentResponse::new(&question.question)
-                                    .with_metadata(
-                                        "disambiguation",
-                                        serde_json::json!({
-                                            "status": "awaiting_clarification",
-                                            "skill_id": skill_id,
-                                            "options": question.options,
-                                            "clarifying": question.clarifying,
-                                            "detection": {
-                                                "type": detection.ambiguity_type,
-                                                "confidence": detection.confidence,
-                                                "what_is_unclear": detection.what_is_unclear,
-                                            }
-                                        }),
-                                    );
-                                self.finish_turn_if_root(&response).await?;
-                                return Ok(response);
+                    let response = AgentResponse::new(&question.question).with_metadata(
+                        "disambiguation",
+                        serde_json::json!({
+                            "status": "awaiting_clarification",
+                            "skill_id": skill_id,
+                            "options": question.options,
+                            "clarifying": question.clarifying,
+                            "detection": {
+                                "type": detection.ambiguity_type,
+                                "confidence": detection.confidence,
+                                "what_is_unclear": detection.what_is_unclear,
                             }
-                            DisambiguationResult::Clarified {
-                                enriched_input: re_enriched,
-                                ..
-                            } => {
-                                debug!(skill_id = %skill_id, "Skill re-check: clarified immediately, executing");
-                                // Fall through to execute with the further-enriched input.
-                                *self.pending_skill_id.write() = None;
-                                let skill_response =
-                                    self.execute_skill_by_id(skill_id, &re_enriched).await?;
-                                self.memory
-                                    .add_message(ChatMessage::user(&re_enriched))
-                                    .await?;
-                                return self
-                                    .handle_skill_response(
-                                        &re_enriched,
-                                        skill_id,
-                                        skill_response,
-                                        &HashMap::new(),
-                                    )
-                                    .await;
-                            }
-                            DisambiguationResult::ProceedWithBestGuess {
-                                enriched_input: re_enriched,
-                            } => {
-                                debug!(skill_id = %skill_id, "Skill re-check: proceeding with best guess");
-                                *self.pending_skill_id.write() = None;
-                                let skill_response =
-                                    self.execute_skill_by_id(skill_id, &re_enriched).await?;
-                                self.memory
-                                    .add_message(ChatMessage::user(&re_enriched))
-                                    .await?;
-                                return self
-                                    .handle_skill_response(
-                                        &re_enriched,
-                                        skill_id,
-                                        skill_response,
-                                        &HashMap::new(),
-                                    )
-                                    .await;
-                            }
-                            DisambiguationResult::GiveUp { reason } => {
-                                *self.pending_skill_id.write() = None;
-                                let apology = self
+                        }),
+                    );
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
+                }
+                DisambiguationResult::Clarified {
+                    enriched_input: re_enriched,
+                    ..
+                } => {
+                    debug!(skill_id = %skill_id, "Skill re-check: clarified immediately, executing");
+                    // Fall through to execute with the further-enriched input.
+                    *self.pending_skill_id.write() = None;
+                    let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
+                    self.memory
+                        .add_message(ChatMessage::user(&re_enriched))
+                        .await?;
+                    return self
+                        .handle_skill_response(
+                            &re_enriched,
+                            skill_id,
+                            skill_response,
+                            &HashMap::new(),
+                        )
+                        .await;
+                }
+                DisambiguationResult::ProceedWithBestGuess {
+                    enriched_input: re_enriched,
+                } => {
+                    debug!(skill_id = %skill_id, "Skill re-check: proceeding with best guess");
+                    *self.pending_skill_id.write() = None;
+                    let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
+                    self.memory
+                        .add_message(ChatMessage::user(&re_enriched))
+                        .await?;
+                    return self
+                        .handle_skill_response(
+                            &re_enriched,
+                            skill_id,
+                            skill_response,
+                            &HashMap::new(),
+                        )
+                        .await;
+                }
+                DisambiguationResult::GiveUp { reason } => {
+                    *self.pending_skill_id.write() = None;
+                    let apology = self
                                     .generate_localized_apology(
                                         "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
                                         &reason,
@@ -8585,13 +8607,13 @@ Respond in JSON format:
                                     .unwrap_or_else(|_| {
                                         format!("I'm sorry, I couldn't understand your request: {}", reason)
                                     });
-                                let response = AgentResponse::new(&apology);
-                                self.finish_turn_if_root(&response).await?;
-                                return Ok(response);
-                            }
-                            DisambiguationResult::Escalate { reason } => {
-                                *self.pending_skill_id.write() = None;
-                                let apology = self
+                    let response = AgentResponse::new(&apology);
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
+                }
+                DisambiguationResult::Escalate { reason } => {
+                    *self.pending_skill_id.write() = None;
+                    let apology = self
                                     .generate_localized_apology(
                                         "Explain briefly that you're transferring the user to a human agent for help.",
                                         &reason,
@@ -8600,19 +8622,19 @@ Respond in JSON format:
                                     .unwrap_or_else(|_| {
                                         format!("I need human assistance to help with your request: {}", reason)
                                     });
-                                let response = AgentResponse::new(&apology);
-                                self.finish_turn_if_root(&response).await?;
-                                return Ok(response);
-                            }
-                            DisambiguationResult::Abandoned { new_input } => {
-                                // User abandoned during skill re-check.
-                                // Clear skill routing state and fall through to normal execution.
-                                *self.pending_skill_id.write() = None;
-                                debug!(skill_id = %skill_id, "Skill re-check: abandoned by user");
-                                if let Some(fresh) = new_input {
-                                    return self.run_loop_internal(&fresh).await;
-                                }
-                                let ack = self
+                    let response = AgentResponse::new(&apology);
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
+                }
+                DisambiguationResult::Abandoned { new_input } => {
+                    // User abandoned during skill re-check.
+                    // Clear skill routing state and fall through to normal execution.
+                    *self.pending_skill_id.write() = None;
+                    debug!(skill_id = %skill_id, "Skill re-check: abandoned by user");
+                    if let Some(fresh) = new_input {
+                        return self.run_loop_internal(&fresh).await;
+                    }
+                    let ack = self
                                     .generate_localized_apology(
                                         "The user changed their mind about their previous request. \
                                          Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
@@ -8623,15 +8645,12 @@ Respond in JSON format:
                                     .unwrap_or_else(|_| {
                                         "OK, no problem. What else can I help with?".to_string()
                                     });
-                                self.memory
-                                    .add_message(ChatMessage::assistant(&ack))
-                                    .await?;
-                                let response = AgentResponse::new(&ack);
-                                self.finish_turn_if_root(&response).await?;
-                                return Ok(response);
-                            }
-                        }
-                    }
+                    self.memory
+                        .add_message(ChatMessage::assistant(&ack))
+                        .await?;
+                    let response = AgentResponse::new(&ack);
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(response);
                 }
             }
         }
@@ -8780,19 +8799,19 @@ Respond in JSON format:
         }
         match reasoning_mode {
             ReasoningMode::CoT => {
-                if let Some(msg) = messages.first_mut() {
-                    if matches!(msg.role, ai_agents_core::Role::System) {
-                        msg.content = self.build_cot_system_prompt(&msg.content);
-                        debug!("Applied Chain-of-Thought system prompt");
-                    }
+                if let Some(msg) = messages.first_mut()
+                    && matches!(msg.role, ai_agents_core::Role::System)
+                {
+                    msg.content = self.build_cot_system_prompt(&msg.content);
+                    debug!("Applied Chain-of-Thought system prompt");
                 }
             }
             ReasoningMode::React => {
-                if let Some(msg) = messages.first_mut() {
-                    if matches!(msg.role, ai_agents_core::Role::System) {
-                        msg.content = self.build_react_system_prompt(&msg.content);
-                        debug!("Applied ReAct system prompt");
-                    }
+                if let Some(msg) = messages.first_mut()
+                    && matches!(msg.role, ai_agents_core::Role::System)
+                {
+                    msg.content = self.build_react_system_prompt(&msg.content);
+                    debug!("Applied ReAct system prompt");
                 }
             }
             _ => {}
@@ -8850,16 +8869,16 @@ Respond in JSON format:
                 raw_content,
                 thinking,
             } => {
-                self.finish_text_response_from_model(
+                self.finish_text_response_from_model(CommittedTextResponse {
                     processed_input,
                     input_context,
-                    raw_content,
+                    answer: raw_content,
                     reasoning_mode,
                     auto_detected,
-                    1,
-                    thinking,
-                    Vec::new(),
-                )
+                    iterations: 1,
+                    thinking_content: thinking,
+                    all_tool_calls: Vec::new(),
+                })
                 .await
             }
             MainResponseDraft::ToolCalls {
@@ -8913,15 +8932,18 @@ Respond in JSON format:
     //
     async fn finish_text_response_from_model(
         &self,
-        processed_input: &str,
-        input_context: &HashMap<String, Value>,
-        answer: String,
-        reasoning_mode: ReasoningMode,
-        auto_detected: bool,
-        iterations: u32,
-        thinking_content: Option<String>,
-        all_tool_calls: Vec<ToolCall>,
+        response: CommittedTextResponse<'_>,
     ) -> Result<AgentResponse> {
+        let CommittedTextResponse {
+            processed_input,
+            input_context,
+            answer,
+            reasoning_mode,
+            auto_detected,
+            iterations,
+            thinking_content,
+            all_tool_calls,
+        } = response;
         let output_data = self.process_output(&answer, input_context).await?;
         let mut final_content = if output_data.metadata.rejected {
             output_data
@@ -8944,15 +8966,15 @@ Respond in JSON format:
                 .await?;
             self.apply_post_loop_result(processed_input, result).await?
         };
-        let response = self.build_agent_response(
-            final_content,
+        let response = self.build_agent_response(AgentResponseParts {
+            content: final_content,
             all_tool_calls,
             reasoning_mode,
             auto_detected,
             iterations,
-            thinking_content,
+            thinking: thinking_content,
             reflection_metadata,
-        );
+        });
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
@@ -9018,7 +9040,7 @@ Respond in JSON format:
                 thinking_content = extracted_thinking;
             }
             return self
-                .finish_text_response_from_model(
+                .finish_text_response_from_model(CommittedTextResponse {
                     processed_input,
                     input_context,
                     answer,
@@ -9027,7 +9049,7 @@ Respond in JSON format:
                     iterations,
                     thinking_content,
                     all_tool_calls,
-                )
+                })
                 .await;
         }
     }
@@ -9076,7 +9098,7 @@ Respond in JSON format:
                     // Check if this is a HITL rejection - if so, break the loop
                     if matches!(e, AgentError::HITLRejected(_)) {
                         self.memory
-                            .add_message(ChatMessage::assistant(&format!(
+                            .add_message(ChatMessage::assistant(format!(
                                 "The operation was rejected by the approver: {}",
                                 e
                             )))
@@ -9241,16 +9263,15 @@ Respond in JSON format:
             let new_messages = self
                 .build_messages_internal(true, None, protocol.choice.is_none())
                 .await?;
-            if post_iter == 0 {
-                if let Some(system_msg) = new_messages.first() {
-                    if system_msg.role == ai_agents_core::Role::System {
-                        debug!(
-                            prompt_preview =
-                                &system_msg.content[system_msg.content.len().saturating_sub(200)..],
-                            "Post-transition system prompt (last 200 chars)"
-                        );
-                    }
-                }
+            if post_iter == 0
+                && let Some(system_msg) = new_messages.first()
+                && system_msg.role == ai_agents_core::Role::System
+            {
+                debug!(
+                    prompt_preview =
+                        &system_msg.content[system_msg.content.len().saturating_sub(200)..],
+                    "Post-transition system prompt (last 200 chars)"
+                );
             }
 
             let new_response = self
@@ -9324,10 +9345,10 @@ Respond in JSON format:
                 return false;
             }
             // Per-state override on the new (current) state
-            if let Some(def) = sm.current_definition() {
-                if let Some(regen) = def.regenerate_on_enter {
-                    return regen;
-                }
+            if let Some(def) = sm.current_definition()
+                && let Some(regen) = def.regenerate_on_enter
+            {
+                return regen;
             }
         }
         true
@@ -9336,21 +9357,21 @@ Respond in JSON format:
     /// Return true when the new state requires full dispatch via run_loop_internal.
     /// Covers orchestration states and any non-None effective reasoning mode.
     fn needs_redispatch_for_new_state(&self) -> bool {
-        if let Some(ref sm) = self.state_machine {
-            if let Some(def) = sm.current_definition() {
-                if def.concurrent.is_some()
-                    || def.group_chat.is_some()
-                    || def.pipeline.is_some()
-                    || def.handoff.is_some()
-                    || def.delegate.is_some()
-                {
-                    return true;
-                }
-                // Any non-None effective reasoning mode requires the main dispatch loop.
-                let effective = self.get_effective_reasoning_config();
-                if !matches!(effective.mode, ReasoningMode::None) {
-                    return true;
-                }
+        if let Some(ref sm) = self.state_machine
+            && let Some(def) = sm.current_definition()
+        {
+            if def.concurrent.is_some()
+                || def.group_chat.is_some()
+                || def.pipeline.is_some()
+                || def.handoff.is_some()
+                || def.delegate.is_some()
+            {
+                return true;
+            }
+            // Any non-None effective reasoning mode requires the main dispatch loop.
+            let effective = self.get_effective_reasoning_config();
+            if !matches!(effective.mode, ReasoningMode::None) {
+                return true;
             }
         }
         false
@@ -9399,16 +9420,17 @@ Respond in JSON format:
         }
     }
 
-    fn build_agent_response(
-        &self,
-        content: String,
-        all_tool_calls: Vec<ToolCall>,
-        reasoning_mode: ReasoningMode,
-        auto_detected: bool,
-        iterations: u32,
-        thinking: Option<String>,
-        reflection_metadata: Option<ReflectionMetadata>,
-    ) -> AgentResponse {
+    /// Builds the final response metadata after committed output and transition handling complete.
+    fn build_agent_response(&self, parts: AgentResponseParts) -> AgentResponse {
+        let AgentResponseParts {
+            content,
+            all_tool_calls,
+            reasoning_mode,
+            auto_detected,
+            iterations,
+            thinking,
+            reflection_metadata,
+        } = parts;
         let reasoning_metadata = ReasoningMetadata::new(reasoning_mode.clone())
             .with_thinking(thinking.clone().unwrap_or_default())
             .with_iterations(iterations)
@@ -10087,33 +10109,33 @@ Respond in JSON format:
         }
 
         // Handle orchestration states (delegate, concurrent, group_chat, pipeline, handoff).
-        if let Some(ref sm) = self.state_machine {
-            if let Some(def) = sm.current_definition() {
-                if let Some(ref delegate_id) = def.delegate {
-                    return self
-                        .handle_delegated_state(processed_input, delegate_id, &def)
-                        .await;
-                }
-                if let Some(ref concurrent_config) = def.concurrent {
-                    return self
-                        .handle_concurrent_state(processed_input, concurrent_config)
-                        .await;
-                }
-                if let Some(ref group_chat_config) = def.group_chat {
-                    return self
-                        .handle_group_chat_state(processed_input, group_chat_config)
-                        .await;
-                }
-                if let Some(ref pipeline_config) = def.pipeline {
-                    return self
-                        .handle_pipeline_state(processed_input, pipeline_config)
-                        .await;
-                }
-                if let Some(ref handoff_config) = def.handoff {
-                    return self
-                        .handle_handoff_state(processed_input, handoff_config)
-                        .await;
-                }
+        if let Some(ref sm) = self.state_machine
+            && let Some(def) = sm.current_definition()
+        {
+            if let Some(ref delegate_id) = def.delegate {
+                return self
+                    .handle_delegated_state(processed_input, delegate_id, &def)
+                    .await;
+            }
+            if let Some(ref concurrent_config) = def.concurrent {
+                return self
+                    .handle_concurrent_state(processed_input, concurrent_config)
+                    .await;
+            }
+            if let Some(ref group_chat_config) = def.group_chat {
+                return self
+                    .handle_group_chat_state(processed_input, group_chat_config)
+                    .await;
+            }
+            if let Some(ref pipeline_config) = def.pipeline {
+                return self
+                    .handle_pipeline_state(processed_input, pipeline_config)
+                    .await;
+            }
+            if let Some(ref handoff_config) = def.handoff {
+                return self
+                    .handle_handoff_state(processed_input, handoff_config)
+                    .await;
             }
         }
 
@@ -10142,14 +10164,13 @@ Respond in JSON format:
                     .and_then(|m| m.get("disambiguation"))
                     .and_then(|d| d.get("status"))
                     .and_then(|s| s.as_str())
+                    && q == "awaiting_clarification"
                 {
-                    if q == "awaiting_clarification" {
-                        // Store the clarification question in memory so the next turn
-                        // can be handled as a clarification response.
-                        self.memory
-                            .add_message(ChatMessage::assistant(&response.content))
-                            .await?;
-                    }
+                    // Store the clarification question in memory so the next turn
+                    // can be handled as a clarification response.
+                    self.memory
+                        .add_message(ChatMessage::assistant(&response.content))
+                        .await?;
                 }
                 self.finish_turn_if_root(&response).await?;
                 return Ok(response);
@@ -10271,15 +10292,15 @@ Respond in JSON format:
             let reflected = reflection_metadata.is_some();
             let reasoning_mode_debug = format!("{:?}", reasoning_mode);
 
-            let response = self.build_agent_response(
-                final_content,
+            let response = self.build_agent_response(AgentResponseParts {
+                content: final_content,
                 all_tool_calls,
                 reasoning_mode,
                 auto_detected,
                 iterations,
-                thinking_content,
+                thinking: thinking_content,
                 reflection_metadata,
-            );
+            });
 
             self.finish_turn_if_root(&response).await?;
 
@@ -10467,46 +10488,44 @@ Respond in JSON format:
                 routing_resolved.store(true, Ordering::SeqCst);
                 transition_finalized = true;
             }
-            if transition_finalized {
-                if let Some(result) = main_result.take() {
-                    let stream_draft = match result {
-                        Ok(stream_draft) => stream_draft,
-                        Err(error) => {
-                            self.finalize_optional_branch(
-                                &main_id,
-                                RuntimeOptimizationKind::BufferedStreamingRouting,
-                                RuntimeCommitBehavior::FinalResponse,
-                                "failed",
-                                false,
-                            );
-                            return Err(error);
-                        }
-                    };
-                    let raw_draft_content = stream_draft.draft.raw_content().to_string();
-                    let buffered_chunks = stream_draft.chunks;
-                    self.finalize_optional_branch(
-                        &main_id,
-                        RuntimeOptimizationKind::BufferedStreamingRouting,
-                        RuntimeCommitBehavior::FinalResponse,
-                        "committed",
-                        true,
-                    );
-                    let response = self
-                        .commit_main_response_draft(
-                            processed_input,
-                            input_context,
-                            stream_draft.draft,
-                            ReasoningMode::None,
+            if transition_finalized && let Some(result) = main_result.take() {
+                let stream_draft = match result {
+                    Ok(stream_draft) => stream_draft,
+                    Err(error) => {
+                        self.finalize_optional_branch(
+                            &main_id,
+                            RuntimeOptimizationKind::BufferedStreamingRouting,
+                            RuntimeCommitBehavior::FinalResponse,
+                            "failed",
                             false,
-                        )
-                        .await?;
-                    let chunks = if response.content == raw_draft_content {
-                        buffered_chunks
-                    } else {
-                        vec![StreamChunk::content(response.content.clone())]
-                    };
-                    return Ok(Some((response, chunks)));
-                }
+                        );
+                        return Err(error);
+                    }
+                };
+                let raw_draft_content = stream_draft.draft.raw_content().to_string();
+                let buffered_chunks = stream_draft.chunks;
+                self.finalize_optional_branch(
+                    &main_id,
+                    RuntimeOptimizationKind::BufferedStreamingRouting,
+                    RuntimeCommitBehavior::FinalResponse,
+                    "committed",
+                    true,
+                );
+                let response = self
+                    .commit_main_response_draft(
+                        processed_input,
+                        input_context,
+                        stream_draft.draft,
+                        ReasoningMode::None,
+                        false,
+                    )
+                    .await?;
+                let chunks = if response.content == raw_draft_content {
+                    buffered_chunks
+                } else {
+                    vec![StreamChunk::content(response.content.clone())]
+                };
+                return Ok(Some((response, chunks)));
             }
             tokio::select! {
                 result = &mut main_future, if main_pending => {
@@ -10655,8 +10674,9 @@ Respond in JSON format:
             }
 
             // Handle orchestration states in streaming mode.
-            if let Some(ref sm) = self.state_machine {
-                if let Some(def) = sm.current_definition() {
+            if let Some(ref sm) = self.state_machine
+                && let Some(def) = sm.current_definition()
+            {
                     let orchestration_result = if let Some(ref delegate_id) = def.delegate {
                         Some(self.handle_delegated_state(processed_input, delegate_id, &def).await)
                     } else if let Some(ref concurrent_config) = def.concurrent {
@@ -10684,7 +10704,6 @@ Respond in JSON format:
                         return;
                     }
                 }
-            }
 
             // Skill routing
             match self.try_skill_route(processed_input).await {
@@ -10825,10 +10844,10 @@ Respond in JSON format:
 
                 // Check if reflection is active — if so, suppress streaming for this LLM call
                 // because we may need to retry and the user would see a stale first attempt.
-                let reflection_active = match self.should_reflect(processed_input, "").await {
-                    Ok(v) => v,
-                    Err(_) => false,
-                };
+                let reflection_active = self
+                    .should_reflect(processed_input, "")
+                    .await
+                    .unwrap_or_default();
 
                 let buffered_decision = reflection_active || protocol.choice.is_some();
                 let content = if buffered_decision {
@@ -10908,11 +10927,11 @@ Respond in JSON format:
                             "(Transitioned to new state — tool call handled by workflow)",
                         )).await;
 
-                        if include_state_events {
-                            if let Some(state) = self.current_state() {
+                        if include_state_events
+                            && let Some(state) = self.current_state()
+                        {
                                 yield StreamChunk::state_transition(None, state);
                             }
-                        }
                         continue;
                     }
 
@@ -10948,7 +10967,7 @@ Respond in JSON format:
                             Err(e) => {
                                 if matches!(e, AgentError::HITLRejected(_)) {
                                     let _ = self.memory.add_message(ChatMessage::assistant(
-                                        &format!("The operation was rejected by the approver: {}", e),
+                                        format!("The operation was rejected by the approver: {}", e),
                                     )).await;
                                     let response = AgentResponse {
                                         content: format!("Operation cancelled: {}", e),
@@ -10967,7 +10986,7 @@ Respond in JSON format:
                                     yield StreamChunk::tool_result(
                                         &tool_call.id,
                                         &tool_call.name,
-                                        &e.to_string(),
+                                        e.to_string(),
                                         false,
                                     );
                                 }
@@ -11089,11 +11108,11 @@ Respond in JSON format:
                 };
 
                 if transitioned {
-                    if include_state_events {
-                        if let Some(state) = self.current_state() {
+                    if include_state_events
+                        && let Some(state) = self.current_state()
+                    {
                             yield StreamChunk::state_transition(None, state);
                         }
-                    }
                     // Yield the post-transition re-generated or re-dispatched content.
                     yield StreamChunk::content(&final_content);
                 }
@@ -11318,7 +11337,7 @@ Respond in JSON format:
                                 Some(hitl.config().default_timeout_seconds),
                             );
                             match self.request_hitl_approval(check_result).await {
-                                Ok(result) if matches!(result, ApprovalResult::Approved | ApprovalResult::Modified { .. }) => {
+                                Ok(ApprovalResult::Approved | ApprovalResult::Modified { .. }) => {
                                     let mut inner = self.run_loop_internal_stream(input);
                                     while let Some(chunk) = inner.next().await {
                                         yield chunk;
@@ -12276,8 +12295,10 @@ mod tests {
 
     #[tokio::test]
     async fn storage_init_requires_storage_for_actor_facts() {
-        let mut facts = ai_agents_facts::FactsConfig::default();
-        facts.enabled = true;
+        let facts = ai_agents_facts::FactsConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let agent = runtime_storage_agent().with_facts_config(None, Some(facts));
 
         let error = agent.init_storage().await.unwrap_err();
@@ -12292,8 +12313,10 @@ mod tests {
     #[tokio::test]
     async fn storage_init_validates_actor_facts_capability() {
         let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
-        let mut actor_memory = ai_agents_facts::ActorMemoryConfig::default();
-        actor_memory.enabled = true;
+        let actor_memory = ai_agents_facts::ActorMemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let agent = runtime_storage_agent()
             .with_storage(storage)
             .with_facts_config(Some(actor_memory), None);
@@ -12309,8 +12332,10 @@ mod tests {
     #[tokio::test]
     async fn blocking_chat_rejects_unsupported_required_storage() {
         let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
-        let mut facts = ai_agents_facts::FactsConfig::default();
-        facts.enabled = true;
+        let facts = ai_agents_facts::FactsConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let agent = runtime_storage_agent()
             .with_storage(storage)
             .with_facts_config(None, Some(facts));
@@ -12326,9 +12351,10 @@ mod tests {
     #[tokio::test]
     async fn streaming_chat_rejects_unsupported_required_storage_before_stream_creation() {
         let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
-        let mut config = ai_agents_relationships::RelationshipConfig::default();
-        config.enabled = true;
-        config.persistence.enabled = true;
+        let config = ai_agents_relationships::RelationshipConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let manager = Arc::new(RelationshipManager::from_config(config).unwrap());
         let agent = runtime_storage_agent()
             .with_storage(storage)
@@ -12348,8 +12374,10 @@ mod tests {
             StorageCapability::Snapshot,
             StorageCapability::ActorFacts,
         ]));
-        let mut facts = ai_agents_facts::FactsConfig::default();
-        facts.enabled = true;
+        let facts = ai_agents_facts::FactsConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let agent = runtime_storage_agent()
             .with_storage(storage)
             .with_facts_config(None, Some(facts));
@@ -12360,9 +12388,10 @@ mod tests {
 
     #[tokio::test]
     async fn storage_init_requires_storage_for_persistent_relationships() {
-        let mut config = ai_agents_relationships::RelationshipConfig::default();
-        config.enabled = true;
-        config.persistence.enabled = true;
+        let config = ai_agents_relationships::RelationshipConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let manager = Arc::new(RelationshipManager::from_config(config).unwrap());
         let agent = runtime_storage_agent().with_relationships(manager);
 
@@ -12378,9 +12407,10 @@ mod tests {
     #[tokio::test]
     async fn storage_init_validates_persistent_relationships_capability() {
         let storage = Arc::new(RuntimeStorage::new([StorageCapability::Snapshot]));
-        let mut config = ai_agents_relationships::RelationshipConfig::default();
-        config.enabled = true;
-        config.persistence.enabled = true;
+        let config = ai_agents_relationships::RelationshipConfig {
+            enabled: true,
+            ..Default::default()
+        };
         let manager = Arc::new(RelationshipManager::from_config(config).unwrap());
         let agent = runtime_storage_agent()
             .with_storage(storage)
@@ -13439,13 +13469,17 @@ mod tests {
     }
 
     fn approval_security_config(policy_enabled: bool) -> ToolSecurityConfig {
-        let mut security = ToolSecurityConfig::default();
-        security.enabled = true;
-        security.fail_closed = true;
-        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
-        policy.enabled = policy_enabled;
-        policy.write_paths = vec![".".to_string()];
-        policy.require_confirmation = true;
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let policy = ai_agents_tools::ToolPolicyConfig {
+            enabled: policy_enabled,
+            write_paths: vec![".".to_string()],
+            require_confirmation: true,
+            ..Default::default()
+        };
         security.tools.insert("locked_write".to_string(), policy);
         security
     }
@@ -13577,17 +13611,21 @@ mod tests {
         denial: MutationDenial,
     ) -> ToolSecurityConfig {
         let workspace = workspace.to_string_lossy().into_owned();
-        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
-        policy.read_paths = vec![workspace.clone()];
-        policy.write_paths = vec![workspace.clone()];
+        let mut policy = ai_agents_tools::ToolPolicyConfig {
+            read_paths: vec![workspace.clone()],
+            write_paths: vec![workspace.clone()],
+            ..Default::default()
+        };
         match denial {
             MutationDenial::Policy => policy.blocked_paths = vec![workspace],
             MutationDenial::Approval => policy.require_confirmation = true,
         }
 
-        let mut security = ToolSecurityConfig::default();
-        security.enabled = true;
-        security.fail_closed = true;
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
         security.tools.insert(tool_id.to_string(), policy);
         security
     }
@@ -13700,8 +13738,10 @@ mod tests {
     ) -> RuntimeAgent {
         use ai_agents_hitl::{CallbackHandler, HITLConfig};
 
-        let mut config = HITLConfig::default();
-        config.on_timeout = timeout_action;
+        let config = HITLConfig {
+            on_timeout: timeout_action,
+            ..Default::default()
+        };
         let handler = CallbackHandler::new(move |_| raw_result.clone());
         AgentBuilder::new()
             .system_prompt("Test HITL hooks.")
@@ -13913,12 +13953,16 @@ mod tests {
         let mut tools = ai_agents_tools::ToolRegistry::new();
         tools.register(Arc::new(ContextEchoTool)).unwrap();
 
-        let mut security = ToolSecurityConfig::default();
-        security.enabled = true;
-        security.fail_closed = true;
-        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
-        policy.read_paths = vec![".".to_string()];
-        policy.max_results = Some(7);
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let mut policy = ai_agents_tools::ToolPolicyConfig {
+            read_paths: vec![".".to_string()],
+            max_results: Some(7),
+            ..Default::default()
+        };
         policy
             .config
             .insert("backend".to_string(), serde_json::json!("memory"));
@@ -13943,6 +13987,7 @@ mod tests {
             .unwrap();
 
         assert!(record.success);
+        assert!(matches!(&record.source, ToolCallSource::Manual));
         assert_eq!(record.requested_name, "Context Echo");
         assert_eq!(record.canonical_id, "context_echo");
         assert_eq!(record.policy.outcome, PermissionOutcome::Allow);
@@ -14231,9 +14276,11 @@ spawner:
         };
         child_spec.tool_security.enabled = true;
         child_spec.tool_security.fail_closed = true;
-        let mut file_write_policy = ai_agents_tools::ToolPolicyConfig::default();
-        file_write_policy.write_paths = vec![workspace.root.to_string_lossy().into_owned()];
-        file_write_policy.allow_without_confirmation = true;
+        let file_write_policy = ai_agents_tools::ToolPolicyConfig {
+            write_paths: vec![workspace.root.to_string_lossy().into_owned()],
+            allow_without_confirmation: true,
+            ..Default::default()
+        };
         child_spec
             .tool_security
             .tools
@@ -14527,12 +14574,16 @@ spawner:
             }))
             .build()
             .unwrap();
-        let mut security = ToolSecurityConfig::default();
-        security.enabled = true;
-        security.fail_closed = true;
-        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
-        policy.write_paths = vec![".".to_string()];
-        policy.rate_limit = Some(1);
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let policy = ai_agents_tools::ToolPolicyConfig {
+            write_paths: vec![".".to_string()],
+            rate_limit: Some(1),
+            ..Default::default()
+        };
         security
             .tools
             .insert("limited_override".to_string(), policy);
@@ -14578,12 +14629,16 @@ spawner:
         let classification = tool.classify_call(&arguments);
         let resource_keys =
             tool_resource_lock_keys(tool.id(), &arguments, &bindings, &classification);
-        let mut security = ToolSecurityConfig::default();
-        security.enabled = true;
-        security.fail_closed = true;
-        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
-        policy.write_paths = vec![".".to_string()];
-        policy.rate_limit = Some(1);
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let policy = ai_agents_tools::ToolPolicyConfig {
+            write_paths: vec![".".to_string()],
+            rate_limit: Some(1),
+            ..Default::default()
+        };
         security.tools.insert(tool.id().to_string(), policy);
         let agent = Arc::new(
             AgentBuilder::new()
@@ -14696,13 +14751,17 @@ spawner:
     async fn final_policy_reapplies_argument_caps_after_approval_changes() {
         use ai_agents_hitl::CallbackHandler;
 
-        let mut security = ToolSecurityConfig::default();
-        security.enabled = true;
-        security.fail_closed = true;
-        let mut policy = ai_agents_tools::ToolPolicyConfig::default();
-        policy.read_paths = vec![".".to_string()];
-        policy.max_results = Some(5);
-        policy.require_confirmation = true;
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        let policy = ai_agents_tools::ToolPolicyConfig {
+            read_paths: vec![".".to_string()],
+            max_results: Some(5),
+            require_confirmation: true,
+            ..Default::default()
+        };
         security.tools.insert("context_echo".to_string(), policy);
         let handler = CallbackHandler::new(|_| ApprovalResult::Modified {
             changes: HashMap::from([("max_results".to_string(), serde_json::json!(99))]),
@@ -16635,6 +16694,55 @@ states:
         let ctx = agent.get_context();
         assert_eq!(ctx.get("step1_exited"), Some(&serde_json::json!(true)));
         assert_eq!(ctx.get("step2_entered"), Some(&serde_json::json!(true)));
+    }
+
+    #[tokio::test]
+    async fn state_action_tool_preserves_source_in_stored_record() {
+        let yaml = r#"
+name: StateActionToolAgent
+system_prompt: "You are helpful."
+tools:
+  - context_echo
+states:
+  initial: idle
+  states:
+    idle:
+      prompt: "Idle"
+    active:
+      prompt: "Active"
+      on_enter:
+        - set_context:
+            action_started: true
+        - tool: context_echo
+          args: {}
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("unused")))
+            .tool(Arc::new(ContextEchoTool))
+            .build()
+            .unwrap();
+
+        agent.transition_to("active").await.unwrap();
+
+        let record: ToolExecutionRecord = serde_json::from_value(
+            agent
+                .get_context()
+                .get("last_tool_record")
+                .cloned()
+                .expect("successful state action must store its execution record"),
+        )
+        .unwrap();
+        assert!(record.executed);
+        assert!(record.success);
+        assert_eq!(record.canonical_id, "context_echo");
+        assert!(matches!(
+            &record.source,
+            ToolCallSource::StateAction {
+                state: Some(state),
+                action_index: 1,
+            } if state == "active"
+        ));
     }
 
     #[tokio::test]

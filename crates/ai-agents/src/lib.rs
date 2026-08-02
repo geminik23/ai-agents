@@ -608,6 +608,29 @@ pub use hitl::{
     resolve_tool_message,
 };
 
+// Tool Provider System (v0.5.1 - Simplified)
+pub use tools::{
+    ProviderHealth, ToolAliases, ToolContext, ToolDescriptor, ToolMetadata, ToolProvider,
+    ToolProviderError, ToolProviderType, TrustLevel,
+};
+
+// Reasoning & Reflection (v0.5.3)
+pub use reasoning::{
+    CriterionResult, EvaluationResult, Plan, PlanAction, PlanAvailableActions,
+    PlanReflectionConfig, PlanStatus, PlanStep, PlanningConfig, ReasoningConfig, ReasoningMetadata,
+    ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig, ReflectionMetadata,
+    ReflectionMode, StepFailureAction, StepStatus, StringOrList,
+};
+
+// Intent Disambiguation (v0.5.4)
+pub use disambiguation::{
+    AmbiguityAspect, AmbiguityDetectionResult, AmbiguityDetector, AmbiguityType, CacheConfig,
+    ClarificationConfig, ClarificationGenerator, ClarificationOption, ClarificationParseResult,
+    ClarificationQuestion, ClarificationStyle, ContextConfig, DetectionConfig,
+    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
+    MaxAttemptsAction, SkillDisambiguationOverride, SkipCondition, StateDisambiguationOverride,
+};
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -652,26 +675,3 @@ process:
         assert_type::<crate::ApprovalResolvedOutcome>();
     }
 }
-
-// Tool Provider System (v0.5.1 - Simplified)
-pub use tools::{
-    ProviderHealth, ToolAliases, ToolContext, ToolDescriptor, ToolMetadata, ToolProvider,
-    ToolProviderError, ToolProviderType, TrustLevel,
-};
-
-// Reasoning & Reflection (v0.5.3)
-pub use reasoning::{
-    CriterionResult, EvaluationResult, Plan, PlanAction, PlanAvailableActions,
-    PlanReflectionConfig, PlanStatus, PlanStep, PlanningConfig, ReasoningConfig, ReasoningMetadata,
-    ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig, ReflectionMetadata,
-    ReflectionMode, StepFailureAction, StepStatus, StringOrList,
-};
-
-// Intent Disambiguation (v0.5.4)
-pub use disambiguation::{
-    AmbiguityAspect, AmbiguityDetectionResult, AmbiguityDetector, AmbiguityType, CacheConfig,
-    ClarificationConfig, ClarificationGenerator, ClarificationOption, ClarificationParseResult,
-    ClarificationQuestion, ClarificationStyle, ContextConfig, DetectionConfig,
-    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
-    MaxAttemptsAction, SkillDisambiguationOverride, SkipCondition, StateDisambiguationOverride,
-};

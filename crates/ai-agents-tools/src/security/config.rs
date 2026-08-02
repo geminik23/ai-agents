@@ -31,17 +31,12 @@ impl Default for ToolSecurityConfig {
 }
 
 /// Behavior when a mutation tool has no explicit write policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum NoWritePolicyBehavior {
     Deny,
+    #[default]
     DryRunOnly,
-}
-
-impl Default for NoWritePolicyBehavior {
-    fn default() -> Self {
-        Self::DryRunOnly
-    }
 }
 
 /// Exact argv command allowed by command policy.

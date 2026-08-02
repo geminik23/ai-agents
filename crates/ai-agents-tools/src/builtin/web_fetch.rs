@@ -6,7 +6,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -47,6 +47,16 @@ pub trait WebFetchTransport: Send + Sync {
         &self,
         request: WebFetchTransportRequest,
     ) -> Result<WebFetchTransportResponse, String>;
+
+    /// Sends a request using only the addresses approved by URL validation.
+    /// The compatibility default delegates to `send`; socket-opening transports must override it to enforce address binding.
+    async fn send_validated(
+        &self,
+        request: WebFetchTransportRequest,
+        _addresses: &[SocketAddr],
+    ) -> Result<WebFetchTransportResponse, String> {
+        self.send(request).await
+    }
 }
 
 /// Resolves hostnames for SSRF validation before each request.
@@ -55,19 +65,54 @@ pub trait WebFetchResolver: Send + Sync {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String>;
 }
 
-struct ReqwestWebFetchTransport {
-    client: reqwest::Client,
-}
+struct ReqwestWebFetchTransport;
 
 #[async_trait]
 impl WebFetchTransport for ReqwestWebFetchTransport {
     async fn send(
         &self,
-        request: WebFetchTransportRequest,
+        _request: WebFetchTransportRequest,
     ) -> Result<WebFetchTransportResponse, String> {
-        let response = self
-            .client
-            .get(&request.url)
+        Err(
+            "Validated network addresses are required for the default web fetch transport"
+                .to_string(),
+        )
+    }
+
+    async fn send_validated(
+        &self,
+        request: WebFetchTransportRequest,
+        addresses: &[SocketAddr],
+    ) -> Result<WebFetchTransportResponse, String> {
+        let url = reqwest::Url::parse(&request.url)
+            .map_err(|error| format!("Request URL is invalid: {}", error))?;
+        let host = url
+            .host_str()
+            .ok_or_else(|| "Request URL host is required".to_string())?;
+        let port = url.port_or_known_default().unwrap_or(443);
+        if addresses.is_empty() || addresses.iter().any(|address| address.port() != port) {
+            return Err("Validated network addresses do not match the request port".to_string());
+        }
+        if let Ok(ip) = host.parse::<IpAddr>()
+            && addresses.iter().any(|address| address.ip() != ip)
+        {
+            return Err("Validated network addresses do not match the request host".to_string());
+        }
+
+        // Build a request-scoped client so DNS overrides cannot leak across concurrent hosts.
+        // Proxies are disabled because a proxy could resolve the hostname outside this validated address set.
+        let mut client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
+            .no_proxy();
+        if host.parse::<IpAddr>().is_err() {
+            client = client.resolve_to_addrs(host, addresses);
+        }
+        let client = client
+            .build()
+            .map_err(|error| format!("Request client construction failed: {}", error))?;
+        let response = client
+            .get(url)
             .send()
             .await
             .map_err(|error| format!("Request failed: {}", error))?;
@@ -136,14 +181,9 @@ impl WebFetchTool {
 
     /// Create a web fetch tool that can use a shared extraction LLM.
     pub fn with_extractor_slot(extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>) -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self::with_extractor_slot_and_transport(
             extractor,
-            Arc::new(ReqwestWebFetchTransport { client }),
+            Arc::new(ReqwestWebFetchTransport),
             Arc::new(TokioWebFetchResolver),
         )
     }
@@ -394,21 +434,21 @@ impl Tool for WebFetchTool {
         );
         if cache_ttl > 0 {
             let cached_entry = { self.cache.read().get(&cache_key).cloned() };
-            if let Some(entry) = cached_entry {
-                if Instant::now() < entry.expires_at {
-                    if let Err(result) = validate_cached_output_with_policy(
-                        &entry.output,
-                        &policy,
-                        self.resolver.as_ref(),
-                    )
-                    .await
-                    {
-                        return result;
-                    }
-                    let mut output = entry.output;
-                    output.from_cache = true;
-                    return web_result(&output, output.truncated, max_output_chars, true, None);
+            if let Some(entry) = cached_entry
+                && Instant::now() < entry.expires_at
+            {
+                if let Err(result) = validate_cached_output_with_policy(
+                    &entry.output,
+                    &policy,
+                    self.resolver.as_ref(),
+                )
+                .await
+                {
+                    return result;
                 }
+                let mut output = entry.output;
+                output.from_cache = true;
+                return web_result(&output, output.truncated, max_output_chars, true, None);
             }
         }
 
@@ -423,17 +463,22 @@ impl Tool for WebFetchTool {
                         .unwrap_or("Tool execution cancelled"),
                 );
             }
-            if let Err(result) =
-                validate_url_with_policy(&current_url, Some(&policy), self.resolver.as_ref()).await
-            {
-                return result;
-            }
+            let validated_target =
+                match validate_url_with_policy(&current_url, Some(&policy), self.resolver.as_ref())
+                    .await
+                {
+                    Ok(target) => target,
+                    Err(result) => return result,
+                };
             let response = match self
                 .transport
-                .send(WebFetchTransportRequest {
-                    url: current_url.to_string(),
-                    max_response_bytes,
-                })
+                .send_validated(
+                    WebFetchTransportRequest {
+                        url: current_url.to_string(),
+                        max_response_bytes,
+                    },
+                    &validated_target.addresses,
+                )
                 .await
             {
                 Ok(response) => response,
@@ -452,11 +497,6 @@ impl Tool for WebFetchTool {
                         return ToolResult::error(format!("Invalid redirect URL: {}", error));
                     }
                 };
-                if let Err(result) =
-                    validate_url_with_policy(&next_url, Some(&policy), self.resolver.as_ref()).await
-                {
-                    return result;
-                }
                 redirects.push(next_url.to_string());
                 current_url = next_url;
                 continue;
@@ -496,16 +536,16 @@ impl Tool for WebFetchTool {
         let mut extraction_available = false;
         let mut final_content = content;
         let mut extraction_error = None;
-        if let Some(prompt) = input.prompt.as_deref() {
-            if let Some(extractor) = { self.extractor.read().clone() } {
-                match extract_with_llm(extractor, prompt, &final_content).await {
-                    Ok(answer) => {
-                        final_content = answer;
-                        extraction_available = true;
-                    }
-                    Err(error) => {
-                        extraction_error = Some(error);
-                    }
+        if let Some(prompt) = input.prompt.as_deref()
+            && let Some(extractor) = { self.extractor.read().clone() }
+        {
+            match extract_with_llm(extractor, prompt, &final_content).await {
+                Ok(answer) => {
+                    final_content = answer;
+                    extraction_available = true;
+                }
+                Err(error) => {
+                    extraction_error = Some(error);
                 }
             }
         }
@@ -541,16 +581,20 @@ impl Tool for WebFetchTool {
     }
 }
 
+struct ValidatedWebTarget {
+    addresses: Vec<SocketAddr>,
+}
+
 async fn validate_url_with_policy(
     url: &reqwest::Url,
     policy: Option<&WebFetchPolicyInput>,
     resolver: &dyn WebFetchResolver,
-) -> Result<(), ToolResult> {
-    validate_url(url, resolver).await?;
+) -> Result<ValidatedWebTarget, ToolResult> {
+    let target = validate_url(url, resolver).await?;
     if let Some(policy) = policy {
         check_configured_url_policy(url, policy)?;
     }
-    Ok(())
+    Ok(target)
 }
 
 async fn validate_cached_output_with_policy(
@@ -560,12 +604,12 @@ async fn validate_cached_output_with_policy(
 ) -> Result<(), ToolResult> {
     let final_url = reqwest::Url::parse(&output.final_url)
         .map_err(|error| ToolResult::error(format!("Cached final URL is invalid: {}", error)))?;
-    validate_url_with_policy(&final_url, Some(policy), resolver).await?;
+    let _ = validate_url_with_policy(&final_url, Some(policy), resolver).await?;
     for redirect in &output.redirects {
         let url = reqwest::Url::parse(redirect).map_err(|error| {
             ToolResult::error(format!("Cached redirect URL is invalid: {}", error))
         })?;
-        validate_url_with_policy(&url, Some(policy), resolver).await?;
+        let _ = validate_url_with_policy(&url, Some(policy), resolver).await?;
     }
     Ok(())
 }
@@ -589,7 +633,7 @@ fn policy_cache_fingerprint(policy: &WebFetchPolicyInput) -> String {
 async fn validate_url(
     url: &reqwest::Url,
     resolver: &dyn WebFetchResolver,
-) -> Result<(), ToolResult> {
+) -> Result<ValidatedWebTarget, ToolResult> {
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -612,11 +656,13 @@ async fn validate_url(
             "Localhost and metadata-service hosts are blocked",
         ));
     }
+    let port = url.port_or_known_default().unwrap_or(443);
     if let Ok(ip) = host.parse::<IpAddr>() {
         validate_ip(ip)?;
-        return Ok(());
+        return Ok(ValidatedWebTarget {
+            addresses: vec![SocketAddr::new(ip, port)],
+        });
     }
-    let port = url.port_or_known_default().unwrap_or(443);
     let addresses = resolver
         .resolve(host, port)
         .await
@@ -624,10 +670,15 @@ async fn validate_url(
     if addresses.is_empty() {
         return Err(ToolResult::error("DNS lookup returned no addresses"));
     }
-    for address in addresses {
-        validate_ip(address)?;
+    for address in &addresses {
+        validate_ip(*address)?;
     }
-    Ok(())
+    Ok(ValidatedWebTarget {
+        addresses: addresses
+            .into_iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect(),
+    })
 }
 
 fn check_configured_url_policy(
@@ -714,36 +765,68 @@ fn check_configured_url_policy(
 fn validate_ip(ip: IpAddr) -> Result<(), ToolResult> {
     if is_blocked_ip(ip) {
         Err(ToolResult::error(
-            "Private, localhost, link-local, multicast, documentation, and metadata IPs are blocked",
+            "Non-public and special-use IP addresses are blocked",
         ))
     } else {
         Ok(())
     }
 }
 
+//
+// The stable MSRV lacks IpAddr::is_global, so this conservative list rejects non-public and special-use prefixes before transport binding.
+//
 fn is_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(ip) => {
-            ip.is_private()
-                || ip.is_loopback()
-                || ip.is_link_local()
-                || ip.is_multicast()
-                || ip.is_documentation()
-                || ip.octets() == [169, 254, 169, 254]
-                || ip.octets() == [0, 0, 0, 0]
-        }
-        IpAddr::V6(ip) => {
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || ip.is_multicast()
-                || ip.segments()[0] & 0xfe00 == 0xfc00
-                || ip.segments()[0] & 0xffc0 == 0xfe80
-                || (ip.segments()[0] == 0x2001 && ip.segments()[1] == 0x0db8)
-                || ip
-                    .to_ipv4_mapped()
-                    .is_some_and(|mapped| is_blocked_ip(IpAddr::V4(mapped)))
-        }
+        IpAddr::V4(ip) => [
+            (Ipv4Addr::new(0, 0, 0, 0), 8),
+            (Ipv4Addr::new(10, 0, 0, 0), 8),
+            (Ipv4Addr::new(100, 64, 0, 0), 10),
+            (Ipv4Addr::new(127, 0, 0, 0), 8),
+            (Ipv4Addr::new(169, 254, 0, 0), 16),
+            (Ipv4Addr::new(172, 16, 0, 0), 12),
+            (Ipv4Addr::new(192, 0, 0, 0), 24),
+            (Ipv4Addr::new(192, 0, 2, 0), 24),
+            (Ipv4Addr::new(192, 88, 99, 0), 24),
+            (Ipv4Addr::new(192, 168, 0, 0), 16),
+            (Ipv4Addr::new(198, 18, 0, 0), 15),
+            (Ipv4Addr::new(198, 51, 100, 0), 24),
+            (Ipv4Addr::new(203, 0, 113, 0), 24),
+            (Ipv4Addr::new(224, 0, 0, 0), 4),
+            (Ipv4Addr::new(240, 0, 0, 0), 4),
+        ]
+        .into_iter()
+        .any(|(network, prefix)| ipv4_in_prefix(ip, network, prefix)),
+        IpAddr::V6(ip) => [
+            (Ipv6Addr::UNSPECIFIED, 96),
+            (Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), 96),
+            (Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 96),
+            (Ipv6Addr::new(0x64, 0xff9b, 1, 0, 0, 0, 0, 0), 48),
+            (Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0), 64),
+            (Ipv6Addr::new(0x100, 0, 0, 1, 0, 0, 0, 0), 64),
+            (Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, 0, 0), 23),
+            (Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 0), 32),
+            (Ipv6Addr::new(0x2002, 0, 0, 0, 0, 0, 0, 0), 16),
+            (Ipv6Addr::new(0x3ffe, 0, 0, 0, 0, 0, 0, 0), 16),
+            (Ipv6Addr::new(0x3fff, 0, 0, 0, 0, 0, 0, 0), 20),
+            (Ipv6Addr::new(0x5f00, 0, 0, 0, 0, 0, 0, 0), 16),
+            (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7),
+            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10),
+            (Ipv6Addr::new(0xfec0, 0, 0, 0, 0, 0, 0, 0), 10),
+            (Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8),
+        ]
+        .into_iter()
+        .any(|(network, prefix)| ipv6_in_prefix(ip, network, prefix)),
     }
+}
+
+fn ipv4_in_prefix(ip: Ipv4Addr, network: Ipv4Addr, prefix: u8) -> bool {
+    let shift = 32 - u32::from(prefix);
+    u32::from(ip) >> shift == u32::from(network) >> shift
+}
+
+fn ipv6_in_prefix(ip: Ipv6Addr, network: Ipv6Addr, prefix: u8) -> bool {
+    let shift = 128 - u32::from(prefix);
+    u128::from_be_bytes(ip.octets()) >> shift == u128::from_be_bytes(network.octets()) >> shift
 }
 
 fn normalize_host(host: &str) -> String {
@@ -872,11 +955,13 @@ fn web_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[derive(Default)]
     struct FixtureTransport {
         routes: RwLock<HashMap<String, WebFetchTransportResponse>>,
         requests: RwLock<Vec<String>>,
+        validated_addresses: RwLock<Vec<Vec<SocketAddr>>>,
     }
 
     impl FixtureTransport {
@@ -886,6 +971,10 @@ mod tests {
 
         fn requests(&self) -> Vec<String> {
             self.requests.read().clone()
+        }
+
+        fn validated_addresses(&self) -> Vec<Vec<SocketAddr>> {
+            self.validated_addresses.read().clone()
         }
     }
 
@@ -901,6 +990,15 @@ mod tests {
                 .get(&request.url)
                 .cloned()
                 .ok_or_else(|| format!("Unconfigured web fetch route: {}", request.url))
+        }
+
+        async fn send_validated(
+            &self,
+            request: WebFetchTransportRequest,
+            addresses: &[SocketAddr],
+        ) -> Result<WebFetchTransportResponse, String> {
+            self.validated_addresses.write().push(addresses.to_vec());
+            self.send(request).await
         }
     }
 
@@ -954,14 +1052,30 @@ mod tests {
     #[tokio::test]
     async fn blocks_non_public_ip_ranges_without_requesting() {
         for url in [
-            "http://127.0.0.1/",
+            "http://0.0.0.1/",
             "http://10.0.0.1/",
+            "http://100.64.0.1/",
+            "http://127.0.0.1/",
             "http://169.254.1.1/",
             "http://169.254.169.254/latest",
+            "http://192.0.0.1/",
             "http://192.0.2.1/",
+            "http://192.88.99.2/",
+            "http://198.18.0.1/",
+            "http://240.0.0.1/",
+            "http://255.255.255.255/",
             "http://[::1]/",
-            "http://[fe80::1]/",
+            "http://[64:ff9b::1]/",
+            "http://[64:ff9b:1::1]/",
+            "http://[100::1]/",
+            "http://[100:0:0:1::1]/",
+            "http://[2001:2::1]/",
             "http://[2001:db8::1]/",
+            "http://[2002::1]/",
+            "http://[3fff::1]/",
+            "http://[5f00::1]/",
+            "http://[fe80::1]/",
+            "http://[fec0::1]/",
             "http://[::ffff:10.0.0.1]/",
         ] {
             let result = WebFetchTool::new()
@@ -971,6 +1085,123 @@ mod tests {
                 )
                 .await;
             assert!(!result.success, "URL should be blocked: {}", url);
+        }
+    }
+
+    #[tokio::test]
+    async fn default_transport_connects_only_to_supplied_address() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\n\r\nbound")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        let url = format!("http://binding.invalid:{}/bound", address.port());
+
+        let response = ReqwestWebFetchTransport
+            .send_validated(
+                WebFetchTransportRequest {
+                    url,
+                    max_response_bytes: 64,
+                },
+                &[address],
+            )
+            .await
+            .unwrap();
+        let request = server.await.unwrap().to_ascii_lowercase();
+
+        assert_eq!(response.body, b"bound");
+        assert!(request.contains(&format!("host: binding.invalid:{}", address.port())));
+    }
+
+    #[tokio::test]
+    async fn validated_addresses_are_passed_to_transport() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/page",
+            response(200, Some("text/plain"), None, "bound"),
+        );
+        let mut resolver = FixtureResolver::default();
+        resolver
+            .addresses
+            .insert("public.test".to_string(), vec![IpAddr::from([1, 1, 1, 1])]);
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::new(resolver),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://public.test/page"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(result.success);
+        assert_eq!(
+            transport.validated_addresses(),
+            vec![vec![SocketAddr::from(([1, 1, 1, 1], 443))]]
+        );
+    }
+
+    #[tokio::test]
+    async fn blocks_embedded_credentials_without_requesting() {
+        let transport = Arc::new(FixtureTransport::default());
+        let result = fixture_tool(Arc::clone(&transport))
+            .execute(
+                serde_json::json!({"url": "https://user:password@public.test/"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("embedded credentials"));
+        assert!(transport.requests().is_empty());
+        assert!(transport.validated_addresses().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dns_alias_to_metadata_address_is_blocked_before_transport() {
+        let transport = Arc::new(FixtureTransport::default());
+        let mut resolver = FixtureResolver::default();
+        resolver.addresses.insert(
+            "metadata-alias.test".to_string(),
+            vec![IpAddr::from([100, 100, 100, 200])],
+        );
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::new(resolver),
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "http://metadata-alias.test/latest"}),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Non-public and special-use"));
+        assert!(transport.requests().is_empty());
+        assert!(transport.validated_addresses().is_empty());
+    }
+
+    #[test]
+    fn public_address_examples_remain_allowed() {
+        for address in ["1.1.1.1", "8.8.8.8", "2606:4700:4700::1111"] {
+            let address = address.parse::<IpAddr>().unwrap();
+            assert!(
+                !is_blocked_ip(address),
+                "address should remain allowed: {address}"
+            );
         }
     }
 
@@ -1040,6 +1271,7 @@ mod tests {
                 "https://public.test/final".to_string()
             ]
         );
+        assert_eq!(transport.validated_addresses().len(), 2);
     }
 
     #[tokio::test]
@@ -1068,7 +1300,7 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(transport.requests(), vec!["https://public.test/start"]);
-        assert!(result.output.contains("Private"));
+        assert!(result.output.contains("Non-public and special-use"));
     }
 
     #[tokio::test]

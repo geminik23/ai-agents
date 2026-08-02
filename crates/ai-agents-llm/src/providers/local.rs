@@ -132,11 +132,7 @@ impl<T: LocalModelProvider> LLMProvider for LocalModelAdapter<T> {
     }
 
     fn supports(&self, feature: LLMFeature) -> bool {
-        match feature {
-            LLMFeature::Streaming => true,
-            LLMFeature::SystemMessages => true,
-            _ => false,
-        }
+        matches!(feature, LLMFeature::Streaming | LLMFeature::SystemMessages)
     }
 }
 

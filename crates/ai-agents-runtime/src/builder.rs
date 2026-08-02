@@ -590,10 +590,10 @@ impl AgentBuilder {
     pub fn extend_tools(mut self, additional: ToolRegistry) -> Self {
         let registry = self.tools.get_or_insert_with(ToolRegistry::new);
         for id in additional.list_ids() {
-            if registry.get(&id).is_none() {
-                if let Some(tool) = additional.get(&id) {
-                    let _ = registry.register(tool);
-                }
+            if registry.get(&id).is_none()
+                && let Some(tool) = additional.get(&id)
+            {
+                let _ = registry.register(tool);
             }
         }
         self
@@ -877,7 +877,7 @@ impl AgentBuilder {
                 // Auto-inject into parent when no explicit storage: is configured.
                 let parent_has_storage = self.storage.is_some()
                     || self.storage_config.is_some()
-                    || self.spec.as_ref().map_or(false, |s| s.has_storage());
+                    || self.spec.as_ref().is_some_and(|s| s.has_storage());
                 if !parent_has_storage {
                     self.storage = Some(st);
                 }
@@ -953,30 +953,30 @@ impl AgentBuilder {
         }
 
         // Validate that all orchestration state references have matching agents.
-        if let Some(ref spec) = self.spec {
-            if let Some(ref state_config) = spec.states {
-                let refs = collect_orchestration_refs(&state_config.states);
-                let mut missing: Vec<String> = Vec::new();
+        if let Some(ref spec) = self.spec
+            && let Some(ref state_config) = spec.states
+        {
+            let refs = collect_orchestration_refs(&state_config.states);
+            let mut missing: Vec<String> = Vec::new();
 
-                for (agent_id, state_name, pattern) in &refs {
-                    if !registry.contains(agent_id) {
-                        missing.push(format!(
-                            "  - '{}' (referenced by state '{}' via {})",
-                            agent_id, state_name, pattern
-                        ));
-                    }
+            for (agent_id, state_name, pattern) in &refs {
+                if !registry.contains(agent_id) {
+                    missing.push(format!(
+                        "  - '{}' (referenced by state '{}' via {})",
+                        agent_id, state_name, pattern
+                    ));
                 }
+            }
 
-                if !missing.is_empty() {
-                    missing.sort();
-                    missing.dedup();
-                    return Err(AgentError::Config(format!(
-                        "Auto-spawn validation failed. These agents are referenced by \
-                         orchestration states but were not successfully spawned:\n\n{}\n\n\
-                         Check that agent YAML files exist and contain valid specs.",
-                        missing.join("\n")
-                    )));
-                }
+            if !missing.is_empty() {
+                missing.sort();
+                missing.dedup();
+                return Err(AgentError::Config(format!(
+                    "Auto-spawn validation failed. These agents are referenced by \
+                     orchestration states but were not successfully spawned:\n\n{}\n\n\
+                     Check that agent YAML files exist and contain valid specs.",
+                    missing.join("\n")
+                )));
             }
         }
 
@@ -1002,7 +1002,7 @@ impl AgentBuilder {
             .system_prompt
             .ok_or_else(|| AgentError::Config("System prompt is required".into()))?;
 
-        let mut tools = self.tools.unwrap_or_else(ToolRegistry::new);
+        let mut tools = self.tools.unwrap_or_default();
 
         // ERROR NOTE: Don't include tools prompt here
         // - it will be added AFTER template rendering in get_effective_system_prompt() to avoid Jinja2 parsing JSON braces
@@ -1017,41 +1017,41 @@ impl AgentBuilder {
             AgentInfo::new("agent", "Agent", "1.0.0")
         };
 
-        if let Some(ref spec) = self.spec {
-            if !spec.skills.is_empty() {
-                let mut loader = self.skill_loader.take().unwrap_or_else(SkillLoader::new);
-                if let Some(ref dir) = self.yaml_dir {
-                    loader.set_base_dir(dir);
-                }
-                let loaded_skills = loader.load_refs(&spec.skills)?;
-                self.skills.extend(loaded_skills);
+        if let Some(ref spec) = self.spec
+            && !spec.skills.is_empty()
+        {
+            let mut loader = self.skill_loader.take().unwrap_or_default();
+            if let Some(ref dir) = self.yaml_dir {
+                loader.set_base_dir(dir);
             }
+            let loaded_skills = loader.load_refs(&spec.skills)?;
+            self.skills.extend(loaded_skills);
         }
 
-        let mut llm_registry = self.llm_registry.unwrap_or_else(LLMRegistry::new);
+        let mut llm_registry = self.llm_registry.unwrap_or_default();
 
-        if let Some(llm) = self.llm {
-            if !llm_registry.has("default") {
-                let provider = if self.llm_registry_observed {
-                    if let Some(ref manager) = observability_manager {
-                        Arc::new(ObservedLLMProvider::new(
-                            llm.clone(),
-                            Arc::clone(manager),
-                            Some("default".to_string()),
-                            llm.provider_name().to_string(),
-                            model_by_alias_from_spec(self.spec.as_ref())
-                                .get("default")
-                                .cloned()
-                                .unwrap_or_else(|| "default".to_string()),
-                        )) as Arc<dyn LLMProvider>
-                    } else {
-                        llm.clone()
-                    }
+        if let Some(llm) = self.llm
+            && !llm_registry.has("default")
+        {
+            let provider = if self.llm_registry_observed {
+                if let Some(ref manager) = observability_manager {
+                    Arc::new(ObservedLLMProvider::new(
+                        llm.clone(),
+                        Arc::clone(manager),
+                        Some("default".to_string()),
+                        llm.provider_name().to_string(),
+                        model_by_alias_from_spec(self.spec.as_ref())
+                            .get("default")
+                            .cloned()
+                            .unwrap_or_else(|| "default".to_string()),
+                    )) as Arc<dyn LLMProvider>
                 } else {
                     llm.clone()
-                };
-                llm_registry.register("default", provider);
-            }
+                }
+            } else {
+                llm.clone()
+            };
+            llm_registry.register("default", provider);
         }
 
         if let Some(ref spec) = self.spec {
@@ -1070,16 +1070,16 @@ impl AgentBuilder {
             ));
         }
 
-        if let Some(ref manager) = observability_manager {
-            if !self.llm_registry_observed {
-                let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
-                llm_registry = wrap_registry_with_observability(
-                    llm_registry,
-                    Arc::clone(manager),
-                    &model_by_alias,
-                );
-                self.llm_registry_observed = true;
-            }
+        if let Some(ref manager) = observability_manager
+            && !self.llm_registry_observed
+        {
+            let model_by_alias = model_by_alias_from_spec(self.spec.as_ref());
+            llm_registry = wrap_registry_with_observability(
+                llm_registry,
+                Arc::clone(manager),
+                &model_by_alias,
+            );
+            self.llm_registry_observed = true;
         }
 
         // Create memory after LLM registry is ready (needed for CompactingMemory summarizer)
@@ -1133,11 +1133,11 @@ impl AgentBuilder {
             };
 
         // Register persona_evolve tool if allow_llm_evolve is true.
-        if let Some(ref pm) = persona_manager {
-            if pm.should_register_evolve_tool() {
-                let evolve_tool = ai_agents_persona::PersonaEvolveTool::new(pm.clone());
-                let _ = tools.register(Arc::new(evolve_tool));
-            }
+        if let Some(ref pm) = persona_manager
+            && pm.should_register_evolve_tool()
+        {
+            let evolve_tool = ai_agents_persona::PersonaEvolveTool::new(pm.clone());
+            let _ = tools.register(Arc::new(evolve_tool));
         }
 
         if let Some(ref manager) = observability_manager {
@@ -1220,12 +1220,12 @@ impl AgentBuilder {
                 })
                 .unwrap_or_default();
 
-            if let Some(ref spec) = self.spec {
-                if let Some(ref spawner) = spec.spawner {
-                    // management_tools and orchestration_tools are explicit registration and grant signals.
-                    ids.extend(spawner.management_tools.granted_management_tool_ids());
-                    ids.extend(spawner.orchestration_tools.granted_orchestration_tool_ids());
-                }
+            if let Some(ref spec) = self.spec
+                && let Some(ref spawner) = spec.spawner
+            {
+                // management_tools and orchestration_tools are explicit registration and grant signals.
+                ids.extend(spawner.management_tools.granted_management_tool_ids());
+                ids.extend(spawner.orchestration_tools.granted_orchestration_tool_ids());
             }
 
             if persona_manager
@@ -1312,12 +1312,12 @@ impl AgentBuilder {
         if let Some(processor) = self.process_processor {
             agent =
                 agent.with_process_processor(processor.with_llm_registry(llm_registry_arc.clone()));
-        } else if let Some(ref spec) = self.spec {
-            if spec.has_process() {
-                let processor = ProcessProcessor::new(spec.process.clone())
-                    .with_llm_registry(llm_registry_arc.clone());
-                agent = agent.with_process_processor(processor);
-            }
+        } else if let Some(ref spec) = self.spec
+            && spec.has_process()
+        {
+            let processor = ProcessProcessor::new(spec.process.clone())
+                .with_llm_registry(llm_registry_arc.clone());
+            agent = agent.with_process_processor(processor);
         }
 
         for (name, filter) in self.message_filters {
@@ -1335,33 +1335,33 @@ impl AgentBuilder {
                 Arc::new(LLMTransitionEvaluator::new(eval_llm))
             });
             agent = agent.with_state_machine(state_machine, evaluator);
-        } else if let Some(ref spec) = self.spec {
-            if let Some(ref state_config) = spec.states {
-                let state_machine = StateMachine::new(state_config.clone())?;
-                let evaluator = self.transition_evaluator.unwrap_or_else(|| {
-                    let eval_llm = llm_registry_arc
-                        .get("evaluator")
-                        .or_else(|_| llm_registry_arc.router())
-                        .or_else(|_| llm_registry_arc.default())
-                        .expect("At least one LLM required for transition evaluator");
-                    Arc::new(LLMTransitionEvaluator::new(eval_llm))
-                });
-                agent = agent.with_state_machine(Arc::new(state_machine), evaluator);
-            }
+        } else if let Some(ref spec) = self.spec
+            && let Some(ref state_config) = spec.states
+        {
+            let state_machine = StateMachine::new(state_config.clone())?;
+            let evaluator = self.transition_evaluator.unwrap_or_else(|| {
+                let eval_llm = llm_registry_arc
+                    .get("evaluator")
+                    .or_else(|_| llm_registry_arc.router())
+                    .or_else(|_| llm_registry_arc.default())
+                    .expect("At least one LLM required for transition evaluator");
+                Arc::new(LLMTransitionEvaluator::new(eval_llm))
+            });
+            agent = agent.with_state_machine(Arc::new(state_machine), evaluator);
         }
 
         // Configure context manager from spec or builder
         if let Some(context_manager) = self.context_manager {
             agent = agent.with_context_manager(context_manager);
-        } else if let Some(ref spec) = self.spec {
-            if !spec.context.is_empty() {
-                let context_manager = ContextManager::new(
-                    spec.context.clone(),
-                    spec.name.clone(),
-                    spec.version.clone(),
-                );
-                agent = agent.with_context_manager(Arc::new(context_manager));
-            }
+        } else if let Some(ref spec) = self.spec
+            && !spec.context.is_empty()
+        {
+            let context_manager = ContextManager::new(
+                spec.context.clone(),
+                spec.name.clone(),
+                spec.version.clone(),
+            );
+            agent = agent.with_context_manager(Arc::new(context_manager));
         }
 
         // Configure parallel tools and streaming from spec
@@ -1424,14 +1424,14 @@ impl AgentBuilder {
                 .approval_handler
                 .unwrap_or_else(|| Arc::new(RejectAllHandler::new()));
             agent = agent.with_hitl(hitl_engine, handler);
-        } else if let Some(ref spec) = self.spec {
-            if let Some(ref hitl_config) = spec.hitl {
-                let hitl_engine = HITLEngine::new(hitl_config.clone());
-                let handler = self
-                    .approval_handler
-                    .unwrap_or_else(|| Arc::new(RejectAllHandler::new()));
-                agent = agent.with_hitl(hitl_engine, handler);
-            }
+        } else if let Some(ref spec) = self.spec
+            && let Some(ref hitl_config) = spec.hitl
+        {
+            let hitl_engine = HITLEngine::new(hitl_config.clone());
+            let handler = self
+                .approval_handler
+                .unwrap_or_else(|| Arc::new(RejectAllHandler::new()));
+            agent = agent.with_hitl(hitl_engine, handler);
         }
 
         if let Some(reasoning) = self.reasoning {
@@ -1447,10 +1447,10 @@ impl AgentBuilder {
         }
 
         // Configure disambiguation from spec
-        if let Some(ref spec) = self.spec {
-            if spec.disambiguation.is_enabled() {
-                agent = agent.with_disambiguation(spec.disambiguation.clone());
-            }
+        if let Some(ref spec) = self.spec
+            && spec.disambiguation.is_enabled()
+        {
+            agent = agent.with_disambiguation(spec.disambiguation.clone());
         }
 
         // Wire persona manager into the agent (created earlier before tools_arc).

@@ -35,7 +35,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Evaluation, safety, control & observability** - YAML scenario evals with assertions/judges, runtime latency optimization, speculative branch execution, error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
 - **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`; custom LLM providers remain source-compatible and can opt into native tool requests through additive methods
 
-Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, credentials, custom integrations, and provider-internal I/O.
+Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, filesystem ownership, network egress, credentials, custom integrations, and provider-internal I/O.
 
 ## v1 Scope and Support
 

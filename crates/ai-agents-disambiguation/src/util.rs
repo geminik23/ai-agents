@@ -7,16 +7,15 @@ pub(crate) fn extract_json(content: &str) -> &str {
     }
 
     // Try markdown code block with json tag
-    if let Some(start) = trimmed.find("```json") {
-        if let Some(end) = trimmed[start..]
+    if let Some(start) = trimmed.find("```json")
+        && let Some(end) = trimmed[start..]
             .find("```\n")
             .or_else(|| trimmed[start..].rfind("```"))
-        {
-            let json_start = start + 7;
-            let json_end = start + end;
-            if json_end > json_start {
-                return trimmed[json_start..json_end].trim();
-            }
+    {
+        let json_start = start + 7;
+        let json_end = start + end;
+        if json_end > json_start {
+            return trimmed[json_start..json_end].trim();
         }
     }
 
@@ -33,10 +32,10 @@ pub(crate) fn extract_json(content: &str) -> &str {
     }
 
     // Try bare JSON object
-    if let Some(start) = trimmed.find('{') {
-        if let Some(end) = trimmed.rfind('}') {
-            return &trimmed[start..=end];
-        }
+    if let Some(start) = trimmed.find('{')
+        && let Some(end) = trimmed.rfind('}')
+    {
+        return &trimmed[start..=end];
     }
 
     trimmed

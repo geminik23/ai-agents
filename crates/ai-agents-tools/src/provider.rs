@@ -56,23 +56,21 @@ impl ToolDescriptor {
     }
 
     pub fn get_name(&self, lang: Option<&str>) -> &str {
-        if let Some(lang) = lang {
-            if let Some(ref aliases) = self.aliases {
-                if let Some(name) = aliases.get_name(lang) {
-                    return name;
-                }
-            }
+        if let Some(lang) = lang
+            && let Some(ref aliases) = self.aliases
+            && let Some(name) = aliases.get_name(lang)
+        {
+            return name;
         }
         &self.name
     }
 
     pub fn get_description(&self, lang: Option<&str>) -> &str {
-        if let Some(lang) = lang {
-            if let Some(ref aliases) = self.aliases {
-                if let Some(desc) = aliases.get_description(lang) {
-                    return desc;
-                }
-            }
+        if let Some(lang) = lang
+            && let Some(ref aliases) = self.aliases
+            && let Some(desc) = aliases.get_description(lang)
+        {
+            return desc;
         }
         &self.description
     }

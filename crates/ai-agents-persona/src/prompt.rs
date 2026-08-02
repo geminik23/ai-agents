@@ -137,18 +137,18 @@ fn render_traits(traits: &PersonaTraits) -> String {
         has_content = true;
     }
 
-    if let Some(ref values) = traits.values {
-        if !values.is_empty() {
-            lines.push(format!("Values: {}.", values.join(", ")));
-            has_content = true;
-        }
+    if let Some(ref values) = traits.values
+        && !values.is_empty()
+    {
+        lines.push(format!("Values: {}.", values.join(", ")));
+        has_content = true;
     }
 
-    if let Some(ref fears) = traits.fears {
-        if !fears.is_empty() {
-            lines.push(format!("Fears: {}.", fears.join(", ")));
-            has_content = true;
-        }
+    if let Some(ref fears) = traits.fears
+        && !fears.is_empty()
+    {
+        lines.push(format!("Fears: {}.", fears.join(", ")));
+        has_content = true;
     }
 
     if let Some(ref style) = traits.speaking_style {

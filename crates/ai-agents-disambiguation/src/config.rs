@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Main disambiguation configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DisambiguationConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -27,19 +27,6 @@ pub struct DisambiguationConfig {
 
 fn default_enabled() -> bool {
     false
-}
-
-impl Default for DisambiguationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            detection: DetectionConfig::default(),
-            clarification: ClarificationConfig::default(),
-            context: ContextConfig::default(),
-            skip_when: Vec::new(),
-            cache: CacheConfig::default(),
-        }
-    }
 }
 
 impl DisambiguationConfig {

@@ -427,6 +427,10 @@ impl CompositeHooks {
         Self { hooks: Vec::new() }
     }
 
+    /// Adds a hook to this fluent composite builder.
+    ///
+    /// The method keeps its frozen v1 name instead of implementing arithmetic addition semantics.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, hooks: Arc<dyn AgentHooks>) -> Self {
         self.hooks.push(hooks);
         self

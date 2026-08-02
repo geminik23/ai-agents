@@ -328,6 +328,10 @@ impl StringList {
 /// String or object form for tool call assertions.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would change the frozen public assertion construction API"
+)]
 pub enum ToolCalledAssertion {
     Id(String),
     Object(ToolCalledObject),
@@ -406,6 +410,10 @@ pub struct LlmRequestAssertion {
 /// Boolean or object form for approval assertions.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "boxing would change the frozen public assertion construction API"
+)]
 pub enum ApprovalAssertion {
     Bool(bool),
     Object(ApprovalAssertionObject),
@@ -1248,18 +1256,17 @@ fn evaluate_llm_request(
             }
         })
         .count();
-    let content_matches = same_request
-        .then_some(matching_count > 0)
-        .unwrap_or_else(|| {
-            checks.iter().all(|(role, text)| {
-                evidence.llm_requests.iter().any(|request| {
-                    request.messages.iter().any(|message| {
-                        role.is_none_or(|role| message.role == role)
-                            && message.content.contains(text)
-                    })
+    let content_matches = if same_request {
+        matching_count > 0
+    } else {
+        checks.iter().all(|(role, text)| {
+            evidence.llm_requests.iter().any(|request| {
+                request.messages.iter().any(|message| {
+                    role.is_none_or(|role| message.role == role) && message.content.contains(text)
                 })
             })
-        });
+        })
+    };
     let has_count_constraint =
         assertion.count.is_some() || assertion.count_gte.is_some() || assertion.count_lte.is_some();
     let passed = (checks.is_empty() || content_matches)
@@ -1543,28 +1550,28 @@ fn path_matches(root: &Value, assertion: &PathAssertion) -> bool {
 }
 
 fn path_actual_matches(actual: Option<&Value>, assertion: &PathAssertion) -> bool {
-    if let Some(exists) = assertion.exists {
-        if exists != actual.is_some() {
-            return false;
-        }
+    if let Some(exists) = assertion.exists
+        && exists != actual.is_some()
+    {
+        return false;
     }
     let Some(actual) = actual else {
         return assertion.exists == Some(false);
     };
-    if let Some(expected) = &assertion.eq {
-        if actual != expected {
-            return false;
-        }
+    if let Some(expected) = &assertion.eq
+        && actual != expected
+    {
+        return false;
     }
-    if let Some(expected) = &assertion.neq {
-        if actual == expected {
-            return false;
-        }
+    if let Some(expected) = &assertion.neq
+        && actual == expected
+    {
+        return false;
     }
-    if let Some(values) = &assertion.in_values {
-        if !values.contains(actual) {
-            return false;
-        }
+    if let Some(values) = &assertion.in_values
+        && !values.contains(actual)
+    {
+        return false;
     }
     if let Some(expected) = &assertion.contains {
         let contains = match (actual, expected) {
@@ -1634,17 +1641,17 @@ async fn evaluate_facts(
         );
         return;
     };
-    if let Some(actor) = &assertion.actor {
-        if fact_evidence.actor_id.as_deref() != Some(actor.as_str()) {
-            push_bool(
-                "facts_include",
-                false,
-                json!(fact_evidence.actor_id),
-                json!(actor),
-                details,
-            );
-            return;
-        }
+    if let Some(actor) = &assertion.actor
+        && fact_evidence.actor_id.as_deref() != Some(actor.as_str())
+    {
+        push_bool(
+            "facts_include",
+            false,
+            json!(fact_evidence.actor_id),
+            json!(actor),
+            details,
+        );
+        return;
     }
     let facts: Vec<Value> = fact_evidence
         .facts
@@ -1729,17 +1736,17 @@ fn evaluate_relationship(
         );
         return;
     };
-    if let Some(actor) = &assertion.actor {
-        if rel.actor_id.as_deref() != Some(actor.as_str()) {
-            push_bool(
-                "relationship",
-                false,
-                json!(rel.actor_id),
-                json!(actor),
-                details,
-            );
-            return;
-        }
+    if let Some(actor) = &assertion.actor
+        && rel.actor_id.as_deref() != Some(actor.as_str())
+    {
+        push_bool(
+            "relationship",
+            false,
+            json!(rel.actor_id),
+            json!(actor),
+            details,
+        );
+        return;
     }
     let current = rel.current.as_ref();
     let mut passed = assertion
@@ -1906,10 +1913,9 @@ fn collect_agent_strings(value: &Value, agents: &mut Vec<String>) {
                 if matches!(
                     key.as_str(),
                     "agent" | "agent_id" | "id" | "final_agent" | "to_agent" | "from_agent"
-                ) {
-                    if let Some(text) = value.as_str() {
-                        agents.push(text.to_string());
-                    }
+                ) && let Some(text) = value.as_str()
+                {
+                    agents.push(text.to_string());
                 }
                 collect_agent_strings(value, agents);
             }

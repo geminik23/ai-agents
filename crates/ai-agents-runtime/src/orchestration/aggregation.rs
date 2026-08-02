@@ -90,7 +90,7 @@ async fn synthesize_with_llm(
 
     let messages = vec![
         ChatMessage::system(system),
-        ChatMessage::user(&format!(
+        ChatMessage::user(format!(
             "Synthesize these responses:\n\n{}",
             agent_responses
         )),
@@ -305,7 +305,7 @@ async fn resolve_tie_with_llm(llm: &dyn LLMProvider, tied_choices: &[String]) ->
             "You are a tiebreaker. Multiple options received equal votes. \
              Pick the single best option. Respond with ONLY the option text.",
         ),
-        ChatMessage::user(&format!(
+        ChatMessage::user(format!(
             "These options are tied:\n{}\n\nPick one.",
             choices_list
         )),

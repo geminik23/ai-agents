@@ -205,7 +205,7 @@ fn encode_component(value: &str) -> String {
 }
 
 fn decode_component(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let mut decoded = Vec::with_capacity(value.len() / 2);
@@ -562,7 +562,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            summaries.sort_by(|left, right| right.last_active.cmp(&left.last_active));
+            summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_active));
             if let Some(limit) = filter.limit {
                 summaries.truncate(limit);
             }
@@ -755,9 +755,11 @@ mod tests {
         let session_id = "session/零";
         let agent_id = "agent/零";
         let actor_id = "actor/零";
-        let mut metadata = SessionMetadata::default();
-        metadata.actor_id = Some(actor_id.into());
-        metadata.actors = vec![actor_id.into(), "other/😀".into()];
+        let metadata = SessionMetadata {
+            actor_id: Some(actor_id.into()),
+            actors: vec![actor_id.into(), "other/😀".into()],
+            ..SessionMetadata::default()
+        };
 
         storage
             .save(session_id, &AgentSnapshot::new(agent_id.into()))
@@ -860,10 +862,14 @@ mod tests {
         let sibling = NamespacedStorage::new(inner.clone(), "sibling");
         let older = Utc::now() - chrono::Duration::minutes(1);
         let newer = Utc::now();
-        let mut owned_metadata = SessionMetadata::default();
-        owned_metadata.last_active = older;
-        let mut sibling_metadata = SessionMetadata::default();
-        sibling_metadata.last_active = newer;
+        let owned_metadata = SessionMetadata {
+            last_active: older,
+            ..SessionMetadata::default()
+        };
+        let sibling_metadata = SessionMetadata {
+            last_active: newer,
+            ..SessionMetadata::default()
+        };
 
         storage
             .save("owned-session", &AgentSnapshot::new("agent".into()))

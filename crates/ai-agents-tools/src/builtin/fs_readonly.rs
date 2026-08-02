@@ -150,31 +150,21 @@ struct GlobOutput {
     duration_ms: u64,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum GrepMode {
+    #[default]
     Regex,
     Literal,
 }
 
-impl Default for GrepMode {
-    fn default() -> Self {
-        Self::Regex
-    }
-}
-
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 enum GrepOutputMode {
     Content,
+    #[default]
     FilesWithMatches,
     Count,
-}
-
-impl Default for GrepOutputMode {
-    fn default() -> Self {
-        Self::FilesWithMatches
-    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -409,7 +399,7 @@ impl Tool for GlobTool {
             };
             for entry in read_dir.flatten() {
                 visited += 1;
-                if visited % 128 == 0 {
+                if visited.is_multiple_of(128) {
                     tokio::task::yield_now().await;
                 }
                 let path = entry.path();
@@ -736,11 +726,11 @@ impl Tool for FileReadTool {
 
         match read_text_range(&path, start_line, effective_end, max_lines, max_bytes).await {
             Ok(mut output) => {
-                if let Ok(bytes) = fs::read(&path) {
-                    if let Ok(version) = file_version_evidence(&path, &bytes) {
-                        self.versions.record(version.clone());
-                        output.version = Some(version);
-                    }
+                if let Ok(bytes) = fs::read(&path)
+                    && let Ok(version) = file_version_evidence(&path, &bytes)
+                {
+                    self.versions.record(version.clone());
+                    output.version = Some(version);
                 }
                 json_result_with_caps(&output, output.truncated, None)
             }
@@ -815,7 +805,7 @@ impl Tool for FileListTool {
             };
             for entry in read_dir.flatten() {
                 visited += 1;
-                if visited % 128 == 0 {
+                if visited.is_multiple_of(128) {
                     tokio::task::yield_now().await;
                 }
                 let path = entry.path();
@@ -873,7 +863,7 @@ impl Tool for FileListTool {
                 entries.push(FileListEntry {
                     path: relative,
                     kind,
-                    size: metadata.is_file().then(|| metadata.len()),
+                    size: metadata.is_file().then_some(metadata.len()),
                     modified: metadata.modified().ok().map(system_time_rfc3339),
                     symlink,
                     policy,
@@ -998,7 +988,7 @@ impl Tool for FileInfoTool {
             path: input.path,
             exists: true,
             kind: kind_from_metadata(&metadata).to_string(),
-            size: metadata.is_file().then(|| metadata.len()),
+            size: metadata.is_file().then_some(metadata.len()),
             modified: metadata.modified().ok().map(system_time_rfc3339),
             created: metadata.created().ok().map(system_time_rfc3339),
             readonly: metadata.permissions().readonly(),
@@ -1066,10 +1056,10 @@ fn read_tool_metadata(operation: ToolOperationKind) -> ToolSafetyMetadata {
 
 fn ensure_safe_path(path: &Path) -> Result<(), String> {
     ensure_safe_path_allow_missing(path)?;
-    if path.exists() {
-        if let Ok(canonical) = fs::canonicalize(path) {
-            ensure_no_blocked_components(&canonical)?;
-        }
+    if path.exists()
+        && let Ok(canonical) = fs::canonicalize(path)
+    {
+        ensure_no_blocked_components(&canonical)?;
     }
     Ok(())
 }
@@ -1184,7 +1174,7 @@ async fn collect_files(root: &Path, include: Option<&GlobMatcher>) -> Vec<PathBu
         };
         for entry in read_dir.flatten() {
             visited += 1;
-            if visited % 128 == 0 {
+            if visited.is_multiple_of(128) {
                 tokio::task::yield_now().await;
             }
             let path = entry.path();
@@ -1314,7 +1304,7 @@ async fn read_text_range(
         content.push_str(&line);
         bytes_read += read;
         lines_returned += 1;
-        if line_number % 256 == 0 {
+        if line_number.is_multiple_of(256) {
             tokio::task::yield_now().await;
         }
     }

@@ -40,11 +40,11 @@ impl AmbiguityDetector {
                     }
                 }
                 SkipCondition::InState { states } => {
-                    if let Some(ref current) = context.current_state {
-                        if states.contains(current) {
-                            debug!(state = %current, "Skipping: in excluded state");
-                            return Ok(true);
-                        }
+                    if let Some(ref current) = context.current_state
+                        && states.contains(current)
+                    {
+                        debug!(state = %current, "Skipping: in excluded state");
+                        return Ok(true);
                     }
                 }
                 SkipCondition::Social { .. } => {

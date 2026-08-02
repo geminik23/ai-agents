@@ -323,10 +323,10 @@ impl FileTool {
                 for entry in entries.flatten() {
                     let file_name = entry.file_name().to_string_lossy().to_string();
 
-                    if let Some(pat) = pattern {
-                        if !self.matches_pattern(&file_name, pat) {
-                            continue;
-                        }
+                    if let Some(pat) = pattern
+                        && !self.matches_pattern(&file_name, pat)
+                    {
+                        continue;
                     }
 
                     let metadata = entry.metadata().ok();
@@ -434,13 +434,11 @@ impl FileTool {
             return true;
         }
 
-        if pattern.starts_with("*.") {
-            let ext = &pattern[2..];
+        if let Some(ext) = pattern.strip_prefix("*.") {
             return name.ends_with(&format!(".{}", ext));
         }
 
-        if pattern.ends_with(".*") {
-            let prefix = &pattern[..pattern.len() - 2];
+        if let Some(prefix) = pattern.strip_suffix(".*") {
             return name.starts_with(prefix);
         }
 

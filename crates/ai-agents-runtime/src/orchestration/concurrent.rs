@@ -15,6 +15,8 @@ use crate::spawner::AgentRegistry;
 use crate::turn_context::current_turn_actor_context;
 
 /// Run multiple agents in parallel and aggregate results.
+/// The explicit arguments preserve the public orchestration call contract and its independent controls.
+#[allow(clippy::too_many_arguments)]
 pub async fn concurrent(
     registry: &AgentRegistry,
     input: &str,
@@ -128,13 +130,13 @@ pub async fn concurrent(
     }
 
     // Check minimum required successes.
-    if let Some(min) = min_required {
-        if success_count < min {
-            return Err(AgentError::Other(format!(
-                "Only {} of {} required agents succeeded",
-                success_count, min
-            )));
-        }
+    if let Some(min) = min_required
+        && success_count < min
+    {
+        return Err(AgentError::Other(format!(
+            "Only {} of {} required agents succeeded",
+            success_count, min
+        )));
     }
 
     // Build agent weight map for voting aggregation.

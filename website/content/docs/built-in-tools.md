@@ -23,7 +23,7 @@ Aliases and display names resolve to a canonical ID before scope, policy, HITL, 
 
 ## Common execution and evidence contract
 
-Every model call, skill step, state action, plan step, fallback, orchestration call, and manual invocation converges on the shared runtime executor. The stable order is:
+Every currently emitted production source - model call, skill step, state action, plan step, fallback, and manual invocation - converges on the shared runtime executor. Task, orchestration, and spawner source variants are reserved for future producers; evaluation fixtures are harness-only. The stable order is:
 
 ```text
 runtime deny -> canonical resolution -> grant/scope -> argument normalization
@@ -86,7 +86,9 @@ Tools with no argument binding still receive common tool-level enablement, rate 
 
 ## Controlled filesystem mutation
 
-All six split mutation tools require an explicit allowed write root for an actual mutation. With no write policy, the built-in default is dry-run only; `no_write_policy: deny` also blocks dry runs. Denied paths override allowed roots, path traversal and raw `.git` targets are rejected, and existing ancestors are canonicalized to prevent symlink escape. Actual calls require approval by classification unless policy explicitly sets `allow_without_confirmation: true`; dry runs classify as read-only, safely retryable, and do not require approval.
+All six split mutation tools require an explicit allowed write root for an actual mutation. With no write policy, the built-in default is dry-run only; `no_write_policy: deny` also blocks dry runs. Denied paths override allowed roots, path traversal and raw `.git` targets are rejected, and existing ancestors are canonicalized to prevent symlink escape while the checked path topology remains unchanged. Actual calls require approval by classification unless policy explicitly sets `allow_without_confirmation: true`; dry runs classify as read-only, safely retryable, and do not require approval.
+
+The v1 filesystem contract assumes a host-owned workspace without concurrent untrusted external replacement of validated files, directories, or parent paths. Runtime locks serialize framework-owned conflicting mutations, but they are not OS directory handles or a filesystem sandbox; use process, container, mount, and permission isolation when another process can modify the workspace concurrently.
 
 `file_write`, `file_edit`, and `patch` share read-version evidence with `file_read`. When `require_read_before_write: true`, an existing file must have been read and must still match that version before apply.
 
@@ -113,7 +115,7 @@ All six split mutation tools require an explicit allowed write root for an actua
 
 | Canonical ID | Inputs and defaults | Stable successful output | Safety, approval, and bindings |
 |---|---|---|---|
-| `web_fetch` | Required `url`. Optional extraction `prompt`, `max_chars=20000`, `cache_ttl_seconds=900` (`0` disables cache), `max_response_bytes=1 MiB`, `max_redirects=5`; effective policy can lower all limits. | `url`, `final_url`, `status`, optional `content_type`, `content`, `truncated`, `from_cache`, `redirects`, `extraction_prompt_used`, `extraction_available`. | Network read, `external_read`, open-world, no default approval. `url(url)`; output, response-byte, and redirect limits. Only HTTP(S), no embedded credentials; localhost, metadata, private, link-local, multicast, documentation, and other blocked IP ranges are rejected. DNS/IP and configured URL policy are checked before every request and redirect, including cached redirect evidence. |
+| `web_fetch` | Required `url`. Optional extraction `prompt`, `max_chars=20000`, `cache_ttl_seconds=900` (`0` disables cache), `max_response_bytes=1 MiB`, `max_redirects=5`; effective policy can lower all limits. | `url`, `final_url`, `status`, optional `content_type`, `content`, `truncated`, `from_cache`, `redirects`, `extraction_prompt_used`, `extraction_available`. | Network read, `external_read`, open-world, no default approval. `url(url)`; output, response-byte, and redirect limits. Only HTTP(S), no embedded credentials; localhost, metadata, private, link-local, multicast, documentation, and other blocked IP ranges are rejected. DNS/IP and configured URL policy are checked before every request and redirect, including cached redirect evidence. The default transport disables proxies and connects only to the addresses approved for that request. |
 | `web_search` | Required `query`. Optional `max_results=5`, `include_domains=[]`, `language`, `region`, `safe_search` (`off`, `moderate`, `strict`; omission is passed to the provider as no preference). | `available`, `query`, optional `provider`, `count`, `truncated`, `results`, optional `message`; each result has `title`, `url`, `snippet`, optional `source`, `published_at`. | Network read, `external_read`, open-world, host-dependent, no default approval. Only `limit(max_results -> max_results)` is bound. Requires an available host provider. `include_domains` is a provider request field, not an executor URL-policy binding. |
 | `http` | Required `method`, `url`. Methods: `GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`. Optional `headers`, `body`, `timeout_ms=30000`. | `status`, `status_text`, `headers`, `body`. | Network/open-world. `GET`/`HEAD` classify `external_read` with no default approval; other methods classify `external_write`. Bindings: `url(url)`, `operation(method)`. This is a raw API client, not the public-content safety profile of `web_fetch`; configure domain/method policy and explicit confirmation or approval rules for state-changing methods. Runtime output caps still apply. |
 
@@ -139,7 +141,7 @@ The host implements `ai_agents::tools::WebSearchProvider`, whose availability ch
 
 Evaluation uses `StaticWebSearchProvider` for deterministic exact-query responses and `UnavailableWebSearchProvider` when no fixture/provider is configured. The runtime checks `is_available()` before invoking the tool.
 
-`web_fetch` retrieves a known URL itself through the built-in GET transport. It owns URL parsing, DNS/IP validation, redirect-by-redirect policy, response byte limits, HTML-to-text conversion, caching, and optional LLM extraction.
+`web_fetch` retrieves a known URL itself through the built-in GET transport. It owns URL parsing, DNS/IP validation, validated-address binding, redirect-by-redirect policy, response byte limits, HTML-to-text conversion, caching, and optional LLM extraction. The default transport disables proxies because proxy-side hostname resolution would bypass the validated address set. A custom low-level `WebFetchTransport` that opens sockets must override validated sending and enforce the supplied address set; host firewall and network egress controls remain the final deployment boundary.
 
 These boundaries are intentional:
 

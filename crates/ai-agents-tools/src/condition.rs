@@ -16,7 +16,7 @@ pub struct ToolCallRecord {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EvaluationContext {
     pub context: HashMap<String, Value>,
     pub state_name: Option<String>,
@@ -24,19 +24,6 @@ pub struct EvaluationContext {
     pub previous_state: Option<String>,
     pub called_tools: Vec<ToolCallRecord>,
     pub recent_messages: Vec<ChatMessage>,
-}
-
-impl Default for EvaluationContext {
-    fn default() -> Self {
-        Self {
-            context: HashMap::new(),
-            state_name: None,
-            state_turn_count: 0,
-            previous_state: None,
-            called_tools: Vec::new(),
-            recent_messages: Vec::new(),
-        }
-    }
 }
 
 impl EvaluationContext {
@@ -182,10 +169,10 @@ impl<G: LLMGetter> ConditionEvaluator<G> {
     }
 
     fn evaluate_state(&self, matcher: &StateMatcher, ctx: &EvaluationContext) -> bool {
-        if let Some(ref expected_name) = matcher.name {
-            if ctx.state_name.as_ref() != Some(expected_name) {
-                return false;
-            }
+        if let Some(ref expected_name) = matcher.name
+            && ctx.state_name.as_ref() != Some(expected_name)
+        {
+            return false;
         }
 
         if let Some(ref turn_op) = matcher.turn_count {
@@ -198,10 +185,10 @@ impl<G: LLMGetter> ConditionEvaluator<G> {
             }
         }
 
-        if let Some(ref expected_prev) = matcher.previous {
-            if ctx.previous_state.as_ref() != Some(expected_prev) {
-                return false;
-            }
+        if let Some(ref expected_prev) = matcher.previous
+            && ctx.previous_state.as_ref() != Some(expected_prev)
+        {
+            return false;
         }
 
         true

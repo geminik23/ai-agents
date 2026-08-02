@@ -90,8 +90,8 @@ fn levenshtein(a: &str, b: &str) -> usize {
     let mut prev = vec![0usize; n + 1];
     let mut curr = vec![0usize; n + 1];
 
-    for j in 0..=n {
-        prev[j] = j;
+    for (j, value) in prev.iter_mut().enumerate() {
+        *value = j;
     }
 
     for i in 1..=m {

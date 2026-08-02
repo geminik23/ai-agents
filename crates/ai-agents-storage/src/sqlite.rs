@@ -38,6 +38,16 @@ pub struct SessionInfo {
     pub metadata: SqliteMetadata,
 }
 
+type SessionInfoRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Debug, Clone, Default)]
 pub struct SessionQuery {
     pub agent_id: Option<String>,
@@ -82,18 +92,17 @@ impl SqliteStorage {
 
     async fn connect(path: &str) -> Result<sqlx::SqlitePool> {
         // Ensure parent directories exist -- SQLite's create_if_missing only creates the file.
-        if path != ":memory:" {
-            if let Some(parent) = std::path::Path::new(path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent).map_err(|e| {
-                        AgentError::Persistence(format!(
-                            "failed to create directory {}: {}",
-                            parent.display(),
-                            e
-                        ))
-                    })?;
-                }
-            }
+        if path != ":memory:"
+            && let Some(parent) = std::path::Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                AgentError::Persistence(format!(
+                    "failed to create directory {}: {}",
+                    parent.display(),
+                    e
+                ))
+            })?;
         }
 
         let options = sqlx::sqlite::SqliteConnectOptions::from_str(path)
@@ -359,15 +368,7 @@ impl SqliteStorage {
     }
 
     pub async fn list_sessions_by_agent(&self, agent_id: &str) -> Result<Vec<SessionInfo>> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-        )> = sqlx::query_as(
+        let rows: Vec<SessionInfoRow> = sqlx::query_as(
             r#"
             SELECT session_id, agent_id, created_at, updated_at, message_count, current_state, metadata
             FROM sessions
@@ -542,15 +543,7 @@ impl SqliteStorage {
     }
 
     pub async fn get_session_info(&self, session_id: &str) -> Result<Option<SessionInfo>> {
-        let row: Option<(
-            String,
-            String,
-            String,
-            String,
-            i64,
-            Option<String>,
-            Option<String>,
-        )> = sqlx::query_as(
+        let row: Option<SessionInfoRow> = sqlx::query_as(
             r#"
             SELECT session_id, agent_id, created_at, updated_at, message_count, current_state, metadata
             FROM sessions WHERE session_id = ?
@@ -1135,12 +1128,12 @@ impl AgentStorage for SqliteStorage {
         let first_interaction = relationship
             .get("first_interaction")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z")
+            .unwrap_or("1970-01-01T00:00:00Z")
             .to_string();
         let last_interaction = relationship
             .get("last_interaction")
             .and_then(|v| v.as_str())
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z")
+            .unwrap_or("1970-01-01T00:00:00Z")
             .to_string();
 
         sqlx::query(

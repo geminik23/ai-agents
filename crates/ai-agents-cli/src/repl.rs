@@ -232,10 +232,10 @@ impl CliRepl {
             }
 
             // 1. Try the user-supplied custom command handler first
-            if let Some(ref handler) = self.command_handler {
-                if handler(input, &self.agent) == CommandResult::Handled {
-                    continue;
-                }
+            if let Some(ref handler) = self.command_handler
+                && handler(input, &self.agent) == CommandResult::Handled
+            {
+                continue;
             }
 
             // 2. Try built-in commands
@@ -350,10 +350,10 @@ impl CliRepl {
                 if let Some(state) = self.agent.current_state() {
                     println!("State: {}", state);
                 }
-                if self.agent.has_spawner() {
-                    if let Some(registry) = self.agent.spawner_registry() {
-                        println!("Spawned agents: {}", registry.list().len());
-                    }
+                if self.agent.has_spawner()
+                    && let Some(registry) = self.agent.spawner_registry()
+                {
+                    println!("Spawned agents: {}", registry.list().len());
                 }
                 Some(CommandAction::Continue)
             }
@@ -458,7 +458,7 @@ impl CliRepl {
                     return;
                 }
                 let value: serde_json::Value = serde_json::from_str(&raw_value)
-                    .unwrap_or_else(|_| serde_json::Value::String(raw_value));
+                    .unwrap_or(serde_json::Value::String(raw_value));
                 match self.agent.set_context(key, value) {
                     Ok(()) => println!("  Set: {}", key),
                     Err(e) => eprintln!("[Error] Failed to set context: {}", e),
@@ -528,11 +528,11 @@ impl CliRepl {
                 return;
             }
         };
-        if let Some(storage) = self.agent.storage() {
-            if let Err(e) = storage.save(name, &snapshot).await {
-                eprintln!("[Error] Failed to save parent session: {}", e);
-                return;
-            }
+        if let Some(storage) = self.agent.storage()
+            && let Err(e) = storage.save(name, &snapshot).await
+        {
+            eprintln!("[Error] Failed to save parent session: {}", e);
+            return;
         }
 
         // Save each child agent's session.
@@ -1163,7 +1163,7 @@ impl CliRepl {
                 .memory
                 .messages
                 .iter()
-                .map(|m| estimate_message_tokens(m))
+                .map(estimate_message_tokens)
                 .sum();
             let summary_tokens = snapshot
                 .memory
@@ -1301,13 +1301,12 @@ impl CliRepl {
     fn print_response(&self, response: &AgentResponse) {
         println!("\nAgent: {}\n", response.content);
 
-        if self.config.show_tool_calls {
-            if let Some(ref calls) = response.tool_calls {
-                if !calls.is_empty() {
-                    let names: Vec<&str> = calls.iter().map(|t| t.name.as_str()).collect();
-                    println!("  Tools used: {}", names.join(", "));
-                }
-            }
+        if self.config.show_tool_calls
+            && let Some(ref calls) = response.tool_calls
+            && !calls.is_empty()
+        {
+            let names: Vec<&str> = calls.iter().map(|t| t.name.as_str()).collect();
+            println!("  Tools used: {}", names.join(", "));
         }
     }
 

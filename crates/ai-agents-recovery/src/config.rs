@@ -178,7 +178,7 @@ pub struct ToolRecoveryConfig {
 }
 
 /// Retry and failure policy for a single tool (or the default for all tools).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ToolRetryConfig {
     #[serde(default)]
     pub max_retries: u32,
@@ -186,16 +186,6 @@ pub struct ToolRetryConfig {
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub on_failure: ToolFailureAction,
-}
-
-impl Default for ToolRetryConfig {
-    fn default() -> Self {
-        Self {
-            max_retries: 0,
-            timeout_ms: None,
-            on_failure: ToolFailureAction::default(),
-        }
-    }
 }
 
 /// Action to take when a tool call fails after all retries are exhausted.

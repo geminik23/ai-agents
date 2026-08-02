@@ -165,16 +165,16 @@ impl ClarificationQuestion {
     /// e.g. "What would you like to cancel?\n  A) Order\n  B) Reservation\n  C) Subscription"
     pub fn formatted(&self) -> String {
         let mut text = self.question.clone();
-        if let Some(ref options) = self.options {
-            if !options.is_empty() {
-                text.push('\n');
-                for (i, opt) in options.iter().enumerate() {
-                    let letter = (b'A' + i as u8) as char;
-                    text.push_str(&format!("  {}) {}\n", letter, opt.label));
-                }
-                // Remove trailing newline
-                text.truncate(text.trim_end().len());
+        if let Some(ref options) = self.options
+            && !options.is_empty()
+        {
+            text.push('\n');
+            for (i, opt) in options.iter().enumerate() {
+                let letter = (b'A' + i as u8) as char;
+                text.push_str(&format!("  {}) {}\n", letter, opt.label));
             }
+            // Remove trailing newline
+            text.truncate(text.trim_end().len());
         }
         text
     }

@@ -90,7 +90,9 @@ pub enum RuntimeTaskPriority {
 }
 
 /// Result produced by one speculative branch before commit or discard.
+/// Boxing the draft would break frozen public v1 variant construction, so this enum keeps its current representation.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeBranchResult {
     MainDraft(MainResponseDraft),
     Transition(Option<TransitionCandidate>),

@@ -245,21 +245,16 @@ pub struct TimeMatcher {
     pub timezone: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TransitionTiming {
     /// Evaluate after the assistant response is available.
+    #[default]
     PostResponse,
     /// Evaluate before main response generation when the route is response independent.
     PreResponse,
     /// Evaluate in parallel with a draft response when explicitly enabled.
     Parallel,
-}
-
-impl Default for TransitionTiming {
-    fn default() -> Self {
-        Self::PostResponse
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -520,7 +515,7 @@ pub struct GroupChatStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Jinja2 template for the topic sent to participants.
-    /// {{ user_input }} is the user's message. {{ context.<key> }} accesses context values. When omitted, the raw user message is used as the topic.
+    /// `{{ user_input }}` is the user's message. `{{ context.<key> }}` accesses context values. When omitted, the raw user message is used as the topic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
     /// Parent conversation context included in the topic.
@@ -695,7 +690,7 @@ pub struct HandoffStateConfig {
     pub max_handoffs: u32,
 
     /// Jinja2 template for the input sent to the initial agent.
-    /// {{ user_input }} is the user's message. {{ context.<key> }} accesses context values. When omitted, the raw user message is forwarded directly.
+    /// `{{ user_input }}` is the user's message. `{{ context.<key> }}` accesses context values. When omitted, the raw user message is forwarded directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
     /// Parent conversation context forwarded to the initial agent.
@@ -807,25 +802,25 @@ impl StateConfig {
                 }
             }
 
-            if let Some(ref timeout_state) = def.timeout_to {
-                if !self.is_valid_transition_target(timeout_state, &current_path, states) {
-                    return Err(AgentError::InvalidSpec(format!(
-                        "State '{}' has timeout_to unknown state '{}'",
-                        current_path.join("."),
-                        timeout_state
-                    )));
-                }
+            if let Some(ref timeout_state) = def.timeout_to
+                && !self.is_valid_transition_target(timeout_state, &current_path, states)
+            {
+                return Err(AgentError::InvalidSpec(format!(
+                    "State '{}' has timeout_to unknown state '{}'",
+                    current_path.join("."),
+                    timeout_state
+                )));
             }
 
             if let Some(ref sub_states) = def.states {
-                if let Some(ref initial) = def.initial {
-                    if !sub_states.contains_key(initial) {
-                        return Err(AgentError::InvalidSpec(format!(
-                            "State '{}' has initial sub-state '{}' that doesn't exist",
-                            current_path.join("."),
-                            initial
-                        )));
-                    }
+                if let Some(ref initial) = def.initial
+                    && !sub_states.contains_key(initial)
+                {
+                    return Err(AgentError::InvalidSpec(format!(
+                        "State '{}' has initial sub-state '{}' that doesn't exist",
+                        current_path.join("."),
+                        initial
+                    )));
                 }
                 self.validate_states(sub_states, &current_path)?;
             }
@@ -839,8 +834,7 @@ impl StateConfig {
         current_path: &[String],
         states: &HashMap<String, StateDefinition>,
     ) -> bool {
-        if target.starts_with('^') {
-            let target_name = &target[1..];
+        if let Some(target_name) = target.strip_prefix('^') {
             return self.states.contains_key(target_name);
         }
 
@@ -850,10 +844,10 @@ impl StateConfig {
 
         if current_path.len() > 1 {
             let parent_path = &current_path[..current_path.len() - 1];
-            if let Some(parent_states) = self.get_states_at_path(parent_path) {
-                if parent_states.contains_key(target) {
-                    return true;
-                }
+            if let Some(parent_states) = self.get_states_at_path(parent_path)
+                && parent_states.contains_key(target)
+            {
+                return true;
             }
         }
 
@@ -863,15 +857,7 @@ impl StateConfig {
     fn get_states_at_path(&self, path: &[String]) -> Option<&HashMap<String, StateDefinition>> {
         let mut current = &self.states;
         for segment in path {
-            if let Some(def) = current.get(segment) {
-                if let Some(ref sub_states) = def.states {
-                    current = sub_states;
-                } else {
-                    return None;
-                }
-            } else {
-                return None;
-            }
+            current = current.get(segment)?.states.as_ref()?;
         }
         Some(current)
     }
@@ -888,11 +874,7 @@ impl StateConfig {
 
         let mut current = self.states.get(path[0])?;
         for segment in &path[1..] {
-            if let Some(ref sub_states) = current.states {
-                current = sub_states.get(*segment)?;
-            } else {
-                return None;
-            }
+            current = current.states.as_ref()?.get(*segment)?;
         }
         Some(current)
     }
@@ -900,8 +882,8 @@ impl StateConfig {
     /// Resolve a transition target to a full dotted state path.
     /// Order: `^prefix` (parent-level) → top-level → sibling → child → fallback literal.
     pub fn resolve_full_path(&self, current_path: &str, target: &str) -> String {
-        if target.starts_with('^') {
-            return target[1..].to_string();
+        if let Some(target) = target.strip_prefix('^') {
+            return target.to_string();
         }
 
         if self.states.contains_key(target) {
@@ -977,11 +959,7 @@ impl StateConfig {
     }
 
     fn normalize_target(&self, target: &str) -> String {
-        if target.starts_with('^') {
-            target[1..].to_string()
-        } else {
-            target.to_string()
-        }
+        target.strip_prefix('^').unwrap_or(target).to_string()
     }
 
     fn collect_all_state_paths(

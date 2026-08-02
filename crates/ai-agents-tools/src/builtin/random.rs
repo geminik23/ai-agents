@@ -409,8 +409,7 @@ mod tests {
             .await;
         assert!(result.success);
 
-        let output: BoolOutput = serde_json::from_str(&result.output).unwrap();
-        assert!(output.value == true || output.value == false);
+        let _: BoolOutput = serde_json::from_str(&result.output).unwrap();
     }
 
     #[tokio::test]

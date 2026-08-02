@@ -115,7 +115,7 @@ pub fn aggregate_events(
         .into_values()
         .map(|(dimensions, group_events)| build_metrics(dimensions, &group_events))
         .collect();
-    metrics.sort_by(|a, b| stable_group_key(&a.dimensions).cmp(&stable_group_key(&b.dimensions)));
+    metrics.sort_by_key(|metric| stable_group_key(&metric.dimensions));
     metrics
 }
 

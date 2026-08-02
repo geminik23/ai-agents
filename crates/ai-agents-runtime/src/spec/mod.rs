@@ -738,7 +738,7 @@ impl AgentSpec {
     }
 
     pub fn has_persona(&self) -> bool {
-        self.persona.as_ref().map_or(false, |p| p.is_configured())
+        self.persona.as_ref().is_some_and(|p| p.is_configured())
     }
 
     pub fn has_actor_memory(&self) -> bool {
@@ -1296,8 +1296,10 @@ skills:
 
     #[test]
     fn test_agent_spec_validation_empty_name() {
-        let mut spec = AgentSpec::default();
-        spec.name = "".to_string();
+        let mut spec = AgentSpec {
+            name: String::new(),
+            ..AgentSpec::default()
+        };
         assert!(spec.validate().is_err());
 
         spec.name = "Valid".to_string();
@@ -1306,8 +1308,10 @@ skills:
 
     #[test]
     fn test_agent_spec_validation_empty_prompt() {
-        let mut spec = AgentSpec::default();
-        spec.system_prompt = "".to_string();
+        let mut spec = AgentSpec {
+            system_prompt: String::new(),
+            ..AgentSpec::default()
+        };
         assert!(spec.validate().is_err());
 
         spec.system_prompt = "Valid prompt".to_string();
@@ -1316,8 +1320,10 @@ skills:
 
     #[test]
     fn test_agent_spec_validation_zero_iterations() {
-        let mut spec = AgentSpec::default();
-        spec.max_iterations = 0;
+        let mut spec = AgentSpec {
+            max_iterations: 0,
+            ..AgentSpec::default()
+        };
         assert!(spec.validate().is_err());
 
         spec.max_iterations = 5;

@@ -23,25 +23,25 @@ impl HITLEngine {
     }
 
     pub fn check_tool(&self, tool_name: &str, args: &Value) -> HITLCheckResult {
-        if let Some(tool_config) = self.config.tools.get(tool_name) {
-            if tool_config.require_approval {
-                let context = self.build_tool_context(tool_config, args);
-                let raw = tool_config
-                    .approval_message
-                    .get_any()
-                    .unwrap_or_else(|| format!("Approve execution of tool '{}'?", tool_name));
-                let message = render_template(&raw, &context);
-                let timeout = tool_config
-                    .timeout_seconds
-                    .or(Some(self.config.default_timeout_seconds));
+        if let Some(tool_config) = self.config.tools.get(tool_name)
+            && tool_config.require_approval
+        {
+            let context = self.build_tool_context(tool_config, args);
+            let raw = tool_config
+                .approval_message
+                .get_any()
+                .unwrap_or_else(|| format!("Approve execution of tool '{}'?", tool_name));
+            let message = render_template(&raw, &context);
+            let timeout = tool_config
+                .timeout_seconds
+                .or(Some(self.config.default_timeout_seconds));
 
-                return HITLCheckResult::required(
-                    ApprovalTrigger::tool(tool_name, args.clone()),
-                    context,
-                    message,
-                    timeout,
-                );
-            }
+            return HITLCheckResult::required(
+                ApprovalTrigger::tool(tool_name, args.clone()),
+                context,
+                message,
+                timeout,
+            );
         }
         HITLCheckResult::not_required()
     }
@@ -54,40 +54,40 @@ impl HITLEngine {
         handler: &dyn ApprovalHandler,
         llm_registry: Option<&LLMRegistry>,
     ) -> Result<HITLCheckResult> {
-        if let Some(tool_config) = self.config.tools.get(tool_name) {
-            if tool_config.require_approval {
-                let mut context = self.build_tool_context(tool_config, args);
+        if let Some(tool_config) = self.config.tools.get(tool_name)
+            && tool_config.require_approval
+        {
+            let mut context = self.build_tool_context(tool_config, args);
 
-                // Merge language hints from agent context for message localization
-                for key in &["user.language", "input.detected.language", "language"] {
-                    if !context.contains_key(*key) {
-                        if let Some(val) = agent_context.get(*key) {
-                            context.insert(key.to_string(), val.clone());
-                        }
-                    }
+            // Merge language hints from agent context for message localization
+            for key in &["user.language", "input.detected.language", "language"] {
+                if !context.contains_key(*key)
+                    && let Some(val) = agent_context.get(*key)
+                {
+                    context.insert(key.to_string(), val.clone());
                 }
-
-                let message = resolve_tool_message(
-                    tool_config,
-                    tool_name,
-                    &self.config.message_language,
-                    &context,
-                    handler,
-                    llm_registry,
-                )
-                .await?;
-
-                let timeout = tool_config
-                    .timeout_seconds
-                    .or(Some(self.config.default_timeout_seconds));
-
-                return Ok(HITLCheckResult::required(
-                    ApprovalTrigger::tool(tool_name, args.clone()),
-                    context,
-                    message,
-                    timeout,
-                ));
             }
+
+            let message = resolve_tool_message(
+                tool_config,
+                tool_name,
+                &self.config.message_language,
+                &context,
+                handler,
+                llm_registry,
+            )
+            .await?;
+
+            let timeout = tool_config
+                .timeout_seconds
+                .or(Some(self.config.default_timeout_seconds));
+
+            return Ok(HITLCheckResult::required(
+                ApprovalTrigger::tool(tool_name, args.clone()),
+                context,
+                message,
+                timeout,
+            ));
         }
         Ok(HITLCheckResult::not_required())
     }
@@ -153,10 +153,10 @@ impl HITLEngine {
 
                 // Merge language hints from agent context for message localization
                 for key in &["user.language", "input.detected.language", "language"] {
-                    if !context.contains_key(*key) {
-                        if let Some(val) = agent_context.get(*key) {
-                            context.insert(key.to_string(), val.clone());
-                        }
+                    if !context.contains_key(*key)
+                        && let Some(val) = agent_context.get(*key)
+                    {
+                        context.insert(key.to_string(), val.clone());
                     }
                 }
 
@@ -195,29 +195,29 @@ impl HITLEngine {
     }
 
     pub fn check_state_transition(&self, from: Option<&str>, to: &str) -> HITLCheckResult {
-        if let Some(state_config) = self.config.states.get(to) {
-            if state_config.on_enter == StateApprovalTrigger::RequireApproval {
-                let message = state_config
-                    .approval_message
-                    .get_any()
-                    .unwrap_or_else(|| format!("Approve transition to state '{}'?", to));
+        if let Some(state_config) = self.config.states.get(to)
+            && state_config.on_enter == StateApprovalTrigger::RequireApproval
+        {
+            let message = state_config
+                .approval_message
+                .get_any()
+                .unwrap_or_else(|| format!("Approve transition to state '{}'?", to));
 
-                let mut context = HashMap::new();
-                if let Some(from_state) = from {
-                    context.insert(
-                        "from_state".to_string(),
-                        Value::String(from_state.to_string()),
-                    );
-                }
-                context.insert("to_state".to_string(), Value::String(to.to_string()));
-
-                return HITLCheckResult::required(
-                    ApprovalTrigger::state(from.map(String::from), to),
-                    context,
-                    message,
-                    Some(self.config.default_timeout_seconds),
+            let mut context = HashMap::new();
+            if let Some(from_state) = from {
+                context.insert(
+                    "from_state".to_string(),
+                    Value::String(from_state.to_string()),
                 );
             }
+            context.insert("to_state".to_string(), Value::String(to.to_string()));
+
+            return HITLCheckResult::required(
+                ApprovalTrigger::state(from.map(String::from), to),
+                context,
+                message,
+                Some(self.config.default_timeout_seconds),
+            );
         }
         HITLCheckResult::not_required()
     }
@@ -230,56 +230,56 @@ impl HITLEngine {
         handler: &dyn ApprovalHandler,
         llm_registry: Option<&LLMRegistry>,
     ) -> Result<HITLCheckResult> {
-        if let Some(state_config) = self.config.states.get(to) {
-            if state_config.on_enter == StateApprovalTrigger::RequireApproval {
-                let mut context = HashMap::new();
-                if let Some(from_state) = from {
-                    context.insert(
-                        "from_state".to_string(),
-                        Value::String(from_state.to_string()),
-                    );
-                }
-                context.insert("to_state".to_string(), Value::String(to.to_string()));
-
-                // Merge language hints from agent context for message localization
-                for key in &["user.language", "input.detected.language", "language"] {
-                    if !context.contains_key(*key) {
-                        if let Some(val) = agent_context.get(*key) {
-                            context.insert(key.to_string(), val.clone());
-                        }
-                    }
-                }
-
-                let message = if state_config.approval_message.is_empty() {
-                    format!("Approve transition to state '{}'?", to)
-                } else {
-                    let effective_config = state_config
-                        .message_language
-                        .as_ref()
-                        .unwrap_or(&self.config.message_language);
-
-                    let mut resolver = MessageResolver::new(effective_config);
-                    if let Some(registry) = llm_registry {
-                        resolver = resolver.with_llm_registry(registry);
-                    }
-
-                    resolver
-                        .resolve(
-                            &state_config.approval_message,
-                            state_config.message_language.as_ref(),
-                            &context,
-                            handler,
-                        )
-                        .await?
-                };
-
-                return Ok(HITLCheckResult::required(
-                    ApprovalTrigger::state(from.map(String::from), to),
-                    context,
-                    message,
-                    Some(self.config.default_timeout_seconds),
-                ));
+        if let Some(state_config) = self.config.states.get(to)
+            && state_config.on_enter == StateApprovalTrigger::RequireApproval
+        {
+            let mut context = HashMap::new();
+            if let Some(from_state) = from {
+                context.insert(
+                    "from_state".to_string(),
+                    Value::String(from_state.to_string()),
+                );
             }
+            context.insert("to_state".to_string(), Value::String(to.to_string()));
+
+            // Merge language hints from agent context for message localization
+            for key in &["user.language", "input.detected.language", "language"] {
+                if !context.contains_key(*key)
+                    && let Some(val) = agent_context.get(*key)
+                {
+                    context.insert(key.to_string(), val.clone());
+                }
+            }
+
+            let message = if state_config.approval_message.is_empty() {
+                format!("Approve transition to state '{}'?", to)
+            } else {
+                let effective_config = state_config
+                    .message_language
+                    .as_ref()
+                    .unwrap_or(&self.config.message_language);
+
+                let mut resolver = MessageResolver::new(effective_config);
+                if let Some(registry) = llm_registry {
+                    resolver = resolver.with_llm_registry(registry);
+                }
+
+                resolver
+                    .resolve(
+                        &state_config.approval_message,
+                        state_config.message_language.as_ref(),
+                        &context,
+                        handler,
+                    )
+                    .await?
+            };
+
+            return Ok(HITLCheckResult::required(
+                ApprovalTrigger::state(from.map(String::from), to),
+                context,
+                message,
+                Some(self.config.default_timeout_seconds),
+            ));
         }
         Ok(HITLCheckResult::not_required())
     }
@@ -323,10 +323,10 @@ impl HITLEngine {
                 let field = field.trim();
                 let value_str = value_str.trim();
 
-                if let Some(field_value) = self.get_field_value(data, field) {
-                    if let Some(compare_value) = parse_number(value_str) {
-                        return op_fn(field_value, compare_value);
-                    }
+                if let Some(field_value) = self.get_field_value(data, field)
+                    && let Some(compare_value) = parse_number(value_str)
+                {
+                    return op_fn(field_value, compare_value);
                 }
             }
         }
@@ -338,10 +338,10 @@ impl HITLEngine {
                 let inner = &list_str[1..list_str.len() - 1];
                 let allowed: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
 
-                if let Some(value) = data.get(field) {
-                    if let Some(s) = value.as_str() {
-                        return allowed.contains(&s);
-                    }
+                if let Some(value) = data.get(field)
+                    && let Some(s) = value.as_str()
+                {
+                    return allowed.contains(&s);
                 }
             }
         }
@@ -353,10 +353,10 @@ impl HITLEngine {
                 let inner = &list_str[1..list_str.len() - 1];
                 let blocked: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
 
-                if let Some(value) = data.get(field) {
-                    if let Some(s) = value.as_str() {
-                        return !blocked.contains(&s);
-                    }
+                if let Some(value) = data.get(field)
+                    && let Some(s) = value.as_str()
+                {
+                    return !blocked.contains(&s);
                 }
             }
         }
@@ -510,7 +510,7 @@ mod tests {
                 context.get("recipient").unwrap(),
                 &Value::String("John".to_string())
             );
-            assert!(context.get("extra").is_none());
+            assert!(!context.contains_key("extra"));
             assert_eq!(message, "Approve payment?");
             assert_eq!(timeout, Some(120));
         }

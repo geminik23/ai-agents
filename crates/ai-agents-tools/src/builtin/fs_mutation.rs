@@ -266,27 +266,25 @@ impl Tool for FileWriteTool {
         if exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this target");
         }
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                    return ToolResult::error(
-                        "parent directory does not exist or create_parent_dirs is not allowed",
-                    );
-                }
-                if !input.dry_run {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return ToolResult::error(format!(
-                            "Create parent directory error: {}",
-                            error
-                        ));
-                    }
-                }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            if !(input.create_parent_dirs && policy.create_parent_dirs) {
+                return ToolResult::error(
+                    "parent directory does not exist or create_parent_dirs is not allowed",
+                );
+            }
+            if !input.dry_run
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                return ToolResult::error(format!("Create parent directory error: {}", error));
             }
         }
-        if exists && !input.dry_run {
-            if let Err(reason) = enforce_read_before_write(&self.versions, &path, &policy) {
-                return ToolResult::error(reason);
-            }
+        if exists
+            && !input.dry_run
+            && let Err(reason) = enforce_read_before_write(&self.versions, &path, &policy)
+        {
+            return ToolResult::error(reason);
         }
         let changed_lines = input
             .content
@@ -452,10 +450,10 @@ impl Tool for FileEditTool {
         if replacements > max_replacements {
             return ToolResult::error("replacement count exceeds configured max_replacements");
         }
-        if !input.dry_run {
-            if let Err(reason) = enforce_read_before_write(&self.versions, &path, &policy) {
-                return ToolResult::error(reason);
-            }
+        if !input.dry_run
+            && let Err(reason) = enforce_read_before_write(&self.versions, &path, &policy)
+        {
+            return ToolResult::error(reason);
         }
         let edited = if input.replace_all {
             original.replace(&input.old_text, &input.new_text)
@@ -629,10 +627,11 @@ impl Tool for PatchTool {
                     );
                 }
             }
-            if exists && !input.dry_run {
-                if let Err(reason) = enforce_read_before_write(&self.versions, &path, &policy) {
-                    return ToolResult::error(reason);
-                }
+            if exists
+                && !input.dry_run
+                && let Err(reason) = enforce_read_before_write(&self.versions, &path, &policy)
+            {
+                return ToolResult::error(reason);
             }
             let (original, expected) = if exists {
                 let snapshot = match read_file_snapshot(&path) {
@@ -672,10 +671,10 @@ impl Tool for PatchTool {
                 return ToolResult::error(error);
             }
             for output in &outputs {
-                if let Some((path, content)) = output.written_file() {
-                    if let Ok(version) = file_version_evidence(path, content.as_bytes()) {
-                        self.versions.record(version);
-                    }
+                if let Some((path, content)) = output.written_file()
+                    && let Ok(version) = file_version_evidence(path, content.as_bytes())
+                {
+                    self.versions.record(version);
                 }
             }
         }
@@ -825,22 +824,22 @@ fn apply_patch_transaction(outputs: &[PatchApply]) -> Result<(), String> {
                 content,
                 expected,
             } => {
-                if let Some(parent) = path.parent() {
-                    if !parent.exists() {
-                        let missing = missing_directories(parent);
-                        if let Err(error) = fs::create_dir_all(parent) {
-                            let cleanup_error = cleanup_created_directories(&missing).err();
-                            let error = match cleanup_error {
-                                Some(cleanup_error) => format!(
-                                    "Create parent directory error: {}; partial directory creation may remain: {}",
-                                    error, cleanup_error
-                                ),
-                                None => format!("Create parent directory error: {}", error),
-                            };
-                            return fail_patch_transaction(error, &rollbacks, &created_directories);
-                        }
-                        created_directories.extend(missing);
+                if let Some(parent) = path.parent()
+                    && !parent.exists()
+                {
+                    let missing = missing_directories(parent);
+                    if let Err(error) = fs::create_dir_all(parent) {
+                        let cleanup_error = cleanup_created_directories(&missing).err();
+                        let error = match cleanup_error {
+                            Some(cleanup_error) => format!(
+                                "Create parent directory error: {}; partial directory creation may remain: {}",
+                                error, cleanup_error
+                            ),
+                            None => format!("Create parent directory error: {}", error),
+                        };
+                        return fail_patch_transaction(error, &rollbacks, &created_directories);
                     }
+                    created_directories.extend(missing);
                 }
                 if let Err(error) = verify_expected_state(path, expected, "pre-apply") {
                     return fail_patch_transaction(error, &rollbacks, &created_directories);
@@ -1093,14 +1092,14 @@ fn missing_directories(path: &Path) -> Vec<PathBuf> {
 fn cleanup_created_directories(paths: &[PathBuf]) -> Result<(), String> {
     let mut errors = Vec::new();
     for path in paths.iter().rev() {
-        if let Err(error) = fs::remove_dir(path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                errors.push(format!(
-                    "Patch rollback directory cleanup conflict for {}: {}",
-                    path.display(),
-                    error
-                ));
-            }
+        if let Err(error) = fs::remove_dir(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            errors.push(format!(
+                "Patch rollback directory cleanup conflict for {}: {}",
+                path.display(),
+                error
+            ));
         }
     }
     if errors.is_empty() {
@@ -1326,10 +1325,10 @@ fn parse_unified_diff(input: &str) -> Result<Vec<PatchFile>, String> {
     let mut current_hunk: Option<PatchHunk> = None;
     for line in input.lines() {
         if let Some(rest) = line.strip_prefix("--- ") {
-            if let Some(hunk) = current_hunk.take() {
-                if let Some(file) = current.as_mut() {
-                    file.hunks.push(hunk);
-                }
+            if let Some(hunk) = current_hunk.take()
+                && let Some(file) = current.as_mut()
+            {
+                file.hunks.push(hunk);
             }
             if let Some(file) = current.take() {
                 files.push(file);
@@ -1345,10 +1344,10 @@ fn parse_unified_diff(input: &str) -> Result<Vec<PatchFile>, String> {
             };
             file.new_path = clean_patch_path(rest);
         } else if line.starts_with("@@") {
-            if let Some(hunk) = current_hunk.take() {
-                if let Some(file) = current.as_mut() {
-                    file.hunks.push(hunk);
-                }
+            if let Some(hunk) = current_hunk.take()
+                && let Some(file) = current.as_mut()
+            {
+                file.hunks.push(hunk);
             }
             current_hunk = Some(PatchHunk {
                 old_start: parse_hunk_old_start(line)?,
@@ -1373,10 +1372,10 @@ fn parse_unified_diff(input: &str) -> Result<Vec<PatchFile>, String> {
             }
         }
     }
-    if let Some(hunk) = current_hunk {
-        if let Some(file) = current.as_mut() {
-            file.hunks.push(hunk);
-        }
+    if let Some(hunk) = current_hunk
+        && let Some(file) = current.as_mut()
+    {
+        file.hunks.push(hunk);
     }
     if let Some(file) = current {
         files.push(file);
@@ -1779,21 +1778,18 @@ impl Tool for CopyPathTool {
         if destination_exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this destination");
         }
-        if let Some(parent) = destination.parent() {
-            if !parent.exists() {
-                if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                    return ToolResult::error(
-                        "destination parent directory does not exist or create_parent_dirs is not allowed",
-                    );
-                }
-                if !input.dry_run {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return ToolResult::error(format!(
-                            "Create parent directory error: {}",
-                            error
-                        ));
-                    }
-                }
+        if let Some(parent) = destination.parent()
+            && !parent.exists()
+        {
+            if !(input.create_parent_dirs && policy.create_parent_dirs) {
+                return ToolResult::error(
+                    "destination parent directory does not exist or create_parent_dirs is not allowed",
+                );
+            }
+            if !input.dry_run
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                return ToolResult::error(format!("Create parent directory error: {}", error));
             }
         }
         let mut cleanup_warning = None;
@@ -1950,21 +1946,18 @@ impl Tool for MovePathTool {
         if destination_exists && !policy.overwrite_existing && !input.dry_run {
             return ToolResult::error("overwrite_existing policy is false for this destination");
         }
-        if let Some(parent) = destination.parent() {
-            if !parent.exists() {
-                if !(input.create_parent_dirs && policy.create_parent_dirs) {
-                    return ToolResult::error(
-                        "destination parent directory does not exist or create_parent_dirs is not allowed",
-                    );
-                }
-                if !input.dry_run {
-                    if let Err(error) = fs::create_dir_all(parent) {
-                        return ToolResult::error(format!(
-                            "Create parent directory error: {}",
-                            error
-                        ));
-                    }
-                }
+        if let Some(parent) = destination.parent()
+            && !parent.exists()
+        {
+            if !(input.create_parent_dirs && policy.create_parent_dirs) {
+                return ToolResult::error(
+                    "destination parent directory does not exist or create_parent_dirs is not allowed",
+                );
+            }
+            if !input.dry_run
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                return ToolResult::error(format!("Create parent directory error: {}", error));
             }
         }
         let recursive = source.is_dir();
@@ -2240,10 +2233,10 @@ fn copy_path(source: &Path, destination: &Path) -> std::io::Result<()> {
     if source.is_dir() {
         copy_directory(source, destination)
     } else {
-        if let Some(parent) = destination.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = destination.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
         }
         fs::copy(source, destination)?;
         Ok(())

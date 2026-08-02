@@ -513,13 +513,12 @@ impl RedisStorage {
         let mut deleted = 0;
 
         for session_id in sessions {
-            if let Some(meta) = self.get_meta(&session_id).await? {
-                if let Ok(updated_at) = DateTime::parse_from_rfc3339(&meta.updated_at) {
-                    if updated_at.with_timezone(&Utc) < before {
-                        self.delete(&session_id).await?;
-                        deleted += 1;
-                    }
-                }
+            if let Some(meta) = self.get_meta(&session_id).await?
+                && let Ok(updated_at) = DateTime::parse_from_rfc3339(&meta.updated_at)
+                && updated_at.with_timezone(&Utc) < before
+            {
+                self.delete(&session_id).await?;
+                deleted += 1;
             }
         }
 

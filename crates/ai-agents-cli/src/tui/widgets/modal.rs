@@ -158,7 +158,7 @@ impl ModalState {
 
 pub fn render_modal(area: Rect, buf: &mut Buffer, state: &ModalState, theme: &Theme) {
     // Center the modal
-    let width = (area.width * 60 / 100).min(60).max(30);
+    let width = (area.width * 60 / 100).clamp(30, 60);
     let content_lines = if state.question.is_some() {
         4 + state
             .question

@@ -185,10 +185,11 @@ impl Default for MaintenanceTaskPolicy {
 }
 
 /// Execution mode for post-turn maintenance.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceMode {
     /// Run in the existing serial response path.
+    #[default]
     InlineSerial,
     /// Run with other independent maintenance tasks and await completion.
     InlineParallel,
@@ -196,14 +197,8 @@ pub enum MaintenanceMode {
     Background,
 }
 
-impl Default for MaintenanceMode {
-    fn default() -> Self {
-        Self::InlineSerial
-    }
-}
-
 /// Freshness policy for pending background maintenance.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AwaitBeforeNextTurn {
     /// Never wait for this task before a new turn.
@@ -211,20 +206,16 @@ pub enum AwaitBeforeNextTurn {
     /// Wait before a turn from the same actor.
     SameActor,
     /// Wait before every new turn.
+    #[default]
     Always,
 }
 
-impl Default for AwaitBeforeNextTurn {
-    fn default() -> Self {
-        Self::Always
-    }
-}
-
 /// Behavior when a background queue cannot accept more tasks.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum BackgroundOverflowPolicy {
     /// Run the task inline instead of dropping it.
+    #[default]
     RunInline,
     /// Drop the task and record skipped maintenance.
     Drop,
@@ -232,28 +223,17 @@ pub enum BackgroundOverflowPolicy {
     Error,
 }
 
-impl Default for BackgroundOverflowPolicy {
-    fn default() -> Self {
-        Self::RunInline
-    }
-}
-
 /// Streaming behavior when optimized routing may run before output begins.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum StreamingOptimizationPolicy {
     /// Run safe preflight routing before opening the stream.
+    #[default]
     PreflightOnly,
     /// Buffer unresolved stream output until routing decisions finish.
     BufferUntilRoutingDone,
     /// Disable optimized streaming behavior.
     Disabled,
-}
-
-impl Default for StreamingOptimizationPolicy {
-    fn default() -> Self {
-        Self::PreflightOnly
-    }
 }
 
 #[cfg(test)]

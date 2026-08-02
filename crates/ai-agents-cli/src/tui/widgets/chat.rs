@@ -37,8 +37,8 @@ pub struct ChatState {
     pub show_timing: bool,
 }
 
-impl ChatState {
-    pub fn new() -> Self {
+impl Default for ChatState {
+    fn default() -> Self {
         Self {
             messages: Vec::new(),
             scroll_offset: 0,
@@ -47,6 +47,12 @@ impl ChatState {
             show_tool_calls: false,
             show_timing: false,
         }
+    }
+}
+
+impl ChatState {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Calculate the total number of lines needed for all messages.
@@ -99,11 +105,7 @@ fn message_lines(msg: &DisplayMessage, width: usize, show_tools: bool, show_timi
     let trimmed = clean.trim_end_matches('\n');
     let content_lines = trimmed.split('\n').count() as u16;
     let first_line_len = prefix_len + trimmed.split('\n').next().map(|s| s.len()).unwrap_or(0);
-    let wrap_extra = if width > 0 {
-        (first_line_len / width) as u16
-    } else {
-        0
-    };
+    let wrap_extra = first_line_len.checked_div(width).unwrap_or(0) as u16;
     let mut lines = content_lines + wrap_extra;
     if show_tools && !msg.tools.is_empty() {
         lines += 1;
@@ -202,11 +204,11 @@ pub fn render_chat(area: Rect, buf: &mut Buffer, state: &ChatState, theme: &Them
             lines.push(Line::from(Span::styled(trans, theme.system_style)));
         }
 
-        if state.show_timing {
-            if let Some(ms) = msg.timing_ms {
-                let timing = format!("  ({:.1}s)", ms as f64 / 1000.0);
-                lines.push(Line::from(Span::styled(timing, theme.hint_style)));
-            }
+        if state.show_timing
+            && let Some(ms) = msg.timing_ms
+        {
+            let timing = format!("  ({:.1}s)", ms as f64 / 1000.0);
+            lines.push(Line::from(Span::styled(timing, theme.hint_style)));
         }
     }
 

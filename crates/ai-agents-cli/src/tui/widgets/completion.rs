@@ -122,6 +122,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
 ];
 
 /// Tracks the current completion popup state.
+#[derive(Default)]
 pub struct CompletionState {
     pub items: Vec<&'static SlashCommand>,
     pub selected: usize,
@@ -130,11 +131,7 @@ pub struct CompletionState {
 
 impl CompletionState {
     pub fn new() -> Self {
-        Self {
-            items: Vec::new(),
-            selected: 0,
-            visible: false,
-        }
+        Self::default()
     }
 
     pub fn selected_command(&self) -> Option<&str> {

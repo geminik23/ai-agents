@@ -59,9 +59,9 @@ pub fn export_observability(manager: &ObservabilityManager) -> std::io::Result<E
 }
 
 fn output_path(base: &Path, default_file: &str, extension: &str) -> PathBuf {
-    if base.extension().and_then(|ext| ext.to_str()) == Some(extension) {
-        base.to_path_buf()
-    } else if base.extension().is_some() && !base.exists() {
+    if base.extension().and_then(|ext| ext.to_str()) == Some(extension)
+        || (base.extension().is_some() && !base.exists())
+    {
         base.to_path_buf()
     } else {
         base.join(default_file)
@@ -80,10 +80,10 @@ fn raw_json_output_path(base: &Path, report_enabled: bool) -> PathBuf {
 }
 
 fn ensure_parent(path: &Path) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     Ok(())
 }

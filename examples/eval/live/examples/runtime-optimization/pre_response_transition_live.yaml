@@ -74,4 +74,3 @@ scenarios:
                 - "which support area"
             - tool_not_called: command
             - tool_not_called: http
-

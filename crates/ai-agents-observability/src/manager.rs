@@ -240,6 +240,10 @@ impl ObservabilityManager {
     }
 
     /// Converts a completed SpanGuard into an ObservationEvent.
+    //
+    // Keep this public signature stable for custom span integrations.
+    //
+    #[allow(clippy::too_many_arguments)]
     pub fn build_event_from_span(
         &self,
         context: SpanContext,
@@ -277,12 +281,8 @@ impl ObservabilityManager {
     /// Drains queued events into the synchronous aggregation path.
     fn drain_pending(&self) {
         let mut receiver = self.receiver.lock();
-        loop {
-            match receiver.try_recv() {
-                Ok(event) => self.ingest_event(event),
-                Err(mpsc::error::TryRecvError::Empty)
-                | Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
+        while let Ok(event) = receiver.try_recv() {
+            self.ingest_event(event);
         }
     }
 
@@ -482,12 +482,11 @@ pub fn resolve_language_from_context(
     context: &HashMap<String, Value>,
 ) -> String {
     for path in &config.language.paths {
-        if let Some(value) = get_dotted(context, path) {
-            if let Some(language) = value.as_str() {
-                if !language.trim().is_empty() {
-                    return language.to_string();
-                }
-            }
+        if let Some(value) = get_dotted(context, path)
+            && let Some(language) = value.as_str()
+            && !language.trim().is_empty()
+        {
+            return language.to_string();
         }
     }
     config.language.fallback.clone()
@@ -551,11 +550,19 @@ mod tests {
 
     #[test]
     fn token_count_flags_are_applied_before_report() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.tokens.count_input = false;
-        config.tokens.count_output = true;
-        config.cost.enabled = false;
+        let config = ObservabilityConfig {
+            enabled: true,
+            tokens: crate::config::TokenConfig {
+                count_input: false,
+                count_output: true,
+                ..Default::default()
+            },
+            cost: crate::config::CostConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let manager = ObservabilityManager::new(config);
         manager.record_event(test_event());
 
@@ -567,9 +574,14 @@ mod tests {
 
     #[test]
     fn pending_branch_event_is_hidden_until_finalized() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.export.write_raw_events = true;
+        let config = ObservabilityConfig {
+            enabled: true,
+            export: crate::config::ExportConfig {
+                write_raw_events: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let manager = ObservabilityManager::new(config);
         manager.record_pending_event("branch", test_event());
 
@@ -603,9 +615,14 @@ mod tests {
 
     #[test]
     fn pending_branch_events_are_bounded() {
-        let mut config = ObservabilityConfig::default();
-        config.enabled = true;
-        config.buffer.pending_branch_event_limit = 1;
+        let config = ObservabilityConfig {
+            enabled: true,
+            buffer: crate::config::BufferConfig {
+                pending_branch_event_limit: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let manager = ObservabilityManager::new(config);
         manager.record_pending_event("branch-a", test_event());
         manager.record_pending_event("branch-b", test_event());

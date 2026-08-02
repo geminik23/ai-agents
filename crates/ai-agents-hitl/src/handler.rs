@@ -255,13 +255,13 @@ mod tests {
 
     #[test]
     fn test_reject_all_default() {
-        let handler = RejectAllHandler::default();
+        let handler = RejectAllHandler;
         assert!(std::mem::size_of_val(&handler) == 0);
     }
 
     #[test]
     fn test_auto_approve_default() {
-        let handler = AutoApproveHandler::default();
+        let handler = AutoApproveHandler;
         assert!(std::mem::size_of_val(&handler) == 0);
     }
 }

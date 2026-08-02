@@ -72,13 +72,11 @@ pub fn evaluate_expression(expr: &str, ctx: &TransitionContext) -> bool {
 }
 
 fn evaluate_simple_expression(expr: &str, ctx: &TransitionContext) -> bool {
-    if expr.starts_with("context.") {
-        let path = &expr[8..];
+    if let Some(path) = expr.strip_prefix("context.") {
         return get_context_value(path, &ctx.context).is_some();
     }
 
-    if expr.starts_with("state.") {
-        let field = &expr[6..];
+    if let Some(field) = expr.strip_prefix("state.") {
         return evaluate_state_expression(field, ctx);
     }
 
@@ -88,14 +86,14 @@ fn evaluate_simple_expression(expr: &str, ctx: &TransitionContext) -> bool {
         let right = right.trim_start_matches(op).trim();
         let left = left.trim();
 
-        if let (Some(left_val), Ok(right_val)) = (resolve_value(left, ctx), right.parse::<f64>()) {
-            if let Some(left_num) = left_val.as_f64() {
-                return if op == ">=" {
-                    left_num >= right_val
-                } else {
-                    left_num > right_val
-                };
-            }
+        if let (Some(left_val), Ok(right_val)) = (resolve_value(left, ctx), right.parse::<f64>())
+            && let Some(left_num) = left_val.as_f64()
+        {
+            return if op == ">=" {
+                left_num >= right_val
+            } else {
+                left_num > right_val
+            };
         }
     }
 
@@ -105,14 +103,14 @@ fn evaluate_simple_expression(expr: &str, ctx: &TransitionContext) -> bool {
         let right = right.trim_start_matches(op).trim();
         let left = left.trim();
 
-        if let (Some(left_val), Ok(right_val)) = (resolve_value(left, ctx), right.parse::<f64>()) {
-            if let Some(left_num) = left_val.as_f64() {
-                return if op == "<=" {
-                    left_num <= right_val
-                } else {
-                    left_num < right_val
-                };
-            }
+        if let (Some(left_val), Ok(right_val)) = (resolve_value(left, ctx), right.parse::<f64>())
+            && let Some(left_num) = left_val.as_f64()
+        {
+            return if op == "<=" {
+                left_num <= right_val
+            } else {
+                left_num < right_val
+            };
         }
     }
 
@@ -165,22 +163,17 @@ fn evaluate_simple_expression(expr: &str, ctx: &TransitionContext) -> bool {
 
 fn resolve_value(expr: &str, ctx: &TransitionContext) -> Option<Value> {
     let expr = expr.trim();
-    if expr.starts_with("context.") {
-        let path = &expr[8..];
+    if let Some(path) = expr.strip_prefix("context.") {
         return get_context_value(path, &ctx.context);
     }
-    if expr.starts_with("state.") {
-        let field = &expr[6..];
+    if let Some(field) = expr.strip_prefix("state.") {
         return get_state_value(field, ctx);
     }
     None
 }
 
 fn evaluate_state_expression(field: &str, _ctx: &TransitionContext) -> bool {
-    match field {
-        "turn_count" => true,
-        _ => false,
-    }
+    matches!(field, "turn_count")
 }
 
 fn get_state_value(field: &str, ctx: &TransitionContext) -> Option<Value> {
@@ -246,10 +239,10 @@ fn values_equal_coerced(value: &Value, expected: &Value) -> bool {
                 _ => {}
             },
             Value::Number(n) => {
-                if let Ok(parsed) = s.parse::<f64>() {
-                    if let Some(expected_f) = n.as_f64() {
-                        return (parsed - expected_f).abs() < f64::EPSILON;
-                    }
+                if let Ok(parsed) = s.parse::<f64>()
+                    && let Some(expected_f) = n.as_f64()
+                {
+                    return (parsed - expected_f).abs() < f64::EPSILON;
                 }
             }
             _ => {}
@@ -264,10 +257,10 @@ fn values_equal_coerced(value: &Value, expected: &Value) -> bool {
                 _ => {}
             },
             Value::Number(n) => {
-                if let Ok(parsed) = s.parse::<f64>() {
-                    if let Some(val_f) = n.as_f64() {
-                        return (parsed - val_f).abs() < f64::EPSILON;
-                    }
+                if let Ok(parsed) = s.parse::<f64>()
+                    && let Some(val_f) = n.as_f64()
+                {
+                    return (parsed - val_f).abs() < f64::EPSILON;
                 }
             }
             _ => {}
@@ -310,10 +303,10 @@ impl TransitionEvaluator for LLMTransitionEvaluator {
 
         // Guard-based transitions (existing, no LLM)
         for (i, transition) in transitions.iter().enumerate() {
-            if let Some(ref guard) = transition.guard {
-                if evaluate_guard(guard, context) {
-                    return Ok(Some(i));
-                }
+            if let Some(ref guard) = transition.guard
+                && evaluate_guard(guard, context)
+            {
+                return Ok(Some(i));
             }
         }
 
@@ -321,22 +314,21 @@ impl TransitionEvaluator for LLMTransitionEvaluator {
         //
         // If disambiguation has resolved an intent, try to match it against transitions that declare an `intent` field.
         // This is DETERMINISTIC - no LLM call.
-        if let Some(resolved) = context.context.get("resolved_intent") {
-            if let Some(resolved_str) = resolved.as_str() {
-                // Skip null values (used to clear stale context)
-                if !resolved_str.is_empty() {
-                    for (i, transition) in transitions.iter().enumerate() {
-                        if let Some(ref intent) = transition.intent {
-                            if intent == resolved_str {
-                                tracing::debug!(
-                                    resolved_intent = resolved_str,
-                                    target = %transition.to,
-                                    "Deterministic routing via resolved_intent"
-                                );
-                                return Ok(Some(i));
-                            }
-                        }
-                    }
+        if let Some(resolved) = context.context.get("resolved_intent")
+            && let Some(resolved_str) = resolved.as_str()
+            // Skip null values (used to clear stale context)
+            && !resolved_str.is_empty()
+        {
+            for (i, transition) in transitions.iter().enumerate() {
+                if let Some(ref intent) = transition.intent
+                    && intent == resolved_str
+                {
+                    tracing::debug!(
+                        resolved_intent = resolved_str,
+                        target = %transition.to,
+                        "Deterministic routing via resolved_intent"
+                    );
+                    return Ok(Some(i));
                 }
             }
         }
@@ -407,10 +399,10 @@ impl GuardOnlyEvaluator {
         ctx: &TransitionContext,
     ) -> Option<usize> {
         for (i, transition) in transitions.iter().enumerate() {
-            if let Some(ref guard) = transition.guard {
-                if evaluate_guard(guard, ctx) {
-                    return Some(i);
-                }
+            if let Some(ref guard) = transition.guard
+                && evaluate_guard(guard, ctx)
+            {
+                return Some(i);
             }
         }
         None

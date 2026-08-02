@@ -15,7 +15,7 @@ Most agents are really just a set of decisions. Which LLM do they use? What tool
 
 Those are configuration questions. But in many frameworks, the answers are scattered across classes, registries, helper functions, and glue code. By the time everything is wired together, the most important part of the agent, its actual behavior, is buried under implementation detail.
 
-This framework starts from a different premise. If agent behavior can be declared, it should not require code. 
+This framework starts from a different premise. If agent behavior can be declared, it should not require code.
 
 That idea is where **One YAML = Any Agent** comes from.
 

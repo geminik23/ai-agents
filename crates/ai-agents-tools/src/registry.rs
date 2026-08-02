@@ -15,19 +15,14 @@ use super::types::{
 };
 
 /// Schema rendering mode for tool prompt generation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSchemaPromptMode {
     /// Include full JSON schema properties for every granted tool.
+    #[default]
     Full,
     /// Include only compact descriptors: name, description, required fields, and property types.
     Compact,
-}
-
-impl Default for ToolSchemaPromptMode {
-    fn default() -> Self {
-        Self::Full
-    }
 }
 
 /// Canonical identity produced by registry resolution.
@@ -273,10 +268,10 @@ impl ToolRegistry {
             return self.resolved_tool_from_ref(&requested_name, canonical_id, tool_ref);
         }
 
-        if let Some(tool_id) = self.display_name_index.read().get(&normalized).cloned() {
-            if let Some(tool_ref) = tool_index.get(&tool_id) {
-                return self.resolved_tool_from_ref(&requested_name, &tool_id, tool_ref);
-            }
+        if let Some(tool_id) = self.display_name_index.read().get(&normalized).cloned()
+            && let Some(tool_ref) = tool_index.get(&tool_id)
+        {
+            return self.resolved_tool_from_ref(&requested_name, &tool_id, tool_ref);
         }
 
         let alias_index = self.alias_index.read();
@@ -286,10 +281,9 @@ impl ToolRegistry {
                     .ends_with(&format!(":{}", normalized))
                     .then(|| tool_id.clone())
             })
-        }) {
-            if let Some(tool_ref) = tool_index.get(&tool_id) {
-                return self.resolved_tool_from_ref(&requested_name, &tool_id, tool_ref);
-            }
+        }) && let Some(tool_ref) = tool_index.get(&tool_id)
+        {
+            return self.resolved_tool_from_ref(&requested_name, &tool_id, tool_ref);
         }
 
         None
@@ -440,17 +434,23 @@ impl ToolRegistry {
 
         let tools = provider.list_tools().await;
 
+        // Resolve provider tools before taking index locks so provider I/O cannot block registry access.
+        let mut resolved_tools = Vec::with_capacity(tools.len());
+        for descriptor in &tools {
+            resolved_tools.push((descriptor, provider.get_tool(&descriptor.id).await));
+        }
+
         {
             let mut tool_index = self.tool_index.write();
             let mut alias_index = self.alias_index.write();
             let mut display_name_index = self.display_name_index.write();
 
-            for descriptor in &tools {
+            for (descriptor, tool) in resolved_tools {
                 if tool_index.contains_key(&descriptor.id) {
                     return Err(ToolError::Duplicate(descriptor.id.clone()));
                 }
 
-                if let Some(tool) = provider.get_tool(&descriptor.id).await {
+                if let Some(tool) = tool {
                     Self::insert_unique_index(
                         &mut display_name_index,
                         Self::normalize_key(&descriptor.name),
@@ -499,10 +499,9 @@ impl ToolRegistry {
                     if let ToolRef::Provider {
                         provider_id: pid, ..
                     } = tool_ref
+                        && pid == provider_id
                     {
-                        if pid == provider_id {
-                            return Some(id.clone());
-                        }
+                        return Some(id.clone());
                     }
                     None
                 })
@@ -558,8 +557,8 @@ impl ToolRegistry {
     }
 
     pub async fn provider_health(&self, provider_id: &str) -> Option<ProviderHealth> {
-        let providers = self.providers.read();
-        if let Some(provider) = providers.get(provider_id) {
+        let provider = self.providers.read().get(provider_id).cloned();
+        if let Some(provider) = provider {
             Some(provider.health_check().await)
         } else {
             None
@@ -578,33 +577,40 @@ impl ToolRegistry {
 
                 let tools = provider.list_tools().await;
 
-                let mut tool_index = self.tool_index.write();
-                let mut alias_index = self.alias_index.write();
-                let mut display_name_index = self.display_name_index.write();
-
-                let old_tools: Vec<String> = tool_index
-                    .iter()
-                    .filter_map(|(id, tool_ref)| {
-                        if let ToolRef::Provider {
-                            provider_id: pid, ..
-                        } = tool_ref
-                        {
-                            if pid == provider_id {
-                                return Some(id.clone());
-                            }
-                        }
-                        None
-                    })
-                    .collect();
-
-                for tool_id in &old_tools {
-                    tool_index.remove(tool_id);
-                }
-                alias_index.retain(|_, tool_id| !old_tools.contains(tool_id));
-                display_name_index.retain(|_, tool_id| !old_tools.contains(tool_id));
-
+                // Resolve provider tools before taking index locks so refresh keeps the old snapshot available during provider I/O.
+                let mut resolved_tools = Vec::with_capacity(tools.len());
                 for descriptor in &tools {
                     if let Some(tool) = provider.get_tool(&descriptor.id).await {
+                        resolved_tools.push((descriptor, tool));
+                    }
+                }
+
+                {
+                    let mut tool_index = self.tool_index.write();
+                    let mut alias_index = self.alias_index.write();
+                    let mut display_name_index = self.display_name_index.write();
+
+                    let old_tools: Vec<String> = tool_index
+                        .iter()
+                        .filter_map(|(id, tool_ref)| {
+                            if let ToolRef::Provider {
+                                provider_id: pid, ..
+                            } = tool_ref
+                                && pid == provider_id
+                            {
+                                return Some(id.clone());
+                            }
+                            None
+                        })
+                        .collect();
+
+                    for tool_id in &old_tools {
+                        tool_index.remove(tool_id);
+                    }
+                    alias_index.retain(|_, tool_id| !old_tools.contains(tool_id));
+                    display_name_index.retain(|_, tool_id| !old_tools.contains(tool_id));
+
+                    for (descriptor, tool) in resolved_tools {
                         Self::insert_unique_index(
                             &mut display_name_index,
                             Self::normalize_key(&descriptor.name),
@@ -630,8 +636,8 @@ impl ToolRegistry {
                             }
                         }
                     }
+                    self.bump_version();
                 }
-                self.bump_version();
             }
             Ok(())
         } else {
@@ -762,42 +768,42 @@ impl ToolRegistry {
         let mut found_any = false;
 
         for id in tool_ids {
-            if let Some(tool_ref) = tool_index.get(id) {
-                if let Some(tool) = self.resolve_tool_ref(tool_ref) {
-                    found_any = true;
+            if let Some(tool_ref) = tool_index.get(id)
+                && let Some(tool) = self.resolve_tool_ref(tool_ref)
+            {
+                found_any = true;
 
-                    let (name, description) = if let Some(lang) = language {
-                        if let Some(aliases) = builtin_aliases.get(id) {
-                            let name = aliases
-                                .names
-                                .get(lang)
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| tool.name());
-                            let desc = aliases
-                                .descriptions
-                                .get(lang)
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| tool.description());
-                            (name, desc)
-                        } else {
-                            (tool.name(), tool.description())
-                        }
+                let (name, description) = if let Some(lang) = language {
+                    if let Some(aliases) = builtin_aliases.get(id) {
+                        let name = aliases
+                            .names
+                            .get(lang)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| tool.name());
+                        let desc = aliases
+                            .descriptions
+                            .get(lang)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| tool.description());
+                        (name, desc)
                     } else {
                         (tool.name(), tool.description())
-                    };
+                    }
+                } else {
+                    (tool.name(), tool.description())
+                };
 
-                    let schema = tool.input_schema();
-                    let args_desc = if let Some(props) = schema.get("properties") {
-                        serde_json::to_string(props).unwrap_or_default()
-                    } else {
-                        "{}".to_string()
-                    };
+                let schema = tool.input_schema();
+                let args_desc = if let Some(props) = schema.get("properties") {
+                    serde_json::to_string(props).unwrap_or_default()
+                } else {
+                    "{}".to_string()
+                };
 
-                    prompt.push_str(&format!(
-                        "- {}: {}. Arguments: {}\n",
-                        name, description, args_desc
-                    ));
-                }
+                prompt.push_str(&format!(
+                    "- {}: {}. Arguments: {}\n",
+                    name, description, args_desc
+                ));
             }
         }
 
@@ -850,34 +856,34 @@ impl ToolRegistry {
 
         for id in tool_ids {
             let id = id.as_ref();
-            if let Some(tool_ref) = tool_index.get(id) {
-                if let Some(tool) = self.resolve_tool_ref(tool_ref) {
-                    found_any = true;
+            if let Some(tool_ref) = tool_index.get(id)
+                && let Some(tool) = self.resolve_tool_ref(tool_ref)
+            {
+                found_any = true;
 
-                    let (name, description) = if let Some(lang) = language {
-                        if let Some(aliases) = builtin_aliases.get(id) {
-                            let n = aliases
-                                .names
-                                .get(lang)
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| tool.name());
-                            let d = aliases
-                                .descriptions
-                                .get(lang)
-                                .map(|s| s.as_str())
-                                .unwrap_or_else(|| tool.description());
-                            (n, d)
-                        } else {
-                            (tool.name(), tool.description())
-                        }
+                let (name, description) = if let Some(lang) = language {
+                    if let Some(aliases) = builtin_aliases.get(id) {
+                        let n = aliases
+                            .names
+                            .get(lang)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| tool.name());
+                        let d = aliases
+                            .descriptions
+                            .get(lang)
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| tool.description());
+                        (n, d)
                     } else {
                         (tool.name(), tool.description())
-                    };
+                    }
+                } else {
+                    (tool.name(), tool.description())
+                };
 
-                    let schema = tool.input_schema();
-                    let compact = compact_schema_descriptor(&schema);
-                    prompt.push_str(&format!("- {}: {}. {}\n", name, description, compact));
-                }
+                let schema = tool.input_schema();
+                let compact = compact_schema_descriptor(&schema);
+                prompt.push_str(&format!("- {}: {}. {}\n", name, description, compact));
             }
         }
 
