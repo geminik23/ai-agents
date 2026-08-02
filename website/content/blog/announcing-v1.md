@@ -2,12 +2,10 @@
 title = "AI Agents v1.0: The Runtime Behind One YAML"
 date = 2026-08-02
 description = "The stable, versioned Rust runtime contract behind YAML-defined agents."
-draft = true
 template = "blog-page.html"
 [taxonomies]
 tags = ["release", "architecture", "design"]
 +++
-
 
 > This post describes the v1.0 release as of its publication date. Current supported behavior and operational boundaries are defined by the [Concepts](@/docs/concepts.md), [YAML Reference](@/docs/yaml-reference.md), and [Built-in Tools](@/docs/built-in-tools.md) pages.
 
@@ -57,7 +55,7 @@ tools:
 Install the CLI and run it directly:
 
 ```sh
-cargo install ai-agents-cli
+cargo install ai-agents-cli --version '=1.0.0'
 ai-agents-cli run agent.yaml
 ```
 
@@ -65,7 +63,7 @@ The same YAML can be loaded by a Rust application, evaluated with separate scena
 
 That shared path keeps tested behavior aligned with CLI and embedded use. A tool called from a skill should not bypass normal execution rules, and a spawned child should not bypass them because it was created dynamically.
 
-The framework is modular internally, but execution comes back to one runtime.
+The framework is modular internally, but execution comes back to one runtime contract.
 
 ## The Hard Part Begins When Agents Can Act
 
@@ -75,13 +73,24 @@ A tool call can inspect a repository, modify a file, run a validation command, a
 
 In v1.0, registering a tool does not automatically expose it. YAML agents grant ordinary tools explicitly, and omitting `tools:` grants none. States may narrow the top-level grant but cannot widen it. Provider tool choice can select among effective tools, but it cannot create new authority.
 
+```text
+Host registers tools
+  -> YAML grants tools
+  -> state narrows the grant
+  -> provider sees the effective tools
+  -> model returns a tool call
+  -> runtime checks scope, policy, and approval
+  -> final admission and resource locks
+  -> tool execution and evidence
+```
+
 A granted call still enters one shared execution path. The runtime resolves the tool's canonical identity and rejects calls outside the effective scope or policy before asking for approval. If approval changes the arguments, the final call is checked again before the bound tool executes.
 
 Human approval can authorize an allowed but sensitive operation. It cannot override an automatic denial.
 
-The same boundary applies whether the call came from a model response, skill step, state action, plan, fallback, or host-triggered path.
+The same boundary applies to calls emitted by a model, skill, state action, plan, or fallback, and to manual calls that the host submits through the runtime's shared executor.
 
-Side effects also have one committed owner. A speculative branch may consume model time, but a losing branch cannot write memory, mutate context, run tools, or emit user-visible output. Its usage evidence can remain without allowing its effects to escape.
+Only the selected branch may commit side effects. A speculative branch may consume model time, but a losing branch cannot write memory, mutate context, run tools, or emit user-visible output. Its usage evidence can remain without allowing its effects to escape.
 
 These controls make behavior inspectable inside the framework. They are not an operating-system sandbox. Deployment isolation, credentials, custom integrations, and provider-side behavior remain host responsibilities.
 
@@ -89,11 +98,13 @@ These controls make behavior inspectable inside the framework. They are not an o
 
 The runtime is conversational at its core, but a conversation can carry much more than messages.
 
-Hierarchical states give behavior structure. Skills package reusable workflows. Process stages prepare input and output, while context sources bring structured runtime values into prompts, guards, and tools.
+Hierarchical states give behavior structure. Skills package reusable workflows. Process stages prepare input and output, while context sources bring structured runtime values into prompts, state-transition guards, and tools.
 
-The runtime also keeps different kinds of state separate. Conversation memory, session snapshots, actor facts, relationship memory, and persona work together without being collapsed into one generic store.
+The runtime keeps conversation memory, session snapshots, actor facts, relationship state, and persona evolution as distinct runtime concerns.
 
-Agents can also create and coordinate other agents inside the runtime. Dynamic child admission is bounded and fail-closed, while orchestration supports routing, pipelines, concurrent aggregation, group chat, and handoff. This is coordination within one runtime, not a general graph engine or a cross-service agent protocol.
+Agents can also create and coordinate other agents inside the runtime. Agent spawning is limited by configured capacity and tool allowlists, and declared child construction fails as a whole when any child cannot be admitted. Orchestration supports routing, pipelines, concurrent aggregation, group chat, and handoff. This is coordination within one runtime, not a general graph engine or a cross-service agent protocol.
+
+For example, a support agent can route a request through states, retain actor facts in SQLite, ask for approval before a sensitive tool call, and hand work to a specialist without changing the shared execution rules.
 
 The result is a set of composable primitives rather than one prescribed agent shape. Each agent enables only the sections it needs.
 
