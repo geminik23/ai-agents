@@ -209,10 +209,16 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn symlink_privilege_unavailable(error: &io::Error) -> bool {
+        // Windows may report missing symlink privilege as PermissionDenied or ERROR_PRIVILEGE_NOT_HELD.
+        error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+    }
+
+    #[cfg(windows)]
     fn symlink_dir(target: &Path, link: &Path) -> bool {
         match std::os::windows::fs::symlink_dir(target, link) {
             Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
+            Err(error) if symlink_privilege_unavailable(&error) => false,
             Err(error) => panic!("failed to create directory symlink: {error}"),
         }
     }
@@ -227,7 +233,7 @@ mod tests {
     fn symlink_file(target: &Path, link: &Path) -> bool {
         match std::os::windows::fs::symlink_file(target, link) {
             Ok(()) => true,
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => false,
+            Err(error) if symlink_privilege_unavailable(&error) => false,
             Err(error) => panic!("failed to create file symlink: {error}"),
         }
     }

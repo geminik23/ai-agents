@@ -1609,7 +1609,16 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        match std::os::windows::fs::symlink_file(&target, &link) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to create file symlink: {error}"),
+        }
         let result = FileInfoTool::new()
             .execute(
                 serde_json::json!({

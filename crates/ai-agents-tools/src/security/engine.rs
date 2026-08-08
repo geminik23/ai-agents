@@ -1647,29 +1647,34 @@ mod tests {
 
     #[tokio::test]
     async fn test_path_restrictions() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowed_root = directory.path().join("allowed");
+        std::fs::create_dir(&allowed_root).unwrap();
+        let allowed_path = allowed_root.join("test.txt");
+        let denied_path = directory.path().join("denied/test.txt");
         let mut config = enabled_security_config();
 
         let tool_config = ToolPolicyConfig {
-            allowed_paths: vec!["/tmp/".to_string(), "/home/user/".to_string()],
+            allowed_paths: vec![allowed_root.to_string_lossy().into_owned()],
             ..Default::default()
         };
         config.tools.insert("file_write".to_string(), tool_config);
 
         let engine = ToolSecurityEngine::new(config);
 
-        let args = serde_json::json!({"path": "/tmp/test.txt"});
+        let args = serde_json::json!({"path": allowed_path});
         let result = engine
             .check_tool_execution("file_write", &args)
             .await
             .unwrap();
-        assert!(result.is_allowed());
+        assert!(result.is_allowed(), "{result:?}");
 
-        let args = serde_json::json!({"path": "/etc/passwd"});
+        let args = serde_json::json!({"path": denied_path});
         let result = engine
             .check_tool_execution("file_write", &args)
             .await
             .unwrap();
-        assert!(result.is_blocked());
+        assert!(result.is_blocked(), "{result:?}");
     }
 
     #[tokio::test]
