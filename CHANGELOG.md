@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 1.0.1 - 2026-08-07
+## 1.0.1 - 2026-08-08
 
 ### Changed
 - Tool scope: runtime and nested state scopes only narrow declared grants, and state changes invalidate stale final admission before invocation
