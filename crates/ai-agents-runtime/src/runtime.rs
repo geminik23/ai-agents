@@ -12694,7 +12694,9 @@ mod tests {
         drop(restored);
         reopened_storage.close().await;
         drop(reopened_storage);
-        std::fs::remove_dir_all(directory).unwrap();
+        crate::remove_sqlite_test_directory(&directory)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

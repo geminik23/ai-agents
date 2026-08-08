@@ -981,7 +981,9 @@ mod tests {
             inner.close().await;
         }
 
-        std::fs::remove_dir_all(directory).unwrap();
+        crate::remove_sqlite_test_directory(&directory)
+            .await
+            .unwrap();
     }
 
     #[cfg(feature = "redis-storage")]

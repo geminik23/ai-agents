@@ -25,6 +25,29 @@ pub use turn_context::TurnActorContext;
 
 pub use ai_agents_core::{AgentInfo, AgentResponse, Result, ToolCall};
 
+// Retry only transient Windows SQLite sharing violations so test cleanup remains strict for every other error.
+#[cfg(test)]
+pub(crate) async fn remove_sqlite_test_directory(path: &std::path::Path) -> std::io::Result<()> {
+    const MAX_ATTEMPTS: usize = 20;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if cfg!(windows)
+                    && error.raw_os_error() == Some(32)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    unreachable!("the final cleanup attempt always returns")
+}
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
