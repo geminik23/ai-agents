@@ -81,7 +81,11 @@ struct DiagnosticsInput {
     #[serde(default)]
     severity: Option<String>,
     /// Maximum returned diagnostics. Defaults to 200.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_optional_positive_usize"
+    )]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
 }
 
@@ -236,6 +240,9 @@ impl Tool for DiagnosticsTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        if let Err(error) = crate::validate_positive_max_results(ctx.limits.max_results) {
+            return ToolResult::error(format!("Invalid result limit: {error}"));
+        }
         let severity = match parse_severity(input.severity.as_deref()) {
             Ok(severity) => severity,
             Err(error) => return ToolResult::error(error),
@@ -583,12 +590,63 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{DiagnosticItem, StaticDiagnosticsProvider};
+    use crate::types::{DiagnosticItem, DiagnosticsProvider, StaticDiagnosticsProvider};
     use parking_lot::RwLock;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingDiagnosticsProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DiagnosticsProvider for RecordingDiagnosticsProvider {
+        async fn diagnostics(&self, _request: DiagnosticsRequest) -> DiagnosticsResponse {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            DiagnosticsResponse {
+                available: true,
+                ..Default::default()
+            }
+        }
+    }
 
     fn value(output: &str) -> Value {
         serde_json::from_str(output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn diagnostics_rejects_zero_result_limits_before_provider_invocation() {
+        let provider = Arc::new(RecordingDiagnosticsProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let slot = Arc::new(RwLock::new(
+            Arc::clone(&provider) as Arc<dyn crate::types::DiagnosticsProvider>
+        ));
+        let tool = DiagnosticsTool::new(slot);
+
+        let invalid_request = tool
+            .execute(
+                serde_json::json!({"max_results": 0}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
+            .await;
+        assert!(!invalid_request.success);
+        assert!(
+            invalid_request
+                .output
+                .contains("max_results must be greater than 0")
+        );
+
+        let mut invalid_context = ai_agents_core::ToolExecutionContext::test("test");
+        invalid_context.limits.max_results = Some(0);
+        let invalid_context = tool.execute(serde_json::json!({}), invalid_context).await;
+        assert!(!invalid_context.success);
+        assert!(
+            invalid_context
+                .output
+                .contains("max_results must be greater than 0")
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

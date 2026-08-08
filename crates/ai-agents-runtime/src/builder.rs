@@ -407,7 +407,7 @@ impl AgentBuilder {
     pub fn auto_configure_features(mut self) -> Result<Self> {
         if let Some(ref spec) = self.spec {
             self.recovery_manager = Some(RecoveryManager::new(spec.error_recovery.clone()));
-            self.tool_security = Some(ToolSecurityEngine::new(spec.tool_security.clone()));
+            self.tool_security = Some(ToolSecurityEngine::try_new(spec.tool_security.clone())?);
 
             if spec.has_process() {
                 let mut processor = ProcessProcessor::new(spec.process.clone());
@@ -1306,7 +1306,8 @@ impl AgentBuilder {
         if let Some(engine) = self.tool_security {
             agent = agent.with_tool_security(engine);
         } else if let Some(ref spec) = self.spec {
-            agent = agent.with_tool_security(ToolSecurityEngine::new(spec.tool_security.clone()));
+            agent =
+                agent.with_tool_security(ToolSecurityEngine::try_new(spec.tool_security.clone())?);
         }
 
         if let Some(processor) = self.process_processor {
@@ -1636,6 +1637,25 @@ tool_security:
     }
 
     #[test]
+    fn test_builder_from_yaml_rejects_zero_max_results() {
+        let yaml = r#"
+name: SecureAgent
+system_prompt: "You are helpful."
+tool_security:
+  enabled: true
+  tools:
+    web_search:
+      max_results: 0
+"#;
+        let error = AgentBuilder::from_yaml(yaml).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("tool_security.tools.web_search.max_results must be greater than 0")
+        );
+    }
+
+    #[test]
     fn test_builder_from_yaml_with_skills() {
         let yaml = r#"
 name: SkillAgent
@@ -1668,6 +1688,30 @@ skills:
         let builder = AgentBuilder::from_spec(spec);
         assert!(builder.spec.is_some());
         assert_eq!(builder.system_prompt, Some("You are helpful".to_string()));
+    }
+
+    #[test]
+    fn test_builder_rejects_invalid_programmatic_tool_security() {
+        use ai_agents_llm::mock::MockLLMProvider;
+
+        let mut spec = AgentSpec::default();
+        spec.tool_security.tools.insert(
+            "web_search".to_string(),
+            ai_agents_tools::ToolPolicyConfig {
+                max_results: Some(0),
+                ..Default::default()
+            },
+        );
+
+        let error = AgentBuilder::from_spec(spec)
+            .llm(Arc::new(MockLLMProvider::new("test")))
+            .build()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max_results must be greater than 0")
+        );
     }
 
     #[test]

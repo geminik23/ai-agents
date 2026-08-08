@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.1 - 2026-08-07
+
+### Changed
+- Tool scope: runtime and nested state scopes only narrow declared grants, and state changes invalidate stale final admission before invocation
+
+### Fixed
+- Filesystem containment: missing roots and dangling symlinks use resolved workspace-aware checks while deny, unavailable, and approval restrictions remain fail-closed
+- Result limits: built-in `max_results` inputs and per-tool policy reject zero instead of returning no results or silently raising it to one
+- Web fetch cache: cached responses obey the current effective redirect limit and incompatible redirect chains are fetched again under the stricter call
+
 ## 1.0.0 - 2026-08-02
 
 ### Added

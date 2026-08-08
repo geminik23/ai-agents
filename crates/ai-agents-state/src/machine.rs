@@ -1,12 +1,17 @@
 use chrono::Utc;
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ai_agents_core::{AgentError, Result, StateMachineSnapshot, StateTransitionEvent};
 
-use super::config::{StateConfig, StateDefinition, Transition};
+use super::config::{StateConfig, StateDefinition, ToolRef, Transition};
 
 pub struct StateMachine {
     config: StateConfig,
+    /// Serializes state-authority snapshots with transitions, reset, and restore.
+    state_guard: RwLock<()>,
+    /// Monotonic generation for changes that can invalidate state-scoped authorization.
+    generation: AtomicU64,
     current: RwLock<String>,
     previous: RwLock<Option<String>>,
     turn_count: RwLock<u32>,
@@ -20,6 +25,8 @@ impl StateMachine {
         let initial = Self::resolve_initial_state(&config)?;
         Ok(Self {
             config,
+            state_guard: RwLock::new(()),
+            generation: AtomicU64::new(1),
             current: RwLock::new(initial),
             previous: RwLock::new(None),
             turn_count: RwLock::new(0),
@@ -71,7 +78,39 @@ impl StateMachine {
         self.config.get_state(&parent_path).cloned()
     }
 
+    /// Returns the generation and every explicit tool scope from root to current state as one authority snapshot.
+    pub fn current_tool_scope_snapshot(&self) -> (u64, Vec<Vec<ToolRef>>) {
+        let _guard = self.state_guard.read();
+        let current = self.current.read().clone();
+        let mut path = String::new();
+        let mut scopes = Vec::new();
+
+        for part in current.split('.') {
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(part);
+            if let Some(tools) = self
+                .config
+                .get_state(&path)
+                .and_then(|definition| definition.tools.clone())
+            {
+                scopes.push(tools);
+            }
+        }
+
+        (self.generation.load(Ordering::SeqCst), scopes)
+    }
+
+    /// Returns the current state-authority generation after any active mutation completes.
+    pub fn generation(&self) -> u64 {
+        let _guard = self.state_guard.read();
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Applies one valid transition and advances the authority generation after all state fields are committed.
     pub fn transition_to(&self, state: &str, reason: &str) -> Result<()> {
+        let _guard = self.state_guard.write();
         let current_path = self.current.read().clone();
         let resolved_path = self.config.resolve_full_path(&current_path, state);
 
@@ -103,6 +142,7 @@ impl StateMachine {
             timestamp: Utc::now(),
         };
         self.history.write().push(event);
+        self.generation.fetch_add(1, Ordering::SeqCst);
 
         Ok(())
     }
@@ -152,6 +192,7 @@ impl StateMachine {
     }
 
     pub fn increment_turn(&self) {
+        let _guard = self.state_guard.write();
         *self.turn_count.write() += 1;
     }
 
@@ -160,6 +201,7 @@ impl StateMachine {
     }
 
     pub fn increment_no_transition(&self) {
+        let _guard = self.state_guard.write();
         *self.no_transition_count.write() += 1;
     }
 
@@ -168,6 +210,7 @@ impl StateMachine {
     }
 
     pub fn reset_no_transition(&self) {
+        let _guard = self.state_guard.write();
         *self.no_transition_count.write() = 0;
     }
 
@@ -180,17 +223,31 @@ impl StateMachine {
         None
     }
 
+    /// Restores the initial state and advances generation only when reset changes machine state.
     pub fn reset(&self) {
+        let _guard = self.state_guard.write();
         let initial =
             Self::resolve_initial_state(&self.config).unwrap_or(self.config.initial.clone());
+        let changed = *self.current.read() != initial
+            || self.previous.read().is_some()
+            || *self.turn_count.read() != 0
+            || *self.no_transition_count.read() != 0
+            || !self.history.read().is_empty();
+        if !changed {
+            return;
+        }
+
         *self.current.write() = initial;
         *self.previous.write() = None;
         *self.turn_count.write() = 0;
         *self.no_transition_count.write() = 0;
         self.history.write().clear();
+        self.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Captures a consistent persistence snapshot after any active state mutation completes.
     pub fn snapshot(&self) -> StateMachineSnapshot {
+        let _guard = self.state_guard.read();
         StateMachineSnapshot {
             current_state: self.current.read().clone(),
             previous_state: self.previous.read().clone(),
@@ -200,6 +257,7 @@ impl StateMachine {
         }
     }
 
+    /// Restores a valid snapshot and advances generation only when persisted machine state differs.
     pub fn restore(&self, snapshot: StateMachineSnapshot) -> Result<()> {
         if self.config.get_state(&snapshot.current_state).is_none() {
             return Err(AgentError::InvalidSpec(format!(
@@ -207,11 +265,35 @@ impl StateMachine {
                 snapshot.current_state
             )));
         }
+
+        let _guard = self.state_guard.write();
+        let current_history = self.history.read();
+        let history_matches = current_history.len() == snapshot.history.len()
+            && current_history
+                .iter()
+                .zip(&snapshot.history)
+                .all(|(left, right)| {
+                    left.from == right.from
+                        && left.to == right.to
+                        && left.reason == right.reason
+                        && left.timestamp == right.timestamp
+                });
+        let changed = *self.current.read() != snapshot.current_state
+            || *self.previous.read() != snapshot.previous_state
+            || *self.turn_count.read() != snapshot.turn_count
+            || *self.no_transition_count.read() != snapshot.no_transition_count
+            || !history_matches;
+        drop(current_history);
+        if !changed {
+            return Ok(());
+        }
+
         *self.current.write() = snapshot.current_state;
         *self.previous.write() = snapshot.previous_state;
         *self.turn_count.write() = snapshot.turn_count;
         *self.no_transition_count.write() = snapshot.no_transition_count;
         *self.history.write() = snapshot.history;
+        self.generation.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -460,6 +542,67 @@ mod tests {
         assert!(sm.previous().is_none());
         assert_eq!(sm.turn_count(), 0);
         assert!(sm.history().is_empty());
+    }
+
+    #[test]
+    fn generation_tracks_only_successful_transition_reset_and_restore_changes() {
+        let sm = StateMachine::new(create_test_config()).unwrap();
+        let initial_generation = sm.generation();
+        let initial_snapshot = sm.snapshot();
+
+        sm.reset();
+        sm.restore(initial_snapshot.clone()).unwrap();
+        assert_eq!(sm.generation(), initial_generation);
+
+        assert!(sm.transition_to("missing", "invalid").is_err());
+        assert_eq!(sm.generation(), initial_generation);
+
+        sm.transition_to("support", "valid").unwrap();
+        let transition_generation = sm.generation();
+        assert_eq!(transition_generation, initial_generation + 1);
+        let transitioned_snapshot = sm.snapshot();
+
+        sm.restore(transitioned_snapshot.clone()).unwrap();
+        assert_eq!(sm.generation(), transition_generation);
+        sm.increment_turn();
+        assert_eq!(sm.generation(), transition_generation);
+
+        sm.reset();
+        let reset_generation = sm.generation();
+        assert_eq!(reset_generation, transition_generation + 1);
+        sm.reset();
+        assert_eq!(sm.generation(), reset_generation);
+
+        sm.restore(transitioned_snapshot).unwrap();
+        assert_eq!(sm.generation(), reset_generation + 1);
+        sm.restore(initial_snapshot).unwrap();
+        assert_eq!(sm.generation(), reset_generation + 2);
+    }
+
+    #[test]
+    fn current_tool_scope_snapshot_keeps_complete_ancestor_chain() {
+        let yaml = r#"
+initial: root
+states:
+  root:
+    tools: [root_tool]
+    initial: middle
+    states:
+      middle:
+        initial: leaf
+        states:
+          leaf:
+            tools: []
+"#;
+        let config: StateConfig = serde_yaml::from_str(yaml).unwrap();
+        let sm = StateMachine::new(config).unwrap();
+
+        let (generation, scopes) = sm.current_tool_scope_snapshot();
+
+        assert_eq!(generation, sm.generation());
+        assert_eq!(scopes.len(), 2);
+        assert_eq!(scopes[0][0].id(), "root_tool");
+        assert!(scopes[1].is_empty());
     }
 
     #[test]

@@ -931,7 +931,7 @@ See [Built-in Tools](@/docs/built-in-tools.md) for the complete 30-tool input, o
 
 ### Expanded built-in inputs
 
-These inputs are generated into the model-facing tool schemas when the tool is granted. All outputs are bounded and include truncation metadata where applicable.
+These inputs are generated into the model-facing tool schemas when the tool is granted. All outputs are bounded and include truncation metadata where applicable. Every built-in `max_results` value in this table must be a positive integer; generated schemas advertise a minimum of `1`, and runtime deserialization rejects zero.
 
 | Tool | Required inputs | Optional inputs and defaults |
 |------|-----------------|------------------------------|
@@ -1015,13 +1015,13 @@ states:
 
 ### Per-State Tool Scoping
 
-Tool availability per state narrows the top-level grant:
+Tool availability per state narrows the current effective grant:
 
-- `tools: []` - explicitly no tools in this state
-- `tools: [datetime]` - only `datetime`, and only if top-level `tools:` also grants `datetime`
-- *omit `tools`* - inherit the current top-level grant or parent-state narrowing
+- `tools: []` - explicitly no tools in this state or any descendant that omits its own list
+- `tools: [datetime]` - only `datetime`, and only if every earlier grant and explicit ancestor scope also permits `datetime`
+- *omit `tools`* - inherit the complete effective narrowing from the top level and all explicit ancestor states
 
-A state cannot expose a tool that is absent from the effective grant. The effective grant is top-level `tools:` plus explicitly enabled feature tools such as orchestration tools or `persona_evolve`. Tool security, HITL, eval assertions, and recovery policies use canonical tool IDs, not localized aliases or display names.
+A state cannot expose a tool that is absent from the effective grant. The runtime intersects the declared grant, any live runtime narrowing, and every explicit state scope from the root state to the current state. The declared grant is top-level `tools:` plus explicitly enabled feature tools such as orchestration tools or `persona_evolve`. Tool security, HITL, eval assertions, and recovery policies use canonical tool IDs after normal alias resolution.
 
 ### `tool_aliases`
 
@@ -1948,7 +1948,7 @@ Runtime-enforced per-tool policy fields:
 | `allow_command_escalation` | Allow approval-based escalation outside the exact argv allowlist |
 | `commands.allow` / `commands.deny` | Legacy fixed command identity matching for process-backed tools |
 | `commands.requires_approval` | Legacy command identities that require HITL approval |
-| `max_results` | Maximum rows, matches, or entries exposed through `ctx.limits.max_results` |
+| `max_results` | Positive maximum rows, matches, or entries exposed through `ctx.limits.max_results`; zero is invalid |
 | `max_file_size_bytes` | Maximum local file bytes exposed through `ctx.limits.max_file_size_bytes` |
 | `max_output_chars` | Maximum model-facing output characters exposed through `ctx.limits.max_output_chars` |
 | `max_response_bytes` | Maximum network response bytes exposed through `ctx.limits.max_response_bytes` |
@@ -1956,9 +1956,9 @@ Runtime-enforced per-tool policy fields:
 | `max_changed_files` / `max_changed_lines` | Common caps reserved for mutation tools |
 | `config` | Host-supplied custom settings exposed as `ToolExecutionContext.custom_config`; not shown in model-facing schemas. Current built-in config: `sleep.config.max_duration_ms` |
 
-Policy cap fields are applied as upper bounds or defaults before execution for built-ins that support the corresponding input, and they are passed to all tools in `ToolExecutionContext.limits`. Examples: `grep.max_output_chars`, `git_diff.max_output_chars`, `web_fetch.max_response_bytes`, `web_fetch.max_redirects`, `file_edit.max_replacements`, and `patch.max_changed_lines`. Optional-path tools such as `glob`, `grep`, `git_status`, `git_diff`, and `diagnostics` declare `path: "."` for policy checks when the call omits `path`. `patch` declares `base_path: "."`. Path policy canonicalizes existing paths and write-parent ancestors to deny symlink escapes while the checked topology remains unchanged. `web_fetch` re-checks configured scheme, port, domain, and public-address policy on redirect targets, then the default transport connects only to that request's validated addresses with proxies disabled. Custom low-level web-fetch transports and host egress controls must preserve their own network boundary.
+Policy cap fields are applied as upper bounds or defaults before execution for built-ins that support the corresponding input, and they are passed to all tools in `ToolExecutionContext.limits`. Examples: `grep.max_output_chars`, `git_diff.max_output_chars`, `web_fetch.max_response_bytes`, `web_fetch.max_redirects`, `file_edit.max_replacements`, and `patch.max_changed_lines`. Optional-path tools such as `glob`, `grep`, `git_status`, `git_diff`, and `diagnostics` declare `path: "."` for policy checks when the call omits `path`. `patch` declares `base_path: "."`. Path policy resolves existing entries and nearest existing ancestors for both candidates and configured roots before containment decisions. Relative policy roots are anchored to the canonical host-owned workspace and fail closed if an existing ancestor resolves outside it; explicit absolute roots authorize their resolved locations. Dangling candidate or policy-root symlinks fail closed. Allow rules require resolved containment, while deny, unavailable, and approval rules match either lexical or resolved paths so a symlink cannot weaken a restriction while the checked topology remains unchanged. `web_fetch` re-checks configured scheme, port, domain, and public-address policy on redirect targets. Cache reuse also requires the stored redirect count to satisfy the current effective redirect limit; compatible hits avoid the HTTP transport request but repeat current DNS/IP and URL-policy validation. The default transport connects only to that request's validated addresses with proxies disabled. Custom low-level transports must return one response per call without automatically following redirects, honor the per-response byte limit while reading, and preserve their own validated-address and host-egress boundary.
 
-Approval does not freeze an old authorization decision. After approval, the runtime resolves the final tool once, reapplies current policy caps to the approved arguments, and recomputes classification and resource keys. It then verifies current scope, emergency control, provider availability, policy, and approval binding before lock acquisition. After waiting for locks, a changed policy or runtime generation fails closed and one atomic rate-limit admission occurs immediately before invocation. The runtime executes the same resolved tool object and records the observed registry version as evidence rather than claiming an atomic registry snapshot. An initial hard denial returns immediately and is not revived if policy later becomes permissive; a call that was awaiting approval is denied if the final policy becomes restrictive.
+Approval does not freeze an old authorization decision. After approval, the runtime resolves the final tool once, reapplies current policy caps to the approved arguments, and recomputes classification and resource keys. It then verifies current scope, emergency control, provider availability, policy, and approval binding before lock acquisition. State-scope evaluation records the state generation that authorized the call. After waiting for locks, a changed policy, runtime-control, or state generation fails closed and one atomic rate-limit admission occurs immediately before invocation. The runtime executes the same resolved tool object and records the observed registry version as evidence rather than claiming an atomic registry snapshot. An initial hard denial returns immediately and is not revived if policy later becomes permissive; a call that was awaiting approval is denied if the final policy becomes restrictive.
 
 Calls classified as concurrency-safe, including mutation dry runs, do not acquire resource locks. Non-concurrency-safe path operations use one conservative shared path-mutation lock in addition to normalized exact resource keys, so v1 favors correctness over parallel filesystem mutation. Non-concurrency-safe calls without a concrete resource use one shared unbound-side-effect lock. Parent and spawned runtimes share the lock table. Resource guards are released before completion hooks and before fallback re-enters the normal authorization path.
 

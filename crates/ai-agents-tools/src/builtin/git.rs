@@ -57,7 +57,11 @@ struct GitStatusInput {
     #[serde(default = "default_true")]
     include_untracked: bool,
     /// Maximum changed paths. Defaults to 200.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_optional_positive_usize"
+    )]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
 }
 
@@ -140,6 +144,9 @@ impl Tool for GitStatusTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        if let Err(error) = crate::validate_positive_max_results(ctx.limits.max_results) {
+            return ToolResult::error(format!("Invalid result limit: {error}"));
+        }
         let cwd = PathBuf::from(input.path.unwrap_or_else(|| ".".to_string()));
         if let Err(reason) = validate_path(&cwd) {
             return ToolResult::error(reason);
@@ -417,6 +424,29 @@ mod tests {
         run_git(dir.path(), &["config", "user.email", "test@example.com"]).unwrap();
         run_git(dir.path(), &["config", "user.name", "Test User"]).unwrap();
         dir
+    }
+
+    #[tokio::test]
+    async fn git_status_rejects_zero_max_results_before_running_git() {
+        let result = GitStatusTool::new()
+            .execute(
+                serde_json::json!({"path": "missing", "max_results": 0}),
+                ai_agents_core::ToolExecutionContext::test("test"),
+            )
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("max_results must be greater than 0"));
+    }
+
+    #[tokio::test]
+    async fn git_status_rejects_zero_execution_context_limit_before_running_git() {
+        let mut context = ai_agents_core::ToolExecutionContext::test("test");
+        context.limits.max_results = Some(0);
+        let result = GitStatusTool::new()
+            .execute(serde_json::json!({"path": "missing"}), context)
+            .await;
+        assert!(!result.success);
+        assert!(result.output.contains("max_results must be greater than 0"));
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ use ai_agents_core::{
 };
 
 use crate::generate_schema;
+use crate::security::path::PathPolicyResolver;
 use crate::types::{FileVersionEvidence, FileVersionStore, file_version_evidence};
 
 const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
@@ -1164,15 +1165,21 @@ fn mutation_classification(metadata: &ToolSafetyMetadata, args: &Value) -> ToolC
     classification
 }
 
+// Mutation tools repeat only the final local path guard; the shared executor remains authoritative for complete policy and approval evaluation.
 fn ensure_write_allowed(
     path: &Path,
     dry_run: bool,
     policy: &MutationPolicySnapshot,
 ) -> Result<(), String> {
-    let normalized = normalize_path(path);
-    let resolved = resolve_existing_or_parent(path)?;
+    let resolver = mutation_path_resolver()?;
+    resolver
+        .resolve_path(path)
+        .map_err(|error| format!("Path policy resolution failed: {}", error))?;
     for blocked in &policy.blocked_paths {
-        if path_matches_restricted_policy(blocked, &normalized, &resolved)? {
+        if resolver
+            .matches_restriction(path, Path::new(blocked))
+            .map_err(|error| format!("Path policy resolution failed: {}", error))?
+        {
             return Err("path is blocked by policy".to_string());
         }
     }
@@ -1182,34 +1189,30 @@ fn ensure_write_allowed(
         }
         return Ok(());
     }
-    if !policy
-        .write_paths
-        .iter()
-        .chain(policy.allowed_paths.iter())
-        .any(|allowed| {
-            path_matches_allowed_policy(allowed, &normalized, &resolved).unwrap_or(false)
-        })
-    {
+    let mut matches_allowed = false;
+    for allowed in policy.write_paths.iter().chain(policy.allowed_paths.iter()) {
+        if resolver
+            .is_allowed(path, Path::new(allowed))
+            .map_err(|error| format!("Path policy resolution failed: {}", error))?
+        {
+            matches_allowed = true;
+            break;
+        }
+    }
+    if !matches_allowed {
         return Err("path is not under an allowed write root".to_string());
     }
     Ok(())
 }
 
 fn ensure_not_write_root(path: &Path, policy: &MutationPolicySnapshot) -> Result<(), String> {
-    let normalized = normalize_path(path);
-    let resolved = resolve_existing_or_parent(path)?;
+    let resolver = mutation_path_resolver()?;
     for root in policy.write_paths.iter().chain(policy.allowed_paths.iter()) {
-        let root_path = Path::new(root);
-        if normalized == normalize_path(root_path) {
+        if resolver
+            .is_same_location(path, Path::new(root))
+            .map_err(|error| format!("Path policy resolution failed: {}", error))?
+        {
             return Err("refusing to delete a configured write root".to_string());
-        }
-        if path_entry_exists(root_path) {
-            let resolved_root = root_path
-                .canonicalize()
-                .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
-            if resolved == resolved_root.components().collect::<PathBuf>() {
-                return Err("refusing to delete a configured write root".to_string());
-            }
         }
     }
     Ok(())
@@ -1503,67 +1506,8 @@ fn path_entry_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-fn resolve_existing_or_parent(path: &Path) -> Result<PathBuf, String> {
-    if path_entry_exists(path) {
-        return path
-            .canonicalize()
-            .map_err(|error| format!("Path canonicalization failed: {}", error));
-    }
-    let normalized = normalize_path(path);
-    let mut ancestor = normalized.as_path();
-    let mut missing = Vec::new();
-    while !path_entry_exists(ancestor) {
-        let Some(name) = ancestor.file_name() else {
-            break;
-        };
-        missing.push(name.to_os_string());
-        ancestor = ancestor.parent().unwrap_or_else(|| Path::new("."));
-    }
-    let mut resolved = ancestor
-        .canonicalize()
-        .map_err(|error| format!("Path parent canonicalization failed: {}", error))?;
-    for component in missing.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved.components().collect())
-}
-
-fn path_matches_allowed_policy(
-    pattern: &str,
-    normalized: &Path,
-    resolved: &Path,
-) -> Result<bool, String> {
-    let pattern_path = Path::new(pattern);
-    let normalized_pattern = normalize_path(pattern_path);
-    if !normalized.starts_with(&normalized_pattern) {
-        return Ok(false);
-    }
-    if !path_entry_exists(pattern_path) {
-        return Ok(true);
-    }
-    let resolved_pattern = pattern_path
-        .canonicalize()
-        .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
-    Ok(resolved.starts_with(resolved_pattern.components().collect::<PathBuf>()))
-}
-
-fn path_matches_restricted_policy(
-    pattern: &str,
-    normalized: &Path,
-    resolved: &Path,
-) -> Result<bool, String> {
-    let pattern_path = Path::new(pattern);
-    let normalized_pattern = normalize_path(pattern_path);
-    if normalized.starts_with(&normalized_pattern) {
-        return Ok(true);
-    }
-    if !path_entry_exists(pattern_path) {
-        return Ok(false);
-    }
-    let resolved_pattern = pattern_path
-        .canonicalize()
-        .map_err(|error| format!("Policy path canonicalization failed: {}", error))?;
-    Ok(resolved.starts_with(resolved_pattern.components().collect::<PathBuf>()))
+fn mutation_path_resolver() -> Result<PathPolicyResolver, String> {
+    PathPolicyResolver::new().map_err(|error| format!("Path policy resolution failed: {}", error))
 }
 
 fn exceeds(limit: Option<usize>, value: usize) -> bool {
@@ -1932,7 +1876,11 @@ impl Tool for MovePathTool {
             Ok(path) => path,
             Err(error) => return ToolResult::error(format!("Source path error: {}", error)),
         };
-        let resolved_destination = match resolve_existing_or_parent(&destination) {
+        let resolved_destination = match mutation_path_resolver().and_then(|resolver| {
+            resolver
+                .resolve_path(&destination)
+                .map_err(|error| format!("Path policy resolution failed: {}", error))
+        }) {
             Ok(path) => path,
             Err(error) => return ToolResult::error(error),
         };
@@ -2185,10 +2133,15 @@ fn path_mutation_classification(
 }
 
 fn ensure_read_allowed(path: &Path, policy: &MutationPolicySnapshot) -> Result<(), String> {
-    let normalized = normalize_path(path);
-    let resolved = resolve_existing_or_parent(path)?;
+    let resolver = mutation_path_resolver()?;
+    resolver
+        .resolve_path(path)
+        .map_err(|error| format!("Path policy resolution failed: {}", error))?;
     for blocked in &policy.blocked_paths {
-        if path_matches_restricted_policy(blocked, &normalized, &resolved)? {
+        if resolver
+            .matches_restriction(path, Path::new(blocked))
+            .map_err(|error| format!("Path policy resolution failed: {}", error))?
+        {
             return Err("source path is blocked by policy".to_string());
         }
     }
@@ -2199,7 +2152,9 @@ fn validate_copy_destination(source: &Path, destination: &Path) -> Result<(), St
     let source = source
         .canonicalize()
         .map_err(|error| format!("Source canonicalization failed: {}", error))?;
-    let destination = resolve_existing_or_parent(destination)?;
+    let destination = mutation_path_resolver()?
+        .resolve_path(destination)
+        .map_err(|error| format!("Path policy resolution failed: {}", error))?;
     if destination == source || source.is_dir() && destination.starts_with(&source) {
         return Err("destination must not equal or be nested under the source".to_string());
     }
@@ -3439,6 +3394,86 @@ mod tests {
         assert_eq!(output["recursive"], true);
         assert_eq!(output["bytes_affected"], 6);
         assert_eq!(output["approval_required"], false);
+    }
+
+    #[tokio::test]
+    async fn file_write_allows_creation_beneath_missing_absolute_root() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("missing-root");
+        let path = root.join("nested/file.txt");
+        let result = FileWriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "created",
+                    "create_parent_dirs": true,
+                    "dry_run": false
+                }),
+                mutation_context("file_write", &root),
+            )
+            .await;
+
+        assert!(result.success, "{}", result.output);
+        assert_eq!(fs::read_to_string(path).unwrap(), "created");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_write_rejects_dangling_allowed_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let missing_target = dir.path().join("missing-target");
+        let root = dir.path().join("dangling-root");
+        symlink(&missing_target, &root).unwrap();
+        let path = root.join("file.txt");
+        let result = FileWriteTool::new()
+            .execute(
+                serde_json::json!({
+                    "path": path.to_string_lossy(),
+                    "content": "blocked",
+                    "create_parent_dirs": true,
+                    "dry_run": false
+                }),
+                mutation_context("file_write", &root),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("Path policy resolution failed"));
+        assert!(!missing_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn copy_path_rejects_blocked_source_through_symlink_alias() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let blocked = dir.path().join("blocked");
+        fs::create_dir(&root).unwrap();
+        fs::create_dir(&blocked).unwrap();
+        fs::write(blocked.join("source.txt"), "source").unwrap();
+        symlink(&blocked, root.join("alias")).unwrap();
+        let destination = root.join("destination.txt");
+        let mut context = mutation_context("copy_path", &root);
+        context.policy_snapshot["blocked_paths"] = serde_json::json!([blocked.to_string_lossy()]);
+
+        let result = CopyPathTool::new()
+            .execute(
+                serde_json::json!({
+                    "source_path": root.join("alias/source.txt").to_string_lossy(),
+                    "destination_path": destination.to_string_lossy(),
+                    "dry_run": false
+                }),
+                context,
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("source path is blocked"));
+        assert!(!destination.exists());
     }
 
     #[tokio::test]

@@ -80,7 +80,7 @@ scenarios:
     tags: [live, examples, yaml, state-machine, support, escalation, global-transition, real-llm]
     language: en
     turns:
-      - input: "I am furious that this issue has happened three times. Prepare a concise escalation summary, but do not claim that a manager has already been contacted."
+      - input: "I am furious that this issue has happened three times, and I want it escalated to a manager. Prepare a concise escalation summary, but do not claim that a manager has already been contacted."
         assert:
           all:
             - response_not_empty: true

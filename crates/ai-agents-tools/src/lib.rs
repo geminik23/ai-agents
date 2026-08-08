@@ -51,6 +51,7 @@ pub use security::{
 };
 
 use schemars::JsonSchema;
+use serde::Deserialize;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -73,6 +74,26 @@ pub enum ToolError {
 pub fn generate_schema<T: JsonSchema>() -> serde_json::Value {
     let schema = schemars::schema_for!(T);
     serde_json::to_value(schema).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+pub(crate) fn deserialize_optional_positive_usize<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<usize>::deserialize(deserializer)?;
+    validate_positive_max_results(value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
+pub(crate) fn validate_positive_max_results(
+    value: Option<usize>,
+) -> std::result::Result<(), &'static str> {
+    if value == Some(0) {
+        return Err("max_results must be greater than 0");
+    }
+    Ok(())
 }
 
 pub fn create_builtin_registry() -> ToolRegistry {
@@ -181,4 +202,29 @@ pub fn create_builtin_registry() -> ToolRegistry {
         .register(Arc::new(HttpTool::new()))
         .expect("failed to register http");
     registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_max_results_schemas_require_positive_values() {
+        let registry = create_builtin_registry();
+        for tool_id in [
+            "glob",
+            "grep",
+            "file_list",
+            "git_status",
+            "diagnostics",
+            "web_search",
+        ] {
+            let schema = registry.get(tool_id).unwrap().input_schema();
+            assert_eq!(
+                schema["properties"]["max_results"]["minimum"],
+                serde_json::json!(1),
+                "{tool_id} must advertise positive max_results"
+            );
+        }
+    }
 }

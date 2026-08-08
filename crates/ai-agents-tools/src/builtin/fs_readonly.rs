@@ -127,7 +127,11 @@ struct GlobInput {
     #[serde(default)]
     path: Option<String>,
     /// Maximum returned paths. Defaults to 100.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_optional_positive_usize"
+    )]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
     /// Result offset for pagination. Defaults to 0.
     #[serde(default)]
@@ -190,7 +194,11 @@ struct GrepInput {
     #[serde(default)]
     context: Option<usize>,
     /// Maximum result rows. Defaults to 250.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_optional_positive_usize"
+    )]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
     /// Result offset for pagination. Defaults to 0.
     #[serde(default)]
@@ -278,7 +286,11 @@ struct FileListInput {
     #[serde(default)]
     include_hidden: bool,
     /// Maximum returned entries. Defaults to 200.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_optional_positive_usize"
+    )]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
     /// Result offset for pagination. Defaults to 0.
     #[serde(default)]
@@ -380,6 +392,9 @@ impl Tool for GlobTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        if let Err(error) = crate::validate_positive_max_results(ctx.limits.max_results) {
+            return ToolResult::error(format!("Invalid result limit: {error}"));
+        }
         let root = PathBuf::from(input.path.unwrap_or_else(|| ".".to_string()));
         if let Err(reason) = ensure_safe_path(&root) {
             return ToolResult::error(reason);
@@ -495,6 +510,9 @@ impl Tool for GrepTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        if let Err(error) = crate::validate_positive_max_results(ctx.limits.max_results) {
+            return ToolResult::error(format!("Invalid result limit: {error}"));
+        }
         let root = PathBuf::from(input.path.clone().unwrap_or_else(|| ".".to_string()));
         if let Err(reason) = ensure_safe_path(&root) {
             return ToolResult::error(reason);
@@ -777,6 +795,9 @@ impl Tool for FileListTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        if let Err(error) = crate::validate_positive_max_results(ctx.limits.max_results) {
+            return ToolResult::error(format!("Invalid result limit: {error}"));
+        }
         let root = PathBuf::from(&input.path);
         if let Err(reason) = ensure_safe_path(&root) {
             return ToolResult::error(reason);
@@ -1402,6 +1423,51 @@ mod tests {
 
     fn value(output: &str) -> Value {
         serde_json::from_str(output).unwrap()
+    }
+
+    #[tokio::test]
+    async fn result_list_tools_reject_zero_max_results() {
+        let context = ai_agents_core::ToolExecutionContext::test("test");
+        let glob = GlobTool::new()
+            .execute(
+                serde_json::json!({"pattern": "*", "max_results": 0}),
+                context.clone(),
+            )
+            .await;
+        let grep = GrepTool::new()
+            .execute(
+                serde_json::json!({"pattern": "test", "max_results": 0}),
+                context.clone(),
+            )
+            .await;
+        let file_list = FileListTool::new()
+            .execute(serde_json::json!({"path": ".", "max_results": 0}), context)
+            .await;
+
+        for result in [glob, grep, file_list] {
+            assert!(!result.success);
+            assert!(result.output.contains("max_results must be greater than 0"));
+        }
+    }
+
+    #[tokio::test]
+    async fn result_list_tools_reject_zero_execution_context_limit() {
+        let mut context = ai_agents_core::ToolExecutionContext::test("test");
+        context.limits.max_results = Some(0);
+        let glob = GlobTool::new()
+            .execute(serde_json::json!({"pattern": "*"}), context.clone())
+            .await;
+        let grep = GrepTool::new()
+            .execute(serde_json::json!({"pattern": "test"}), context.clone())
+            .await;
+        let file_list = FileListTool::new()
+            .execute(serde_json::json!({"path": "."}), context)
+            .await;
+
+        for result in [glob, grep, file_list] {
+            assert!(!result.success);
+            assert!(result.output.contains("max_results must be greater than 0"));
+        }
     }
 
     #[tokio::test]

@@ -630,6 +630,7 @@ impl AgentSpec {
             states.validate()?;
         }
 
+        self.tool_security.validate()?;
         self.runtime.optimization.validate()?;
         self.validate_runtime_optimization_cross_fields()?;
 
@@ -1327,6 +1328,31 @@ skills:
         assert!(spec.validate().is_err());
 
         spec.max_iterations = 5;
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_spec_validation_rejects_zero_max_results() {
+        let mut spec = AgentSpec::default();
+        spec.tool_security.tools.insert(
+            "web_search".to_string(),
+            ai_agents_tools::ToolPolicyConfig {
+                max_results: Some(0),
+                ..Default::default()
+            },
+        );
+        let error = spec.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tool_security.tools.web_search.max_results must be greater than 0")
+        );
+
+        spec.tool_security
+            .tools
+            .get_mut("web_search")
+            .unwrap()
+            .max_results = Some(1);
         assert!(spec.validate().is_ok());
     }
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 use tracing::debug;
 
 use super::config::*;
+use super::path::PathPolicyResolver;
 use ai_agents_core::{
     CommandBindingKind, CommandPolicyBinding, DomainPolicyBinding, PathAccessMode,
     PathPolicyBinding, Result, ResultLimitBinding, ResultLimitKind, ToolCallClassification,
@@ -49,16 +50,38 @@ pub struct ToolSecurityEngine {
 }
 
 impl ToolSecurityEngine {
+    /// Creates a validated security engine and panics when host policy is invalid.
     pub fn new(config: ToolSecurityConfig) -> Self {
-        Self::new_with_policy_version(config, 1)
+        Self::try_new(config).expect("invalid tool security configuration")
     }
 
+    /// Creates a validated security engine with a recoverable configuration error.
+    pub fn try_new(config: ToolSecurityConfig) -> Result<Self> {
+        Self::try_new_with_policy_version(config, 1)
+    }
+
+    /// Creates a versioned validated engine and panics when host policy is invalid.
     pub fn new_with_policy_version(config: ToolSecurityConfig, policy_version: u64) -> Self {
-        Self {
+        Self::try_new_with_policy_version(config, policy_version)
+            .expect("invalid tool security configuration")
+    }
+
+    /// Creates a versioned validated engine without admitting invalid policy state.
+    pub fn try_new_with_policy_version(
+        config: ToolSecurityConfig,
+        policy_version: u64,
+    ) -> Result<Self> {
+        config.validate()?;
+        Ok(Self {
             config,
             tool_call_tracker: Arc::new(RwLock::new(ToolCallTracker::default())),
             policy_version,
-        }
+        })
+    }
+
+    /// Revalidates the immutable configuration owned by this engine.
+    pub fn validate(&self) -> Result<()> {
+        self.config.validate()
     }
 
     pub fn config(&self) -> &ToolSecurityConfig {
@@ -487,37 +510,55 @@ impl ToolSecurityEngine {
                 self.config.fail_closed,
             );
         }
+        let resolver = match PathPolicyResolver::new() {
+            Ok(resolver) => resolver,
+            Err(error) => return Some(path_resolution_block(tool_id, error)),
+        };
         for value in values {
-            let normalized = normalize_path(&value.path);
+            if let Err(error) = resolver.resolve_path(Path::new(&value.path)) {
+                return Some(path_resolution_block(tool_id, error));
+            }
 
             for pattern in tool_config
                 .blocked_paths
                 .iter()
                 .chain(tool_config.paths.deny.iter())
             {
-                if path_matches_restricted(pattern, &value.path, &normalized) {
-                    return Some(SecurityCheckResult::Block {
-                        reason: format!("Path is blocked for tool '{}'", tool_id),
-                    });
+                match resolver.matches_restriction(Path::new(&value.path), Path::new(pattern)) {
+                    Ok(true) => {
+                        return Some(SecurityCheckResult::Block {
+                            reason: format!("Path is blocked for tool '{}'", tool_id),
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Some(path_resolution_block(tool_id, error)),
                 }
             }
 
             for pattern in tool_config.paths.unavailable.iter() {
-                if path_matches_restricted(pattern, &value.path, &normalized) {
-                    return Some(SecurityCheckResult::Unavailable {
-                        reason: format!("Path is unavailable for tool '{}'", tool_id),
-                    });
+                match resolver.matches_restriction(Path::new(&value.path), Path::new(pattern)) {
+                    Ok(true) => {
+                        return Some(SecurityCheckResult::Unavailable {
+                            reason: format!("Path is unavailable for tool '{}'", tool_id),
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Some(path_resolution_block(tool_id, error)),
                 }
             }
 
             for pattern in tool_config.paths.requires_approval.iter() {
-                if path_matches_restricted(pattern, &value.path, &normalized) {
-                    return Some(SecurityCheckResult::RequireConfirmation {
-                        message: format!(
-                            "Confirm access to path '{}' for tool '{}' ?",
-                            value.path, tool_id
-                        ),
-                    });
+                match resolver.matches_restriction(Path::new(&value.path), Path::new(pattern)) {
+                    Ok(true) => {
+                        return Some(SecurityCheckResult::RequireConfirmation {
+                            message: format!(
+                                "Confirm access to path '{}' for tool '{}' ?",
+                                value.path, tool_id
+                            ),
+                        });
+                    }
+                    Ok(false) => {}
+                    Err(error) => return Some(path_resolution_block(tool_id, error)),
                 }
             }
 
@@ -551,14 +592,23 @@ impl ToolSecurityEngine {
                     ),
                 });
             }
-            if !allowed.is_empty()
-                && !allowed
-                    .iter()
-                    .any(|pattern| path_matches_allowed(pattern, &value.path, &normalized))
-            {
-                return Some(SecurityCheckResult::Block {
-                    reason: format!("Path not in allowed list for tool '{}'", tool_id),
-                });
+            if !allowed.is_empty() {
+                let mut matches_allowed = false;
+                for pattern in allowed {
+                    match resolver.is_allowed(Path::new(&value.path), Path::new(pattern)) {
+                        Ok(true) => {
+                            matches_allowed = true;
+                            break;
+                        }
+                        Ok(false) => {}
+                        Err(error) => return Some(path_resolution_block(tool_id, error)),
+                    }
+                }
+                if !matches_allowed {
+                    return Some(SecurityCheckResult::Block {
+                        reason: format!("Path not in allowed list for tool '{}'", tool_id),
+                    });
+                }
             }
         }
 
@@ -1347,82 +1397,16 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     host == pattern || host.ends_with(&format!(".{}", pattern))
 }
 
-fn normalize_path(path: &str) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in Path::new(path).components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
+fn path_resolution_block(
+    tool_id: &str,
+    error: super::path::PathResolutionError,
+) -> SecurityCheckResult {
+    SecurityCheckResult::Block {
+        reason: format!(
+            "Path policy resolution failed for tool '{}': {}",
+            tool_id, error
+        ),
     }
-    normalized
-}
-
-fn path_matches(pattern: &str, path: &Path) -> bool {
-    let pattern = normalize_path(pattern);
-    path.starts_with(pattern)
-}
-
-fn path_matches_allowed(pattern: &str, raw_path: &str, normalized: &Path) -> bool {
-    if !path_matches(pattern, normalized) {
-        return false;
-    }
-    let pattern_path = Path::new(pattern);
-    if !pattern_path.exists() {
-        return true;
-    }
-    let Ok(resolved) = resolve_existing_or_parent(Path::new(raw_path)) else {
-        return false;
-    };
-    let Ok(resolved_pattern) = pattern_path.canonicalize() else {
-        return false;
-    };
-    resolved.starts_with(resolved_pattern.components().collect::<PathBuf>())
-}
-
-fn path_matches_restricted(pattern: &str, raw_path: &str, normalized: &Path) -> bool {
-    if path_matches(pattern, normalized) {
-        return true;
-    }
-    let pattern_path = Path::new(pattern);
-    if !pattern_path.exists() {
-        return false;
-    }
-    let Ok(resolved) = resolve_existing_or_parent(Path::new(raw_path)) else {
-        return false;
-    };
-    let Ok(resolved_pattern) = pattern_path.canonicalize() else {
-        return false;
-    };
-    resolved.starts_with(resolved_pattern.components().collect::<PathBuf>())
-}
-
-fn resolve_existing_or_parent(path: &Path) -> std::io::Result<PathBuf> {
-    if path.exists() {
-        return path.canonicalize();
-    }
-    let normalized = if path.is_absolute() {
-        path.components().collect::<PathBuf>()
-    } else {
-        std::env::current_dir()?.join(path).components().collect()
-    };
-    let mut ancestor = normalized.as_path();
-    let mut missing = Vec::new();
-    while !ancestor.exists() {
-        let Some(name) = ancestor.file_name() else {
-            break;
-        };
-        missing.push(name.to_os_string());
-        ancestor = ancestor.parent().unwrap_or_else(|| Path::new("."));
-    }
-    let mut resolved = ancestor.canonicalize()?;
-    for component in missing.iter().rev() {
-        resolved.push(component);
-    }
-    Ok(resolved.components().collect())
 }
 
 fn contains_casefold(values: &[String], needle: &str) -> bool {
@@ -1852,6 +1836,199 @@ mod tests {
         assert!(result.is_blocked());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn path_restrictions_keep_results_through_symlink_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        let restricted = root.path().join("restricted");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::create_dir(&restricted).unwrap();
+        symlink(&restricted, workspace.join("alias")).unwrap();
+        let candidate = workspace.join("alias/secret.txt");
+        let bindings = ToolPolicyBindings {
+            path_fields: vec![PathPolicyBinding::read("root")],
+            ..Default::default()
+        };
+
+        let mut denied_config = enabled_security_config();
+        denied_config.tools.insert(
+            "custom_search".to_string(),
+            ToolPolicyConfig {
+                read_paths: vec![restricted.to_string_lossy().into_owned()],
+                blocked_paths: vec![restricted.to_string_lossy().into_owned()],
+                ..Default::default()
+            },
+        );
+        let denied = ToolSecurityEngine::new(denied_config)
+            .check_tool_execution_with_bindings(
+                "custom_search",
+                &serde_json::json!({"root": candidate}),
+                &bindings,
+            )
+            .await
+            .unwrap();
+        assert!(denied.is_blocked());
+        assert!(!denied.is_unavailable());
+
+        let mut unavailable_config = enabled_security_config();
+        unavailable_config.tools.insert(
+            "custom_search".to_string(),
+            ToolPolicyConfig {
+                read_paths: vec![restricted.to_string_lossy().into_owned()],
+                paths: PathPolicyConfig {
+                    unavailable: vec![restricted.to_string_lossy().into_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let unavailable = ToolSecurityEngine::new(unavailable_config)
+            .check_tool_execution_with_bindings(
+                "custom_search",
+                &serde_json::json!({"root": candidate}),
+                &bindings,
+            )
+            .await
+            .unwrap();
+        assert!(unavailable.is_unavailable());
+
+        let mut approval_config = enabled_security_config();
+        approval_config.tools.insert(
+            "custom_search".to_string(),
+            ToolPolicyConfig {
+                read_paths: vec![restricted.to_string_lossy().into_owned()],
+                paths: PathPolicyConfig {
+                    requires_approval: vec![restricted.to_string_lossy().into_owned()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let approval = ToolSecurityEngine::new(approval_config)
+            .check_tool_execution_with_bindings(
+                "custom_search",
+                &serde_json::json!({"root": candidate}),
+                &bindings,
+            )
+            .await
+            .unwrap();
+        assert!(approval.requires_approval());
+    }
+
+    #[tokio::test]
+    async fn copy_and_move_bindings_enforce_source_and_destination_roots() {
+        let root = tempfile::tempdir().unwrap();
+        let readable = root.path().join("readable");
+        let writable = root.path().join("writable");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&readable).unwrap();
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+
+        let mut copy_config = enabled_security_config();
+        copy_config.tools.insert(
+            "copy_path".to_string(),
+            ToolPolicyConfig {
+                read_paths: vec![readable.to_string_lossy().into_owned()],
+                write_paths: vec![writable.to_string_lossy().into_owned()],
+                ..Default::default()
+            },
+        );
+        let copy_engine = ToolSecurityEngine::new(copy_config);
+        let copy_bindings = legacy_policy_bindings("copy_path");
+        let copy_allowed = copy_engine
+            .check_tool_execution_with_bindings(
+                "copy_path",
+                &serde_json::json!({
+                    "source_path": readable.join("source.txt"),
+                    "destination_path": writable.join("destination.txt")
+                }),
+                &copy_bindings,
+            )
+            .await
+            .unwrap();
+        assert!(copy_allowed.is_allowed());
+
+        let copy_source_blocked = copy_engine
+            .check_tool_execution_with_bindings(
+                "copy_path",
+                &serde_json::json!({
+                    "source_path": outside.join("source.txt"),
+                    "destination_path": writable.join("destination.txt")
+                }),
+                &copy_bindings,
+            )
+            .await
+            .unwrap();
+        assert!(copy_source_blocked.is_blocked());
+
+        let copy_destination_blocked = copy_engine
+            .check_tool_execution_with_bindings(
+                "copy_path",
+                &serde_json::json!({
+                    "source_path": readable.join("source.txt"),
+                    "destination_path": outside.join("destination.txt")
+                }),
+                &copy_bindings,
+            )
+            .await
+            .unwrap();
+        assert!(copy_destination_blocked.is_blocked());
+
+        let mut move_config = enabled_security_config();
+        move_config.tools.insert(
+            "move_path".to_string(),
+            ToolPolicyConfig {
+                read_paths: vec![readable.to_string_lossy().into_owned()],
+                write_paths: vec![writable.to_string_lossy().into_owned()],
+                ..Default::default()
+            },
+        );
+        let move_engine = ToolSecurityEngine::new(move_config);
+        let move_bindings = legacy_policy_bindings("move_path");
+        let move_allowed = move_engine
+            .check_tool_execution_with_bindings(
+                "move_path",
+                &serde_json::json!({
+                    "source_path": writable.join("source.txt"),
+                    "destination_path": writable.join("destination.txt")
+                }),
+                &move_bindings,
+            )
+            .await
+            .unwrap();
+        assert!(move_allowed.is_allowed());
+
+        let move_source_blocked = move_engine
+            .check_tool_execution_with_bindings(
+                "move_path",
+                &serde_json::json!({
+                    "source_path": readable.join("source.txt"),
+                    "destination_path": writable.join("destination.txt")
+                }),
+                &move_bindings,
+            )
+            .await
+            .unwrap();
+        assert!(move_source_blocked.is_blocked());
+
+        let move_destination_blocked = move_engine
+            .check_tool_execution_with_bindings(
+                "move_path",
+                &serde_json::json!({
+                    "source_path": writable.join("source.txt"),
+                    "destination_path": outside.join("destination.txt")
+                }),
+                &move_bindings,
+            )
+            .await
+            .unwrap();
+        assert!(move_destination_blocked.is_blocked());
+    }
+
     #[test]
     fn custom_config_is_exposed_separately() {
         let mut config = enabled_security_config();
@@ -1888,6 +2065,11 @@ mod tests {
             }),
         );
         assert_eq!(prepared.get("max_results").and_then(Value::as_u64), Some(5));
+        let lower = engine.prepare_tool_arguments(
+            "grep",
+            &serde_json::json!({"pattern": "Tool", "max_results": 3}),
+        );
+        assert_eq!(lower.get("max_results").and_then(Value::as_u64), Some(3));
         assert_eq!(
             prepared.get("max_file_size_bytes").and_then(Value::as_u64),
             Some(1024)
@@ -1895,6 +2077,24 @@ mod tests {
         assert_eq!(
             prepared.get("max_output_chars").and_then(Value::as_u64),
             Some(1000)
+        );
+    }
+
+    #[test]
+    fn invalid_result_limit_is_rejected_before_engine_construction() {
+        let mut config = enabled_security_config();
+        config.tools.insert(
+            "web_search".to_string(),
+            ToolPolicyConfig {
+                max_results: Some(0),
+                ..Default::default()
+            },
+        );
+        let error = ToolSecurityEngine::try_new(config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("max_results must be greater than 0")
         );
     }
 

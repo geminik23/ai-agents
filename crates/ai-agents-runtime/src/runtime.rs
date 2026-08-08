@@ -60,6 +60,15 @@ struct ToolDecisionVersions {
     policy: u64,
     registry: u64,
     runtime_control: u64,
+    state: Option<u64>,
+}
+
+//
+// Carries deterministic effective tools with the state generation that authorized their scopes.
+//
+struct AvailableToolIdsSnapshot {
+    tool_ids: Vec<String>,
+    state_generation: Option<u64>,
 }
 
 //
@@ -72,6 +81,7 @@ struct ToolApprovalBinding {
     confirmation_required: bool,
     policy_version: u64,
     runtime_control_version: u64,
+    state_generation: Option<u64>,
     reviewed_tool: Arc<dyn ai_agents_core::Tool>,
 }
 
@@ -107,6 +117,7 @@ impl ToolApprovalBinding {
             || self.confirmation_required != confirmation_required
             || self.policy_version != versions.policy
             || self.runtime_control_version != versions.runtime_control
+            || self.state_generation != versions.state
             || !Arc::ptr_eq(&self.reviewed_tool, resolved_tool)
     }
 }
@@ -156,8 +167,8 @@ use ai_agents_recovery::{
 use ai_agents_relationships::RelationshipManager;
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
 use ai_agents_state::{
-    PromptMode, StateAction, StateMachine, StateMachineSnapshot, StateTransitionEvent, ToolRef,
-    Transition, TransitionContext, TransitionEvaluator, TransitionTiming, evaluate_guard,
+    PromptMode, StateAction, StateMachine, StateMachineSnapshot, StateTransitionEvent, Transition,
+    TransitionContext, TransitionEvaluator, TransitionTiming, evaluate_guard,
 };
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
 use ai_agents_tools::{
@@ -285,7 +296,7 @@ struct RuntimeControlState {
     emergency_deny: Arc<AtomicBool>,
     /// Optional live replacement for tool security policy.
     tool_security_override: RwLock<Option<ToolSecurityEngine>>,
-    /// Optional live replacement for the top-level tool scope.
+    /// Optional live narrowing scope applied after the runtime's declared grant.
     tool_scope_override: RwLock<Option<Vec<String>>>,
 }
 
@@ -317,14 +328,21 @@ impl RuntimeControlHandle {
         self.state.version.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Overrides tool security for later tool calls.
+    /// Overrides tool security for later tool calls and panics if host policy is invalid.
     pub fn set_tool_security(&self, config: ToolSecurityConfig) -> u64 {
+        self.try_set_tool_security(config)
+            .expect("invalid tool security configuration")
+    }
+
+    /// Validates replacement policy before changing the runtime-control generation or active snapshot.
+    pub fn try_set_tool_security(&self, config: ToolSecurityConfig) -> Result<u64> {
+        config.validate()?;
         let _guard = self.state.snapshot_guard.write();
         let generation = self.bump();
         *self.state.tool_security_override.write() = Some(
             ToolSecurityEngine::new_with_policy_version(config, generation),
         );
-        generation
+        Ok(generation)
     }
 
     /// Clears the live tool security override.
@@ -334,14 +352,14 @@ impl RuntimeControlHandle {
         self.bump()
     }
 
-    /// Overrides the top-level tool scope for later calls.
+    /// Narrows the runtime's declared tool grant for later calls without adding authority.
     pub fn set_tool_scope(&self, tool_ids: Vec<String>) -> u64 {
         let _guard = self.state.snapshot_guard.write();
         *self.state.tool_scope_override.write() = Some(tool_ids);
         self.bump()
     }
 
-    /// Clears the live tool scope override.
+    /// Clears live narrowing so later calls return to the runtime's declared grant.
     pub fn clear_tool_scope_override(&self) -> u64 {
         let _guard = self.state.snapshot_guard.write();
         *self.state.tool_scope_override.write() = None;
@@ -2344,11 +2362,12 @@ impl RuntimeAgent {
         }
     }
 
-    /// Performs the single rate admission after locks are held and rejects changed controls.
+    /// Performs the single rate admission after locks are held and rejects changed runtime, policy, or state authority.
     fn admit_tool_execution(
         &self,
         expected_runtime_version: u64,
         expected_policy_version: u64,
+        expected_state_generation: Option<u64>,
         canonical_id: &str,
     ) -> SecurityCheckResult {
         let _guard = self.runtime_control.snapshot_guard.read();
@@ -2369,6 +2388,15 @@ impl RuntimeAgent {
         {
             return SecurityCheckResult::Block {
                 reason: "runtime safety controls changed before admission".to_string(),
+            };
+        }
+        let current_state_generation = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| state_machine.generation());
+        if current_state_generation != expected_state_generation {
+            return SecurityCheckResult::Block {
+                reason: "state scope changed before admission".to_string(),
             };
         }
         security_engine.admit_tool_execution(canonical_id)
@@ -3121,93 +3149,108 @@ impl RuntimeAgent {
             .render(&self.base_system_prompt, &context)
     }
 
-    /// Resolves the exact top-level grant carried by a runtime safety snapshot.
-    fn get_top_level_tool_ids_for_scope(&self, scope_override: Option<&[String]>) -> Vec<String> {
-        scope_override
-            .or(self.declared_tool_ids.as_deref())
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|id| self.tools.canonical_id(id))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
+    /// Canonicalizes IDs once while preserving their first declaration order and ignoring unknown entries.
+    fn canonical_unique_tool_ids(&self, ids: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        ids.iter()
+            .filter_map(|id| self.tools.canonical_id(id))
+            .filter(|canonical_id| seen.insert(canonical_id.clone()))
+            .collect()
     }
 
+    /// Applies runtime narrowing to the canonical declared grant without permitting scope-based expansion.
+    fn get_top_level_tool_ids_for_scope(&self, scope_override: Option<&[String]>) -> Vec<String> {
+        let Some(declared) = self.declared_tool_ids.as_deref() else {
+            return Vec::new();
+        };
+        let mut effective = self.canonical_unique_tool_ids(declared);
+        if let Some(scope) = scope_override {
+            let scope: HashSet<String> =
+                self.canonical_unique_tool_ids(scope).into_iter().collect();
+            effective.retain(|canonical_id| scope.contains(canonical_id));
+        }
+        effective
+    }
+
+    /// Reads the live runtime narrowing and returns the current deterministic effective tool IDs.
     async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
+        Ok(self.get_available_tool_ids_snapshot().await?.tool_ids)
+    }
+
+    /// Captures the runtime scope used for ordinary availability checks before applying state narrowing.
+    async fn get_available_tool_ids_snapshot(&self) -> Result<AvailableToolIdsSnapshot> {
         let scope_override = self.runtime_control.tool_scope_override.read().clone();
-        self.get_available_tool_ids_for_scope(scope_override.as_deref())
+        self.get_available_tool_ids_snapshot_for_scope(scope_override.as_deref())
             .await
     }
 
-    /// Applies state narrowing to the supplied top-level scope instead of reading mutable control again.
-    async fn get_available_tool_ids_for_scope(
+    /// Applies every explicit ancestor and current-state scope to one runtime snapshot and retains its state generation.
+    async fn get_available_tool_ids_snapshot_for_scope(
         &self,
         scope_override: Option<&[String]>,
-    ) -> Result<Vec<String>> {
-        let top_level = self.get_top_level_tool_ids_for_scope(scope_override);
-        if top_level.is_empty() {
-            return Ok(Vec::new());
+    ) -> Result<AvailableToolIdsSnapshot> {
+        let mut available = self.get_top_level_tool_ids_for_scope(scope_override);
+        let (state_generation, state_scopes) = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| {
+                let (generation, scopes) = state_machine.current_tool_scope_snapshot();
+                (Some(generation), scopes)
+            })
+            .unwrap_or((None, Vec::new()));
+
+        if available.is_empty() || state_scopes.is_empty() {
+            return Ok(AvailableToolIdsSnapshot {
+                tool_ids: available,
+                state_generation,
+            });
         }
 
-        match self.get_current_tool_refs() {
-            Some(tool_refs) => {
-                if tool_refs.is_empty() {
-                    return Ok(Vec::new());
-                }
+        let eval_ctx = self.build_evaluation_context().await?;
+        let llm_getter = RegistryLLMGetter {
+            registry: self.llm_registry.clone(),
+        };
+        let evaluator = ConditionEvaluator::new(llm_getter);
 
-                let eval_ctx = self.build_evaluation_context().await?;
-                let llm_getter = RegistryLLMGetter {
-                    registry: self.llm_registry.clone(),
+        for state_scope in state_scopes {
+            if state_scope.is_empty() {
+                available.clear();
+                break;
+            }
+
+            let mut allowed = HashSet::new();
+            for tool_ref in &state_scope {
+                let tool_id = tool_ref.id();
+                let Some(canonical_id) = self.tools.canonical_id(tool_id) else {
+                    continue;
                 };
-                let evaluator = ConditionEvaluator::new(llm_getter);
-
-                let mut available = Vec::new();
-                for tool_ref in &tool_refs {
-                    let tool_id = tool_ref.id();
-                    let Some(canonical_id) = self.tools.canonical_id(tool_id) else {
-                        continue;
-                    };
-                    if !top_level.iter().any(|id| id == &canonical_id) {
-                        debug!(tool = %canonical_id, "Tool not in top-level grant, skipping");
-                        continue;
-                    }
-
-                    if let Some(condition) = tool_ref.condition() {
-                        match evaluator.evaluate(condition, &eval_ctx).await {
-                            Ok(true) => {
-                                available.push(canonical_id);
-                            }
-                            Ok(false) => {
-                                debug!(tool = tool_id, "Tool condition not met, skipping");
-                            }
-                            Err(e) => {
-                                warn!(tool = tool_id, error = %e, "Error evaluating tool condition");
-                            }
+                let condition_matches = if let Some(condition) = tool_ref.condition() {
+                    match evaluator.evaluate(condition, &eval_ctx).await {
+                        Ok(matches) => matches,
+                        Err(error) => {
+                            warn!(tool = tool_id, error = %error, "Error evaluating tool condition");
+                            false
                         }
-                    } else {
-                        available.push(canonical_id);
                     }
+                } else {
+                    true
+                };
+                if condition_matches {
+                    allowed.insert(canonical_id);
+                } else {
+                    debug!(tool = tool_id, "Tool condition not met, skipping");
                 }
-
-                Ok(available)
             }
-            None => Ok(top_level),
-        }
-    }
-
-    /// Returns `Some(tools)` if the current state explicitly declares tools
-    /// (including `Some([])` for "no tools"), or `None` if the state doesn't
-    /// specify tools (meaning: fall back to agent-level declared_tool_ids).
-    fn get_current_tool_refs(&self) -> Option<Vec<ToolRef>> {
-        if let Some(ref sm) = self.state_machine
-            && let Some(state_def) = sm.current_definition()
-        {
-            let parent_def = sm.get_parent_definition();
-            if let Some(effective) = state_def.get_effective_tools(parent_def.as_ref()) {
-                return Some(effective.into_iter().cloned().collect());
+            available.retain(|canonical_id| allowed.contains(canonical_id));
+            if available.is_empty() {
+                break;
             }
         }
-        None
+
+        Ok(AvailableToolIdsSnapshot {
+            tool_ids: available,
+            state_generation,
+        })
     }
 
     async fn build_evaluation_context(&self) -> Result<EvaluationContext> {
@@ -4151,6 +4194,10 @@ impl RuntimeAgent {
             policy: self.active_tool_security().policy_version(),
             registry: self.tools.version(),
             runtime_control: self.runtime_control.version.load(Ordering::SeqCst),
+            state: self
+                .state_machine
+                .as_ref()
+                .map(|state_machine| state_machine.generation()),
         };
         self.record_from_parts_at(
             request,
@@ -4456,8 +4503,12 @@ impl RuntimeAgent {
 
         let canonical_id = resolved.identity.canonical_id.clone();
 
-        let available_tool_ids = self.get_available_tool_ids().await?;
-        if !available_tool_ids.iter().any(|id| id == &canonical_id) {
+        let initial_scope_snapshot = self.get_available_tool_ids_snapshot().await?;
+        if !initial_scope_snapshot
+            .tool_ids
+            .iter()
+            .any(|id| id == &canonical_id)
+        {
             let record = self.record_from_parts(
                 &request,
                 canonical_id.clone(),
@@ -5182,6 +5233,7 @@ impl RuntimeAgent {
                 confirmation_required: approval_confirmation_required,
                 policy_version: security_engine.policy_version(),
                 runtime_control_version: approval_control_snapshot.version,
+                state_generation: initial_scope_snapshot.state_generation,
                 reviewed_tool: Arc::clone(&resolved.tool),
             })
         });
@@ -5193,10 +5245,11 @@ impl RuntimeAgent {
         let control_snapshot = self.runtime_safety_snapshot();
         let resolved = self.tools.resolve(&request.requested_name);
         let registry_version = self.tools.version();
-        let versions = ToolDecisionVersions {
+        let mut versions = ToolDecisionVersions {
             policy: control_snapshot.tool_security.policy_version(),
             registry: registry_version,
             runtime_control: control_snapshot.version,
+            state: None,
         };
         metadata.insert(
             "runtime_scope_snapshot".to_string(),
@@ -5268,7 +5321,8 @@ impl RuntimeAgent {
         let final_denial = |canonical_id: String,
                             output: String,
                             policy: ToolPolicyDecisionRecord,
-                            metadata: HashMap<String, Value>| {
+                            metadata: HashMap<String, Value>,
+                            decision_versions: ToolDecisionVersions| {
             self.record_from_parts_at(
                 &request,
                 canonical_id,
@@ -5283,7 +5337,7 @@ impl RuntimeAgent {
                 approval_record.clone(),
                 false,
                 false,
-                versions,
+                decision_versions,
             )
         };
 
@@ -5294,19 +5348,32 @@ impl RuntimeAgent {
                 reason.clone(),
                 ToolPolicyDecisionRecord::deny(reason),
                 metadata,
+                versions,
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
         }
 
-        let available_tool_ids = self
-            .get_available_tool_ids_for_scope(control_snapshot.tool_scope_override.as_deref())
+        //
+        // Final scope evaluation uses the same post-HITL runtime snapshot and captures state authority before locks.
+        // Admission must reject any later state transition, reset, or restore before consuming rate capacity or invoking the tool.
+        //
+        let available_snapshot = self
+            .get_available_tool_ids_snapshot_for_scope(
+                control_snapshot.tool_scope_override.as_deref(),
+            )
             .await?;
+        versions.state = available_snapshot.state_generation;
         metadata.insert(
             "available_tool_ids_snapshot".to_string(),
-            serde_json::to_value(&available_tool_ids).unwrap_or(Value::Null),
+            serde_json::to_value(&available_snapshot.tool_ids).unwrap_or(Value::Null),
         );
-        if !available_tool_ids
+        metadata.insert(
+            "state_generation_snapshot".to_string(),
+            serde_json::to_value(available_snapshot.state_generation).unwrap_or(Value::Null),
+        );
+        if !available_snapshot
+            .tool_ids
             .iter()
             .any(|tool_id| tool_id == &canonical_id)
         {
@@ -5319,6 +5386,7 @@ impl RuntimeAgent {
                 reason.clone(),
                 ToolPolicyDecisionRecord::deny(reason),
                 metadata,
+                versions,
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
@@ -5338,6 +5406,7 @@ impl RuntimeAgent {
                     format!("Denied: {}", reason),
                     ToolPolicyDecisionRecord::deny(reason.clone()),
                     metadata,
+                    versions,
                 );
                 self.finish_tool_record(&record).await;
                 return Ok(record);
@@ -5348,6 +5417,7 @@ impl RuntimeAgent {
                     format!("Unavailable: {}", reason),
                     ToolPolicyDecisionRecord::unavailable(reason.clone()),
                     metadata,
+                    versions,
                 );
                 self.finish_tool_record(&record).await;
                 return Ok(record);
@@ -5379,6 +5449,7 @@ impl RuntimeAgent {
                 reason.clone(),
                 ToolPolicyDecisionRecord::deny(reason),
                 metadata,
+                versions,
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
@@ -5390,6 +5461,7 @@ impl RuntimeAgent {
                 reason.clone(),
                 ToolPolicyDecisionRecord::approval(reason),
                 metadata,
+                versions,
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
@@ -5413,6 +5485,7 @@ impl RuntimeAgent {
                 reason.to_string(),
                 ToolPolicyDecisionRecord::unavailable(reason),
                 metadata,
+                versions,
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
@@ -5430,14 +5503,22 @@ impl RuntimeAgent {
                 reason.clone(),
                 ToolPolicyDecisionRecord::deny(reason),
                 metadata,
+                versions,
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
         };
 
-        // Policy updates after admission apply to later calls, while emergency cancellation remains live for this call.
-        let admission =
-            self.admit_tool_execution(versions.runtime_control, versions.policy, &canonical_id);
+        //
+        // The lock-held admission is the last authority boundary. Runtime, policy, and state generations must still match before the one atomic rate admission.
+        // Updates after admission apply to later calls, while emergency cancellation remains live for this call.
+        //
+        let admission = self.admit_tool_execution(
+            versions.runtime_control,
+            versions.policy,
+            versions.state,
+            &canonical_id,
+        );
         if !matches!(admission, SecurityCheckResult::Allow) {
             let latest_control = self.runtime_safety_snapshot();
             let reason = admission
@@ -5467,6 +5548,10 @@ impl RuntimeAgent {
                     policy: latest_control.tool_security.policy_version(),
                     registry: versions.registry,
                     runtime_control: latest_control.version,
+                    state: self
+                        .state_machine
+                        .as_ref()
+                        .map(|state_machine| state_machine.generation()),
                 },
             );
             self.finish_tool_record_after_resource_guards(resource_guards, &record)
@@ -13889,6 +13974,7 @@ mod tests {
             policy: 2,
             registry: 3,
             runtime_control: 4,
+            state: Some(5),
         };
         let binding = ToolApprovalBinding {
             canonical_id: "context_echo".to_string(),
@@ -13896,6 +13982,7 @@ mod tests {
             confirmation_required: true,
             policy_version: versions.policy,
             runtime_control_version: versions.runtime_control,
+            state_generation: versions.state,
             reviewed_tool,
         };
 
@@ -14297,6 +14384,10 @@ spawner:
             &parent.resource_locks,
             &spawned.agent.resource_locks
         ));
+        assert!(!Arc::ptr_eq(
+            &parent.runtime_control,
+            &spawned.agent.runtime_control
+        ));
 
         let parent_call = {
             let parent = Arc::clone(&parent);
@@ -14561,6 +14652,54 @@ spawner:
         assert_eq!(record.policy.outcome, PermissionOutcome::Unavailable);
         assert_eq!(max_active.load(Ordering::SeqCst), 0);
         assert!(record.metadata.contains_key("policy_snapshot"));
+    }
+
+    #[test]
+    fn invalid_live_policy_does_not_replace_snapshot_or_generation() {
+        let agent = AgentBuilder::new()
+            .system_prompt("Test runtime policy validation.")
+            .llm(Arc::new(mock_with_response("done")))
+            .build()
+            .unwrap();
+        let control = agent.runtime_control();
+        let mut valid = ToolSecurityConfig::default();
+        valid.tools.insert(
+            "web_search".to_string(),
+            ai_agents_tools::ToolPolicyConfig {
+                max_results: Some(5),
+                ..Default::default()
+            },
+        );
+        let generation = control.try_set_tool_security(valid).unwrap();
+
+        let mut invalid = ToolSecurityConfig::default();
+        invalid.tools.insert(
+            "web_search".to_string(),
+            ai_agents_tools::ToolPolicyConfig {
+                max_results: Some(0),
+                ..Default::default()
+            },
+        );
+        let error = control.try_set_tool_security(invalid).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("max_results must be greater than 0")
+        );
+        assert_eq!(control.version(), generation);
+        assert_eq!(
+            control
+                .state
+                .tool_security_override
+                .read()
+                .as_ref()
+                .unwrap()
+                .config()
+                .tools["web_search"]
+                .max_results,
+            Some(5)
+        );
     }
 
     #[tokio::test]
@@ -15298,6 +15437,345 @@ system_prompt: "You are helpful."
 
         let available = agent.get_available_tool_ids().await.unwrap();
         assert!(available.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_scope_cannot_widen_omitted_or_empty_yaml_grants() {
+        for tools in ["", "tools: []"] {
+            let yaml = format!(
+                r#"
+name: RuntimeScopeNoGrantAgent
+system_prompt: "No ordinary tools are granted."
+{tools}
+"#
+            );
+            let agent = AgentBuilder::from_yaml(&yaml)
+                .unwrap()
+                .llm(Arc::new(mock_with_response("done")))
+                .auto_configure_features()
+                .unwrap()
+                .build()
+                .unwrap();
+
+            agent
+                .runtime_control()
+                .set_tool_scope(vec!["calculator".to_string()]);
+
+            assert!(agent.get_available_tool_ids().await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_scope_widening_attempt_keeps_only_declared_tools() {
+        let yaml = r#"
+name: RuntimeScopeWideningAgent
+system_prompt: "Runtime scope cannot add authority."
+tools: [calculator]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("done")))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        agent
+            .runtime_control()
+            .set_tool_scope(vec!["calculator".to_string(), "datetime".to_string()]);
+
+        assert_eq!(
+            agent.get_available_tool_ids().await.unwrap(),
+            vec!["calculator".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_scope_is_canonical_unique_ordered_and_clear_restores_declared_grant() {
+        let yaml = r#"
+name: RuntimeScopeIntersectionAgent
+system_prompt: "Use only declared tools."
+tools: [calculator, datetime]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("done")))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut aliases = ai_agents_tools::ToolAliases::default();
+        aliases
+            .names
+            .insert("en".to_string(), "calculate_alias".to_string());
+        agent.tools.set_tool_aliases("calculator", aliases);
+        let control = agent.runtime_control();
+
+        control.set_tool_scope(vec![
+            "datetime".to_string(),
+            "calculate_alias".to_string(),
+            "calculator".to_string(),
+            "unknown".to_string(),
+            "datetime".to_string(),
+        ]);
+        assert_eq!(
+            agent.get_available_tool_ids().await.unwrap(),
+            vec!["calculator".to_string(), "datetime".to_string()]
+        );
+
+        control.set_tool_scope(vec!["datetime".to_string()]);
+        assert_eq!(
+            agent.get_available_tool_ids().await.unwrap(),
+            vec!["datetime".to_string()]
+        );
+
+        control.clear_tool_scope_override();
+        assert_eq!(
+            agent.get_available_tool_ids().await.unwrap(),
+            vec!["calculator".to_string(), "datetime".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_scope_preserves_programmatic_registration_as_declared_grant() {
+        let agent = AgentBuilder::new()
+            .system_prompt("Use registered tools.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ContextEchoTool))
+            .tool(Arc::new(SlowTool))
+            .build()
+            .unwrap();
+
+        agent.runtime_control().set_tool_scope(vec![
+            "Context Echo".to_string(),
+            "context_echo".to_string(),
+            "unknown".to_string(),
+        ]);
+
+        assert_eq!(
+            agent.get_available_tool_ids().await.unwrap(),
+            vec!["context_echo".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_state_scopes_intersect_every_ancestor_with_aliases() {
+        let yaml = r#"
+name: NestedStateScopeAgent
+system_prompt: "Honor every state scope."
+tools: [calculator, datetime, echo]
+states:
+  initial: root
+  states:
+    root:
+      tools: [calculate_alias, datetime]
+      initial: middle
+      states:
+        middle:
+          initial: leaf
+          states:
+            leaf:
+              tools: [datetime_alias, echo]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("done")))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut calculator_aliases = ai_agents_tools::ToolAliases::default();
+        calculator_aliases
+            .names
+            .insert("en".to_string(), "calculate_alias".to_string());
+        agent
+            .tools
+            .set_tool_aliases("calculator", calculator_aliases);
+        let mut datetime_aliases = ai_agents_tools::ToolAliases::default();
+        datetime_aliases
+            .names
+            .insert("en".to_string(), "datetime_alias".to_string());
+        agent.tools.set_tool_aliases("datetime", datetime_aliases);
+        agent.runtime_control().set_tool_scope(vec![
+            "unknown".to_string(),
+            "datetime_alias".to_string(),
+            "calculate_alias".to_string(),
+            "datetime".to_string(),
+        ]);
+
+        assert_eq!(agent.current_state().as_deref(), Some("root.middle.leaf"));
+        assert_eq!(
+            agent.get_available_tool_ids().await.unwrap(),
+            vec!["datetime".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestor_empty_state_scope_denies_omitted_descendants() {
+        let yaml = r#"
+name: NestedEmptyStateScopeAgent
+system_prompt: "An empty ancestor scope denies all tools."
+tools: [calculator]
+states:
+  initial: root
+  states:
+    root:
+      tools: []
+      initial: middle
+      states:
+        middle:
+          initial: leaf
+          states:
+            leaf: {}
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("done")))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(agent.get_available_tool_ids().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn state_change_during_approval_invalidates_the_reviewed_authority() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let handler = Arc::new(BlockingApprovalHandler {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            result: ApprovalResult::Approved,
+        });
+        let yaml = r#"
+name: ApprovalStateGenerationAgent
+system_prompt: "State authority may change during approval."
+tools: [locked_write]
+states:
+  initial: first
+  states:
+    first:
+      tools: [locked_write]
+    second:
+      tools: [locked_write]
+"#;
+        let agent = Arc::new(
+            AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(LockedWriteTool {
+                    active: Arc::clone(&active),
+                    max_active: Arc::clone(&max_active),
+                }))
+                .tool_security(ToolSecurityEngine::new(approval_security_config(true)))
+                .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+                .approval_handler(handler)
+                .build()
+                .unwrap(),
+        );
+        let running = Arc::clone(&agent);
+        let call = tokio::spawn(async move {
+            running
+                .invoke_tool(ToolExecutionRequest::new(
+                    "approval-state-generation",
+                    "locked_write",
+                    serde_json::json!({"path": "./state-generation.txt"}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+
+        entered.wait().await;
+        agent.transition_to("second").await.unwrap();
+        release.notify_one();
+        let record = call.await.unwrap();
+
+        assert!(!record.executed);
+        assert!(record.output.contains("Approval became stale"));
+        assert_eq!(max_active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn state_change_while_waiting_for_resource_lock_fails_final_admission() {
+        let holder_gate = PathMutationGate::new();
+        let waiter_gate = PathMutationGate::new();
+        let yaml = r#"
+name: LockedStateGenerationAgent
+system_prompt: "State authority must remain stable through admission."
+tools: [state_lock_holder, state_lock_waiter]
+states:
+  initial: first
+  states:
+    first:
+      tools: [state_lock_holder, state_lock_waiter]
+    second:
+      tools: [state_lock_holder, state_lock_waiter]
+"#;
+        let agent = Arc::new(
+            AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "state_lock_holder",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: holder_gate.clone(),
+                }))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "state_lock_waiter",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: waiter_gate.clone(),
+                }))
+                .build()
+                .unwrap(),
+        );
+        let holder_call = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "state-lock-holder",
+                        "state_lock_holder",
+                        serde_json::json!({"path": "./shared-state-path.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+        holder_gate.wait_until_entered().await;
+        let waiter_call = {
+            let agent = Arc::clone(&agent);
+            tokio::spawn(async move {
+                agent
+                    .invoke_tool(ToolExecutionRequest::new(
+                        "state-lock-waiter",
+                        "state_lock_waiter",
+                        serde_json::json!({"path": "./shared-state-path.txt"}),
+                        ToolCallSource::Manual,
+                    ))
+                    .await
+                    .unwrap()
+            })
+        };
+
+        wait_for_resource_lock_strong_count(&agent.resource_locks, 2).await;
+        agent.transition_to("second").await.unwrap();
+        holder_gate.release();
+        let holder_record = holder_call.await.unwrap();
+        let waiter_record = waiter_call.await.unwrap();
+
+        assert!(holder_record.success);
+        assert!(!waiter_record.executed);
+        assert!(
+            waiter_record
+                .output
+                .contains("state scope changed before admission")
+        );
+        assert!(!waiter_gate.entered.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-use ai_agents_core::PermissionOutcome;
+use ai_agents_core::{AgentError, PermissionOutcome, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -27,6 +27,26 @@ impl Default for ToolSecurityConfig {
             default_timeout_ms: default_tool_timeout(),
             tools: HashMap::new(),
         }
+    }
+}
+
+impl ToolSecurityConfig {
+    /// Validates policy values that have a framework-wide semantic domain.
+    pub fn validate(&self) -> Result<()> {
+        let mut invalid_paths: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|(_, policy)| policy.max_results == Some(0))
+            .map(|(tool_id, _)| format!("tool_security.tools.{tool_id}.max_results"))
+            .collect();
+        invalid_paths.sort();
+        if invalid_paths.is_empty() {
+            return Ok(());
+        }
+        Err(AgentError::Config(format!(
+            "{} must be greater than 0",
+            invalid_paths.join(", ")
+        )))
     }
 }
 
@@ -451,5 +471,39 @@ tools:
         assert!(policy.enabled);
         assert!(!policy.require_confirmation);
         assert!(policy.rate_limit.is_none());
+    }
+
+    #[test]
+    fn max_results_must_be_positive() {
+        let mut config = ToolSecurityConfig::default();
+        config.tools.insert(
+            "web_search".to_string(),
+            ToolPolicyConfig {
+                max_results: Some(0),
+                ..Default::default()
+            },
+        );
+        let error = config.validate().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tool_security.tools.web_search.max_results must be greater than 0")
+        );
+
+        config.tools.get_mut("web_search").unwrap().max_results = Some(1);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn zero_redirect_limit_remains_valid() {
+        let mut config = ToolSecurityConfig::default();
+        config.tools.insert(
+            "web_fetch".to_string(),
+            ToolPolicyConfig {
+                max_redirects: Some(0),
+                ..Default::default()
+            },
+        );
+        assert!(config.validate().is_ok());
     }
 }

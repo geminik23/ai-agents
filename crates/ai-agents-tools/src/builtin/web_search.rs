@@ -49,7 +49,11 @@ struct WebSearchInput {
     /// Search query sent to the host provider.
     query: String,
     /// Maximum result count requested by the model. Defaults to 5.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::deserialize_optional_positive_usize"
+    )]
+    #[schemars(range(min = 1))]
     max_results: Option<usize>,
     /// Optional result-domain filters such as docs.rs or rust-lang.org.
     #[serde(default)]
@@ -128,11 +132,13 @@ impl Tool for WebSearchTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        if let Err(error) = crate::validate_positive_max_results(ctx.limits.max_results) {
+            return ToolResult::error(format!("Invalid result limit: {error}"));
+        }
         let max_results = input
             .max_results
             .unwrap_or(DEFAULT_MAX_RESULTS)
-            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS))
-            .max(1);
+            .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS));
         let request = WebSearchRequest {
             query: input.query.clone(),
             max_results: Some(max_results),
@@ -184,8 +190,78 @@ fn result_from_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{StaticWebSearchProvider, WebSearchResultItem};
+    use crate::types::{StaticWebSearchProvider, WebSearchProvider, WebSearchResultItem};
+    use parking_lot::Mutex;
     use std::collections::HashMap;
+
+    struct RecordingProvider {
+        max_results: Mutex<Vec<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl WebSearchProvider for RecordingProvider {
+        async fn search(&self, request: WebSearchRequest) -> WebSearchResponse {
+            self.max_results
+                .lock()
+                .push(request.max_results.unwrap_or_default());
+            WebSearchResponse {
+                available: true,
+                ..Default::default()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn max_results_rejects_zero_and_preserves_positive_caps() {
+        let provider = Arc::new(RecordingProvider {
+            max_results: Mutex::new(Vec::new()),
+        });
+        let slot = Arc::new(RwLock::new(
+            Arc::clone(&provider) as Arc<dyn crate::types::WebSearchProvider>
+        ));
+        let tool = WebSearchTool::with_provider_slot(slot);
+
+        let zero_request = tool
+            .execute(
+                serde_json::json!({"query": "rust", "max_results": 0}),
+                ToolExecutionContext::test("web_search"),
+            )
+            .await;
+        assert!(!zero_request.success);
+        assert!(
+            zero_request
+                .output
+                .contains("max_results must be greater than 0")
+        );
+
+        let mut zero_context = ToolExecutionContext::test("web_search");
+        zero_context.limits.max_results = Some(0);
+        let invalid_context = tool
+            .execute(serde_json::json!({"query": "rust"}), zero_context)
+            .await;
+        assert!(!invalid_context.success);
+
+        let mut capped_context = ToolExecutionContext::test("web_search");
+        capped_context.limits.max_results = Some(2);
+        assert!(
+            tool.execute(
+                serde_json::json!({"query": "rust", "max_results": 4}),
+                capped_context.clone(),
+            )
+            .await
+            .success
+        );
+        assert!(
+            tool.execute(
+                serde_json::json!({"query": "rust", "max_results": 1}),
+                capped_context,
+            )
+            .await
+            .success
+        );
+
+        assert_eq!(*provider.max_results.lock(), vec![2, 1]);
+    }
 
     #[tokio::test]
     async fn static_provider_returns_bounded_results() {

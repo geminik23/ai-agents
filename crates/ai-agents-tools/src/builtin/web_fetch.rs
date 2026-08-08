@@ -40,7 +40,9 @@ pub struct WebFetchTransportResponse {
     pub body: Vec<u8>,
 }
 
-/// Sends HTTP requests without applying URL or redirect policy.
+/// Sends one HTTP response per call without applying URL or redirect policy.
+/// Implementations must not follow redirects automatically because `WebFetchTool` validates every hop.
+/// Implementations that open sockets must enforce approved addresses and `max_response_bytes` while reading each response.
 #[async_trait]
 pub trait WebFetchTransport: Send + Sync {
     async fn send(
@@ -403,16 +405,11 @@ impl Tool for WebFetchTool {
                     .max_response_bytes
                     .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES * 8),
             );
-        let max_redirects = input
-            .max_redirects
-            .or(policy.max_redirects)
-            .unwrap_or(DEFAULT_MAX_REDIRECTS)
-            .min(DEFAULT_MAX_REDIRECTS * 4)
-            .min(
-                ctx.limits
-                    .max_redirects
-                    .unwrap_or(DEFAULT_MAX_REDIRECTS * 4),
-            );
+        let max_redirects = effective_max_redirects(
+            input.max_redirects,
+            policy.max_redirects,
+            ctx.limits.max_redirects,
+        );
         let cache_ttl = input.cache_ttl_seconds.unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
 
         let original_url = match reqwest::Url::parse(&input.url) {
@@ -425,11 +422,12 @@ impl Tool for WebFetchTool {
             return result;
         }
         let cache_key = format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             input.url,
             input.prompt.as_deref().unwrap_or(""),
             max_output_chars,
             max_response_bytes,
+            max_redirects,
             policy_cache_fingerprint(&policy)
         );
         if cache_ttl > 0 {
@@ -437,18 +435,24 @@ impl Tool for WebFetchTool {
             if let Some(entry) = cached_entry
                 && Instant::now() < entry.expires_at
             {
-                if let Err(result) = validate_cached_output_with_policy(
+                match validate_cached_output_with_policy(
                     &entry.output,
                     &policy,
+                    max_redirects,
                     self.resolver.as_ref(),
                 )
                 .await
                 {
-                    return result;
+                    Ok(true) => {
+                        let mut output = entry.output;
+                        output.from_cache = true;
+                        return web_result(&output, output.truncated, max_output_chars, true, None);
+                    }
+                    Ok(false) => {
+                        self.cache.write().remove(&cache_key);
+                    }
+                    Err(result) => return result,
                 }
-                let mut output = entry.output;
-                output.from_cache = true;
-                return web_result(&output, output.truncated, max_output_chars, true, None);
             }
         }
 
@@ -484,6 +488,12 @@ impl Tool for WebFetchTool {
                 Ok(response) => response,
                 Err(error) => return ToolResult::error(error),
             };
+            if response.body.len() > max_response_bytes {
+                return ToolResult::error(format!(
+                    "Response exceeded max_response_bytes {}",
+                    max_response_bytes
+                ));
+            }
             if (300..400).contains(&response.status) {
                 if redirects.len() >= max_redirects {
                     return ToolResult::error("Redirect limit exceeded");
@@ -506,12 +516,6 @@ impl Tool for WebFetchTool {
 
         let status = response.status;
         let content_type = response.content_type;
-        if response.body.len() > max_response_bytes {
-            return ToolResult::error(format!(
-                "Response exceeded max_response_bytes {}",
-                max_response_bytes
-            ));
-        }
         if ctx.cancellation.is_cancelled() {
             return ToolResult::error(
                 ctx.cancellation
@@ -597,11 +601,16 @@ async fn validate_url_with_policy(
     Ok(target)
 }
 
+// Redirect-count incompatibility is a safe cache miss, while current URL or address policy failures remain hard errors.
 async fn validate_cached_output_with_policy(
     output: &WebFetchOutput,
     policy: &WebFetchPolicyInput,
+    max_redirects: usize,
     resolver: &dyn WebFetchResolver,
-) -> Result<(), ToolResult> {
+) -> Result<bool, ToolResult> {
+    if output.redirects.len() > max_redirects {
+        return Ok(false);
+    }
     let final_url = reqwest::Url::parse(&output.final_url)
         .map_err(|error| ToolResult::error(format!("Cached final URL is invalid: {}", error)))?;
     let _ = validate_url_with_policy(&final_url, Some(policy), resolver).await?;
@@ -611,7 +620,20 @@ async fn validate_cached_output_with_policy(
         })?;
         let _ = validate_url_with_policy(&url, Some(policy), resolver).await?;
     }
-    Ok(())
+    Ok(true)
+}
+
+fn effective_max_redirects(
+    request_limit: Option<usize>,
+    policy_limit: Option<usize>,
+    context_limit: Option<usize>,
+) -> usize {
+    [request_limit, policy_limit, context_limit]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(DEFAULT_MAX_REDIRECTS)
+        .min(DEFAULT_MAX_REDIRECTS * 4)
 }
 
 fn policy_cache_fingerprint(policy: &WebFetchPolicyInput) -> String {
@@ -1005,6 +1027,13 @@ mod tests {
     struct FixtureResolver {
         addresses: HashMap<String, Vec<IpAddr>>,
         default: Vec<IpAddr>,
+        requests: RwLock<Vec<String>>,
+    }
+
+    impl FixtureResolver {
+        fn requests(&self) -> Vec<String> {
+            self.requests.read().clone()
+        }
     }
 
     impl Default for FixtureResolver {
@@ -1012,6 +1041,7 @@ mod tests {
             Self {
                 addresses: HashMap::new(),
                 default: vec![IpAddr::from([93, 184, 216, 34])],
+                requests: RwLock::new(Vec::new()),
             }
         }
     }
@@ -1019,6 +1049,7 @@ mod tests {
     #[async_trait]
     impl WebFetchResolver for FixtureResolver {
         async fn resolve(&self, host: &str, _port: u16) -> Result<Vec<IpAddr>, String> {
+            self.requests.write().push(host.to_string());
             Ok(self
                 .addresses
                 .get(host)
@@ -1354,6 +1385,303 @@ mod tests {
         assert_eq!(transport.requests().len(), 1);
         assert_eq!(output(&first)["from_cache"], false);
         assert_eq!(output(&second)["from_cache"], true);
+    }
+
+    #[test]
+    fn effective_redirect_limit_uses_the_strictest_supplied_value() {
+        assert_eq!(effective_max_redirects(None, None, None), 5);
+        assert_eq!(effective_max_redirects(Some(10), Some(3), Some(4)), 3);
+        assert_eq!(effective_max_redirects(Some(0), Some(5), None), 0);
+        assert_eq!(effective_max_redirects(Some(99), None, None), 20);
+    }
+
+    #[tokio::test]
+    async fn stricter_request_redirect_limit_uses_a_fresh_request_and_fails() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("/middle"), ""),
+        );
+        transport.route(
+            "https://public.test/middle",
+            response(302, None, Some("/final"), ""),
+        );
+        transport.route(
+            "https://public.test/final",
+            response(200, Some("text/plain"), None, "done"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+
+        let first = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/start",
+                    "cache_ttl_seconds": 60,
+                    "max_redirects": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let second = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/start",
+                    "cache_ttl_seconds": 60,
+                    "max_redirects": 1
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(first.success);
+        assert!(!second.success);
+        assert!(second.output.contains("Redirect limit exceeded"));
+        assert_eq!(
+            transport.requests(),
+            vec![
+                "https://public.test/start".to_string(),
+                "https://public.test/middle".to_string(),
+                "https://public.test/final".to_string(),
+                "https://public.test/start".to_string(),
+                "https://public.test/middle".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_redirect_limit_reuses_direct_response_but_rejects_redirects() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/direct",
+            response(200, Some("text/plain"), None, "direct"),
+        );
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("/final"), ""),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+        let direct_args = serde_json::json!({
+            "url": "https://public.test/direct",
+            "cache_ttl_seconds": 60,
+            "max_redirects": 0
+        });
+
+        let direct_first = tool
+            .execute(
+                direct_args.clone(),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let direct_second = tool
+            .execute(
+                direct_args,
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let redirected = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/start",
+                    "cache_ttl_seconds": 60,
+                    "max_redirects": 0
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(direct_first.success && direct_second.success);
+        assert_eq!(output(&direct_second)["from_cache"], true);
+        assert!(!redirected.success);
+        assert!(redirected.output.contains("Redirect limit exceeded"));
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn policy_and_context_redirect_limits_participate_in_cache_separation() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("/final"), ""),
+        );
+        transport.route(
+            "https://public.test/final",
+            response(200, Some("text/plain"), None, "done"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+        let args = serde_json::json!({
+            "url": "https://public.test/start",
+            "cache_ttl_seconds": 60
+        });
+        let mut permissive = ai_agents_core::ToolExecutionContext::test("web_fetch");
+        permissive.policy_snapshot = serde_json::json!({"max_redirects": 5});
+        permissive.limits.max_redirects = Some(5);
+        let mut strict_policy = ai_agents_core::ToolExecutionContext::test("web_fetch");
+        strict_policy.policy_snapshot = serde_json::json!({"max_redirects": 0});
+        let mut strict_context = ai_agents_core::ToolExecutionContext::test("web_fetch");
+        strict_context.limits.max_redirects = Some(0);
+
+        let first = tool.execute(args.clone(), permissive).await;
+        let policy_result = tool.execute(args.clone(), strict_policy).await;
+        let context_result = tool.execute(args, strict_context).await;
+
+        assert!(first.success);
+        assert!(!policy_result.success);
+        assert!(!context_result.success);
+        assert!(policy_result.output.contains("Redirect limit exceeded"));
+        assert!(context_result.output.contains("Redirect limit exceeded"));
+        assert_eq!(transport.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn compatible_cache_hit_revalidates_dns_without_transport_request() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/cached",
+            response(200, Some("text/plain"), None, "cached"),
+        );
+        let resolver = Arc::new(FixtureResolver::default());
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::clone(&resolver) as Arc<dyn WebFetchResolver>,
+        );
+        let args = serde_json::json!({
+            "url": "https://public.test/cached",
+            "cache_ttl_seconds": 60,
+            "max_redirects": 0
+        });
+
+        let first = tool
+            .execute(
+                args.clone(),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let second = tool
+            .execute(
+                args,
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(first.success && second.success);
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(resolver.requests().len(), 4);
+        assert_eq!(output(&second)["from_cache"], true);
+    }
+
+    #[tokio::test]
+    async fn cache_separates_output_and_response_byte_caps() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/capped",
+            response(200, Some("text/plain"), None, "abcdef"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+
+        let first = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/capped",
+                    "cache_ttl_seconds": 60,
+                    "max_chars": 6,
+                    "max_response_bytes": 6
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let narrower_output = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/capped",
+                    "cache_ttl_seconds": 60,
+                    "max_chars": 3,
+                    "max_response_bytes": 6
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+        let narrower_response = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/capped",
+                    "cache_ttl_seconds": 60,
+                    "max_chars": 6,
+                    "max_response_bytes": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(first.success && narrower_output.success);
+        assert_eq!(output(&narrower_output)["content"], "abc");
+        assert_eq!(output(&narrower_output)["truncated"], true);
+        assert!(!narrower_response.success);
+        assert!(narrower_response.output.contains("max_response_bytes 5"));
+        assert_eq!(transport.requests().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn oversized_redirect_body_is_rejected_before_following_location() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("/final"), "123456"),
+        );
+        transport.route(
+            "https://public.test/final",
+            response(200, Some("text/plain"), None, "done"),
+        );
+
+        let result = fixture_tool(Arc::clone(&transport))
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/start",
+                    "max_response_bytes": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("max_response_bytes 5"));
+        assert_eq!(transport.requests(), vec!["https://public.test/start"]);
+    }
+
+    #[tokio::test]
+    async fn cached_redirect_count_above_limit_is_a_safe_miss() {
+        let resolver = FixtureResolver::default();
+        let cached = WebFetchOutput {
+            url: "https://public.test/start".to_string(),
+            final_url: "https://public.test/final".to_string(),
+            status: 200,
+            content_type: Some("text/plain".to_string()),
+            content: "done".to_string(),
+            truncated: false,
+            from_cache: false,
+            redirects: vec!["https://public.test/final".to_string()],
+            extraction_prompt_used: false,
+            extraction_available: false,
+        };
+
+        let compatible = validate_cached_output_with_policy(
+            &cached,
+            &WebFetchPolicyInput::default(),
+            1,
+            &resolver,
+        )
+        .await
+        .unwrap();
+        let incompatible = validate_cached_output_with_policy(
+            &cached,
+            &WebFetchPolicyInput::default(),
+            0,
+            &resolver,
+        )
+        .await
+        .unwrap();
+
+        assert!(compatible);
+        assert!(!incompatible);
     }
 
     #[tokio::test]
