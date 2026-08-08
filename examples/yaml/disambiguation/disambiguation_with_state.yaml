@@ -14,9 +14,10 @@ description: "Disambiguation + state machine with intent-based deterministic rou
 # Flow: user input -> detector -> ambiguous + multiple intents
 #                  -> clarifier (options constrained to available_intents)
 #                  -> user picks -> resolved_intent set in context
-#                  -> state machine matches intent: field -> deterministic transition
+#                  -> state requires confirmation -> language-matched yes/no question
+#                  -> user confirms -> state machine matches intent: field -> deterministic transition
 #
-#       clear input -> detector -> confidence >= threshold -> normal LLM transition eval
+#       clear input -> detector -> confidence >= threshold -> normal LLM transition eval with no extra confirmation
 
 system_prompt: |
   You are a customer service assistant.
@@ -77,7 +78,7 @@ disambiguation:
 #   A state can declare its own `disambiguation:` block to override agent-level settings.
 #   Available override fields:
 #     threshold            - override the agent-level confidence cutoff
-#     require_confirmation - ask "Did you mean X?" even after clarification resolves
+#     require_confirmation - after ambiguous clarification resolves, ask a language-matched yes/no question before redispatch
 #     required_clarity     - list of fields that must be explicitly stated.
 #                            if the detector reports any of these in what_is_unclear, clarification is forced regardless of confidence score.
 states:
@@ -124,7 +125,9 @@ states:
     # threshold 0.95 (vs agent-level 0.7) flags even somewhat-clear messages like "pay them".
     # required_clarity: if the detector reports "amount" or "recipient" in what_is_unclear,
     # clarification is forced even if confidence is above the threshold.
-    # require_confirmation: after clarification resolves, the agent still asks "Did you mean X?"
+    # require_confirmation: after ambiguous clarification resolves, the router asks one language-matched yes/no question.
+    # The resolved request stays pending until the user confirms. Reset, restore, timeout, or state authority changes invalidate even in-flight results.
+    # Rejection cancels the request, while clear input is not asked again.
     payment:
       prompt: |
         The user wants to make a payment.
@@ -133,7 +136,7 @@ states:
         NEVER process a payment without the user saying yes or confirming.
       disambiguation:
         threshold: 0.95                  # override agent-level 0.7. nearly everything is flagged
-        require_confirmation: true       # ask "Did you mean X?" even after clarification
+        require_confirmation: true       # confirm a resolved ambiguity before redispatch. default: false
         required_clarity:
           - amount                       # must be explicitly stated
           - recipient                    # must be explicitly stated

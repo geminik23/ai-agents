@@ -22,6 +22,9 @@ pub type ClarificationQuestionFuture<'a> =
 pub type ClarificationParseFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ClarificationParseResult>> + Send + 'a>>;
 
+/// Boxed future used when observing semantic confirmation parsing before private classification.
+pub type ConfirmationParseFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+
 /// Runtime-provided hook for observing clarification calls without adding an observability dependency.
 pub trait ClarificationObserver: Send + Sync {
     /// Wraps clarification question generation with external instrumentation.
@@ -35,6 +38,14 @@ pub trait ClarificationObserver: Send + Sync {
         &'a self,
         future: ClarificationParseFuture<'a>,
     ) -> ClarificationParseFuture<'a>;
+
+    /// Wraps semantic confirmation parsing while preserving existing observer implementations.
+    fn observe_confirmation_parse<'a>(
+        &'a self,
+        future: ConfirmationParseFuture<'a>,
+    ) -> ConfirmationParseFuture<'a> {
+        future
+    }
 }
 
 /// LLM-based generator for clarification questions.
@@ -106,6 +117,120 @@ impl ClarificationGenerator {
         } else {
             run.await
         }
+    }
+
+    /// Generates a language-matched yes/no question for a resolved interpretation.
+    pub(crate) async fn generate_confirmation(
+        &self,
+        original_input: &str,
+        clarification_response: &str,
+        enriched_input: &str,
+    ) -> Result<ClarificationQuestion> {
+        let llm_alias = self.config.llm.as_deref().unwrap_or("router");
+        let llm = self.llm_registry.get(llm_alias).map_err(|_| {
+            AgentError::Config(format!("LLM '{}' not found for confirmation", llm_alias))
+        })?;
+        let prompt = format!(
+            r#"Original user request: "{}"
+
+The user clarified with: "{}"
+
+Resolved interpretation: "{}"
+
+Ask exactly one concise yes/no question that confirms the resolved interpretation before it is executed.
+Match the user's language based on the original request and clarification response.
+Do not add explanations, warnings, or new details.
+
+Respond in JSON format:
+{{
+  "question": "The confirmation question"
+}}
+
+Output ONLY valid JSON, no other text."#,
+            original_input, clarification_response, enriched_input
+        );
+        let messages = vec![
+            ChatMessage::system(
+                "You confirm resolved user intent before execution. Match the user's language and respond only with valid JSON.",
+            ),
+            ChatMessage::user(&prompt),
+        ];
+
+        let run: ClarificationQuestionFuture<'_> = Box::pin(async move {
+            let response = llm
+                .complete(&messages, None)
+                .await
+                .map_err(|e| AgentError::LLM(format!("Confirmation generation failed: {}", e)))?;
+            self.parse_confirmation_question(&response.content)
+        });
+
+        if let Some(observer) = self.observer.as_ref() {
+            observer.observe_question(run).await
+        } else {
+            run.await
+        }
+    }
+
+    /// Parses a confirmation response semantically so every user language follows the same control flow.
+    pub(crate) async fn parse_confirmation_response(
+        &self,
+        original_input: &str,
+        enriched_input: &str,
+        question: &ClarificationQuestion,
+        user_response: &str,
+    ) -> Result<ConfirmationDecision> {
+        let llm_alias = self.config.llm.as_deref().unwrap_or("router");
+        let llm = self.llm_registry.get(llm_alias).map_err(|_| {
+            AgentError::Config(format!(
+                "LLM '{}' not found for confirmation parsing",
+                llm_alias
+            ))
+        })?;
+        let prompt = format!(
+            r#"Original user request: "{}"
+
+Resolved interpretation awaiting confirmation: "{}"
+
+We asked: "{}"
+
+User responded: "{}"
+
+Classify the user's response by meaning in any language:
+- "confirmed" means the user explicitly agrees with the resolved interpretation.
+- "rejected" means the user explicitly disagrees with or rejects that interpretation.
+- "abandoned" means the user wants to cancel or drop the original request.
+- "switched" means the user has moved to a different topic.
+- "unclear" means none of the above is clear.
+
+Do not infer confirmation from an ambiguous response.
+
+Respond in JSON format:
+{{
+  "status": "confirmed|rejected|abandoned|switched|unclear"
+}}
+
+Output ONLY valid JSON, no other text."#,
+            original_input, enriched_input, question.question, user_response
+        );
+        let messages = vec![
+            ChatMessage::system(
+                "You classify confirmation responses by meaning in any language. Respond only with valid JSON.",
+            ),
+            ChatMessage::user(&prompt),
+        ];
+
+        let run: ConfirmationParseFuture<'_> = Box::pin(async move {
+            llm.complete(&messages, None)
+                .await
+                .map(|response| response.content)
+                .map_err(|e| AgentError::LLM(format!("Confirmation parsing failed: {}", e)))
+        });
+        let content = if let Some(observer) = self.observer.as_ref() {
+            observer.observe_confirmation_parse(run).await?
+        } else {
+            run.await?
+        };
+        self.parse_confirmation_result(&content)
     }
 
     /// Parse user's response to clarification question
@@ -297,6 +422,45 @@ IMPORTANT:
         prompt
     }
 
+    fn parse_confirmation_question(&self, content: &str) -> Result<ClarificationQuestion> {
+        let json_str = extract_json(content);
+        let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+            AgentError::Other(format!("Failed to parse confirmation question: {}", e))
+        })?;
+        let question = parsed["question"]
+            .as_str()
+            .ok_or_else(|| AgentError::Other("Missing confirmation question".to_string()))?;
+
+        Ok(ClarificationQuestion {
+            question: question.to_string(),
+            options: None,
+            style: ClarificationStyle::YesNo,
+            clarifying: Vec::new(),
+        })
+    }
+
+    fn parse_confirmation_result(&self, content: &str) -> Result<ConfirmationDecision> {
+        let json_str = extract_json(content);
+        let parsed: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+            AgentError::Other(format!("Failed to parse confirmation response: {}", e))
+        })?;
+
+        match parsed["status"].as_str() {
+            Some("confirmed") => Ok(ConfirmationDecision::Confirmed),
+            Some("rejected") => Ok(ConfirmationDecision::Rejected),
+            Some("abandoned") => Ok(ConfirmationDecision::Abandoned),
+            Some("switched") => Ok(ConfirmationDecision::TopicSwitch),
+            Some("unclear") => Ok(ConfirmationDecision::Unclear),
+            Some(status) => Err(AgentError::Other(format!(
+                "Unknown confirmation status: {}",
+                status
+            ))),
+            None => Err(AgentError::Other(
+                "Missing confirmation response status".to_string(),
+            )),
+        }
+    }
+
     fn build_parse_prompt(
         &self,
         original_input: &str,
@@ -462,7 +626,17 @@ IMPORTANT:
     }
 }
 
-/// Result of parsing user's clarification response
+/// Semantic outcome of a confirmation response without overloading clarification payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfirmationDecision {
+    Confirmed,
+    Rejected,
+    Abandoned,
+    TopicSwitch,
+    Unclear,
+}
+
+/// Result of parsing a clarification response
 #[derive(Debug, Clone)]
 pub enum ClarificationParseResult {
     /// User's response was understood

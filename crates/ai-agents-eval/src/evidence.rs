@@ -456,7 +456,7 @@ fn infer_disambiguation(
             .and_then(Value::as_str)
             .unwrap_or("triggered")
         {
-            "awaiting_clarification" => DisambiguationStatus::Triggered,
+            "awaiting_clarification" | "awaiting_confirmation" => DisambiguationStatus::Triggered,
             "clarified" => DisambiguationStatus::Clarified,
             "best_guess" => DisambiguationStatus::BestGuess,
             "abandoned" => DisambiguationStatus::Abandoned,
@@ -586,6 +586,23 @@ mod tests {
         assert!(!serialized.contains("persona and reasoning prompt"));
         assert!(!serialized.contains("private user history"));
         assert!(!serialized.contains("private assistant history"));
+    }
+
+    #[test]
+    fn normalizes_awaiting_confirmation_as_triggered_disambiguation() {
+        let metadata = json!({
+            "disambiguation": {
+                "status": "awaiting_confirmation",
+                "detection": {
+                    "type": "missing_target",
+                    "confidence": 0.25
+                }
+            }
+        });
+
+        let evidence = infer_disambiguation(Some(&metadata), &Value::Null).unwrap();
+        assert_eq!(evidence.status, DisambiguationStatus::Triggered);
+        assert_eq!(evidence.confidence, Some(0.25));
     }
 
     #[test]

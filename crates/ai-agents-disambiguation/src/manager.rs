@@ -2,13 +2,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use ai_agents_core::Result;
 use ai_agents_llm::LLMRegistry;
 
-use super::clarifier::{ClarificationGenerator, ClarificationObserver, ClarificationParseResult};
+use super::clarifier::{
+    ClarificationGenerator, ClarificationObserver, ClarificationParseResult, ConfirmationDecision,
+};
 use super::config::{
     DisambiguationConfig, MaxAttemptsAction, SkillDisambiguationOverride,
     StateDisambiguationOverride,
@@ -18,22 +21,41 @@ use super::types::{
     AmbiguityDetectionResult, ClarificationQuestion, DisambiguationContext, DisambiguationResult,
 };
 
+const RUNTIME_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
+
 /// Manager orchestrating the full disambiguation flow
 pub struct DisambiguationManager {
     config: DisambiguationConfig,
     detector: AmbiguityDetector,
     clarifier: ClarificationGenerator,
     pending_clarification: RwLock<Option<PendingClarification>>,
+    next_pending_id: AtomicU64,
 }
 
-/// Pending clarification state
+/// Manager-owned request retained across clarification and confirmation turns.
 #[derive(Debug, Clone)]
 struct PendingClarification {
+    id: u64,
     original_input: String,
     question: ClarificationQuestion,
     detection: AmbiguityDetectionResult,
     attempts: u32,
-    required_clarity: Vec<String>,
+    origin_state: Option<String>,
+    origin_state_generation: Option<u64>,
+    phase: PendingPhase,
+}
+
+/// Pending phases keep unresolved and resolved payloads mutually exclusive.
+#[derive(Debug, Clone)]
+enum PendingPhase {
+    Clarification {
+        required_clarity: Vec<String>,
+        require_confirmation: bool,
+    },
+    Confirmation {
+        enriched_input: String,
+        resolved: HashMap<String, serde_json::Value>,
+    },
 }
 
 impl DisambiguationManager {
@@ -53,6 +75,7 @@ impl DisambiguationManager {
             detector,
             clarifier,
             pending_clarification: RwLock::new(None),
+            next_pending_id: AtomicU64::new(1),
         }
     }
 
@@ -71,9 +94,69 @@ impl DisambiguationManager {
         self
     }
 
-    /// Check if there's a pending clarification
+    /// Check if there is a pending clarification or confirmation.
     pub async fn has_pending_clarification(&self) -> bool {
         self.pending_clarification.read().await.is_some()
+    }
+
+    /// Check whether the pending exchange is waiting for explicit confirmation.
+    pub async fn has_pending_confirmation(&self) -> bool {
+        self.pending_clarification
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|pending| matches!(&pending.phase, PendingPhase::Confirmation { .. }))
+    }
+
+    // Replace pending state only when no reset, response, or new exchange has invalidated the captured owner.
+    async fn replace_pending_if_current(
+        &self,
+        expected_id: u64,
+        mut replacement: PendingClarification,
+    ) -> bool {
+        let mut pending = self.pending_clarification.write().await;
+        if pending
+            .as_ref()
+            .is_some_and(|current| current.id == expected_id)
+        {
+            // A new revision prevents another response captured from the old phase from overwriting this replacement.
+            replacement.id = self.next_pending_id.fetch_add(1, Ordering::Relaxed);
+            *pending = Some(replacement);
+            true
+        } else {
+            false
+        }
+    }
+
+    // Consume pending state exactly once so concurrent or reset-invalidated responses cannot release stale input.
+    async fn take_pending_if_current(&self, expected_id: u64) -> bool {
+        let mut pending = self.pending_clarification.write().await;
+        if pending
+            .as_ref()
+            .is_some_and(|current| current.id == expected_id)
+        {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn confirmation_invalidated(&self, reason: &'static str) -> DisambiguationResult {
+        info!(
+            confirmation_event = "invalidated",
+            invalidation_reason = reason,
+            "Pending confirmation ownership changed"
+        );
+        DisambiguationResult::Abandoned { new_input: None }
+    }
+
+    // Runtime state generation is carried in reserved context metadata to preserve public context struct compatibility.
+    fn context_state_generation(context: &DisambiguationContext) -> Option<u64> {
+        context
+            .user_context
+            .get(RUNTIME_STATE_GENERATION_KEY)
+            .and_then(serde_json::Value::as_u64)
     }
 
     /// Process user input with disambiguation
@@ -94,16 +177,35 @@ impl DisambiguationManager {
         state_override: Option<&StateDisambiguationOverride>,
         skill_override: Option<&SkillDisambiguationOverride>,
     ) -> Result<DisambiguationResult> {
-        // Handle a pending clarification before applying new-turn enablement so an
-        // existing exchange remains resolvable if the active configuration layer changes.
-        // ISSUE: Solved
-        // Clone and drop the read guard before entering the async block to avoid deadlocking with the write lock inside handle_clarification_response.
+        // Pending clarification remains resolvable across layered enablement changes, but resolved confirmation is owned by its originating state.
+        // Clone before awaiting handlers so they can replace or clear manager-owned state without holding the read lock.
         let pending = self.pending_clarification.read().await.clone();
         if let Some(pending) = pending {
+            let awaiting_confirmation = matches!(&pending.phase, PendingPhase::Confirmation { .. });
             debug!(
                 attempts = pending.attempts,
-                "Processing clarification response"
+                awaiting_confirmation, "Processing clarification response"
             );
+            if awaiting_confirmation {
+                let current_state_generation = Self::context_state_generation(context);
+                if pending.origin_state != context.current_state
+                    || pending.origin_state_generation != current_state_generation
+                {
+                    if !self.take_pending_if_current(pending.id).await {
+                        return Ok(self.confirmation_invalidated("pending_replaced"));
+                    }
+                    info!(
+                        confirmation_event = "invalidated",
+                        origin_state = ?pending.origin_state,
+                        current_state = ?context.current_state,
+                        origin_state_generation = ?pending.origin_state_generation,
+                        current_state_generation = ?current_state_generation,
+                        "Pending confirmation invalidated by state ownership change"
+                    );
+                    return Ok(DisambiguationResult::Abandoned { new_input: None });
+                }
+                return self.handle_confirmation_response(input, &pending).await;
+            }
             return self
                 .handle_clarification_response(input, &pending, context)
                 .await;
@@ -206,11 +308,18 @@ impl DisambiguationManager {
                     .await?;
 
                 *self.pending_clarification.write().await = Some(PendingClarification {
+                    id: self.next_pending_id.fetch_add(1, Ordering::Relaxed),
                     original_input: input.to_string(),
                     question: question.clone(),
                     detection: forced_detection.clone(),
                     attempts: 1,
-                    required_clarity: required_clarity.clone(),
+                    origin_state: context.current_state.clone(),
+                    origin_state_generation: Self::context_state_generation(&context),
+                    phase: PendingPhase::Clarification {
+                        required_clarity: required_clarity.clone(),
+                        require_confirmation: state_override
+                            .is_some_and(|state| state.require_confirmation),
+                    },
                 });
 
                 return Ok(DisambiguationResult::NeedsClarification {
@@ -276,11 +385,18 @@ impl DisambiguationManager {
 
         // Store pending clarification
         *self.pending_clarification.write().await = Some(PendingClarification {
+            id: self.next_pending_id.fetch_add(1, Ordering::Relaxed),
             original_input: input.to_string(),
             question: question.clone(),
             detection: detection.clone(),
             attempts: 1,
-            required_clarity: required_clarity.clone(),
+            origin_state: context.current_state.clone(),
+            origin_state_generation: Self::context_state_generation(&context),
+            phase: PendingPhase::Clarification {
+                required_clarity: required_clarity.clone(),
+                require_confirmation: state_override
+                    .is_some_and(|state| state.require_confirmation),
+            },
         });
 
         Ok(DisambiguationResult::NeedsClarification {
@@ -296,6 +412,15 @@ impl DisambiguationManager {
         pending: &PendingClarification,
         context: &DisambiguationContext,
     ) -> Result<DisambiguationResult> {
+        let PendingPhase::Clarification {
+            required_clarity,
+            require_confirmation,
+        } = &pending.phase
+        else {
+            return Err(ai_agents_core::AgentError::Other(
+                "Pending clarification phase is unavailable".to_string(),
+            ));
+        };
         let parse_result = self
             .clarifier
             .parse_response(
@@ -311,9 +436,62 @@ impl DisambiguationManager {
                 enriched_input,
                 resolved,
             } => {
-                // Clear pending state
-                *self.pending_clarification.write().await = None;
+                if *require_confirmation {
+                    // State ownership is checked before generating a confirmation so a stale resolved request cannot acquire a new gate in another state.
+                    let current_state_generation = Self::context_state_generation(context);
+                    if pending.origin_state != context.current_state
+                        || pending.origin_state_generation != current_state_generation
+                    {
+                        if !self.take_pending_if_current(pending.id).await {
+                            return Ok(self.confirmation_invalidated("pending_replaced"));
+                        }
+                        info!(
+                            confirmation_event = "invalidated",
+                            origin_state = ?pending.origin_state,
+                            current_state = ?context.current_state,
+                            origin_state_generation = ?pending.origin_state_generation,
+                            current_state_generation = ?current_state_generation,
+                            "Resolved clarification invalidated by state ownership change"
+                        );
+                        return Ok(DisambiguationResult::Abandoned { new_input: None });
+                    }
 
+                    // Generation failures leave the unresolved phase intact so a retry cannot bypass explicit confirmation.
+                    let question = self
+                        .clarifier
+                        .generate_confirmation(&pending.original_input, response, &enriched_input)
+                        .await?;
+                    let updated = PendingClarification {
+                        id: pending.id,
+                        original_input: pending.original_input.clone(),
+                        question: question.clone(),
+                        detection: pending.detection.clone(),
+                        attempts: 1,
+                        origin_state: pending.origin_state.clone(),
+                        origin_state_generation: pending.origin_state_generation,
+                        phase: PendingPhase::Confirmation {
+                            enriched_input,
+                            resolved,
+                        },
+                    };
+                    if !self.replace_pending_if_current(pending.id, updated).await {
+                        return Ok(self.confirmation_invalidated("pending_replaced"));
+                    }
+
+                    info!(
+                        confirmation_event = "requested",
+                        origin_state = ?pending.origin_state,
+                        "Clarification resolved and awaits confirmation"
+                    );
+                    return Ok(DisambiguationResult::NeedsClarification {
+                        question,
+                        detection: pending.detection.clone(),
+                    });
+                }
+
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
                 info!(
                     original = %pending.original_input,
                     enriched = %enriched_input,
@@ -330,9 +508,9 @@ impl DisambiguationManager {
                 let new_attempts = pending.attempts + 1;
 
                 if new_attempts >= self.config.clarification.max_attempts {
-                    // Clear pending state
-                    *self.pending_clarification.write().await = None;
-
+                    if !self.take_pending_if_current(pending.id).await {
+                        return Ok(self.confirmation_invalidated("pending_replaced"));
+                    }
                     return self.handle_max_attempts(&pending.original_input);
                 }
 
@@ -349,18 +527,27 @@ impl DisambiguationManager {
                         &pending.detection,
                         &new_context,
                         None,
-                        &pending.required_clarity,
+                        required_clarity,
                     )
                     .await?;
 
                 // Update pending state
-                *self.pending_clarification.write().await = Some(PendingClarification {
+                let updated = PendingClarification {
+                    id: pending.id,
                     original_input: pending.original_input.clone(),
                     question: question.clone(),
                     detection: pending.detection.clone(),
                     attempts: new_attempts,
-                    required_clarity: pending.required_clarity.clone(),
-                });
+                    origin_state: pending.origin_state.clone(),
+                    origin_state_generation: pending.origin_state_generation,
+                    phase: PendingPhase::Clarification {
+                        required_clarity: required_clarity.clone(),
+                        require_confirmation: *require_confirmation,
+                    },
+                };
+                if !self.replace_pending_if_current(pending.id, updated).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
 
                 warn!(
                     attempts = new_attempts,
@@ -374,15 +561,144 @@ impl DisambiguationManager {
                 })
             }
             ClarificationParseResult::Abandoned => {
-                *self.pending_clarification.write().await = None;
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
                 info!("User abandoned clarification");
                 Ok(DisambiguationResult::Abandoned { new_input: None })
             }
             ClarificationParseResult::TopicSwitch => {
-                *self.pending_clarification.write().await = None;
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
                 info!("User switched to a different topic during clarification");
                 Ok(DisambiguationResult::Abandoned {
                     new_input: Some(response.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Resolves the confirmation phase without releasing the enriched request before explicit agreement.
+    async fn handle_confirmation_response(
+        &self,
+        response: &str,
+        pending: &PendingClarification,
+    ) -> Result<DisambiguationResult> {
+        let PendingPhase::Confirmation {
+            enriched_input,
+            resolved,
+        } = &pending.phase
+        else {
+            return Err(ai_agents_core::AgentError::Other(
+                "Pending confirmation phase is unavailable".to_string(),
+            ));
+        };
+        let decision = self
+            .clarifier
+            .parse_confirmation_response(
+                &pending.original_input,
+                enriched_input,
+                &pending.question,
+                response,
+            )
+            .await?;
+
+        match decision {
+            ConfirmationDecision::Confirmed => {
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
+                info!(
+                    confirmation_event = "confirmed",
+                    origin_state = ?pending.origin_state,
+                    "Resolved intent confirmed"
+                );
+                Ok(DisambiguationResult::Clarified {
+                    original_input: pending.original_input.clone(),
+                    enriched_input: enriched_input.clone(),
+                    resolved: resolved.clone(),
+                })
+            }
+            ConfirmationDecision::Unclear => {
+                let new_attempts = pending.attempts + 1;
+                if new_attempts >= self.config.clarification.max_attempts {
+                    if !self.take_pending_if_current(pending.id).await {
+                        return Ok(self.confirmation_invalidated("pending_replaced"));
+                    }
+                    return self.handle_confirmation_max_attempts();
+                }
+
+                let mut updated = pending.clone();
+                updated.attempts = new_attempts;
+                if !self.replace_pending_if_current(pending.id, updated).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
+                warn!(
+                    confirmation_event = "unclear",
+                    attempts = new_attempts,
+                    max = self.config.clarification.max_attempts,
+                    "Confirmation response not understood, retrying"
+                );
+                Ok(DisambiguationResult::NeedsClarification {
+                    question: pending.question.clone(),
+                    detection: pending.detection.clone(),
+                })
+            }
+            ConfirmationDecision::Rejected => {
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
+                info!(confirmation_event = "rejected", "Resolved intent rejected");
+                Ok(DisambiguationResult::Abandoned { new_input: None })
+            }
+            ConfirmationDecision::Abandoned => {
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
+                info!(
+                    confirmation_event = "abandoned",
+                    "Resolved intent abandoned"
+                );
+                Ok(DisambiguationResult::Abandoned { new_input: None })
+            }
+            ConfirmationDecision::TopicSwitch => {
+                if !self.take_pending_if_current(pending.id).await {
+                    return Ok(self.confirmation_invalidated("pending_replaced"));
+                }
+                info!(
+                    confirmation_event = "topic_switch",
+                    "User switched topics during confirmation"
+                );
+                Ok(DisambiguationResult::Abandoned {
+                    new_input: Some(response.to_string()),
+                })
+            }
+        }
+    }
+
+    /// Applies configured exhaustion behavior without allowing best-guess execution to bypass confirmation.
+    fn handle_confirmation_max_attempts(&self) -> Result<DisambiguationResult> {
+        match self.config.clarification.on_max_attempts {
+            MaxAttemptsAction::Escalate => {
+                info!(
+                    confirmation_event = "exhausted",
+                    outcome = "escalate",
+                    "Confirmation attempts exhausted"
+                );
+                Ok(DisambiguationResult::Escalate {
+                    reason: "User confirmation requires human assistance".to_string(),
+                })
+            }
+            MaxAttemptsAction::ApologizeAndStop | MaxAttemptsAction::ProceedWithBestGuess => {
+                info!(
+                    confirmation_event = "exhausted",
+                    outcome = "stop",
+                    "Confirmation attempts exhausted"
+                );
+                Ok(DisambiguationResult::GiveUp {
+                    reason: "Unable to confirm the resolved request after multiple attempts"
+                        .to_string(),
                 })
             }
         }
@@ -474,9 +790,19 @@ impl DisambiguationManager {
         required
     }
 
-    /// Clear any pending clarification state
+    /// Clear pending state and record confirmation invalidation without retaining user text.
     pub async fn clear_pending(&self) {
-        *self.pending_clarification.write().await = None;
+        let pending = self.pending_clarification.write().await.take();
+        if pending
+            .as_ref()
+            .is_some_and(|pending| matches!(&pending.phase, PendingPhase::Confirmation { .. }))
+        {
+            info!(
+                confirmation_event = "invalidated",
+                invalidation_reason = "reset_or_clear",
+                "Pending confirmation cleared"
+            );
+        }
     }
 
     /// Get the current pending clarification if any
@@ -544,6 +870,84 @@ mod tests {
     use ai_agents_llm::mock::MockLLMProvider;
 
     const CLARIFICATION_RESPONSE: &str = r#"{"question":"Please clarify.","options":null}"#;
+    const CLARIFIED_RESPONSE: &str = r#"{"status":"answered","selected_option":"1","enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#;
+    const CONFIRMATION_QUESTION: &str = r#"{"question":"Should I send the report to Ada?"}"#;
+
+    struct BlockingConfirmationObserver {
+        entered: tokio::sync::Barrier,
+        release: tokio::sync::Notify,
+    }
+
+    struct ConcurrentClarificationObserver {
+        entered: tokio::sync::Barrier,
+        parsed: tokio::sync::Barrier,
+    }
+
+    impl BlockingConfirmationObserver {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    impl ConcurrentClarificationObserver {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Barrier::new(2),
+                parsed: tokio::sync::Barrier::new(2),
+            }
+        }
+    }
+
+    impl ClarificationObserver for ConcurrentClarificationObserver {
+        fn observe_question<'a>(
+            &'a self,
+            future: crate::ClarificationQuestionFuture<'a>,
+        ) -> crate::ClarificationQuestionFuture<'a> {
+            future
+        }
+
+        fn observe_parse<'a>(
+            &'a self,
+            future: crate::ClarificationParseFuture<'a>,
+        ) -> crate::ClarificationParseFuture<'a> {
+            Box::pin(async move {
+                self.entered.wait().await;
+                let result = future.await;
+                self.parsed.wait().await;
+                result
+            })
+        }
+    }
+
+    impl ClarificationObserver for BlockingConfirmationObserver {
+        fn observe_question<'a>(
+            &'a self,
+            future: crate::ClarificationQuestionFuture<'a>,
+        ) -> crate::ClarificationQuestionFuture<'a> {
+            future
+        }
+
+        fn observe_parse<'a>(
+            &'a self,
+            future: crate::ClarificationParseFuture<'a>,
+        ) -> crate::ClarificationParseFuture<'a> {
+            future
+        }
+
+        fn observe_confirmation_parse<'a>(
+            &'a self,
+            future: crate::ConfirmationParseFuture<'a>,
+        ) -> crate::ConfirmationParseFuture<'a> {
+            Box::pin(async move {
+                self.entered.wait().await;
+                self.release.notified().await;
+                future.await
+            })
+        }
+    }
 
     fn manager_with_responses(
         threshold: f32,
@@ -557,21 +961,29 @@ mod tests {
         threshold: f32,
         responses: Vec<&str>,
     ) -> (DisambiguationManager, MockLLMProvider) {
+        manager_with_config(
+            DisambiguationConfig {
+                enabled,
+                detection: super::super::config::DetectionConfig {
+                    threshold,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            responses,
+        )
+    }
+
+    fn manager_with_config(
+        config: DisambiguationConfig,
+        responses: Vec<&str>,
+    ) -> (DisambiguationManager, MockLLMProvider) {
         let mut mock = MockLLMProvider::new("disambiguation-test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), false);
         let observer = mock.clone();
 
         let mut registry = LLMRegistry::new();
         registry.register("router", Arc::new(mock));
-
-        let config = DisambiguationConfig {
-            enabled,
-            detection: super::super::config::DetectionConfig {
-                threshold,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
 
         (
             DisambiguationManager::new(config, Arc::new(registry)),
@@ -583,6 +995,15 @@ mod tests {
         format!(
             r#"{{"is_ambiguous":{is_ambiguous},"confidence":{confidence},"ambiguity_type":"missing_target","reasoning":"raw detector reasoning","what_is_unclear":["target"],"detected_language":"en"}}"#
         )
+    }
+
+    fn context_with_state_generation(state: &str, generation: u64) -> DisambiguationContext {
+        DisambiguationContext::new()
+            .with_state(state)
+            .with_user_context(HashMap::from([(
+                RUNTIME_STATE_GENERATION_KEY.to_string(),
+                serde_json::json!(generation),
+            )]))
     }
 
     #[test]
@@ -871,6 +1292,490 @@ mod tests {
 
         let prompt = &mock.call_history()[0].messages[1].content;
         assert!(prompt.contains("account, recipient, amount"));
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_waits_for_explicit_agreement_and_preserves_resolution() {
+        let detection = detection_response(true, 0.2);
+        let (manager, mock) = manager_with_responses(
+            0.7,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+                r#"{"status":"confirmed"}"#,
+            ],
+        );
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+
+        let initial = manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(initial.needs_clarification());
+
+        let confirmation = manager
+            .process_input_with_override(
+                "The report to Ada",
+                &DisambiguationContext::new(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let DisambiguationResult::NeedsClarification { question, .. } = confirmation else {
+            panic!("resolved ambiguous input must wait for state confirmation");
+        };
+        assert_eq!(
+            question.style,
+            super::super::config::ClarificationStyle::YesNo
+        );
+        assert_eq!(question.question, "Should I send the report to Ada?");
+        assert!(manager.has_pending_clarification().await);
+
+        let confirmed = manager
+            .process_input_with_override("Yes", &DisambiguationContext::new(), None, None)
+            .await
+            .unwrap();
+        let DisambiguationResult::Clarified {
+            enriched_input,
+            resolved,
+            ..
+        } = confirmed
+        else {
+            panic!("explicit agreement must release the resolved request");
+        };
+        assert_eq!(enriched_input, "Send the report to Ada");
+        assert_eq!(
+            resolved.get("intent"),
+            Some(&serde_json::json!("send_report"))
+        );
+        assert!(!manager.has_pending_clarification().await);
+        assert_eq!(mock.call_count(), 5);
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_rejection_cancels_without_releasing_resolution() {
+        let detection = detection_response(true, 0.2);
+        let (manager, _) = manager_with_responses(
+            0.7,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+                r#"{"status":"rejected"}"#,
+            ],
+        );
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+
+        manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .process_input("The report to Ada", &DisambiguationContext::new())
+            .await
+            .unwrap();
+        let rejected = manager
+            .process_input("No", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rejected,
+            DisambiguationResult::Abandoned { new_input: None }
+        ));
+        assert!(!manager.has_pending_clarification().await);
+    }
+
+    #[tokio::test]
+    async fn clearing_in_flight_confirmation_prevents_stale_release() {
+        let detection = detection_response(true, 0.2);
+        let (manager, _) = manager_with_responses(
+            0.7,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+                r#"{"status":"confirmed"}"#,
+            ],
+        );
+        let observer = Arc::new(BlockingConfirmationObserver::new());
+        let manager = Arc::new(manager.with_clarification_observer(observer.clone()));
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+
+        manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .process_input("The report to Ada", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        let pending = Arc::clone(&manager);
+        let confirmation = tokio::spawn(async move {
+            pending
+                .process_input("Yes", &DisambiguationContext::new())
+                .await
+                .unwrap()
+        });
+        observer.entered.wait().await;
+        manager.clear_pending().await;
+        observer.release.notify_one();
+
+        let result = confirmation.await.unwrap();
+        assert!(matches!(
+            result,
+            DisambiguationResult::Abandoned { new_input: None }
+        ));
+        assert!(!manager.has_pending_clarification().await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_clarification_responses_cannot_replace_the_same_revision() {
+        let detection = detection_response(true, 0.2);
+        let (manager, _) = manager_with_config(
+            DisambiguationConfig {
+                enabled: true,
+                detection: super::super::config::DetectionConfig {
+                    threshold: 0.7,
+                    ..Default::default()
+                },
+                clarification: super::super::config::ClarificationConfig {
+                    max_attempts: 3,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                r#"{"status":"unclear"}"#,
+                r#"{"status":"unclear"}"#,
+                CLARIFICATION_RESPONSE,
+                CLARIFICATION_RESPONSE,
+            ],
+        );
+        let observer = Arc::new(ConcurrentClarificationObserver::new());
+        let manager = Arc::new(manager.with_clarification_observer(observer));
+        manager
+            .process_input("Send it", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        let first_manager = Arc::clone(&manager);
+        let first = tokio::spawn(async move {
+            first_manager
+                .process_input("The report", &DisambiguationContext::new())
+                .await
+                .unwrap()
+        });
+        let second_manager = Arc::clone(&manager);
+        let second = tokio::spawn(async move {
+            second_manager
+                .process_input("To Ada", &DisambiguationContext::new())
+                .await
+                .unwrap()
+        });
+        let (first, second) = tokio::join!(first, second);
+        let results = [first.unwrap(), second.unwrap()];
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result.needs_clarification())
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, DisambiguationResult::Abandoned { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(manager.clarification_attempts().await, 2);
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_is_invalidated_when_state_generation_changes() {
+        let detection = detection_response(true, 0.2);
+        let (manager, mock) = manager_with_responses(
+            0.7,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+            ],
+        );
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+        let generation_one = context_with_state_generation("active", 1);
+
+        manager
+            .process_input_with_override("Send it", &generation_one, Some(&state_override), None)
+            .await
+            .unwrap();
+        manager
+            .process_input("The report to Ada", &generation_one)
+            .await
+            .unwrap();
+        assert!(manager.has_pending_confirmation().await);
+
+        let invalidated = manager
+            .process_input("Yes", &context_with_state_generation("active", 2))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            invalidated,
+            DisambiguationResult::Abandoned { new_input: None }
+        ));
+        assert!(!manager.has_pending_clarification().await);
+        assert_eq!(mock.call_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_is_invalidated_when_state_ownership_changes() {
+        let detection = detection_response(true, 0.2);
+        let (manager, mock) = manager_with_responses(
+            0.7,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+            ],
+        );
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+        let active = DisambiguationContext::new().with_state("active");
+
+        manager
+            .process_input_with_override("Send it", &active, Some(&state_override), None)
+            .await
+            .unwrap();
+        manager
+            .process_input("The report to Ada", &active)
+            .await
+            .unwrap();
+        assert!(manager.has_pending_confirmation().await);
+
+        let invalidated = manager
+            .process_input("Yes", &DisambiguationContext::new().with_state("review"))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            invalidated,
+            DisambiguationResult::Abandoned { new_input: None }
+        ));
+        assert!(!manager.has_pending_clarification().await);
+        assert_eq!(mock.call_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn confirmation_exhaustion_preserves_escalation() {
+        let detection = detection_response(true, 0.2);
+        let (manager, _) = manager_with_config(
+            DisambiguationConfig {
+                enabled: true,
+                clarification: super::super::config::ClarificationConfig {
+                    max_attempts: 2,
+                    on_max_attempts: MaxAttemptsAction::Escalate,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+                r#"{"status":"unclear"}"#,
+            ],
+        );
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+
+        manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .process_input("The report to Ada", &DisambiguationContext::new())
+            .await
+            .unwrap();
+        let exhausted = manager
+            .process_input("Maybe", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(exhausted, DisambiguationResult::Escalate { .. }));
+    }
+
+    #[test]
+    fn confirmation_exhaustion_preserves_apologize_and_stop() {
+        let (manager, _) = manager_with_config(
+            DisambiguationConfig {
+                enabled: true,
+                clarification: super::super::config::ClarificationConfig {
+                    on_max_attempts: MaxAttemptsAction::ApologizeAndStop,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+
+        let exhausted = manager.handle_confirmation_max_attempts().unwrap();
+        assert!(matches!(exhausted, DisambiguationResult::GiveUp { .. }));
+    }
+
+    #[tokio::test]
+    async fn confirmation_exhaustion_never_uses_best_guess() {
+        let detection = detection_response(true, 0.2);
+        let (manager, _) = manager_with_config(
+            DisambiguationConfig {
+                enabled: true,
+                clarification: super::super::config::ClarificationConfig {
+                    max_attempts: 2,
+                    on_max_attempts: MaxAttemptsAction::ProceedWithBestGuess,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+                CONFIRMATION_QUESTION,
+                r#"{"status":"unclear"}"#,
+            ],
+        );
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+
+        manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+        manager
+            .process_input("The report to Ada", &DisambiguationContext::new())
+            .await
+            .unwrap();
+        let exhausted = manager
+            .process_input("Maybe", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(&exhausted, DisambiguationResult::GiveUp { .. }));
+        assert!(!matches!(
+            &exhausted,
+            DisambiguationResult::ProceedWithBestGuess { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_false_releases_clarification_immediately() {
+        let detection = detection_response(true, 0.2);
+        let (manager, mock) = manager_with_responses(
+            0.7,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+            ],
+        );
+
+        manager
+            .process_input_with_override(
+                "Send it",
+                &DisambiguationContext::new(),
+                Some(&StateDisambiguationOverride::default()),
+                None,
+            )
+            .await
+            .unwrap();
+        let result = manager
+            .process_input("The report to Ada", &DisambiguationContext::new())
+            .await
+            .unwrap();
+
+        assert!(matches!(result, DisambiguationResult::Clarified { .. }));
+        assert!(!manager.has_pending_clarification().await);
+        assert_eq!(mock.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_does_not_intercept_clear_input() {
+        let detection = detection_response(false, 0.9);
+        let (manager, mock) = manager_with_responses(0.7, vec![detection.as_str()]);
+        let state_override = StateDisambiguationOverride {
+            require_confirmation: true,
+            ..Default::default()
+        };
+
+        let result = manager
+            .process_input_with_override(
+                "Send the report to Ada",
+                &DisambiguationContext::new(),
+                Some(&state_override),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.is_clear());
+        assert!(!manager.has_pending_clarification().await);
+        assert_eq!(mock.call_count(), 1);
     }
 
     #[tokio::test]

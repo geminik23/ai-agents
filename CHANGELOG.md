@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.2 - 2026-08-08
+
+### Changed
+- Web fetch cache: process-local responses use bounded retention, checked storage-time expiry, and per-response byte limits across redirects
+
+### Fixed
+- Disambiguation confirmation: state-level confirmation keeps clarified requests pending until explicit agreement, invalidates stale and in-flight ownership on reset, restore, timeout, or state change, and preserves configured stop or escalation behavior
+- Process sanitization: router prompts use explicit PII names and require complete replacement so multiword types such as credit card numbers are not collapsed into ambiguous labels
+- Web fetch approval: approval-required initial domains execute only with approved or modified context evidence while redirects requiring separate approval remain blocked
+
 ## 1.0.1 - 2026-08-08
 
 ### Changed

@@ -261,7 +261,7 @@ examples/eval/mocked/basic/no_tools_explicit_empty_mocked.yaml
 - Prefer structural evidence for runtime behavior: `tool_called`, `tool_not_called`, `state`, `state_history_contains`, `context_path`, `metadata_path`, and `observability`.
 - Add deterministic response checks for minimum useful output, such as stable arithmetic results, requested symbols, fixture details, or dry-run wording.
 - For mutation tools, add a separate unfiltered exact `tool_called` count before filtered dry-run/result assertions so an extra unsafe attempt cannot be hidden by a later matching call.
-- Give multi-call live scenarios hard `budget` limits and set `retries: 0`; cost budgets require configured pricing for every model alias that may run.
+- Treat scenario `budget` as opt-in for suites whose contract is explicitly bounded or cost-sensitive. Do not hard-code uncalibrated limits into reusable public live examples because the eval CLI cannot override them and shared limits can prevent valid retries or provider-specific call paths. Cost budgets require configured pricing for every model alias that may run.
 - Use `result_path` for deterministic tool output fields such as `result`, `length`, `value`, `uuid`, `dry_run`, `bytes_written`, `available`, and `count`.
 - Use `any` when several safe tools can satisfy the same read-only behavior.
 - Use `response_contains_any` for bounded wording choices and `response_not_contains` for complete overclaim phrases.

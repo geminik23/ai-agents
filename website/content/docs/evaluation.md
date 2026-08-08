@@ -357,9 +357,9 @@ scenarios:
 
 `max_llm_calls` limits calls across every alias, child agent using the shared registry, turn, agent reset, and retry in that scenario. Token and cost limits reserve a conservative maximum before each provider call, then settle against provider usage or a fallback estimate. A call is rejected before it starts when its reservation would exceed a configured limit; if reported usage exceeds the reservation, the response fails and no later provider call may start.
 
-`max_cost_usd` requires suite-level `observability.cost` pricing for every provider/model alias that may execute. Missing pricing fails before the provider call. Budget values must be finite and greater than zero. Scenario retries share the same budget rather than receiving a fresh allowance, but multi-call live smoke suites should still set `retries: 0` to avoid unnecessary rebuilds and nondeterministic amplification.
+`max_cost_usd` requires suite-level `observability.cost` pricing for every provider/model alias that may execute. Missing pricing fails before the provider call. Budget values must be finite and greater than zero. Scenario retries share the same budget rather than receiving a fresh allowance, so a declared budget must cover every intended attempt.
 
-Post-run assertions such as `observability.total_llm_calls_lte` remain useful evidence, but they do not replace a protective scenario budget because they run after usage has occurred.
+Post-run assertions such as `observability.total_llm_calls_lte` run after usage has occurred, while a declared scenario budget guards before provider execution. A dry configuration check validates schema and budget wiring without executing a provider.
 
 ---
 

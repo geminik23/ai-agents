@@ -35,7 +35,7 @@ mod util;
 
 pub use clarifier::{
     ClarificationGenerator, ClarificationObserver, ClarificationParseFuture,
-    ClarificationParseResult, ClarificationQuestionFuture,
+    ClarificationParseResult, ClarificationQuestionFuture, ConfirmationParseFuture,
 };
 pub use config::{
     AmbiguityAspect, CacheConfig, ClarificationConfig, ClarificationStyle, ContextConfig,

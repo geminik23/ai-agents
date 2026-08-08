@@ -10,6 +10,8 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
+const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
+
 /// Shared lock table used to serialize side-effecting tool calls by canonical resource.
 pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
 
@@ -135,7 +137,8 @@ use ai_agents_core::{
 };
 use ai_agents_disambiguation::{
     ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
-    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
+    ConfirmationParseFuture, DisambiguationConfig, DisambiguationContext, DisambiguationManager,
+    DisambiguationResult,
 };
 use ai_agents_hitl::{
     ApprovalHandler, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger, HITLCheckResult,
@@ -238,14 +241,23 @@ struct AgentResponseParts {
     reflection_metadata: Option<ReflectionMetadata>,
 }
 
+#[derive(Clone, Copy)]
+struct DisambiguationOwnership {
+    epoch: u64,
+    state_generation: Option<u64>,
+}
+
 /// Outcome of skill routing — used by `try_skill_route`.
 enum SkillRouteResult {
     /// No skill matched, continue to normal LLM chat.
     NoMatch,
     /// Skill executed successfully.
     Response { skill_id: String, content: String },
-    /// Skill matched but needs disambiguation first.
-    NeedsClarification(AgentResponse),
+    /// Skill matched but needs disambiguation first or returned a terminal disambiguation response.
+    NeedsClarification {
+        response: AgentResponse,
+        ownership: Option<DisambiguationOwnership>,
+    },
 }
 
 /// Result of response-independent parallel transition selection.
@@ -267,6 +279,16 @@ enum PostLoopResult {
     /// Transition fired into a state that requires full dispatch.
     /// Caller re-enters run_loop_internal to apply the correct handler.
     NeedsRedispatch,
+}
+
+struct StateTransitionReservation<'a> {
+    reserved: &'a AtomicBool,
+}
+
+impl Drop for StateTransitionReservation<'_> {
+    fn drop(&mut self) {
+        self.reserved.store(false, Ordering::SeqCst);
+    }
 }
 
 struct RootTurnCleanup<'a> {
@@ -412,6 +434,12 @@ pub struct RuntimeAgent {
     reasoning_config: ReasoningConfig,
     reflection_config: ReflectionConfig,
     disambiguation_manager: Option<DisambiguationManager>,
+    /// Generation invalidating confirmation work across reset and state changes.
+    disambiguation_epoch: AtomicU64,
+    /// Serializes confirmation redispatch admission with reset and state mutation.
+    disambiguation_admission: tokio::sync::RwLock<()>,
+    /// Reserves one runtime-owned transition before its exit actions can produce side effects.
+    state_transition_reserved: AtomicBool,
     /// Structured persona manager for identity, evolution, and secrets.
     persona_manager: Option<Arc<ai_agents_persona::PersonaManager>>,
     /// Skill ID that triggered the current pending disambiguation.
@@ -512,6 +540,16 @@ impl ClarificationObserver for ObservabilityClarificationObserver {
             with_observation_purpose(ObservationPurpose::DisambiguationClarification, future).await
         })
     }
+
+    /// Scopes semantic confirmation parsing as disambiguation_clarification.
+    fn observe_confirmation_parse<'a>(
+        &'a self,
+        future: ConfirmationParseFuture<'a>,
+    ) -> ConfirmationParseFuture<'a> {
+        Box::pin(async move {
+            with_observation_purpose(ObservationPurpose::DisambiguationClarification, future).await
+        })
+    }
 }
 
 struct ObservabilityProcessStageObserver;
@@ -595,6 +633,9 @@ impl RuntimeAgent {
             reasoning_config: ReasoningConfig::default(),
             reflection_config: ReflectionConfig::default(),
             disambiguation_manager: None,
+            disambiguation_epoch: AtomicU64::new(0),
+            disambiguation_admission: tokio::sync::RwLock::new(()),
+            state_transition_reserved: AtomicBool::new(false),
             persona_manager: None,
             pending_skill_id: RwLock::new(None),
             current_plan: RwLock::new(None),
@@ -2455,18 +2496,104 @@ impl RuntimeAgent {
         self.state_machine.as_ref().map(|sm| sm.current())
     }
 
-    pub async fn transition_to(&self, state: &str) -> Result<()> {
-        if let Some(ref sm) = self.state_machine {
-            let from_state = sm.current();
-            let history_before = sm.history();
-            self.execute_state_exit_actions(&from_state).await;
-            sm.transition_to(state, "manual transition")?;
-            let entered = sm.current();
-            let is_reentry =
-                Self::state_was_previously_entered(&entered, &from_state, &history_before);
-            self.execute_state_enter_actions(&entered, is_reentry).await;
-            info!(to = %entered, "Manual state transition");
+    // State changes invalidate only resolved confirmation ownership; ordinary clarification remains manager-owned across layered enablement changes.
+    async fn invalidate_pending_confirmation(&self, reason: &'static str) {
+        self.disambiguation_epoch.fetch_add(1, Ordering::SeqCst);
+        let Some(disambiguator) = self.disambiguation_manager.as_ref() else {
+            return;
+        };
+        if disambiguator.has_pending_confirmation().await {
+            disambiguator.clear_pending().await;
+            *self.pending_skill_id.write() = None;
+            info!(
+                confirmation_event = "invalidated",
+                invalidation_reason = reason,
+                "Runtime invalidated pending confirmation"
+            );
         }
+    }
+
+    // Admission linearizes pending publication or redispatch before reset and state mutation, then rechecks both ownership generations.
+    async fn admit_disambiguation_redispatch(
+        &self,
+        expected_epoch: u64,
+        expected_state_generation: Option<u64>,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, ()>> {
+        let admission = self.disambiguation_admission.read().await;
+        let state_generation = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| state_machine.generation());
+        if self.disambiguation_epoch.load(Ordering::SeqCst) != expected_epoch
+            || state_generation != expected_state_generation
+        {
+            return Err(AgentError::Other(
+                "Disambiguation ownership changed before redispatch admission".to_string(),
+            ));
+        }
+        Ok(admission)
+    }
+
+    // A transition reservation prevents losing runtime transitions from running duplicate exit side effects.
+    fn reserve_state_transition(&self) -> Option<StateTransitionReservation<'_>> {
+        self.state_transition_reserved
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| StateTransitionReservation {
+                reserved: &self.state_transition_reserved,
+            })
+    }
+
+    // Optional ownership is used only for terminal skill responses that came from manager-owned pending state.
+    async fn admit_optional_disambiguation_ownership(
+        &self,
+        ownership: Option<DisambiguationOwnership>,
+    ) -> Result<Option<tokio::sync::RwLockReadGuard<'_, ()>>> {
+        match ownership {
+            Some(ownership) => self
+                .admit_disambiguation_redispatch(ownership.epoch, ownership.state_generation)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Applies a manual transition after reserving its exit actions and keeping async lifecycle work outside the commit lock.
+    pub async fn transition_to(&self, state: &str) -> Result<()> {
+        let Some(ref sm) = self.state_machine else {
+            return Ok(());
+        };
+        let claim_admission = self.disambiguation_admission.write().await;
+        let reservation = self.reserve_state_transition().ok_or_else(|| {
+            AgentError::Other("Another state transition is already in progress".to_string())
+        })?;
+        let from_state = sm.current();
+        let expected_state_generation = sm.generation();
+        let expected_disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+        let history_before = sm.history();
+        drop(claim_admission);
+
+        self.execute_state_exit_actions(&from_state).await;
+
+        let admission = self.disambiguation_admission.write().await;
+        if sm.current() != from_state
+            || sm.generation() != expected_state_generation
+            || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
+        {
+            return Err(AgentError::Other(
+                "State ownership changed during manual transition preparation".to_string(),
+            ));
+        }
+        sm.transition_to(state, "manual transition")?;
+        self.invalidate_pending_confirmation("state_transition")
+            .await;
+        let entered = sm.current();
+        let is_reentry = Self::state_was_previously_entered(&entered, &from_state, &history_before);
+        drop(admission);
+
+        self.execute_state_enter_actions(&entered, is_reentry).await;
+        drop(reservation);
+        info!(to = %entered, "Manual state transition");
         Ok(())
     }
 
@@ -2599,7 +2726,19 @@ impl RuntimeAgent {
         Ok(snapshot)
     }
 
+    /// Restores persisted state after invalidating any pending confirmation ownership.
     pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {
+        let _admission = self.disambiguation_admission.write().await;
+        if self.state_transition_reserved.load(Ordering::SeqCst) {
+            return Err(AgentError::Other(
+                "Cannot restore state while a state transition is in progress".to_string(),
+            ));
+        }
+        self.invalidate_pending_confirmation("state_restore").await;
+        *self.pending_skill_id.write() = None;
+        if let Some(disambiguator) = self.disambiguation_manager.as_ref() {
+            disambiguator.clear_pending().await;
+        }
         self.memory.restore(snapshot.memory).await?;
 
         if let (Some(sm), Some(sm_snapshot)) = (&self.state_machine, snapshot.state_machine)
@@ -3469,7 +3608,18 @@ impl RuntimeAgent {
 
         let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
 
-        let user_context = self.build_context_with_overlays();
+        let mut user_context = self.build_context_with_overlays();
+        user_context.remove(DISAMBIGUATION_STATE_GENERATION_KEY);
+        if let Some(state_generation) = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| state_machine.generation())
+        {
+            user_context.insert(
+                DISAMBIGUATION_STATE_GENERATION_KEY.to_string(),
+                serde_json::json!(state_generation),
+            );
+        }
 
         // Extract canonical intent labels from current state's transitions
         let available_intents: Vec<String> = if let Some(ref sm) = self.state_machine {
@@ -5730,6 +5880,11 @@ impl RuntimeAgent {
     ) -> Result<SkillRouteResult> {
         let skill_id = candidate.skill_id;
         let skill = candidate.skill;
+        let expected_state_generation = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| state_machine.generation());
+        let expected_disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
         if let Some(ref skill_disambig) = skill.disambiguation
             && skill_disambig.enabled.unwrap_or(false)
             && let Some(ref disambiguator) = self.disambiguation_manager
@@ -5741,7 +5896,7 @@ impl RuntimeAgent {
                 .and_then(|sm| sm.current_definition())
                 .and_then(|def| def.disambiguation.clone());
 
-            match self
+            let disambiguation_result = self
                 .observe_purpose(
                     ObservationPurpose::DisambiguationDetection,
                     disambiguator.process_input_with_override(
@@ -5751,8 +5906,21 @@ impl RuntimeAgent {
                         Some(skill_disambig),
                     ),
                 )
-                .await?
+                .await?;
+            let current_state_generation = self
+                .state_machine
+                .as_ref()
+                .map(|state_machine| state_machine.generation());
+            if current_state_generation != expected_state_generation
+                || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
+                disambiguator.clear_pending().await;
+                *self.pending_skill_id.write() = None;
+                return Err(AgentError::Other(
+                    "State or reset ownership changed during skill disambiguation".to_string(),
+                ));
+            }
+            match disambiguation_result {
                 DisambiguationResult::Clear => {
                     debug!(skill_id = %skill_id, "Skill disambiguation: clear");
                 }
@@ -5760,6 +5928,13 @@ impl RuntimeAgent {
                     question,
                     detection,
                 } => {
+                    let admission = self
+                        .admit_disambiguation_redispatch(
+                            expected_disambiguation_epoch,
+                            expected_state_generation,
+                        )
+                        .await?;
+                    let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
                     info!(
                         skill_id = %skill_id,
                         ambiguity_type = ?detection.ambiguity_type,
@@ -5767,36 +5942,52 @@ impl RuntimeAgent {
                         "Skill requires clarification before execution"
                     );
                     *self.pending_skill_id.write() = Some(skill_id.clone());
-                    return Ok(SkillRouteResult::NeedsClarification(
-                        AgentResponse::new(&question.question).with_metadata(
-                            "disambiguation",
-                            serde_json::json!({
-                                "status": "awaiting_clarification",
-                                "skill_id": skill_id,
-                                "options": question.options,
-                                "clarifying": question.clarifying,
-                                "detection": {
-                                    "type": detection.ambiguity_type,
-                                    "confidence": detection.confidence,
-                                    "what_is_unclear": detection.what_is_unclear,
-                                }
-                            }),
-                        ),
-                    ));
+                    let response = AgentResponse::new(&question.question).with_metadata(
+                        "disambiguation",
+                        serde_json::json!({
+                            "status": if awaiting_confirmation { "awaiting_confirmation" } else { "awaiting_clarification" },
+                            "skill_id": skill_id,
+                            "options": question.options,
+                            "clarifying": question.clarifying,
+                            "detection": {
+                                "type": detection.ambiguity_type,
+                                "confidence": detection.confidence,
+                                "what_is_unclear": detection.what_is_unclear,
+                            }
+                        }),
+                    );
+                    drop(admission);
+                    return Ok(SkillRouteResult::NeedsClarification {
+                        response,
+                        ownership: Some(DisambiguationOwnership {
+                            epoch: expected_disambiguation_epoch,
+                            state_generation: expected_state_generation,
+                        }),
+                    });
                 }
                 DisambiguationResult::Clarified { enriched_input, .. } => {
                     info!(skill_id = %skill_id, enriched = %enriched_input, "Skill disambiguation clarified");
-                    return Ok(SkillRouteResult::Response {
-                        skill_id,
-                        content: self.execute_skill(&skill, &enriched_input).await?,
-                    });
+                    let admission = self
+                        .admit_disambiguation_redispatch(
+                            expected_disambiguation_epoch,
+                            expected_state_generation,
+                        )
+                        .await?;
+                    drop(admission);
+                    let content = self.execute_skill(&skill, &enriched_input).await?;
+                    return Ok(SkillRouteResult::Response { skill_id, content });
                 }
                 DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
                     info!(skill_id = %skill_id, "Skill disambiguation best guess");
-                    return Ok(SkillRouteResult::Response {
-                        skill_id,
-                        content: self.execute_skill(&skill, &enriched_input).await?,
-                    });
+                    let admission = self
+                        .admit_disambiguation_redispatch(
+                            expected_disambiguation_epoch,
+                            expected_state_generation,
+                        )
+                        .await?;
+                    drop(admission);
+                    let content = self.execute_skill(&skill, &enriched_input).await?;
+                    return Ok(SkillRouteResult::Response { skill_id, content });
                 }
                 DisambiguationResult::GiveUp { reason } => {
                     warn!(skill_id = %skill_id, reason = %reason, "Skill disambiguation gave up");
@@ -5809,9 +6000,10 @@ impl RuntimeAgent {
                                 .unwrap_or_else(|_| {
                                     format!("I'm sorry, I couldn't understand your request: {}", reason)
                                 });
-                    return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
-                        &apology,
-                    )));
+                    return Ok(SkillRouteResult::NeedsClarification {
+                        response: AgentResponse::new(&apology),
+                        ownership: None,
+                    });
                 }
                 DisambiguationResult::Escalate { reason } => {
                     info!(skill_id = %skill_id, reason = %reason, "Skill disambiguation escalating");
@@ -5824,9 +6016,10 @@ impl RuntimeAgent {
                                 .unwrap_or_else(|_| {
                                     format!("I need human assistance to help with your request: {}", reason)
                                 });
-                    return Ok(SkillRouteResult::NeedsClarification(AgentResponse::new(
-                        &apology,
-                    )));
+                    return Ok(SkillRouteResult::NeedsClarification {
+                        response: AgentResponse::new(&apology),
+                        ownership: None,
+                    });
                 }
                 DisambiguationResult::Abandoned { .. } => {
                     debug!(skill_id = %skill_id, "Skill disambiguation abandoned");
@@ -5834,10 +6027,15 @@ impl RuntimeAgent {
                 }
             }
         }
-        Ok(SkillRouteResult::Response {
-            skill_id,
-            content: self.execute_skill(&skill, input).await?,
-        })
+        let admission = self
+            .admit_disambiguation_redispatch(
+                expected_disambiguation_epoch,
+                expected_state_generation,
+            )
+            .await?;
+        drop(admission);
+        let content = self.execute_skill(&skill, input).await?;
+        Ok(SkillRouteResult::Response { skill_id, content })
     }
 
     /// Result of skill routing.
@@ -6151,20 +6349,46 @@ OVERALL: PASS/FAIL"#,
         Some(processor)
     }
 
+    // Timeout transitions reserve exit actions before committing ownership changes under the short write lock.
     async fn check_turn_timeout(&self) -> Result<()> {
-        if let Some(ref sm) = self.state_machine
-            && let Some(timeout_state) = sm.check_timeout()
-        {
-            let from_state = sm.current();
-            let history_before = sm.history();
-            self.execute_state_exit_actions(&from_state).await;
-            sm.transition_to(&timeout_state, "max_turns exceeded")?;
-            let entered = sm.current();
-            let is_reentry =
-                Self::state_was_previously_entered(&entered, &from_state, &history_before);
-            self.execute_state_enter_actions(&entered, is_reentry).await;
-            info!(to = %entered, "Timeout transition");
+        let Some(ref sm) = self.state_machine else {
+            return Ok(());
+        };
+        let Some(timeout_state) = sm.check_timeout() else {
+            return Ok(());
+        };
+        let claim_admission = self.disambiguation_admission.write().await;
+        if sm.check_timeout().as_deref() != Some(timeout_state.as_str()) {
+            return Ok(());
         }
+        let Some(reservation) = self.reserve_state_transition() else {
+            return Ok(());
+        };
+        let from_state = sm.current();
+        let expected_state_generation = sm.generation();
+        let expected_disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+        let history_before = sm.history();
+        drop(claim_admission);
+
+        self.execute_state_exit_actions(&from_state).await;
+
+        let admission = self.disambiguation_admission.write().await;
+        if sm.current() != from_state
+            || sm.generation() != expected_state_generation
+            || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
+            || sm.check_timeout().as_deref() != Some(timeout_state.as_str())
+        {
+            return Ok(());
+        }
+        sm.transition_to(&timeout_state, "max_turns exceeded")?;
+        self.invalidate_pending_confirmation("state_timeout").await;
+        let entered = sm.current();
+        let is_reentry = Self::state_was_previously_entered(&entered, &from_state, &history_before);
+        drop(admission);
+
+        self.execute_state_enter_actions(&entered, is_reentry).await;
+        drop(reservation);
+        info!(to = %entered, "Timeout transition");
         Ok(())
     }
 
@@ -6306,7 +6530,7 @@ OVERALL: PASS/FAIL"#,
         Ok(approved)
     }
 
-    /// Applies transition side effects after approval has succeeded.
+    /// Applies an approved transition after reserving exit actions and keeping async hooks outside the commit lock.
     async fn apply_transition_target(
         &self,
         from_state: &str,
@@ -6317,17 +6541,40 @@ OVERALL: PASS/FAIL"#,
         let Some(ref sm) = self.state_machine else {
             return Ok(false);
         };
-
+        let claim_admission = self.disambiguation_admission.write().await;
+        if sm.current() != from_state {
+            return Ok(false);
+        }
+        let Some(reservation) = self.reserve_state_transition() else {
+            return Ok(false);
+        };
+        let expected_state_generation = sm.generation();
+        let expected_disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
         let history_before = sm.history();
+        drop(claim_admission);
+
         self.execute_state_exit_actions(from_state).await;
+
+        let admission = self.disambiguation_admission.write().await;
+        if sm.current() != from_state
+            || sm.generation() != expected_state_generation
+            || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
+        {
+            return Ok(false);
+        }
         sm.transition_to(target, reason)?;
+        self.invalidate_pending_confirmation("state_transition")
+            .await;
         sm.reset_no_transition();
         if let Some(staged) = staged {
-            self.commit_staged_context_writes(staged).await;
+            self.commit_staged_context_writes(staged);
         }
         let entered = sm.current();
         let is_reentry = Self::state_was_previously_entered(&entered, from_state, &history_before);
+        drop(admission);
+
         self.execute_state_enter_actions(&entered, is_reentry).await;
+        drop(reservation);
         self.hooks
             .on_state_transition(Some(from_state), &entered, reason)
             .await;
@@ -6827,7 +7074,13 @@ OVERALL: PASS/FAIL"#,
                         .handle_skill_response(processed_input, &skill_id, content, input_context)
                         .await
                         .map(Some),
-                    SkillRouteResult::NeedsClarification(response) => {
+                    SkillRouteResult::NeedsClarification {
+                        response,
+                        ownership,
+                    } => {
+                        let admission = self
+                            .admit_optional_disambiguation_ownership(ownership)
+                            .await?;
                         if response
                             .metadata
                             .as_ref()
@@ -6840,6 +7093,7 @@ OVERALL: PASS/FAIL"#,
                                 .add_message(ChatMessage::assistant(&response.content))
                                 .await?;
                         }
+                        drop(admission);
                         self.finish_turn_if_root(&response).await?;
                         Ok(Some(response))
                     }
@@ -7471,7 +7725,7 @@ OVERALL: PASS/FAIL"#,
         staged
     }
 
-    async fn commit_staged_context_writes(&self, staged: &HashMap<String, Value>) {
+    fn commit_staged_context_writes(&self, staged: &HashMap<String, Value>) {
         for (key, value) in staged {
             if let Err(error) = self.context_manager.update(key, value.clone()) {
                 warn!(key = %key, error = %error, "staged context write failed");
@@ -7482,7 +7736,7 @@ OVERALL: PASS/FAIL"#,
     /// Run context extractors for the current state on the user's input.
     async fn run_context_extractors(&self, user_message: &str) {
         let staged = self.run_context_extractors_staged(user_message).await;
-        self.commit_staged_context_writes(&staged).await;
+        self.commit_staged_context_writes(&staged);
     }
 
     async fn check_memory_compression(&self) -> Result<()> {
@@ -8241,6 +8495,10 @@ Respond in JSON format:
         }
     }
 
+    //
+    // Blocking disambiguation returns every clarification or required confirmation as its own root response before redispatch.
+    // The manager retains resolved input and pending skill ownership until a later turn explicitly confirms it.
+    //
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
         //
         // Blocking execution must fail before a turn starts when required persistence is unavailable.
@@ -8278,7 +8536,12 @@ Respond in JSON format:
                 .and_then(|sm| sm.current_definition())
                 .and_then(|def| def.disambiguation.clone());
 
-            match self
+            let state_generation = self
+                .state_machine
+                .as_ref()
+                .map(|state_machine| state_machine.generation());
+            let disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+            let mut disambiguation_result = self
                 .observe_purpose(
                     ObservationPurpose::DisambiguationDetection,
                     disambiguator.process_input_with_override(
@@ -8288,8 +8551,24 @@ Respond in JSON format:
                         None,
                     ),
                 )
-                .await?
+                .await?;
+            let current_state_generation = self
+                .state_machine
+                .as_ref()
+                .map(|state_machine| state_machine.generation());
+            if current_state_generation != state_generation
+                || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
             {
+                disambiguator.clear_pending().await;
+                *self.pending_skill_id.write() = None;
+                disambiguation_result = DisambiguationResult::Abandoned { new_input: None };
+                info!(
+                    confirmation_event = "invalidated",
+                    invalidation_reason = "state_generation_changed",
+                    "Disambiguation result invalidated before redispatch"
+                );
+            }
+            match disambiguation_result {
                 DisambiguationResult::Clear => {
                     debug!("Input is clear, proceeding normally");
                 }
@@ -8297,21 +8576,32 @@ Respond in JSON format:
                     question,
                     detection,
                 } => {
+                    let admission = self
+                        .admit_disambiguation_redispatch(disambiguation_epoch, state_generation)
+                        .await?;
+                    let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
                     info!(
                         ambiguity_type = ?detection.ambiguity_type,
                         confidence = detection.confidence,
                         "Input requires clarification"
                     );
 
+                    // This branch also owns post-resolution confirmation questions.
+                    // Do not clear pending_skill_id or redispatch until the manager returns Clarified on a later turn.
                     self.commit_root_user_message(input).await?;
                     self.memory
                         .add_message(ChatMessage::assistant(&question.question))
                         .await?;
 
+                    let status = if awaiting_confirmation {
+                        "awaiting_confirmation"
+                    } else {
+                        "awaiting_clarification"
+                    };
                     let response = AgentResponse::new(&question.question).with_metadata(
                         "disambiguation",
                         serde_json::json!({
-                            "status": "awaiting_clarification",
+                            "status": status,
                             "options": question.options,
                             "clarifying": question.clarifying,
                             "detection": {
@@ -8321,6 +8611,7 @@ Respond in JSON format:
                             }
                         }),
                     );
+                    drop(admission);
                     self.finish_turn_if_root(&response).await?;
                     return Ok(response);
                 }
@@ -8329,6 +8620,16 @@ Respond in JSON format:
                     resolved,
                     ..
                 } => {
+                    let admission = match self
+                        .admit_disambiguation_redispatch(disambiguation_epoch, state_generation)
+                        .await
+                    {
+                        Ok(admission) => admission,
+                        Err(error) => {
+                            *self.pending_skill_id.write() = None;
+                            return Err(error);
+                        }
+                    };
                     info!(
                         resolved_count = resolved.len(),
                         enriched = %enriched_input,
@@ -8356,11 +8657,18 @@ Respond in JSON format:
                     let skill_id = self.pending_skill_id.read().clone();
                     if let Some(skill_id) = skill_id {
                         info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input");
+                        drop(admission);
                         return self
-                            .recheck_skill_disambiguation(&skill_id, &enriched_input)
+                            .recheck_skill_disambiguation(
+                                &skill_id,
+                                &enriched_input,
+                                disambiguation_epoch,
+                                state_generation,
+                            )
                             .await;
                     }
 
+                    drop(admission);
                     return self.run_loop_internal(&enriched_input).await;
                 }
                 DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
@@ -8371,7 +8679,12 @@ Respond in JSON format:
                     if let Some(skill_id) = skill_id {
                         info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input");
                         return self
-                            .recheck_skill_disambiguation(&skill_id, &enriched_input)
+                            .recheck_skill_disambiguation(
+                                &skill_id,
+                                &enriched_input,
+                                disambiguation_epoch,
+                                state_generation,
+                            )
                             .await;
                     }
 
@@ -8572,6 +8885,8 @@ Respond in JSON format:
         &self,
         skill_id: &str,
         enriched_input: &str,
+        expected_disambiguation_epoch: u64,
+        expected_state_generation: Option<u64>,
     ) -> Result<AgentResponse> {
         let skill = self
             .skill_router
@@ -8591,7 +8906,7 @@ Respond in JSON format:
                 .and_then(|sm| sm.current_definition())
                 .and_then(|def| def.disambiguation.clone());
 
-            match self
+            let disambiguation_result = self
                 .observe_purpose(
                     ObservationPurpose::DisambiguationDetection,
                     disambiguator.process_input_with_override(
@@ -8601,8 +8916,22 @@ Respond in JSON format:
                         Some(skill_disambig),
                     ),
                 )
-                .await?
+                .await?;
+            let current_state_generation = self
+                .state_machine
+                .as_ref()
+                .map(|state_machine| state_machine.generation());
+            if current_state_generation != expected_state_generation
+                || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
+                disambiguator.clear_pending().await;
+                *self.pending_skill_id.write() = None;
+                return Err(AgentError::Other(
+                    "State or reset ownership changed during skill disambiguation recheck"
+                        .to_string(),
+                ));
+            }
+            match disambiguation_result {
                 DisambiguationResult::Clear => {
                     debug!(skill_id = %skill_id, "Skill re-check: all fields present");
                 }
@@ -8610,6 +8939,13 @@ Respond in JSON format:
                     question,
                     detection,
                 } => {
+                    let admission = self
+                        .admit_disambiguation_redispatch(
+                            expected_disambiguation_epoch,
+                            expected_state_generation,
+                        )
+                        .await?;
+                    let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
                     info!(
                         skill_id = %skill_id,
                         ambiguity_type = ?detection.ambiguity_type,
@@ -8629,7 +8965,7 @@ Respond in JSON format:
                     let response = AgentResponse::new(&question.question).with_metadata(
                         "disambiguation",
                         serde_json::json!({
-                            "status": "awaiting_clarification",
+                            "status": if awaiting_confirmation { "awaiting_confirmation" } else { "awaiting_clarification" },
                             "skill_id": skill_id,
                             "options": question.options,
                             "clarifying": question.clarifying,
@@ -8640,6 +8976,7 @@ Respond in JSON format:
                             }
                         }),
                     );
+                    drop(admission);
                     self.finish_turn_if_root(&response).await?;
                     return Ok(response);
                 }
@@ -8648,8 +8985,14 @@ Respond in JSON format:
                     ..
                 } => {
                     debug!(skill_id = %skill_id, "Skill re-check: clarified immediately, executing");
-                    // Fall through to execute with the further-enriched input.
+                    let admission = self
+                        .admit_disambiguation_redispatch(
+                            expected_disambiguation_epoch,
+                            expected_state_generation,
+                        )
+                        .await?;
                     *self.pending_skill_id.write() = None;
+                    drop(admission);
                     let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
                     self.memory
                         .add_message(ChatMessage::user(&re_enriched))
@@ -8667,7 +9010,14 @@ Respond in JSON format:
                     enriched_input: re_enriched,
                 } => {
                     debug!(skill_id = %skill_id, "Skill re-check: proceeding with best guess");
+                    let admission = self
+                        .admit_disambiguation_redispatch(
+                            expected_disambiguation_epoch,
+                            expected_state_generation,
+                        )
+                        .await?;
                     *self.pending_skill_id.write() = None;
+                    drop(admission);
                     let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
                     self.memory
                         .add_message(ChatMessage::user(&re_enriched))
@@ -8740,8 +9090,15 @@ Respond in JSON format:
             }
         }
 
-        // Skill has no disambiguation or all fields present: execute.
+        // Skill execution is admitted before the read guard is released so later invalidation cannot retroactively cancel it.
+        let admission = self
+            .admit_disambiguation_redispatch(
+                expected_disambiguation_epoch,
+                expected_state_generation,
+            )
+            .await?;
         *self.pending_skill_id.write() = None;
+        drop(admission);
         let skill_response = self.execute_skill_by_id(skill_id, enriched_input).await?;
         self.memory
             .add_message(ChatMessage::user(enriched_input))
@@ -10241,7 +10598,13 @@ Respond in JSON format:
                     .handle_skill_response(processed_input, &skill_id, content, &input_data.context)
                     .await;
             }
-            SkillRouteResult::NeedsClarification(response) => {
+            SkillRouteResult::NeedsClarification {
+                response,
+                ownership,
+            } => {
+                let admission = self
+                    .admit_optional_disambiguation_ownership(ownership)
+                    .await?;
                 self.commit_root_user_message(processed_input).await?;
                 if let Some(q) = response
                     .metadata
@@ -10257,6 +10620,7 @@ Respond in JSON format:
                         .add_message(ChatMessage::assistant(&response.content))
                         .await?;
                 }
+                drop(admission);
                 self.finish_turn_if_root(&response).await?;
                 return Ok(response);
             }
@@ -10809,12 +11173,26 @@ Respond in JSON format:
                         }
                     }
                 }
-                Ok(SkillRouteResult::NeedsClarification(response)) => {
+                Ok(SkillRouteResult::NeedsClarification {
+                    response,
+                    ownership,
+                }) => {
+                    let admission = match self
+                        .admit_optional_disambiguation_ownership(ownership)
+                        .await
+                    {
+                        Ok(admission) => admission,
+                        Err(e) => {
+                            yield StreamChunk::error(e.to_string());
+                            return;
+                        }
+                    };
                     if let Err(e) = self.commit_root_user_message(processed_input).await {
                         yield StreamChunk::error(e.to_string());
                         return;
                     }
                     let _ = self.memory.add_message(ChatMessage::assistant(&response.content)).await;
+                    drop(admission);
                     if let Err(e) = self.finish_turn_if_root(&response).await {
                         yield StreamChunk::error(e.to_string());
                         return;
@@ -11215,8 +11593,8 @@ Respond in JSON format:
         })
     }
 
-    /// Streaming entry point with disambiguation
-    /// Mirrors run_loop but yields StreamChunks instead of AgentResponse.
+    /// Streams the root turn while keeping clarification and confirmation questions as terminal responses for their turn.
+    /// Pending manager and skill ownership must survive until explicit confirmation returns a resolved result for redispatch.
     fn run_loop_stream<'a>(
         &'a self,
         input: &'a str,
@@ -11263,7 +11641,12 @@ Respond in JSON format:
                     .and_then(|sm| sm.current_definition())
                     .and_then(|def| def.disambiguation.clone());
 
-                let result = match self
+                let state_generation = self
+                    .state_machine
+                    .as_ref()
+                    .map(|state_machine| state_machine.generation());
+                let disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+                let mut result = match self
                     .observe_purpose(
                         ObservationPurpose::DisambiguationDetection,
                         disambiguator.process_input_with_override(
@@ -11281,7 +11664,22 @@ Respond in JSON format:
                         return;
                     }
                 };
-
+                let current_state_generation = self
+                    .state_machine
+                    .as_ref()
+                    .map(|state_machine| state_machine.generation());
+                if current_state_generation != state_generation
+                    || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
+                {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                    result = DisambiguationResult::Abandoned { new_input: None };
+                    info!(
+                        confirmation_event = "invalidated",
+                        invalidation_reason = "state_generation_changed",
+                        "Streaming disambiguation result invalidated before redispatch"
+                    );
+                }
                 match result {
                     DisambiguationResult::Clear => {
                         debug!("Input is clear, proceeding normally (stream)");
@@ -11290,11 +11688,28 @@ Respond in JSON format:
                         question,
                         detection,
                     } => {
+                        let admission = match self
+                            .admit_disambiguation_redispatch(
+                                disambiguation_epoch,
+                                state_generation,
+                            )
+                            .await
+                        {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                *self.pending_skill_id.write() = None;
+                                yield StreamChunk::error(error.to_string());
+                                return;
+                            }
+                        };
+                        let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
                         info!(
                             ambiguity_type = ?detection.ambiguity_type,
                             confidence = detection.confidence,
                             "Input requires clarification (stream)"
                         );
+                        // Confirmation uses the same terminal branch so enriched input cannot stream before explicit agreement.
+                        // Keep pending_skill_id intact for the later confirmed redispatch.
                         if let Err(e) = self.commit_root_user_message(input).await {
                             yield StreamChunk::error(e.to_string());
                             return;
@@ -11303,7 +11718,16 @@ Respond in JSON format:
                             .memory
                             .add_message(ChatMessage::assistant(&question.question))
                             .await;
-                        let response = AgentResponse::new(&question.question);
+                        let status = if awaiting_confirmation {
+                            "awaiting_confirmation"
+                        } else {
+                            "awaiting_clarification"
+                        };
+                        let response = AgentResponse::new(&question.question).with_metadata(
+                            "disambiguation",
+                            serde_json::json!({ "status": status }),
+                        );
+                        drop(admission);
                         if let Err(e) = self.finish_turn_if_root(&response).await {
                             yield StreamChunk::error(e.to_string());
                             return;
@@ -11317,6 +11741,20 @@ Respond in JSON format:
                         resolved,
                         ..
                     } => {
+                        let admission = match self
+                            .admit_disambiguation_redispatch(
+                                disambiguation_epoch,
+                                state_generation,
+                            )
+                            .await
+                        {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                *self.pending_skill_id.write() = None;
+                                yield StreamChunk::error(error.to_string());
+                                return;
+                            }
+                        };
                         info!(
                             resolved_count = resolved.len(),
                             enriched = %enriched_input,
@@ -11339,7 +11777,16 @@ Respond in JSON format:
                         let skill_id = self.pending_skill_id.read().clone();
                         if let Some(skill_id) = skill_id {
                             info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input (stream)");
-                            match self.recheck_skill_disambiguation(&skill_id, &enriched_input).await {
+                            drop(admission);
+                            match self
+                                .recheck_skill_disambiguation(
+                                    &skill_id,
+                                    &enriched_input,
+                                    disambiguation_epoch,
+                                    state_generation,
+                                )
+                                .await
+                            {
                                 Ok(resp) => {
                                     yield StreamChunk::content(&resp.content);
                                     yield StreamChunk::Done {};
@@ -11352,7 +11799,8 @@ Respond in JSON format:
                             }
                         }
 
-                        // Forward to internal stream with enriched input
+                        // Forward to internal stream with enriched input.
+                        drop(admission);
                         let mut inner = self.run_loop_internal_stream(&enriched_input);
                         while let Some(chunk) = inner.next().await {
                             yield chunk;
@@ -11366,7 +11814,15 @@ Respond in JSON format:
                         let skill_id = self.pending_skill_id.read().clone();
                         if let Some(skill_id) = skill_id {
                             info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input (stream)");
-                            match self.recheck_skill_disambiguation(&skill_id, &enriched_input).await {
+                            match self
+                                .recheck_skill_disambiguation(
+                                    &skill_id,
+                                    &enriched_input,
+                                    disambiguation_epoch,
+                                    state_generation,
+                                )
+                                .await
+                            {
                                 Ok(resp) => {
                                     yield StreamChunk::content(&resp.content);
                                     yield StreamChunk::Done {};
@@ -11525,15 +11981,31 @@ Respond in JSON format:
         &self.skills
     }
 
-    pub async fn reset(&self) -> Result<()> {
+    /// Clears conversation and pending runtime ownership through one reset contract.
+    async fn reset_runtime_state(&self) -> Result<()> {
+        let _admission = self.disambiguation_admission.write().await;
+        if self.state_transition_reserved.load(Ordering::SeqCst) {
+            return Err(AgentError::Other(
+                "Cannot reset while a state transition is in progress".to_string(),
+            ));
+        }
+        self.disambiguation_epoch.fetch_add(1, Ordering::SeqCst);
+        *self.pending_skill_id.write() = None;
+        if let Some(disambiguator) = self.disambiguation_manager.as_ref() {
+            disambiguator.clear_pending().await;
+        }
         self.memory.clear().await?;
         *self.iteration_count.write() = 0;
         self.tool_call_history.write().clear();
-        *self.pending_skill_id.write() = None;
         if let Some(ref sm) = self.state_machine {
             sm.reset();
         }
         Ok(())
+    }
+
+    /// Resets the runtime using the same cleanup path as the Agent trait.
+    pub async fn reset(&self) -> Result<()> {
+        self.reset_runtime_state().await
     }
 
     pub fn max_context_tokens(&self) -> u32 {
@@ -11821,14 +12293,9 @@ impl Agent for RuntimeAgent {
         self.info.clone()
     }
 
+    /// Resets the runtime without leaving clarification or skill ownership behind.
     async fn reset(&self) -> Result<()> {
-        self.memory.clear().await?;
-        *self.iteration_count.write() = 0;
-        self.tool_call_history.write().clear();
-        if let Some(ref sm) = self.state_machine {
-            sm.reset();
-        }
-        Ok(())
+        self.reset_runtime_state().await
     }
 }
 
@@ -12064,8 +12531,11 @@ mod tests {
     use crate::AgentBuilder;
     use ai_agents_core::{LLMChunk, LLMConfig, LLMError, LLMFeature, Tool};
     use ai_agents_llm::mock::MockLLMProvider;
+    use ai_agents_skills::{SkillDefinition, SkillStep};
     use ai_agents_tools::{
         CalculatorTool, CopyPathTool, DeletePathTool, FileWriteTool, MovePathTool,
+        WebFetchResolver, WebFetchTool, WebFetchTransport, WebFetchTransportRequest,
+        WebFetchTransportResponse,
     };
 
     fn mock_with_response(response: &str) -> MockLLMProvider {
@@ -12078,6 +12548,892 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
+    }
+
+    /// Builds a two-state fixture so confirmation ownership can be invalidated by transition.
+    fn disambiguation_state_machine(
+        state_enabled: Option<bool>,
+        require_confirmation: bool,
+    ) -> Arc<StateMachine> {
+        let definition = ai_agents_state::StateDefinition {
+            prompt: Some("Handle the resolved request.".to_string()),
+            disambiguation: Some(ai_agents_disambiguation::StateDisambiguationOverride {
+                enabled: state_enabled,
+                require_confirmation,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let review = ai_agents_state::StateDefinition {
+            prompt: Some("Review a fresh request.".to_string()),
+            ..Default::default()
+        };
+        Arc::new(
+            StateMachine::new(ai_agents_state::StateConfig {
+                initial: "active".to_string(),
+                states: std::collections::HashMap::from([
+                    ("active".to_string(), definition),
+                    ("review".to_string(), review),
+                ]),
+                global_transitions: Vec::new(),
+                fallback: None,
+                max_no_transition: None,
+                regenerate_on_transition: true,
+            })
+            .unwrap(),
+        )
+    }
+
+    /// Builds a state-aware disambiguation fixture without skills.
+    fn state_disambiguation_agent(
+        responses: Vec<&str>,
+        manager_enabled: bool,
+        state_enabled: Option<bool>,
+        require_confirmation: bool,
+    ) -> (RuntimeAgent, MockLLMProvider) {
+        state_disambiguation_agent_with_skills(
+            responses,
+            manager_enabled,
+            state_enabled,
+            require_confirmation,
+            Vec::new(),
+        )
+    }
+
+    /// Builds a state-aware disambiguation fixture with optional real skill routing.
+    fn state_disambiguation_agent_with_skills(
+        responses: Vec<&str>,
+        manager_enabled: bool,
+        state_enabled: Option<bool>,
+        require_confirmation: bool,
+        skills: Vec<SkillDefinition>,
+    ) -> (RuntimeAgent, MockLLMProvider) {
+        let mut mock = MockLLMProvider::new("state-confirmation");
+        mock.set_responses(responses.into_iter().map(String::from).collect(), false);
+        let observed = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("Handle requests.")
+            .llm(Arc::new(mock.clone()))
+            .llm_alias("router", Arc::new(mock))
+            .state_machine(disambiguation_state_machine(
+                state_enabled,
+                require_confirmation,
+            ))
+            .skills(skills)
+            .build()
+            .unwrap()
+            .with_disambiguation(DisambiguationConfig {
+                enabled: manager_enabled,
+                ..Default::default()
+            });
+        (agent, observed)
+    }
+
+    /// Defines a prompt skill whose provider call proves committed execution.
+    fn confirmation_skill() -> SkillDefinition {
+        SkillDefinition {
+            id: "send_report".to_string(),
+            description: "Send a report after clarification".to_string(),
+            trigger: "When the user asks to send a report".to_string(),
+            steps: vec![SkillStep::Prompt {
+                prompt: "Execute confirmed report skill for: {{ input }}".to_string(),
+                llm: None,
+            }],
+            reasoning: None,
+            reflection: None,
+            disambiguation: Some(ai_agents_disambiguation::SkillDisambiguationOverride {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Counts committed skill prompt calls without relying on final response wording.
+    fn confirmation_skill_call_count(observed: &MockLLMProvider) -> usize {
+        observed
+            .call_history()
+            .iter()
+            .filter(|call| {
+                call.messages
+                    .iter()
+                    .any(|message| message.content.contains("Execute confirmed report skill"))
+            })
+            .count()
+    }
+
+    struct BlockingRuntimeConfirmationObserver {
+        entered: tokio::sync::Barrier,
+        release: tokio::sync::Notify,
+    }
+
+    impl BlockingRuntimeConfirmationObserver {
+        fn new() -> Self {
+            Self {
+                entered: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    struct ResetOnTransitionHooks {
+        agent: parking_lot::Mutex<Option<Weak<RuntimeAgent>>>,
+        invoked: AtomicBool,
+    }
+
+    #[async_trait]
+    impl AgentHooks for ResetOnTransitionHooks {
+        async fn on_state_transition(&self, _from: Option<&str>, _to: &str, _reason: &str) {
+            if self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let agent = self.agent.lock().as_ref().and_then(Weak::upgrade);
+            if let Some(agent) = agent {
+                agent.reset().await.unwrap();
+            }
+        }
+    }
+
+    impl ClarificationObserver for BlockingRuntimeConfirmationObserver {
+        fn observe_question<'a>(
+            &'a self,
+            future: ClarificationQuestionFuture<'a>,
+        ) -> ClarificationQuestionFuture<'a> {
+            future
+        }
+
+        fn observe_parse<'a>(
+            &'a self,
+            future: ClarificationParseFuture<'a>,
+        ) -> ClarificationParseFuture<'a> {
+            future
+        }
+
+        fn observe_confirmation_parse<'a>(
+            &'a self,
+            future: ConfirmationParseFuture<'a>,
+        ) -> ConfirmationParseFuture<'a> {
+            Box::pin(async move {
+                self.entered.wait().await;
+                self.release.notified().await;
+                future.await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_blocks_redispatch_until_explicit_agreement() {
+        let (agent, observed) = state_disambiguation_agent(
+            vec![
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"status":"confirmed"}"#,
+                "Request executed.",
+            ],
+            true,
+            None,
+            true,
+        );
+
+        let clarification = agent.chat("Send it").await.unwrap();
+        assert_eq!(clarification.content, "What should I send?");
+        assert_eq!(observed.call_count(), 2);
+
+        let confirmation = agent.chat("The report to Ada").await.unwrap();
+        assert_eq!(confirmation.content, "Should I send the report to Ada?");
+        assert_eq!(
+            confirmation
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("disambiguation"))
+                .and_then(|metadata| metadata.get("status"))
+                .and_then(Value::as_str),
+            Some("awaiting_confirmation")
+        );
+        assert_eq!(observed.call_count(), 4);
+
+        let completed = agent.chat("Yes").await.unwrap();
+        assert_eq!(completed.content, "Request executed.");
+        assert_eq!(observed.call_count(), 6);
+    }
+
+    #[tokio::test]
+    async fn streaming_state_confirmation_ends_the_turn_before_redispatch() {
+        let (agent, observed) = state_disambiguation_agent(
+            vec![
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"status":"confirmed"}"#,
+                "Request executed.",
+            ],
+            true,
+            None,
+            true,
+        );
+
+        let mut clarification_stream = agent.chat_stream("Send it").await.unwrap();
+        let mut clarification = String::new();
+        while let Some(chunk) = clarification_stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => clarification.push_str(&text),
+                StreamChunk::Done {} => break,
+                StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(clarification, "What should I send?");
+        assert_eq!(observed.call_count(), 2);
+
+        let mut confirmation_stream = agent.chat_stream("The report to Ada").await.unwrap();
+        let mut confirmation = String::new();
+        while let Some(chunk) = confirmation_stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => confirmation.push_str(&text),
+                StreamChunk::Done {} => break,
+                StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(confirmation, "Should I send the report to Ada?");
+        assert_eq!(observed.call_count(), 4);
+
+        let mut completed_stream = agent.chat_stream("Yes").await.unwrap();
+        let mut completed = String::new();
+        while let Some(chunk) = completed_stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => completed.push_str(&text),
+                StreamChunk::Done {} => break,
+                StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                _ => {}
+            }
+        }
+        assert_eq!(completed, "Request executed.");
+        assert_eq!(observed.call_count(), 6);
+    }
+
+    /// Confirms that a pending skill remains inert until confirmation and then runs once.
+    #[tokio::test]
+    async fn confirmed_skill_route_executes_exactly_once() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"status":"confirmed"}"#,
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"resolved","what_is_unclear":[],"detected_language":"en"}"#,
+                "Report skill executed.",
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        let clarification = agent.chat("Send it").await.unwrap();
+        assert_eq!(clarification.content, "What should I send?");
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+
+        let confirmation = agent.chat("The report to Ada").await.unwrap();
+        assert_eq!(confirmation.content, "Should I send the report to Ada?");
+        assert_eq!(
+            confirmation
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("disambiguation"))
+                .and_then(|metadata| metadata.get("status"))
+                .and_then(Value::as_str),
+            Some("awaiting_confirmation")
+        );
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+
+        let completed = agent.chat("Yes").await.unwrap();
+        assert_eq!(completed.content, "Report skill executed.");
+        assert_eq!(confirmation_skill_call_count(&observed), 1);
+        assert!(agent.pending_skill_id.read().is_none());
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        assert!(!messages.iter().any(|message| message.content == "Yes"));
+    }
+
+    /// Preserves a second clarification response after confirmation instead of overwriting its metadata.
+    #[tokio::test]
+    async fn confirmed_skill_recheck_preserves_new_clarification_metadata() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"status":"confirmed"}"#,
+                r#"{"is_ambiguous":true,"confidence":0.3,"ambiguity_type":"missing_parameters","reasoning":"timing missing","what_is_unclear":["timing"],"detected_language":"en"}"#,
+                r#"{"question":"When should I send it?","options":null}"#,
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        let follow_up = agent.chat("Yes").await.unwrap();
+
+        assert_eq!(follow_up.content, "When should I send it?");
+        let metadata = follow_up
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("disambiguation"))
+            .unwrap();
+        assert_eq!(
+            metadata.get("status").and_then(Value::as_str),
+            Some("awaiting_clarification")
+        );
+        assert_eq!(
+            metadata.get("skill_id").and_then(Value::as_str),
+            Some("send_report")
+        );
+        assert!(metadata.get("detection").is_some());
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+    }
+
+    /// Confirms rejection clears a pending skill without executing its prompt.
+    #[tokio::test]
+    async fn rejected_skill_confirmation_never_executes() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"status":"rejected"}"#,
+                "Confirmation rejected.",
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        let rejected = agent.chat("No").await.unwrap();
+
+        assert_eq!(rejected.content, "Confirmation rejected.");
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+        assert!(agent.pending_skill_id.read().is_none());
+    }
+
+    /// Confirms reset clears manager and skill ownership before a later streaming turn.
+    #[tokio::test]
+    async fn reset_invalidates_pending_skill_confirmation_before_streaming_input() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"fresh input","what_is_unclear":[],"detected_language":"en"}"#,
+                "none",
+                "Fresh response.",
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        agent.reset().await.unwrap();
+        assert!(agent.pending_skill_id.read().is_none());
+        assert!(
+            !agent
+                .disambiguation_manager()
+                .unwrap()
+                .has_pending_clarification()
+                .await
+        );
+
+        let mut stream = agent.chat_stream("Yes").await.unwrap();
+        let mut content = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => content.push_str(&text),
+                StreamChunk::Done {} => break,
+                StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(content, "Fresh response.");
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+    }
+
+    /// Confirms the Agent trait reset uses the same pending ownership cleanup.
+    #[tokio::test]
+    async fn trait_reset_clears_pending_skill_confirmation() {
+        let (agent, _) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        <RuntimeAgent as Agent>::reset(&agent).await.unwrap();
+
+        assert!(agent.pending_skill_id.read().is_none());
+        assert!(
+            !agent
+                .disambiguation_manager()
+                .unwrap()
+                .has_pending_clarification()
+                .await
+        );
+    }
+
+    /// Confirms a state transition cancels stale skill execution before confirmation parsing.
+    #[tokio::test]
+    async fn state_change_invalidates_pending_skill_confirmation() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"fresh input","what_is_unclear":[],"detected_language":"en"}"#,
+                "none",
+                "Fresh response.",
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        agent.transition_to("review").await.unwrap();
+        let cancelled = agent.chat("Yes").await.unwrap();
+
+        assert_eq!(cancelled.content, "Fresh response.");
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+        assert!(agent.pending_skill_id.read().is_none());
+    }
+
+    /// Confirms reset wins over a confirmation result that was already being parsed.
+    #[tokio::test]
+    async fn in_flight_confirmation_cannot_redispatch_after_reset() {
+        let (mut agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                r#"{"status":"confirmed"}"#,
+                "Confirmation cancelled.",
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+        let observer = Arc::new(BlockingRuntimeConfirmationObserver::new());
+        let manager = agent
+            .disambiguation_manager
+            .take()
+            .unwrap()
+            .with_clarification_observer(observer.clone());
+        agent.disambiguation_manager = Some(manager);
+        let agent = Arc::new(agent);
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+
+        let confirming_agent = Arc::clone(&agent);
+        let confirmation = tokio::spawn(async move { confirming_agent.chat("Yes").await });
+        observer.entered.wait().await;
+        agent.reset().await.unwrap();
+        observer.release.notify_one();
+
+        let response = confirmation.await.unwrap().unwrap();
+        assert_eq!(response.content, "Confirmation cancelled.");
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+        assert!(agent.pending_skill_id.read().is_none());
+    }
+
+    /// Confirms a queued reset prevents an older terminal question from being published afterward.
+    #[tokio::test]
+    async fn queued_reset_prevents_stale_confirmation_question_publication() {
+        let (agent, observed) = state_disambiguation_agent(
+            vec![
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+            ],
+            true,
+            None,
+            true,
+        );
+        let agent = Arc::new(agent);
+        agent.chat("Send it").await.unwrap();
+
+        let admission = agent.disambiguation_admission.write().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let resetting_agent = Arc::clone(&agent);
+        let reset = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            resetting_agent.reset().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        let responding_agent = Arc::clone(&agent);
+        let response =
+            tokio::spawn(async move { responding_agent.chat("The report to Ada").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while observed.call_count() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clarification processing must reach terminal publication");
+        drop(admission);
+
+        reset.await.unwrap().unwrap();
+        let error = response.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("ownership changed"));
+        assert!(
+            !agent
+                .disambiguation_manager()
+                .unwrap()
+                .has_pending_clarification()
+                .await
+        );
+        assert!(agent.memory.get_messages(None).await.unwrap().is_empty());
+    }
+
+    /// Confirms skill clarification consumers recheck ownership before publishing returned responses.
+    #[tokio::test]
+    async fn queued_reset_prevents_stale_skill_clarification_publication() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+        let agent = Arc::new(agent);
+        let admission = agent.disambiguation_admission.write().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let resetting_agent = Arc::clone(&agent);
+        let reset = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            resetting_agent.reset().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+
+        let responding_agent = Arc::clone(&agent);
+        let response = tokio::spawn(async move { responding_agent.chat("Send it").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while observed.call_count() < 4 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("skill clarification must reach terminal publication");
+        drop(admission);
+
+        reset.await.unwrap().unwrap();
+        let error = response.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("ownership changed"));
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+        assert!(agent.pending_skill_id.read().is_none());
+        assert!(agent.memory.get_messages(None).await.unwrap().is_empty());
+    }
+
+    /// Confirms transition hooks can reenter reset after the state commit lock is released.
+    #[tokio::test]
+    async fn transition_hook_can_reset_without_admission_deadlock() {
+        let hooks = Arc::new(ResetOnTransitionHooks {
+            agent: parking_lot::Mutex::new(None),
+            invoked: AtomicBool::new(false),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test transition hook reentrancy.")
+                .llm(Arc::new(mock_with_response("done")))
+                .state_machine(disambiguation_state_machine(None, false))
+                .build()
+                .unwrap()
+                .with_hooks(hooks.clone()),
+        );
+        *hooks.agent.lock() = Some(Arc::downgrade(&agent));
+
+        let transitioned = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.apply_transition_target("active", "review", "test transition", None),
+        )
+        .await
+        .expect("transition hook reset must not deadlock")
+        .unwrap();
+
+        assert!(transitioned);
+        assert!(hooks.invoked.load(Ordering::SeqCst));
+        assert_eq!(agent.current_state().as_deref(), Some("active"));
+    }
+
+    /// Confirms only the reserved transition can run source-state exit side effects.
+    #[tokio::test]
+    async fn concurrent_transition_cannot_duplicate_exit_actions() {
+        let gate = PathMutationGate::new();
+        let active = ai_agents_state::StateDefinition {
+            on_exit: vec![StateAction::Tool {
+                tool: "transition_exit".to_string(),
+                args: Some(serde_json::json!({"path": "./transition-exit.txt"})),
+            }],
+            ..Default::default()
+        };
+        let state_machine = Arc::new(
+            StateMachine::new(ai_agents_state::StateConfig {
+                initial: "active".to_string(),
+                states: HashMap::from([
+                    ("active".to_string(), active),
+                    (
+                        "review".to_string(),
+                        ai_agents_state::StateDefinition::default(),
+                    ),
+                ]),
+                global_transitions: Vec::new(),
+                fallback: None,
+                max_no_transition: None,
+                regenerate_on_transition: true,
+            })
+            .unwrap(),
+        );
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test transition reservation.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "transition_exit",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: gate.clone(),
+                }))
+                .state_machine(state_machine)
+                .build()
+                .unwrap(),
+        );
+
+        let first_agent = Arc::clone(&agent);
+        let first = tokio::spawn(async move { first_agent.transition_to("review").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("reserved transition must enter its exit action");
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.transition_to("review"),
+        )
+        .await
+        .expect("competing transition must fail without waiting for the exit action")
+        .unwrap_err();
+        assert!(second.to_string().contains("already in progress"));
+
+        gate.release();
+        first.await.unwrap().unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("review"));
+    }
+
+    /// Confirms a later transition cannot overtake the committed state's enter actions.
+    #[tokio::test]
+    async fn concurrent_transition_cannot_overtake_enter_actions() {
+        let gate = PathMutationGate::new();
+        let review = ai_agents_state::StateDefinition {
+            on_enter: vec![StateAction::Tool {
+                tool: "transition_enter".to_string(),
+                args: Some(serde_json::json!({"path": "./transition-enter.txt"})),
+            }],
+            ..Default::default()
+        };
+        let state_machine = Arc::new(
+            StateMachine::new(ai_agents_state::StateConfig {
+                initial: "active".to_string(),
+                states: HashMap::from([
+                    (
+                        "active".to_string(),
+                        ai_agents_state::StateDefinition::default(),
+                    ),
+                    ("review".to_string(), review),
+                ]),
+                global_transitions: Vec::new(),
+                fallback: None,
+                max_no_transition: None,
+                regenerate_on_transition: true,
+            })
+            .unwrap(),
+        );
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test transition lifecycle reservation.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "transition_enter",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: gate.clone(),
+                }))
+                .state_machine(state_machine)
+                .build()
+                .unwrap(),
+        );
+
+        let first_agent = Arc::clone(&agent);
+        let first = tokio::spawn(async move { first_agent.transition_to("review").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), gate.wait_until_entered())
+            .await
+            .expect("committed transition must enter its destination action");
+
+        let second = agent.transition_to("active").await.unwrap_err();
+        assert!(second.to_string().contains("already in progress"));
+        assert!(agent.reset().await.is_err());
+
+        gate.release();
+        first.await.unwrap().unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("review"));
+    }
+
+    /// Confirms even a same-state restore invalidates manager and skill ownership.
+    #[tokio::test]
+    async fn same_state_restore_invalidates_pending_skill_confirmation() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        let snapshot = agent.save_state().await.unwrap();
+        assert_eq!(agent.current_state().as_deref(), Some("active"));
+
+        agent.restore_state(snapshot).await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("active"));
+        assert!(agent.pending_skill_id.read().is_none());
+        assert!(
+            !agent
+                .disambiguation_manager()
+                .unwrap()
+                .has_pending_clarification()
+                .await
+        );
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+    }
+
+    /// Confirms direct state mutation cannot hide behind a return to the same state path.
+    #[tokio::test]
+    async fn direct_state_generation_change_invalidates_confirmation() {
+        let (agent, observed) = state_disambiguation_agent_with_skills(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "send_report",
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":null}"#,
+                r#"{"status":"answered","selected_option":null,"enriched_input":"Send the report to Ada","resolved":{"intent":"send_report"}}"#,
+                r#"{"question":"Should I send the report to Ada?"}"#,
+                "Confirmation cancelled.",
+            ],
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+
+        agent.chat("Send it").await.unwrap();
+        agent.chat("The report to Ada").await.unwrap();
+        let state_machine = agent.state_machine().unwrap();
+        state_machine
+            .transition_to("review", "external test")
+            .unwrap();
+        state_machine
+            .transition_to("active", "external test")
+            .unwrap();
+
+        let response = agent.chat("Yes").await.unwrap();
+
+        assert_eq!(response.content, "Confirmation cancelled.");
+        assert_eq!(confirmation_skill_call_count(&observed), 0);
+        assert!(agent.pending_skill_id.read().is_none());
+    }
+
+    #[tokio::test]
+    async fn state_confirmation_does_not_add_a_question_for_clear_input() {
+        let (agent, observed) = state_disambiguation_agent(
+            vec![
+                r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"clear","what_is_unclear":[],"detected_language":"en"}"#,
+                "Request executed.",
+            ],
+            true,
+            None,
+            true,
+        );
+
+        let response = agent.chat("Send the report to Ada").await.unwrap();
+
+        assert_eq!(response.content, "Request executed.");
+        assert_eq!(observed.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn state_override_cannot_activate_a_disabled_top_level_manager() {
+        let (agent, observed) =
+            state_disambiguation_agent(vec!["Request executed."], false, Some(true), true);
+
+        assert!(!agent.has_disambiguation());
+        let response = agent.chat("Send it").await.unwrap();
+
+        assert_eq!(response.content, "Request executed.");
+        assert_eq!(observed.call_count(), 1);
     }
 
     #[tokio::test]
@@ -13071,6 +14427,12 @@ mod tests {
         result: ApprovalResult,
     }
 
+    struct RuntimeWebFetchTransport {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct RuntimeWebFetchResolver;
+
     struct ReentrantToolHooks {
         agent: parking_lot::Mutex<Option<Weak<RuntimeAgent>>>,
         invoked: AtomicBool,
@@ -13438,6 +14800,46 @@ mod tests {
             } else {
                 ToolResult::error(format!("{} failed", self.id))
             }
+        }
+    }
+
+    #[async_trait]
+    impl WebFetchTransport for RuntimeWebFetchTransport {
+        /// Rejects unvalidated transport calls in the shared-executor fixture.
+        async fn send(
+            &self,
+            _request: WebFetchTransportRequest,
+        ) -> std::result::Result<WebFetchTransportResponse, String> {
+            Err("validated addresses are required".to_string())
+        }
+
+        /// Records transport only after runtime and tool policy validation complete.
+        async fn send_validated(
+            &self,
+            _request: WebFetchTransportRequest,
+            _addresses: &[std::net::SocketAddr],
+        ) -> std::result::Result<WebFetchTransportResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(WebFetchTransportResponse {
+                status: 200,
+                content_type: Some("text/plain".to_string()),
+                location: None,
+                body: b"approved".to_vec(),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl WebFetchResolver for RuntimeWebFetchResolver {
+        /// Returns one public fixture address without external DNS.
+        async fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::result::Result<Vec<std::net::IpAddr>, String> {
+            Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                93, 184, 216, 34,
+            ))])
         }
     }
 
@@ -14036,6 +15438,69 @@ mod tests {
         ));
         let output: Value = serde_json::from_str(&record.output).unwrap();
         assert_eq!(output["mutation_performed"], false);
+    }
+
+    /// Proves shared HITL approval evidence reaches the web fetch implementation unchanged.
+    #[tokio::test]
+    async fn shared_executor_approval_reaches_web_fetch_transport() {
+        use ai_agents_hitl::{CallbackHandler, HITLConfig};
+        use ai_agents_tools::{DomainPolicyConfig, ToolPolicyConfig};
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::new(RuntimeWebFetchTransport {
+                calls: Arc::clone(&calls),
+            }),
+            Arc::new(RuntimeWebFetchResolver),
+        );
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        security.tools.insert(
+            "web_fetch".to_string(),
+            ToolPolicyConfig {
+                domains: DomainPolicyConfig {
+                    requires_approval: vec!["approval.test".to_string()],
+                    ..Default::default()
+                },
+                allowed_schemes: vec!["https".to_string()],
+                allowed_ports: vec![443],
+                ..Default::default()
+            },
+        );
+        let handler = CallbackHandler::new(|_| ApprovalResult::Approved);
+        let agent = AgentBuilder::new()
+            .system_prompt("Test approved web fetch execution.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(tool))
+            .tool_security(ToolSecurityEngine::new(security))
+            .build()
+            .unwrap()
+            .with_hitl(HITLEngine::new(HITLConfig::default()), Arc::new(handler));
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "approved-web-fetch",
+                "web_fetch",
+                serde_json::json!({
+                    "url": "https://approval.test/page",
+                    "cache_ttl_seconds": 0
+                }),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.success);
+        assert!(
+            record
+                .approval
+                .as_ref()
+                .is_some_and(|approval| matches!(approval.status, ToolApprovalStatus::Approved))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

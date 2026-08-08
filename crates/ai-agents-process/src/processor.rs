@@ -405,17 +405,25 @@ impl ProcessProcessor {
         if let Some(pii_config) = &config.pii
             && !pii_config.types.is_empty()
         {
-            let pii_types: Vec<String> = pii_config
-                .types
-                .iter()
-                .map(|t| format!("{:?}", t).to_lowercase())
-                .collect();
+            let pii_types: Vec<&str> = pii_config.types.iter().map(pii_type_prompt_label).collect();
             let action = match pii_config.action {
-                PIIAction::Mask => format!("replace with '{}'", pii_config.mask_char.repeat(4)),
-                PIIAction::Remove => "remove completely".to_string(),
-                PIIAction::Flag => "wrap with [PII: type]".to_string(),
+                PIIAction::Mask => format!(
+                    "Replace every detected value with '{}' and retain none of its original characters",
+                    pii_config.mask_char.repeat(4)
+                ),
+                PIIAction::Remove => {
+                    "Remove every detected value completely and retain none of its original characters"
+                        .to_string()
+                }
+                PIIAction::Flag => {
+                    "Wrap every detected value with [PII: type]".to_string()
+                }
             };
-            instructions.push(format!("PII types to {}: {}", action, pii_types.join(", ")));
+            instructions.push(format!(
+                "PII rule: {}. Types: {}",
+                action,
+                pii_types.join(", ")
+            ));
         }
 
         if let Some(harmful_config) = &config.harmful
@@ -866,6 +874,19 @@ fn purpose_hint_for_stages(stages: &[ProcessStage]) -> ProcessPurposeHint {
     ProcessPurposeHint::Other
 }
 
+// Returns explicit natural-language labels so multiword PII types remain unambiguous to router models.
+fn pii_type_prompt_label(pii_type: &PIIType) -> &'static str {
+    match pii_type {
+        PIIType::Email => "email address",
+        PIIType::Phone => "phone number",
+        PIIType::CreditCard => "credit card number",
+        PIIType::Ssn => "social security number",
+        PIIType::IpAddress => "IP address",
+        PIIType::Name => "person name",
+        PIIType::Address => "physical address",
+    }
+}
+
 fn process_purpose_hint_for_stage(stage: &ProcessStage) -> ProcessPurposeHint {
     match stage {
         ProcessStage::Detect(_) => ProcessPurposeHint::Detect,
@@ -1257,6 +1278,19 @@ mod tests {
         let extracted = result.context.get("extracted").unwrap();
         assert_eq!(extracted["order_number"], "ORD-12345");
         assert_eq!(extracted["urgency"], "high");
+    }
+
+    #[test]
+    fn test_pii_prompt_labels_are_unambiguous() {
+        assert_eq!(
+            pii_type_prompt_label(&PIIType::CreditCard),
+            "credit card number"
+        );
+        assert_eq!(
+            pii_type_prompt_label(&PIIType::Ssn),
+            "social security number"
+        );
+        assert_eq!(pii_type_prompt_label(&PIIType::IpAddress), "IP address");
     }
 
     #[tokio::test]

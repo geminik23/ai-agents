@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use ai_agents_core::{
     ChatMessage, DomainPolicyBinding, LLMConfig, LLMProvider, ResultLimitBinding, ResultLimitKind,
-    Tool, ToolCallClassification, ToolExecutionContext, ToolOperationKind, ToolPolicyBindings,
-    ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
+    Tool, ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification, ToolExecutionContext,
+    ToolOperationKind, ToolPolicyBindings, ToolResult, ToolSafetyMetadata, ToolSideEffectLevel,
 };
 
 use crate::generate_schema;
@@ -23,6 +23,7 @@ const DEFAULT_MAX_OUTPUT_CHARS: usize = 20_000;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 900;
 const DEFAULT_MAX_REDIRECTS: usize = 5;
 const DEFAULT_TIMEOUT_MS: u64 = 15_000;
+const MAX_CACHE_ENTRIES: usize = 128;
 
 /// A single HTTP GET issued by the web fetch tool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,7 +172,7 @@ impl WebFetchResolver for TokioWebFetchResolver {
 pub struct WebFetchTool {
     transport: Arc<dyn WebFetchTransport>,
     resolver: Arc<dyn WebFetchResolver>,
-    cache: Arc<RwLock<HashMap<String, CacheEntry>>>,
+    cache: Arc<RwLock<WebFetchCache>>,
     extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
 }
 
@@ -207,7 +208,7 @@ impl WebFetchTool {
         Self {
             transport,
             resolver,
-            cache: Arc::new(RwLock::new(HashMap::new())),
+            cache: Arc::new(RwLock::new(WebFetchCache::new(MAX_CACHE_ENTRIES))),
             extractor,
         }
     }
@@ -229,10 +230,10 @@ struct WebFetchInput {
     /// Maximum output characters. Defaults to 20000.
     #[serde(default)]
     max_chars: Option<usize>,
-    /// Cache TTL in seconds. Defaults to 900.
+    /// Storage-time cache lifetime in seconds. Defaults to 900; zero disables caching.
     #[serde(default)]
     cache_ttl_seconds: Option<u64>,
-    /// Maximum response bytes. Defaults to 1 MiB.
+    /// Maximum bytes for each response, including redirect responses. Defaults to 1 MiB.
     #[serde(default)]
     max_response_bytes: Option<usize>,
     /// Maximum redirects. Defaults to 5.
@@ -330,6 +331,89 @@ struct WebFetchOutput {
 struct CacheEntry {
     output: WebFetchOutput,
     expires_at: Instant,
+    sequence: u64,
+}
+
+/// A bounded process-local cache that removes expired entries when it is accessed.
+struct WebFetchCache {
+    entries: HashMap<String, CacheEntry>,
+    capacity: usize,
+    next_sequence: u64,
+}
+
+impl WebFetchCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            next_sequence: 0,
+        }
+    }
+
+    fn get(&mut self, key: &str, now: Instant) -> Option<WebFetchOutput> {
+        self.remove_expired(now);
+        self.entries.get(key).map(|entry| entry.output.clone())
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.entries.remove(key);
+    }
+
+    fn insert(
+        &mut self,
+        key: String,
+        output: WebFetchOutput,
+        lifetime: Duration,
+        stored_at: Instant,
+    ) -> Result<(), String> {
+        let expires_at = stored_at
+            .checked_add(lifetime)
+            .ok_or_else(cache_ttl_unrepresentable_error)?;
+        self.remove_expired(stored_at);
+        if self.capacity == 0 {
+            return Ok(());
+        }
+
+        if !self.entries.contains_key(&key)
+            && self.entries.len() >= self.capacity
+            && let Some(oldest_key) = self
+                .entries
+                .iter()
+                .min_by(|(left_key, left), (right_key, right)| {
+                    left.sequence
+                        .cmp(&right.sequence)
+                        .then_with(|| left_key.cmp(right_key))
+                })
+                .map(|(key, _)| key.clone())
+        {
+            self.entries.remove(&oldest_key);
+        }
+
+        let sequence = self.next_sequence;
+        self.next_sequence = self.next_sequence.wrapping_add(1);
+        self.entries.insert(
+            key,
+            CacheEntry {
+                output,
+                expires_at,
+                sequence,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| now < entry.expires_at);
+    }
+}
+
+//
+// Initial approval-required domains need positive context evidence, while redirects cannot start a second approval flow.
+//
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UrlPolicyTarget {
+    Initial,
+    Redirect,
 }
 
 #[async_trait]
@@ -411,13 +495,27 @@ impl Tool for WebFetchTool {
             ctx.limits.max_redirects,
         );
         let cache_ttl = input.cache_ttl_seconds.unwrap_or(DEFAULT_CACHE_TTL_SECONDS);
+        let cache_lifetime = match checked_cache_lifetime(cache_ttl, Instant::now()) {
+            Ok(lifetime) => lifetime,
+            Err(error) => return ToolResult::error(error),
+        };
 
         let original_url = match reqwest::Url::parse(&input.url) {
             Ok(url) => url,
             Err(error) => return ToolResult::error(format!("Invalid URL: {}", error)),
         };
         if let Err(result) =
-            validate_url_with_policy(&original_url, Some(&policy), self.resolver.as_ref()).await
+            require_initial_domain_approval(&original_url, &policy, ctx.approval.as_ref())
+        {
+            return result;
+        }
+        if let Err(result) = validate_url_with_policy(
+            &original_url,
+            Some(&policy),
+            UrlPolicyTarget::Initial,
+            self.resolver.as_ref(),
+        )
+        .await
         {
             return result;
         }
@@ -430,13 +528,11 @@ impl Tool for WebFetchTool {
             max_redirects,
             policy_cache_fingerprint(&policy)
         );
-        if cache_ttl > 0 {
-            let cached_entry = { self.cache.read().get(&cache_key).cloned() };
-            if let Some(entry) = cached_entry
-                && Instant::now() < entry.expires_at
-            {
+        if cache_lifetime.is_some() {
+            let cached_output = { self.cache.write().get(&cache_key, Instant::now()) };
+            if let Some(mut output) = cached_output {
                 match validate_cached_output_with_policy(
-                    &entry.output,
+                    &output,
                     &policy,
                     max_redirects,
                     self.resolver.as_ref(),
@@ -444,7 +540,6 @@ impl Tool for WebFetchTool {
                 .await
                 {
                     Ok(true) => {
-                        let mut output = entry.output;
                         output.from_cache = true;
                         return web_result(&output, output.truncated, max_output_chars, true, None);
                     }
@@ -467,13 +562,22 @@ impl Tool for WebFetchTool {
                         .unwrap_or("Tool execution cancelled"),
                 );
             }
-            let validated_target =
-                match validate_url_with_policy(&current_url, Some(&policy), self.resolver.as_ref())
-                    .await
-                {
-                    Ok(target) => target,
-                    Err(result) => return result,
-                };
+            let policy_target = if redirects.is_empty() {
+                UrlPolicyTarget::Initial
+            } else {
+                UrlPolicyTarget::Redirect
+            };
+            let validated_target = match validate_url_with_policy(
+                &current_url,
+                Some(&policy),
+                policy_target,
+                self.resolver.as_ref(),
+            )
+            .await
+            {
+                Ok(target) => target,
+                Err(result) => return result,
+            };
             let response = match self
                 .transport
                 .send_validated(
@@ -566,14 +670,13 @@ impl Tool for WebFetchTool {
             extraction_prompt_used: input.prompt.is_some(),
             extraction_available,
         };
-        if cache_ttl > 0 {
-            self.cache.write().insert(
-                cache_key,
-                CacheEntry {
-                    output: output.clone(),
-                    expires_at: Instant::now() + Duration::from_secs(cache_ttl),
-                },
-            );
+        if let Some(cache_lifetime) = cache_lifetime
+            && let Err(error) =
+                self.cache
+                    .write()
+                    .insert(cache_key, output.clone(), cache_lifetime, Instant::now())
+        {
+            return ToolResult::error(error);
         }
         web_result(
             &output,
@@ -592,13 +695,57 @@ struct ValidatedWebTarget {
 async fn validate_url_with_policy(
     url: &reqwest::Url,
     policy: Option<&WebFetchPolicyInput>,
+    policy_target: UrlPolicyTarget,
     resolver: &dyn WebFetchResolver,
 ) -> Result<ValidatedWebTarget, ToolResult> {
-    let target = validate_url(url, resolver).await?;
     if let Some(policy) = policy {
-        check_configured_url_policy(url, policy)?;
+        check_configured_url_policy(url, policy, policy_target)?;
     }
-    Ok(target)
+    validate_url(url, resolver).await
+}
+
+// This gate runs before DNS and cache lookup so direct tool execution cannot bypass required approval.
+fn require_initial_domain_approval(
+    url: &reqwest::Url,
+    policy: &WebFetchPolicyInput,
+    approval: Option<&ToolApprovalRecord>,
+) -> Result<(), ToolResult> {
+    let Some(host) = url.host_str().map(normalize_host) else {
+        return Err(ToolResult::error("URL host is required"));
+    };
+    let Some(pattern) = policy
+        .domain_requires_approval
+        .iter()
+        .find(|pattern| host_matches(pattern, &host))
+    else {
+        return Ok(());
+    };
+    if approval.is_some_and(|record| {
+        matches!(
+            record.status,
+            ToolApprovalStatus::Approved | ToolApprovalStatus::Modified
+        )
+    }) {
+        return Ok(());
+    }
+    Err(ToolResult::error(format!(
+        "Domain '{}' requires an approved tool execution context",
+        pattern
+    )))
+}
+
+fn checked_cache_lifetime(seconds: u64, now: Instant) -> Result<Option<Duration>, String> {
+    if seconds == 0 {
+        return Ok(None);
+    }
+    let lifetime = Duration::from_secs(seconds);
+    now.checked_add(lifetime)
+        .ok_or_else(cache_ttl_unrepresentable_error)?;
+    Ok(Some(lifetime))
+}
+
+fn cache_ttl_unrepresentable_error() -> String {
+    "cache_ttl_seconds is too large to represent on this platform".to_string()
 }
 
 // Redirect-count incompatibility is a safe cache miss, while current URL or address policy failures remain hard errors.
@@ -613,12 +760,18 @@ async fn validate_cached_output_with_policy(
     }
     let final_url = reqwest::Url::parse(&output.final_url)
         .map_err(|error| ToolResult::error(format!("Cached final URL is invalid: {}", error)))?;
-    let _ = validate_url_with_policy(&final_url, Some(policy), resolver).await?;
+    let final_target = if output.redirects.is_empty() {
+        UrlPolicyTarget::Initial
+    } else {
+        UrlPolicyTarget::Redirect
+    };
+    let _ = validate_url_with_policy(&final_url, Some(policy), final_target, resolver).await?;
     for redirect in &output.redirects {
         let url = reqwest::Url::parse(redirect).map_err(|error| {
             ToolResult::error(format!("Cached redirect URL is invalid: {}", error))
         })?;
-        let _ = validate_url_with_policy(&url, Some(policy), resolver).await?;
+        let _ = validate_url_with_policy(&url, Some(policy), UrlPolicyTarget::Redirect, resolver)
+            .await?;
     }
     Ok(true)
 }
@@ -706,6 +859,7 @@ async fn validate_url(
 fn check_configured_url_policy(
     url: &reqwest::Url,
     policy: &WebFetchPolicyInput,
+    policy_target: UrlPolicyTarget,
 ) -> Result<(), ToolResult> {
     let scheme = url.scheme();
     if !policy.allowed_schemes.is_empty()
@@ -761,12 +915,14 @@ fn check_configured_url_policy(
         }
     }
 
-    for pattern in &policy.domain_requires_approval {
-        if host_matches(pattern, &host) {
-            return Err(ToolResult::error(format!(
-                "Domain '{}' requires approval and cannot be reached by redirect",
-                pattern
-            )));
+    if policy_target == UrlPolicyTarget::Redirect {
+        for pattern in &policy.domain_requires_approval {
+            if host_matches(pattern, &host) {
+                return Err(ToolResult::error(format!(
+                    "Domain '{}' requires approval and cannot be reached by redirect",
+                    pattern
+                )));
+            }
         }
     }
 
@@ -1076,8 +1232,38 @@ mod tests {
         WebFetchTool::with_transport_and_resolver(transport, Arc::new(FixtureResolver::default()))
     }
 
+    fn approval_context(status: Option<ToolApprovalStatus>) -> ToolExecutionContext {
+        let mut context = ToolExecutionContext::test("web_fetch");
+        context.policy_snapshot = serde_json::json!({
+            "domains": {
+                "requires_approval": ["approval.test"]
+            }
+        });
+        context.approval = status.map(|status| ToolApprovalRecord {
+            status,
+            reason: None,
+            modified_arguments: None,
+        });
+        context
+    }
+
     fn output(result: &ToolResult) -> Value {
         serde_json::from_str(&result.output).expect("web fetch output should be JSON")
+    }
+
+    fn cached_output(url: &str) -> WebFetchOutput {
+        WebFetchOutput {
+            url: url.to_string(),
+            final_url: url.to_string(),
+            status: 200,
+            content_type: Some("text/plain".to_string()),
+            content: url.to_string(),
+            truncated: false,
+            from_cache: false,
+            redirects: Vec::new(),
+            extraction_prompt_used: false,
+            extraction_available: false,
+        }
     }
 
     #[tokio::test]
@@ -1306,6 +1492,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approved_and_modified_initial_domains_reach_transport() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://approval.test/page",
+            response(200, Some("text/plain"), None, "approved"),
+        );
+        let tool = fixture_tool(Arc::clone(&transport));
+
+        for status in [ToolApprovalStatus::Approved, ToolApprovalStatus::Modified] {
+            let result = tool
+                .execute(
+                    serde_json::json!({
+                        "url": "https://approval.test/page",
+                        "cache_ttl_seconds": 0
+                    }),
+                    approval_context(Some(status)),
+                )
+                .await;
+            assert!(result.success);
+        }
+
+        assert_eq!(
+            transport.requests(),
+            vec![
+                "https://approval.test/page".to_string(),
+                "https://approval.test/page".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_required_initial_domain_fails_closed_before_dns_and_transport() {
+        let transport = Arc::new(FixtureTransport::default());
+        let resolver = Arc::new(FixtureResolver::default());
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::clone(&resolver) as Arc<dyn WebFetchResolver>,
+        );
+        let statuses = [
+            None,
+            Some(ToolApprovalStatus::NotRequired),
+            Some(ToolApprovalStatus::Rejected),
+            Some(ToolApprovalStatus::Timeout),
+            Some(ToolApprovalStatus::Unavailable),
+        ];
+
+        for status in statuses {
+            let result = tool
+                .execute(
+                    serde_json::json!({"url": "https://approval.test/page"}),
+                    approval_context(status),
+                )
+                .await;
+            assert!(!result.success);
+            assert!(
+                result
+                    .output
+                    .contains("requires an approved tool execution context")
+            );
+        }
+
+        assert!(resolver.requests().is_empty());
+        assert!(transport.requests().is_empty());
+        assert!(transport.validated_addresses().is_empty());
+    }
+
+    #[tokio::test]
+    async fn redirect_to_approval_required_domain_stops_before_second_dns_and_request() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("https://approval.test/page"), ""),
+        );
+        transport.route(
+            "https://approval.test/page",
+            response(200, Some("text/plain"), None, "not reached"),
+        );
+        let resolver = Arc::new(FixtureResolver::default());
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::clone(&resolver) as Arc<dyn WebFetchResolver>,
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://public.test/start"}),
+                approval_context(Some(ToolApprovalStatus::Approved)),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("cannot be reached by redirect"));
+        assert_eq!(transport.requests(), vec!["https://public.test/start"]);
+        assert!(resolver.requests().iter().all(|host| host == "public.test"));
+    }
+
+    #[tokio::test]
     async fn blocks_private_redirect_before_second_request() {
         let transport = Arc::new(FixtureTransport::default());
         transport.route(
@@ -1353,6 +1636,135 @@ mod tests {
 
         assert!(!result.success);
         assert!(result.output.contains("max_response_bytes 5"));
+    }
+
+    #[tokio::test]
+    async fn response_byte_limit_applies_independently_to_each_redirect_response() {
+        let transport = Arc::new(FixtureTransport::default());
+        transport.route(
+            "https://public.test/start",
+            response(302, None, Some("/final"), "12345"),
+        );
+        transport.route(
+            "https://public.test/final",
+            response(200, Some("text/plain"), None, "abcde"),
+        );
+
+        let result = fixture_tool(Arc::clone(&transport))
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/start",
+                    "max_response_bytes": 5
+                }),
+                ai_agents_core::ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(result.success);
+        assert_eq!(output(&result)["content"], "abcde");
+        assert_eq!(transport.requests().len(), 2);
+    }
+
+    #[test]
+    fn cache_evicts_oldest_entry_at_capacity() {
+        let stored_at = Instant::now();
+        let mut cache = WebFetchCache::new(2);
+        let lifetime = Duration::from_secs(60);
+        cache
+            .insert(
+                "first".to_string(),
+                cached_output("https://public.test/first"),
+                lifetime,
+                stored_at,
+            )
+            .unwrap();
+        cache
+            .insert(
+                "second".to_string(),
+                cached_output("https://public.test/second"),
+                lifetime,
+                stored_at + Duration::from_secs(1),
+            )
+            .unwrap();
+        cache
+            .insert(
+                "third".to_string(),
+                cached_output("https://public.test/third"),
+                lifetime,
+                stored_at + Duration::from_secs(2),
+            )
+            .unwrap();
+
+        let checked_at = stored_at + Duration::from_secs(3);
+        assert_eq!(cache.entries.len(), 2);
+        assert!(cache.get("first", checked_at).is_none());
+        assert!(cache.get("second", checked_at).is_some());
+        assert!(cache.get("third", checked_at).is_some());
+    }
+
+    #[test]
+    fn cache_lazily_removes_expired_entries_without_refreshing_hits() {
+        let stored_at = Instant::now();
+        let mut cache = WebFetchCache::new(3);
+        cache
+            .insert(
+                "short".to_string(),
+                cached_output("https://public.test/short"),
+                Duration::from_secs(1),
+                stored_at,
+            )
+            .unwrap();
+        cache
+            .insert(
+                "long".to_string(),
+                cached_output("https://public.test/long"),
+                Duration::from_secs(10),
+                stored_at,
+            )
+            .unwrap();
+
+        assert!(
+            cache
+                .get("short", stored_at + Duration::from_millis(500))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get("long", stored_at + Duration::from_secs(2))
+                .is_some()
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert!(
+            cache
+                .get("short", stored_at + Duration::from_secs(2))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_cache_ttl_fails_before_dns_and_transport() {
+        let transport = Arc::new(FixtureTransport::default());
+        let resolver = Arc::new(FixtureResolver::default());
+        let tool = WebFetchTool::with_transport_and_resolver(
+            Arc::clone(&transport) as Arc<dyn WebFetchTransport>,
+            Arc::clone(&resolver) as Arc<dyn WebFetchResolver>,
+        );
+
+        let result = tool
+            .execute(
+                serde_json::json!({
+                    "url": "https://public.test/page",
+                    "cache_ttl_seconds": u64::MAX
+                }),
+                ToolExecutionContext::test("web_fetch"),
+            )
+            .await;
+
+        assert!(!result.success);
+        assert!(result.output.contains("cache_ttl_seconds is too large"));
+        assert!(resolver.requests().is_empty());
+        assert!(transport.requests().is_empty());
+        assert!(transport.validated_addresses().is_empty());
     }
 
     #[tokio::test]
@@ -1735,7 +2147,7 @@ mod tests {
         let allowed = reqwest::Url::parse("https://docs.rs/serde/latest/serde/").unwrap();
         let denied = reqwest::Url::parse("https://example.com/").unwrap();
 
-        assert!(check_configured_url_policy(&allowed, &policy).is_ok());
-        assert!(check_configured_url_policy(&denied, &policy).is_err());
+        assert!(check_configured_url_policy(&allowed, &policy, UrlPolicyTarget::Redirect).is_ok());
+        assert!(check_configured_url_policy(&denied, &policy, UrlPolicyTarget::Redirect).is_err());
     }
 }
