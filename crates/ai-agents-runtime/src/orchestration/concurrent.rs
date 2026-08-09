@@ -11,11 +11,13 @@ use tracing::{info, warn};
 use super::aggregation;
 use super::types::{AgentResult, ConcurrentResult};
 use crate::Agent;
+use crate::runtime::{current_runtime_gate_identity_stack, scope_runtime_gate_identity_stack};
 use crate::spawner::AgentRegistry;
 use crate::turn_context::current_turn_actor_context;
 
 /// Run multiple agents in parallel and aggregate results.
 /// The explicit arguments preserve the public orchestration call contract and its independent controls.
+/// The complete immutable root-gate ancestry is captured before spawning so every child preserves cycle detection.
 #[allow(clippy::too_many_arguments)]
 pub async fn concurrent(
     registry: &AgentRegistry,
@@ -36,6 +38,10 @@ pub async fn concurrent(
 
     let start = Instant::now();
     let mut join_set = JoinSet::new();
+    //
+    // Tokio task-locals do not cross JoinSet::spawn, so all children inherit one immutable snapshot of the caller's complete root ownership chain.
+    //
+    let gate_identity_stack = current_runtime_gate_identity_stack();
 
     for (agent_index, agent_ref) in agents.iter().enumerate() {
         let agent_id = agent_ref.id().to_string();
@@ -46,57 +52,61 @@ pub async fn concurrent(
         let timeout = timeout_ms;
         let actor_context = current_turn_actor_context();
         let observation_context = current_observation_context();
+        let gate_identity_stack = gate_identity_stack.clone();
 
         join_set.spawn(async move {
-            let agent_start = Instant::now();
-            let run = async {
-                if let Some(context) = actor_context {
-                    agent.chat_with_actor_context(&input_owned, context).await
-                } else {
-                    agent.chat(&input_owned).await
-                }
-            };
-            let result = if let Some(t) = timeout {
-                match tokio::time::timeout(tokio::time::Duration::from_millis(t), async {
-                    if let Some(context) = observation_context.clone() {
-                        with_observation_context(context, run).await
+            scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
+                let agent_start = Instant::now();
+                let run = async {
+                    if let Some(context) = actor_context {
+                        agent.chat_with_actor_context(&input_owned, context).await
                     } else {
-                        run.await
+                        agent.chat(&input_owned).await
                     }
-                })
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => Err(AgentError::Other(format!(
-                        "Agent {} timed out after {}ms",
-                        agent_id, t
-                    ))),
-                }
-            } else if let Some(context) = observation_context {
-                with_observation_context(context, run).await
-            } else {
-                run.await
-            };
+                };
+                let result = if let Some(t) = timeout {
+                    match tokio::time::timeout(tokio::time::Duration::from_millis(t), async {
+                        if let Some(context) = observation_context.clone() {
+                            with_observation_context(context, run).await
+                        } else {
+                            run.await
+                        }
+                    })
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => Err(AgentError::Other(format!(
+                            "Agent {} timed out after {}ms",
+                            agent_id, t
+                        ))),
+                    }
+                } else if let Some(context) = observation_context {
+                    with_observation_context(context, run).await
+                } else {
+                    run.await
+                };
 
-            let duration_ms = agent_start.elapsed().as_millis() as u64;
-            match result {
-                Ok(response) => AgentResult {
-                    agent_index,
-                    agent_id,
-                    response: Some(response),
-                    duration_ms,
-                    success: true,
-                    error: None,
-                },
-                Err(e) => AgentResult {
-                    agent_index,
-                    agent_id,
-                    response: None,
-                    duration_ms,
-                    success: false,
-                    error: Some(e.to_string()),
-                },
-            }
+                let duration_ms = agent_start.elapsed().as_millis() as u64;
+                match result {
+                    Ok(response) => AgentResult {
+                        agent_index,
+                        agent_id,
+                        response: Some(response),
+                        duration_ms,
+                        success: true,
+                        error: None,
+                    },
+                    Err(e) => AgentResult {
+                        agent_index,
+                        agent_id,
+                        response: None,
+                        duration_ms,
+                        success: false,
+                        error: Some(e.to_string()),
+                    },
+                }
+            })
+            .await
         });
     }
 

@@ -241,7 +241,7 @@ assert:
         gte: 1
 ```
 
-This is best for regression gates around call count, token use, cost, and configured dimensions such as `background`, not for judging response quality.
+This is best for regression gates around call count, token use, cost, and configured dimensions such as `background`, not for judging response quality. Eval captures an observability cursor before each turn. `TurnObservabilityEvidence` uses one post-cursor snapshot so its report, trace ID, and span IDs derive from the exact same events that remain retained in the manager's rolling metrics window; evicted events are not recovered. In contrast, direct `ObservabilityManager` report, raw-event, and export APIs retain their rolling global window.
 
 Dimension-count assertions use the aggregate dimensions configured on the agent or eval observability overlay:
 
@@ -286,7 +286,7 @@ scenarios:
                   gte: 1
 ```
 
-Branch raw events also carry both `speculative` and `runtime.speculative` dimensions for export and debugging. Dimension-count assertions operate on configured aggregate dimensions, so include `speculative` when you want to match speculative branch metrics. Branch telemetry is the stable way to inspect speculative LLM work because losing branches do not fire final response hooks.
+Branch raw events also carry both `speculative` and `runtime.speculative` dimensions for export and debugging. Dimension-count assertions operate on configured aggregate dimensions, so include `speculative` when you want to match speculative branch metrics. `branch_status: committed` means the branch won selection into the committed runtime path; it does not prove transaction success or rollback of external effects. Branch telemetry is the stable way to inspect speculative LLM work because losing branches do not fire final response hooks.
 
 Runtime optimization can schedule background actor memory maintenance. The eval runner flushes background runtime tasks before collecting turn evidence, so facts, relationships, and observability assertions see the completed post-turn state. The example suite `examples/eval/mocked/runtime-optimization/pre_response_transition_mocked.yaml` shows a no-key regression check for pre-response guard routing, and the speculative suites cover committed, discarded, failed, and cancelled branch status dimensions.
 
@@ -327,6 +327,8 @@ Important parts:
 | `fixtures` | Mock/replay/record/real LLM modes, sequenced outcomes, attempt-local values, mock or real-tool transports, context, diagnostics, commands, and deterministic HITL approvals. |
 | `scenarios` | Test cases with optional hard provider budgets and direct turns or advanced steps. |
 | `assert` | Assertions evaluated after a turn. |
+
+`settings.timeout_per_turn_ms` and a turn-level `timeout_ms` bound the whole turn, including provider calls, HITL waits, resource-lock waits, tool attempts and retries, streaming collection, and finalization. `settings.timeout_per_scenario_ms` separately bounds the complete scenario attempt across its turns and steps. These are different from `tool_security.*.timeout_ms`, which applies to each individual `Tool::execute` invocation attempt, and from `command.timeout_ms`, which bounds the direct child process. No timeout layer promises rollback of effects that already escaped to a filesystem, process, network, or custom integration.
 
 ---
 
@@ -539,7 +541,7 @@ fixtures:
 
 When no command fixture or host runner is installed, the shared executor records an explicit unavailable result for `command` before the tool tries to execute.
 
-Tool evidence comes from executor-level `ToolExecutionRecord` values. Assertions can check successful calls, denied calls, unavailable tools, approval rejection, approval timeout, cancellation, and missing policy bindings because non-executed attempts are still recorded and can be matched with `executed: false`.
+Tool evidence comes from executor-level `ToolExecutionRecord` values. Assertions can check successful calls, denied calls, unavailable tools, approval rejection, approval timeout, cancellation, and missing policy bindings because non-executed attempts are still recorded and can be matched with `executed: false`. Shared-executor `on_tool_start` and `on_tool_complete` hooks describe one request lifecycle rather than individual retry invocations. A non-executed request can finalize before or after its start hook, so eval treats `ToolExecutionRecord.executed` as authoritative.
 
 ### Deterministic HITL approval fixtures
 
@@ -689,7 +691,7 @@ assert:
 
 For `approval_not_requested`, boolean form checks whether the turn has no approval records; object form passes only when no record matches its filters. Assertion trigger types are normalized as `tool`, `condition`, or `state` (state assertions use optional `from` and `to`), even though the fixture rule spelling is `state_transition`.
 
-Raw and effective decisions are intentionally distinct. `raw_decision` is what the handler returned: `approved`, `rejected`, `modified`, or `timeout`. `effective_decision` is what the runtime resolved: `approved`, `rejected`, `modified`, or `error`. For example, the supplied HITL agents resolve timeout to rejection, so suites assert `raw_decision: timeout` with `effective_decision: rejected`; another timeout policy can resolve to `error`. Rejected, timed-out, and errored requests have no effective executable arguments. Pair approval assertions with `tool_called.executed` to prove whether the wrapped tool ran.
+Raw and effective decisions are intentionally distinct. `raw_decision` is what the handler returned: `approved`, `rejected`, `modified`, or `timeout`. `effective_decision` is what the runtime resolved: `approved`, `rejected`, `modified`, or `error`. For example, the supplied HITL agents resolve timeout to rejection, so suites assert `raw_decision: timeout` with `effective_decision: rejected`; another timeout policy can resolve to `error`. Rejected, timed-out, and errored requests have no effective executable arguments. Pair approval assertions with `tool_called.executed` to prove whether the wrapped tool ran. An expected rejection that ends the agent loop is a finalized cancellation response, not provider/runtime/consumer cancellation: blocking and event-stream turns retain the authoritative response, and an event stream emits `Final(AgentResponse)`. Only an actual stream failure, timeout, runtime cancellation, or consumer drop remains incomplete without `Final`.
 
 A turn that is expected to end in a runtime error can declare one substring or a list of alternatives:
 
@@ -746,7 +748,7 @@ Release-blocking tool-execution smoke suites should use explicit `tool_choice: r
 
 The `examples/eval/live/run_live_example_evals.sh` helper discovers only `examples/eval/live/examples/`. It intentionally excludes `examples/eval/live/quality/`, including judge-based quality suites, which must be run separately. Explicit required/specific choices may add one corrective provider call on a non-native fallback, and that call uses the same scenario call, token, cost, timeout, and cancellation budgets.
 
-A streamed eval turn consumes the complete runtime event stream. Content chunks remain diagnostic previews, while the terminal `Final(AgentResponse)` supplies the authoritative response content and metadata used by assertions. Streaming turns can use `metadata_contains` and `metadata_path`; a stream that errors or ends without `Final` remains an incomplete turn, with partial chunk text retained only for failure diagnostics.
+A streamed eval turn consumes the complete runtime event stream. Content chunks remain diagnostic previews, while the terminal `Final(AgentResponse)` supplies the authoritative response content and metadata used by assertions. Streaming turns can use `metadata_contains` and `metadata_path`. Provider failure, runtime cancellation, consumer drop, or timeout can leave the stream incomplete without `Final`; an expected HITL rejection instead finalizes an authoritative cancellation response and is evaluated as a completed turn. Partial chunk text from an incomplete stream is retained only for failure diagnostics.
 
 `fixtures.llm.mode` controls how the eval runner supplies LLM providers.
 

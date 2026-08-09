@@ -53,6 +53,7 @@ scenarios:
           all:
             - response_not_empty: true
             - response_contains: "CLOUD-LANTERN"
+            # Turn-local evidence includes the compaction call and this turn's main response.
             - observability:
                 dimension_counts:
                   - match_dimensions:
@@ -66,7 +67,7 @@ scenarios:
                       status: success
                     assert:
                       path: count
-                      gte: 4
+                      gte: 1
       - input: "Recall the topic labels from earlier. Include at least one label associated with the first two topics and one associated with the last two topics."
         assert:
           all:

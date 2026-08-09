@@ -23,6 +23,22 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Opaque marker for scoping a later observation snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservabilityCursor {
+    ingested_events: u64,
+    dropped_events: u64,
+}
+
+/// Retained post-cursor events and the report derived from that exact event set.
+#[derive(Debug, Clone)]
+pub struct ScopedObservationSnapshot {
+    /// Redacted events still retained in the rolling metrics window.
+    pub events: Vec<ObservationEvent>,
+    /// Report derived only from the returned events.
+    pub report: ObservabilityReport,
+}
+
 /// Central collector that receives events, applies privacy rules, aggregates metrics, and exports reports.
 pub struct ObservabilityManager {
     config: ObservabilityConfig,
@@ -207,10 +223,33 @@ impl ObservabilityManager {
         self.aggregator.aggregate_configured()
     }
 
+    /// Captures a cursor after draining all events already queued for ingestion.
+    pub fn event_cursor(&self) -> ObservabilityCursor {
+        self.drain_pending();
+        ObservabilityCursor {
+            ingested_events: self.aggregator.cursor(),
+            dropped_events: self.dropped_events(),
+        }
+    }
+
     /// Returns retained raw events after redaction and queue draining.
     pub fn raw_events(&self) -> Vec<ObservationEvent> {
         self.drain_pending();
         self.raw_events.read().iter().cloned().collect()
+    }
+
+    /// Drains once and snapshots retained events after the cursor with a report from that exact event set.
+    /// Rolling-window eviction is preserved, while dropped events are reported as the counter delta since the cursor.
+    pub fn snapshot_since(&self, cursor: ObservabilityCursor) -> ScopedObservationSnapshot {
+        self.drain_pending();
+        let events = self.aggregator.events_since(cursor.ingested_events);
+        let dropped_events = self.dropped_events().saturating_sub(cursor.dropped_events);
+        let report = generate_report(
+            &events,
+            aggregate_events(&events, &self.config.aggregation.dimensions),
+            dropped_events,
+        );
+        ScopedObservationSnapshot { events, report }
     }
 
     /// Builds the user-facing report from the current rolling event window.
@@ -219,7 +258,7 @@ impl ObservabilityManager {
         let events = self.aggregator.events();
         generate_report(
             &events,
-            self.aggregator.aggregate_configured(),
+            aggregate_events(&events, &self.config.aggregation.dimensions),
             self.dropped_events(),
         )
     }
@@ -632,5 +671,96 @@ mod tests {
         let report = manager.generate_report();
         assert_eq!(report.summary.total_events, 1);
         assert_eq!(report.dropped_events, 1);
+    }
+
+    #[test]
+    fn snapshot_since_scopes_report_and_events_to_cursor() {
+        let config = ObservabilityConfig {
+            enabled: true,
+            aggregation: crate::config::AggregationConfig {
+                dimensions: vec![AggregationDimension::Purpose],
+                window_size: 4,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manager = ObservabilityManager::new(config);
+        let mut first = test_event();
+        first.turn_id = "turn-1".to_string();
+        manager.record_event(first);
+        let cursor = manager.event_cursor();
+
+        let mut second = test_event();
+        second.turn_id = "turn-2".to_string();
+        manager.record_event(second);
+
+        let snapshot = manager.snapshot_since(cursor);
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.events[0].turn_id, "turn-2");
+        assert_eq!(
+            snapshot.report.summary.total_events,
+            snapshot.events.len() as u64
+        );
+        assert_eq!(
+            snapshot
+                .report
+                .configured
+                .iter()
+                .map(|metric| metric.count)
+                .sum::<u64>(),
+            snapshot.events.len() as u64
+        );
+        assert_eq!(manager.generate_report().summary.total_events, 2);
+    }
+
+    #[test]
+    fn snapshot_since_preserves_rolling_window_eviction() {
+        let config = ObservabilityConfig {
+            enabled: true,
+            aggregation: crate::config::AggregationConfig {
+                window_size: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manager = ObservabilityManager::new(config);
+        let cursor = manager.event_cursor();
+        for turn_id in ["turn-1", "turn-2", "turn-3"] {
+            let mut event = test_event();
+            event.turn_id = turn_id.to_string();
+            manager.record_event(event);
+        }
+
+        let snapshot = manager.snapshot_since(cursor);
+        assert_eq!(snapshot.events.len(), 2);
+        assert_eq!(snapshot.events[0].turn_id, "turn-2");
+        assert_eq!(snapshot.events[1].turn_id, "turn-3");
+        assert_eq!(snapshot.report.summary.total_events, 2);
+    }
+
+    #[test]
+    fn snapshot_since_exposes_only_the_dropped_event_delta() {
+        let config = ObservabilityConfig {
+            enabled: true,
+            buffer: crate::config::BufferConfig {
+                event_buffer: 1,
+                drop_on_full: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let manager = ObservabilityManager::new(config);
+        manager.record_event(test_event());
+        manager.record_event(test_event());
+        let cursor = manager.event_cursor();
+
+        manager.record_event(test_event());
+        manager.record_event(test_event());
+
+        let snapshot = manager.snapshot_since(cursor);
+        assert_eq!(snapshot.report.summary.total_events, 1);
+        assert_eq!(snapshot.events.len(), 1);
+        assert_eq!(snapshot.report.dropped_events, 1);
+        assert_eq!(manager.generate_report().dropped_events, 2);
     }
 }

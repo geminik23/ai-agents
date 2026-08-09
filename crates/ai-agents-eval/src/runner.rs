@@ -19,7 +19,7 @@ use crate::assertion::{
 use crate::budget::{BudgetProviderConfig, ScenarioBudgetTracker};
 use crate::compatibility::suite_from_jsonl;
 use crate::evidence::{
-    ApprovalEvidence, LlmRequestEvidence, collect_turn_evidence, relationship_snapshot,
+    ApprovalEvidence, LlmRequestEvidence, collect_turn_evidence_since, relationship_snapshot,
 };
 use crate::fixtures::{
     AttemptFixtureContext, AttemptWorkspace, LlmFixtureMode, RecordingToolLog,
@@ -920,6 +920,7 @@ impl EvalRunner {
         let tool_start = tool_log.len();
         let approval_start = approval_log.len();
         let llm_start = llm_log.len();
+        let observability_cursor = agent.observability().map(|manager| manager.event_cursor());
         let start = Instant::now();
         let timeout_ms = turn
             .timeout_ms
@@ -944,12 +945,13 @@ impl EvalRunner {
             operation.runtime_error = Some(error.to_string());
         }
         let latency_ms = start.elapsed().as_millis() as u64;
-        let mut evidence = collect_turn_evidence(
+        let mut evidence = collect_turn_evidence_since(
             agent,
             operation.response_metadata.clone(),
             tool_log,
             tool_start,
             before_relationship,
+            observability_cursor,
         );
         evidence.approvals = approval_log.records_since(approval_start);
         evidence.llm_requests = llm_log.records_since(llm_start);
@@ -1114,7 +1116,7 @@ async fn collect_stream_response(
     consume_stream_response(stream, deadline, timeout_ms).await
 }
 
-// Uses the final response as the successful turn result and retains chunk text only as diagnostics when the stream fails before finalization.
+// Uses Final as the successful result and treats the first Error as terminal; expected HITL rejection is delivered as Final.
 async fn consume_stream_response<S>(
     mut stream: S,
     deadline: TokioInstant,
@@ -1134,9 +1136,12 @@ where
                 partial_content.push_str(&text);
             }
             Ok(Some(AgentStreamEvent::Chunk(StreamChunk::Error { message }))) => {
-                if runtime_error.is_none() {
-                    runtime_error = Some(message);
-                }
+                return TurnOperation {
+                    response_content: partial_content,
+                    response_metadata: None,
+                    response_present: partial_content_seen,
+                    runtime_error: Some(message),
+                };
             }
             Ok(Some(AgentStreamEvent::Chunk(_))) => {}
             Ok(Some(AgentStreamEvent::Final(response))) => {
@@ -1863,7 +1868,11 @@ scenarios:
     }
 
     #[tokio::test]
-    async fn streaming_error_retains_partial_content_and_consumes_until_eof() {
+    async fn streaming_error_is_terminal_and_retains_prior_partial_content() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let polled = Arc::new(AtomicUsize::new(0));
+        let polled_events = Arc::clone(&polled);
         let events = stream::iter(vec![
             AgentStreamEvent::Chunk(StreamChunk::Content {
                 text: "before ".to_string(),
@@ -1875,15 +1884,19 @@ scenarios:
                 text: "after".to_string(),
             }),
             AgentStreamEvent::Chunk(StreamChunk::Done {}),
-        ]);
+        ])
+        .inspect(move |_| {
+            polled_events.fetch_add(1, Ordering::Relaxed);
+        });
         let operation =
             consume_stream_response(events, TokioInstant::now() + Duration::from_secs(1), 1_000)
                 .await;
 
-        assert_eq!(operation.response_content, "before after");
+        assert_eq!(operation.response_content, "before ");
         assert!(operation.response_present);
         assert_eq!(operation.response_metadata, None);
         assert_eq!(operation.runtime_error.as_deref(), Some("stream failed"));
+        assert_eq!(polled.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -2462,6 +2475,83 @@ scenarios:
                     assert!(!serialized.contains("Base instruction marker"));
                     assert!(!serialized.contains("Evidence Guide"));
                     assert!(!serialized.contains("Think through this step by step"));
+                    let _ = std::fs::remove_dir_all(dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn observability_evidence_is_scoped_to_each_turn() {
+        std::thread::Builder::new()
+            .name("eval-turn-observability-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let dir = std::env::temp_dir().join(format!(
+                        "ai_agents_eval_turn_observability_test_{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    write_test_agent(&dir);
+                    let result = run_test_suite(
+                        &dir,
+                        "turn-observability.yaml",
+                        r#"
+name: Turn Observability
+agent: agent.yaml
+settings:
+  redact_outputs: false
+observability:
+  enabled: true
+  aggregation:
+    dimensions: [purpose]
+  export:
+    write_report: false
+fixtures:
+  llm:
+    mode: mock
+    responses: [first answer, second answer]
+scenarios:
+  - id: separate-turns
+    turns:
+      - input: First
+      - input: Second
+"#,
+                    )
+                    .await;
+
+                    assert_eq!(result.passed, 1);
+                    let turns = &result.scenarios[0].attempts[0].turns;
+                    assert_eq!(turns.len(), 2);
+                    let first = turns[0].evidence.observability.as_ref().unwrap();
+                    let second = turns[1].evidence.observability.as_ref().unwrap();
+                    let first_report = first.report.as_ref().unwrap();
+                    let second_report = second.report.as_ref().unwrap();
+                    assert!(first_report.summary.total_events > 0);
+                    assert_eq!(
+                        second_report.summary.total_events,
+                        first_report.summary.total_events
+                    );
+                    assert_eq!(
+                        first_report.summary.total_events,
+                        first.span_ids.len() as u64
+                    );
+                    assert_eq!(
+                        second_report.summary.total_events,
+                        second.span_ids.len() as u64
+                    );
+                    assert_ne!(first.trace_id, second.trace_id);
+                    let first_spans: HashSet<_> = first.span_ids.iter().collect();
+                    assert!(
+                        second
+                            .span_ids
+                            .iter()
+                            .all(|span_id| !first_spans.contains(span_id))
+                    );
                     let _ = std::fs::remove_dir_all(dir);
                 });
             })

@@ -42,6 +42,7 @@ scenarios:
         assert:
           all:
             - response_contains: "Continued successfully"
+            # Turn-local evidence includes summarization work and this turn's main response.
             - observability:
                 purpose_counts:
                   summarization:
@@ -61,4 +62,4 @@ scenarios:
                       status: success
                     assert:
                       path: count
-                      gte: 3
+                      gte: 1

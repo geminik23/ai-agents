@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use ai_agents_core::{ChatMessage, Role};
 use ai_agents_hitl::{ApprovalRequest, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger};
-use ai_agents_observability::ObservabilityReport;
+use ai_agents_observability::manager::ObservabilityCursor;
+use ai_agents_observability::{ObservabilityReport, ObservationEvent};
 use ai_agents_runtime::RuntimeAgent;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -378,12 +379,63 @@ pub struct TurnEvidence {
     pub observability: Option<TurnObservabilityEvidence>,
 }
 
+/// Collects post-turn runtime evidence with the original cumulative observability snapshot.
 pub fn collect_turn_evidence(
     agent: &RuntimeAgent,
     response_metadata: Option<HashMap<String, Value>>,
     tool_log: &RecordingToolLog,
     tool_start_index: usize,
     before_relationship: Option<Value>,
+) -> TurnEvidence {
+    let observability = agent.observability().map(|manager| {
+        let report = manager.generate_report();
+        let events = manager.raw_events();
+        observability_evidence(events, report)
+    });
+    collect_turn_evidence_with_observability(
+        agent,
+        response_metadata,
+        tool_log,
+        tool_start_index,
+        before_relationship,
+        observability,
+    )
+}
+
+/// Collects EvalRunner evidence with observability scoped after the pre-turn cursor.
+pub(crate) fn collect_turn_evidence_since(
+    agent: &RuntimeAgent,
+    response_metadata: Option<HashMap<String, Value>>,
+    tool_log: &RecordingToolLog,
+    tool_start_index: usize,
+    before_relationship: Option<Value>,
+    observability_cursor: Option<ObservabilityCursor>,
+) -> TurnEvidence {
+    let observability = agent
+        .observability()
+        .zip(observability_cursor)
+        .map(|(manager, cursor)| {
+            let snapshot = manager.snapshot_since(cursor);
+            observability_evidence(snapshot.events, snapshot.report)
+        });
+    collect_turn_evidence_with_observability(
+        agent,
+        response_metadata,
+        tool_log,
+        tool_start_index,
+        before_relationship,
+        observability,
+    )
+}
+
+// Assembles common runtime evidence after the caller selects cumulative or scoped observability.
+fn collect_turn_evidence_with_observability(
+    agent: &RuntimeAgent,
+    response_metadata: Option<HashMap<String, Value>>,
+    tool_log: &RecordingToolLog,
+    tool_start_index: usize,
+    before_relationship: Option<Value>,
+    observability: Option<TurnObservabilityEvidence>,
 ) -> TurnEvidence {
     let context_map = agent.get_context();
     let context = serde_json::to_value(&context_map).unwrap_or(Value::Null);
@@ -409,18 +461,6 @@ pub fn collect_turn_evidence(
     });
     let relationship = collect_relationship(agent, actor_id.clone(), before_relationship);
     let persona = collect_persona(agent, &context_map);
-    let observability = agent.observability().map(|manager| {
-        let report = manager.generate_report();
-        let raw_events = manager.raw_events();
-        TurnObservabilityEvidence {
-            trace_id: raw_events.last().map(|event| event.trace_id.clone()),
-            span_ids: raw_events
-                .iter()
-                .map(|event| event.span_id.clone())
-                .collect(),
-            report: Some(report),
-        }
-    });
 
     TurnEvidence {
         response_metadata: metadata_value,
@@ -437,6 +477,18 @@ pub fn collect_turn_evidence(
         persona,
         orchestration,
         observability,
+    }
+}
+
+// Converts one selected event vector and its matching report into eval evidence.
+fn observability_evidence(
+    events: Vec<ObservationEvent>,
+    report: ObservabilityReport,
+) -> TurnObservabilityEvidence {
+    TurnObservabilityEvidence {
+        trace_id: events.last().map(|event| event.trace_id.clone()),
+        span_ids: events.iter().map(|event| event.span_id.clone()).collect(),
+        report: Some(report),
     }
 }
 
@@ -569,6 +621,20 @@ fn collect_persona(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Locks the public collector's patch-compatible argument list at compile time.
+    type CollectTurnEvidenceFn = fn(
+        &RuntimeAgent,
+        Option<HashMap<String, Value>>,
+        &RecordingToolLog,
+        usize,
+        Option<Value>,
+    ) -> TurnEvidence;
+
+    #[test]
+    fn collect_turn_evidence_keeps_five_argument_signature() {
+        let _: CollectTurnEvidenceFn = collect_turn_evidence;
+    }
 
     #[test]
     fn llm_request_preserves_roles_and_keeps_content_in_memory() {

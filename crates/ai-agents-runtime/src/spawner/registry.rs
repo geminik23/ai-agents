@@ -9,6 +9,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::runtime::{current_runtime_gate_identity_stack, scope_runtime_gate_identity_stack};
 use crate::spec::AgentSpec;
 use crate::{Agent, RuntimeAgent, TurnActorContext};
 use ai_agents_core::{AgentError, AgentResponse, Result};
@@ -307,6 +308,9 @@ impl AgentRegistry {
             .await
     }
 
+    //
+    // Captures the caller's complete immutable gate ancestry before spawning and cheaply propagates it so recipients preserve cycle detection while the sender waits.
+    //
     async fn broadcast_inner(
         &self,
         from: &str,
@@ -341,24 +345,29 @@ impl AgentRegistry {
 
         let mut handles = Vec::with_capacity(targets.len());
         let observation_context = current_observation_context();
+        let gate_identity_stack = current_runtime_gate_identity_stack();
         for (id, agent) in targets {
             let msg = formatted.clone();
             let context = actor_context.clone();
             let observation_context = observation_context.clone();
+            let gate_identity_stack = Arc::clone(&gate_identity_stack);
             handles.push(tokio::spawn(async move {
-                let run = async move {
-                    if let Some(context) = context {
-                        agent.chat_with_actor_context(&msg, context).await
+                scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
+                    let run = async move {
+                        if let Some(context) = context {
+                            agent.chat_with_actor_context(&msg, context).await
+                        } else {
+                            agent.chat(&msg).await
+                        }
+                    };
+                    let result = if let Some(context) = observation_context {
+                        with_observation_context(context, run).await
                     } else {
-                        agent.chat(&msg).await
-                    }
-                };
-                let result = if let Some(context) = observation_context {
-                    with_observation_context(context, run).await
-                } else {
-                    run.await
-                };
-                (id, result)
+                        run.await
+                    };
+                    (id, result)
+                })
+                .await
             }));
         }
 
@@ -424,11 +433,29 @@ mod tests {
         ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider,
         LLMResponse,
     };
+    use ai_agents_hooks::AgentHooks;
     use ai_agents_llm::LLMRegistry;
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Mutex, Weak};
 
     struct EchoProvider;
+
+    /// Stores normalized broadcast outcomes without retaining response internals in the test hook.
+    type RecordedBroadcastResults = Vec<(String, std::result::Result<String, String>)>;
+
+    /// Broadcasts from a response hook and records each spawned recipient result.
+    struct BroadcastResponseHooks {
+        registry: Weak<AgentRegistry>,
+        invoked: AtomicBool,
+        results: Mutex<Option<RecordedBroadcastResults>>,
+    }
+
+    /// Calls a configured runtime from a response hook and records its root admission result.
+    struct ReentrantResponseHooks {
+        target: Mutex<Option<Weak<RuntimeAgent>>>,
+        invoked: AtomicBool,
+        result: Mutex<Option<std::result::Result<String, String>>>,
+    }
 
     #[async_trait]
     impl LLMProvider for EchoProvider {
@@ -464,6 +491,58 @@ mod tests {
 
         fn supports(&self, _feature: LLMFeature) -> bool {
             false
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for BroadcastResponseHooks {
+        /// Enters the real broadcast spawn path once without retaining registry state across the await.
+        async fn on_response(&self, _response: &AgentResponse) {
+            if self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let Some(registry) = self.registry.upgrade() else {
+                *self.results.lock().unwrap() = Some(vec![(
+                    "registry".to_string(),
+                    Err("broadcast registry is unavailable".to_string()),
+                )]);
+                return;
+            };
+            let results = registry
+                .broadcast("runtime-a", "nested broadcast response hook call")
+                .await
+                .into_iter()
+                .map(|(id, result)| {
+                    (
+                        id,
+                        result
+                            .map(|response| response.content)
+                            .map_err(|error| error.to_string()),
+                    )
+                })
+                .collect();
+            *self.results.lock().unwrap() = Some(results);
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for ReentrantResponseHooks {
+        /// Attempts one nested root call without retaining the target mutex across the await.
+        async fn on_response(&self, _response: &AgentResponse) {
+            if self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let target = self.target.lock().unwrap().as_ref().and_then(Weak::upgrade);
+            let result = if let Some(target) = target {
+                target
+                    .chat("nested broadcast cycle call")
+                    .await
+                    .map(|response| response.content)
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("broadcast cycle target is unavailable".to_string())
+            };
+            *self.result.lock().unwrap() = Some(result);
         }
     }
 
@@ -648,6 +727,93 @@ mod tests {
         for (_, res) in &results {
             assert!(res.is_ok());
         }
+    }
+
+    /// Confirms broadcast propagates root ancestry so an A to B to A cycle fails before waiting on A.
+    #[tokio::test]
+    async fn broadcast_propagates_root_gate_ancestry() {
+        let registry = Arc::new(AgentRegistry::new());
+        let hooks_a = Arc::new(BroadcastResponseHooks {
+            registry: Arc::downgrade(&registry),
+            invoked: AtomicBool::new(false),
+            results: Mutex::new(None),
+        });
+        let hooks_b = Arc::new(ReentrantResponseHooks {
+            target: Mutex::new(None),
+            invoked: AtomicBool::new(false),
+            result: Mutex::new(None),
+        });
+        let runtime_a = AgentBuilder::new()
+            .system_prompt("Runtime A broadcasts to runtime B.")
+            .llm(Arc::new(EchoProvider))
+            .hooks(hooks_a.clone())
+            .build()
+            .unwrap();
+        let runtime_b = AgentBuilder::new()
+            .system_prompt("Runtime B attempts to re-enter runtime A.")
+            .llm(Arc::new(EchoProvider))
+            .hooks(hooks_b.clone())
+            .build()
+            .unwrap();
+        registry
+            .register(SpawnedAgent::untracked(
+                "runtime-a".to_string(),
+                runtime_a,
+                AgentSpec {
+                    name: "runtime-a".to_string(),
+                    ..AgentSpec::default()
+                },
+            ))
+            .await
+            .unwrap();
+        registry
+            .register(SpawnedAgent::untracked(
+                "runtime-b".to_string(),
+                runtime_b,
+                AgentSpec {
+                    name: "runtime-b".to_string(),
+                    ..AgentSpec::default()
+                },
+            ))
+            .await
+            .unwrap();
+        let runtime_a = registry.get("runtime-a").unwrap();
+        *hooks_b.target.lock().unwrap() = Some(Arc::downgrade(&runtime_a));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime_a.chat("outer broadcast request"),
+        )
+        .await
+        .expect("broadcast cycle must fail without deadlocking")
+        .unwrap();
+
+        assert!(response.content.contains("outer broadcast request"));
+        let broadcast_results = hooks_a
+            .results
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("runtime A hook must record broadcast completion");
+        assert_eq!(broadcast_results.len(), 1);
+        assert_eq!(broadcast_results[0].0, "runtime-b");
+        assert!(
+            broadcast_results[0]
+                .1
+                .as_ref()
+                .is_ok_and(|content| content.contains("nested broadcast response hook call"))
+        );
+        let cycle_result = hooks_b
+            .result
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("runtime B hook must record runtime A reentry");
+        assert!(
+            cycle_result
+                .expect_err("runtime A accepted a repeated broadcast gate identity")
+                .contains("reentrant root turn ownership")
+        );
     }
 
     #[tokio::test]

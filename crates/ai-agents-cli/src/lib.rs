@@ -6,6 +6,7 @@ pub mod question;
 pub mod repl;
 pub mod run;
 pub(crate) mod stream_reconcile;
+pub(crate) mod stream_terminal;
 pub mod tui;
 
 pub use approval::CliApprovalHandler;

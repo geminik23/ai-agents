@@ -2,10 +2,12 @@ use std::io::{self, Write};
 
 use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
 use ai_agents::{Agent, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk};
-use futures::StreamExt;
 use serde_json;
 
 use crate::stream_reconcile::{FinalContent, reconcile_final_content, unseen_unique_tool_names};
+use crate::stream_terminal::{
+    INCOMPLETE_STREAM_ERROR, StreamDriveControl, StreamDriveOutcome, drive_agent_stream,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplMode {
@@ -60,6 +62,17 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     } else {
         text.to_string()
     }
+}
+
+fn write_stream_error(output: &mut impl Write, message: &str) -> io::Result<()> {
+    writeln!(output, "\n[Stream Error: {}]\n", message)
+}
+
+fn report_stream_outcome(output: &mut impl Write, outcome: StreamDriveOutcome) -> io::Result<()> {
+    if outcome == StreamDriveOutcome::IncompleteEof {
+        write_stream_error(output, INCOMPLETE_STREAM_ERROR)?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1314,14 +1327,15 @@ impl CliRepl {
 
     async fn handle_streaming(&self, input: &str) {
         match self.agent.chat_stream_events(input).await {
-            Ok(mut stream) => {
+            Ok(stream) => {
                 print!("\nAgent: ");
                 io::stdout().flush().ok();
 
                 let mut streamed_content = String::new();
                 let mut observed_tool_names = Vec::new();
+                let mut stderr = io::stderr();
 
-                while let Some(event) = stream.next().await {
+                let outcome = drive_agent_stream(stream, |event| {
                     match event {
                         AgentStreamEvent::Chunk(chunk) => match chunk {
                             StreamChunk::Content { text } => {
@@ -1360,11 +1374,10 @@ impl CliRepl {
                                 }
                             }
                             StreamChunk::Done {} => {
-                                // AgentStreamEvent::Final owns authoritative completion output.
+                                // Final owns successful completion for the event API.
                             }
                             StreamChunk::Error { message } => {
-                                eprintln!("\n[Stream Error: {}]\n", message);
-                                break;
+                                write_stream_error(&mut stderr, &message).ok();
                             }
                         },
                         AgentStreamEvent::Final(response) => {
@@ -1393,11 +1406,14 @@ impl CliRepl {
                                     println!("  Tools used: {}", final_tool_names.join(", "));
                                 }
                             }
-                            break;
                         }
                         _ => {}
                     }
-                }
+                    StreamDriveControl::Continue
+                })
+                .await;
+
+                report_stream_outcome(&mut stderr, outcome).ok();
             }
             Err(e) => {
                 eprintln!("\n[Error] {}\n", e);
@@ -1439,5 +1455,49 @@ fn parse_save_load_args(input: &str) -> Option<(SaveScope, String)> {
             Some((SaveScope::Agent(id), name))
         }
         Some(name) => Some((SaveScope::All, name.to_string())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_error_is_not_followed_by_incomplete_eof_output() {
+        let mut output = Vec::new();
+
+        write_stream_error(&mut output, "failed").unwrap();
+        report_stream_outcome(&mut output, StreamDriveOutcome::TerminalError).unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(rendered.matches("[Stream Error:").count(), 1);
+        assert!(rendered.contains("failed"));
+        assert!(!rendered.contains(INCOMPLETE_STREAM_ERROR));
+    }
+
+    #[test]
+    fn incomplete_eof_writes_one_explicit_error() {
+        let mut output = Vec::new();
+
+        report_stream_outcome(&mut output, StreamDriveOutcome::IncompleteEof).unwrap();
+
+        let rendered = String::from_utf8(output).unwrap();
+        assert_eq!(rendered.matches("[Stream Error:").count(), 1);
+        assert!(rendered.contains(INCOMPLETE_STREAM_ERROR));
+    }
+
+    #[test]
+    fn successful_or_cancelled_streams_add_no_terminal_error() {
+        for outcome in [
+            StreamDriveOutcome::Final,
+            StreamDriveOutcome::TerminalError,
+            StreamDriveOutcome::ConsumerClosed,
+        ] {
+            let mut output = Vec::new();
+
+            report_stream_outcome(&mut output, outcome).unwrap();
+
+            assert!(output.is_empty());
+        }
     }
 }

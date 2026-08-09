@@ -12,6 +12,36 @@ use tracing::{debug, error, info, instrument, warn};
 
 const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
 
+/// Keeps the strong identity of one non-reentrant root-turn gate.
+pub(crate) type RootTurnGate = Arc<tokio::sync::Mutex<()>>;
+
+/// Owns one immutable root-gate ancestry snapshot that can cross polls and spawned tasks by cloning one `Arc`.
+pub(crate) type RootTurnGateIdentityStack = Arc<[RootTurnGate]>;
+
+tokio::task_local! {
+    static RUNTIME_GATE_IDENTITY_STACK: RootTurnGateIdentityStack;
+}
+
+/// Captures the immutable gate ownership chain for propagation and returns an empty chain outside any root-turn scope.
+pub(crate) fn current_runtime_gate_identity_stack() -> RootTurnGateIdentityStack {
+    RUNTIME_GATE_IDENTITY_STACK
+        .try_with(Arc::clone)
+        .unwrap_or_default()
+}
+
+/// Polls a future with an explicit gate ownership chain while cloning only its immutable owner instead of rebuilding the ancestry.
+pub(crate) async fn scope_runtime_gate_identity_stack<F, T>(
+    identity_stack: &RootTurnGateIdentityStack,
+    future: F,
+) -> T
+where
+    F: Future<Output = T>,
+{
+    RUNTIME_GATE_IDENTITY_STACK
+        .scope(Arc::clone(identity_stack), future)
+        .await
+}
+
 /// Shared lock table used to serialize side-effecting tool calls by canonical resource.
 pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>;
 
@@ -21,6 +51,14 @@ pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync:
 struct ToolResourceGuards {
     guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
     locks: ToolResourceLocks,
+}
+
+//
+// Couples one acquired root-turn gate with the immutable ancestry owner that must remain active through hooks, orchestration, and stream polling.
+//
+struct RootTurnAdmission {
+    guard: tokio::sync::OwnedMutexGuard<()>,
+    identity_stack: RootTurnGateIdentityStack,
 }
 
 #[derive(Clone)]
@@ -513,6 +551,8 @@ pub struct RuntimeAgent {
     resource_locks: ToolResourceLocks,
     /// Host-only runtime control state.
     runtime_control: Arc<RuntimeControlState>,
+    /// Serializes independent externally initiated root turns across blocking and streaming APIs.
+    root_turn_gate: RootTurnGate,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -598,6 +638,7 @@ impl LLMGetter for RegistryLLMGetter {
 }
 
 impl RuntimeAgent {
+    /// Constructs a runtime with one gate shared by every external root-turn entry point.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         info: AgentInfo,
@@ -681,6 +722,7 @@ impl RuntimeAgent {
             background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
             resource_locks: new_tool_resource_locks(),
             runtime_control: Arc::new(RuntimeControlState::default()),
+            root_turn_gate: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -889,32 +931,69 @@ impl RuntimeAgent {
         }
     }
 
-    /// Runs chat with actor and observation context while avoiding recursive async types.
+    /// Runs one actor-scoped external root turn with gate ownership visible through finalization, hooks, orchestration, and export.
+    ///
+    /// Internal redispatch calls `run_loop` directly and therefore keeps the original guard and identity stack instead of acquiring this non-reentrant gate again.
     fn chat_with_actor_context_boxed<'a>(
         &'a self,
         input: &'a str,
         actor_context: crate::TurnActorContext,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
         Box::pin(async move {
-            let actor_id = actor_context.effective_actor_id().map(str::to_string);
-            let run = async move {
-                scope_actor_context(
-                    actor_context,
-                    Box::pin(async move { self.run_loop(input).await }),
-                )
-                .await
-            };
-            let result = if let Some(context) = self.build_observation_context(actor_id) {
-                with_observation_context(context, run).await
-            } else {
-                run.await
-            };
-            self.export_observability_if_configured().await;
+            let RootTurnAdmission {
+                guard,
+                identity_stack,
+            } = self.acquire_root_turn().await?;
+            let result = scope_runtime_gate_identity_stack(&identity_stack, async move {
+                let actor_id = actor_context.effective_actor_id().map(str::to_string);
+                let run = async move {
+                    scope_actor_context(
+                        actor_context,
+                        Box::pin(async move { self.run_loop(input).await }),
+                    )
+                    .await
+                };
+                let result = if let Some(context) = self.build_observation_context(actor_id) {
+                    with_observation_context(context, run).await
+                } else {
+                    run.await
+                };
+                self.export_observability_if_configured().await;
+                result
+            })
+            .await;
+            drop(guard);
             result
         })
     }
 
-    /// Run one turn with turn-scoped actor context without mutating the runtime's global actor ID.
+    /// Rejects recursive ownership before waiting, then acquires the external root-turn gate and builds one immutable extended ancestry snapshot.
+    async fn acquire_root_turn(&self) -> Result<RootTurnAdmission> {
+        let gate_identity = Arc::clone(&self.root_turn_gate);
+        let current_identity_stack = current_runtime_gate_identity_stack();
+        if current_identity_stack
+            .iter()
+            .any(|owned_gate| Arc::ptr_eq(owned_gate, &gate_identity))
+        {
+            return Err(AgentError::Other(format!(
+                "RuntimeAgent '{}' rejected reentrant root turn ownership",
+                self.info.id
+            )));
+        }
+        let guard = Arc::clone(&gate_identity).lock_owned().await;
+        //
+        // Root admission is the only place that extends ancestry, so later scopes can preserve the complete chain with an `Arc` clone.
+        //
+        let mut identity_stack = Vec::with_capacity(current_identity_stack.len() + 1);
+        identity_stack.extend(current_identity_stack.iter().cloned());
+        identity_stack.push(gate_identity);
+        Ok(RootTurnAdmission {
+            guard,
+            identity_stack: identity_stack.into(),
+        })
+    }
+
+    /// Run one serialized turn with turn-scoped actor context without mutating the runtime's global actor ID.
     ///
     /// The supplied context is available to actor-scoped facts, relationship memory, orchestration, and prompt templates only for the lifetime of this call.
     pub async fn chat_with_actor_context(
@@ -4464,12 +4543,12 @@ impl RuntimeAgent {
         self.finish_tool_record(record).await;
     }
 
-    /// Invokes a resolved tool once with timeout, cancellation, and actor context.
+    /// Invokes a resolved tool once with one fresh attempt deadline, timeout, cancellation, and actor context.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
-        ctx: ToolExecutionContext,
+        mut ctx: ToolExecutionContext,
         timeout_ms: u64,
     ) -> Result<(ToolResult, bool, bool, bool)> {
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
@@ -4480,6 +4559,11 @@ impl RuntimeAgent {
                 false,
             ));
         }
+        //
+        // The tool observes the same timeout budget enforced below, starting immediately before this invocation attempt.
+        // Each retry receives a new deadline rather than inheriting time spent in policy handling or earlier attempts.
+        //
+        ctx.deadline = Some(chrono::Utc::now() + chrono::Duration::milliseconds(timeout_ms as i64));
         //
         // Mark invocation inside the future so cancellation before the first poll remains executed false.
         //
@@ -4582,7 +4666,9 @@ impl RuntimeAgent {
         Some(resource_guards)
     }
 
-    /// Executes a resolved tool with retry policy from recovery settings.
+    /// Executes retry sub-attempts inside one logical executor request while assigning every invocation a fresh deadline.
+    ///
+    /// Hooks and `ToolExecutionRecord` finalization remain request-level and occur once after this retry loop returns.
     async fn run_tool_with_retries(
         &self,
         canonical_id: &str,
@@ -4612,6 +4698,25 @@ impl RuntimeAgent {
         }
     }
 
+    /// Returns the existing model output and evidence reason when a host-backed tool cannot run.
+    fn host_tool_unavailability(&self, canonical_id: &str) -> Option<(&'static str, &'static str)> {
+        match canonical_id {
+            "command" if !self.tools.command_runner_available() => Some((
+                "Command runner is unavailable",
+                "command runner is unavailable",
+            )),
+            "diagnostics" if !self.tools.diagnostics_available() => Some((
+                "Diagnostics provider is unavailable",
+                "diagnostics provider is unavailable",
+            )),
+            "web_search" if !self.tools.web_search_available() => Some((
+                "Web search provider is unavailable",
+                "web search provider is unavailable",
+            )),
+            _ => None,
+        }
+    }
+
     /// Executes a tool request through scope, policy, HITL, timeout, recovery, and evidence recording.
     fn execute_tool_record(
         &self,
@@ -4620,6 +4725,9 @@ impl RuntimeAgent {
         Box::pin(self.execute_tool_record_inner(request))
     }
 
+    /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and fallback ordering.
+    ///
+    /// A failed request selected for fallback releases its guards and finalizes its own record before the fallback starts as a separate shared-executor request.
     async fn execute_tool_record_inner(
         &self,
         request: ToolExecutionRequest,
@@ -4742,6 +4850,39 @@ impl RuntimeAgent {
         let mut security_result = security_engine
             .validate_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
             .await?;
+        //
+        // Terminal policy denials remain authoritative, while allowed or confirmation-requiring calls must fail host availability before any HITL request.
+        // The same capability is checked again after HITL because the host can change while approval waits.
+        //
+        if (security_result.is_allowed()
+            || matches!(
+                &security_result,
+                SecurityCheckResult::RequireConfirmation { .. }
+            ))
+            && let Some((output, reason)) = self.host_tool_unavailability(&canonical_id)
+        {
+            let record = self.record_from_parts(
+                &request,
+                canonical_id,
+                executed_arguments,
+                started_at,
+                start,
+                false,
+                false,
+                output.to_string(),
+                metadata,
+                ToolPolicyDecisionRecord::unavailable(reason),
+                Some(ToolApprovalRecord {
+                    status: ToolApprovalStatus::Unavailable,
+                    reason: Some(reason.to_string()),
+                    modified_arguments: None,
+                }),
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
         match &security_result {
             SecurityCheckResult::Allow => {}
             SecurityCheckResult::Warn { message } => {
@@ -4925,30 +5066,6 @@ impl RuntimeAgent {
             }
         }
 
-        if canonical_id == "command" && !self.tools.command_runner_available() {
-            let record = self.record_from_parts(
-                &request,
-                canonical_id.clone(),
-                executed_arguments.clone(),
-                started_at,
-                start,
-                false,
-                false,
-                "Command runner is unavailable".to_string(),
-                metadata,
-                ToolPolicyDecisionRecord::unavailable("command runner is unavailable"),
-                Some(ToolApprovalRecord {
-                    status: ToolApprovalStatus::Unavailable,
-                    reason: Some("command runner is unavailable".to_string()),
-                    modified_arguments: None,
-                }),
-                false,
-                false,
-            );
-            self.finish_tool_record(&record).await;
-            return Ok(record);
-        }
-
         if approval_record
             .as_ref()
             .is_some_and(|record| matches!(record.status, ToolApprovalStatus::NotRequired))
@@ -5086,54 +5203,6 @@ impl RuntimeAgent {
                     return Ok(record);
                 }
             }
-        }
-
-        if canonical_id == "diagnostics" && !self.tools.diagnostics_available() {
-            let record = self.record_from_parts(
-                &request,
-                canonical_id.clone(),
-                executed_arguments.clone(),
-                started_at,
-                start,
-                false,
-                false,
-                "Diagnostics provider is unavailable".to_string(),
-                metadata,
-                ToolPolicyDecisionRecord::unavailable("diagnostics provider is unavailable"),
-                Some(ToolApprovalRecord {
-                    status: ToolApprovalStatus::Unavailable,
-                    reason: Some("diagnostics provider is unavailable".to_string()),
-                    modified_arguments: None,
-                }),
-                false,
-                false,
-            );
-            self.finish_tool_record(&record).await;
-            return Ok(record);
-        }
-
-        if canonical_id == "web_search" && !self.tools.web_search_available() {
-            let record = self.record_from_parts(
-                &request,
-                canonical_id.clone(),
-                executed_arguments.clone(),
-                started_at,
-                start,
-                false,
-                false,
-                "Web search provider is unavailable".to_string(),
-                metadata,
-                ToolPolicyDecisionRecord::unavailable("web search provider is unavailable"),
-                Some(ToolApprovalRecord {
-                    status: ToolApprovalStatus::Unavailable,
-                    reason: Some("web search provider is unavailable".to_string()),
-                    modified_arguments: None,
-                }),
-                false,
-                false,
-            );
-            self.finish_tool_record(&record).await;
-            return Ok(record);
         }
 
         let hitl_lang_ctx = self.build_hitl_language_context();
@@ -5637,19 +5706,7 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
-        let unavailable_reason = match canonical_id.as_str() {
-            "command" if !self.tools.command_runner_available() => {
-                Some("command runner is unavailable")
-            }
-            "diagnostics" if !self.tools.diagnostics_available() => {
-                Some("diagnostics provider is unavailable")
-            }
-            "web_search" if !self.tools.web_search_available() => {
-                Some("web search provider is unavailable")
-            }
-            _ => None,
-        };
-        if let Some(reason) = unavailable_reason {
+        if let Some((_, reason)) = self.host_tool_unavailability(&canonical_id) {
             let record = final_denial(
                 canonical_id,
                 reason.to_string(),
@@ -5734,7 +5791,6 @@ impl RuntimeAgent {
         let timeout_ms = limits
             .timeout_ms
             .unwrap_or_else(|| security_engine.get_tool_timeout(&canonical_id));
-        let deadline = Some(started_at + chrono::Duration::milliseconds(timeout_ms as i64));
         let turn_actor = current_turn_actor_context();
         let actor = ToolActorContext {
             actor_id: turn_actor
@@ -5764,7 +5820,7 @@ impl RuntimeAgent {
                 Some("runtime control cancellation".to_string()),
             ),
             started_at,
-            deadline,
+            deadline: None,
             permission: ToolPolicyDecisionRecord::allow(),
             approval: approval_record.clone(),
             classification: classification.clone(),
@@ -5784,29 +5840,21 @@ impl RuntimeAgent {
             )
             .await?;
 
-        if !result.success {
+        let fallback_tool = if !result.success {
             match &tool_config.on_failure {
                 ToolFailureAction::Skip => {
                     result = ToolResult::ok(format!(
                         "{{\"skipped\": true, \"reason\": \"Tool '{}' was skipped after failure\"}}",
                         canonical_id
                     ));
+                    None
                 }
-                ToolFailureAction::Fallback { fallback_tool } => {
-                    drop(resource_guards);
-                    let fallback_request = ToolExecutionRequest::new(
-                        request.call_id.clone(),
-                        fallback_tool.clone(),
-                        executed_arguments,
-                        ToolCallSource::Fallback {
-                            original_tool: canonical_id,
-                        },
-                    );
-                    return Box::pin(self.execute_tool_record(fallback_request)).await;
-                }
-                ToolFailureAction::ReportError => {}
+                ToolFailureAction::Fallback { fallback_tool } => Some(fallback_tool.clone()),
+                ToolFailureAction::ReportError => None,
             }
-        }
+        } else {
+            None
+        };
 
         let output_cap = limits.max_output_chars;
         let (output, output_truncated) =
@@ -5833,6 +5881,22 @@ impl RuntimeAgent {
         record.cancelled = cancelled;
         if cancelled {
             record.cancellation_reason = Some("runtime control cancellation".to_string());
+        }
+        if let Some(fallback_tool) = fallback_tool {
+            let fallback_arguments = record.executed_arguments.clone();
+            let original_tool = record.canonical_id.clone();
+            //
+            // Finish the failed logical request after releasing its resource guards so its start hook is matched and fallback hooks cannot overtake the original record.
+            //
+            self.finish_tool_record_after_resource_guards(resource_guards, &record)
+                .await;
+            let fallback_request = ToolExecutionRequest::new(
+                request.call_id.clone(),
+                fallback_tool,
+                fallback_arguments,
+                ToolCallSource::Fallback { original_tool },
+            );
+            return Box::pin(self.execute_tool_record(fallback_request)).await;
         }
         self.finish_tool_record_after_resource_guards(resource_guards, &record)
             .await;
@@ -12296,72 +12360,134 @@ Respond in JSON format:
         all_results
     }
 
-    /// Streams provisional chunks and preserves the legacy Done terminal contract.
+    /// Streams one serialized root turn and releases its owned gate guard at Done or when the stream is dropped.
+    ///
+    /// The captured immutable identity stack is restored for every inner poll and export with an `Arc` clone, so nested hooks and orchestration calls detect same-runtime reentry without rebuilding ancestry. The inner stream is drained after Done before ownership is released.
     pub async fn chat_stream<'a>(
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>> {
+        let RootTurnAdmission {
+            guard: root_turn_guard,
+            identity_stack,
+        } = self.acquire_root_turn().await?;
         //
-        // Streaming readiness is checked before returning a stream so capability failures cannot appear as partial output.
+        // Streaming readiness runs inside the captured ownership stack while the gate is held so initialization cannot overlap or recursively enter another turn.
         //
-        self.init_storage().await?;
+        scope_runtime_gate_identity_stack(&identity_stack, self.init_storage()).await?;
         info!(input_len = input.len(), "Starting streaming chat");
         let terminal = new_runtime_stream_terminal_slot();
         let inner = self.run_loop_stream(input, terminal);
-        if let Some(context) = self.build_observation_context(None) {
-            let stream: Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> =
-                Box::pin(async_stream::stream! {
-                    let mut inner = inner;
-                    loop {
-                        let next = with_observation_context(context.clone(), inner.next()).await;
-                        match next {
-                            Some(chunk) => yield chunk,
-                            None => break,
+        let observation_context = self.build_observation_context(None);
+        let stream: Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> =
+            Box::pin(async_stream::stream! {
+                let mut root_turn_guard = Some(root_turn_guard);
+                let mut inner = inner;
+                loop {
+                    let next = scope_runtime_gate_identity_stack(&identity_stack, async {
+                        if let Some(context) = observation_context.as_ref() {
+                            with_observation_context(context.clone(), inner.next()).await
+                        } else {
+                            inner.next().await
+                        }
+                    })
+                    .await;
+                    match next {
+                        Some(StreamChunk::Done {}) => {
+                            while scope_runtime_gate_identity_stack(&identity_stack, async {
+                                if let Some(context) = observation_context.as_ref() {
+                                    with_observation_context(context.clone(), inner.next())
+                                        .await
+                                        .is_some()
+                                } else {
+                                    inner.next().await.is_some()
+                                }
+                            })
+                            .await
+                            {}
+                            if observation_context.is_some() {
+                                scope_runtime_gate_identity_stack(
+                                    &identity_stack,
+                                    self.export_observability_if_configured(),
+                                )
+                                .await;
+                            }
+                            drop(root_turn_guard.take());
+                            yield StreamChunk::Done {};
+                            return;
+                        }
+                        Some(chunk) => yield chunk,
+                        None => {
+                            if observation_context.is_some() {
+                                scope_runtime_gate_identity_stack(
+                                    &identity_stack,
+                                    self.export_observability_if_configured(),
+                                )
+                                .await;
+                            }
+                            drop(root_turn_guard.take());
+                            return;
                         }
                     }
-                    self.export_observability_if_configured().await;
-                });
-            Ok(stream)
-        } else {
-            Ok(inner)
-        }
+                }
+            });
+        Ok(stream)
     }
 
-    /// Streams provisional chunks and emits one authoritative response after successful root-turn finalization.
+    /// Streams one serialized root turn and releases its owned gate guard at the authoritative terminal event or on drop.
+    ///
+    /// The captured immutable identity stack is restored for every inner poll and export with an `Arc` clone. The event API shares and drains the legacy execution stream so cleanup, nested-call detection, cancellation, and side effects cannot diverge before the gate is released.
     pub async fn chat_stream_events<'a>(
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        let RootTurnAdmission {
+            guard: root_turn_guard,
+            identity_stack,
+        } = self.acquire_root_turn().await?;
         //
-        // The event API shares the legacy execution stream so chunk timing, cancellation, and side effects cannot diverge.
+        // Streaming readiness runs inside the captured ownership stack while the gate is held so initialization cannot overlap or recursively enter another turn.
         //
-        self.init_storage().await?;
+        scope_runtime_gate_identity_stack(&identity_stack, self.init_storage()).await?;
         info!(input_len = input.len(), "Starting streaming chat events");
         let terminal = new_runtime_stream_terminal_slot();
         let mut inner = self.run_loop_stream(input, Arc::clone(&terminal));
         let observation_context = self.build_observation_context(None);
         let stream: Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>> =
             Box::pin(async_stream::stream! {
+                let mut root_turn_guard = Some(root_turn_guard);
                 loop {
-                    let next = if let Some(context) = observation_context.as_ref() {
-                        with_observation_context(context.clone(), inner.next()).await
-                    } else {
-                        inner.next().await
-                    };
+                    let next = scope_runtime_gate_identity_stack(&identity_stack, async {
+                        if let Some(context) = observation_context.as_ref() {
+                            with_observation_context(context.clone(), inner.next()).await
+                        } else {
+                            inner.next().await
+                        }
+                    })
+                    .await;
                     match next {
                         Some(StreamChunk::Done {}) => {
                             let terminal_event = { terminal.write().take() };
                             if let Some(response) = terminal_event {
-                                while if let Some(context) = observation_context.as_ref() {
-                                    with_observation_context(context.clone(), inner.next())
-                                        .await
-                                        .is_some()
-                                } else {
-                                    inner.next().await.is_some()
-                                } {}
+                                while scope_runtime_gate_identity_stack(&identity_stack, async {
+                                    if let Some(context) = observation_context.as_ref() {
+                                        with_observation_context(context.clone(), inner.next())
+                                            .await
+                                            .is_some()
+                                    } else {
+                                        inner.next().await.is_some()
+                                    }
+                                })
+                                .await
+                                {}
                                 if observation_context.is_some() {
-                                    self.export_observability_if_configured().await;
+                                    scope_runtime_gate_identity_stack(
+                                        &identity_stack,
+                                        self.export_observability_if_configured(),
+                                    )
+                                    .await;
                                 }
+                                drop(root_turn_guard.take());
                                 yield AgentStreamEvent::Final(response);
                                 return;
                             }
@@ -12371,25 +12497,39 @@ Respond in JSON format:
                             if finalized {
                                 continue;
                             }
-                            while if let Some(context) = observation_context.as_ref() {
-                                with_observation_context(context.clone(), inner.next())
-                                    .await
-                                    .is_some()
-                            } else {
-                                inner.next().await.is_some()
-                            } {}
+                            while scope_runtime_gate_identity_stack(&identity_stack, async {
+                                if let Some(context) = observation_context.as_ref() {
+                                    with_observation_context(context.clone(), inner.next())
+                                        .await
+                                        .is_some()
+                                } else {
+                                    inner.next().await.is_some()
+                                }
+                            })
+                            .await
+                            {}
                             if observation_context.is_some() {
-                                self.export_observability_if_configured().await;
+                                scope_runtime_gate_identity_stack(
+                                    &identity_stack,
+                                    self.export_observability_if_configured(),
+                                )
+                                .await;
                             }
+                            drop(root_turn_guard.take());
                             yield AgentStreamEvent::Chunk(StreamChunk::Error { message });
                             return;
                         }
                         Some(chunk) => yield AgentStreamEvent::Chunk(chunk),
                         None => {
                             if observation_context.is_some() {
-                                self.export_observability_if_configured().await;
+                                scope_runtime_gate_identity_stack(
+                                    &identity_stack,
+                                    self.export_observability_if_configured(),
+                                )
+                                .await;
                             }
-                            break;
+                            drop(root_turn_guard.take());
+                            return;
                         }
                     }
                 }
@@ -12407,13 +12547,23 @@ impl ToolInvoker for RuntimeAgent {
 
 #[async_trait]
 impl Agent for RuntimeAgent {
+    /// Runs one blocking external root turn with task-local ownership visible through finalization, hooks, orchestration, and export.
     async fn chat(&self, input: &str) -> Result<AgentResponse> {
-        let result = if let Some(context) = self.build_observation_context(None) {
-            with_observation_context(context, self.run_loop(input)).await
-        } else {
-            self.run_loop(input).await
-        };
-        self.export_observability_if_configured().await;
+        let RootTurnAdmission {
+            guard,
+            identity_stack,
+        } = self.acquire_root_turn().await?;
+        let result = scope_runtime_gate_identity_stack(&identity_stack, async {
+            let result = if let Some(context) = self.build_observation_context(None) {
+                with_observation_context(context, self.run_loop(input)).await
+            } else {
+                self.run_loop(input).await
+            };
+            self.export_observability_if_configured().await;
+            result
+        })
+        .await;
+        drop(guard);
         result
     }
 
@@ -12951,6 +13101,221 @@ mod tests {
         }
         assert_eq!(completed, "Request executed.");
         assert_eq!(observed.call_count(), 6);
+    }
+
+    /// Confirms a returned legacy stream blocks a blocking turn until drop and the event terminal releases the same gate.
+    #[tokio::test]
+    async fn root_turn_gate_serializes_blocking_and_streaming_entry_points() {
+        let (complete_entered, mut complete_events) = tokio::sync::mpsc::unbounded_channel();
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Serialize root turns.")
+                .llm(Arc::new(RootTurnProbeProvider { complete_entered }))
+                .build()
+                .unwrap(),
+        );
+        let blocking_agent = Arc::clone(&agent);
+
+        let legacy_stream = agent.chat_stream("stream owner").await.unwrap();
+        assert!(agent.root_turn_gate.try_lock().is_err());
+        let blocking = tokio::spawn(async move { blocking_agent.chat("blocked").await.unwrap() });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), complete_events.recv())
+                .await
+                .is_err(),
+            "blocking turn reached the provider while the legacy stream owned the root gate"
+        );
+
+        drop(legacy_stream);
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), complete_events.recv())
+                .await
+                .expect("blocking turn did not enter after stream drop"),
+            Some(())
+        );
+        let response = tokio::time::timeout(std::time::Duration::from_secs(2), blocking)
+            .await
+            .expect("blocking turn did not finish after stream drop")
+            .unwrap();
+        assert_eq!(response.content, "blocking complete");
+
+        let mut event_stream = agent.chat_stream_events("event terminal").await.unwrap();
+        assert!(agent.root_turn_gate.try_lock().is_err());
+        let mut saw_final = false;
+        while let Some(event) = event_stream.next().await {
+            if matches!(event, AgentStreamEvent::Final(_)) {
+                saw_final = true;
+                break;
+            }
+        }
+        assert!(saw_final);
+        assert!(
+            agent.root_turn_gate.try_lock().is_ok(),
+            "authoritative terminal event retained the root gate"
+        );
+    }
+
+    /// Confirms on_response receives a fail-fast error instead of deadlocking on the same runtime gate.
+    #[tokio::test]
+    async fn response_hook_rejects_same_runtime_chat_reentry() {
+        let hooks = Arc::new(ResponseChatHooks {
+            target: parking_lot::Mutex::new(None),
+            invoked: AtomicBool::new(false),
+            nested_result: parking_lot::Mutex::new(None),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Reject response hook reentry.")
+                .llm(Arc::new(mock_with_response("outer response")))
+                .hooks(hooks.clone())
+                .build()
+                .unwrap(),
+        );
+        *hooks.target.lock() = Some(Arc::downgrade(&agent));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.chat("outer request"),
+        )
+        .await
+        .expect("same-runtime response hook reentry must fail without deadlocking")
+        .unwrap();
+
+        assert_eq!(response.content, "outer response");
+        let nested_result = hooks
+            .nested_result
+            .lock()
+            .clone()
+            .expect("response hook must record its nested call");
+        let error = nested_result.expect_err("same-runtime nested chat must be rejected");
+        assert!(error.contains("reentrant root turn ownership"));
+    }
+
+    /// Confirms a different runtime gate can nest while an A to B to A ownership cycle is rejected at A.
+    #[tokio::test]
+    async fn root_turn_gate_allows_nested_runtime_and_rejects_cycles() {
+        let agent_a = AgentBuilder::new()
+            .system_prompt("Runtime A.")
+            .llm(Arc::new(mock_with_response("response A")))
+            .build()
+            .unwrap();
+        let agent_b = AgentBuilder::new()
+            .system_prompt("Runtime B.")
+            .llm(Arc::new(mock_with_response("response B")))
+            .build()
+            .unwrap();
+        let RootTurnAdmission {
+            guard: guard_a,
+            identity_stack: stack_a,
+        } = agent_a.acquire_root_turn().await.unwrap();
+
+        let cycle_error = scope_runtime_gate_identity_stack(&stack_a, async {
+            let RootTurnAdmission {
+                guard: guard_b,
+                identity_stack: stack_b,
+            } = agent_b
+                .acquire_root_turn()
+                .await
+                .expect("runtime B must acquire a different gate");
+            let result =
+                scope_runtime_gate_identity_stack(&stack_b, agent_a.acquire_root_turn()).await;
+            drop(guard_b);
+            match result {
+                Err(error) => error,
+                Ok(_) => panic!("runtime A accepted a repeated gate identity"),
+            }
+        })
+        .await;
+        drop(guard_a);
+
+        assert!(
+            cycle_error
+                .to_string()
+                .contains("reentrant root turn ownership")
+        );
+    }
+
+    /// Confirms concurrent orchestration propagates root ancestry so an A to B to A cycle fails before waiting on A.
+    #[tokio::test]
+    async fn concurrent_orchestration_propagates_root_gate_ancestry() {
+        let registry = Arc::new(crate::spawner::AgentRegistry::new());
+        let hooks_a = Arc::new(ConcurrentResponseHooks {
+            registry: Arc::downgrade(&registry),
+            child_id: "runtime-b".to_string(),
+            invoked: AtomicBool::new(false),
+            nested_result: parking_lot::Mutex::new(None),
+        });
+        let hooks_b = Arc::new(ResponseChatHooks {
+            target: parking_lot::Mutex::new(None),
+            invoked: AtomicBool::new(false),
+            nested_result: parking_lot::Mutex::new(None),
+        });
+        let agent_a = AgentBuilder::new()
+            .system_prompt("Runtime A dispatches runtime B concurrently.")
+            .llm(Arc::new(mock_with_response("response A")))
+            .hooks(hooks_a.clone())
+            .build()
+            .unwrap();
+        let agent_b = AgentBuilder::new()
+            .system_prompt("Runtime B attempts to re-enter runtime A.")
+            .llm(Arc::new(mock_with_response("response B")))
+            .hooks(hooks_b.clone())
+            .build()
+            .unwrap();
+        let spec_a = crate::spec::AgentSpec {
+            name: "runtime-a".to_string(),
+            system_prompt: "Runtime A dispatches runtime B concurrently.".to_string(),
+            ..crate::spec::AgentSpec::default()
+        };
+        let spec_b = crate::spec::AgentSpec {
+            name: "runtime-b".to_string(),
+            system_prompt: "Runtime B attempts to re-enter runtime A.".to_string(),
+            ..crate::spec::AgentSpec::default()
+        };
+        registry
+            .register(crate::spawner::SpawnedAgent::from_runtime(
+                "runtime-a".to_string(),
+                agent_a,
+                spec_a,
+            ))
+            .await
+            .unwrap();
+        registry
+            .register(crate::spawner::SpawnedAgent::from_runtime(
+                "runtime-b".to_string(),
+                agent_b,
+                spec_b,
+            ))
+            .await
+            .unwrap();
+        let runtime_a = registry.get("runtime-a").unwrap();
+        *hooks_b.target.lock() = Some(Arc::downgrade(&runtime_a));
+
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            runtime_a.chat("outer concurrent request"),
+        )
+        .await
+        .expect("concurrent orchestration cycle must fail without deadlocking")
+        .unwrap();
+
+        assert_eq!(response.content, "response A");
+        let child_result = hooks_a
+            .nested_result
+            .lock()
+            .clone()
+            .expect("runtime A hook must record runtime B completion");
+        assert_eq!(child_result.unwrap(), "response B");
+        let cycle_result = hooks_b
+            .nested_result
+            .lock()
+            .clone()
+            .expect("runtime B hook must record runtime A reentry");
+        assert!(
+            cycle_result
+                .expect_err("runtime A accepted a repeated gate identity")
+                .contains("reentrant root turn ownership")
+        );
     }
 
     /// Confirms that a pending skill remains inert until confirmation and then runs once.
@@ -14447,8 +14812,93 @@ mod tests {
         responses: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    /// Test provider that reports blocking entry and emits a deterministic event stream.
+    struct RootTurnProbeProvider {
+        complete_entered: tokio::sync::mpsc::UnboundedSender<()>,
+    }
+
+    /// Calls a configured runtime from on_response and records whether nested root admission succeeded.
+    struct ResponseChatHooks {
+        target: parking_lot::Mutex<Option<Weak<RuntimeAgent>>>,
+        invoked: AtomicBool,
+        nested_result: parking_lot::Mutex<Option<std::result::Result<String, String>>>,
+    }
+
+    /// Dispatches one concurrent child from on_response and records the spawned orchestration result.
+    struct ConcurrentResponseHooks {
+        registry: Weak<crate::spawner::AgentRegistry>,
+        child_id: String,
+        invoked: AtomicBool,
+        nested_result: parking_lot::Mutex<Option<std::result::Result<String, String>>>,
+    }
+
+    /// Test tool that fails once and records the deadline observed by each invocation attempt.
+    struct RetryDeadlineTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        deadlines: Arc<parking_lot::Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+    }
+
+    /// Test hook that records shared-executor lifecycle order and authoritative records.
+    struct ToolLifecycleRecordingHooks {
+        events: parking_lot::Mutex<Vec<String>>,
+        records: parking_lot::Mutex<Vec<ToolExecutionRecord>>,
+    }
+
+    impl ToolLifecycleRecordingHooks {
+        /// Creates an empty lifecycle recorder.
+        fn new() -> Self {
+            Self {
+                events: parking_lot::Mutex::new(Vec::new()),
+                records: parking_lot::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Returns a stable snapshot of recorded hook order.
+        fn events(&self) -> Vec<String> {
+            self.events.lock().clone()
+        }
+
+        /// Returns a stable snapshot of authoritative execution records.
+        fn records(&self) -> Vec<ToolExecutionRecord> {
+            self.records.lock().clone()
+        }
+    }
+
     /// Test tool that returns the execution context it received.
     struct ContextEchoTool;
+
+    #[async_trait]
+    impl LLMProvider for RootTurnProbeProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            let _ = self.complete_entered.send(());
+            Ok(LLMResponse::new("blocking complete", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Ok(Box::new(futures::stream::iter(vec![Ok(
+                LLMChunk::final_chunk("stream complete", FinishReason::Stop, None),
+            )])))
+        }
+
+        fn provider_name(&self) -> &str {
+            "root-turn-probe"
+        }
+
+        fn supports(&self, feature: LLMFeature) -> bool {
+            matches!(feature, LLMFeature::Streaming)
+        }
+    }
 
     #[async_trait]
     impl ai_agents_core::Tool for ContextEchoTool {
@@ -14494,6 +14944,55 @@ mod tests {
                 })
                 .to_string(),
             )
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for RetryDeadlineTool {
+        fn id(&self) -> &str {
+            "retry_deadline"
+        }
+
+        fn name(&self) -> &str {
+            "Retry Deadline"
+        }
+
+        fn description(&self) -> &str {
+            "Records one deadline per retry invocation."
+        }
+
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            ai_agents_core::ToolSafetyMetadata::compute()
+        }
+
+        fn classify_call(&self, _args: &Value) -> ai_agents_core::ToolCallClassification {
+            let mut classification =
+                ai_agents_core::ToolCallClassification::from_metadata(&self.safety_metadata());
+            classification.timeout_ms = Some(1_000);
+            classification.safely_retryable = true;
+            classification
+        }
+
+        async fn execute(
+            &self,
+            _args: Value,
+            ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            self.deadlines.lock().push(
+                ctx.deadline
+                    .expect("each invocation must receive a deadline"),
+            );
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                ToolResult::error("retry")
+            } else {
+                ToolResult::ok("done")
+            }
         }
     }
 
@@ -14558,12 +15057,17 @@ mod tests {
         id: String,
         succeeds: bool,
         calls: Arc<std::sync::atomic::AtomicUsize>,
+        max_output_chars: Option<usize>,
     }
 
     struct BlockingApprovalHandler {
         entered: Arc<tokio::sync::Barrier>,
         release: Arc<tokio::sync::Notify>,
         result: ApprovalResult,
+    }
+
+    struct CountingApprovalHandler {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     struct RuntimeWebFetchTransport {
@@ -14909,6 +15413,7 @@ mod tests {
             }
         }
 
+        /// Supplies a configurable output cap while preserving non-concurrent path mutation behavior.
         fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
             ai_agents_core::ToolSafetyMetadata {
                 read_only: false,
@@ -14923,22 +15428,28 @@ mod tests {
                 supports_cancellation: true,
                 default_requires_approval: false,
                 should_defer_schema: false,
-                max_output_chars: Some(1024),
+                max_output_chars: Some(self.max_output_chars.unwrap_or(1024)),
                 max_result_size_chars: Some(1024),
             }
         }
 
+        /// Returns deterministic output and metadata for recovery lifecycle assertions.
         async fn execute(
             &self,
             _args: Value,
             _ctx: ai_agents_core::ToolExecutionContext,
         ) -> ToolResult {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if self.succeeds {
+            let mut result = if self.succeeds {
                 ToolResult::ok(format!("{} succeeded", self.id))
             } else {
                 ToolResult::error(format!("{} failed", self.id))
-            }
+            };
+            result.metadata = Some(HashMap::from([(
+                "recovery_test_tool".to_string(),
+                Value::String(self.id.clone()),
+            )]));
+            result
         }
     }
 
@@ -14995,6 +15506,17 @@ mod tests {
     }
 
     #[async_trait]
+    impl ApprovalHandler for CountingApprovalHandler {
+        async fn request_approval(
+            &self,
+            _request: ai_agents_hitl::ApprovalRequest,
+        ) -> ApprovalResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ApprovalResult::Approved
+        }
+    }
+
+    #[async_trait]
     impl AgentHooks for ReentrantToolHooks {
         async fn on_tool_complete(&self, tool: &str, _result: &ToolResult, _duration_ms: u64) {
             if tool != "reentrant_write" || self.invoked.swap(true, Ordering::SeqCst) {
@@ -15020,6 +15542,92 @@ mod tests {
     impl AgentHooks for ResponseCountingHooks {
         async fn on_response(&self, _response: &AgentResponse) {
             self.responses.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for ResponseChatHooks {
+        /// Attempts one nested blocking turn without retaining the target mutex across the await.
+        async fn on_response(&self, _response: &AgentResponse) {
+            if self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let target = self.target.lock().as_ref().and_then(Weak::upgrade);
+            let result = if let Some(target) = target {
+                target
+                    .chat("nested response hook call")
+                    .await
+                    .map(|response| response.content)
+                    .map_err(|error| error.to_string())
+            } else {
+                Err("response hook target is unavailable".to_string())
+            };
+            *self.nested_result.lock() = Some(result);
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for ConcurrentResponseHooks {
+        /// Runs one child through the real concurrent JoinSet boundary without retaining registry state across the await.
+        async fn on_response(&self, _response: &AgentResponse) {
+            if self.invoked.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let Some(registry) = self.registry.upgrade() else {
+                *self.nested_result.lock() =
+                    Some(Err("concurrent registry is unavailable".to_string()));
+                return;
+            };
+            let agents = [ai_agents_state::ConcurrentAgentRef::Id(
+                self.child_id.clone(),
+            )];
+            let aggregation = ai_agents_state::AggregationConfig {
+                strategy: ai_agents_state::AggregationStrategy::FirstWins,
+                synthesizer_llm: None,
+                synthesizer_prompt: None,
+                vote: None,
+            };
+            let result = crate::orchestration::concurrent(
+                &registry,
+                "nested concurrent response hook call",
+                &agents,
+                &aggregation,
+                None,
+                Some(1),
+                None,
+                ai_agents_state::PartialFailureAction::Abort,
+                None,
+            )
+            .await
+            .map(|result| result.response.content)
+            .map_err(|error| error.to_string());
+            *self.nested_result.lock() = Some(result);
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for ToolLifecycleRecordingHooks {
+        async fn on_tool_start(&self, tool: &str, _args: &Value) {
+            self.events.lock().push(format!("start:{tool}"));
+        }
+
+        async fn on_tool_complete(&self, tool: &str, result: &ToolResult, _duration_ms: u64) {
+            self.events
+                .lock()
+                .push(format!("complete:{tool}:{}", result.success));
+        }
+
+        async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
+            self.events.lock().push(format!(
+                "record:{}:{}",
+                record.canonical_id, record.executed
+            ));
+            self.records.lock().push(record.clone());
+        }
+
+        /// Records error reporting so fallback cannot overtake the failed original lifecycle.
+        async fn on_error(&self, _error: &AgentError) {
+            self.events.lock().push("error".to_string());
         }
     }
 
@@ -15923,6 +16531,56 @@ streaming:
     }
 
     #[tokio::test]
+    async fn safely_retryable_tool_receives_a_fresh_deadline_per_attempt() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadlines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let agent = AgentBuilder::new()
+            .system_prompt("Test retry deadlines.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(RetryDeadlineTool {
+                calls: Arc::clone(&calls),
+                deadlines: Arc::clone(&deadlines),
+            }))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    per_tool: HashMap::from([(
+                        "retry_deadline".to_string(),
+                        ToolRetryConfig {
+                            max_retries: 1,
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "retry-deadline-call",
+                "retry_deadline",
+                serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.executed);
+        assert!(record.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let deadlines = deadlines.lock();
+        assert_eq!(deadlines.len(), 2);
+        assert!(
+            deadlines[1] > deadlines[0],
+            "retry inherited the first invocation deadline"
+        );
+    }
+
+    #[tokio::test]
     async fn side_effecting_tools_are_serialized_per_resource() {
         let mock = mock_with_response("hello");
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -16303,6 +16961,52 @@ spawner:
     }
 
     #[tokio::test]
+    async fn policy_denial_keeps_executor_hook_lifecycle_and_record_authority() {
+        let workspace = MutationTestWorkspace::new();
+        let target = workspace.root.join("denied.txt");
+        let hooks = Arc::new(ToolLifecycleRecordingHooks::new());
+        let agent = AgentBuilder::new()
+            .system_prompt("Test denied tool hooks.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(FileWriteTool::new()))
+            .tool_security(ToolSecurityEngine::new(mutation_denial_security_config(
+                "file_write",
+                &workspace.root,
+                MutationDenial::Policy,
+            )))
+            .hooks(hooks.clone())
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "denied-hook-call",
+                "file_write",
+                serde_json::json!({
+                    "path": target.to_string_lossy(),
+                    "content": "blocked"
+                }),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Deny);
+        assert_eq!(
+            hooks.events(),
+            vec![
+                "start:file_write",
+                "complete:file_write:false",
+                "record:file_write:false",
+                "error"
+            ]
+        );
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
     async fn approval_argument_changes_are_rechecked_against_final_scope() {
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -16470,6 +17174,7 @@ spawner:
                 id: "limited_override".to_string(),
                 succeeds: true,
                 calls: Arc::clone(&calls),
+                max_output_chars: None,
             }))
             .build()
             .unwrap();
@@ -16522,6 +17227,7 @@ spawner:
             id: "atomic_rate".to_string(),
             succeeds: true,
             calls: Arc::clone(&calls),
+            max_output_chars: None,
         });
         let arguments = serde_json::json!({"path": "./atomic-rate.txt"});
         let bindings = tool.policy_bindings();
@@ -16811,6 +17517,7 @@ spawner:
                     id: "reentrant_write".to_string(),
                     succeeds: true,
                     calls: Arc::clone(&calls),
+                    max_output_chars: None,
                 }))
                 .hooks(hooks.clone())
                 .build()
@@ -16835,10 +17542,12 @@ spawner:
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// Confirms fallback starts only after the failed original lifecycle and resource ownership complete.
     #[tokio::test]
-    async fn fallback_releases_primary_resource_locks() {
+    async fn fallback_finalizes_original_record_before_shared_execution() {
         let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ToolLifecycleRecordingHooks::new());
         let agent = AgentBuilder::new()
             .system_prompt("Test fallback execution.")
             .llm(Arc::new(mock_with_response("done")))
@@ -16846,16 +17555,19 @@ spawner:
                 id: "primary".to_string(),
                 succeeds: false,
                 calls: Arc::clone(&primary_calls),
+                max_output_chars: None,
             }))
             .tool(Arc::new(RecoveryTestTool {
                 id: "fallback".to_string(),
                 succeeds: true,
                 calls: Arc::clone(&fallback_calls),
+                max_output_chars: None,
             }))
             .recovery_manager(recovery_manager_with_fallbacks([(
                 "primary".to_string(),
                 "fallback".to_string(),
             )]))
+            .hooks(hooks.clone())
             .build()
             .unwrap();
         let record = tokio::time::timeout(
@@ -16871,10 +17583,47 @@ spawner:
         .expect("fallback must not retain the primary resource guard")
         .unwrap();
 
-        assert!(record.success);
-        assert_eq!(record.canonical_id, "fallback");
-        assert_eq!(record.call_id, "fallback-call");
-        assert!(matches!(record.source, ToolCallSource::Fallback { .. }));
+        assert_eq!(
+            hooks.events(),
+            vec![
+                "start:primary",
+                "complete:primary:false",
+                "record:primary:true",
+                "error",
+                "start:fallback",
+                "complete:fallback:true",
+                "record:fallback:true",
+            ]
+        );
+        let records = hooks.records();
+        assert_eq!(records.len(), 2);
+        let original = &records[0];
+        assert_eq!(original.canonical_id, "primary");
+        assert!(matches!(original.source, ToolCallSource::Manual));
+        assert!(original.executed);
+        assert!(!original.success);
+
+        let fallback = &records[1];
+        assert_eq!(fallback.canonical_id, "fallback");
+        assert_eq!(fallback.call_id, "fallback-call");
+        assert!(matches!(
+            &fallback.source,
+            ToolCallSource::Fallback { original_tool } if original_tool == "primary"
+        ));
+        assert!(fallback.executed);
+        assert!(fallback.success);
+        assert_eq!(record.canonical_id, fallback.canonical_id);
+        assert_eq!(record.output, fallback.output);
+
+        let history = agent.tool_call_history();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.tool_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "fallback"]
+        );
+        assert_eq!(history[0].result.get("success"), Some(&Value::Bool(false)));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
@@ -16939,6 +17688,63 @@ tools: [web_search]
         assert!(!record.executed);
         assert!(!record.success);
         assert_eq!(record.policy.outcome, PermissionOutcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn unavailable_host_tool_does_not_request_approval() {
+        let approvals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let handler = Arc::new(CountingApprovalHandler {
+            calls: Arc::clone(&approvals),
+        });
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            fail_closed: true,
+            ..Default::default()
+        };
+        security.tools.insert(
+            "web_search".to_string(),
+            ai_agents_tools::ToolPolicyConfig {
+                enabled: true,
+                require_confirmation: true,
+                ..Default::default()
+            },
+        );
+        let yaml = r#"
+name: UnavailableApprovalAgent
+system_prompt: "Search only with approval."
+tools: [web_search]
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("done")))
+            .auto_configure_features()
+            .unwrap()
+            .tool_security(ToolSecurityEngine::new(security))
+            .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+            .approval_handler(handler)
+            .build()
+            .unwrap();
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "unavailable-before-approval",
+                "web_search",
+                serde_json::json!({"query": "rust async"}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(approvals.load(Ordering::SeqCst), 0);
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Unavailable);
+        assert!(
+            record
+                .approval
+                .as_ref()
+                .is_some_and(|approval| matches!(approval.status, ToolApprovalStatus::Unavailable))
+        );
     }
 
     #[tokio::test]

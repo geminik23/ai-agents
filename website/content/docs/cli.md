@@ -365,7 +365,7 @@ When you type `/` in the input area, a floating completion popup appears above t
 
 ### Streaming
 
-When `--stream` is enabled, provisional tokens appear in real time in the chat area while tool calls and state transitions are displayed as they happen. The finalized response becomes the authoritative stored message, replacing the preview when output processing, reflection, or a committed transition changed the text. Pressing Esc while a turn is active clears the local spinner and visible streaming buffer, but it does not cancel the spawned runtime/provider request; later chunks or the final response may still arrive.
+When `--stream` is enabled, provisional tokens appear in real time in the chat area while tool calls and state transitions are displayed as they happen. The finalized response becomes the authoritative stored message, replacing the preview when output processing, reflection, or a committed transition changed the text. If the event stream ends without a final response or terminal error, the CLI and TUI report an incomplete-stream error instead of treating provisional content as completed; the TUI also clears its preview and active tool state. Pressing Esc while a turn is active abandons that turn's local display and clears the spinner, preview, and active tool state. It does not cancel the spawned runtime/provider request, but later events from the abandoned turn are ignored and cannot overwrite or clear a newer turn.
 
 ### `ask_user` behavior
 

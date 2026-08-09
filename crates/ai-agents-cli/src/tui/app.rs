@@ -10,7 +10,7 @@ use tracing::Level;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tui_textarea::TextArea;
 
 use ai_agents::memory::estimate_tokens;
@@ -21,6 +21,10 @@ use tokio::sync::oneshot;
 use crate::question::response_from_default;
 use crate::repl::{CliReplConfig, ReplMode, parse_relationship_perspective};
 use crate::stream_reconcile::unique_tool_names;
+use crate::stream_terminal::{
+    INCOMPLETE_STREAM_ERROR, StreamDriveControl, StreamDriveOutcome,
+    drive_agent_stream_until_closed,
+};
 use crate::tui::event::{AppMessage, PendingQuestion};
 use crate::tui::palette::{THEME_NAMES, resolve_theme, theme_bg_color};
 use crate::tui::theme::Theme;
@@ -59,6 +63,136 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+#[derive(Debug)]
+enum TurnMessage {
+    StreamEvent {
+        turn_id: u64,
+        event: Box<AgentStreamEvent>,
+    },
+    ChatResponse {
+        turn_id: u64,
+        response: Box<AgentResponse>,
+    },
+    ChatError {
+        turn_id: u64,
+        message: String,
+    },
+}
+
+fn is_current_turn(active_turn_id: &Option<u64>, turn_id: u64) -> bool {
+    *active_turn_id == Some(turn_id)
+}
+
+// Clears provisional UI state without committing it as an agent response.
+fn record_stream_error(
+    chat: &mut ChatState,
+    is_thinking: &mut bool,
+    current_tools: &mut Vec<String>,
+    message: &str,
+) {
+    *is_thinking = false;
+    chat.streaming_content = None;
+    current_tools.clear();
+    chat.messages.push(DisplayMessage {
+        role: Role::System,
+        content: format!("[Error] {}", message),
+        tools: Vec::new(),
+        state_transition: None,
+        timing_ms: None,
+    });
+    chat.auto_scroll = true;
+}
+
+// Commits only the authoritative final response and final tool records to chat history.
+fn record_final_response(
+    chat: &mut ChatState,
+    is_thinking: &mut bool,
+    current_tools: &mut Vec<String>,
+    observed_tool_names: &mut Vec<String>,
+    response: AgentResponse,
+    elapsed: Option<u64>,
+) {
+    *is_thinking = false;
+    chat.streaming_content = None;
+    current_tools.clear();
+
+    let tool_names = unique_tool_names(
+        response
+            .tool_calls
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .map(|call| call.name.clone()),
+    );
+    for name in &tool_names {
+        if !observed_tool_names.contains(name) {
+            observed_tool_names.push(name.clone());
+        }
+    }
+
+    chat.messages.push(DisplayMessage {
+        role: Role::Agent,
+        content: response.content,
+        tools: tool_names,
+        state_transition: None,
+        timing_ms: elapsed,
+    });
+    chat.auto_scroll = true;
+}
+
+// Forwards one turn and stops polling as soon as the TUI receiver is gone.
+fn send_turn_message(
+    turn_tx: &UnboundedSender<TurnMessage>,
+    wake_tx: &UnboundedSender<AppMessage>,
+    message: TurnMessage,
+) -> bool {
+    turn_tx.send(message).is_ok() && wake_tx.send(AppMessage::Tick).is_ok()
+}
+
+async fn forward_stream_to_tui<S>(
+    stream: S,
+    turn_tx: &UnboundedSender<TurnMessage>,
+    wake_tx: &UnboundedSender<AppMessage>,
+    turn_id: u64,
+) -> StreamDriveOutcome
+where
+    S: futures::Stream<Item = AgentStreamEvent>,
+{
+    let outcome = drive_agent_stream_until_closed(
+        stream,
+        |event| {
+            if send_turn_message(
+                turn_tx,
+                wake_tx,
+                TurnMessage::StreamEvent {
+                    turn_id,
+                    event: Box::new(event),
+                },
+            ) {
+                StreamDriveControl::Continue
+            } else {
+                StreamDriveControl::ConsumerClosed
+            }
+        },
+        wake_tx.closed(),
+    )
+    .await;
+
+    if outcome == StreamDriveOutcome::IncompleteEof
+        && !send_turn_message(
+            turn_tx,
+            wake_tx,
+            TurnMessage::ChatError {
+                turn_id,
+                message: INCOMPLETE_STREAM_ERROR.to_string(),
+            },
+        )
+    {
+        return StreamDriveOutcome::ConsumerClosed;
+    }
+    outcome
+}
+
 /// Result from update() indicating whether the app should quit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateResult {
@@ -87,7 +221,9 @@ pub struct App {
     theme: Theme,
     theme_name: String,
     bg_fill: Option<Color>,
-    tx: UnboundedSender<AppMessage>,
+    wake_tx: UnboundedSender<AppMessage>,
+    turn_tx: UnboundedSender<TurnMessage>,
+    turn_rx: UnboundedReceiver<TurnMessage>,
 
     // Input
     input: TextArea<'static>,
@@ -103,6 +239,8 @@ pub struct App {
     is_thinking: bool,
     spinner_frame: usize,
     chat_start: Option<Instant>,
+    next_turn_id: u64,
+    active_turn_id: Option<u64>,
 
     // Tool tracking from stream events
     current_tools: Vec<String>,
@@ -167,13 +305,16 @@ impl App {
         }
 
         let bg_fill = theme_bg_color(&theme_name);
+        let (turn_tx, turn_rx) = unbounded_channel();
         Self {
             agent,
             config,
             theme,
             theme_name,
             bg_fill,
-            tx,
+            wake_tx: tx,
+            turn_tx,
+            turn_rx,
             input,
             is_command_mode: false,
             completions: CompletionState::new(),
@@ -181,6 +322,8 @@ impl App {
             is_thinking: false,
             spinner_frame: 0,
             chat_start: None,
+            next_turn_id: 1,
+            active_turn_id: None,
             current_tools: Vec::new(),
             observed_tool_names: Vec::new(),
             last_tool_call: None,
@@ -194,6 +337,7 @@ impl App {
 
     /// Process one incoming event and return whether the app should keep running.
     pub async fn update(&mut self, msg: AppMessage) -> UpdateResult {
+        self.drain_turn_messages();
         if self.modal.is_some()
             && let AppMessage::Key(key) = msg
         {
@@ -204,18 +348,29 @@ impl App {
             AppMessage::Key(key) => self.handle_key(key).await,
             AppMessage::Resize(_, _) => UpdateResult::Continue,
             AppMessage::StreamEvent(event) => {
+                let terminal = matches!(
+                    &*event,
+                    AgentStreamEvent::Final(_) | AgentStreamEvent::Chunk(StreamChunk::Error { .. })
+                );
                 self.handle_stream_event(*event);
+                if terminal {
+                    self.active_turn_id = None;
+                }
                 UpdateResult::Continue
             }
             AppMessage::ChatResponse(response) => {
                 self.store_final_response(*response);
+                self.active_turn_id = None;
                 UpdateResult::Continue
             }
-            AppMessage::ChatError(err) => {
-                self.is_thinking = false;
-                self.chat.streaming_content = None;
-                self.current_tools.clear();
-                self.add_system_message(&format!("[Error] {}", err));
+            AppMessage::ChatError(message) => {
+                record_stream_error(
+                    &mut self.chat,
+                    &mut self.is_thinking,
+                    &mut self.current_tools,
+                    &message,
+                );
+                self.active_turn_id = None;
                 UpdateResult::Continue
             }
             AppMessage::Question(question) => {
@@ -250,6 +405,45 @@ impl App {
                 });
                 self.chat.auto_scroll = true;
                 UpdateResult::Continue
+            }
+        }
+    }
+
+    // Applies queued messages only when their internally spawned turn still owns the UI.
+    fn drain_turn_messages(&mut self) {
+        while let Ok(message) = self.turn_rx.try_recv() {
+            match message {
+                TurnMessage::StreamEvent { turn_id, event } => {
+                    if !is_current_turn(&self.active_turn_id, turn_id) {
+                        continue;
+                    }
+                    let terminal = matches!(
+                        &*event,
+                        AgentStreamEvent::Final(_)
+                            | AgentStreamEvent::Chunk(StreamChunk::Error { .. })
+                    );
+                    self.handle_stream_event(*event);
+                    if terminal {
+                        self.active_turn_id = None;
+                    }
+                }
+                TurnMessage::ChatResponse { turn_id, response } => {
+                    if is_current_turn(&self.active_turn_id, turn_id) {
+                        self.store_final_response(*response);
+                        self.active_turn_id = None;
+                    }
+                }
+                TurnMessage::ChatError { turn_id, message } => {
+                    if is_current_turn(&self.active_turn_id, turn_id) {
+                        record_stream_error(
+                            &mut self.chat,
+                            &mut self.is_thinking,
+                            &mut self.current_tools,
+                            &message,
+                        );
+                        self.active_turn_id = None;
+                    }
+                }
             }
         }
     }
@@ -389,6 +583,8 @@ impl App {
             if self.is_thinking {
                 self.is_thinking = false;
                 self.chat.streaming_content = None;
+                self.current_tools.clear();
+                self.active_turn_id = None;
                 return UpdateResult::Continue;
             }
             if self.left_panel.is_some() || self.right_panel.is_some() {
@@ -431,41 +627,54 @@ impl App {
             self.is_thinking = true;
             self.chat_start = Some(Instant::now());
             self.current_tools.clear();
+            let turn_id = self.next_turn_id;
+            self.next_turn_id = self.next_turn_id.wrapping_add(1);
+            self.active_turn_id = Some(turn_id);
 
             let agent = Arc::clone(&self.agent);
-            let tx = self.tx.clone();
+            let turn_tx = self.turn_tx.clone();
+            let wake_tx = self.wake_tx.clone();
             let streaming = self.config.mode == ReplMode::Streaming;
 
             tokio::spawn(async move {
                 if streaming {
                     match agent.chat_stream_events(&text).await {
-                        Ok(mut stream) => {
-                            use futures::StreamExt;
-                            while let Some(event) = stream.next().await {
-                                let is_terminal = matches!(
-                                    &event,
-                                    AgentStreamEvent::Final(_)
-                                        | AgentStreamEvent::Chunk(StreamChunk::Error { .. })
-                                );
-                                if tx.send(AppMessage::StreamEvent(Box::new(event))).is_err() {
-                                    break;
-                                }
-                                if is_terminal {
-                                    break;
-                                }
-                            }
+                        Ok(stream) => {
+                            let _ =
+                                forward_stream_to_tui(stream, &turn_tx, &wake_tx, turn_id).await;
                         }
                         Err(e) => {
-                            let _ = tx.send(AppMessage::ChatError(e.to_string()));
+                            let _ = send_turn_message(
+                                &turn_tx,
+                                &wake_tx,
+                                TurnMessage::ChatError {
+                                    turn_id,
+                                    message: e.to_string(),
+                                },
+                            );
                         }
                     }
                 } else {
                     match agent.chat(&text).await {
                         Ok(response) => {
-                            let _ = tx.send(AppMessage::ChatResponse(Box::new(response)));
+                            let _ = send_turn_message(
+                                &turn_tx,
+                                &wake_tx,
+                                TurnMessage::ChatResponse {
+                                    turn_id,
+                                    response: Box::new(response),
+                                },
+                            );
                         }
                         Err(e) => {
-                            let _ = tx.send(AppMessage::ChatError(e.to_string()));
+                            let _ = send_turn_message(
+                                &turn_tx,
+                                &wake_tx,
+                                TurnMessage::ChatError {
+                                    turn_id,
+                                    message: e.to_string(),
+                                },
+                            );
                         }
                     }
                 }
@@ -540,32 +749,14 @@ impl App {
 
     fn store_final_response(&mut self, response: AgentResponse) {
         let elapsed = self.chat_start.map(|s| s.elapsed().as_millis() as u64);
-        self.is_thinking = false;
-        self.chat.streaming_content = None;
-        self.current_tools.clear();
-
-        let tool_names = unique_tool_names(
-            response
-                .tool_calls
-                .as_ref()
-                .into_iter()
-                .flatten()
-                .map(|call| call.name.clone()),
+        record_final_response(
+            &mut self.chat,
+            &mut self.is_thinking,
+            &mut self.current_tools,
+            &mut self.observed_tool_names,
+            response,
+            elapsed,
         );
-        for name in &tool_names {
-            if !self.observed_tool_names.contains(name) {
-                self.observed_tool_names.push(name.clone());
-            }
-        }
-
-        self.chat.messages.push(DisplayMessage {
-            role: Role::Agent,
-            content: response.content,
-            tools: tool_names,
-            state_transition: None,
-            timing_ms: elapsed,
-        });
-        self.chat.auto_scroll = true;
     }
 
     fn handle_stream_chunk(&mut self, chunk: StreamChunk) {
@@ -618,10 +809,12 @@ impl App {
                 // AgentStreamEvent::Final owns committed message and tool state.
             }
             StreamChunk::Error { message } => {
-                self.is_thinking = false;
-                self.chat.streaming_content = None;
-                self.current_tools.clear();
-                self.add_system_message(&format!("[Error] {}", message));
+                record_stream_error(
+                    &mut self.chat,
+                    &mut self.is_thinking,
+                    &mut self.current_tools,
+                    &message,
+                );
             }
         }
     }
@@ -1785,5 +1978,376 @@ impl App {
             agents,
             orchestration_pattern: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_agents::llm::{
+        ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
+    };
+    use ai_agents::{AgentBuilder, AgentResponse};
+    use futures::stream;
+    use tokio::sync::mpsc::{error::TryRecvError, unbounded_channel};
+
+    struct UnusedLlm;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for UnusedLlm {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<LLMResponse, LLMError> {
+            Err(LLMError::Other("unused test provider".to_string()))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Err(LLMError::Other("unused test provider".to_string()))
+        }
+
+        fn provider_name(&self) -> &str {
+            "unused-test-provider"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
+
+    fn test_app() -> App {
+        let agent = AgentBuilder::new()
+            .system_prompt("Test TUI ownership.")
+            .llm(Arc::new(UnusedLlm))
+            .build()
+            .expect("test agent should build");
+        let (wake_tx, _wake_rx) = unbounded_channel();
+        App::new(
+            Arc::new(agent),
+            CliReplConfig::default(),
+            wake_tx,
+            Theme::default(),
+            "dark".to_string(),
+        )
+    }
+
+    fn content(text: &str) -> AgentStreamEvent {
+        AgentStreamEvent::Chunk(StreamChunk::Content {
+            text: text.to_string(),
+        })
+    }
+
+    fn agent_messages(app: &App) -> Vec<(String, Vec<String>)> {
+        app.chat
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Agent)
+            .map(|message| (message.content.clone(), message.tools.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn incomplete_eof_forwards_content_then_chat_error() {
+        let (turn_tx, mut turn_rx) = unbounded_channel();
+        let (wake_tx, mut wake_rx) = unbounded_channel();
+
+        let outcome = forward_stream_to_tui(
+            stream::iter(vec![content("partial")]),
+            &turn_tx,
+            &wake_tx,
+            7,
+        )
+        .await;
+
+        assert_eq!(outcome, StreamDriveOutcome::IncompleteEof);
+        assert!(matches!(
+            turn_rx.recv().await,
+            Some(TurnMessage::StreamEvent { turn_id: 7, .. })
+        ));
+        assert!(matches!(
+            turn_rx.recv().await,
+            Some(TurnMessage::ChatError { turn_id: 7, message })
+                if message == INCOMPLETE_STREAM_ERROR
+        ));
+        assert!(matches!(wake_rx.recv().await, Some(AppMessage::Tick)));
+        assert!(matches!(wake_rx.recv().await, Some(AppMessage::Tick)));
+        assert!(matches!(turn_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn final_is_forwarded_without_a_second_terminal_message() {
+        let (turn_tx, mut turn_rx) = unbounded_channel();
+        let (wake_tx, mut wake_rx) = unbounded_channel();
+        let events = stream::iter(vec![AgentStreamEvent::Final(AgentResponse::new("answer"))]);
+
+        let outcome = forward_stream_to_tui(events, &turn_tx, &wake_tx, 7).await;
+
+        assert_eq!(outcome, StreamDriveOutcome::Final);
+        assert!(matches!(
+            turn_rx.recv().await,
+            Some(TurnMessage::StreamEvent { turn_id: 7, event })
+                if matches!(*event, AgentStreamEvent::Final(_))
+        ));
+        assert!(matches!(wake_rx.recv().await, Some(AppMessage::Tick)));
+        assert!(matches!(turn_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn terminal_error_is_forwarded_without_incomplete_eof() {
+        let (turn_tx, mut turn_rx) = unbounded_channel();
+        let (wake_tx, mut wake_rx) = unbounded_channel();
+        let events = stream::iter(vec![
+            AgentStreamEvent::Chunk(StreamChunk::Error {
+                message: "failed".to_string(),
+            }),
+            content("after"),
+        ]);
+
+        let outcome = forward_stream_to_tui(events, &turn_tx, &wake_tx, 7).await;
+
+        assert_eq!(outcome, StreamDriveOutcome::TerminalError);
+        assert!(matches!(
+            turn_rx.recv().await,
+            Some(TurnMessage::StreamEvent { turn_id: 7, event })
+                if matches!(*event, AgentStreamEvent::Chunk(StreamChunk::Error { .. }))
+        ));
+        assert!(matches!(wake_rx.recv().await, Some(AppMessage::Tick)));
+        assert!(matches!(turn_rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn closed_receiver_interrupts_a_pending_source() {
+        let (turn_tx, _turn_rx) = unbounded_channel();
+        let (wake_tx, wake_rx) = unbounded_channel();
+        drop(wake_rx);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            forward_stream_to_tui(stream::pending(), &turn_tx, &wake_tx, 7),
+        )
+        .await
+        .expect("closed receiver should stop a pending stream");
+
+        assert_eq!(outcome, StreamDriveOutcome::ConsumerClosed);
+    }
+
+    #[test]
+    fn abandoned_turn_messages_cannot_mutate_a_newer_active_turn() {
+        let mut app = test_app();
+        app.active_turn_id = Some(2);
+        app.is_thinking = true;
+        app.spinner_frame = 17;
+        app.chat.streaming_content = Some("newer preview".to_string());
+        app.current_tools = vec!["newer-tool".to_string()];
+        app.chat.messages.push(DisplayMessage {
+            role: Role::Agent,
+            content: "newer agent message".to_string(),
+            tools: vec!["committed-tool".to_string()],
+            state_transition: None,
+            timing_ms: None,
+        });
+
+        let spinner_before = (app.is_thinking, app.spinner_frame);
+        let preview_before = app.chat.streaming_content.clone();
+        let tools_before = app.current_tools.clone();
+        let agent_messages_before = agent_messages(&app);
+
+        for message in [
+            TurnMessage::StreamEvent {
+                turn_id: 1,
+                event: Box::new(content("stale content")),
+            },
+            TurnMessage::StreamEvent {
+                turn_id: 1,
+                event: Box::new(AgentStreamEvent::Final(AgentResponse::new(
+                    "stale stream final",
+                ))),
+            },
+            TurnMessage::StreamEvent {
+                turn_id: 1,
+                event: Box::new(AgentStreamEvent::Chunk(StreamChunk::Error {
+                    message: "stale stream error".to_string(),
+                })),
+            },
+            TurnMessage::ChatError {
+                turn_id: 1,
+                message: "stale blocking error".to_string(),
+            },
+            TurnMessage::ChatResponse {
+                turn_id: 1,
+                response: Box::new(AgentResponse::new("stale blocking response")),
+            },
+        ] {
+            app.turn_tx
+                .send(message)
+                .expect("turn queue should remain open");
+        }
+
+        app.drain_turn_messages();
+
+        assert_eq!(app.active_turn_id, Some(2));
+        assert_eq!((app.is_thinking, app.spinner_frame), spinner_before);
+        assert_eq!(app.chat.streaming_content, preview_before);
+        assert_eq!(app.current_tools, tools_before);
+        assert_eq!(agent_messages(&app), agent_messages_before);
+    }
+
+    #[tokio::test]
+    async fn escape_locally_abandons_ui_state_and_the_next_turn_can_commit() {
+        let mut app = test_app();
+        app.next_turn_id = 2;
+        app.active_turn_id = Some(1);
+        app.is_thinking = true;
+        app.spinner_frame = 23;
+        app.chat.streaming_content = Some("abandoned preview".to_string());
+        app.current_tools = vec!["abandoned-tool".to_string()];
+
+        let result = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await;
+
+        assert_eq!(result, UpdateResult::Continue);
+        assert_eq!(app.active_turn_id, None);
+        assert!(!app.is_thinking);
+        assert_eq!(app.spinner_frame, 23);
+        assert!(app.chat.streaming_content.is_none());
+        assert!(app.current_tools.is_empty());
+        assert!(agent_messages(&app).is_empty());
+
+        app.turn_tx
+            .send(TurnMessage::StreamEvent {
+                turn_id: 1,
+                event: Box::new(content("late abandoned content")),
+            })
+            .expect("local abandon should not close the producer queue");
+        app.drain_turn_messages();
+        assert!(app.chat.streaming_content.is_none());
+        assert!(agent_messages(&app).is_empty());
+
+        let new_turn_id = app.next_turn_id;
+        app.next_turn_id = app.next_turn_id.wrapping_add(1);
+        app.active_turn_id = Some(new_turn_id);
+        app.is_thinking = true;
+        app.current_tools = vec!["new-tool".to_string()];
+
+        app.turn_tx
+            .send(TurnMessage::StreamEvent {
+                turn_id: new_turn_id,
+                event: Box::new(content("new preview")),
+            })
+            .expect("new turn content should enqueue");
+        app.drain_turn_messages();
+
+        assert_eq!(app.active_turn_id, Some(new_turn_id));
+        assert!(app.is_thinking);
+        assert_eq!(app.chat.streaming_content.as_deref(), Some("new preview"));
+        assert_eq!(app.current_tools, vec!["new-tool"]);
+
+        app.turn_tx
+            .send(TurnMessage::StreamEvent {
+                turn_id: new_turn_id,
+                event: Box::new(AgentStreamEvent::Final(AgentResponse::new(
+                    "new authoritative response",
+                ))),
+            })
+            .expect("new turn final response should enqueue");
+        app.drain_turn_messages();
+
+        assert_eq!(app.active_turn_id, None);
+        assert!(!app.is_thinking);
+        assert!(app.chat.streaming_content.is_none());
+        assert!(app.current_tools.is_empty());
+        assert_eq!(
+            agent_messages(&app),
+            vec![("new authoritative response".to_string(), Vec::new())]
+        );
+    }
+
+    #[test]
+    fn final_response_commits_authoritative_content_and_unique_tools_once() {
+        let mut chat = ChatState::new();
+        chat.streaming_content = Some("partial".to_string());
+        let mut is_thinking = true;
+        let mut current_tools = vec!["search".to_string()];
+        let mut observed_tool_names = vec!["search".to_string()];
+        let response = AgentResponse {
+            content: "authoritative".to_string(),
+            metadata: None,
+            tool_calls: Some(vec![
+                ai_agents::agent::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                ai_agents::agent::ToolCall {
+                    id: "call-2".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+                ai_agents::agent::ToolCall {
+                    id: "call-3".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::json!({}),
+                },
+            ]),
+        };
+
+        record_final_response(
+            &mut chat,
+            &mut is_thinking,
+            &mut current_tools,
+            &mut observed_tool_names,
+            response,
+            Some(42),
+        );
+
+        assert!(!is_thinking);
+        assert!(chat.streaming_content.is_none());
+        assert!(current_tools.is_empty());
+        assert_eq!(observed_tool_names, vec!["search", "read"]);
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, Role::Agent);
+        assert_eq!(chat.messages[0].content, "authoritative");
+        assert_eq!(chat.messages[0].tools, vec!["search", "read"]);
+        assert_eq!(chat.messages[0].timing_ms, Some(42));
+    }
+
+    #[test]
+    fn stream_error_clears_provisional_state_without_committing_agent_content() {
+        let mut chat = ChatState::new();
+        chat.streaming_content = Some("partial".to_string());
+        let mut is_thinking = true;
+        let mut current_tools = vec!["search".to_string()];
+
+        record_stream_error(
+            &mut chat,
+            &mut is_thinking,
+            &mut current_tools,
+            INCOMPLETE_STREAM_ERROR,
+        );
+
+        assert!(!is_thinking);
+        assert!(chat.streaming_content.is_none());
+        assert!(current_tools.is_empty());
+        assert_eq!(chat.messages.len(), 1);
+        assert_eq!(chat.messages[0].role, Role::System);
+        assert_eq!(
+            chat.messages[0].content,
+            format!("[Error] {}", INCOMPLETE_STREAM_ERROR)
+        );
+        assert!(
+            !chat
+                .messages
+                .iter()
+                .any(|message| message.role == Role::Agent)
+        );
     }
 }

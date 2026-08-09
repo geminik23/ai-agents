@@ -53,6 +53,7 @@ scenarios:
           all:
             - response_not_empty: true
             - response_contains: "ERROR-PINE"
+            # Turn-local evidence includes the compaction call and this turn's main response.
             - observability:
                 dimension_counts:
                   - match_dimensions:
@@ -66,7 +67,7 @@ scenarios:
                       status: success
                     assert:
                       path: count
-                      gte: 4
+                      gte: 1
       - input: "Return one marker from the first half of our discussion and the reliability marker."
         assert:
           all:

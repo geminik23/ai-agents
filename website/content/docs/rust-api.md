@@ -182,6 +182,8 @@ The `AgentResponse` struct contains:
 - `content` - the final text response
 - `tool_calls` - optional list of tool calls made during the turn
 
+A `RuntimeAgent` runs one independent root turn at a time. Blocking `Agent::chat()`, legacy `chat_stream()`, and `chat_stream_events()` share the same per-agent turn gate, so concurrent calls on the same runtime are serialized rather than interleaving memory, state, hooks, or finalization. Internal redispatch remains part of its owning root turn. Once a stream owns the turn, it retains ownership until terminal completion or until the stream is dropped; another independent turn on that same runtime waits. A directly nested call, response hook, or framework-owned spawned call such as concurrent orchestration or registry broadcast that targets a runtime already in its current ownership chain fails before waiting, including an `A -> B -> A` cycle. Non-cyclic calls to another runtime remain allowed, and separate runtime instances remain independently concurrent.
+
 ---
 
 ## Streaming
@@ -234,6 +236,7 @@ use ai_agents::{AgentStreamEvent, StreamChunk};
 use futures::StreamExt;
 
 let mut events = agent.chat_stream_events("Tell me a story").await?;
+let mut terminal_seen = false;
 
 while let Some(event) = events.next().await {
     match event {
@@ -241,10 +244,12 @@ while let Some(event) = events.next().await {
             print!("{}", text); // provisional content
         }
         AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+            terminal_seen = true;
             eprintln!("Error: {}", message);
             break;
         }
         AgentStreamEvent::Final(response) => {
+            terminal_seen = true;
             // Authoritative content, metadata, and committed tool-call records.
             println!("\nFinal: {}", response.content);
             break;
@@ -253,9 +258,13 @@ while let Some(event) = events.next().await {
         _ => {}
     }
 }
+
+if !terminal_seen {
+    eprintln!("Error: stream ended before Final");
+}
 ```
 
-`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. Errors, timeouts, cancellation, dropped streams, and discarded speculative branches do not emit `Final`.
+`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. Provider failure, runtime cancellation, consumer cancellation or drop, timeout, and discarded speculative work do not produce a successful `Final`; consumers must treat EOF before `Final` or a terminal error as incomplete rather than promoting provisional chunks to a completed response. Expected HITL rejection is different: the runtime finalizes an authoritative cancellation response such as `Operation cancelled: ...`, and the event API emits that response as `Final(AgentResponse)` because the turn completed normally with a rejected action rather than being cancelled by the provider, runtime, or consumer.
 
 Content chunks are provisional. Output processing, reflection, or a committed transition can replace them before `Final.content` is built. Final processing does not retroactively sanitize content chunks that a host already displayed; hosts that must hide provisional content need an appropriate buffering policy.
 
@@ -292,7 +301,7 @@ runtime.optimization.speculative_state_transitions = true;
 runtime.optimization.streaming_policy = StreamingOptimizationPolicy::BufferUntilRoutingDone;
 ```
 
-Branch observability labels use `RuntimeOptimizationKind` and `RuntimeCommitBehavior` internally. Public users normally read those labels from observability reports rather than constructing branches directly. `RuntimeBranchResult` covers scheduler-managed blocking branch outputs, while buffered streaming uses `StreamingDraftResult` through its streaming-specific safety path. Buffered streaming with `BufferUntilRoutingDone` currently applies to response-independent parallel state-transition routing. Its buffer limit protects unresolved routing; after routing misses or fails, later chunks are collected for the committed output without consuming that unresolved-route buffer.
+Branch observability labels use `RuntimeOptimizationKind` and `RuntimeCommitBehavior` internally. Public users normally read those labels from observability reports rather than constructing branches directly. `RuntimeBranchResult` covers scheduler-managed blocking branch outputs, while buffered streaming uses `StreamingDraftResult` through its streaming-specific safety path. A branch status of `committed` means that branch won selection into the one committed runtime path; it does not certify transaction success or promise rollback of provider calls, tool effects, network requests, processes, or effects already observed before a stream is dropped. Buffered streaming with `BufferUntilRoutingDone` currently applies to response-independent parallel state-transition routing. Its buffer limit protects unresolved routing; after routing misses or fails, later chunks are collected for the committed output without consuming that unresolved-route buffer.
 
 ---
 
@@ -404,7 +413,9 @@ fn classify_call(&self, args: &Value) -> ToolCallClassification {
 }
 ```
 
-The shared runtime resolves names to canonical IDs, checks scope and `tool_security`, and applies HITL when needed. After approval it takes a fresh runtime-control snapshot, resolves the final tool once, reapplies policy caps, recomputes classification and resource keys, and verifies current scope, emergency control, provider availability, policy, confirmation requirement, and final arguments before lock acquisition. State-scope evaluation records the state generation that authorized the call. After waiting for locks, a changed runtime, policy, or state generation fails closed and one atomic admission records the rate-limited call immediately before invocation. The same resolved tool object is executed. Resource guards cover admission and the tool side effect, then release before completion hooks or fallback re-enters the shared path. YAML skills, state actions, plans, fallback, orchestration, generated tools, and spawned runtimes use the same path through `ToolInvoker`, so tool calls do not bypass runtime policy. Direct `SkillExecutor::execute` is prompt-only; use `execute_with_invoker` for skills that contain tool steps.
+The shared runtime resolves names to canonical IDs, checks scope and the initial `tool_security` policy, and then preflights host-backed `command`, `diagnostics`, and `web_search` availability before requesting HITL approval. After approval it takes a fresh runtime-control snapshot, resolves the final tool once, reapplies policy caps, recomputes classification and resource keys, and verifies current scope, emergency control, provider availability, policy, confirmation requirement, and final arguments before lock acquisition. State-scope evaluation records the state generation that authorized the call. After waiting for locks, a changed runtime, policy, or state generation fails closed and one atomic admission records the rate-limited call immediately before invocation. The same resolved tool object is executed. Resource guards cover admission and the tool side effect, then release before completion hooks or fallback re-enters the shared path. YAML skills, state actions, plans, fallback, orchestration, generated tools, and spawned runtimes use the same path through `ToolInvoker`, so tool calls do not bypass runtime policy. Direct `SkillExecutor::execute` is prompt-only; use `execute_with_invoker` for skills that contain tool steps.
+
+A `tool_security` timeout applies separately to each `Tool::execute` invocation attempt. Time spent waiting for HITL or resource locks is outside that timer, and a safely retryable call receives a new invocation timeout on each retry; these pieces do not form one end-to-end tool-request deadline. The built-in `command` input timeout is a separate direct-child process limit, while eval `timeout_per_turn_ms` wraps the complete agent turn. Timeout or cancellation does not provide a general rollback guarantee. Custom tools remain responsible for idempotency, cleanup, and external transaction semantics.
 
 Custom tools should use `ctx.limits` for effective framework caps and `ctx.custom_config` for tool-specific settings from `tool_security.tools.<tool_id>.config`. Tool input arguments are model-callable schema fields; `config` is host-supplied and not model-callable. Do not parse `tool_security` YAML directly inside the tool. If `fail_closed: true` and a path, domain, command, operation, or result-limit policy is configured and cannot be enforced by the shared executor alone, custom tools must declare matching `policy_bindings()` or execution is denied before the implementation runs. Side-effecting tools should also set call classification carefully: use `requires_approval` for risky mutation or command calls and set `safely_retryable` only when repeating the exact call cannot duplicate side effects. Declare every path field, including source and destination fields, so the runtime records normalized resources and places non-concurrency-safe path operations under the shared path-mutation lock. Non-concurrency-safe calls without a concrete resource use the shared unbound-side-effect lock.
 
@@ -428,7 +439,7 @@ let todos = agent.todos();
 let control = agent.runtime_control();
 ```
 
-`set_question_handler()` powers `ask_user`, `set_diagnostics_provider()` powers `diagnostics`, `set_command_runner()` powers `command`, `set_web_search_provider()` powers `web_search`, and `todos()` returns the current runtime-local task list. A missing diagnostics, command, or search provider is rejected before tool invocation and recorded as unavailable; `ask_user` instead executes its structured default/unavailable fallback. `ProcessCommandRunner` runs argv without a shell, starts from an empty environment, applies policy-filtered env values, bounds stdout/stderr while reading, cleans up on timeout, and redacts sensitive argv values in evidence. The runtime-control handle can update tool security with fallible `try_set_tool_security()` or compatibility `set_tool_security()`, narrow the runtime's declared tool grant with `set_tool_scope()`, clear those overrides, enable emergency denial with `set_emergency_deny()`, or call `cancel_all()` for future tool calls. Prefer `try_set_tool_security()` for host-supplied policy because invalid positive-only limits return an error before the active policy or runtime-control generation changes; `set_tool_security()` preserves its existing return type and panics on invalid host policy. Runtime scope entries are canonicalized and intersected with the declared grant, so an override cannot grant a registered tool that the runtime did not already own. Runtime controls are local to each runtime and do not automatically propagate from a parent to spawned children.
+`set_question_handler()` powers `ask_user`, `set_diagnostics_provider()` powers `diagnostics`, `set_command_runner()` powers `command`, `set_web_search_provider()` powers `web_search`, and `todos()` returns the current runtime-local task list. After the initial policy check, a missing diagnostics, command, or search provider is rejected before HITL and tool invocation. Availability is checked again during final pre-lock admission in case host capability changed while approval waited; the final record is unavailable with `executed: false`. `ask_user` instead executes its structured default/unavailable fallback. `ProcessCommandRunner` runs argv without a shell, starts from an empty environment, applies policy-filtered env values, bounds stdout/stderr while reading, requests kill and wait cleanup for the direct child on its own command timeout, and redacts sensitive argv values in evidence. The runtime-control handle can update tool security with fallible `try_set_tool_security()` or compatibility `set_tool_security()`, narrow the runtime's declared tool grant with `set_tool_scope()`, clear those overrides, enable emergency denial with `set_emergency_deny()`, or call `cancel_all()` for future tool calls. Prefer `try_set_tool_security()` for host-supplied policy because invalid positive-only limits return an error before the active policy or runtime-control generation changes; `set_tool_security()` preserves its existing return type and panics on invalid host policy. Runtime scope entries are canonicalized and intersected with the declared grant, so an override cannot grant a registered tool that the runtime did not already own. Runtime controls are local to each runtime and do not automatically propagate from a parent to spawned children.
 
 `web_fetch` prompt extraction also uses the runtime LLM registry when a router or default model is available, so nested extraction calls flow through the normal observed provider path. The built-in `web_search` is separate from provider-native LLM search options: it requires an explicit tool grant, a host-installed `WebSearchProvider`, and shared-executor evidence.
 
@@ -647,8 +658,8 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 | `on_message_received`       | User sends a message                        |
 | `on_llm_start`              | LLM request is about to be sent             |
 | `on_llm_complete`           | LLM response received (with timing)         |
-| `on_tool_start`             | Tool execution begins                       |
-| `on_tool_complete`          | Tool execution finishes (with timing)        |
+| `on_tool_start`             | A logical executor request emits its optional start notification |
+| `on_tool_complete`          | A shared-executor request reaches a final record (with timing) |
 | `on_state_transition`       | State machine changes state                  |
 | `on_error`                  | An error occurred                            |
 | `on_response`               | Final response is ready                      |
@@ -674,6 +685,8 @@ let agent = AgentBuilder::from_yaml_file("agent.yaml")?
 | `on_relationship_loaded`    | Relationship: actor relationship was loaded or created |
 | `on_relationship_change`    | Relationship: one or more relationship dimensions changed |
 | `on_notable_event`          | Relationship: a notable relationship event was stored |
+
+`on_tool_start` and `on_tool_complete` are executor request-lifecycle notifications, not per-retry invocation notifications or proof that `Tool::execute` ran. A request can finalize without a start hook or after a start hook without invoking the implementation. Use `on_tool_execution_record` and treat `ToolExecutionRecord.executed` as the authoritative invocation flag.
 
 ---
 
@@ -899,13 +912,13 @@ Core types are re-exported under `ai_agents::eval`: `EvalSuite`, `EvalSettings`,
 
 The runner builds agents through `AgentBuilder`, so the same YAML features used by the CLI are available. Eval fixtures can replace LLMs and tools for deterministic tests, and reports can be written with `write_outputs()`.
 
-Rust options mirror the CLI: `parallel` enables scenario-concurrent runs when isolation allows it, `observability` attaches a safe default overlay, `llm_mode` and `cassette` can force record/replay/real LLM behavior, and streaming turns are collected before assertions run. Default JSON outputs redact input, response, and string assertion details while omitting raw turn evidence and response metadata.
+Rust options mirror the CLI: `parallel` enables scenario-concurrent runs when isolation allows it, `observability` attaches a safe default overlay, `llm_mode` and `cassette` can force record/replay/real LLM behavior, and streaming turns are collected before assertions run. For each turn, eval captures an observability cursor before execution. `TurnObservabilityEvidence` builds that turn's report, trace ID, and span IDs only from post-cursor events that remain retained in the manager's rolling metrics window; it does not recover evicted events. This does not change `ObservabilityManager::generate_report()`, `raw_events()`, or exporter behavior, which remains a rolling global view. Default JSON outputs redact input, response, and string assertion details while omitting raw turn evidence and response metadata.
 
 ---
 
 ## Observability
 
-When `observability.enabled: true` is present in YAML, the builder attaches an `ObservabilityManager` to the runtime. You can read aggregate reports, inspect metrics, export configured files from Rust, or provide your own shared manager when multiple agents should report into one trace and metrics window.
+When `observability.enabled: true` is present in YAML, the builder attaches an `ObservabilityManager` to the runtime. You can read aggregate reports, inspect metrics, export configured files from Rust, or provide your own shared manager when multiple agents should report into one trace and metrics window. These manager and exporter APIs intentionally use the current rolling global window; turn-local cursor slicing is an eval evidence behavior, not a change to the public manager contract.
 
 ```rust
 use ai_agents::{Agent, AgentBuilder, Result};

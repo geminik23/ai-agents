@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.0.4 - 2026-08-09
+
+### Changed
+- Root turn ownership: blocking and streaming calls on one runtime serialize through finalization or stream drop while nested ownership cycles fail before waiting
+- Tool timeouts: each admitted tool invocation and safely retried invocation receives an independent timeout and deadline after approval and resource waits
+- Evaluation observability: turn assertions use only events retained since that turn began instead of cumulative manager history
+
+### Fixed
+- Streaming clients: the CLI and TUI report incomplete event streams, cancel pending delivery when the UI closes, and ignore late terminal events from abandoned turns
+- Tool availability: unavailable command, diagnostics, and web search requests stop before approval and are rechecked before execution
+- Root turn reentry: response hooks, concurrent orchestration, and registry broadcasts reject same-runtime ownership cycles instead of waiting indefinitely
+- Tool fallback evidence: failed original requests complete their own hooks and execution records before fallback execution begins
+
 ## 1.0.3 - 2026-08-09
 
 ### Added

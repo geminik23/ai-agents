@@ -52,7 +52,7 @@ This page tracks what shipped through stable v1.0 and the planned post-v1 direct
 | --- | --- | --- |
 | **Post-v1, unassigned** | Generalized Autonomy Runner | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events |
 | **Post-v1, unassigned** | Information Lifecycle | Retrieval and evidence contracts, extensible RAG, evidence access policy, and maintenance scheduling implemented in the sequence below |
-| **Post-v1, unassigned** | Python Runtime Bindings | Python package backed by the Rust runtime for loading YAML agents, chat, streaming, sessions, memory, relationships, and observability |
+| **Post-v1, unassigned** | Python Runtime Bindings | First package scope: YAML loading and validation, chat, streaming, context, sessions, actor memory, relationships, and observability; task-run bindings follow later after the Generalized Autonomy Runner |
 
 With the stable foundation released, the roadmap focus shifts toward autonomous task runs, the information lifecycle layer for retrieval/evidence/RAG/scoping/background maintenance, Python access to the Rust runtime, external observability integration, realtime/audio interfaces, deeper persistent memory, and richer multi-agent ecosystems.
 
@@ -78,6 +78,8 @@ Background Tasks & Runtime Maintenance Scheduling
 ```
 
 This sequence replaces the old VectorDB-first framing. Vector search is now one backend inside the Knowledge Base / RAG Pipeline, while Retrieval & Evidence is the shared foundation used by file, web, memory, knowledge, tool, and future graph/hierarchical retrievers.
+
+The Knowledge Base / RAG Pipeline may precede Evidence Access Policy only inside a trusted single-scope deployment where every caller is intentionally allowed to see the same indexed corpus. Source groups, labels, collections, and retrieval routes organize or select content; they are not access control. Multi-tenant, role-, persona-, group-, actor-, or delegation-sensitive deployments must wait for the deny-wins evidence policy and enforce it before reranking and context injection.
 
 ---
 
@@ -107,7 +109,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Built-in Tool Expansion** | Safe discovery, repository inspection, diagnostics, interactive questions, session todos, bounded waits, web retrieval primitives, context-aware tool policy, file write/edit, patch review, and controlled validation commands | ✅ Done | rc.16 |
 | **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | ✅ Done | v1.0.0 |
 | **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned after v1.0 | Release unassigned |
-| **Python Runtime Bindings** | Native Python package for loading YAML agents, chat and streaming, task runs, context injection, sessions, actor memory, relationships, and observability through the Rust runtime | Planned after v1.0 | Release unassigned |
+| **Python Runtime Bindings** | Native Python package initially covering YAML loading and validation, chat and streaming, context injection, sessions, actor memory, relationships, and observability through the Rust runtime. Task-run bindings are a later integration after the Generalized Autonomy Runner ships, not part of the first Python package scope. | Planned after v1.0 | Release unassigned |
 | **OpenTelemetry Exporter** | Export privacy-safe `ai-agents` runtime traces through OTLP to external observability backends such as LangSmith, Grafana Tempo, Jaeger, and Datadog. Covers LLM calls, tool calls, skill routing, state transitions, memory operations, multi-agent handoffs, speculative branch outcomes, eval metadata, latency, token usage, and cost estimates. | Planned after v1.0 | Release unassigned; builds on existing observability and tracing |
 | **Realtime & Audio Interfaces** | Typed turn APIs and provider-neutral adapters for audio-input models, realtime speech sessions, runtime delegation, external history sync, interruption handling, and safe committed-text streaming | Planned after v1.0 | Release unassigned |
 | **Retrieval & Evidence Layer** | Unified retrieval/evidence foundation: EvidenceItem, EvidencePack, Retriever trait, retrieval planning, query transforms, fusion/rerank hooks, evidence judging, token budgets, context assembly, and retrieval observability across file, web, memory, knowledge, tool, and future graph/hierarchical sources | Planned after v1.0 | Release unassigned; Information Lifecycle 1/4 |

@@ -52,7 +52,13 @@ pub struct CostStats {
 #[derive(Debug)]
 pub struct MetricsAggregator {
     config: AggregationConfig,
-    events: RwLock<VecDeque<ObservationEvent>>,
+    window: RwLock<MetricsWindow>,
+}
+
+#[derive(Debug, Default)]
+struct MetricsWindow {
+    ingested_events: u64,
+    events: VecDeque<ObservationEvent>,
 }
 
 impl MetricsAggregator {
@@ -60,21 +66,42 @@ impl MetricsAggregator {
     pub fn new(config: AggregationConfig) -> Self {
         Self {
             config,
-            events: RwLock::new(VecDeque::new()),
+            window: RwLock::new(MetricsWindow::default()),
         }
     }
 
-    /// Adds one event and evicts oldest events beyond the window size.
+    /// Adds one event, advances the cumulative cursor, and evicts events beyond the rolling window.
     pub fn record(&self, event: ObservationEvent) {
-        let mut events = self.events.write();
-        events.push_back(event);
-        while events.len() > self.config.window_size {
-            events.pop_front();
+        let mut window = self.window.write();
+        window.ingested_events = window
+            .ingested_events
+            .checked_add(1)
+            .expect("observability event cursor overflowed");
+        window.events.push_back(event);
+        while window.events.len() > self.config.window_size {
+            window.events.pop_front();
         }
     }
 
+    /// Returns the cumulative count of events ingested into this aggregator.
+    pub(crate) fn cursor(&self) -> u64 {
+        self.window.read().ingested_events
+    }
+
+    /// Returns the complete current rolling event window.
     pub fn events(&self) -> Vec<ObservationEvent> {
-        self.events.read().iter().cloned().collect()
+        self.window.read().events.iter().cloned().collect()
+    }
+
+    /// Returns events at or after the cursor that are still retained in the rolling window.
+    pub(crate) fn events_since(&self, cursor: u64) -> Vec<ObservationEvent> {
+        let window = self.window.read();
+        let retained_start = window
+            .ingested_events
+            .saturating_sub(window.events.len() as u64);
+        let requested_start = cursor.max(retained_start).min(window.ingested_events);
+        let offset = requested_start.saturating_sub(retained_start) as usize;
+        window.events.iter().skip(offset).cloned().collect()
     }
 
     /// Aggregates using the dimensions from AggregationConfig.

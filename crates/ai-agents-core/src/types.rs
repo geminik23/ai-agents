@@ -147,7 +147,7 @@ pub struct ToolCallClassification {
     pub requires_network: bool,
     /// True when this call should ask for approval by default.
     pub requires_approval: bool,
-    /// Optional timeout override in milliseconds.
+    /// Optional timeout override in milliseconds for each invocation attempt.
     pub timeout_ms: Option<u64>,
     /// Optional output cap for this call.
     pub max_output_chars: Option<usize>,
@@ -175,7 +175,7 @@ impl ToolCallClassification {
 /// Effective tool limits derived from runtime defaults, policy, safety metadata, and call classification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolExecutionLimits {
-    /// Maximum wall-clock execution time in milliseconds.
+    /// Maximum wall-clock time in milliseconds for each invocation attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Maximum model-facing output characters.
@@ -281,7 +281,9 @@ impl ToolCancellationToken {
     }
 }
 
-/// Context passed unchanged from the shared executor into a tool implementation.
+/// Context passed from the shared executor into one tool invocation attempt.
+///
+/// Retries clone the request-level fields, then refresh [`Self::deadline`] immediately before each `Tool::execute` invocation.
 #[derive(Debug, Clone)]
 pub struct ToolExecutionContext {
     /// Tool name, alias, or display name requested by the caller.
@@ -306,9 +308,9 @@ pub struct ToolExecutionContext {
     pub actor: ToolActorContext,
     /// Cooperative cancellation observer.
     pub cancellation: ToolCancellationToken,
-    /// UTC time at which shared executor handling started.
+    /// UTC time at which shared executor handling started across all retry attempts.
     pub started_at: DateTime<Utc>,
-    /// UTC deadline derived from the timeout budget.
+    /// UTC deadline for the current invocation attempt, refreshed before each retry.
     pub deadline: Option<DateTime<Utc>>,
     /// Permission decision that allowed this call to reach the tool.
     pub permission: ToolPolicyDecisionRecord,
@@ -726,7 +728,9 @@ pub struct ToolApprovalRecord {
     pub modified_arguments: Option<Value>,
 }
 
-/// Structured internal result for a tool request.
+/// Structured internal result for one logical shared-executor request.
+///
+/// Retry invocations are folded into this one request-level record. A configured fallback finalizes the failed original record, then produces a separate record with [`ToolCallSource::Fallback`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRecord {
     /// Stable call ID copied from the request.
@@ -761,7 +765,7 @@ pub struct ToolExecutionRecord {
     pub approval: Option<ToolApprovalRecord>,
     /// Start timestamp for observability and eval evidence.
     pub started_at: DateTime<Utc>,
-    /// Wall-clock duration in milliseconds.
+    /// Wall-clock duration for the logical request, including all retry attempts.
     pub duration_ms: u64,
     /// True when execution exceeded the configured timeout.
     pub timed_out: bool,

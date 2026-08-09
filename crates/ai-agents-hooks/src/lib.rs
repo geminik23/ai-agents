@@ -24,6 +24,11 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// Observes agent behavior and shared tool-executor request lifecycles.
+///
+/// Tool lifecycle hooks describe logical executor requests, not individual retry invocations. A request can finalize without a start callback or without invoking the tool implementation, while an error propagated before record construction may have no completion callback. A fallback starts only after the failed original request releases its resources and completes its own lifecycle. Whether `Tool::execute` was invoked is authoritative only in [`ToolExecutionRecord::executed`].
+///
+/// `RuntimeAgent` invokes turn hooks while retaining root-turn ownership. A direct nested chat or stream call into the same runtime returns an `AgentError` instead of waiting on the non-reentrant gate. Nested calls into another runtime are allowed until a runtime gate identity repeats in the task-local call chain.
 #[async_trait]
 pub trait AgentHooks: Send + Sync {
     async fn on_message_received(&self, _message: &str) {}
@@ -32,16 +37,26 @@ pub trait AgentHooks: Send + Sync {
 
     async fn on_llm_complete(&self, _response: &LLMResponse, _duration_ms: u64) {}
 
+    /// Called at most once when a logical executor request reaches its optional start notification.
+    ///
+    /// Some finalized requests do not emit this callback, and emission does not prove that `Tool::execute` will run or that a record will be produced.
     async fn on_tool_start(&self, _tool: &str, _args: &Value) {}
 
+    /// Called once for every finalized logical executor record, including requests without `on_tool_start` or implementation invocation.
+    ///
+    /// Retry invocations do not emit additional completion hooks. A failed original request selected for fallback completes its request lifecycle before fallback begins separately.
     async fn on_tool_complete(&self, _tool: &str, _result: &ToolResult, _duration_ms: u64) {}
 
+    /// Receives authoritative request-level evidence after `on_tool_complete`, including whether any retry invocation reached the tool implementation.
     async fn on_tool_execution_record(&self, _record: &ToolExecutionRecord) {}
 
     async fn on_state_transition(&self, _from: Option<&str>, _to: &str, _reason: &str) {}
 
     async fn on_error(&self, _error: &AgentError) {}
 
+    /// Observes the finalized response while `RuntimeAgent` still owns the root-turn gate.
+    ///
+    /// Calling a root-turn entry point on the same runtime fails fast; calling a different runtime is allowed unless the nested chain cycles back to an already-owned gate.
     async fn on_response(&self, _response: &AgentResponse) {}
 
     async fn on_approval_requested(&self, _request: &ApprovalRequest) {}
