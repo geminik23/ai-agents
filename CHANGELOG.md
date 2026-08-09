@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.3 - 2026-08-09
+
+### Added
+- Streaming final responses: event streams expose authoritative committed content, metadata, and tool-call records while legacy chunk streams remain compatible
+
+### Changed
+- Streaming clients: evaluations, the CLI, and the TUI use finalized responses while retaining live content, tool, state, and error events
+
 ## 1.0.2 - 2026-08-08
 
 ### Changed

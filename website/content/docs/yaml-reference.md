@@ -2712,9 +2712,9 @@ streaming:
   enabled: true
 ```
 
-> **Note:** Output process pipeline stages (sanitize, format) only run in blocking mode. They are skipped on `chat_stream()` paths.
+> **Note:** Content chunks can reach a streaming consumer before output processing, reflection, or transition replacement completes. `chat_stream_events()` exposes the processed authoritative response as its final event, but final processing does not retroactively sanitize provisional chunks that were already displayed.
 
-`metadata.cli.streaming: true` selects streaming for the CLI, and `--stream` overrides that frontend preference. A Rust host selects streaming by calling `chat_stream()`. Stream chunks expose content, tool, state, completion, and error events but not the final blocking `AgentResponse.metadata`; streamed eval turns therefore cannot use response-metadata assertions.
+`metadata.cli.streaming: true` selects streaming for the CLI, and `--stream` overrides that frontend preference. A Rust host can call legacy `chat_stream()` for the existing chunk-plus-`Done` contract or `chat_stream_events()` for provisional chunks followed by one authoritative `Final(AgentResponse)`. The CLI, TUI, and streamed eval turns use the complete event stream so final content, metadata, and committed tool-call records remain available.
 
 ### `parallel_tools`
 

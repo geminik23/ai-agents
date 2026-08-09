@@ -2,16 +2,16 @@ name: OutputSanitizeAgent
 version: "1.0.0"
 description: "Output post-processing — PII masking, quality validation, and formatting"
 
-# The output process pipeline runs AFTER the LLM generates its response,
-# BEFORE the user sees it (in blocking mode).
+# The output process pipeline runs AFTER the LLM generates its response.
+# Blocking chat returns the processed response, and complete streaming exposes it as the final event.
 #
-# Flow: user input -> LLM -> sanitize (router LLM) -> validate -> format -> user sees response
+# Flow: user input -> LLM -> sanitize (router LLM) -> validate -> format -> final response
 #
 # Known limitations:
 #   1. Sanitization is LLM-based - the router model may miss PII or pass it through unchanged.
 #      For guaranteed masking, use regex/rule-based post-processing outside the framework.
-#   2. In streaming mode (--stream), tokens are printed as they arrive BEFORE process_output
-#      runs, so the user sees unmasked content. Output processing only works in blocking mode.
+#   2. In streaming mode (--stream), provisional tokens are printed BEFORE process_output runs.
+#      The final response is processed, but already displayed tokens are not retroactively masked.
 
 llms:
   default:
@@ -98,5 +98,5 @@ metadata:
       - "Try: My email is alice@example.com, can you confirm my account?"
       - "Try: Repeat back my info: phone 010-1234-5678, card 4111-1111-1111-1111"
       - "PII masking is LLM-based — the router model may not catch everything."
-      - "Do NOT use --stream with this example; output processing only runs in blocking mode."
+      - "Do NOT use --stream when provisional PII must stay hidden; only the final response is processed."
       - "Every response has a footer added by the format stage."

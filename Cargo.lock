@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-context",
  "ai-agents-core",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-cli"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents",
  "ai-agents-eval",
@@ -64,7 +64,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-context"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "async-trait",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "async-trait",
  "chrono",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-disambiguation"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -109,7 +109,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-eval"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-facts",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-facts"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-hitl"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -173,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-hooks"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-hitl",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-llm"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "async-stream",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-memory"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -226,7 +226,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-observability"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-hitl",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-persona"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-context",
  "ai-agents-core",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-process"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -280,7 +280,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-reasoning"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "serde",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-recovery"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -307,7 +307,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-relationships"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "async-trait",
@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-runtime"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-context",
  "ai-agents-core",
@@ -365,7 +365,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-skills"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-disambiguation",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-state"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-disambiguation",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-storage"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "async-trait",
@@ -422,7 +422,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-template"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "minijinja",
@@ -436,7 +436,7 @@ dependencies = [
 
 [[package]]
 name = "ai-agents-tools"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "ai-agents-core",
  "ai-agents-llm",
@@ -530,9 +530,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arc-swap"
@@ -765,15 +765,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "concurrent-queue"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
-dependencies = [
- "crossbeam-utils",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -994,11 +985,10 @@ checksum = "b6aff27af350e7b53e82aac3e5ab6389abd8f280640ac034508dff0608c4c7e5"
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -1978,9 +1968,9 @@ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
 name = "rand"
-version = "0.8.5"
+version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
+checksum = "5ca0ecfa931c29007047d1bc58e623ab12e5590e8c7cc53200d5202b69266d8a"
 dependencies = [
  "libc",
  "rand_chacha",
@@ -2587,9 +2577,9 @@ dependencies = [
 
 [[package]]
 name = "spin"
-version = "0.9.8"
+version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]

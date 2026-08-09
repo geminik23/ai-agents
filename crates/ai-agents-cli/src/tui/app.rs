@@ -15,11 +15,12 @@ use tui_textarea::TextArea;
 
 use ai_agents::memory::estimate_tokens;
 use ai_agents::tools::{QuestionRequest, QuestionResponse};
-use ai_agents::{Agent, RuntimeAgent, StreamChunk};
+use ai_agents::{Agent, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use tokio::sync::oneshot;
 
 use crate::question::response_from_default;
 use crate::repl::{CliReplConfig, ReplMode, parse_relationship_perspective};
+use crate::stream_reconcile::unique_tool_names;
 use crate::tui::event::{AppMessage, PendingQuestion};
 use crate::tui::palette::{THEME_NAMES, resolve_theme, theme_bg_color};
 use crate::tui::theme::Theme;
@@ -202,34 +203,18 @@ impl App {
         match msg {
             AppMessage::Key(key) => self.handle_key(key).await,
             AppMessage::Resize(_, _) => UpdateResult::Continue,
-            AppMessage::StreamChunk(chunk) => {
-                self.handle_stream_chunk(chunk);
+            AppMessage::StreamEvent(event) => {
+                self.handle_stream_event(*event);
                 UpdateResult::Continue
             }
             AppMessage::ChatResponse(response) => {
-                let elapsed = self.chat_start.map(|s| s.elapsed().as_millis() as u64);
-                self.is_thinking = false;
-                self.chat.streaming_content = None;
-
-                let tool_names = response
-                    .tool_calls
-                    .as_ref()
-                    .map(|tc| tc.iter().map(|t| t.name.clone()).collect())
-                    .unwrap_or_default();
-
-                self.chat.messages.push(DisplayMessage {
-                    role: Role::Agent,
-                    content: response.content.clone(),
-                    tools: tool_names,
-                    state_transition: None,
-                    timing_ms: elapsed,
-                });
-                self.chat.auto_scroll = true;
+                self.store_final_response(*response);
                 UpdateResult::Continue
             }
             AppMessage::ChatError(err) => {
                 self.is_thinking = false;
                 self.chat.streaming_content = None;
+                self.current_tools.clear();
                 self.add_system_message(&format!("[Error] {}", err));
                 UpdateResult::Continue
             }
@@ -453,11 +438,19 @@ impl App {
 
             tokio::spawn(async move {
                 if streaming {
-                    match agent.chat_stream(&text).await {
+                    match agent.chat_stream_events(&text).await {
                         Ok(mut stream) => {
                             use futures::StreamExt;
-                            while let Some(chunk) = stream.next().await {
-                                if tx.send(AppMessage::StreamChunk(chunk)).is_err() {
+                            while let Some(event) = stream.next().await {
+                                let is_terminal = matches!(
+                                    &event,
+                                    AgentStreamEvent::Final(_)
+                                        | AgentStreamEvent::Chunk(StreamChunk::Error { .. })
+                                );
+                                if tx.send(AppMessage::StreamEvent(Box::new(event))).is_err() {
+                                    break;
+                                }
+                                if is_terminal {
                                     break;
                                 }
                             }
@@ -537,6 +530,44 @@ impl App {
         self.add_toast(&format!("Theme: {}", self.theme_name));
     }
 
+    fn handle_stream_event(&mut self, event: AgentStreamEvent) {
+        match event {
+            AgentStreamEvent::Chunk(chunk) => self.handle_stream_chunk(chunk),
+            AgentStreamEvent::Final(response) => self.store_final_response(response),
+            _ => {}
+        }
+    }
+
+    fn store_final_response(&mut self, response: AgentResponse) {
+        let elapsed = self.chat_start.map(|s| s.elapsed().as_millis() as u64);
+        self.is_thinking = false;
+        self.chat.streaming_content = None;
+        self.current_tools.clear();
+
+        let tool_names = unique_tool_names(
+            response
+                .tool_calls
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .map(|call| call.name.clone()),
+        );
+        for name in &tool_names {
+            if !self.observed_tool_names.contains(name) {
+                self.observed_tool_names.push(name.clone());
+            }
+        }
+
+        self.chat.messages.push(DisplayMessage {
+            role: Role::Agent,
+            content: response.content,
+            tools: tool_names,
+            state_transition: None,
+            timing_ms: elapsed,
+        });
+        self.chat.auto_scroll = true;
+    }
+
     fn handle_stream_chunk(&mut self, chunk: StreamChunk) {
         match chunk {
             StreamChunk::Content { text } => {
@@ -545,7 +576,9 @@ impl App {
                 self.chat.auto_scroll = true;
             }
             StreamChunk::ToolCallStart { name, .. } => {
-                self.current_tools.push(name.clone());
+                if !self.current_tools.contains(&name) {
+                    self.current_tools.push(name.clone());
+                }
                 if !self.observed_tool_names.contains(&name) {
                     self.observed_tool_names.push(name);
                 }
@@ -582,21 +615,12 @@ impl App {
                 });
             }
             StreamChunk::Done {} => {
-                let elapsed = self.chat_start.map(|s| s.elapsed().as_millis() as u64);
-                let content = self.chat.streaming_content.take().unwrap_or_default();
-                self.is_thinking = false;
-                self.chat.messages.push(DisplayMessage {
-                    role: Role::Agent,
-                    content,
-                    tools: self.current_tools.drain(..).collect(),
-                    state_transition: None,
-                    timing_ms: elapsed,
-                });
-                self.chat.auto_scroll = true;
+                // AgentStreamEvent::Final owns committed message and tool state.
             }
             StreamChunk::Error { message } => {
                 self.is_thinking = false;
                 self.chat.streaming_content = None;
+                self.current_tools.clear();
                 self.add_system_message(&format!("[Error] {}", message));
             }
         }
@@ -1703,8 +1727,14 @@ impl App {
     }
 
     fn build_tools_panel(&self) -> ToolsPanelState {
+        let tool_names = unique_tool_names(
+            self.observed_tool_names
+                .iter()
+                .chain(&self.current_tools)
+                .cloned(),
+        );
         ToolsPanelState {
-            tool_names: self.observed_tool_names.clone(),
+            tool_names,
             last_call: self.last_tool_call.clone(),
         }
     }

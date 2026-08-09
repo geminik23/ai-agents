@@ -8,10 +8,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const RELEASE_VERSION: &str = "1.0.2";
+const RELEASE_VERSION: &str = "1.0.3";
 const RELEASE_LICENSE: &str = "Apache-2.0";
 const RELEASE_RUST_VERSION: &str = "1.88";
-const INTERNAL_REQUIREMENT: &str = "^1.0.2";
+const INTERNAL_REQUIREMENT: &str = "^1.0.3";
 const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
 
 const RELEASE_ORDER: [&str; 23] = [
@@ -770,12 +770,12 @@ mod tests {
     #[test]
     fn wrong_package_version_is_rejected() {
         let mut metadata = valid_metadata();
-        metadata.packages[0].version = "1.0.3".to_string();
+        metadata.packages[0].version = "1.0.4".to_string();
         let rejections = identity_rejections(&metadata, "", "same-lock", &RELEASE_ORDER);
         assert!(
             rejections
                 .iter()
-                .any(|reason| reason.contains("has version '1.0.3'"))
+                .any(|reason| reason.contains("has version '1.0.4'"))
         );
     }
 

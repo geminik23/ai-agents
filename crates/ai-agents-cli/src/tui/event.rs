@@ -6,7 +6,7 @@ use crossterm::event::KeyEvent;
 use tokio::sync::oneshot;
 
 use ai_agents::tools::{QuestionRequest, QuestionResponse};
-use ai_agents::{AgentResponse, StreamChunk};
+use ai_agents::{AgentResponse, AgentStreamEvent};
 
 use super::log_layer::LogEntry;
 
@@ -34,7 +34,7 @@ pub enum AppMessage {
     Resize(u16, u16),
 
     // Agent responses
-    StreamChunk(StreamChunk),
+    StreamEvent(Box<AgentStreamEvent>),
     ChatResponse(Box<AgentResponse>),
     ChatError(String),
 

@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.2** - Stable v1 surfaces follow SemVer within the documented support and operational boundaries.
+> Status: **1.0.3** - Stable v1 surfaces follow SemVer within the documented support and operational boundaries.
 
 ## Features
 
@@ -30,7 +30,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Memory stack** - CompactingMemory and token budgeting; file and Redis snapshot persistence; SQLite snapshots, session metadata/filtering/cleanup, actor facts, and relationship memory
 - **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
 - **Dynamic agent spawning + multi-agent systems** - fail-closed child admission, bounded managed capacity, optional shared LLMs and namespaced storage, agent registry, actor-aware messaging, and router/pipeline/concurrent/group chat/handoff orchestration; active nested spawners are rejected in v1
-- **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming, context injection, and actor/relationship inspection
+- **CLI + TUI** - interactive REPL, ratatui terminal UI, streaming with authoritative final responses, context injection, and actor/relationship inspection
 - **Reasoning, reflection & disambiguation** - chain-of-thought, ReAct, plan-and-execute, self-evaluation, ambiguity detection, and clarification
 - **Evaluation, safety, control & observability** - YAML scenario evals with assertions/judges, runtime latency optimization, speculative branch execution, error recovery with backoff, tool security, HITL approvals, and privacy-safe latency/token/cost tracing with JSON/CSV/Prometheus exports
 - **Extensible via traits** - `LLMProvider`, `Memory`, `Tool`, `ApprovalHandler`, `Summarizer`, `AgentHooks`, `ToolProvider`; custom LLM providers remain source-compatible and can opt into native tool requests through additive methods

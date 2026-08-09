@@ -181,7 +181,8 @@ use ai_agents_tools::{
 };
 
 use super::{
-    Agent, AgentInfo, AgentResponse, ParallelToolsConfig, StreamChunk, StreamingConfig, ToolCall,
+    Agent, AgentInfo, AgentResponse, AgentStreamEvent, ParallelToolsConfig, StreamChunk,
+    StreamingConfig, ToolCall,
 };
 use crate::optimization::{
     AwaitBeforeNextTurn, BackgroundMaintenanceQueue, BackgroundOverflowPolicy, MainResponseDraft,
@@ -239,6 +240,25 @@ struct AgentResponseParts {
     iterations: u32,
     thinking: Option<String>,
     reflection_metadata: Option<ReflectionMetadata>,
+}
+
+//
+// Owns the finalized response paired with a legacy Done chunk without changing provisional chunk timing.
+//
+type RuntimeStreamTerminalSlot = Arc<RwLock<Option<AgentResponse>>>;
+
+//
+// Creates isolated terminal ownership for one public stream.
+//
+fn new_runtime_stream_terminal_slot() -> RuntimeStreamTerminalSlot {
+    Arc::new(RwLock::new(None))
+}
+
+//
+// Records the exact response that already completed root-turn finalization before Done is emitted.
+//
+fn record_runtime_stream_final(slot: &RuntimeStreamTerminalSlot, response: AgentResponse) {
+    *slot.write() = Some(response);
 }
 
 #[derive(Clone, Copy)]
@@ -11041,6 +11061,7 @@ Respond in JSON format:
     fn run_loop_internal_stream<'a>(
         &'a self,
         input: &'a str,
+        terminal: RuntimeStreamTerminalSlot,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
         let include_tool_events = self.streaming.include_tool_events;
         let include_state_events = self.streaming.include_state_events;
@@ -11087,10 +11108,11 @@ Respond in JSON format:
                 // The boxed future prevents this stream state machine from becoming too large.
                 //
                 match Box::pin(self.try_buffered_streaming_branches(processed_input, &input_data.context)).await {
-                    Ok(Some((_response, chunks))) => {
+                    Ok(Some((response, chunks))) => {
                         for chunk in chunks {
                             yield chunk;
                         }
+                        record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
                     }
@@ -11111,6 +11133,7 @@ Respond in JSON format:
                 match self.try_pre_response_transition(processed_input).await {
                     Ok(Some(response)) => {
                         yield StreamChunk::content(&response.content);
+                        record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
                     }
@@ -11144,6 +11167,7 @@ Respond in JSON format:
                         match result {
                             Ok(response) => {
                                 yield StreamChunk::content(&response.content);
+                                record_runtime_stream_final(&terminal, response);
                                 yield StreamChunk::Done {};
                             }
                             Err(e) => {
@@ -11164,6 +11188,7 @@ Respond in JSON format:
                     match self.handle_skill_response(processed_input, &skill_id, content, &input_data.context).await {
                         Ok(resp) => {
                             yield StreamChunk::content(&resp.content);
+                            record_runtime_stream_final(&terminal, resp);
                             yield StreamChunk::Done {};
                             return;
                         }
@@ -11198,6 +11223,7 @@ Respond in JSON format:
                         return;
                     }
                     yield StreamChunk::content(&response.content);
+                    record_runtime_stream_final(&terminal, response);
                     yield StreamChunk::Done {};
                     return;
                 }
@@ -11234,6 +11260,7 @@ Respond in JSON format:
                 match self.handle_plan_and_execute(processed_input, &input_data.context, auto_detected).await {
                     Ok(resp) => {
                         yield StreamChunk::content(&resp.content);
+                        record_runtime_stream_final(&terminal, resp);
                         yield StreamChunk::Done {};
                         return;
                     }
@@ -11441,7 +11468,9 @@ Respond in JSON format:
                                         yield StreamChunk::error(finalize_error.to_string());
                                         return;
                                     }
-                                    yield StreamChunk::error(response.content);
+                                    let legacy_error = response.content.clone();
+                                    record_runtime_stream_final(&terminal, response);
+                                    yield StreamChunk::error(legacy_error);
                                     yield StreamChunk::Done {};
                                     return;
                                 }
@@ -11495,7 +11524,7 @@ Respond in JSON format:
                 };
 
                 // Reflection (uses blocking LLM calls for retries)
-                let (final_content, _reflection_metadata) = match self
+                let (final_content, reflection_metadata) = match self
                     .run_reflection(&*llm, processed_input, final_content)
                     .await
                 {
@@ -11580,13 +11609,22 @@ Respond in JSON format:
                     yield StreamChunk::content(&final_content);
                 }
 
-                // Parity with non-stream: finalize the committed response once.
-                let final_response = AgentResponse::new(&final_content);
+                // Build and finalize the same authoritative response shape before exposing the terminal event.
+                let final_response = self.build_agent_response(AgentResponseParts {
+                    content: final_content,
+                    all_tool_calls,
+                    reasoning_mode,
+                    auto_detected,
+                    iterations,
+                    thinking: thinking_content,
+                    reflection_metadata,
+                });
                 if let Err(e) = self.finish_turn_if_root(&final_response).await {
                     yield StreamChunk::error(e.to_string());
                     return;
                 }
 
+                record_runtime_stream_final(&terminal, final_response);
                 yield StreamChunk::Done {};
                 return;
             }
@@ -11598,6 +11636,7 @@ Respond in JSON format:
     fn run_loop_stream<'a>(
         &'a self,
         input: &'a str,
+        terminal: RuntimeStreamTerminalSlot,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
         Box::pin(async_stream::stream! {
             self.begin_root_turn();
@@ -11733,6 +11772,7 @@ Respond in JSON format:
                             return;
                         }
                         yield StreamChunk::content(&question.question);
+                        record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
                     }
@@ -11789,6 +11829,7 @@ Respond in JSON format:
                             {
                                 Ok(resp) => {
                                     yield StreamChunk::content(&resp.content);
+                                    record_runtime_stream_final(&terminal, resp);
                                     yield StreamChunk::Done {};
                                     return;
                                 }
@@ -11801,7 +11842,10 @@ Respond in JSON format:
 
                         // Forward to internal stream with enriched input.
                         drop(admission);
-                        let mut inner = self.run_loop_internal_stream(&enriched_input);
+                        let mut inner = self.run_loop_internal_stream(
+                            &enriched_input,
+                            Arc::clone(&terminal),
+                        );
                         while let Some(chunk) = inner.next().await {
                             yield chunk;
                         }
@@ -11825,6 +11869,7 @@ Respond in JSON format:
                             {
                                 Ok(resp) => {
                                     yield StreamChunk::content(&resp.content);
+                                    record_runtime_stream_final(&terminal, resp);
                                     yield StreamChunk::Done {};
                                     return;
                                 }
@@ -11835,7 +11880,10 @@ Respond in JSON format:
                             }
                         }
 
-                        let mut inner = self.run_loop_internal_stream(&enriched_input);
+                        let mut inner = self.run_loop_internal_stream(
+                            &enriched_input,
+                            Arc::clone(&terminal),
+                        );
                         while let Some(chunk) = inner.next().await {
                             yield chunk;
                         }
@@ -11859,6 +11907,7 @@ Respond in JSON format:
                             return;
                         }
                         yield StreamChunk::content(&apology);
+                        record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
                     }
@@ -11879,7 +11928,10 @@ Respond in JSON format:
                             );
                             match self.request_hitl_approval(check_result).await {
                                 Ok(ApprovalResult::Approved | ApprovalResult::Modified { .. }) => {
-                                    let mut inner = self.run_loop_internal_stream(input);
+                                    let mut inner = self.run_loop_internal_stream(
+                                        input,
+                                        Arc::clone(&terminal),
+                                    );
                                     while let Some(chunk) = inner.next().await {
                                         yield chunk;
                                     }
@@ -11907,6 +11959,7 @@ Respond in JSON format:
                             return;
                         }
                         yield StreamChunk::content(&apology);
+                        record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
                     }
@@ -11926,7 +11979,10 @@ Respond in JSON format:
                         match new_input {
                             Some(fresh_input) => {
                                 // Topic switch: forward to internal stream with fresh input.
-                                let mut inner = self.run_loop_internal_stream(&fresh_input);
+                                let mut inner = self.run_loop_internal_stream(
+                                    &fresh_input,
+                                    Arc::clone(&terminal),
+                                );
                                 while let Some(chunk) = inner.next().await {
                                     yield chunk;
                                 }
@@ -11957,6 +12013,7 @@ Respond in JSON format:
                                     return;
                                 }
                                 yield StreamChunk::content(&ack);
+                                record_runtime_stream_final(&terminal, response);
                                 yield StreamChunk::Done {};
                                 return;
                             }
@@ -11966,7 +12023,7 @@ Respond in JSON format:
             }
 
             // No disambiguation or Clear result — proceed with internal stream
-            let mut inner = self.run_loop_internal_stream(input);
+            let mut inner = self.run_loop_internal_stream(input, Arc::clone(&terminal));
             while let Some(chunk) = inner.next().await {
                 yield chunk;
             }
@@ -12239,7 +12296,7 @@ Respond in JSON format:
         all_results
     }
 
-    /// Stream a chat response with real-time updates
+    /// Streams provisional chunks and preserves the legacy Done terminal contract.
     pub async fn chat_stream<'a>(
         &'a self,
         input: &'a str,
@@ -12249,7 +12306,8 @@ Respond in JSON format:
         //
         self.init_storage().await?;
         info!(input_len = input.len(), "Starting streaming chat");
-        let inner = self.run_loop_stream(input);
+        let terminal = new_runtime_stream_terminal_slot();
+        let inner = self.run_loop_stream(input, terminal);
         if let Some(context) = self.build_observation_context(None) {
             let stream: Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> =
                 Box::pin(async_stream::stream! {
@@ -12267,6 +12325,76 @@ Respond in JSON format:
         } else {
             Ok(inner)
         }
+    }
+
+    /// Streams provisional chunks and emits one authoritative response after successful root-turn finalization.
+    pub async fn chat_stream_events<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        //
+        // The event API shares the legacy execution stream so chunk timing, cancellation, and side effects cannot diverge.
+        //
+        self.init_storage().await?;
+        info!(input_len = input.len(), "Starting streaming chat events");
+        let terminal = new_runtime_stream_terminal_slot();
+        let mut inner = self.run_loop_stream(input, Arc::clone(&terminal));
+        let observation_context = self.build_observation_context(None);
+        let stream: Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>> =
+            Box::pin(async_stream::stream! {
+                loop {
+                    let next = if let Some(context) = observation_context.as_ref() {
+                        with_observation_context(context.clone(), inner.next()).await
+                    } else {
+                        inner.next().await
+                    };
+                    match next {
+                        Some(StreamChunk::Done {}) => {
+                            let terminal_event = { terminal.write().take() };
+                            if let Some(response) = terminal_event {
+                                while if let Some(context) = observation_context.as_ref() {
+                                    with_observation_context(context.clone(), inner.next())
+                                        .await
+                                        .is_some()
+                                } else {
+                                    inner.next().await.is_some()
+                                } {}
+                                if observation_context.is_some() {
+                                    self.export_observability_if_configured().await;
+                                }
+                                yield AgentStreamEvent::Final(response);
+                                return;
+                            }
+                        }
+                        Some(StreamChunk::Error { message }) => {
+                            let finalized = { terminal.read().is_some() };
+                            if finalized {
+                                continue;
+                            }
+                            while if let Some(context) = observation_context.as_ref() {
+                                with_observation_context(context.clone(), inner.next())
+                                    .await
+                                    .is_some()
+                            } else {
+                                inner.next().await.is_some()
+                            } {}
+                            if observation_context.is_some() {
+                                self.export_observability_if_configured().await;
+                            }
+                            yield AgentStreamEvent::Chunk(StreamChunk::Error { message });
+                            return;
+                        }
+                        Some(chunk) => yield AgentStreamEvent::Chunk(chunk),
+                        None => {
+                            if observation_context.is_some() {
+                                self.export_observability_if_configured().await;
+                            }
+                            break;
+                        }
+                    }
+                }
+            });
+        Ok(stream)
     }
 }
 
@@ -12787,17 +12915,28 @@ mod tests {
         assert_eq!(clarification, "What should I send?");
         assert_eq!(observed.call_count(), 2);
 
-        let mut confirmation_stream = agent.chat_stream("The report to Ada").await.unwrap();
-        let mut confirmation = String::new();
-        while let Some(chunk) = confirmation_stream.next().await {
-            match chunk {
-                StreamChunk::Content { text } => confirmation.push_str(&text),
-                StreamChunk::Done {} => break,
-                StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
-                _ => {}
+        let mut confirmation_stream = agent.chat_stream_events("The report to Ada").await.unwrap();
+        let mut confirmation = None;
+        while let Some(event) = confirmation_stream.next().await {
+            match event {
+                AgentStreamEvent::Final(response) => confirmation = Some(response),
+                AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                    panic!("unexpected stream error: {message}")
+                }
+                AgentStreamEvent::Chunk(_) => {}
             }
         }
-        assert_eq!(confirmation, "Should I send the report to Ada?");
+        let confirmation = confirmation.expect("confirmation must finalize");
+        assert_eq!(confirmation.content, "Should I send the report to Ada?");
+        assert_eq!(
+            confirmation
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("disambiguation"))
+                .and_then(|metadata| metadata.get("status"))
+                .and_then(Value::as_str),
+            Some("awaiting_confirmation")
+        );
         assert_eq!(observed.call_count(), 4);
 
         let mut completed_stream = agent.chat_stream("Yes").await.unwrap();
@@ -15323,6 +15462,158 @@ mod tests {
         assert_eq!(response.content, "Hello! How can I help you?");
     }
 
+    #[tokio::test]
+    async fn stream_events_emit_one_authoritative_final_without_legacy_done() {
+        let agent = AgentBuilder::new()
+            .system_prompt("You are a test assistant.")
+            .llm(Arc::new(mock_with_response(
+                "Hello from the final response.",
+            )))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream_events("Hi").await.unwrap();
+        let mut final_responses = Vec::new();
+        let mut legacy_done = 0;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentStreamEvent::Chunk(StreamChunk::Done {}) => legacy_done += 1,
+                AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                    panic!("unexpected stream error: {message}")
+                }
+                AgentStreamEvent::Final(response) => final_responses.push(response),
+                AgentStreamEvent::Chunk(_) => {}
+            }
+        }
+
+        assert_eq!(legacy_done, 0);
+        assert_eq!(final_responses.len(), 1);
+        let response = final_responses.pop().unwrap();
+        assert_eq!(response.content, "Hello from the final response.");
+        assert!(
+            response
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| { metadata.contains_key("reasoning") })
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_final_content_includes_output_processing_after_provisional_chunks() {
+        let yaml = r#"
+name: ProcessedStreamAgent
+system_prompt: "Answer directly."
+process:
+  output:
+    - type: format
+      config:
+        template: "{{ response }} [finalized]"
+streaming:
+  enabled: true
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("provisional answer")))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream_events("Hi").await.unwrap();
+        let mut provisional = String::new();
+        let mut final_content = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentStreamEvent::Chunk(StreamChunk::Content { text }) => {
+                    provisional.push_str(&text)
+                }
+                AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                    panic!("unexpected stream error: {message}")
+                }
+                AgentStreamEvent::Final(response) => final_content = Some(response.content),
+                AgentStreamEvent::Chunk(_) => {}
+            }
+        }
+
+        assert_eq!(provisional, "provisional answer");
+        assert_eq!(
+            final_content.as_deref(),
+            Some("provisional answer [finalized]")
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_events_preserve_tool_progress_and_final_tool_calls() {
+        let agent = AgentBuilder::new()
+            .system_prompt("Use the echo tool once, then answer.")
+            .llm(Arc::new(mock_with_responses(vec![
+                r#"{"tool":"echo","arguments":{"message":"hello"}}"#,
+                "Echo completed.",
+            ])))
+            .tool(Arc::new(ai_agents_tools::EchoTool::new()))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream_events("echo hello").await.unwrap();
+        let mut starts = 0;
+        let mut results = 0;
+        let mut ends = 0;
+        let mut final_response = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentStreamEvent::Chunk(StreamChunk::ToolCallStart { name, .. }) => {
+                    assert_eq!(name, "echo");
+                    starts += 1;
+                }
+                AgentStreamEvent::Chunk(StreamChunk::ToolResult { name, success, .. }) => {
+                    assert_eq!(name, "echo");
+                    assert!(success);
+                    results += 1;
+                }
+                AgentStreamEvent::Chunk(StreamChunk::ToolCallEnd { .. }) => ends += 1,
+                AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                    panic!("unexpected stream error: {message}")
+                }
+                AgentStreamEvent::Final(response) => final_response = Some(response),
+                AgentStreamEvent::Chunk(_) => {}
+            }
+        }
+
+        assert_eq!((starts, results, ends), (1, 1, 1));
+        let response = final_response.expect("tool stream must finalize");
+        assert_eq!(response.content, "Echo completed.");
+        assert_eq!(
+            response.tool_calls.as_ref().map(|calls| calls
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>()),
+            Some(vec!["echo"])
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_still_emits_one_done_chunk() {
+        let agent = AgentBuilder::new()
+            .system_prompt("You are a test assistant.")
+            .llm(Arc::new(mock_with_response(
+                "Hello from the legacy stream.",
+            )))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("Hi").await.unwrap();
+        let mut done = 0;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Done {} => done += 1,
+                StreamChunk::Error { message } => panic!("unexpected stream error: {message}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(done, 1);
+    }
+
     // Multi-turn conversation
     #[tokio::test]
     async fn test_integration_multi_turn_conversation() {
@@ -17398,6 +17689,48 @@ hitl:
         assert_eq!(messages[0].content, "echo hello");
         assert!(messages[1].content.contains("\"tool\":\"echo\""));
         assert!(messages[2].content.contains("rejected by the approver"));
+    }
+
+    #[tokio::test]
+    async fn tool_hitl_rejection_preserves_legacy_error_but_finalizes_event_stream() {
+        let mock = mock_with_response(r#"{"tool":"echo","arguments":{"message":"hello"}}"#);
+        let yaml = r#"
+name: ToolRejectEventAgent
+system_prompt: "You use tools when requested."
+tools:
+  - echo
+streaming:
+  enabled: true
+hitl:
+  tools:
+    echo:
+      require_approval: true
+      approval_message: "Approve echo?"
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream_events("echo hello").await.unwrap();
+        let mut error_seen = false;
+        let mut final_response = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                AgentStreamEvent::Chunk(StreamChunk::Error { .. }) => error_seen = true,
+                AgentStreamEvent::Final(response) => final_response = Some(response),
+                AgentStreamEvent::Chunk(_) => {}
+            }
+        }
+
+        assert!(!error_seen);
+        assert!(
+            final_response
+                .is_some_and(|response| { response.content.contains("Operation cancelled") })
+        );
     }
 
     #[tokio::test]

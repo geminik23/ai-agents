@@ -1,4 +1,15 @@
+use ai_agents_core::AgentResponse;
 use serde::{Deserialize, Serialize};
+
+/// Emits provisional stream chunks followed by one authoritative committed response.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum AgentStreamEvent {
+    /// Provisional content, tool, state, or error information emitted during execution.
+    Chunk(StreamChunk),
+    /// Authoritative response emitted after successful root-turn finalization.
+    Final(AgentResponse),
+}
 
 /// Represents a chunk of streamed response from the agent
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,6 +142,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_agent_stream_event_carries_chunks_and_final_response() {
+        let chunk = AgentStreamEvent::Chunk(StreamChunk::content("Hello"));
+        assert!(matches!(
+            chunk,
+            AgentStreamEvent::Chunk(StreamChunk::Content { .. })
+        ));
+
+        let final_response = AgentStreamEvent::Final(AgentResponse::new("Hello"));
+        assert!(
+            matches!(final_response, AgentStreamEvent::Final(response) if response.content == "Hello")
+        );
+    }
+
+    #[test]
     fn test_stream_chunk_constructors() {
         let content = StreamChunk::content("Hello");
         assert!(content.is_content());
@@ -162,6 +187,11 @@ mod tests {
         let json = serde_json::to_string(&tool_start).unwrap();
         assert!(json.contains("tool_call_start"));
         assert!(json.contains("calculator"));
+
+        assert_eq!(
+            serde_json::to_string(&StreamChunk::Done {}).unwrap(),
+            r#"{"type":"done"}"#
+        );
     }
 
     #[test]

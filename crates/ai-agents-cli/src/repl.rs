@@ -1,9 +1,11 @@
 use std::io::{self, Write};
 
 use ai_agents::memory::{estimate_message_tokens, estimate_tokens};
-use ai_agents::{Agent, AgentResponse, RuntimeAgent, StreamChunk};
+use ai_agents::{Agent, AgentResponse, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use futures::StreamExt;
 use serde_json;
+
+use crate::stream_reconcile::{FinalContent, reconcile_final_content, unseen_unique_tool_names};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplMode {
@@ -1311,52 +1313,89 @@ impl CliRepl {
     }
 
     async fn handle_streaming(&self, input: &str) {
-        match self.agent.chat_stream(input).await {
+        match self.agent.chat_stream_events(input).await {
             Ok(mut stream) => {
                 print!("\nAgent: ");
                 io::stdout().flush().ok();
 
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        StreamChunk::Content { text } => {
-                            print!("{}", text);
-                            io::stdout().flush().ok();
-                        }
-                        StreamChunk::ToolCallStart { name, .. } => {
-                            if self.config.show_tool_calls {
-                                print!("\n  [Tool: {}...", name);
+                let mut streamed_content = String::new();
+                let mut observed_tool_names = Vec::new();
+
+                while let Some(event) = stream.next().await {
+                    match event {
+                        AgentStreamEvent::Chunk(chunk) => match chunk {
+                            StreamChunk::Content { text } => {
+                                streamed_content.push_str(&text);
+                                print!("{}", text);
                                 io::stdout().flush().ok();
                             }
-                        }
-                        StreamChunk::ToolResult {
-                            output, success, ..
-                        } => {
-                            if self.config.show_tool_calls {
-                                if success {
-                                    print!(" ✓]");
-                                } else {
-                                    print!(" ✗ {}]", output);
+                            StreamChunk::ToolCallStart { name, .. } => {
+                                if !observed_tool_names.contains(&name) {
+                                    observed_tool_names.push(name.clone());
                                 }
-                                io::stdout().flush().ok();
+                                if self.config.show_tool_calls {
+                                    print!("\n  [Tool: {}...", name);
+                                    io::stdout().flush().ok();
+                                }
                             }
-                        }
-                        StreamChunk::ToolCallEnd { .. } => {}
-                        StreamChunk::ToolCallDelta { .. } => {}
-                        StreamChunk::StateTransition { from, to } => {
-                            if self.config.show_state_transitions {
-                                let from_str = from.as_deref().unwrap_or("—");
-                                print!("\n  [State: {} → {}]", from_str, to);
-                                io::stdout().flush().ok();
+                            StreamChunk::ToolResult {
+                                output, success, ..
+                            } => {
+                                if self.config.show_tool_calls {
+                                    if success {
+                                        print!(" ✓]");
+                                    } else {
+                                        print!(" ✗ {}]", output);
+                                    }
+                                    io::stdout().flush().ok();
+                                }
                             }
-                        }
-                        StreamChunk::Done {} => {
-                            println!("\n");
+                            StreamChunk::ToolCallEnd { .. } => {}
+                            StreamChunk::ToolCallDelta { .. } => {}
+                            StreamChunk::StateTransition { from, to } => {
+                                if self.config.show_state_transitions {
+                                    let from_str = from.as_deref().unwrap_or("—");
+                                    print!("\n  [State: {} → {}]", from_str, to);
+                                    io::stdout().flush().ok();
+                                }
+                            }
+                            StreamChunk::Done {} => {
+                                // AgentStreamEvent::Final owns authoritative completion output.
+                            }
+                            StreamChunk::Error { message } => {
+                                eprintln!("\n[Stream Error: {}]\n", message);
+                                break;
+                            }
+                        },
+                        AgentStreamEvent::Final(response) => {
+                            match reconcile_final_content(&streamed_content, &response.content) {
+                                FinalContent::Unchanged => println!("\n"),
+                                FinalContent::Suffix(suffix) => {
+                                    print!("{}", suffix);
+                                    println!("\n");
+                                }
+                                FinalContent::Authoritative(content) => {
+                                    println!("\n\nAgent (authoritative final): {}\n", content);
+                                }
+                            }
+
+                            if self.config.show_tool_calls {
+                                let final_tool_names = unseen_unique_tool_names(
+                                    response
+                                        .tool_calls
+                                        .as_ref()
+                                        .into_iter()
+                                        .flatten()
+                                        .map(|call| call.name.clone()),
+                                    &observed_tool_names,
+                                );
+                                if !final_tool_names.is_empty() {
+                                    println!("  Tools used: {}", final_tool_names.join(", "));
+                                }
+                            }
                             break;
                         }
-                        StreamChunk::Error { message } => {
-                            eprintln!("\n[Stream Error: {}]\n", message);
-                            break;
-                        }
+                        _ => {}
                     }
                 }
             }

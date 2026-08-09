@@ -7,7 +7,7 @@ use ai_agents_hooks::AgentHooks;
 use ai_agents_observability::config::{ExportConfig, ExportFormat};
 use ai_agents_observability::{CostEstimator, ObservabilityConfig};
 use ai_agents_runtime::spec::{AgentSpec, LLMConfigOrSelector, StorageConfig};
-use ai_agents_runtime::{Agent, AgentBuilder, RuntimeAgent, StreamChunk};
+use ai_agents_runtime::{Agent, AgentBuilder, AgentStreamEvent, RuntimeAgent, StreamChunk};
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
@@ -1106,7 +1106,7 @@ async fn collect_stream_response(
     timeout_ms: u64,
 ) -> TurnOperation {
     let deadline = TokioInstant::now() + Duration::from_millis(timeout_ms);
-    let stream = match timeout_at(deadline, agent.chat_stream(input)).await {
+    let stream = match timeout_at(deadline, agent.chat_stream_events(input)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(error)) => return TurnOperation::error(error.to_string()),
         Err(_) => return TurnOperation::error(format!("turn timed out after {}ms", timeout_ms)),
@@ -1114,32 +1114,34 @@ async fn collect_stream_response(
     consume_stream_response(stream, deadline, timeout_ms).await
 }
 
+// Uses the final response as the successful turn result and retains chunk text only as diagnostics when the stream fails before finalization.
 async fn consume_stream_response<S>(
     mut stream: S,
     deadline: TokioInstant,
     timeout_ms: u64,
 ) -> TurnOperation
 where
-    S: futures::Stream<Item = StreamChunk> + Unpin,
+    S: futures::Stream<Item = AgentStreamEvent> + Unpin,
 {
-    let mut content = String::new();
-    let mut content_seen = false;
+    let mut partial_content = String::new();
+    let mut partial_content_seen = false;
     let mut runtime_error = None;
-    let mut done = false;
+    let mut final_response = None;
     loop {
         match timeout_at(deadline, stream.next()).await {
-            Ok(Some(StreamChunk::Content { text })) => {
-                content_seen = true;
-                content.push_str(&text);
+            Ok(Some(AgentStreamEvent::Chunk(StreamChunk::Content { text }))) => {
+                partial_content_seen = true;
+                partial_content.push_str(&text);
             }
-            Ok(Some(StreamChunk::Done {})) => {
-                done = true;
-                break;
-            }
-            Ok(Some(StreamChunk::Error { message })) => {
+            Ok(Some(AgentStreamEvent::Chunk(StreamChunk::Error { message }))) => {
                 if runtime_error.is_none() {
                     runtime_error = Some(message);
                 }
+            }
+            Ok(Some(AgentStreamEvent::Chunk(_))) => {}
+            Ok(Some(AgentStreamEvent::Final(response))) => {
+                final_response = Some(response);
+                break;
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
@@ -1151,13 +1153,22 @@ where
             }
         }
     }
-    if !done && runtime_error.is_none() {
-        runtime_error = Some("stream ended before Done".to_string());
+
+    if let Some(response) = final_response {
+        return TurnOperation {
+            response_content: response.content,
+            response_metadata: response.metadata,
+            response_present: true,
+            runtime_error,
+        };
+    }
+    if runtime_error.is_none() {
+        runtime_error = Some("stream ended before Final".to_string());
     }
     TurnOperation {
-        response_content: content,
+        response_content: partial_content,
         response_metadata: None,
-        response_present: content_seen || (done && runtime_error.is_none()),
+        response_present: partial_content_seen,
         runtime_error,
     }
 }
@@ -1811,25 +1822,86 @@ scenarios:
     }
 
     #[tokio::test]
-    async fn streaming_error_retains_partial_content_and_consumes_until_done() {
-        let chunks = stream::iter(vec![
-            StreamChunk::Content {
-                text: "before ".to_string(),
-            },
-            StreamChunk::Error {
-                message: "stream failed".to_string(),
-            },
-            StreamChunk::Content {
-                text: "after".to_string(),
-            },
-            StreamChunk::Done {},
+    async fn streaming_final_response_is_authoritative() {
+        let response = ai_agents_runtime::AgentResponse::new("authoritative")
+            .with_metadata("source", json!("final"));
+        let events = stream::iter(vec![
+            AgentStreamEvent::Chunk(StreamChunk::Content {
+                text: "partial content".to_string(),
+            }),
+            AgentStreamEvent::Chunk(StreamChunk::Done {}),
+            AgentStreamEvent::Final(response),
         ]);
         let operation =
-            consume_stream_response(chunks, TokioInstant::now() + Duration::from_secs(1), 1_000)
+            consume_stream_response(events, TokioInstant::now() + Duration::from_secs(1), 1_000)
                 .await;
+
+        assert_eq!(operation.response_content, "authoritative");
+        assert_eq!(
+            operation
+                .response_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("source")),
+            Some(&json!("final"))
+        );
+        assert!(operation.response_present);
+        assert_eq!(operation.runtime_error, None);
+    }
+
+    #[tokio::test]
+    async fn streaming_final_response_is_present_without_content_chunks() {
+        let events = stream::iter(vec![AgentStreamEvent::Final(
+            ai_agents_runtime::AgentResponse::new(""),
+        )]);
+        let operation =
+            consume_stream_response(events, TokioInstant::now() + Duration::from_secs(1), 1_000)
+                .await;
+
+        assert_eq!(operation.response_content, "");
+        assert!(operation.response_present);
+        assert_eq!(operation.runtime_error, None);
+    }
+
+    #[tokio::test]
+    async fn streaming_error_retains_partial_content_and_consumes_until_eof() {
+        let events = stream::iter(vec![
+            AgentStreamEvent::Chunk(StreamChunk::Content {
+                text: "before ".to_string(),
+            }),
+            AgentStreamEvent::Chunk(StreamChunk::Error {
+                message: "stream failed".to_string(),
+            }),
+            AgentStreamEvent::Chunk(StreamChunk::Content {
+                text: "after".to_string(),
+            }),
+            AgentStreamEvent::Chunk(StreamChunk::Done {}),
+        ]);
+        let operation =
+            consume_stream_response(events, TokioInstant::now() + Duration::from_secs(1), 1_000)
+                .await;
+
         assert_eq!(operation.response_content, "before after");
         assert!(operation.response_present);
+        assert_eq!(operation.response_metadata, None);
         assert_eq!(operation.runtime_error.as_deref(), Some("stream failed"));
+    }
+
+    #[tokio::test]
+    async fn streaming_eof_without_final_is_incomplete() {
+        let events = stream::iter(vec![AgentStreamEvent::Chunk(StreamChunk::Content {
+            text: "partial".to_string(),
+        })]);
+        let operation =
+            consume_stream_response(events, TokioInstant::now() + Duration::from_secs(1), 1_000)
+                .await;
+
+        assert_eq!(operation.response_content, "partial");
+        assert!(operation.response_present);
+        assert_eq!(operation.response_metadata, None);
+        assert_eq!(
+            operation.runtime_error.as_deref(),
+            Some("stream ended before Final")
+        );
     }
 
     #[test]

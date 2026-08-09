@@ -136,7 +136,7 @@ Implementation notes:
 - A suite cannot authorize its own `real` or `record` mode. Use `--real-llm` or `--record` explicitly; without those flags no real provider is constructed.
 - `settings.parallel` and `--parallel` run scenario-isolated suites concurrently. `fail_fast`, `env` overlays, and unsupported isolation modes force serial execution or configuration errors. Attempts without env overrides can run together, while an env-mutating attempt has exclusive process-environment access until restoration completes.
 - Suite-level `observability:` is honored. CLI `--observability` creates a safe default overlay under the eval output directory.
-- `turn.stream: true` uses `chat_stream()` and collects streamed content before assertions run. Record mode rejects streaming before invoking the provider because atomic stream recording is not implemented.
+- `turn.stream: true` uses the complete runtime event stream and evaluates the authoritative final response content and metadata. Record mode rejects streaming before invoking the provider because atomic stream recording is not implemented.
 - `fixtures.mock_server.enabled: true` starts a local HTTP server and injects `mock_server.base_url` into runtime context.
 - `settings.redact_outputs: true` stores `[redacted]` for input, response, and string assertion details, and default JSON/JSONL reports omit raw `TurnEvidence` and response metadata.
 - `--tag-mode` must be `any` or `all`; invalid values exit with code `2`.
@@ -365,7 +365,7 @@ When you type `/` in the input area, a floating completion popup appears above t
 
 ### Streaming
 
-When `--stream` is enabled, tokens appear in real time in the chat area. Tool calls and state transitions are displayed inline as they happen. Pressing Esc while a turn is active clears the local spinner and visible streaming buffer, but it does not cancel the spawned runtime/provider request; later chunks or the final response may still arrive.
+When `--stream` is enabled, provisional tokens appear in real time in the chat area while tool calls and state transitions are displayed as they happen. The finalized response becomes the authoritative stored message, replacing the preview when output processing, reflection, or a committed transition changed the text. Pressing Esc while a turn is active clears the local spinner and visible streaming buffer, but it does not cancel the spawned runtime/provider request; later chunks or the final response may still arrive.
 
 ### `ask_user` behavior
 

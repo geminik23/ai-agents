@@ -746,7 +746,7 @@ Release-blocking tool-execution smoke suites should use explicit `tool_choice: r
 
 The `examples/eval/live/run_live_example_evals.sh` helper discovers only `examples/eval/live/examples/`. It intentionally excludes `examples/eval/live/quality/`, including judge-based quality suites, which must be run separately. Explicit required/specific choices may add one corrective provider call on a non-native fallback, and that call uses the same scenario call, token, cost, timeout, and cancellation budgets.
 
-A streamed eval turn joins committed chunks into response text, but stream chunks do not carry the final blocking `AgentResponse.metadata` contract. Use blocking turns for `metadata_contains` or `metadata_path` assertions; use tool, state, context, and observability evidence for streamed-turn assertions.
+A streamed eval turn consumes the complete runtime event stream. Content chunks remain diagnostic previews, while the terminal `Final(AgentResponse)` supplies the authoritative response content and metadata used by assertions. Streaming turns can use `metadata_contains` and `metadata_path`; a stream that errors or ends without `Final` remains an incomplete turn, with partial chunk text retained only for failure diagnostics.
 
 `fixtures.llm.mode` controls how the eval runner supplies LLM providers.
 

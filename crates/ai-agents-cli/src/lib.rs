@@ -5,6 +5,7 @@ pub mod metadata;
 pub mod question;
 pub mod repl;
 pub mod run;
+pub(crate) mod stream_reconcile;
 pub mod tui;
 
 pub use approval::CliApprovalHandler;

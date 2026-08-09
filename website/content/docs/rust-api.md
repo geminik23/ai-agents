@@ -225,7 +225,39 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-When the selected LLM has explicit `tool_choice`, the runtime buffers that provider decision before emitting committed content or the existing `ToolCallStart`, `ToolCallEnd`, and `ToolResult` events. v1 does not expose provider-native incremental tool-call deltas as a separate API; agents that omit `tool_choice` keep the existing streaming path. `StreamChunk` also does not carry the final blocking `AgentResponse.metadata`; use blocking `chat()` when that metadata is part of the contract.
+When the selected LLM has explicit `tool_choice`, the runtime buffers that provider decision before emitting committed content or the existing `ToolCallStart`, `ToolCallEnd`, and `ToolResult` events. v1 does not expose provider-native incremental tool-call deltas as a separate API; agents that omit `tool_choice` keep the existing streaming path. The legacy `chat_stream()` contract remains available and still ends with `StreamChunk::Done {}`.
+
+Use the complete event stream when the caller needs the authoritative final content, metadata, or committed tool-call records:
+
+```rust
+use ai_agents::{AgentStreamEvent, StreamChunk};
+use futures::StreamExt;
+
+let mut events = agent.chat_stream_events("Tell me a story").await?;
+
+while let Some(event) = events.next().await {
+    match event {
+        AgentStreamEvent::Chunk(StreamChunk::Content { text }) => {
+            print!("{}", text); // provisional content
+        }
+        AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+            eprintln!("Error: {}", message);
+            break;
+        }
+        AgentStreamEvent::Final(response) => {
+            // Authoritative content, metadata, and committed tool-call records.
+            println!("\nFinal: {}", response.content);
+            break;
+        }
+        AgentStreamEvent::Chunk(_) => {}
+        _ => {}
+    }
+}
+```
+
+`chat_stream_events()` emits no `Chunk(StreamChunk::Done {})`. A successful stream ends with exactly one `Final(AgentResponse)` after root-turn finalization. Errors, timeouts, cancellation, dropped streams, and discarded speculative branches do not emit `Final`.
+
+Content chunks are provisional. Output processing, reflection, or a committed transition can replace them before `Final.content` is built. Final processing does not retroactively sanitize content chunks that a host already displayed; hosts that must hide provisional content need an appropriate buffering policy.
 
 ### StreamChunk variants
 

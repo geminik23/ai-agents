@@ -20,7 +20,7 @@ pub use optimization::{
     StreamingOptimizationPolicy, TurnBranchScheduler, TurnOptimizationContext,
 };
 pub use runtime::{RuntimeAgent, RuntimeControlHandle};
-pub use streaming::{StreamChunk, StreamingConfig};
+pub use streaming::{AgentStreamEvent, StreamChunk, StreamingConfig};
 pub use turn_context::TurnActorContext;
 
 pub use ai_agents_core::{AgentInfo, AgentResponse, Result, ToolCall};

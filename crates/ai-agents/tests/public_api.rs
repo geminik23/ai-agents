@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use ai_agents::agent::{RuntimeAgent, RuntimeControlHandle};
+use ai_agents::agent::{AgentStreamEvent, RuntimeAgent, RuntimeControlHandle};
 use ai_agents::persistence::{AgentStorage, NoopStorage, StorageCapability};
 use ai_agents::spec::{
     AgentSpec, AutoSpawnEntry, LLMConfigOrSelector, ManagementToolsConfig,
@@ -79,6 +79,7 @@ fn facade_exposes_reviewed_v1_type_closure() {
     let _ = DeletePathTool::new();
     let _ = WebSearchTool::new();
     let _: Option<RuntimeControlHandle> = None;
+    let _: Option<AgentStreamEvent> = None;
     type HostIntegrationConfigurator = fn(
         &RuntimeAgent,
         Arc<dyn QuestionHandler>,

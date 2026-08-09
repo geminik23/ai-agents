@@ -81,7 +81,7 @@
 
 pub mod agent {
     pub use ai_agents_runtime::{
-        Agent, AgentBuilder, AgentInfo, AgentResponse, AwaitBeforeNextTurn,
+        Agent, AgentBuilder, AgentInfo, AgentResponse, AgentStreamEvent, AwaitBeforeNextTurn,
         BackgroundOverflowPolicy, MainResponseDraft, MaintenanceMode, MaintenanceTaskPolicy,
         ParallelToolsConfig, PostTurnOptimizationConfig, RuntimeAgent, RuntimeBranch,
         RuntimeBranchOutcome, RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior,
@@ -524,14 +524,14 @@ pub mod orchestration {
 
 // Top-level re-exports (legacy interface)
 pub use agent::{
-    Agent, AgentBuilder, AgentInfo, AgentResponse, AwaitBeforeNextTurn, BackgroundOverflowPolicy,
-    MainResponseDraft, MaintenanceMode, MaintenanceTaskPolicy, ParallelToolsConfig,
-    PostTurnOptimizationConfig, RuntimeAgent, RuntimeBranch, RuntimeBranchOutcome,
-    RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior, RuntimeConfig,
-    RuntimeOptimizationConfig, RuntimeOptimizationKind, RuntimeTaskPriority, RuntimeTaskPurpose,
-    ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamChunk, StreamingConfig,
-    StreamingDraftResult, StreamingOptimizationPolicy, TurnActorContext, TurnBranchScheduler,
-    TurnOptimizationContext,
+    Agent, AgentBuilder, AgentInfo, AgentResponse, AgentStreamEvent, AwaitBeforeNextTurn,
+    BackgroundOverflowPolicy, MainResponseDraft, MaintenanceMode, MaintenanceTaskPolicy,
+    ParallelToolsConfig, PostTurnOptimizationConfig, RuntimeAgent, RuntimeBranch,
+    RuntimeBranchOutcome, RuntimeBranchResult, RuntimeBranchStatus, RuntimeCommitBehavior,
+    RuntimeConfig, RuntimeOptimizationConfig, RuntimeOptimizationKind, RuntimeTaskPriority,
+    RuntimeTaskPurpose, ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamChunk,
+    StreamingConfig, StreamingDraftResult, StreamingOptimizationPolicy, TurnActorContext,
+    TurnBranchScheduler, TurnOptimizationContext,
 };
 pub use error::{AgentError, Result};
 pub use memory::{
