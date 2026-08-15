@@ -7,10 +7,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 
 const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
+const MAX_TOOL_FALLBACK_HOPS: usize = 16;
 
 /// Keeps the strong identity of one non-reentrant root-turn gate.
 pub(crate) type RootTurnGate = Arc<tokio::sync::Mutex<()>>;
@@ -104,6 +105,80 @@ struct ToolDecisionVersions {
 }
 
 //
+// Carries canonical fallback ancestry across separate shared-executor requests so aliases cannot hide cycles and an acyclic configuration cannot recurse without a fixed bound.
+//
+#[derive(Clone, Debug, Default)]
+struct ToolFallbackState {
+    visited_canonical_ids: Vec<String>,
+}
+
+impl ToolFallbackState {
+    //
+    // Rejects before the start hook, approval, locks, or side effects when the resolved target repeats or would exceed the stable fallback-hop bound; ordinary terminal completion evidence still runs.
+    //
+    fn rejection_reason(&self, canonical_id: &str) -> Option<String> {
+        if self
+            .visited_canonical_ids
+            .iter()
+            .any(|visited| visited == canonical_id)
+        {
+            return Some(format!(
+                "Tool fallback cycle detected at '{canonical_id}' after [{}]",
+                self.visited_canonical_ids.join(" -> ")
+            ));
+        }
+        if self.visited_canonical_ids.len() > MAX_TOOL_FALLBACK_HOPS {
+            return Some(format!(
+                "Tool fallback chain exceeds the maximum of {MAX_TOOL_FALLBACK_HOPS} hops"
+            ));
+        }
+        None
+    }
+
+    //
+    // Extends ancestry only after the current canonical request passes cycle and hop admission.
+    //
+    fn with_current(mut self, canonical_id: String) -> Self {
+        self.visited_canonical_ids.push(canonical_id);
+        self
+    }
+
+    //
+    // Rejects canonical drift after an async approval boundary because a changed final target did not pass the initial fallback admission and may re-enter an ancestor through a refreshed alias or provider.
+    //
+    fn final_rejection_reason(
+        &self,
+        admitted_canonical_id: &str,
+        final_canonical_id: &str,
+    ) -> Option<String> {
+        if admitted_canonical_id == final_canonical_id {
+            return None;
+        }
+        if self
+            .visited_canonical_ids
+            .iter()
+            .any(|visited| visited == final_canonical_id)
+        {
+            return Some(format!(
+                "Tool fallback cycle detected after final resolution changed '{admitted_canonical_id}' to '{final_canonical_id}'"
+            ));
+        }
+        Some(format!(
+            "Tool canonical target changed after initial admission from '{admitted_canonical_id}' to '{final_canonical_id}'"
+        ))
+    }
+}
+
+//
+// Carries one checked timeout representation into every retry attempt so deadline and timer cannot diverge.
+//
+#[derive(Clone, Copy, Debug)]
+struct ValidatedToolTimeout {
+    timer: Duration,
+    deadline_delta: chrono::Duration,
+}
+
+//
 // Carries deterministic effective tools with the state generation that authorized their scopes.
 //
 struct AvailableToolIdsSnapshot {
@@ -169,9 +244,10 @@ use ai_agents_core::traits::storage::StorageCapability;
 use ai_agents_core::{
     AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMError, LLMProvider,
     LLMResponse, LLMToolDefinition, LLMToolRequest, PermissionOutcome, Result, ToolActorContext,
-    ToolApprovalRecord, ToolApprovalStatus, ToolCallSource, ToolCancellationToken, ToolChoice,
-    ToolExecutionContext, ToolExecutionRecord, ToolExecutionRequest, ToolInvoker,
-    ToolPolicyDecisionRecord, ToolResult,
+    ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification, ToolCallSource,
+    ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
+    ToolExecutionRecord, ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
+    ToolSafetyMetadata,
 };
 use ai_agents_disambiguation::{
     ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
@@ -214,8 +290,8 @@ use ai_agents_state::{
 use ai_agents_storage::{StorageConfig as StorageStorageConfig, create_storage};
 use ai_agents_tools::{
     CommandRunner, ConditionEvaluator, DiagnosticsProvider, EvaluationContext, LLMGetter,
-    QuestionHandler, SecurityCheckResult, TodoItem, ToolCallRecord, ToolRegistry,
-    ToolSecurityConfig, ToolSecurityEngine,
+    MAX_TOOL_TIMEOUT_MS, QuestionHandler, SecurityCheckResult, TodoItem, ToolCallRecord,
+    ToolRegistry, ToolSecurityConfig, ToolSecurityEngine,
 };
 
 use super::{
@@ -4543,13 +4619,64 @@ impl RuntimeAgent {
         self.finish_tool_record(record).await;
     }
 
+    //
+    // Validates the stable timeout range once and derives both runtime representations without narrowing or clamping.
+    //
+    fn validated_tool_timeout(timeout_ms: u64) -> Result<ValidatedToolTimeout> {
+        if timeout_ms > MAX_TOOL_TIMEOUT_MS {
+            return Err(AgentError::Config(format!(
+                "effective tool timeout_ms must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds"
+            )));
+        }
+        let timer = Duration::from_millis(timeout_ms);
+        let deadline_delta = chrono::Duration::from_std(timer).map_err(|_| {
+            AgentError::Config(format!(
+                "effective tool timeout_ms cannot be represented as a UTC deadline: {timeout_ms}"
+            ))
+        })?;
+        Ok(ValidatedToolTimeout {
+            timer,
+            deadline_delta,
+        })
+    }
+
+    //
+    // Selects one invocation cap while ensuring call classification and recovery can narrow but never widen security policy.
+    //
+    fn effective_tool_limits(
+        security_engine: &ToolSecurityEngine,
+        canonical_id: &str,
+        safety: &ToolSafetyMetadata,
+        classification: &ToolCallClassification,
+        recovery_timeout_ms: Option<u64>,
+    ) -> Result<(ToolExecutionLimits, ValidatedToolTimeout)> {
+        if let Some(timeout_ms) = classification.timeout_ms {
+            Self::validated_tool_timeout(timeout_ms)?;
+        }
+        if let Some(timeout_ms) = recovery_timeout_ms {
+            Self::validated_tool_timeout(timeout_ms)?;
+        }
+
+        let mut limits = security_engine.effective_limits(canonical_id, safety, classification);
+        if let Some(recovery_timeout_ms) = recovery_timeout_ms {
+            limits.timeout_ms = Some(limits.timeout_ms.map_or(recovery_timeout_ms, |timeout_ms| {
+                timeout_ms.min(recovery_timeout_ms)
+            }));
+        }
+        let timeout_ms = limits
+            .timeout_ms
+            .unwrap_or_else(|| security_engine.get_tool_timeout(canonical_id));
+        let timeout = Self::validated_tool_timeout(timeout_ms)?;
+        Ok((limits, timeout))
+    }
+
     /// Invokes a resolved tool once with one fresh attempt deadline, timeout, cancellation, and actor context.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
         mut ctx: ToolExecutionContext,
-        timeout_ms: u64,
+        timeout: ValidatedToolTimeout,
     ) -> Result<(ToolResult, bool, bool, bool)> {
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
             return Ok((
@@ -4560,10 +4687,19 @@ impl RuntimeAgent {
             ));
         }
         //
-        // The tool observes the same timeout budget enforced below, starting immediately before this invocation attempt.
+        // The tool observes the same checked timeout enforced below, starting immediately before this invocation attempt.
         // Each retry receives a new deadline rather than inheriting time spent in policy handling or earlier attempts.
         //
-        ctx.deadline = Some(chrono::Utc::now() + chrono::Duration::milliseconds(timeout_ms as i64));
+        ctx.deadline = Some(
+            chrono::Utc::now()
+                .checked_add_signed(timeout.deadline_delta)
+                .ok_or_else(|| {
+                    AgentError::Config(
+                        "effective tool timeout_ms exceeds the current UTC deadline range"
+                            .to_string(),
+                    )
+                })?,
+        );
         //
         // Mark invocation inside the future so cancellation before the first poll remains executed false.
         //
@@ -4579,14 +4715,14 @@ impl RuntimeAgent {
             }
         };
         tokio::pin!(future);
-        let timeout = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms));
-        tokio::pin!(timeout);
+        let timer = tokio::time::sleep(timeout.timer);
+        tokio::pin!(timer);
         let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
         loop {
             tokio::select! {
                 result = &mut future => return Ok((result, false, false, true)),
-                _ = &mut timeout => {
+                _ = &mut timer => {
                     return Ok((
                         ToolResult::error("Tool execution timed out"),
                         true,
@@ -4675,7 +4811,7 @@ impl RuntimeAgent {
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
         ctx: ToolExecutionContext,
-        timeout_ms: u64,
+        timeout: ValidatedToolTimeout,
         max_retries: u32,
     ) -> Result<(ToolResult, bool, bool, bool)> {
         let max_retries = if ctx.classification.safely_retryable {
@@ -4687,7 +4823,7 @@ impl RuntimeAgent {
         let mut invoked = false;
         loop {
             let (result, timed_out, cancelled, attempt_invoked) = self
-                .execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout_ms)
+                .execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout)
                 .await?;
             invoked |= attempt_invoked;
             if result.success || timed_out || cancelled || attempts >= max_retries {
@@ -4717,20 +4853,21 @@ impl RuntimeAgent {
         }
     }
 
-    /// Executes a tool request through scope, policy, HITL, timeout, recovery, and evidence recording.
+    /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        Box::pin(self.execute_tool_record_inner(request))
+        Box::pin(self.execute_tool_record_inner(request, ToolFallbackState::default()))
     }
 
-    /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and fallback ordering.
+    /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
     ///
-    /// A failed request selected for fallback releases its guards and finalizes its own record before the fallback starts as a separate shared-executor request.
+    /// A failed request selected for fallback releases its guards and finalizes its own record before the fallback starts as a separate shared-executor request. Canonical ancestry crosses that boundary so alias-mediated cycles and overlong acyclic chains stop before the start hook, approval, locks, or invocation while retaining terminal completion evidence.
     async fn execute_tool_record_inner(
         &self,
         request: ToolExecutionRequest,
+        fallback_state: ToolFallbackState,
     ) -> Result<ToolExecutionRecord> {
         let started_at = chrono::Utc::now();
         let start = Instant::now();
@@ -4814,20 +4951,52 @@ impl RuntimeAgent {
 
         let approval_control_snapshot = self.runtime_safety_snapshot();
         let security_engine = approval_control_snapshot.tool_security.clone();
+        if let Some(reason) = fallback_state.rejection_reason(&canonical_id) {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "fallback_chain".to_string(),
+                serde_json::to_value(&fallback_state.visited_canonical_ids).unwrap_or(Value::Null),
+            );
+            let record = self.record_from_parts(
+                &request,
+                canonical_id,
+                request.arguments.clone(),
+                started_at,
+                start,
+                false,
+                false,
+                format!("Denied: {reason}"),
+                metadata,
+                ToolPolicyDecisionRecord::deny(reason),
+                None,
+                false,
+                false,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
+        let admitted_canonical_id = canonical_id.clone();
+        let fallback_state = fallback_state.with_current(canonical_id.clone());
         let bindings = resolved.tool.policy_bindings();
         let mut executed_arguments = security_engine.prepare_tool_arguments_with_bindings(
             &canonical_id,
             &request.arguments,
             &bindings,
         );
-        self.hooks
-            .on_tool_start(&canonical_id, &executed_arguments)
-            .await;
-
         let mut metadata = HashMap::new();
         let safety = resolved.tool.safety_metadata();
         let classification = resolved.tool.classify_call(&executed_arguments);
-        let limits = security_engine.effective_limits(&canonical_id, &safety, &classification);
+        let initial_recovery_timeout_ms = self.recovery_manager.get_tool_timeout(&canonical_id);
+        let (limits, _) = Self::effective_tool_limits(
+            &security_engine,
+            &canonical_id,
+            &safety,
+            &classification,
+            initial_recovery_timeout_ms,
+        )?;
+        self.hooks
+            .on_tool_start(&canonical_id, &executed_arguments)
+            .await;
         metadata.insert(
             "classification".to_string(),
             serde_json::to_value(&classification).unwrap_or(Value::Null),
@@ -5523,6 +5692,39 @@ impl RuntimeAgent {
         };
 
         let canonical_id = resolved.identity.canonical_id.clone();
+        if let Some(reason) =
+            fallback_state.final_rejection_reason(&admitted_canonical_id, &canonical_id)
+        {
+            //
+            // Preserve the admitted identity used by on_tool_start for completion, record, and history. The changed final resolution remains diagnostic metadata because it never reached invocation admission.
+            //
+            metadata.insert(
+                "fallback_chain".to_string(),
+                serde_json::to_value(&fallback_state.visited_canonical_ids).unwrap_or(Value::Null),
+            );
+            metadata.insert(
+                "final_resolved_canonical_id".to_string(),
+                Value::String(canonical_id),
+            );
+            let record = self.record_from_parts_at(
+                &request,
+                admitted_canonical_id,
+                executed_arguments,
+                started_at,
+                start,
+                false,
+                false,
+                format!("Denied: {reason}"),
+                metadata,
+                ToolPolicyDecisionRecord::deny(reason),
+                approval_record,
+                false,
+                false,
+                versions,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
         let bindings = resolved.tool.policy_bindings();
         let final_arguments = control_snapshot
             .tool_security
@@ -5535,14 +5737,52 @@ impl RuntimeAgent {
         let classification = resolved.tool.classify_call(&final_arguments);
         let safety = resolved.tool.safety_metadata();
         let security_engine = control_snapshot.tool_security;
-        let limits = security_engine.effective_limits(&canonical_id, &safety, &classification);
-        let policy_snapshot = security_engine.policy_snapshot(&canonical_id);
-        let resource_lock_keys =
-            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification);
+        let tool_config = self.recovery_manager.get_tool_config(&canonical_id).clone();
+        let recovery_timeout_ms = self.recovery_manager.get_tool_timeout(&canonical_id);
         metadata.insert(
             "classification".to_string(),
             serde_json::to_value(&classification).unwrap_or(Value::Null),
         );
+        //
+        // Approved arguments can produce a new invalid call classification after the request start hook has fired. Finalize non-execution evidence instead of returning a bare configuration error that would leave the lifecycle unmatched.
+        //
+        let (limits, timeout) = match Self::effective_tool_limits(
+            &security_engine,
+            &canonical_id,
+            &safety,
+            &classification,
+            recovery_timeout_ms,
+        ) {
+            Ok(effective) => effective,
+            Err(error) => {
+                let reason = error.to_string();
+                metadata.insert(
+                    "configuration_error".to_string(),
+                    Value::String(reason.clone()),
+                );
+                let record = self.record_from_parts_at(
+                    &request,
+                    canonical_id,
+                    final_arguments,
+                    started_at,
+                    start,
+                    false,
+                    false,
+                    format!("Denied: {reason}"),
+                    metadata,
+                    ToolPolicyDecisionRecord::deny(reason),
+                    approval_record,
+                    false,
+                    false,
+                    versions,
+                );
+                self.finish_tool_record(&record).await;
+                return Ok(record);
+            }
+        };
+        let policy_snapshot = security_engine.policy_snapshot(&canonical_id);
+        let resource_lock_keys =
+            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification);
         metadata.insert(
             "effective_limits".to_string(),
             serde_json::to_value(&limits).unwrap_or(Value::Null),
@@ -5724,14 +5964,19 @@ impl RuntimeAgent {
         //
         let Some(resource_guards) = self.acquire_tool_resource_locks(&resource_lock_keys).await
         else {
+            //
+            // Cancellation while lock admission waits is terminal runtime-control evidence, even though the non-executed result retains its denial policy outcome.
+            //
             let reason = "Tool execution cancelled while waiting for resource locks".to_string();
-            let record = final_denial(
+            let mut record = final_denial(
                 canonical_id,
                 reason.clone(),
                 ToolPolicyDecisionRecord::deny(reason),
                 metadata,
                 versions,
             );
+            record.cancelled = true;
+            record.cancellation_reason = Some("runtime control cancellation".to_string());
             self.finish_tool_record(&record).await;
             return Ok(record);
         };
@@ -5787,10 +6032,6 @@ impl RuntimeAgent {
         }
         let executed_arguments = final_arguments;
 
-        let tool_config = self.recovery_manager.get_tool_config(&canonical_id);
-        let timeout_ms = limits
-            .timeout_ms
-            .unwrap_or_else(|| security_engine.get_tool_timeout(&canonical_id));
         let turn_actor = current_turn_actor_context();
         let actor = ToolActorContext {
             actor_id: turn_actor
@@ -5835,12 +6076,15 @@ impl RuntimeAgent {
                 resolved.tool.clone(),
                 executed_arguments.clone(),
                 tool_context,
-                timeout_ms,
+                timeout,
                 tool_config.max_retries,
             )
             .await?;
 
-        let fallback_tool = if !result.success {
+        //
+        // Runtime cancellation is terminal for the logical request. Recovery fallback must not mask the cancelled record or start new work after the host asked active execution to stop.
+        //
+        let fallback_tool = if !result.success && !cancelled {
             match &tool_config.on_failure {
                 ToolFailureAction::Skip => {
                     result = ToolResult::ok(format!(
@@ -5896,7 +6140,8 @@ impl RuntimeAgent {
                 fallback_arguments,
                 ToolCallSource::Fallback { original_tool },
             );
-            return Box::pin(self.execute_tool_record(fallback_request)).await;
+            return Box::pin(self.execute_tool_record_inner(fallback_request, fallback_state))
+                .await;
         }
         self.finish_tool_record_after_resource_guards(resource_guards, &record)
             .await;
@@ -12811,9 +13056,9 @@ mod tests {
     use ai_agents_llm::mock::MockLLMProvider;
     use ai_agents_skills::{SkillDefinition, SkillStep};
     use ai_agents_tools::{
-        CalculatorTool, CopyPathTool, DeletePathTool, FileWriteTool, MovePathTool,
-        WebFetchResolver, WebFetchTool, WebFetchTransport, WebFetchTransportRequest,
-        WebFetchTransportResponse,
+        CalculatorTool, CopyPathTool, DeletePathTool, FileWriteTool, MovePathTool, ToolAliases,
+        ToolDescriptor, ToolProvider, ToolProviderError, ToolProviderType, WebFetchResolver,
+        WebFetchTool, WebFetchTransport, WebFetchTransportRequest, WebFetchTransportResponse,
     };
 
     fn mock_with_response(response: &str) -> MockLLMProvider {
@@ -14836,6 +15081,7 @@ mod tests {
     struct RetryDeadlineTool {
         calls: Arc<std::sync::atomic::AtomicUsize>,
         deadlines: Arc<parking_lot::Mutex<Vec<chrono::DateTime<chrono::Utc>>>>,
+        remaining_ms: Arc<parking_lot::Mutex<Vec<i64>>>,
     }
 
     /// Test hook that records shared-executor lifecycle order and authoritative records.
@@ -14977,15 +15223,21 @@ mod tests {
             classification
         }
 
+        // Records each fresh retry deadline and its initial remaining budget before deciding whether to retry.
         async fn execute(
             &self,
             _args: Value,
             ctx: ai_agents_core::ToolExecutionContext,
         ) -> ToolResult {
-            self.deadlines.lock().push(
-                ctx.deadline
-                    .expect("each invocation must receive a deadline"),
+            let deadline = ctx
+                .deadline
+                .expect("each invocation must receive a deadline");
+            self.remaining_ms.lock().push(
+                deadline
+                    .signed_duration_since(chrono::Utc::now())
+                    .num_milliseconds(),
             );
+            self.deadlines.lock().push(deadline);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call == 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -14994,6 +15246,21 @@ mod tests {
                 ToolResult::ok("done")
             }
         }
+    }
+
+    /// Test tool that exposes one call-level timeout and waits long enough to observe the selected timer.
+    struct ClassifiedTimeoutTool {
+        id: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        timeout_ms: u64,
+        sleep_ms: u64,
+        requires_approval: bool,
+        remaining_ms: Arc<parking_lot::Mutex<Vec<i64>>>,
+    }
+
+    /// Test tool that changes timeout classification after approval and can hold a shared path lock.
+    struct ApprovalModifiedTimeoutTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// Test tool that stays active long enough for runtime cancellation.
@@ -15070,6 +15337,19 @@ mod tests {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
+    /// Test provider that moves one fallback alias to an ancestor canonical ID during refresh.
+    struct DriftingFallbackProvider {
+        refreshed: AtomicBool,
+        primary_calls: Arc<std::sync::atomic::AtomicUsize>,
+        secondary_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// Test hook that records fallback lifecycle evidence and refreshes the provider after initial canonical admission.
+    struct RefreshFallbackProviderHooks {
+        agent: parking_lot::Mutex<Option<Weak<RuntimeAgent>>>,
+        lifecycle: Arc<ToolLifecycleRecordingHooks>,
+    }
+
     struct RuntimeWebFetchTransport {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -15080,6 +15360,130 @@ mod tests {
         agent: parking_lot::Mutex<Option<Weak<RuntimeAgent>>>,
         invoked: AtomicBool,
         nested_success: AtomicBool,
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for ClassifiedTimeoutTool {
+        // Returns the configurable ID used to select timeout policy in each test.
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        // Provides a stable display name for the test registry.
+        fn name(&self) -> &str {
+            "Classified Timeout"
+        }
+
+        // Describes the test tool's deadline observation behavior.
+        fn description(&self) -> &str {
+            "Records and waits under one call-level timeout."
+        }
+
+        // Accepts empty object arguments so timeout tests isolate execution limits.
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        // Exposes the configured call-level cap and approval requirement to the runtime.
+        fn classify_call(&self, _args: &Value) -> ai_agents_core::ToolCallClassification {
+            let mut classification =
+                ai_agents_core::ToolCallClassification::from_metadata(&self.safety_metadata());
+            classification.timeout_ms = Some(self.timeout_ms);
+            classification.requires_approval = self.requires_approval;
+            classification
+        }
+
+        // Records the visible deadline and sleeps past the selected cap so the runtime timer must terminate execution.
+        async fn execute(
+            &self,
+            _args: Value,
+            ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let deadline = ctx
+                .deadline
+                .expect("each invocation must receive a deadline");
+            self.remaining_ms.lock().push(
+                deadline
+                    .signed_duration_since(chrono::Utc::now())
+                    .num_milliseconds(),
+            );
+            tokio::time::sleep(Duration::from_millis(self.sleep_ms)).await;
+            ToolResult::ok("done")
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Tool for ApprovalModifiedTimeoutTool {
+        // Returns the canonical ID used by the approval-modification timeout test.
+        fn id(&self) -> &str {
+            "approval_modified_timeout"
+        }
+
+        // Provides a stable display name for approval requests.
+        fn name(&self) -> &str {
+            "Approval Modified Timeout"
+        }
+
+        // Describes the argument-dependent timeout behavior under test.
+        fn description(&self) -> &str {
+            "Becomes invalid only after approval modifies its arguments."
+        }
+
+        // Accepts the path and approval-controlled invalid-timeout switch.
+        fn input_schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        // Binds one path so a misplaced final validation would wait for a resource lock.
+        fn policy_bindings(&self) -> ai_agents_core::ToolPolicyBindings {
+            ai_agents_core::ToolPolicyBindings {
+                path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                ..Default::default()
+            }
+        }
+
+        // Keeps the test call non-concurrent so final timeout validation must precede its path lock.
+        fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+            ai_agents_core::ToolSafetyMetadata {
+                read_only: false,
+                concurrency_safe: false,
+                operation: ai_agents_core::ToolOperationKind::Write,
+                side_effect_level: ai_agents_core::ToolSideEffectLevel::LocalWrite,
+                requires_network: false,
+                destructive: false,
+                open_world: false,
+                host_dependent: false,
+                requires_user_interaction: false,
+                supports_cancellation: true,
+                default_requires_approval: true,
+                should_defer_schema: false,
+                max_output_chars: Some(1024),
+                max_result_size_chars: Some(1024),
+            }
+        }
+
+        // Produces an invalid cap only from the arguments returned by the approval handler.
+        fn classify_call(&self, args: &Value) -> ai_agents_core::ToolCallClassification {
+            let mut classification =
+                ai_agents_core::ToolCallClassification::from_metadata(&self.safety_metadata());
+            classification.timeout_ms = Some(if args["invalid_timeout"].as_bool() == Some(true) {
+                u64::MAX
+            } else {
+                1_000
+            });
+            classification
+        }
+
+        // Records any incorrect invocation after final classification should have failed.
+        async fn execute(
+            &self,
+            _args: Value,
+            _ctx: ai_agents_core::ToolExecutionContext,
+        ) -> ToolResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ToolResult::ok("unexpected")
+        }
     }
 
     #[async_trait]
@@ -15490,6 +15894,106 @@ mod tests {
             Ok(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                 93, 184, 216, 34,
             ))])
+        }
+    }
+
+    #[async_trait]
+    impl ToolProvider for DriftingFallbackProvider {
+        // Returns the provider ID used by the registry refresh test.
+        fn id(&self) -> &str {
+            "drifting_fallback"
+        }
+
+        // Provides a stable test provider name.
+        fn name(&self) -> &str {
+            "Drifting Fallback"
+        }
+
+        // Marks the provider as a custom in-process fixture.
+        fn provider_type(&self) -> ToolProviderType {
+            ToolProviderType::Custom
+        }
+
+        // Moves the fallback alias from secondary to primary after refresh.
+        async fn list_tools(&self) -> Vec<ToolDescriptor> {
+            let alias = ToolAliases::new().with_name("en", "fallback alias");
+            let mut primary = ToolDescriptor::new(
+                "primary",
+                "Primary",
+                "Fails before fallback.",
+                serde_json::json!({"type": "object"}),
+            );
+            let mut secondary = ToolDescriptor::new(
+                "secondary",
+                "Secondary",
+                "Must not execute after final canonical drift.",
+                serde_json::json!({"type": "object"}),
+            );
+            if self.refreshed.load(Ordering::SeqCst) {
+                primary = primary.with_aliases(alias);
+            } else {
+                secondary = secondary.with_aliases(alias);
+            }
+            vec![primary, secondary]
+        }
+
+        // Returns deterministic failing tools so fallback ancestry is the only terminal control.
+        async fn get_tool(&self, tool_id: &str) -> Option<Arc<dyn Tool>> {
+            let calls = match tool_id {
+                "primary" => Arc::clone(&self.primary_calls),
+                "secondary" => Arc::clone(&self.secondary_calls),
+                _ => return None,
+            };
+            Some(Arc::new(RecoveryTestTool {
+                id: tool_id.to_string(),
+                succeeds: false,
+                calls,
+                max_output_chars: None,
+            }))
+        }
+
+        // Allows the registry to rebuild canonical and alias indexes during the test hook.
+        fn supports_refresh(&self) -> bool {
+            true
+        }
+
+        // Switches the alias mapping before the registry recreates its provider snapshot.
+        async fn refresh(&self) -> std::result::Result<(), ToolProviderError> {
+            self.refreshed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AgentHooks for RefreshFallbackProviderHooks {
+        // Records the admitted lifecycle identity before refreshing the fallback provider at the intended async boundary.
+        async fn on_tool_start(&self, tool: &str, args: &Value) {
+            self.lifecycle.on_tool_start(tool, args).await;
+            if tool != "secondary" {
+                return;
+            }
+            let agent = self.agent.lock().as_ref().and_then(Weak::upgrade);
+            if let Some(agent) = agent {
+                agent
+                    .tools
+                    .refresh_provider("drifting_fallback")
+                    .await
+                    .unwrap();
+            }
+        }
+
+        async fn on_tool_complete(&self, tool: &str, result: &ToolResult, duration_ms: u64) {
+            self.lifecycle
+                .on_tool_complete(tool, result, duration_ms)
+                .await;
+        }
+
+        async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
+            self.lifecycle.on_tool_execution_record(record).await;
+        }
+
+        async fn on_error(&self, error: &AgentError) {
+            self.lifecycle.on_error(error).await;
         }
     }
 
@@ -16491,6 +16995,54 @@ streaming:
         assert!(record.cancellation_reason.is_some());
     }
 
+    // Verifies runtime cancellation returns the original terminal record without starting configured fallback work.
+    #[tokio::test]
+    async fn cancelled_tool_does_not_enter_fallback() {
+        let fallback_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test cancellation before fallback.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(SlowTool))
+                .tool(Arc::new(RecoveryTestTool {
+                    id: "fallback".to_string(),
+                    succeeds: true,
+                    calls: Arc::clone(&fallback_calls),
+                    max_output_chars: None,
+                }))
+                .recovery_manager(recovery_manager_with_fallbacks([(
+                    "slow".to_string(),
+                    "fallback".to_string(),
+                )]))
+                .build()
+                .unwrap(),
+        );
+        let control = agent.runtime_control();
+        let running_agent = Arc::clone(&agent);
+        let handle = tokio::spawn(async move {
+            running_agent
+                .invoke_tool(ToolExecutionRequest::new(
+                    "cancelled-fallback-call",
+                    "slow",
+                    serde_json::json!({}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        control.cancel_all();
+        let record = handle.await.unwrap();
+
+        assert!(record.executed);
+        assert!(record.cancelled);
+        assert!(!record.success);
+        assert_eq!(record.canonical_id, "slow");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(agent.tool_call_history().len(), 1);
+    }
+
     #[tokio::test]
     async fn non_idempotent_tool_calls_are_not_retried() {
         use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
@@ -16536,12 +17088,14 @@ streaming:
 
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let deadlines = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let remaining_ms = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let agent = AgentBuilder::new()
             .system_prompt("Test retry deadlines.")
             .llm(Arc::new(mock_with_response("done")))
             .tool(Arc::new(RetryDeadlineTool {
                 calls: Arc::clone(&calls),
                 deadlines: Arc::clone(&deadlines),
+                remaining_ms: Arc::clone(&remaining_ms),
             }))
             .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
                 tools: ToolRecoveryConfig {
@@ -16577,6 +17131,323 @@ streaming:
         assert!(
             deadlines[1] > deadlines[0],
             "retry inherited the first invocation deadline"
+        );
+        let remaining_ms = remaining_ms.lock();
+        assert_eq!(remaining_ms.len(), 2);
+        assert!(
+            remaining_ms
+                .iter()
+                .all(|remaining| (800..=1_000).contains(remaining))
+        );
+    }
+
+    // Verifies a call-level cap drives both the visible deadline and the executor timer.
+    #[tokio::test]
+    async fn call_classification_timeout_controls_deadline_and_timer() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let remaining_ms = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let agent = AgentBuilder::new()
+            .system_prompt("Test call-level timeout.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ClassifiedTimeoutTool {
+                id: "classified_timeout",
+                calls: Arc::clone(&calls),
+                timeout_ms: 100,
+                sleep_ms: 150,
+                requires_approval: false,
+                remaining_ms: Arc::clone(&remaining_ms),
+            }))
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "classified-timeout-call",
+                "classified_timeout",
+                serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.executed);
+        assert!(record.timed_out);
+        assert!(!record.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let remaining_ms = remaining_ms.lock();
+        assert_eq!(remaining_ms.len(), 1);
+        assert!((1..=100).contains(&remaining_ms[0]));
+    }
+
+    // Verifies a per-tool recovery cap lowers broader call and security timeout values.
+    #[tokio::test]
+    async fn recovery_timeout_only_lowers_call_and_policy_timeouts() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let remaining_ms = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let agent = AgentBuilder::new()
+            .system_prompt("Test recovery timeout.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ClassifiedTimeoutTool {
+                id: "recovery_timeout",
+                calls: Arc::clone(&calls),
+                timeout_ms: 1_000,
+                sleep_ms: 150,
+                requires_approval: false,
+                remaining_ms: Arc::clone(&remaining_ms),
+            }))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    per_tool: HashMap::from([(
+                        "recovery_timeout".to_string(),
+                        ToolRetryConfig {
+                            timeout_ms: Some(100),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "recovery-timeout-call",
+                "recovery_timeout",
+                serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.executed);
+        assert!(record.timed_out);
+        assert!(!record.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(record.metadata["effective_limits"]["timeout_ms"], 100);
+        let remaining_ms = remaining_ms.lock();
+        assert_eq!(remaining_ms.len(), 1);
+        assert!((1..=100).contains(&remaining_ms[0]));
+    }
+
+    // Verifies the complete default recovery policy supplies the timeout when no per-tool policy exists.
+    #[tokio::test]
+    async fn recovery_default_timeout_controls_deadline_and_timer() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let remaining_ms = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let agent = AgentBuilder::new()
+            .system_prompt("Test default recovery timeout.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ClassifiedTimeoutTool {
+                id: "default_recovery_timeout",
+                calls: Arc::clone(&calls),
+                timeout_ms: 1_000,
+                sleep_ms: 150,
+                requires_approval: false,
+                remaining_ms: Arc::clone(&remaining_ms),
+            }))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    default: ToolRetryConfig {
+                        timeout_ms: Some(100),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "default-recovery-timeout-call",
+                "default_recovery_timeout",
+                serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert!(record.executed);
+        assert!(record.timed_out);
+        assert!(!record.success);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(record.metadata["effective_limits"]["timeout_ms"], 100);
+        let remaining_ms = remaining_ms.lock();
+        assert_eq!(remaining_ms.len(), 1);
+        assert!((1..=100).contains(&remaining_ms[0]));
+    }
+
+    // Verifies classification and recovery values cannot widen the security baseline.
+    #[test]
+    fn recovery_timeout_cannot_widen_security_baseline() {
+        let security_engine = ToolSecurityEngine::new(ToolSecurityConfig {
+            default_timeout_ms: 100,
+            ..Default::default()
+        });
+        let safety = ToolSafetyMetadata::compute();
+        let mut classification = ToolCallClassification::from_metadata(&safety);
+        classification.timeout_ms = Some(500);
+
+        let (limits, timeout) = RuntimeAgent::effective_tool_limits(
+            &security_engine,
+            "recovery_cannot_widen",
+            &safety,
+            &classification,
+            Some(1_000),
+        )
+        .unwrap();
+
+        assert_eq!(limits.timeout_ms, Some(100));
+        assert_eq!(timeout.timer, Duration::from_millis(100));
+    }
+
+    // Verifies an invalid call-level cap fails before approval or invocation side effects.
+    #[tokio::test]
+    async fn invalid_call_timeout_stops_before_approval_or_tool_invocation() {
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let remaining_ms = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut security = ToolSecurityConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        security.tools.insert(
+            "invalid_call_timeout".to_string(),
+            ai_agents_tools::ToolPolicyConfig {
+                require_confirmation: true,
+                ..Default::default()
+            },
+        );
+        let agent = AgentBuilder::new()
+            .system_prompt("Test invalid call timeout.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(ClassifiedTimeoutTool {
+                id: "invalid_call_timeout",
+                calls: Arc::clone(&tool_calls),
+                timeout_ms: u64::MAX,
+                sleep_ms: 0,
+                requires_approval: false,
+                remaining_ms,
+            }))
+            .tool_security(ToolSecurityEngine::new(security))
+            .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+            .approval_handler(Arc::new(CountingApprovalHandler {
+                calls: Arc::clone(&approval_calls),
+            }))
+            .build()
+            .unwrap();
+
+        let error = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "invalid-call-timeout",
+                "invalid_call_timeout",
+                serde_json::json!({}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "effective tool timeout_ms must be no greater than 3153600000000000 milliseconds"
+        ));
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Verifies approval-modified arguments are reclassified before resource-lock waiting or implementation invocation.
+    #[tokio::test]
+    async fn invalid_modified_call_timeout_stops_before_lock_or_invocation() {
+        use ai_agents_hitl::CallbackHandler;
+
+        let blocker_gate = PathMutationGate::new();
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ToolLifecycleRecordingHooks::new());
+        let handler = CallbackHandler::new(|_| ApprovalResult::Modified {
+            changes: HashMap::from([("invalid_timeout".to_string(), Value::Bool(true))]),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test final call timeout validation.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tool(Arc::new(BlockingPathMutationTool {
+                    id: "timeout_lock_blocker",
+                    path_fields: vec![ai_agents_core::PathPolicyBinding::write("path")],
+                    gate: blocker_gate.clone(),
+                }))
+                .tool(Arc::new(ApprovalModifiedTimeoutTool {
+                    calls: Arc::clone(&tool_calls),
+                }))
+                .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+                .approval_handler(Arc::new(handler))
+                .hooks(hooks.clone())
+                .build()
+                .unwrap(),
+        );
+        let blocking_agent = Arc::clone(&agent);
+        let blocker = tokio::spawn(async move {
+            blocking_agent
+                .invoke_tool(ToolExecutionRequest::new(
+                    "timeout-lock-blocker",
+                    "timeout_lock_blocker",
+                    serde_json::json!({"path": "./shared-timeout.txt"}),
+                    ToolCallSource::Manual,
+                ))
+                .await
+                .unwrap()
+        });
+        blocker_gate.wait_until_entered().await;
+
+        let record = tokio::time::timeout(
+            Duration::from_millis(500),
+            agent.invoke_tool(ToolExecutionRequest::new(
+                "invalid-modified-timeout",
+                "approval_modified_timeout",
+                serde_json::json!({
+                    "path": "./shared-timeout.txt",
+                    "invalid_timeout": false
+                }),
+                ToolCallSource::Manual,
+            )),
+        )
+        .await
+        .expect("final timeout validation must not wait for the held path lock")
+        .unwrap();
+
+        blocker_gate.release();
+        assert!(blocker.await.unwrap().success);
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Deny);
+        assert!(record.output.contains(
+            "effective tool timeout_ms must be no greater than 3153600000000000 milliseconds"
+        ));
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+        let invalid_request_events = hooks
+            .events()
+            .into_iter()
+            .filter(|event| event.contains("approval_modified_timeout") || event == "error")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invalid_request_events,
+            vec![
+                "start:approval_modified_timeout",
+                "complete:approval_modified_timeout:false",
+                "record:approval_modified_timeout:false",
+                "error"
+            ]
         );
     }
 
@@ -16927,7 +17798,13 @@ spawner:
             .await
             .expect("cancelled lock waiter did not finish")
             .unwrap();
+        assert!(!waiter_record.success);
         assert!(!waiter_record.executed);
+        assert!(waiter_record.cancelled);
+        assert_eq!(
+            waiter_record.cancellation_reason.as_deref(),
+            Some("runtime control cancellation")
+        );
         assert!(!waiter_gate.entered.load(Ordering::SeqCst));
         assert_eq!(
             locks
@@ -17162,6 +18039,129 @@ spawner:
                 .max_results,
             Some(5)
         );
+    }
+
+    // Verifies invalid security timeout configuration prevents agent construction and later side effects.
+    #[test]
+    fn invalid_timeout_config_stops_before_approval_or_tool_invocation() {
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spec = crate::spec::AgentSpec {
+            tool_security: ToolSecurityConfig {
+                enabled: true,
+                default_timeout_ms: u64::MAX,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = AgentBuilder::from_spec(spec)
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(FlakyWriteTool {
+                calls: Arc::clone(&tool_calls),
+            }))
+            .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+            .approval_handler(Arc::new(CountingApprovalHandler {
+                calls: Arc::clone(&approval_calls),
+            }))
+            .build();
+
+        assert!(result.is_err());
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Verifies invalid recovery timeout configuration prevents agent construction and later side effects.
+    #[test]
+    fn invalid_recovery_timeout_config_stops_before_approval_or_tool_invocation() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, ToolRecoveryConfig, ToolRetryConfig};
+
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let approval_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spec = crate::spec::AgentSpec {
+            error_recovery: ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    default: ToolRetryConfig {
+                        timeout_ms: Some(u64::MAX),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let result = AgentBuilder::from_spec(spec)
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(FlakyWriteTool {
+                calls: Arc::clone(&tool_calls),
+            }))
+            .hitl_engine(HITLEngine::new(ai_agents_hitl::HITLConfig::default()))
+            .approval_handler(Arc::new(CountingApprovalHandler {
+                calls: Arc::clone(&approval_calls),
+            }))
+            .build();
+
+        assert!(result.is_err());
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Verifies rejected runtime policy replacement preserves both the valid snapshot and generation.
+    #[test]
+    fn invalid_timeout_policy_does_not_replace_snapshot_or_generation() {
+        let agent = AgentBuilder::new()
+            .system_prompt("Test runtime timeout policy validation.")
+            .llm(Arc::new(mock_with_response("done")))
+            .build()
+            .unwrap();
+        let control = agent.runtime_control();
+        let valid = ToolSecurityConfig {
+            default_timeout_ms: 5_000,
+            ..Default::default()
+        };
+        let generation = control.try_set_tool_security(valid).unwrap();
+
+        let invalid = ToolSecurityConfig {
+            default_timeout_ms: MAX_TOOL_TIMEOUT_MS + 1,
+            ..Default::default()
+        };
+        let error = control.try_set_tool_security(invalid).unwrap_err();
+
+        assert!(error.to_string().contains(&format!(
+            "tool_security.default_timeout_ms must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds"
+        )));
+        assert_eq!(control.version(), generation);
+        assert_eq!(
+            control
+                .state
+                .tool_security_override
+                .read()
+                .as_ref()
+                .unwrap()
+                .config()
+                .default_timeout_ms,
+            5_000
+        );
+    }
+
+    // Verifies the shared maximum converts exactly while larger public u64 values fail closed.
+    #[test]
+    fn runtime_tool_timeout_conversion_enforces_the_stable_boundary() {
+        let timeout = RuntimeAgent::validated_tool_timeout(MAX_TOOL_TIMEOUT_MS).unwrap();
+        assert_eq!(timeout.timer, Duration::from_millis(MAX_TOOL_TIMEOUT_MS));
+        assert_eq!(
+            timeout.deadline_delta,
+            chrono::Duration::milliseconds(MAX_TOOL_TIMEOUT_MS as i64)
+        );
+
+        for timeout_ms in [MAX_TOOL_TIMEOUT_MS + 1, u64::MAX] {
+            let error = RuntimeAgent::validated_tool_timeout(timeout_ms).unwrap_err();
+            assert!(error.to_string().contains(&format!(
+                "effective tool timeout_ms must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds"
+            )));
+        }
     }
 
     #[tokio::test]
@@ -17626,6 +18626,271 @@ spawner:
         assert_eq!(history[0].result.get("success"), Some(&Value::Bool(false)));
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Confirms a self-referential fallback produces bounded non-execution evidence after the failed original lifecycle.
+    #[tokio::test]
+    async fn self_fallback_cycle_is_denied_before_reinvocation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ToolLifecycleRecordingHooks::new());
+        let agent = AgentBuilder::new()
+            .system_prompt("Test self-fallback cycle admission.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(RecoveryTestTool {
+                id: "primary".to_string(),
+                succeeds: false,
+                calls: Arc::clone(&calls),
+                max_output_chars: None,
+            }))
+            .recovery_manager(recovery_manager_with_fallbacks([(
+                "primary".to_string(),
+                "primary".to_string(),
+            )]))
+            .hooks(hooks.clone())
+            .build()
+            .unwrap();
+
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.invoke_tool(ToolExecutionRequest::new(
+                "self-fallback-call",
+                "primary",
+                serde_json::json!({"path": "./shared.txt"}),
+                ToolCallSource::Manual,
+            )),
+        )
+        .await
+        .expect("self fallback must terminate without recursive execution")
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(record.canonical_id, "primary");
+        assert!(!record.executed);
+        assert!(!record.success);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Deny);
+        assert!(record.output.contains("fallback cycle"));
+        assert!(matches!(
+            record.source,
+            ToolCallSource::Fallback { ref original_tool } if original_tool == "primary"
+        ));
+        assert_eq!(
+            record.metadata.get("fallback_chain"),
+            Some(&serde_json::json!(["primary"]))
+        );
+        assert_eq!(
+            hooks.events(),
+            vec![
+                "start:primary",
+                "complete:primary:false",
+                "record:primary:true",
+                "error",
+                "complete:primary:false",
+                "record:primary:false",
+                "error",
+            ]
+        );
+        assert_eq!(agent.tool_call_history().len(), 2);
+    }
+
+    /// Confirms fallback ancestry compares resolved canonical IDs so display aliases cannot conceal a multi-tool cycle.
+    #[tokio::test]
+    async fn alias_mediated_fallback_cycle_is_denied_canonically() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let secondary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ToolLifecycleRecordingHooks::new());
+        let agent = AgentBuilder::new()
+            .system_prompt("Test canonical fallback cycle admission.")
+            .llm(Arc::new(mock_with_response("done")))
+            .tool(Arc::new(RecoveryTestTool {
+                id: "primary".to_string(),
+                succeeds: false,
+                calls: Arc::clone(&primary_calls),
+                max_output_chars: None,
+            }))
+            .tool(Arc::new(RecoveryTestTool {
+                id: "secondary".to_string(),
+                succeeds: false,
+                calls: Arc::clone(&secondary_calls),
+                max_output_chars: None,
+            }))
+            .recovery_manager(recovery_manager_with_fallbacks([
+                ("primary".to_string(), "secondary".to_string()),
+                ("secondary".to_string(), "primary alias".to_string()),
+            ]))
+            .hooks(hooks.clone())
+            .build()
+            .unwrap();
+        agent.tools.set_tool_aliases(
+            "primary",
+            ToolAliases::new().with_name("en", "primary alias"),
+        );
+
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.invoke_tool(ToolExecutionRequest::new(
+                "alias-fallback-call",
+                "primary",
+                serde_json::json!({"path": "./shared.txt"}),
+                ToolCallSource::Manual,
+            )),
+        )
+        .await
+        .expect("alias-mediated fallback cycle must terminate")
+        .unwrap();
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(record.requested_name, "primary alias");
+        assert_eq!(record.canonical_id, "primary");
+        assert!(!record.executed);
+        assert!(record.output.contains("fallback cycle"));
+        assert_eq!(
+            record.metadata.get("fallback_chain"),
+            Some(&serde_json::json!(["primary", "secondary"]))
+        );
+        assert_eq!(hooks.records().len(), 3);
+        assert_eq!(agent.tool_call_history().len(), 3);
+    }
+
+    /// Confirms final provider refresh cannot move a fallback alias onto an already visited canonical ancestor.
+    #[tokio::test]
+    async fn final_canonical_drift_cannot_bypass_fallback_ancestry() {
+        let primary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let secondary_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = Arc::new(DriftingFallbackProvider {
+            refreshed: AtomicBool::new(false),
+            primary_calls: Arc::clone(&primary_calls),
+            secondary_calls: Arc::clone(&secondary_calls),
+        });
+        let registry = ToolRegistry::new();
+        registry.register_provider(provider).await.unwrap();
+        let lifecycle = Arc::new(ToolLifecycleRecordingHooks::new());
+        let hooks = Arc::new(RefreshFallbackProviderHooks {
+            agent: parking_lot::Mutex::new(None),
+            lifecycle: Arc::clone(&lifecycle),
+        });
+        let agent = Arc::new(
+            AgentBuilder::new()
+                .system_prompt("Test final canonical fallback admission.")
+                .llm(Arc::new(mock_with_response("done")))
+                .tools(registry)
+                .recovery_manager(recovery_manager_with_fallbacks([(
+                    "primary".to_string(),
+                    "fallback alias".to_string(),
+                )]))
+                .hooks(hooks.clone())
+                .build()
+                .unwrap(),
+        );
+        *hooks.agent.lock() = Some(Arc::downgrade(&agent));
+
+        let record = agent
+            .invoke_tool(ToolExecutionRequest::new(
+                "drifting-fallback-call",
+                "primary",
+                serde_json::json!({"path": "./shared.txt"}),
+                ToolCallSource::Manual,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(record.canonical_id, "secondary");
+        assert!(!record.executed);
+        assert_eq!(record.policy.outcome, PermissionOutcome::Deny);
+        assert!(record.output.contains("fallback cycle"));
+        assert_eq!(
+            record.metadata.get("fallback_chain"),
+            Some(&serde_json::json!(["primary", "secondary"]))
+        );
+        assert_eq!(
+            record.metadata.get("final_resolved_canonical_id"),
+            Some(&serde_json::json!("primary"))
+        );
+        assert_eq!(
+            lifecycle.events(),
+            vec![
+                "start:primary",
+                "complete:primary:false",
+                "record:primary:true",
+                "error",
+                "start:secondary",
+                "complete:secondary:false",
+                "record:secondary:false",
+                "error",
+            ]
+        );
+        let records = lifecycle.records();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].canonical_id, "secondary");
+        assert_eq!(
+            records[1].metadata.get("final_resolved_canonical_id"),
+            Some(&serde_json::json!("primary"))
+        );
+        let history = agent.tool_call_history();
+        assert_eq!(
+            history
+                .iter()
+                .map(|entry| entry.tool_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "secondary"]
+        );
+    }
+
+    /// Confirms a unique acyclic fallback chain is bounded before the first request beyond the fixed hop limit invokes its tool.
+    #[tokio::test]
+    async fn acyclic_fallback_chain_is_denied_after_the_hop_limit() {
+        let tool_count = MAX_TOOL_FALLBACK_HOPS + 2;
+        let calls = (0..tool_count)
+            .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
+        let mut builder = AgentBuilder::new()
+            .system_prompt("Test bounded acyclic fallback admission.")
+            .llm(Arc::new(mock_with_response("done")));
+        for (index, counter) in calls.iter().enumerate() {
+            builder = builder.tool(Arc::new(RecoveryTestTool {
+                id: format!("fallback_{index}"),
+                succeeds: false,
+                calls: Arc::clone(counter),
+                max_output_chars: None,
+            }));
+        }
+        let fallbacks = (0..tool_count - 1).map(|index| {
+            (
+                format!("fallback_{index}"),
+                format!("fallback_{}", index + 1),
+            )
+        });
+        let agent = builder
+            .recovery_manager(recovery_manager_with_fallbacks(fallbacks))
+            .build()
+            .unwrap();
+
+        let record = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.invoke_tool(ToolExecutionRequest::new(
+                "bounded-fallback-call",
+                "fallback_0",
+                serde_json::json!({"path": "./shared.txt"}),
+                ToolCallSource::Manual,
+            )),
+        )
+        .await
+        .expect("bounded fallback chain must terminate")
+        .unwrap();
+
+        for counter in calls.iter().take(MAX_TOOL_FALLBACK_HOPS + 1) {
+            assert_eq!(counter.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(calls[MAX_TOOL_FALLBACK_HOPS + 1].load(Ordering::SeqCst), 0);
+        assert_eq!(
+            record.canonical_id,
+            format!("fallback_{}", MAX_TOOL_FALLBACK_HOPS + 1)
+        );
+        assert!(!record.executed);
+        assert!(record.output.contains("maximum of 16 hops"));
+        assert_eq!(agent.tool_call_history().len(), tool_count);
     }
 
     #[tokio::test]

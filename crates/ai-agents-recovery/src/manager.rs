@@ -12,8 +12,15 @@ pub struct RecoveryManager {
 }
 
 impl RecoveryManager {
+    /// Creates a validated recovery manager and panics when host configuration is invalid.
     pub fn new(config: ErrorRecoveryConfig) -> Self {
-        Self { config }
+        Self::try_new(config).expect("invalid error recovery configuration")
+    }
+
+    /// Creates a validated recovery manager with a recoverable configuration error.
+    pub fn try_new(config: ErrorRecoveryConfig) -> ai_agents_core::Result<Self> {
+        config.validate()?;
+        Ok(Self { config })
     }
 
     pub fn config(&self) -> &ErrorRecoveryConfig {
@@ -34,6 +41,7 @@ impl RecoveryManager {
     {
         let config = retry_config.unwrap_or(&self.config.default);
         let mut attempts = 0u32;
+        let mut retries = 0u32;
 
         loop {
             attempts += 1;
@@ -47,18 +55,19 @@ impl RecoveryManager {
                         return Err(RecoveryError::NonRetryable(classified));
                     }
 
-                    if attempts >= config.max_retries {
+                    if retries >= config.max_retries {
                         return Err(RecoveryError::MaxRetriesExceeded {
                             attempts,
                             last_error: classified,
                         });
                     }
 
-                    let wait = self.calculate_backoff(attempts, &config.backoff);
+                    retries += 1;
+                    let wait = self.calculate_backoff(retries, &config.backoff);
                     tracing::warn!(
-                        "[Recovery] {} failed (attempt {}/{}), retrying in {:?}",
+                        "[Recovery] {} failed (retry {}/{}), retrying in {:?}",
                         operation_name,
-                        attempts,
+                        retries,
                         config.max_retries,
                         wait
                     );
@@ -102,13 +111,18 @@ impl RecoveryManager {
         Duration::from_millis(wait_ms.min(config.max_ms as f64) as u64)
     }
 
-    /// Get tool-specific retry config
+    /// Returns the tool-specific retry policy or the complete default policy.
     pub fn get_tool_config(&self, tool_id: &str) -> &super::ToolRetryConfig {
         self.config
             .tools
             .per_tool
             .get(tool_id)
             .unwrap_or(&self.config.tools.default)
+    }
+
+    /// Returns the timeout from the complete retry policy selected for this tool.
+    pub fn get_tool_timeout(&self, tool_id: &str) -> Option<u64> {
+        self.get_tool_config(tool_id).timeout_ms
     }
 }
 
@@ -118,6 +132,60 @@ mod tests {
     use crate::ClassifiedError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn try_new_rejects_invalid_tool_recovery_timeout() {
+        let config = super::super::ErrorRecoveryConfig {
+            tools: super::super::ToolRecoveryConfig {
+                default: super::super::ToolRetryConfig {
+                    timeout_ms: Some(ai_agents_core::MAX_TOOL_TIMEOUT_MS + 1),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let error = RecoveryManager::try_new(config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("error_recovery.tools.default.timeout_ms")
+        );
+    }
+
+    #[test]
+    fn per_tool_timeout_follows_complete_policy_selection() {
+        let manager = RecoveryManager::new(super::super::ErrorRecoveryConfig {
+            tools: super::super::ToolRecoveryConfig {
+                default: super::super::ToolRetryConfig {
+                    timeout_ms: Some(5_000),
+                    ..Default::default()
+                },
+                per_tool: std::collections::HashMap::from([
+                    (
+                        "without_timeout".to_string(),
+                        super::super::ToolRetryConfig {
+                            max_retries: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "with_timeout".to_string(),
+                        super::super::ToolRetryConfig {
+                            timeout_ms: Some(1_000),
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            },
+            ..Default::default()
+        });
+
+        assert_eq!(manager.get_tool_timeout("other"), Some(5_000));
+        assert_eq!(manager.get_tool_timeout("without_timeout"), None);
+        assert_eq!(manager.get_tool_timeout("with_timeout"), Some(1_000));
+    }
 
     #[tokio::test]
     async fn test_retry_success_after_failures() {
@@ -151,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_retries_exceeded() {
+    async fn test_max_retries_counts_retries_after_the_initial_attempt() {
         let config = super::super::ErrorRecoveryConfig {
             default: super::super::RetryConfig {
                 max_retries: 3,
@@ -160,17 +228,24 @@ mod tests {
             ..Default::default()
         };
         let manager = RecoveryManager::new(config);
+        let attempts = Arc::new(AtomicU32::new(0));
+        let observed_attempts = Arc::clone(&attempts);
 
         let result: Result<(), RecoveryError> = manager
-            .with_retry("test", None, || async {
-                Err::<(), _>(ClassifiedError::timeout("always fails"))
+            .with_retry("test", None, || {
+                let attempts = Arc::clone(&observed_attempts);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err::<(), _>(ClassifiedError::timeout("always fails"))
+                }
             })
             .await;
 
         assert!(matches!(
             result,
-            Err(RecoveryError::MaxRetriesExceeded { .. })
+            Err(RecoveryError::MaxRetriesExceeded { attempts: 4, .. })
         ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
     }
 
     #[tokio::test]

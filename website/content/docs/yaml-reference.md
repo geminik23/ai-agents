@@ -1713,13 +1713,15 @@ process:
 
 Automatic retry, failover, and overflow handling - no code changes needed.
 
+The current runtime applies `error_recovery.default` to main-response LLM provider attempts, `error_recovery.llm.on_failure` when the primary attempt and configured retry policy end in failure, `error_recovery.llm.on_context_overflow` while building the prompt, and `error_recovery.tools` to tool attempts. The compatibility fields `error_recovery.llm.on_rate_limit` and `error_recovery.parsing` are parsed but do not currently add a separate execution path; use `default.retry_on: [rate_limit]` for provider retry and `llm.on_failure` for exhausted provider failures.
+
 ### `error_recovery.default`
 
-Default retry policy for LLM and tool calls.
+Default retry policy for main-response LLM provider calls. Tool calls use the separate `error_recovery.tools` policy.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `max_retries` | `u32` | `0` | Number of retry attempts (0 = fail immediately) |
+| `max_retries` | `u32` | `0` | Number of retries after the initial provider attempt; `0` makes no retry |
 | `backoff.type` | `string` | - | `exponential` |
 | `backoff.initial_ms` | `u64` | - | First retry delay in ms |
 | `backoff.max_ms` | `u64` | - | Maximum delay cap |
@@ -1752,7 +1754,7 @@ LLM-specific failure policies.
 
 #### `on_failure`
 
-What to do after all retries are exhausted.
+What to do when the primary provider attempt and configured retry policy end in failure, including an immediately classified non-retriable failure.
 
 | Action | Description |
 |--------|-------------|
@@ -1806,7 +1808,7 @@ error_recovery:
 
 ### `error_recovery.tools`
 
-Per-tool retry configuration.
+Per-tool retry configuration. `max_retries` counts retries after the initial invocation, and `0` makes no retry. A per-tool entry replaces the complete default tool-recovery policy rather than merging omitted fields from it.
 
 ```yaml
 error_recovery:
@@ -1816,16 +1818,22 @@ error_recovery:
       timeout_ms: 10000
 ```
 
+`error_recovery.tools.default.timeout_ms` and per-tool `error_recovery.tools.<id>.timeout_ms` are optional `u64` invocation caps. A per-tool entry replaces the complete default tool-recovery policy, so an omitted per-tool `timeout_ms` does not inherit the default timeout. Values accept `0..=3153600000000000` milliseconds, matching `MAX_TOOL_TIMEOUT_MS`; larger values fail validation with the complete field path. Recovery and call-classification timeouts can only lower the selected `tool_security` timeout, never widen it.
+
+For `on_failure: { action: fallback, fallback_tool: ... }`, the failed request finalizes before the fallback starts as a separate tool request. Runtime-control tool cancellation is terminal for that request and does not start fallback work. The runtime compares resolved canonical IDs during initial admission and after final resolution, so direct cycles, alias-mediated cycles, and canonical target drift are rejected before invocation. A chain may admit at most 16 fallback hops; the rejected terminal request is recorded with `executed: false`. The bound is runtime-enforced because aliases and registry mappings cannot be validated reliably from YAML strings alone.
+
 ---
 
 ## Tool Security
 
-The `tool_security` block enforces safety constraints after tool availability has already been checked. Security can restrict, deny, require approval, or mark a granted tool unavailable, but it does not grant access to tools omitted from top-level `tools:`.
+The `tool_security` block enforces safety constraints after registration, grant, and scope resolution. Host-backed `command`, `diagnostics`, and `web_search` availability is checked after initial policy and before HITL, then checked again before invocation. Security can restrict, deny, require approval, or mark a granted tool unavailable, but it does not grant access to tools omitted from top-level `tools:`.
 
 | Detail | Value |
 |--------|-------|
 | **Type** | `object` |
 | **Default** | `{}` (disabled) |
+
+`default_timeout_ms` is a `u64` millisecond value with default `30000`. Both it and every `tool_security.tools.<id>.timeout_ms` accept values from `0` through `3153600000000000` inclusive (`MAX_TOOL_TIMEOUT_MS`, a fixed 100,000 365-day-year duration). Larger values fail configuration validation with the complete field path; they are not wrapped, clamped, or deferred until execution.
 
 ```yaml
 tool_security:
@@ -1923,7 +1931,7 @@ Runtime-enforced per-tool policy fields:
 | `require_confirmation` | Require HITL approval after hard denials pass; `require_approval` is accepted as an alias |
 | `allow_without_confirmation` | Explicitly disable the default approval requirement for side-effecting calls inside policy |
 | `rate_limit` | Maximum calls per minute for that tool |
-| `timeout_ms` | Timeout for each `Tool::execute` invocation attempt; falls back to `tool_security.default_timeout_ms`. HITL wait, resource-lock wait, and separate retries are not one end-to-end timeout |
+| `timeout_ms` | `u64` security baseline for each `Tool::execute` invocation attempt, from `0` through `3153600000000000` inclusive; falls back to `tool_security.default_timeout_ms`. Call classification and recovery timeout caps may lower this value but cannot raise it. HITL wait, resource-lock wait, and separate retries are not one end-to-end timeout |
 | `read_paths` / `allowed_paths` | Allowed local roots checked against a tool call's read path arguments |
 | `write_paths` | Allowed local write roots for mutation tools |
 | `working_dirs` | Allowed working directories for the `command` tool; `read_paths` never grant command cwd access, and `command` also requires `allowed_commands` or `command_templates` when `working_dirs` is set |
@@ -1960,7 +1968,7 @@ Policy cap fields are applied as upper bounds or defaults before execution for b
 
 Approval does not freeze an old authorization decision. Host-backed `command`, `diagnostics`, and `web_search` availability is checked after initial policy and before HITL. After approval, the runtime resolves the final tool once, reapplies current policy caps to the approved arguments, and recomputes classification and resource keys. It then verifies current scope, emergency control, provider availability, policy, and approval binding before lock acquisition. State-scope evaluation records the state generation that authorized the call. After waiting for locks, a changed policy, runtime-control, or state generation fails closed and one atomic rate-limit admission occurs immediately before invocation. The runtime executes the same resolved tool object and records the observed registry version as evidence rather than claiming an atomic registry snapshot. An initial hard denial returns immediately and is not revived if policy later becomes permissive; a call that was awaiting approval is denied if the final policy becomes restrictive.
 
-The effective tool timeout starts around each admitted `Tool::execute` invocation attempt. HITL and resource-lock waits occur before that timeout, and every safely retryable attempt receives a separate timeout; `timeout_ms` is not a total deadline for the complete tool request. The `command.timeout_ms` input separately bounds its direct child process, while eval turn timeouts bound a whole agent turn. None of these timeout layers guarantees rollback of filesystem, process, network, custom-tool, or other external effects. `on_tool_start` and `on_tool_complete` describe the executor request lifecycle, not individual retry invocations; lifecycle hooks can observe a finalized request that records `executed: false`. `ToolExecutionRecord.executed` is the authority for whether the implementation was invoked.
+The effective tool timeout is the narrowest applicable value from the selected tool-security default or per-tool baseline, `ToolCallClassification.timeout_ms`, and the timeout from the selected complete recovery policy. Classification and recovery are lowering caps and cannot widen security policy. The timeout starts around each admitted `Tool::execute` invocation attempt. HITL and resource-lock waits occur before that timeout, and every safely retryable attempt receives a separate timeout; `timeout_ms` is not a total deadline for the complete tool request. The runtime derives the UTC `ToolExecutionContext.deadline` and Tokio timer from the same validated duration, so an accepted value cannot wrap into a different deadline. The `command.timeout_ms` input separately bounds its direct child process, while eval turn timeouts bound a whole agent turn. None of these timeout layers guarantees rollback of filesystem, process, network, custom-tool, or other external effects. `on_tool_start` and `on_tool_complete` describe the executor request lifecycle, not individual retry invocations; lifecycle hooks can observe a finalized request that records `executed: false`. `ToolExecutionRecord.executed` is the authority for whether the implementation was invoked.
 
 Calls classified as concurrency-safe, including mutation dry runs, do not acquire resource locks. Non-concurrency-safe path operations use one conservative shared path-mutation lock in addition to normalized exact resource keys, so v1 favors correctness over parallel filesystem mutation. Non-concurrency-safe calls without a concrete resource use one shared unbound-side-effect lock. Parent and spawned runtimes share the lock table. Resource guards are released before completion hooks and before fallback re-enters the normal authorization path.
 
@@ -1986,7 +1994,7 @@ For mutation and command built-ins, prefer `tool_security.enabled: true` with `f
 
 Legacy `allowed_domains`, `blocked_domains`, and `allowed_paths` still work for compatibility. New YAML should prefer `domains.*`, `write_paths`, and `working_dirs`.
 
-Compatibility note: before the explicit-grant change, some release-candidate projects relied on omitted top-level `tools:` exposing every registered tool. That is no longer true. Omit `tools:` or set `tools: []` for a no-tools agent, and list every ordinary tool explicitly when you want it to be callable. User-visible RC-to-stable changes are recorded under `Unreleased` in the project changelog.
+Compatibility note: before the explicit-grant change, some release-candidate projects relied on omitted top-level `tools:` exposing every registered tool. That is no longer true. Omit `tools:` or set `tools: []` for a no-tools agent, and list every ordinary tool explicitly when you want it to be callable. User-visible RC-to-stable changes are recorded in their corresponding release sections in the project changelog.
 
 ---
 

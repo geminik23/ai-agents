@@ -1,8 +1,9 @@
+use ai_agents_core::{AgentError, MAX_TOOL_TIMEOUT_MS, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Top-level error recovery configuration for an agent.
-/// Controls retry, LLM failure handling, tool failure handling, and parse error handling.
+/// Controls active retry, LLM failure and context handling, tool failure handling, and compatibility parsing settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ErrorRecoveryConfig {
     #[serde(default)]
@@ -15,8 +16,42 @@ pub struct ErrorRecoveryConfig {
     pub parsing: ParsingRecoveryConfig,
 }
 
-/// Retry policy: how many times to retry and with what backoff strategy.
-/// Applied to both LLM calls and tool calls unless overridden per-tool.
+impl ErrorRecoveryConfig {
+    /// Validates default and per-tool invocation timeout caps before a recovery manager is installed.
+    pub fn validate(&self) -> Result<()> {
+        let mut invalid_paths = Vec::new();
+        if self
+            .tools
+            .default
+            .timeout_ms
+            .is_some_and(|timeout_ms| timeout_ms > MAX_TOOL_TIMEOUT_MS)
+        {
+            invalid_paths.push("error_recovery.tools.default.timeout_ms".to_string());
+        }
+        invalid_paths.extend(
+            self.tools
+                .per_tool
+                .iter()
+                .filter(|(_, config)| {
+                    config
+                        .timeout_ms
+                        .is_some_and(|timeout_ms| timeout_ms > MAX_TOOL_TIMEOUT_MS)
+                })
+                .map(|(tool_id, _)| format!("error_recovery.tools.{tool_id}.timeout_ms")),
+        );
+        invalid_paths.sort();
+        if invalid_paths.is_empty() {
+            return Ok(());
+        }
+        Err(AgentError::Config(format!(
+            "{} must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds",
+            invalid_paths.join(", ")
+        )))
+    }
+}
+
+/// Retry policy used by `RecoveryManager::with_retry` after an initial failed attempt.
+/// Runtime main-provider calls use the top-level default, while tool calls use `ToolRetryConfig`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryConfig {
     #[serde(default)]
@@ -94,7 +129,7 @@ pub enum ErrorType {
     ToolError,
 }
 
-/// LLM-specific recovery settings: what to do on total failure, rate limits, or context overflow.
+/// LLM-specific failure and context-overflow settings plus compatibility rate-limit configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LLMRecoveryConfig {
     #[serde(default)]
@@ -105,7 +140,7 @@ pub struct LLMRecoveryConfig {
     pub on_context_overflow: ContextOverflowAction,
 }
 
-/// Action to take when the primary LLM fails after all retries are exhausted.
+/// Action to take when the primary LLM attempt and configured retry policy end in failure.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum LLMFailureAction {
@@ -119,7 +154,8 @@ pub enum LLMFailureAction {
     },
 }
 
-/// Action to take when the LLM returns a rate-limit error.
+/// Compatibility configuration for rate-limit-specific recovery.
+/// The current runtime uses `RetryConfig` for rate-limit retries and `LLMFailureAction` after exhaustion instead of executing these variants separately.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RateLimitAction {
@@ -182,13 +218,14 @@ pub struct ToolRecoveryConfig {
 pub struct ToolRetryConfig {
     #[serde(default)]
     pub max_retries: u32,
+    /// Optional invocation timeout cap, up to [`MAX_TOOL_TIMEOUT_MS`].
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     #[serde(default)]
     pub on_failure: ToolFailureAction,
 }
 
-/// Action to take when a tool call fails after all retries are exhausted.
+/// Action to take when a tool call and its retry policy end in failure.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ToolFailureAction {
@@ -200,7 +237,8 @@ pub enum ToolFailureAction {
     },
 }
 
-/// Recovery settings for malformed LLM output (invalid JSON, bad tool call format).
+/// Compatibility settings for malformed LLM output.
+/// The current main-provider path does not execute these actions separately.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ParsingRecoveryConfig {
     #[serde(default)]
@@ -209,7 +247,7 @@ pub struct ParsingRecoveryConfig {
     pub on_invalid_tool_call: ParseErrorAction,
 }
 
-/// Action to take when the LLM response cannot be parsed as expected.
+/// Compatibility action retained for parsing recovery configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum ParseErrorAction {
@@ -266,6 +304,55 @@ mod tests {
             config.default.backoff.backoff_type,
             BackoffType::Exponential
         );
+    }
+
+    #[test]
+    fn tool_recovery_timeouts_accept_the_documented_range() {
+        let config = ErrorRecoveryConfig {
+            tools: ToolRecoveryConfig {
+                default: ToolRetryConfig {
+                    timeout_ms: Some(MAX_TOOL_TIMEOUT_MS),
+                    ..Default::default()
+                },
+                per_tool: HashMap::from([(
+                    "slow".to_string(),
+                    ToolRetryConfig {
+                        timeout_ms: Some(MAX_TOOL_TIMEOUT_MS),
+                        ..Default::default()
+                    },
+                )]),
+            },
+            ..Default::default()
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn tool_recovery_timeouts_reject_unrepresentable_values_with_full_paths() {
+        for timeout_ms in [MAX_TOOL_TIMEOUT_MS + 1, u64::MAX] {
+            let config = ErrorRecoveryConfig {
+                tools: ToolRecoveryConfig {
+                    default: ToolRetryConfig {
+                        timeout_ms: Some(timeout_ms),
+                        ..Default::default()
+                    },
+                    per_tool: HashMap::from([(
+                        "slow".to_string(),
+                        ToolRetryConfig {
+                            timeout_ms: Some(timeout_ms),
+                            ..Default::default()
+                        },
+                    )]),
+                },
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("error_recovery.tools.default.timeout_ms"));
+            assert!(message.contains("error_recovery.tools.slow.timeout_ms"));
+            assert!(message.contains("3153600000000000 milliseconds"));
+        }
     }
 
     #[test]

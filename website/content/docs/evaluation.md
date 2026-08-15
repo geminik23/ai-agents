@@ -428,6 +428,8 @@ Each alias has an independent cursor. The last outcome repeats after exhaustion.
 
 Each scenario attempt receives an opaque absolute workspace. Runtime context includes `eval.workspace` and includes `mock_server.base_url` when the local server is enabled. Parent and spawner file, SQLite, and Redis storage are isolated per attempt.
 
+When scenario retries are enabled, `timeout_per_scenario_ms` is applied independently to each attempt. Retry delay begins only after the completed attempt timeout has ended, so it does not consume that prior attempt's timeout budget, but it remains part of the scenario runner's total wall time.
+
 Mock response strings can interpolate only `{{ eval.workspace }}` and `{{ mock_server.base_url }}`. JSON tool calls are rewritten as parsed JSON, so native path separators remain valid. Other template expressions remain unchanged, and a mock-server token without an enabled server is a configuration error.
 
 ```yaml
@@ -541,7 +543,7 @@ fixtures:
 
 When no command fixture or host runner is installed, the shared executor records an explicit unavailable result for `command` before the tool tries to execute.
 
-Tool evidence comes from executor-level `ToolExecutionRecord` values. Assertions can check successful calls, denied calls, unavailable tools, approval rejection, approval timeout, cancellation, and missing policy bindings because non-executed attempts are still recorded and can be matched with `executed: false`. Shared-executor `on_tool_start` and `on_tool_complete` hooks describe one request lifecycle rather than individual retry invocations. A non-executed request can finalize before or after its start hook, so eval treats `ToolExecutionRecord.executed` as authoritative.
+Tool evidence comes from executor-level `ToolExecutionRecord` values. `tool_called` assertions can match identity, count, execution, success, source, arguments, and structured successful output. Non-executed denial, unavailability, approval rejection, timeout, and cancellation records can be matched with `executed: false`, but that predicate alone does not identify the reason; current `tool_called` predicates do not directly match `cancelled`, `timed_out`, or tool metadata. Shared-executor `on_tool_start` and `on_tool_complete` hooks describe one request lifecycle rather than individual retry invocations. A non-executed request can finalize before or after its start hook, so eval treats `ToolExecutionRecord.executed` as authoritative.
 
 ### Deterministic HITL approval fixtures
 
@@ -691,7 +693,7 @@ assert:
 
 For `approval_not_requested`, boolean form checks whether the turn has no approval records; object form passes only when no record matches its filters. Assertion trigger types are normalized as `tool`, `condition`, or `state` (state assertions use optional `from` and `to`), even though the fixture rule spelling is `state_transition`.
 
-Raw and effective decisions are intentionally distinct. `raw_decision` is what the handler returned: `approved`, `rejected`, `modified`, or `timeout`. `effective_decision` is what the runtime resolved: `approved`, `rejected`, `modified`, or `error`. For example, the supplied HITL agents resolve timeout to rejection, so suites assert `raw_decision: timeout` with `effective_decision: rejected`; another timeout policy can resolve to `error`. Rejected, timed-out, and errored requests have no effective executable arguments. Pair approval assertions with `tool_called.executed` to prove whether the wrapped tool ran. An expected rejection that ends the agent loop is a finalized cancellation response, not provider/runtime/consumer cancellation: blocking and event-stream turns retain the authoritative response, and an event stream emits `Final(AgentResponse)`. Only an actual stream failure, timeout, runtime cancellation, or consumer drop remains incomplete without `Final`.
+Raw and effective decisions are intentionally distinct. `raw_decision` is what the handler returned: `approved`, `rejected`, `modified`, or `timeout`. `effective_decision` is what the runtime resolved: `approved`, `rejected`, `modified`, or `error`. For example, the supplied HITL agents resolve timeout to rejection, so suites assert `raw_decision: timeout` with `effective_decision: rejected`; another timeout policy can resolve to `error`. Rejected, timed-out, and errored requests have no effective executable arguments. Pair approval assertions with `tool_called.executed` to prove whether the wrapped tool ran. An expected rejection that ends the agent loop is a finalized cancellation response: blocking and event-stream turns retain the authoritative response, and an event stream emits `Final(AgentResponse)`. Provider failure, root-future or streaming-task abort, whole-turn timeout, and consumer drop can instead leave the stream incomplete. Runtime-control tool cancellation may still be represented in a later finalized response if the root turn recovers.
 
 A turn that is expected to end in a runtime error can declare one substring or a list of alternatives:
 
@@ -748,7 +750,7 @@ Release-blocking tool-execution smoke suites should use explicit `tool_choice: r
 
 The `examples/eval/live/run_live_example_evals.sh` helper discovers only `examples/eval/live/examples/`. It intentionally excludes `examples/eval/live/quality/`, including judge-based quality suites, which must be run separately. Explicit required/specific choices may add one corrective provider call on a non-native fallback, and that call uses the same scenario call, token, cost, timeout, and cancellation budgets.
 
-A streamed eval turn consumes the complete runtime event stream. Content chunks remain diagnostic previews, while the terminal `Final(AgentResponse)` supplies the authoritative response content and metadata used by assertions. Streaming turns can use `metadata_contains` and `metadata_path`. Provider failure, runtime cancellation, consumer drop, or timeout can leave the stream incomplete without `Final`; an expected HITL rejection instead finalizes an authoritative cancellation response and is evaluated as a completed turn. Partial chunk text from an incomplete stream is retained only for failure diagnostics.
+A streamed eval turn consumes the complete runtime event stream. Content chunks remain diagnostic previews, while the terminal `Final(AgentResponse)` supplies the authoritative response content and metadata used by assertions. Streaming turns can use `metadata_contains` and `metadata_path`. Provider failure, root-future or streaming-task abort, consumer drop, or whole-turn timeout can leave the stream incomplete without `Final`; an expected HITL rejection instead finalizes an authoritative cancellation response and is evaluated as a completed turn. Runtime-control tool cancellation does not by itself make the root stream incomplete. Partial chunk text from an incomplete stream is retained only for failure diagnostics.
 
 `fixtures.llm.mode` controls how the eval runner supplies LLM providers.
 

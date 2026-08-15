@@ -46,8 +46,8 @@ pub use builtin::{
 
 pub use security::{
     CommandPolicyConfig, CommandRuleConfig, CommandTemplateConfig, DomainPolicyConfig,
-    NoWritePolicyBehavior, OperationPolicyConfig, PathPolicyConfig, SecurityCheckResult,
-    ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+    MAX_TOOL_TIMEOUT_MS, NoWritePolicyBehavior, OperationPolicyConfig, PathPolicyConfig,
+    SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
 };
 
 use schemars::JsonSchema;

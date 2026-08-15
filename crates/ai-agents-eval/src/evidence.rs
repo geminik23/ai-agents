@@ -31,7 +31,7 @@ pub enum ToolExecutionSource {
 /// Structured record for one tool execution observed during eval.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolExecutionRecord {
-    /// Unique ID for this recorded tool call.
+    /// Correlation ID shared by records from one logical tool request and its fallback chain.
     pub call_id: String,
     /// Canonical tool ID executed by the registry.
     pub tool_id: String,

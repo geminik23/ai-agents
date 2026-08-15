@@ -8,10 +8,10 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const RELEASE_VERSION: &str = "1.0.4";
+const RELEASE_VERSION: &str = "1.0.5";
 const RELEASE_LICENSE: &str = "Apache-2.0";
 const RELEASE_RUST_VERSION: &str = "1.88";
-const INTERNAL_REQUIREMENT: &str = "^1.0.4";
+const INTERNAL_REQUIREMENT: &str = "^1.0.5";
 const RELEASE_RECORD_SCHEMA_VERSION: u32 = 1;
 
 const RELEASE_ORDER: [&str; 23] = [

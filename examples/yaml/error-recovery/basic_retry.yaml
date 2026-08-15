@@ -17,9 +17,9 @@ llm:
   provider: openai
   model: gpt-4.1-mini
 
-# Retry policy for LLM calls and tools.
-# max_retries: 0 means no retry (fail immediately) -- the default.
-# Set > 0 to enable automatic retry with the configured backoff.
+# The top-level default retries main-response LLM provider calls.
+# max_retries counts retries after the initial call; 0 means no retry.
+# Tool calls use the separate error_recovery.tools policy below.
 error_recovery:
   default:
     max_retries: 3
@@ -43,12 +43,10 @@ error_recovery:
       - invalid_api_key  # Wrong or expired key; retrying wastes quota
       - invalid_request  # Malformed request the provider will always reject
 
-    # Omitted (handled by dedicated mechanisms, not this retry loop):
-    # * context_too_long - routed to error_recovery.llm.on_context_overflow (truncate or summarize), not a simple retry
-    # * invalid_response - LLM returned unparseable output; wired to error_recovery.parsing.on_invalid_json / on_invalid_tool_call (retry-with-hint)
-    # * tool_error - tool execution failures use the per-tool retry config under error_recovery.tools.<id>.max_retries
-    #
-    # Three belong to other error_recovery sub-sections. (check other YAML examples)
+    # Omitted from this retry loop:
+    # * context_too_long - routed to error_recovery.llm.on_context_overflow
+    # * invalid_response - propagated by the current main-provider path
+    # * tool_error - tool failures use error_recovery.tools below
 
   # Per-tool override: give every tool call up to 2 retries.
   tools:

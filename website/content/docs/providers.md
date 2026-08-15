@@ -475,7 +475,7 @@ This setup uses Claude for main responses and ordinary model tool selection, whi
 
 ## Fallback Configuration
 
-Use the `error_recovery` block to handle provider failures gracefully. If the primary LLM fails, the framework can fall back to another provider, wait and retry on rate limits, or compress context when it overflows.
+Use the `error_recovery` block to handle main-response provider failures. The top-level retry policy can retry classified transient failures such as rate limits, `llm.on_failure` can select an outcome whenever the primary retry policy ends in failure, and `llm.on_context_overflow` can truncate or summarize prompt history.
 
 ```yaml
 llms:
@@ -501,9 +501,6 @@ error_recovery:
     on_failure:
       action: fallback_llm
       fallback_llm: fallback
-    on_rate_limit:
-      action: wait_and_retry
-      max_wait_ms: 10000
     on_context_overflow:
       action: summarize
       summarizer_llm: fallback
@@ -515,10 +512,9 @@ error_recovery:
 | Scenario | Actions |
 | --- | --- |
 | `on_failure` | `error` (default), `fallback_llm` (switch to another named LLM), `fallback_response` (return a static message) |
-| `on_rate_limit` | `error` (default), `wait_and_retry` (pause then retry), `switch_model` (switch to another named LLM) |
 | `on_context_overflow` | `error` (default), `truncate` (drop oldest messages), `summarize` (compress history with an LLM) |
 
-This means your agent stays up even when a provider has an outage - it just switches to the fallback automatically.
+The compatibility `llm.on_rate_limit` field is parsed but does not currently add a separate runtime action. Configure `error_recovery.default.retry_on` to include `rate_limit`, then use `llm.on_failure` for the outcome when the primary retry policy ends in failure.
 
 ---
 
@@ -596,7 +592,7 @@ llm:
 | `resilient_max_delay_ms` | `u64` | Maximum backoff delay |
 | `resilient_jitter` | `bool` | Add randomness to backoff timing |
 
-> **Note:** If you also have an `error_recovery:` section in your agent spec, the agent retries at the conversation level while `resilient` retries at the HTTP level. A failed request could trigger up to `resilient_attempts x max_retries` total API calls.
+> **Note:** If you also have an `error_recovery:` section in your agent spec, main-response provider retries can multiply transport-level attempts. `error_recovery.default.max_retries` counts retries after the initial provider attempt. Record actual calls rather than estimating them from one product formula because transport adapters may apply their own attempt semantics.
 
 ### Azure OpenAI
 

@@ -630,6 +630,7 @@ impl AgentSpec {
             states.validate()?;
         }
 
+        self.error_recovery.validate()?;
         self.tool_security.validate()?;
         self.runtime.optimization.validate()?;
         self.validate_runtime_optimization_cross_fields()?;
@@ -1354,6 +1355,55 @@ skills:
             .unwrap()
             .max_results = Some(1);
         assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn test_agent_spec_validation_rejects_unrepresentable_tool_timeouts() {
+        let yaml = format!(
+            r#"
+name: TimeoutAgent
+system_prompt: Test timeout validation.
+tool_security:
+  default_timeout_ms: {}
+  tools:
+    slow:
+      timeout_ms: {}
+"#,
+            ai_agents_tools::MAX_TOOL_TIMEOUT_MS + 1,
+            u64::MAX
+        );
+        let spec = AgentSpec::from_yaml_strict(&yaml).unwrap();
+        let error = spec.validate().unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("tool_security.default_timeout_ms"));
+        assert!(message.contains("tool_security.tools.slow.timeout_ms"));
+        assert!(message.contains("3153600000000000 milliseconds"));
+    }
+
+    #[test]
+    fn test_agent_spec_validation_rejects_unrepresentable_recovery_timeouts() {
+        let yaml = format!(
+            r#"
+name: RecoveryTimeoutAgent
+system_prompt: Test recovery timeout validation.
+error_recovery:
+  tools:
+    default:
+      timeout_ms: {}
+    slow:
+      timeout_ms: {}
+"#,
+            ai_agents_core::MAX_TOOL_TIMEOUT_MS + 1,
+            u64::MAX
+        );
+        let spec = AgentSpec::from_yaml_strict(&yaml).unwrap();
+        let error = spec.validate().unwrap_err();
+        let message = error.to_string();
+
+        assert!(message.contains("error_recovery.tools.default.timeout_ms"));
+        assert!(message.contains("error_recovery.tools.slow.timeout_ms"));
+        assert!(message.contains("3153600000000000 milliseconds"));
     }
 
     #[test]

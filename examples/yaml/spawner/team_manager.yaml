@@ -72,7 +72,7 @@ spawner:
 
   # Spawned agents can ONLY use these tools.
   # This caps child-agent specs, but each child still needs its own top-level tools list.
-  # Tools not in this list are stripped from the agent spec before spawning.
+  # A child declaring a tool outside this list is rejected before spawning.
   allowed_tools:
     - calculator
     - datetime

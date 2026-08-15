@@ -18,11 +18,11 @@ pub use traits::tool::{Tool, ToolInfo, ToolInvoker, ToolResult};
 pub use types::{
     AgentInfo, AgentResponse, CommandBindingKind, CommandPolicyBinding, DomainPolicyBinding,
     FactCategory, FactFilter, FinishReason, KeyFact, LLMChunk, LLMConfig, LLMFeature, LLMResponse,
-    LLMToolDefinition, LLMToolRequest, PathAccessMode, PathBindingKind, PathPolicyBinding,
-    PermissionOutcome, ResultLimitBinding, ResultLimitKind, SessionFilter, SessionMetadata,
-    SessionSummary, StateMachineSnapshot, StateTransitionEvent, TokenUsage, ToolActorContext,
-    ToolApprovalRecord, ToolApprovalStatus, ToolCall, ToolCallClassification, ToolCallSource,
-    ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
+    LLMToolDefinition, LLMToolRequest, MAX_TOOL_TIMEOUT_MS, PathAccessMode, PathBindingKind,
+    PathPolicyBinding, PermissionOutcome, ResultLimitBinding, ResultLimitKind, SessionFilter,
+    SessionMetadata, SessionSummary, StateMachineSnapshot, StateTransitionEvent, TokenUsage,
+    ToolActorContext, ToolApprovalRecord, ToolApprovalStatus, ToolCall, ToolCallClassification,
+    ToolCallSource, ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
     ToolExecutionRecord, ToolExecutionRequest, ToolOperationKind, ToolPolicyBindings,
     ToolPolicyDecisionRecord, ToolSafetyMetadata, ToolSideEffectLevel,
 };

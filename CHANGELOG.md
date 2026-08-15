@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 1.0.5 - 2026-08-15
+
+### Changed
+- TUI dependencies: updated Ratatui, Crossterm, and the maintained textarea package, removing the transitive unmaintained `paste` and vulnerable `lru` versions
+
+### Fixed
+- Error recovery retries: main LLM max_retries now counts retries after the initial attempt, matching its public meaning and tool recovery behavior
+- Tool timeouts: security, recovery, and call-level limits share one validated range, the narrowest cap drives both deadline and timer, and invalid post-approval classification retains terminal non-execution evidence
+- Tool fallback recovery: canonical cycle detection is rechecked after final resolution, cancellation remains terminal, and a fixed hop limit prevents recursive fallback chains from invoking tools without bound
+
 ## 1.0.4 - 2026-08-09
 
 ### Changed

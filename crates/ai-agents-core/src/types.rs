@@ -5,6 +5,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Maximum accepted framework tool-execution timeout in milliseconds.
+///
+/// This fixed 100,000-year bound leaves substantial headroom inside Chrono's UTC range while preserving realistic existing configurations.
+pub const MAX_TOOL_TIMEOUT_MS: u64 = 100_000 * 365 * 24 * 60 * 60 * 1_000;
+
 /// High-level operation category used for tool policy and scheduling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -147,7 +152,7 @@ pub struct ToolCallClassification {
     pub requires_network: bool,
     /// True when this call should ask for approval by default.
     pub requires_approval: bool,
-    /// Optional timeout override in milliseconds for each invocation attempt.
+    /// Optional timeout cap in milliseconds for each invocation attempt, up to [`MAX_TOOL_TIMEOUT_MS`].
     pub timeout_ms: Option<u64>,
     /// Optional output cap for this call.
     pub max_output_chars: Option<usize>,
@@ -175,7 +180,7 @@ impl ToolCallClassification {
 /// Effective tool limits derived from runtime defaults, policy, safety metadata, and call classification.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ToolExecutionLimits {
-    /// Maximum wall-clock time in milliseconds for each invocation attempt.
+    /// Maximum wall-clock time in milliseconds for each invocation attempt, up to [`MAX_TOOL_TIMEOUT_MS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     /// Maximum model-facing output characters.

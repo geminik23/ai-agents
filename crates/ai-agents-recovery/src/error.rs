@@ -66,7 +66,7 @@ impl std::error::Error for ClassifiedError {}
 
 #[derive(Debug, Error)]
 pub enum RecoveryError {
-    #[error("Max retries ({attempts}) exceeded: {last_error}")]
+    #[error("Retry limit exceeded after {attempts} attempts: {last_error}")]
     MaxRetriesExceeded {
         attempts: u32,
         last_error: ClassifiedError,

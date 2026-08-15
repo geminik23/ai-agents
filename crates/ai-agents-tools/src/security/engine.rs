@@ -144,8 +144,15 @@ impl ToolSecurityEngine {
             .enabled
             .then(|| self.config.tools.get(tool_id))
             .flatten();
+        let policy_timeout_ms = self.get_tool_timeout(tool_id);
         ToolExecutionLimits {
-            timeout_ms: Some(self.get_tool_timeout(tool_id)),
+            timeout_ms: Some(
+                classification
+                    .timeout_ms
+                    .map_or(policy_timeout_ms, |timeout_ms| {
+                        timeout_ms.min(policy_timeout_ms)
+                    }),
+            ),
             max_output_chars: min_optional_usize(
                 classification.max_output_chars,
                 policy.and_then(|config| config.max_output_chars),
@@ -1643,6 +1650,32 @@ mod tests {
 
         assert_eq!(engine.get_tool_timeout("slow"), 10000);
         assert_eq!(engine.get_tool_timeout("other"), 5000);
+    }
+
+    #[test]
+    fn call_classification_timeout_only_lowers_policy_timeout() {
+        let engine = ToolSecurityEngine::new(ToolSecurityConfig {
+            default_timeout_ms: 5_000,
+            ..Default::default()
+        });
+        let safety = ToolSafetyMetadata::compute();
+        let mut classification = ToolCallClassification::from_metadata(&safety);
+
+        classification.timeout_ms = Some(1_000);
+        assert_eq!(
+            engine
+                .effective_limits("custom", &safety, &classification)
+                .timeout_ms,
+            Some(1_000)
+        );
+
+        classification.timeout_ms = Some(10_000);
+        assert_eq!(
+            engine
+                .effective_limits("custom", &safety, &classification)
+                .timeout_ms,
+            Some(5_000)
+        );
     }
 
     #[tokio::test]

@@ -1,3 +1,4 @@
+pub use ai_agents_core::MAX_TOOL_TIMEOUT_MS;
 use ai_agents_core::{AgentError, PermissionOutcome, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ pub struct ToolSecurityConfig {
     /// Blocks tools without explicit policy when security is enabled.
     #[serde(default)]
     pub fail_closed: bool,
-    /// Default timeout for tool execution in milliseconds.
+    /// Default timeout for tool execution in milliseconds, up to [`MAX_TOOL_TIMEOUT_MS`].
     #[serde(default = "default_tool_timeout")]
     pub default_timeout_ms: u64,
     /// Per-tool policies keyed by canonical tool ID.
@@ -33,6 +34,28 @@ impl Default for ToolSecurityConfig {
 impl ToolSecurityConfig {
     /// Validates policy values that have a framework-wide semantic domain.
     pub fn validate(&self) -> Result<()> {
+        let mut invalid_timeout_paths = Vec::new();
+        if self.default_timeout_ms > MAX_TOOL_TIMEOUT_MS {
+            invalid_timeout_paths.push("tool_security.default_timeout_ms".to_string());
+        }
+        invalid_timeout_paths.extend(
+            self.tools
+                .iter()
+                .filter(|(_, policy)| {
+                    policy
+                        .timeout_ms
+                        .is_some_and(|timeout_ms| timeout_ms > MAX_TOOL_TIMEOUT_MS)
+                })
+                .map(|(tool_id, _)| format!("tool_security.tools.{tool_id}.timeout_ms")),
+        );
+        invalid_timeout_paths.sort();
+        if !invalid_timeout_paths.is_empty() {
+            return Err(AgentError::Config(format!(
+                "{} must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds",
+                invalid_timeout_paths.join(", ")
+            )));
+        }
+
         let mut invalid_paths: Vec<String> = self
             .tools
             .iter()
@@ -95,7 +118,7 @@ pub struct ToolPolicyConfig {
     /// Maximum allowed calls per minute.
     #[serde(default)]
     pub rate_limit: Option<u32>,
-    /// Tool-specific timeout in milliseconds.
+    /// Tool-specific timeout in milliseconds, up to [`MAX_TOOL_TIMEOUT_MS`].
     #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Legacy domain allowlist mapped to domain policy.
@@ -471,6 +494,55 @@ tools:
         assert!(policy.enabled);
         assert!(!policy.require_confirmation);
         assert!(policy.rate_limit.is_none());
+    }
+
+    #[test]
+    fn tool_timeouts_accept_the_documented_range() {
+        let mut config = ToolSecurityConfig {
+            default_timeout_ms: MAX_TOOL_TIMEOUT_MS,
+            ..Default::default()
+        };
+        config.tools.insert(
+            "slow".to_string(),
+            ToolPolicyConfig {
+                timeout_ms: Some(MAX_TOOL_TIMEOUT_MS),
+                ..Default::default()
+            },
+        );
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn default_tool_timeout_rejects_unrepresentable_values() {
+        for timeout_ms in [MAX_TOOL_TIMEOUT_MS + 1, u64::MAX] {
+            let config = ToolSecurityConfig {
+                default_timeout_ms: timeout_ms,
+                ..Default::default()
+            };
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(&format!(
+                "tool_security.default_timeout_ms must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds"
+            )));
+        }
+    }
+
+    #[test]
+    fn per_tool_timeout_rejects_unrepresentable_values_with_full_paths() {
+        for timeout_ms in [MAX_TOOL_TIMEOUT_MS + 1, u64::MAX] {
+            let mut config = ToolSecurityConfig::default();
+            config.tools.insert(
+                "slow".to_string(),
+                ToolPolicyConfig {
+                    timeout_ms: Some(timeout_ms),
+                    ..Default::default()
+                },
+            );
+            let error = config.validate().unwrap_err();
+            assert!(error.to_string().contains(&format!(
+                "tool_security.tools.slow.timeout_ms must be no greater than {MAX_TOOL_TIMEOUT_MS} milliseconds"
+            )));
+        }
     }
 
     #[test]

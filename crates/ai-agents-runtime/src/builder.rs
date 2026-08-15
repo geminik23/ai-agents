@@ -406,7 +406,7 @@ impl AgentBuilder {
     /// ```
     pub fn auto_configure_features(mut self) -> Result<Self> {
         if let Some(ref spec) = self.spec {
-            self.recovery_manager = Some(RecoveryManager::new(spec.error_recovery.clone()));
+            self.recovery_manager = Some(RecoveryManager::try_new(spec.error_recovery.clone())?);
             self.tool_security = Some(ToolSecurityEngine::try_new(spec.tool_security.clone())?);
 
             if spec.has_process() {
@@ -1300,7 +1300,8 @@ impl AgentBuilder {
         if let Some(manager) = self.recovery_manager {
             agent = agent.with_recovery_manager(manager);
         } else if let Some(ref spec) = self.spec {
-            agent = agent.with_recovery_manager(RecoveryManager::new(spec.error_recovery.clone()));
+            agent =
+                agent.with_recovery_manager(RecoveryManager::try_new(spec.error_recovery.clone())?);
         }
 
         if let Some(engine) = self.tool_security {

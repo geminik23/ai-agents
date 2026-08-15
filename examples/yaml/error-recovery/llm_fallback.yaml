@@ -45,7 +45,7 @@ error_recovery:
       initial_ms: 500
 
   llm:
-    # Switch to the fallback LLM after all retries are exhausted.
+    # Switch to the fallback LLM when the primary retry policy ends in failure.
     on_failure:
       action: fallback_llm
       fallback_llm: fallback

@@ -574,7 +574,7 @@ impl App {
             }
         }
 
-        // Esc cancels streaming, closes panels, or closes completion.
+        // Esc abandons only this TUI's active display, closes panels, or closes completion; the runtime/provider request is not cancelled here.
         if key.code == KeyCode::Esc {
             if self.completions.visible {
                 self.completions.close();

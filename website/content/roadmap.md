@@ -12,11 +12,11 @@ This page tracks what shipped through stable v1.0 and the planned post-v1 direct
 
 | Status | Meaning |
 | --- | --- |
-| ✅ Done | Released and available |
-| Implemented on main | Implemented but not yet published in a release candidate |
-| Current | Active focus before the stable foundation release |
+| ✅ Done | Released and available in the stable v1 line |
+| Implemented on main | Implemented maintenance work not yet included in a published release |
+| Current | Active maintenance or implementation focus |
 | Planned | Planned, but release target is unassigned |
-| Planned after v1.0 | Planned after the stable foundation release; exact release unassigned |
+| Planned after v1.0 | Planned beyond the stable v1 foundation; exact release unassigned |
 | Planned optional | Optional companion product or workspace; not required for the core runtime |
 
 ---

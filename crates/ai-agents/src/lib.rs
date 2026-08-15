@@ -438,8 +438,8 @@ pub mod disambiguation {
 pub mod tool_security {
     pub use ai_agents_tools::{
         CommandPolicyConfig, CommandRuleConfig, CommandTemplateConfig, DomainPolicyConfig,
-        NoWritePolicyBehavior, OperationPolicyConfig, PathPolicyConfig, SecurityCheckResult,
-        ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+        MAX_TOOL_TIMEOUT_MS, NoWritePolicyBehavior, OperationPolicyConfig, PathPolicyConfig,
+        SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
     };
 }
 
@@ -567,7 +567,8 @@ pub use recovery::{
     RecoveryManager, SkipPatternFilter,
 };
 pub use tool_security::{
-    SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig, ToolSecurityEngine,
+    MAX_TOOL_TIMEOUT_MS, SecurityCheckResult, ToolPolicyConfig, ToolSecurityConfig,
+    ToolSecurityEngine,
 };
 
 pub use eval::{
