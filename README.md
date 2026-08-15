@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.5** - Stable v1 surfaces follow SemVer within the documented support and operational boundaries.
+> Status: **1.0.5**
 
 ## Features
 
@@ -37,14 +37,13 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 
 Ordinary model-callable tools are fail-closed through explicit grants. Optional tool security adds path, command, domain, approval, timeout, and result-limit enforcement. These controls are not an OS sandbox; hosts remain responsible for deployment isolation, filesystem ownership, network egress, credentials, custom integrations, and provider-internal I/O.
 
-## v1 Scope and Support
+## Feature Status
 
-The v1 scope includes YAML-first construction, blocking and streaming chat, strict specs, state, skills, process, context, explicit tool grants and final authorization, memory, capability-aware storage, facts and relationships, spawning and orchestration, evaluation, observability, provider adapters, CLI/TUI, and opt-in runtime optimization.
+ai-agents.rs 1.0 includes YAML and Rust agent construction, blocking and streaming chat, tools, state machines, skills, memory, storage, evaluation, observability, spawning, orchestration, and the CLI/TUI.
 
-- **Stable**: builder and blocking chat, strict YAML, state/skills/process/context, built-in tool authorization, and in-memory/compacting memory follow normal v1 SemVer; compatibility changes are recorded in the changelog.
-- **Supported**: streaming, evaluation and observability, provider adapters and MCP, persona, file and SQLite storage, facts and relationships, spawning and orchestration, and runtime optimization are production-usable within their documented operational boundaries.
-- **Experimental**: Redis is snapshot-only for v1, and Noop storage provides no persistence. Both may receive compatibility changes in a minor release with release notes, but may not silently lose data or bypass safety checks.
-- **Future Work**: the Generalized Autonomy Runner, retrieval/evidence/RAG, generalized background scheduling, and Python bindings are not shipped v1 contracts.
+Redis storage is experimental and currently supports snapshots only. Noop storage does not persist data.
+
+Retrieval/RAG, generalized background scheduling, Python bindings, and the Generalized Autonomy Runner are planned but are not currently available.
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 
