@@ -15,6 +15,7 @@
 - Native history privacy: replay state is removed before non-Google fallback requests and first-party observation payloads while provider-input token estimates still account for the original request
 - Evaluation guardrails: hard budget failures and cassette record/streaming contract failures remain terminal instead of being hidden by retry or fallback
 - Google streaming: premature SSE EOF, malformed frames, blocked candidates, and partial function calls terminate without promoting a successful final response or executing parsed tool text
+- HTTP/2 transport: prevents unbounded memory growth from streams containing excessive empty DATA frames
 
 ## 1.0.5 - 2026-08-15
 
