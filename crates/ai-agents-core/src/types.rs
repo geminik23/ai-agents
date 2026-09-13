@@ -934,6 +934,39 @@ impl LLMResponse {
         self
     }
 
+    /// Stores validated opaque provider state under the framework-reserved metadata key.
+    pub fn set_provider_state(
+        &mut self,
+        state: crate::native_history::NativeProviderState,
+    ) -> Result<(), crate::traits::llm::LLMError> {
+        crate::native_history::set_response_provider_state(self, state)
+    }
+
+    /// Stores validated opaque provider state and returns this response.
+    pub fn with_provider_state(
+        mut self,
+        state: crate::native_history::NativeProviderState,
+    ) -> Result<Self, crate::traits::llm::LLMError> {
+        self.set_provider_state(state)?;
+        Ok(self)
+    }
+
+    /// Reads and validates opaque provider state from reserved response metadata.
+    pub fn provider_state(
+        &self,
+    ) -> Result<Option<crate::native_history::NativeProviderState>, crate::traits::llm::LLMError>
+    {
+        crate::native_history::response_provider_state(self)
+    }
+
+    /// Removes provider state only after validating the stored envelope.
+    pub fn take_provider_state(
+        &mut self,
+    ) -> Result<Option<crate::native_history::NativeProviderState>, crate::traits::llm::LLMError>
+    {
+        crate::native_history::take_response_provider_state(self)
+    }
+
     /// Stores normalized native tool calls under the framework-reserved metadata key.
     pub fn set_tool_calls(
         &mut self,

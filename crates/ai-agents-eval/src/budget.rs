@@ -285,6 +285,10 @@ fn mark_failed(state: &mut BudgetUsage, message: String) -> LLMError {
     LLMError::Other(message)
 }
 
+fn is_budget_error(error: &LLMError) -> bool {
+    matches!(error, LLMError::Other(message) if message.starts_with(BUDGET_ERROR_PREFIX))
+}
+
 struct BudgetedLlmProvider {
     inner: Arc<dyn LLMProvider>,
     tracker: ScenarioBudgetTracker,
@@ -354,6 +358,10 @@ impl LLMProvider for BudgetedLlmProvider {
 
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
         self.inner.supports_tool_choice(choice)
+    }
+
+    fn is_terminal_error(&self, error: &LLMError) -> bool {
+        is_budget_error(error) || self.inner.is_terminal_error(error)
     }
 
     async fn complete_stream(
@@ -940,5 +948,15 @@ mod tests {
         drop(stream);
         assert_eq!(tracker.lock_state().tokens_used, used_after_completion);
         assert!(!tracker.has_failed());
+    }
+
+    #[test]
+    fn budget_owned_failures_are_terminal_before_runtime_fallback() {
+        assert!(is_budget_error(&LLMError::Other(format!(
+            "{BUDGET_ERROR_PREFIX}: fixture"
+        ))));
+        assert!(!is_budget_error(&LLMError::Other(
+            "ordinary provider failure".to_string()
+        )));
     }
 }

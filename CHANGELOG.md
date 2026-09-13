@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 1.0.6 - 2026-09-13
+
+### Changed
+- Google provider ownership: normal `provider: google` execution now uses the framework's first-party GenerateContent and text-SSE adapter, while the low-level `build_llm()` compatibility escape hatch retains the upstream backend
+- Native tool history: replay-bearing provider state is preserved as an opaque signed exchange across runtime, memory, snapshots, record/replay, and committed speculative or streaming paths without widening tool authorization
+- Google usage reporting: completion usage includes reported thinking tokens, and streamed cumulative usage is settled once at terminal completion
+
+### Fixed
+- Google native tool continuation: Gemini function-call `thoughtSignature`, original part ordering, call IDs, and correlated function responses are returned on subsequent requests instead of being dropped before the second model iteration
+- Native history safety: malformed, truncated, or evicted active exchanges fail before continuation or tool replay; incomplete prior turns are projected without re-executing their tools
+- Native history privacy: replay state is removed before non-Google fallback requests and first-party observation payloads while provider-input token estimates still account for the original request
+- Evaluation guardrails: hard budget failures and cassette record/streaming contract failures remain terminal instead of being hidden by retry or fallback
+- Google streaming: premature SSE EOF, malformed frames, blocked candidates, and partial function calls terminate without promoting a successful final response or executing parsed tool text
+- HTTP/2 transport: prevents unbounded memory growth from streams containing excessive empty DATA frames
+
 ## 1.0.5 - 2026-08-15
 
 ### Changed

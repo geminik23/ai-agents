@@ -6,7 +6,7 @@ use crate::span::SpanGuard;
 use ai_agents_core::{
     ChatMessage, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
     LLMToolRequest, Tool, ToolCallClassification, ToolChoice, ToolExecutionContext,
-    ToolPolicyBindings, ToolResult, ToolSafetyMetadata,
+    ToolPolicyBindings, ToolResult, ToolSafetyMetadata, native_observation_projection,
 };
 use async_trait::async_trait;
 use futures::Stream;
@@ -50,6 +50,46 @@ impl ObservedLLMProvider {
             streaming,
         }
     }
+
+    /// Projects replay-bearing assistant and tool markers before first-party payload capture or hashing while leaving provider input untouched.
+    fn observation_messages(messages: &[ChatMessage]) -> Result<Vec<ChatMessage>, LLMError> {
+        messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                if matches!(
+                    message.role,
+                    ai_agents_core::Role::Assistant
+                        | ai_agents_core::Role::Tool
+                        | ai_agents_core::Role::Function
+                ) {
+                    message.content = native_observation_projection(&message.content)?;
+                }
+                Ok(message)
+            })
+            .collect()
+    }
+
+    fn record_prompt_payload(
+        &self,
+        span: &mut SpanGuard,
+        messages: &[ChatMessage],
+    ) -> Result<(), LLMError> {
+        let projected = Self::observation_messages(messages)?;
+        if self.manager.config().privacy.include_prompts {
+            span.set_payload(serde_json::json!({"messages": projected}));
+        } else if self.manager.config().privacy.hash_inputs {
+            let text = projected
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            span.set_payload(
+                serde_json::json!({"input": self.manager.redactor().redact_text(&text)}),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -65,18 +105,7 @@ impl LLMProvider for ObservedLLMProvider {
         let mut span = self
             .manager
             .start_span(self.event_type(false), current_purpose());
-        if self.manager.config().privacy.include_prompts {
-            span.set_payload(serde_json::json!({"messages": messages}));
-        } else if self.manager.config().privacy.hash_inputs {
-            let text = messages
-                .iter()
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            span.set_payload(
-                serde_json::json!({"input": self.manager.redactor().redact_text(&text)}),
-            );
-        }
+        self.record_prompt_payload(&mut span, messages)?;
 
         match self.inner.complete(messages, config).await {
             Ok(response) => {
@@ -119,18 +148,7 @@ impl LLMProvider for ObservedLLMProvider {
         let mut span = self
             .manager
             .start_span(self.event_type(false), current_purpose());
-        if self.manager.config().privacy.include_prompts {
-            span.set_payload(serde_json::json!({"messages": messages}));
-        } else if self.manager.config().privacy.hash_inputs {
-            let text = messages
-                .iter()
-                .map(|message| message.content.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            span.set_payload(
-                serde_json::json!({"input": self.manager.redactor().redact_text(&text)}),
-            );
-        }
+        self.record_prompt_payload(&mut span, messages)?;
 
         match self
             .inner
@@ -184,6 +202,7 @@ impl LLMProvider for ObservedLLMProvider {
         let mut span = self
             .manager
             .start_span(self.event_type(true), current_purpose());
+        self.record_prompt_payload(&mut span, messages)?;
         let estimated_input_tokens = estimate_messages(messages);
         let inner = match self.inner.complete_stream(messages, config).await {
             Ok(stream) => stream,
@@ -209,6 +228,10 @@ impl LLMProvider for ObservedLLMProvider {
 
     fn supports(&self, feature: LLMFeature) -> bool {
         self.inner.supports(feature)
+    }
+
+    fn is_terminal_error(&self, error: &LLMError) -> bool {
+        self.inner.is_terminal_error(error)
     }
 }
 
@@ -463,6 +486,10 @@ mod tests {
         fn supports(&self, _feature: LLMFeature) -> bool {
             false
         }
+
+        fn is_terminal_error(&self, error: &LLMError) -> bool {
+            matches!(error, LLMError::Serialization(_))
+        }
     }
 
     #[tokio::test]
@@ -498,5 +525,50 @@ mod tests {
             Some(ToolChoice::Required)
         );
         assert!(observed.supports_tool_choice(&ToolChoice::Auto));
+        assert!(observed.is_terminal_error(&LLMError::Serialization("native history".to_string())));
+    }
+
+    #[test]
+    fn observation_projection_removes_provider_state_without_mutating_history() {
+        let call = ai_agents_core::ToolCall {
+            id: "call-1".to_string(),
+            name: "lookup".to_string(),
+            arguments: serde_json::json!({"query": "safe"}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            "exchange-1",
+            "google",
+            "generateContent",
+            ai_agents_core::NativeProviderTarget::new(
+                "https://generativelanguage.googleapis.com/v1beta/",
+                "gemini-3.7-flash",
+            )
+            .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "lookup", "args": {"query": "safe"}},
+                    "thoughtSignature": "signature-must-not-be-observed"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("call-1", 0).unwrap()],
+        )
+        .unwrap();
+        let stored =
+            ai_agents_core::encode_native_tool_call_markers(&[call], Some(&state)).unwrap();
+        let messages = vec![ChatMessage::assistant(&stored)];
+
+        let projected = ObservedLLMProvider::observation_messages(&messages).unwrap();
+
+        assert!(
+            !projected[0]
+                .content
+                .contains("signature-must-not-be-observed")
+        );
+        assert!(
+            messages[0]
+                .content
+                .contains("signature-must-not-be-observed")
+        );
     }
 }

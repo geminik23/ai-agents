@@ -57,6 +57,15 @@ pub trait LLMProvider: Send + Sync {
 
     /// Check if this provider supports a given feature.
     fn supports(&self, feature: LLMFeature) -> bool;
+
+    /// Reports whether a provider error is terminal for this exact attempt.
+    ///
+    /// Terminal errors represent local configuration, protocol, or history failures that retry,
+    /// provider fallback, and static success responses must not hide. The default preserves the
+    /// behavior of existing custom providers by classifying every error as recoverable.
+    fn is_terminal_error(&self, _error: &LLMError) -> bool {
+        false
+    }
 }
 
 /// Higher-level LLM capabilities for agent operations
@@ -154,6 +163,8 @@ mod tests {
 
     struct LegacyProvider;
 
+    struct TerminalProvider;
+
     #[async_trait]
     impl LLMProvider for LegacyProvider {
         async fn complete(
@@ -184,6 +195,40 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LLMProvider for TerminalProvider {
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            config: Option<&LLMConfig>,
+        ) -> Result<LLMResponse, LLMError> {
+            LegacyProvider.complete(messages, config).await
+        }
+
+        async fn complete_stream(
+            &self,
+            messages: &[ChatMessage],
+            config: Option<&LLMConfig>,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            LegacyProvider.complete_stream(messages, config).await
+        }
+
+        fn provider_name(&self) -> &str {
+            "terminal"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+
+        fn is_terminal_error(&self, error: &LLMError) -> bool {
+            matches!(error, LLMError::Config(_) | LLMError::Serialization(_))
+        }
+    }
+
     #[test]
     fn additive_tool_methods_preserve_legacy_implementations() {
         let provider = LegacyProvider;
@@ -194,6 +239,7 @@ mod tests {
 
         assert!(provider.configured_tool_choice().is_none());
         assert!(!provider.supports_tool_choice(&ToolChoice::Auto));
+        assert!(!provider.is_terminal_error(&LLMError::Config("legacy".to_string())));
         let error = futures::executor::block_on(provider.complete_with_tools(&[], None, &request))
             .unwrap_err();
         assert!(
@@ -201,5 +247,14 @@ mod tests {
                 .to_string()
                 .contains("does not support native tool completion")
         );
+    }
+
+    #[test]
+    fn terminal_error_classification_is_additive_and_provider_owned() {
+        let provider = TerminalProvider;
+
+        assert!(provider.is_terminal_error(&LLMError::Config("bad config".to_string())));
+        assert!(provider.is_terminal_error(&LLMError::Serialization("bad history".to_string())));
+        assert!(!provider.is_terminal_error(&LLMError::Network("temporary".to_string())));
     }
 }

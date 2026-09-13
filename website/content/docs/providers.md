@@ -15,7 +15,7 @@ AI Agents supports 12 LLM providers out of the box - from cloud APIs like OpenAI
 | --- | --- | --- | --- |
 | OpenAI | `openai` | `OPENAI_API_KEY` | `gpt-5.4-nano`, `gpt-5.4-mini`, `gpt-5.4` |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4.6`, `claude-haiku-4.5` |
-| Google Gemini | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash`, `gemini-2.5-pro` |
+| Google Gemini (first-party adapter) | `google` | `GOOGLE_API_KEY` | `gemini-2.5-flash`, `gemini-2.5-pro` |
 | Ollama | `ollama` | *(none)* | `llama3.1`, `qwen3:8b`, `mistral` |
 | DeepSeek | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-chat`, `deepseek-reasoner` |
 | Groq | `groq` | `GROQ_API_KEY` | `llama-3.3-70b-versatile` |
@@ -114,6 +114,16 @@ llm:
   provider: google
   model: gemini-2.5-pro
 ```
+
+The normal `provider: google` path uses the framework's first-party Google Developer API adapter. It preserves the original model `Content.parts`, function-call IDs, and Gemini `thoughtSignature` values across native tool continuations. Native selection remains opt-in with `tool_choice: auto`; omitted choice uses the framework's prompt-JSON protocol, and `required` or `specific` uses the existing bounded prompt fallback.
+
+Google native history is replay data rather than tool authority. Calls reconstructed from that history still pass through the effective grant, policy, HITL, resource locks, final admission, and execution evidence. If required current-turn history is malformed or cannot fit configured memory/context limits, the runtime fails locally instead of retrying the user request or executing a tool again. An incomplete exchange from an earlier user turn is sent as a non-executing description rather than native replay.
+
+If ordinary recovery switches from Google to a different provider after an API or transport failure, the destination receives a readable call/result projection without Google's opaque signed state. A later compatible Google continuation still uses the original memory representation; projection never mutates stored history.
+
+The first-party path reports thinking tokens as completion usage and rejects an SSE response that ends without a terminal `finishReason`. Provisional text already emitted before a stream error cannot be withdrawn, but an incomplete response is not promoted to an authoritative final response. Google `functionResponse.response` values are sent as objects using the compatibility wrapper `{name, content}`, including when a tool returned a scalar, array, or plain string.
+
+`UnifiedLLMProvider::build_llm()` remains a low-level compatibility escape hatch returning the upstream `llm` crate's provider type. Calling that method directly does not use the first-party adapter or its signed-history contract. Google's OpenAI-compatible endpoint also remains outside this fix because its `extra_content.google.thought_signature` representation requires a separate compatibility path.
 
 ---
 
@@ -387,7 +397,7 @@ Use them when you know a model/server supports more or less than the provider de
 | OpenAI | Yes | Yes | Not applicable |
 | Anthropic | Yes | Yes | Not applicable |
 | OpenRouter | Yes | Yes | Not applicable |
-| Google | Yes | No | One bounded prompt corrective retry |
+| Google first-party GenerateContent | Yes | No | One bounded prompt corrective retry |
 | OpenAI-compatible | With `function_calling: true` | With `function_calling: true` | Prompt fallback when not enabled |
 | Other unified or custom providers | No by default | No by default | Prompt fallback unless the provider implements the additive native methods |
 
@@ -567,11 +577,13 @@ These work across any provider that supports reasoning. Use `timeout_seconds` al
 
 ## Extra Parameters
 
-Any YAML field not recognized as a named parameter is captured as a provider-specific extra and forwarded to the underlying LLM client. This lets you use provider-specific features without framework changes.
+Any YAML field not recognized as a named parameter is captured as a provider-specific extra. Providers decide which extras they support. The first-party Google adapter accepts a restricted `extra_body`: framework-owned `contents`, `systemInstruction`, `tools`, and `toolConfig` cannot be overridden, while unsupported top-level fields fail configuration instead of being forwarded silently. Tool definitions use Google's `parametersJsonSchema`, preserving supported JSON Schema constraints.
 
 ### Transport-Level Resilience
 
 The `llm` crate supports HTTP-level retry with exponential backoff, complementary to the framework's agent-level `error_recovery`. Both can be active simultaneously.
+
+These `resilient_*` fields apply to upstream-backed providers. The first-party Google adapter does not add an internal retry loop; configure agent-level `error_recovery` for Google. Local native-history and protocol integrity errors are terminal and do not enter retry, fallback-model, or static-response recovery.
 
 ```yaml
 llm:

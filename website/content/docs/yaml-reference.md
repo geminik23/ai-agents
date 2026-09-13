@@ -247,7 +247,11 @@ tools:
   - random
 ```
 
-OpenAI, Anthropic, and OpenRouter use native `auto`, `required`, and `specific` selection. Google uses native `auto`; its `required` and `specific` choices use one bounded prompt corrective retry because the pinned provider dependency does not expose those native modes. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+OpenAI, Anthropic, and OpenRouter use native `auto`, `required`, and `specific` selection. Google currently enables native `auto` only; its `required` and `specific` choices retain one bounded prompt corrective retry. OpenAI-compatible servers use native selection only with `function_calling: true`. Other and custom providers use prompt fallback unless they implement the additive native request methods. `none` is enforced by the runtime without exposing definitions or prompt instructions. A second non-compliant prompt response fails the turn.
+
+The normal Google path is a first-party GenerateContent adapter. With native `auto`, it retains Gemini's opaque `thoughtSignature`, original model-part order, and call/result correlation across the current tool loop. Signed history does not grant tools and is never parsed recursively as additional calls. Current signed exchanges are kept as an atomic memory group; if that group cannot fit the configured memory or context budget, the turn fails instead of truncating the signature or silently expanding the limit.
+
+Google tool input schemas are sent through `parametersJsonSchema` and must describe an object. Function results are wrapped in an object as `{name, content}` so object, scalar, array, boolean, null, and plain-text outputs remain valid `functionResponse.response` values. Google `extra_body` is intentionally restricted: `contents`, `systemInstruction`, `tools`, and `toolConfig` are runtime-owned, and unsupported top-level fields are rejected. The first-party Google adapter does not implement `resilient_*`; use `error_recovery` for ordinary transport/API failures. Native-history and local protocol-integrity errors remain terminal.
 
 With explicit `tool_choice`, `chat_stream()` buffers the provider decision before emitting committed text or existing runtime tool events. The framework does not expose a separate provider-native streaming tool-call API in v1.
 

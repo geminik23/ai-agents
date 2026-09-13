@@ -4,6 +4,7 @@ mod compacting;
 mod context;
 mod events;
 mod in_memory;
+mod native;
 mod summarizer;
 mod token_budget;
 

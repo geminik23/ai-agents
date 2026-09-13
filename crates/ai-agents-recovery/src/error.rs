@@ -102,6 +102,99 @@ impl RecoveryError {
     }
 }
 
+/// Typed failure from a retry loop that preserves the operation's original error.
+///
+/// Callers can stop terminal protocol failures immediately while retaining the distinction
+/// between policy non-retryability and retry exhaustion for their existing fallback logic.
+#[derive(Debug)]
+pub enum RetryFailure<E> {
+    /// The caller declared this exact error terminal before retry classification or backoff.
+    Terminal { attempts: u32, error: E },
+    /// Retry policy rejected this error type on the current attempt.
+    NonRetryable {
+        attempts: u32,
+        error: E,
+        classified: ClassifiedError,
+    },
+    /// The initial attempt and all configured retries failed.
+    Exhausted {
+        attempts: u32,
+        error: E,
+        classified: ClassifiedError,
+    },
+}
+
+impl<E> RetryFailure<E> {
+    /// Returns the number of attempts completed before this failure.
+    pub fn attempts(&self) -> u32 {
+        match self {
+            Self::Terminal { attempts, .. }
+            | Self::NonRetryable { attempts, .. }
+            | Self::Exhausted { attempts, .. } => *attempts,
+        }
+    }
+
+    /// Returns whether the caller explicitly classified this failure as terminal.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, Self::Terminal { .. })
+    }
+
+    /// Borrows the original typed operation error.
+    pub fn error(&self) -> &E {
+        match self {
+            Self::Terminal { error, .. }
+            | Self::NonRetryable { error, .. }
+            | Self::Exhausted { error, .. } => error,
+        }
+    }
+
+    /// Returns retry classification evidence when policy evaluated the error.
+    pub fn classified(&self) -> Option<&ClassifiedError> {
+        match self {
+            Self::Terminal { .. } => None,
+            Self::NonRetryable { classified, .. } | Self::Exhausted { classified, .. } => {
+                Some(classified)
+            }
+        }
+    }
+
+    /// Consumes the failure and returns the original typed operation error.
+    pub fn into_error(self) -> E {
+        match self {
+            Self::Terminal { error, .. }
+            | Self::NonRetryable { error, .. }
+            | Self::Exhausted { error, .. } => error,
+        }
+    }
+}
+
+impl<E: fmt::Display> fmt::Display for RetryFailure<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Terminal { attempts, error } => {
+                write!(
+                    formatter,
+                    "Terminal error after {attempts} attempt(s): {error}"
+                )
+            }
+            Self::NonRetryable {
+                attempts, error, ..
+            } => write!(
+                formatter,
+                "Non-retryable error after {attempts} attempt(s): {error}"
+            ),
+            Self::Exhausted {
+                attempts, error, ..
+            } => write!(
+                formatter,
+                "Retry limit exceeded after {attempts} attempt(s): {error}"
+            ),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for RetryFailure<E> {}
+
 pub trait IntoClassifiedError {
     fn classify(self) -> ClassifiedError;
 }
@@ -114,27 +207,30 @@ impl IntoClassifiedError for ClassifiedError {
 
 impl IntoClassifiedError for ai_agents_llm::LLMError {
     fn classify(self) -> ClassifiedError {
-        match &self {
-            ai_agents_llm::LLMError::RateLimit { .. } => {
-                ClassifiedError::rate_limit(self.to_string())
-            }
-            ai_agents_llm::LLMError::Network(_) => ClassifiedError::connection(self.to_string()),
-            ai_agents_llm::LLMError::API { status, .. } => {
-                if let Some(code) = status {
-                    if *code >= 500 {
-                        return ClassifiedError::server(self.to_string());
-                    }
-                    if *code == 401 || *code == 403 {
-                        return ClassifiedError::invalid_api_key(self.to_string());
-                    }
+        classify_llm_error(&self)
+    }
+}
+
+/// Classifies an LLM error by reference so typed retry paths can retain the original value.
+pub fn classify_llm_error(error: &ai_agents_llm::LLMError) -> ClassifiedError {
+    match error {
+        ai_agents_llm::LLMError::RateLimit { .. } => ClassifiedError::rate_limit(error.to_string()),
+        ai_agents_llm::LLMError::Network(_) => ClassifiedError::connection(error.to_string()),
+        ai_agents_llm::LLMError::API { status, .. } => {
+            if let Some(code) = status {
+                if *code >= 500 {
+                    return ClassifiedError::server(error.to_string());
                 }
-                ClassifiedError::new(ErrorType::InvalidRequest, self.to_string())
+                if *code == 401 || *code == 403 {
+                    return ClassifiedError::invalid_api_key(error.to_string());
+                }
             }
-            ai_agents_llm::LLMError::Config(_) => {
-                ClassifiedError::new(ErrorType::InvalidRequest, self.to_string())
-            }
-            _ => ClassifiedError::new(ErrorType::InvalidResponse, self.to_string()),
+            ClassifiedError::new(ErrorType::InvalidRequest, error.to_string())
         }
+        ai_agents_llm::LLMError::Config(_) => {
+            ClassifiedError::new(ErrorType::InvalidRequest, error.to_string())
+        }
+        _ => ClassifiedError::new(ErrorType::InvalidResponse, error.to_string()),
     }
 }
 

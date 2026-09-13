@@ -139,6 +139,10 @@ impl LLMProvider for MultiLLMRouter {
     fn supports(&self, feature: LLMFeature) -> bool {
         self.primary.supports(feature)
     }
+
+    fn is_terminal_error(&self, error: &LLMError) -> bool {
+        self.primary.is_terminal_error(error)
+    }
 }
 
 #[async_trait]
@@ -200,6 +204,7 @@ impl LLMCapability for MultiLLMRouter {
 mod tests {
     use super::*;
     use crate::mock::MockLLMProvider;
+    use crate::providers::{ProviderType, UnifiedLLMProvider};
     use ai_agents_core::{FinishReason, LLMToolDefinition, LLMToolRequest, Role, ToolChoice};
     use std::collections::HashMap;
 
@@ -243,6 +248,23 @@ mod tests {
 
         assert!(router.supports_tool_choice(&ToolChoice::Required));
         assert_eq!(history.last_call().unwrap().request, Some(request));
+    }
+
+    #[test]
+    fn test_router_delegates_terminal_error_classification_to_primary() {
+        let primary = UnifiedLLMProvider::from_spec_config(
+            ProviderType::Google,
+            "gemini-3.7-flash",
+            Some("test-key".to_string()),
+            None,
+            LLMConfig::default(),
+        )
+        .unwrap();
+        let router = MultiLLMRouter::new(Arc::new(primary));
+        assert!(router.is_terminal_error(&LLMError::Serialization(
+            "invalid native history".to_string()
+        )));
+        assert!(!router.is_terminal_error(&LLMError::Network("temporary".to_string())));
     }
 
     #[tokio::test]

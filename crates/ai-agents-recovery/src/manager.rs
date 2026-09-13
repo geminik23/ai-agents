@@ -2,6 +2,7 @@
 
 use super::{
     BackoffType, ErrorRecoveryConfig, ErrorType, IntoClassifiedError, RecoveryError, RetryConfig,
+    RetryFailure, classify_llm_error,
 };
 use std::future::Future;
 use std::time::Duration;
@@ -72,6 +73,68 @@ impl RecoveryManager {
                         wait
                     );
 
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+
+    /// Executes an LLM operation with retry policy while retaining each original typed error.
+    ///
+    /// The terminal predicate runs immediately after an attempt fails and before generic error
+    /// classification, retry scheduling, or backoff. This lets runtime preserve provider-owned
+    /// protocol/history failures while continuing to apply its existing fallback policy only to
+    /// non-terminal or exhausted failures.
+    pub async fn with_llm_retry<T, F, Fut, P>(
+        &self,
+        operation_name: &str,
+        retry_config: Option<&RetryConfig>,
+        mut operation: F,
+        is_terminal: P,
+    ) -> Result<T, RetryFailure<ai_agents_llm::LLMError>>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ai_agents_llm::LLMError>>,
+        P: Fn(&ai_agents_llm::LLMError) -> bool,
+    {
+        let config = retry_config.unwrap_or(&self.config.default);
+        let mut attempts = 0u32;
+        let mut retries = 0u32;
+
+        loop {
+            attempts += 1;
+            match operation().await {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    if is_terminal(&error) {
+                        return Err(RetryFailure::Terminal { attempts, error });
+                    }
+
+                    let classified = classify_llm_error(&error);
+                    if !self.should_retry(&classified.error_type, config) {
+                        return Err(RetryFailure::NonRetryable {
+                            attempts,
+                            error,
+                            classified,
+                        });
+                    }
+                    if retries >= config.max_retries {
+                        return Err(RetryFailure::Exhausted {
+                            attempts,
+                            error,
+                            classified,
+                        });
+                    }
+
+                    retries += 1;
+                    let wait = self.calculate_backoff(retries, &config.backoff);
+                    tracing::warn!(
+                        "[Recovery] {} failed (retry {}/{}), retrying in {:?}",
+                        operation_name,
+                        retries,
+                        config.max_retries,
+                        wait
+                    );
                     tokio::time::sleep(wait).await;
                 }
             }
@@ -266,6 +329,164 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(RecoveryError::NonRetryable(_))));
+    }
+
+    #[tokio::test]
+    async fn typed_llm_retry_stops_terminal_error_before_retry() {
+        let manager = RecoveryManager::new(super::super::ErrorRecoveryConfig {
+            default: super::super::RetryConfig {
+                max_retries: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let attempts = Arc::new(AtomicU32::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+
+        let result = manager
+            .with_llm_retry(
+                "terminal",
+                None,
+                || {
+                    let attempts = Arc::clone(&observed_attempts);
+                    async move {
+                        attempts.fetch_add(1, Ordering::SeqCst);
+                        Err::<(), _>(ai_agents_llm::LLMError::Network(
+                            "typed terminal".to_string(),
+                        ))
+                    }
+                },
+                |_| true,
+            )
+            .await;
+
+        let failure = result.unwrap_err();
+        assert!(failure.is_terminal());
+        assert_eq!(failure.attempts(), 1);
+        assert!(failure.classified().is_none());
+        assert!(matches!(
+            failure.into_error(),
+            ai_agents_llm::LLMError::Network(message) if message == "typed terminal"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_llm_retry_preserves_transient_retry_behavior() {
+        let manager = RecoveryManager::new(super::super::ErrorRecoveryConfig {
+            default: super::super::RetryConfig {
+                max_retries: 3,
+                backoff: super::super::BackoffConfig {
+                    initial_ms: 0,
+                    max_ms: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let attempts = Arc::new(AtomicU32::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+
+        let result = manager
+            .with_llm_retry(
+                "transient",
+                None,
+                || {
+                    let attempts = Arc::clone(&observed_attempts);
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        if attempt < 2 {
+                            Err(ai_agents_llm::LLMError::Network(format!(
+                                "attempt-{attempt}"
+                            )))
+                        } else {
+                            Ok("success")
+                        }
+                    }
+                },
+                |_| false,
+            )
+            .await;
+
+        assert_eq!(result.unwrap(), "success");
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn typed_llm_retry_preserves_exhausted_error_variant_and_value() {
+        let manager = RecoveryManager::new(super::super::ErrorRecoveryConfig {
+            default: super::super::RetryConfig {
+                max_retries: 2,
+                backoff: super::super::BackoffConfig {
+                    initial_ms: 0,
+                    max_ms: 0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let attempts = Arc::new(AtomicU32::new(0));
+        let observed_attempts = Arc::clone(&attempts);
+
+        let failure = manager
+            .with_llm_retry(
+                "exhausted",
+                None,
+                || {
+                    let attempts = Arc::clone(&observed_attempts);
+                    async move {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                        Err::<(), _>(ai_agents_llm::LLMError::Network(format!(
+                            "attempt-{attempt}"
+                        )))
+                    }
+                },
+                |_| false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(!failure.is_terminal());
+        assert_eq!(failure.attempts(), 3);
+        assert_eq!(
+            failure.classified().unwrap().error_type,
+            super::super::ErrorType::ConnectionError
+        );
+        assert!(matches!(
+            failure.into_error(),
+            ai_agents_llm::LLMError::Network(message) if message == "attempt-3"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn typed_llm_retry_preserves_non_retryable_error() {
+        let manager = RecoveryManager::default();
+        let failure = manager
+            .with_llm_retry(
+                "config",
+                None,
+                || async {
+                    Err::<(), _>(ai_agents_llm::LLMError::Config(
+                        "invalid typed config".to_string(),
+                    ))
+                },
+                |_| false,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            &failure,
+            RetryFailure::NonRetryable { classified, .. }
+                if classified.error_type == super::super::ErrorType::InvalidRequest
+        ));
+        assert!(matches!(
+            failure.into_error(),
+            ai_agents_llm::LLMError::Config(message) if message == "invalid typed config"
+        ));
     }
 
     #[test]
