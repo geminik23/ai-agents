@@ -247,7 +247,8 @@ use ai_agents_core::{
     ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification, ToolCallSource,
     ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
     ToolExecutionRecord, ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
-    ToolSafetyMetadata,
+    ToolSafetyMetadata, decode_native_tool_call_markers, encode_native_tool_call_markers,
+    encode_native_tool_result_marker, inspect_native_history, native_readable_projection,
 };
 use ai_agents_disambiguation::{
     ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
@@ -278,8 +279,8 @@ use ai_agents_reasoning::{
     ReflectionMetadata, StepFailureAction,
 };
 use ai_agents_recovery::{
-    ByRoleFilter, ContextOverflowAction, FilterConfig, IntoClassifiedError, KeepRecentFilter,
-    LLMFailureAction, MessageFilter, RecoveryManager, SkipPatternFilter, ToolFailureAction,
+    ByRoleFilter, ContextOverflowAction, FilterConfig, KeepRecentFilter, LLMFailureAction,
+    MessageFilter, RecoveryManager, SkipPatternFilter, ToolFailureAction,
 };
 use ai_agents_relationships::RelationshipManager;
 use ai_agents_skills::{SkillDefinition, SkillExecutor, SkillRouter};
@@ -327,6 +328,13 @@ struct MainToolProtocol {
 struct MainProviderResponse {
     response: LLMResponse,
     used_native_tools: bool,
+}
+
+// Tracks the latest committed signed model response only to detect custom-memory loss before continuation; replay data remains owned by memory.
+#[derive(Clone)]
+struct ActiveNativeExchange {
+    exchange_id: String,
+    call_ids: Vec<String>,
 }
 
 //
@@ -596,6 +604,8 @@ pub struct RuntimeAgent {
     active_turn_context: RwLock<Option<TurnOptimizationContext>>,
     /// Tracks whether the root turn already wrote the processed user message.
     root_user_message_committed: AtomicBool,
+    /// Expected signed exchanges for the current root tool loop, accumulated so sequential signatures cannot disappear before continuation.
+    active_native_exchanges: RwLock<Vec<ActiveNativeExchange>>,
     /// Current actor ID for cross-session memory.
     actor_id: RwLock<Option<String>>,
     /// Fact store for managing per-actor extracted facts.
@@ -783,6 +793,7 @@ impl RuntimeAgent {
             redispatch_depth: RwLock::new(0),
             active_turn_context: RwLock::new(None),
             root_user_message_committed: AtomicBool::new(false),
+            active_native_exchanges: RwLock::new(Vec::new()),
             actor_id: RwLock::new(None),
             fact_store: RwLock::new(None),
             fact_extractor: RwLock::new(None),
@@ -1280,6 +1291,7 @@ impl RuntimeAgent {
             if guard.is_none() {
                 self.root_user_message_committed
                     .store(false, Ordering::SeqCst);
+                self.active_native_exchanges.write().clear();
                 let max_calls = self
                     .runtime_config
                     .optimization
@@ -1347,6 +1359,7 @@ impl RuntimeAgent {
             self.root_user_message_committed
                 .store(false, Ordering::SeqCst);
             *self.active_turn_context.write() = None;
+            self.active_native_exchanges.write().clear();
         }
     }
 
@@ -1506,6 +1519,7 @@ impl RuntimeAgent {
                 return Ok(());
             }
         };
+        let messages = Self::readable_native_messages(messages)?;
         let recent: Vec<_> = messages
             .iter()
             .rev()
@@ -1608,6 +1622,7 @@ impl RuntimeAgent {
                 return Ok(());
             }
         };
+        let messages = Self::readable_native_messages(messages)?;
         let storage = self.storage.read().clone();
         let hooks = Arc::clone(&self.hooks);
         let agent_id = self.info.id.clone();
@@ -1849,7 +1864,7 @@ impl RuntimeAgent {
             None => return Ok(vec![]),
         };
 
-        let messages = self.memory.get_messages(None).await?;
+        let messages = Self::readable_native_messages(self.memory.get_messages(None).await?)?;
         let recent: Vec<_> = messages.iter().rev().take(last_n).rev().cloned().collect();
 
         if recent.is_empty() {
@@ -2209,6 +2224,13 @@ impl RuntimeAgent {
             Ok(messages) => messages,
             Err(e) => {
                 warn!(actor = %actor_id, error = %e, "failed to read messages for relationship update");
+                return;
+            }
+        };
+        let messages = match Self::readable_native_messages(messages) {
+            Ok(messages) => messages,
+            Err(error) => {
+                warn!(actor = %actor_id, error = %error, "failed to project native history for relationship update");
                 return;
             }
         };
@@ -2915,6 +2937,7 @@ impl RuntimeAgent {
             disambiguator.clear_pending().await;
         }
         self.memory.restore(snapshot.memory).await?;
+        self.active_native_exchanges.write().clear();
 
         if let (Some(sm), Some(sm_snapshot)) = (&self.state_machine, snapshot.state_machine)
             && !sm_snapshot.current_state.is_empty()
@@ -3334,14 +3357,40 @@ impl RuntimeAgent {
             .sum()
     }
 
-    fn truncate_context(&self, messages: &mut Vec<ChatMessage>, keep_recent: usize) {
+    // Finds a removable prefix that never cuts a signed exchange or leaves signed history without its user boundary.
+    fn native_safe_prefix_at_least(messages: &[ChatMessage], required: usize) -> Result<usize> {
+        let inspection =
+            inspect_native_history(messages).map_err(|error| AgentError::LLM(error.to_string()))?;
+        let has_signed_history = !inspection.exchanges().is_empty();
+        for count in required.min(messages.len())..=messages.len() {
+            if has_signed_history
+                && count < messages.len()
+                && messages[count].role != ai_agents_core::Role::User
+            {
+                continue;
+            }
+            if inspection.is_safe_prefix_len(count)
+                && inspect_native_history(&messages[count..]).is_ok()
+            {
+                return Ok(count);
+            }
+        }
+        Err(AgentError::LLM(
+            "Context limits cannot remove a complete native history prefix".to_string(),
+        ))
+    }
+
+    // Truncates only at a validated native-history boundary so the next provider never sees an orphan call or result.
+    fn truncate_context(&self, messages: &mut Vec<ChatMessage>, keep_recent: usize) -> Result<()> {
         if messages.len() <= keep_recent + 1 {
-            return;
+            return Ok(());
         }
         let system_msg = messages.remove(0);
-        let to_remove = messages.len().saturating_sub(keep_recent);
+        let required = messages.len().saturating_sub(keep_recent);
+        let to_remove = Self::native_safe_prefix_at_least(messages, required)?;
         messages.drain(..to_remove);
         messages.insert(0, system_msg);
+        Ok(())
     }
 
     fn get_filter(&self, config: &FilterConfig) -> Arc<dyn MessageFilter> {
@@ -3372,11 +3421,12 @@ impl RuntimeAgent {
     ) -> Result<()> {
         let system_msg = messages.remove(0);
 
-        let to_summarize_count = messages.len().saturating_sub(keep_recent);
-        if to_summarize_count == 0 {
+        let required = messages.len().saturating_sub(keep_recent);
+        if required == 0 {
             messages.insert(0, system_msg);
             return Ok(());
         }
+        let to_summarize_count = Self::native_safe_prefix_at_least(messages, required)?;
 
         let recent_msgs: Vec<ChatMessage> = messages.drain(to_summarize_count..).collect();
         let mut to_summarize = std::mem::take(messages);
@@ -3392,6 +3442,7 @@ impl RuntimeAgent {
             return Ok(());
         }
 
+        let to_summarize = Self::readable_native_messages(to_summarize)?;
         let conversation_text = to_summarize
             .iter()
             .map(|m| format!("{:?}: {}", m.role, m.content))
@@ -3569,7 +3620,7 @@ impl RuntimeAgent {
 
     async fn build_evaluation_context(&self) -> Result<EvaluationContext> {
         let context = self.build_context_with_overlays();
-        let messages = self.memory.get_messages(Some(10)).await?;
+        let messages = Self::readable_native_messages(self.memory.get_messages(Some(10)).await?)?;
         let tool_history = self.tool_call_history.read().clone();
 
         let (state_name, turn_count, previous_state) = if let Some(ref sm) = self.state_machine {
@@ -3757,14 +3808,12 @@ impl RuntimeAgent {
     }
 
     async fn build_disambiguation_context(&self) -> Result<DisambiguationContext> {
-        let recent_messages: Vec<String> = self
-            .memory
-            .get_messages(Some(5))
-            .await?
-            .iter()
-            .rev()
-            .map(|m| format!("{:?}: {}", m.role, m.content))
-            .collect();
+        let recent_messages: Vec<String> =
+            Self::readable_native_messages(self.memory.get_messages(Some(5)).await?)?
+                .iter()
+                .rev()
+                .map(|m| format!("{:?}: {}", m.role, m.content))
+                .collect();
 
         let current_state = self.current_state().map(|s| s.to_string());
 
@@ -3886,7 +3935,7 @@ impl RuntimeAgent {
                     )));
                 }
                 ContextOverflowAction::Truncate { keep_recent } => {
-                    self.truncate_context(&mut messages, *keep_recent);
+                    self.truncate_context(&mut messages, *keep_recent)?;
                 }
                 ContextOverflowAction::Summarize {
                     summarizer_llm,
@@ -3908,6 +3957,7 @@ impl RuntimeAgent {
             }
         }
 
+        self.validate_active_native_history(&messages, true)?;
         Ok(messages)
     }
 
@@ -4009,7 +4059,7 @@ impl RuntimeAgent {
                     saw_tool_result = true;
                 }
                 ai_agents_core::Role::Assistant if saw_tool_result => {
-                    let Some(calls) = self.parse_tool_calls(&message.content) else {
+                    let Some(calls) = self.parse_tool_calls(&message.content)? else {
                         continue;
                     };
                     let calls_are_effective = !calls.is_empty()
@@ -4158,54 +4208,59 @@ impl RuntimeAgent {
         protocol: &MainToolProtocol,
         corrective: bool,
     ) -> Result<MainProviderResponse> {
-        let primary_result = if self.recovery_manager.config().default.max_retries > 0 {
-            self.recovery_manager
-                .with_retry("llm_call", None, || {
+        // Provider-owned protocol/history failures must remain terminal before generic retry classification or configured fallback can hide corruption.
+        let primary_result = self
+            .recovery_manager
+            .with_llm_retry(
+                "llm_call",
+                None,
+                || {
                     let llm = Arc::clone(&llm);
                     async move {
                         self.invoke_main_provider(llm, messages, protocol, corrective)
                             .await
-                            .map_err(|error| error.classify())
                     }
-                })
-                .await
-                .map_err(|error| AgentError::LLM(error.to_string()))
-        } else {
-            self.invoke_main_provider(Arc::clone(&llm), messages, protocol, corrective)
-                .await
-                .map_err(|error| AgentError::LLM(error.to_string()))
-        };
+                },
+                |error| llm.is_terminal_error(error),
+            )
+            .await;
 
         match primary_result {
             Ok(response) => Ok(response),
-            Err(primary_error) => match &self.recovery_manager.config().llm.on_failure {
-                LLMFailureAction::FallbackLlm { fallback_llm } => {
-                    let fallback = self.llm_registry.get(fallback_llm).map_err(|error| {
-                        AgentError::Config(format!(
-                            "Fallback LLM '{fallback_llm}' not found: {error}"
-                        ))
-                    })?;
-                    self.invoke_main_provider(fallback, messages, protocol, corrective)
-                        .await
-                        .map_err(|error| AgentError::LLM(error.to_string()))
-                }
-                LLMFailureAction::FallbackResponse { message } => {
-                    if matches!(
-                        protocol.choice.as_ref(),
-                        Some(ToolChoice::Required | ToolChoice::Specific(_))
-                    ) {
-                        Err(AgentError::LLM(format!(
-                            "Required tool selection failed and cannot be satisfied by a static fallback response: {primary_error}"
-                        )))
-                    } else {
-                        Ok(MainProviderResponse {
-                            response: LLMResponse::new(message.clone(), FinishReason::Stop),
-                            used_native_tools: false,
-                        })
+            Err(ai_agents_recovery::RetryFailure::Terminal { error, .. }) => {
+                Err(AgentError::LLM(error.to_string()))
+            }
+            Err(failure) => {
+                let primary_error = AgentError::LLM(failure.into_error().to_string());
+                match &self.recovery_manager.config().llm.on_failure {
+                    LLMFailureAction::FallbackLlm { fallback_llm } => {
+                        let fallback = self.llm_registry.get(fallback_llm).map_err(|error| {
+                            AgentError::Config(format!(
+                                "Fallback LLM '{fallback_llm}' not found: {error}"
+                            ))
+                        })?;
+                        self.invoke_main_provider(fallback, messages, protocol, corrective)
+                            .await
+                            .map_err(|error| AgentError::LLM(error.to_string()))
                     }
+                    LLMFailureAction::FallbackResponse { message } => {
+                        if matches!(
+                            protocol.choice.as_ref(),
+                            Some(ToolChoice::Required | ToolChoice::Specific(_))
+                        ) {
+                            Err(AgentError::LLM(format!(
+                                "Required tool selection failed and cannot be satisfied by a static fallback response: {primary_error}"
+                            )))
+                        } else {
+                            Ok(MainProviderResponse {
+                                response: LLMResponse::new(message.clone(), FinishReason::Stop),
+                                used_native_tools: false,
+                            })
+                        }
+                    }
+                    LLMFailureAction::Error => Err(primary_error),
                 }
-                LLMFailureAction::Error => Err(primary_error),
-            },
+            }
         }
     }
 
@@ -4214,31 +4269,25 @@ impl RuntimeAgent {
         mut response: LLMResponse,
         protocol: &MainToolProtocol,
     ) -> Result<(LLMResponse, bool)> {
+        let provider_state = response
+            .take_provider_state()
+            .map_err(|error| AgentError::LLM(error.to_string()))?;
         let native_calls = response
             .tool_calls()
             .map_err(|error| AgentError::LLM(error.to_string()))?;
         let calls = match native_calls {
             Some(calls) => {
-                let markers = calls
-                    .iter()
-                    .map(|call| {
-                        serde_json::json!({
-                            "_ai_agents_native_tool_call": true,
-                            "id": call.id,
-                            "tool": call.name,
-                            "arguments": call.arguments,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                response.content = if markers.len() == 1 {
-                    markers[0].to_string()
-                } else {
-                    serde_json::Value::Array(markers).to_string()
-                };
+                response.content = encode_native_tool_call_markers(&calls, provider_state.as_ref())
+                    .map_err(|error| AgentError::LLM(error.to_string()))?;
                 Some(calls)
             }
+            None if provider_state.is_some() => {
+                return Err(AgentError::LLM(
+                    "Provider returned replay state without native tool calls".to_string(),
+                ));
+            }
             None if !matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) => {
-                self.parse_tool_calls(response.content.trim())
+                self.parse_tool_calls(response.content.trim())?
             }
             None => None,
         };
@@ -4302,64 +4351,143 @@ impl RuntimeAgent {
         ))
     }
 
-    fn is_native_tool_call_content(content: &str) -> bool {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(content) else {
-            return false;
-        };
-        match value {
-            serde_json::Value::Array(values) => {
-                !values.is_empty()
-                    && values.iter().all(|value| {
-                        value
-                            .get("_ai_agents_native_tool_call")
-                            .and_then(|marker| marker.as_bool())
-                            == Some(true)
-                    })
-            }
-            serde_json::Value::Object(map) => {
-                map.get("_ai_agents_native_tool_call")
-                    .and_then(|marker| marker.as_bool())
-                    == Some(true)
-            }
-            _ => false,
-        }
+    /// Recognizes only validated native markers so malformed reserved data cannot fall through to prompt parsing.
+    fn is_native_tool_call_content(content: &str) -> Result<bool> {
+        decode_native_tool_call_markers(content)
+            .map(|batch| batch.is_some())
+            .map_err(|error| AgentError::LLM(error.to_string()))
     }
 
+    /// Encodes native results through the shared history codec while preserving ordinary prompt-protocol messages.
     fn tool_result_message(
         tool_call: &ToolCall,
         output: &str,
         native_tool_call: bool,
-    ) -> ChatMessage {
+    ) -> Result<ChatMessage> {
         if !native_tool_call {
-            return ChatMessage::function(&tool_call.name, output);
+            return Ok(ChatMessage::function(&tool_call.name, output));
         }
         let output = serde_json::from_str::<serde_json::Value>(output)
             .unwrap_or_else(|_| serde_json::Value::String(output.to_string()));
-        ChatMessage::function(
-            &tool_call.name,
-            serde_json::json!({
-                "_ai_agents_native_tool_result": true,
-                "id": tool_call.id,
-                "tool": tool_call.name,
-                "output": output,
-            })
-            .to_string(),
-        )
+        let content = encode_native_tool_result_marker(tool_call, output)
+            .map_err(|error| AgentError::LLM(error.to_string()))?;
+        Ok(ChatMessage::function(&tool_call.name, content))
     }
 
+    // Remembers only committed signed-response identity so custom memory cannot silently erase replay state before continuation.
+    fn remember_active_native_exchange(&self, content: &str) -> Result<()> {
+        let Some(batch) = decode_native_tool_call_markers(content)
+            .map_err(|error| AgentError::LLM(error.to_string()))?
+        else {
+            return Ok(());
+        };
+        let Some(state) = batch.provider_state() else {
+            return Ok(());
+        };
+        let expected = ActiveNativeExchange {
+            exchange_id: state.exchange_id().to_string(),
+            call_ids: batch.calls().iter().map(|call| call.id.clone()).collect(),
+        };
+        let mut active = self.active_native_exchanges.write();
+        if let Some(existing) = active
+            .iter()
+            .find(|existing| existing.exchange_id == expected.exchange_id)
+        {
+            if existing.call_ids != expected.call_ids {
+                return Err(AgentError::LLM(format!(
+                    "Active native exchange '{}' changed its call identities",
+                    expected.exchange_id
+                )));
+            }
+        } else {
+            active.push(expected);
+        }
+        Ok(())
+    }
+
+    // Checks the allocated, overflow-processed message set immediately before a continuation request leaves the runtime.
+    fn validate_active_native_history(
+        &self,
+        messages: &[ChatMessage],
+        require_complete: bool,
+    ) -> Result<()> {
+        let expected = self.active_native_exchanges.read().clone();
+        if expected.is_empty() {
+            return Ok(());
+        }
+        let inspection =
+            inspect_native_history(messages).map_err(|error| AgentError::LLM(error.to_string()))?;
+        let expected_count = expected.len();
+        for (index, expected) in expected.iter().enumerate() {
+            let Some(exchange) = inspection
+                .exchanges()
+                .iter()
+                .find(|exchange| exchange.state().exchange_id() == expected.exchange_id)
+            else {
+                return Err(AgentError::LLM(format!(
+                    "Active native exchange '{}' was removed before provider continuation",
+                    expected.exchange_id
+                )));
+            };
+            let must_be_complete = require_complete || index + 1 < expected_count;
+            if exchange.call_ids() != expected.call_ids
+                || (must_be_complete && !exchange.is_complete())
+            {
+                return Err(AgentError::LLM(format!(
+                    "Active native exchange '{}' is incomplete before provider continuation",
+                    expected.exchange_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // Confirms a custom memory retained the committed assistant marker before any tool side effect is admitted.
+    async fn remember_committed_native_exchange(&self, content: &str) -> Result<()> {
+        self.remember_active_native_exchange(content)?;
+        if !self.active_native_exchanges.read().is_empty() {
+            let messages = self.memory.get_messages(None).await?;
+            self.validate_active_native_history(&messages, false)?;
+        }
+        Ok(())
+    }
+
+    // Removes opaque replay state before messages enter auxiliary semantic systems while leaving stored history untouched.
+    fn readable_native_messages(mut messages: Vec<ChatMessage>) -> Result<Vec<ChatMessage>> {
+        for message in &mut messages {
+            if matches!(
+                message.role,
+                ai_agents_core::Role::Assistant
+                    | ai_agents_core::Role::Tool
+                    | ai_agents_core::Role::Function
+            ) {
+                message.content = native_readable_projection(&message.content)
+                    .map_err(|error| AgentError::LLM(error.to_string()))?;
+            }
+        }
+        Ok(messages)
+    }
+
+    /// Applies tool-choice visibility before parsing validated native markers or legacy prompt JSON.
     fn parse_main_tool_calls(
         &self,
         content: &str,
         protocol: &MainToolProtocol,
-    ) -> Option<Vec<ToolCall>> {
+    ) -> Result<Option<Vec<ToolCall>>> {
         if matches!(protocol.choice.as_ref(), Some(ToolChoice::None)) {
-            None
+            Ok(None)
         } else {
             self.parse_tool_calls(content)
         }
     }
 
-    fn parse_tool_calls(&self, content: &str) -> Option<Vec<ToolCall>> {
+    /// Parses framework native markers before the compatibility prompt-JSON protocol.
+    fn parse_tool_calls(&self, content: &str) -> Result<Option<Vec<ToolCall>>> {
+        if let Some(batch) = decode_native_tool_call_markers(content)
+            .map_err(|error| AgentError::LLM(error.to_string()))?
+        {
+            return Ok(Some(batch.into_parts().0));
+        }
         // Try direct JSON parse first
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
             // Handle JSON array of tool calls (parallel tool calling)
@@ -4369,12 +4497,12 @@ impl RuntimeAgent {
                     .filter_map(|v| self.extract_tool_call_from_value(v))
                     .collect();
                 if !calls.is_empty() {
-                    return Some(calls);
+                    return Ok(Some(calls));
                 }
             }
             // Handle single JSON object
             if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
-                return Some(vec![tool_call]);
+                return Ok(Some(vec![tool_call]));
             }
         }
 
@@ -4389,16 +4517,16 @@ impl RuntimeAgent {
                     .filter_map(|v| self.extract_tool_call_from_value(v))
                     .collect();
                 if !calls.is_empty() {
-                    return Some(calls);
+                    return Ok(Some(calls));
                 }
             }
             // Handle single JSON object
             if let Some(tool_call) = self.extract_tool_call_from_value(&parsed) {
-                return Some(vec![tool_call]);
+                return Ok(Some(vec![tool_call]));
             }
         }
 
-        None
+        Ok(None)
     }
 
     fn extract_tool_call_from_value(&self, parsed: &serde_json::Value) -> Option<ToolCall> {
@@ -9609,7 +9737,7 @@ Respond in JSON format:
             .await?;
         let content = response.content.trim().to_string();
         let (thinking, answer) = self.extract_thinking(&content);
-        if let Some(calls) = self.parse_main_tool_calls(&content, &protocol) {
+        if let Some(calls) = self.parse_main_tool_calls(&content, &protocol)? {
             return Ok(MainResponseDraft::ToolCalls {
                 raw_content: content,
                 calls,
@@ -9794,7 +9922,7 @@ Respond in JSON format:
             let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
             self.hooks.on_llm_complete(&response, llm_duration_ms).await;
             let content = response.content.trim();
-            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol) {
+            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
                 match self
                     .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
                     .await?
@@ -9836,7 +9964,11 @@ Respond in JSON format:
         // Check if a transition should fire before executing the LLM's tool call.
         // If a transition fires, on_enter actions handle the tool call correctly
         // (with proper URLs from YAML), so skip the LLM's tool call.
-        let transition_fired = self.evaluate_transitions(processed_input, content).await?;
+        let transition_content = native_readable_projection(content)
+            .map_err(|error| AgentError::LLM(error.to_string()))?;
+        let transition_fired = self
+            .evaluate_transitions(processed_input, &transition_content)
+            .await?;
         if transition_fired {
             self.memory
                 .add_message(ChatMessage::assistant(
@@ -9850,9 +9982,11 @@ Respond in JSON format:
         self.memory
             .add_message(ChatMessage::assistant(content))
             .await?;
-        let native_tool_call = Self::is_native_tool_call_content(content);
+        self.remember_committed_native_exchange(content).await?;
+        let native_tool_call = Self::is_native_tool_call_content(content)?;
 
         let results = self.execute_tools_parallel(&tool_calls).await;
+        let mut rejection = None;
 
         for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
             match result {
@@ -9862,35 +9996,49 @@ Respond in JSON format:
                             tool_call,
                             &output,
                             native_tool_call,
-                        ))
+                        )?)
                         .await?;
                 }
                 Err(e) => {
-                    // Check if this is a HITL rejection - if so, break the loop
                     if matches!(e, AgentError::HITLRejected(_)) {
-                        self.memory
-                            .add_message(ChatMessage::assistant(format!(
-                                "The operation was rejected by the approver: {}",
-                                e
-                            )))
-                            .await?;
-                        // Return the rejection message to user, don't continue loop
-                        return Ok(ToolCallOutcome::Rejected(AgentResponse {
-                            content: format!("Operation cancelled: {}", e),
-                            metadata: None,
-                            tool_calls: Some(all_tool_calls.clone()),
-                        }));
+                        if !native_tool_call {
+                            self.memory
+                                .add_message(ChatMessage::assistant(format!(
+                                    "The operation was rejected by the approver: {e}"
+                                )))
+                                .await?;
+                            return Ok(ToolCallOutcome::Rejected(AgentResponse {
+                                content: format!("Operation cancelled: {e}"),
+                                metadata: None,
+                                tool_calls: Some(all_tool_calls.clone()),
+                            }));
+                        }
+                        if rejection.is_none() {
+                            rejection = Some(e.to_string());
+                        }
                     }
                     self.memory
                         .add_message(Self::tool_result_message(
                             tool_call,
                             &format!("Error: {}", e),
                             native_tool_call,
-                        ))
+                        )?)
                         .await?;
                 }
             }
             all_tool_calls.push(tool_call.clone());
+        }
+        if let Some(rejection) = rejection {
+            self.memory
+                .add_message(ChatMessage::assistant(format!(
+                    "The operation was rejected by the approver: {rejection}"
+                )))
+                .await?;
+            return Ok(ToolCallOutcome::Rejected(AgentResponse {
+                content: format!("Operation cancelled: {rejection}"),
+                metadata: None,
+                tool_calls: Some(all_tool_calls.clone()),
+            }));
         }
         Ok(ToolCallOutcome::Continue)
     }
@@ -10052,8 +10200,8 @@ Respond in JSON format:
 
             // Check if the post-transition response contains tool calls.
             // If so, execute them and loop so the LLM can summarize the result.
-            if let Some(tool_calls) = self.parse_main_tool_calls(&final_content, &protocol) {
-                let native_tool_call = Self::is_native_tool_call_content(&final_content);
+            if let Some(tool_calls) = self.parse_main_tool_calls(&final_content, &protocol)? {
+                let native_tool_call = Self::is_native_tool_call_content(&final_content)?;
                 debug!(
                     post_iter = post_iter,
                     tools = tool_calls.len(),
@@ -10063,8 +10211,11 @@ Respond in JSON format:
                 self.memory
                     .add_message(ChatMessage::assistant(&final_content))
                     .await?;
+                self.remember_committed_native_exchange(&final_content)
+                    .await?;
 
                 let results = self.execute_tools_parallel(&tool_calls).await;
+                let mut rejection = None;
                 for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
                     match result {
                         Ok(output) => {
@@ -10073,19 +10224,33 @@ Respond in JSON format:
                                     tool_call,
                                     &output,
                                     native_tool_call,
-                                ))
+                                )?)
                                 .await?;
                         }
                         Err(e) => {
+                            if native_tool_call
+                                && rejection.is_none()
+                                && matches!(e, AgentError::HITLRejected(_))
+                            {
+                                rejection = Some(e.to_string());
+                            }
                             self.memory
                                 .add_message(Self::tool_result_message(
                                     tool_call,
                                     &format!("Error: {}", e),
                                     native_tool_call,
-                                ))
+                                )?)
                                 .await?;
                         }
                     }
+                }
+                if let Some(rejection) = rejection {
+                    self.memory
+                        .add_message(ChatMessage::assistant(format!(
+                            "The operation was rejected by the approver: {rejection}"
+                        )))
+                        .await?;
+                    return Err(AgentError::HITLRejected(rejection));
                 }
                 // Loop to let the LLM see the tool result and produce a text response.
                 continue;
@@ -11019,7 +11184,7 @@ Respond in JSON format:
 
             let content = response.content.trim();
 
-            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol) {
+            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
                 match self
                     .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
                     .await?
@@ -11129,7 +11294,7 @@ Respond in JSON format:
         }
         chunks.splice(0..0, buffer.drain());
         let content = accumulated.trim().to_string();
-        let draft = if let Some(calls) = self.parse_tool_calls(&content) {
+        let draft = if let Some(calls) = self.parse_tool_calls(&content)? {
             MainResponseDraft::ToolCalls {
                 raw_content: content,
                 calls,
@@ -11710,11 +11875,31 @@ Respond in JSON format:
                 };
 
                 // Tool call handling
-                if let Some(tool_calls) = self.parse_main_tool_calls(&content, &protocol) {
-                    let native_tool_call = Self::is_native_tool_call_content(&content);
+                let parsed_tool_calls = match self.parse_main_tool_calls(&content, &protocol) {
+                    Ok(calls) => calls,
+                    Err(error) => {
+                        yield StreamChunk::error(error.to_string());
+                        return;
+                    }
+                };
+                if let Some(tool_calls) = parsed_tool_calls {
+                    let native_tool_call = match Self::is_native_tool_call_content(&content) {
+                        Ok(native) => native,
+                        Err(error) => {
+                            yield StreamChunk::error(error.to_string());
+                            return;
+                        }
+                    };
                     // Emit tool events for streaming
                     // First check transitions (same as blocking path)
-                    let transition_fired = match self.evaluate_transitions(processed_input, &content).await {
+                    let transition_content = match native_readable_projection(&content) {
+                        Ok(content) => content,
+                        Err(error) => {
+                            yield StreamChunk::error(error.to_string());
+                            return;
+                        }
+                    };
+                    let transition_fired = match self.evaluate_transitions(processed_input, &transition_content).await {
                         Ok(v) => v,
                         Err(e) => {
                             yield StreamChunk::error(e.to_string());
@@ -11735,10 +11920,18 @@ Respond in JSON format:
                     }
 
                     // Store the assistant's tool-call message (same as blocking path)
-                    let _ = self.memory.add_message(ChatMessage::assistant(&content)).await;
+                    if let Err(error) = self.memory.add_message(ChatMessage::assistant(&content)).await {
+                        yield StreamChunk::error(error.to_string());
+                        return;
+                    }
+                    if let Err(error) = self.remember_committed_native_exchange(&content).await {
+                        yield StreamChunk::error(error.to_string());
+                        return;
+                    }
 
                     // Execute tools with streaming events
                     let results = self.execute_tools_parallel(&tool_calls).await;
+                    let mut rejection = None;
 
                     for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
                         if include_tool_events {
@@ -11755,24 +11948,35 @@ Respond in JSON format:
                                         true,
                                     );
                                 }
-                                let _ = self.memory
-                                    .add_message(Self::tool_result_message(
-                                        tool_call,
-                                        &output,
-                                        native_tool_call,
-                                    ))
-                                    .await;
+                                let result_message = match Self::tool_result_message(
+                                    tool_call,
+                                    &output,
+                                    native_tool_call,
+                                ) {
+                                    Ok(message) => message,
+                                    Err(error) => {
+                                        yield StreamChunk::error(error.to_string());
+                                        return;
+                                    }
+                                };
+                                if let Err(error) = self.memory.add_message(result_message).await {
+                                    yield StreamChunk::error(error.to_string());
+                                    return;
+                                }
                             }
                             Err(e) => {
-                                if matches!(e, AgentError::HITLRejected(_)) {
-                                    let _ = self.memory.add_message(ChatMessage::assistant(
-                                        format!("The operation was rejected by the approver: {}", e),
-                                    )).await;
+                                if matches!(e, AgentError::HITLRejected(_)) && !native_tool_call {
                                     let response = AgentResponse {
-                                        content: format!("Operation cancelled: {}", e),
+                                        content: format!("Operation cancelled: {e}"),
                                         metadata: None,
                                         tool_calls: Some(all_tool_calls.clone()),
                                     };
+                                    if let Err(error) = self.memory.add_message(ChatMessage::assistant(
+                                        format!("The operation was rejected by the approver: {e}"),
+                                    )).await {
+                                        yield StreamChunk::error(error.to_string());
+                                        return;
+                                    }
                                     if let Err(finalize_error) = self.finish_turn_if_root(&response).await {
                                         yield StreamChunk::error(finalize_error.to_string());
                                         return;
@@ -11783,6 +11987,9 @@ Respond in JSON format:
                                     yield StreamChunk::Done {};
                                     return;
                                 }
+                                if rejection.is_none() && matches!(e, AgentError::HITLRejected(_)) {
+                                    rejection = Some(e.to_string());
+                                }
                                 if include_tool_events {
                                     yield StreamChunk::tool_result(
                                         &tool_call.id,
@@ -11791,13 +11998,21 @@ Respond in JSON format:
                                         false,
                                     );
                                 }
-                                let _ = self.memory
-                                    .add_message(Self::tool_result_message(
-                                        tool_call,
-                                        &format!("Error: {}", e),
-                                        native_tool_call,
-                                    ))
-                                    .await;
+                                let result_message = match Self::tool_result_message(
+                                    tool_call,
+                                    &format!("Error: {}", e),
+                                    native_tool_call,
+                                ) {
+                                    Ok(message) => message,
+                                    Err(error) => {
+                                        yield StreamChunk::error(error.to_string());
+                                        return;
+                                    }
+                                };
+                                if let Err(error) = self.memory.add_message(result_message).await {
+                                    yield StreamChunk::error(error.to_string());
+                                    return;
+                                }
                             }
                         }
                         all_tool_calls.push(tool_call.clone());
@@ -11805,6 +12020,28 @@ Respond in JSON format:
                         if include_tool_events {
                             yield StreamChunk::tool_end(&tool_call.id);
                         }
+                    }
+                    if let Some(rejection) = rejection {
+                        if let Err(error) = self.memory.add_message(ChatMessage::assistant(
+                            format!("The operation was rejected by the approver: {rejection}"),
+                        )).await {
+                            yield StreamChunk::error(error.to_string());
+                            return;
+                        }
+                        let response = AgentResponse {
+                            content: format!("Operation cancelled: {rejection}"),
+                            metadata: None,
+                            tool_calls: Some(all_tool_calls.clone()),
+                        };
+                        if let Err(finalize_error) = self.finish_turn_if_root(&response).await {
+                            yield StreamChunk::error(finalize_error.to_string());
+                            return;
+                        }
+                        let legacy_error = response.content.clone();
+                        record_runtime_stream_final(&terminal, response);
+                        yield StreamChunk::error(legacy_error);
+                        yield StreamChunk::Done {};
+                        return;
                     }
                     continue;
                 }
@@ -12361,6 +12598,7 @@ Respond in JSON format:
             disambiguator.clear_pending().await;
         }
         self.memory.clear().await?;
+        self.active_native_exchanges.write().clear();
         *self.iteration_count.write() = 0;
         self.tool_call_history.write().clear();
         if let Some(ref sm) = self.state_machine {
@@ -13071,6 +13309,173 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
+    }
+
+    fn signed_calculator_response(
+        exchange_id: &str,
+        call_id: &str,
+        expression: &str,
+    ) -> LLMResponse {
+        let call = ToolCall {
+            id: call_id.to_string(),
+            name: "calculator".to_string(),
+            arguments: serde_json::json!({"expression": expression}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            exchange_id,
+            "fixture",
+            "native-tools",
+            ai_agents_core::NativeProviderTarget::new("https://fixture.invalid/", "fixture-model")
+                .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "calculator", "args": {"expression": expression}},
+                    "thoughtSignature": format!("signature-{exchange_id}")
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new(call_id, 0).unwrap()],
+        )
+        .unwrap();
+        LLMResponse::new("", FinishReason::ToolCall)
+            .with_provider_state(state)
+            .unwrap()
+            .with_tool_calls(vec![call])
+            .unwrap()
+    }
+
+    struct TerminalHistoryProvider {
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    struct DroppingSignedAssistantMemory {
+        messages: RwLock<Vec<ChatMessage>>,
+    }
+
+    struct DroppingEarlierSequentialMemory {
+        messages: RwLock<Vec<ChatMessage>>,
+        signed_seen: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Memory for DroppingSignedAssistantMemory {
+        async fn add_message(&self, message: ChatMessage) -> Result<()> {
+            let signed = message.role == ai_agents_core::Role::Assistant
+                && ai_agents_core::decode_native_tool_call_markers(&message.content)
+                    .map_err(|error| AgentError::LLM(error.to_string()))?
+                    .is_some_and(|batch| batch.provider_state().is_some());
+            if !signed {
+                self.messages.write().push(message);
+            }
+            Ok(())
+        }
+
+        async fn get_messages(&self, limit: Option<usize>) -> Result<Vec<ChatMessage>> {
+            let messages = self.messages.read();
+            let start = limit
+                .map(|limit| messages.len().saturating_sub(limit))
+                .unwrap_or(0);
+            Ok(messages[start..].to_vec())
+        }
+
+        async fn clear(&self) -> Result<()> {
+            self.messages.write().clear();
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            self.messages.read().len()
+        }
+
+        async fn restore(&self, snapshot: ai_agents_core::MemorySnapshot) -> Result<()> {
+            *self.messages.write() = snapshot.messages;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_memory::Memory for DroppingSignedAssistantMemory {}
+
+    #[async_trait]
+    impl ai_agents_core::Memory for DroppingEarlierSequentialMemory {
+        async fn add_message(&self, message: ChatMessage) -> Result<()> {
+            let signed = message.role == ai_agents_core::Role::Assistant
+                && ai_agents_core::decode_native_tool_call_markers(&message.content)
+                    .map_err(|error| AgentError::LLM(error.to_string()))?
+                    .is_some_and(|batch| batch.provider_state().is_some());
+            let mut messages = self.messages.write();
+            if signed && self.signed_seen.fetch_add(1, Ordering::SeqCst) == 1 {
+                messages.retain(|stored| !stored.content.contains("seq-call-1"));
+            }
+            messages.push(message);
+            Ok(())
+        }
+
+        async fn get_messages(&self, limit: Option<usize>) -> Result<Vec<ChatMessage>> {
+            let messages = self.messages.read();
+            let start = limit
+                .map(|limit| messages.len().saturating_sub(limit))
+                .unwrap_or(0);
+            Ok(messages[start..].to_vec())
+        }
+
+        async fn clear(&self) -> Result<()> {
+            self.messages.write().clear();
+            self.signed_seen.store(0, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            self.messages.read().len()
+        }
+
+        async fn restore(&self, snapshot: ai_agents_core::MemorySnapshot) -> Result<()> {
+            *self.messages.write() = snapshot.messages;
+            self.signed_seen.store(0, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_memory::Memory for DroppingEarlierSequentialMemory {}
+
+    #[async_trait]
+    impl LLMProvider for TerminalHistoryProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LLMError::Serialization(
+                "native history integrity failure".to_string(),
+            ))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Err(LLMError::Serialization(
+                "native history integrity failure".to_string(),
+            ))
+        }
+
+        fn provider_name(&self) -> &str {
+            "terminal-history"
+        }
+
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+
+        fn is_terminal_error(&self, error: &LLMError) -> bool {
+            matches!(error, LLMError::Serialization(_))
+        }
     }
 
     /// Builds a two-state fixture so confirmation ownership can be invalidated by transition.
@@ -14189,13 +14594,32 @@ mod tests {
     async fn native_required_choice_executes_through_the_shared_tool_path() {
         let mut mock = MockLLMProvider::new("native-required");
         mock.set_tool_choice(Some(ToolChoice::Required));
+        let native_call = ToolCall {
+            id: "provider-call-1".to_string(),
+            name: "calculator".to_string(),
+            arguments: serde_json::json!({"expression": "2 + 2"}),
+        };
+        let provider_state = ai_agents_core::NativeProviderState::new(
+            "fixture-exchange-1",
+            "fixture",
+            "native-tools",
+            ai_agents_core::NativeProviderTarget::new("https://fixture.invalid/", "fixture-model")
+                .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "calculator", "args": {"expression": "2 + 2"}},
+                    "thoughtSignature": "fixture-signature"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("provider-call-1", 0).unwrap()],
+        )
+        .unwrap();
         mock.add_response(
             LLMResponse::new("", FinishReason::ToolCall)
-                .with_tool_calls(vec![ToolCall {
-                    id: "provider-call-1".to_string(),
-                    name: "calculator".to_string(),
-                    arguments: serde_json::json!({"expression": "2 + 2"}),
-                }])
+                .with_provider_state(provider_state)
+                .unwrap()
+                .with_tool_calls(vec![native_call])
                 .unwrap(),
         );
         mock.add_response(LLMResponse::new("The answer is 4.", FinishReason::Stop));
@@ -14224,6 +14648,275 @@ mod tests {
             calls[1].request.as_ref().map(|request| &request.choice),
             Some(ToolChoice::Auto)
         ));
+        let replay_batch = calls[1]
+            .messages
+            .iter()
+            .find_map(|message| {
+                ai_agents_core::decode_native_tool_call_markers(&message.content).unwrap()
+            })
+            .expect("signed native call marker must be replayed");
+        assert_eq!(
+            replay_batch.provider_state().unwrap().exchange_id(),
+            "fixture-exchange-1"
+        );
+        assert!(calls[1].messages.iter().any(|message| {
+            ai_agents_core::decode_native_tool_result_markers(&message.content)
+                .is_ok_and(|results| results.is_some())
+        }));
+    }
+
+    #[tokio::test]
+    async fn custom_memory_loss_stops_before_signed_tool_execution() {
+        let mut mock = MockLLMProvider::new("native-custom-memory");
+        mock.set_tool_choice(Some(ToolChoice::Required));
+        let call = ToolCall {
+            id: "provider-call-drop".to_string(),
+            name: "calculator".to_string(),
+            arguments: serde_json::json!({"expression": "3 + 4"}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            "fixture-exchange-drop",
+            "fixture",
+            "native-tools",
+            ai_agents_core::NativeProviderTarget::new("https://fixture.invalid/", "fixture-model")
+                .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "calculator", "args": {"expression": "3 + 4"}},
+                    "thoughtSignature": "fixture-signature-drop"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("provider-call-drop", 0).unwrap()],
+        )
+        .unwrap();
+        mock.add_response(
+            LLMResponse::new("", FinishReason::ToolCall)
+                .with_provider_state(state)
+                .unwrap()
+                .with_tool_calls(vec![call])
+                .unwrap(),
+        );
+        let agent = AgentBuilder::new()
+            .system_prompt("Use the calculator.")
+            .llm(Arc::new(mock))
+            .memory(Arc::new(DroppingSignedAssistantMemory {
+                messages: RwLock::new(Vec::new()),
+            }))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let error = agent.chat("What is 3 + 4?").await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("removed before provider continuation")
+        );
+        assert!(agent.tool_call_history.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sequential_signed_history_validates_every_prior_exchange() {
+        let mut mock = MockLLMProvider::new("native-sequential-memory");
+        mock.set_tool_choice(Some(ToolChoice::Required));
+        mock.add_response(signed_calculator_response(
+            "seq-exchange-1",
+            "seq-call-1",
+            "1 + 1",
+        ));
+        mock.add_response(signed_calculator_response(
+            "seq-exchange-2",
+            "seq-call-2",
+            "2 + 2",
+        ));
+        let agent = AgentBuilder::new()
+            .system_prompt("Use the calculator sequentially.")
+            .llm(Arc::new(mock))
+            .memory(Arc::new(DroppingEarlierSequentialMemory {
+                messages: RwLock::new(Vec::new()),
+                signed_seen: std::sync::atomic::AtomicUsize::new(0),
+            }))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        let error = agent.chat("Calculate twice.").await.unwrap_err();
+
+        assert!(error.to_string().contains("seq-exchange-1"));
+        assert_eq!(agent.tool_call_history.read().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn post_transition_signed_hitl_rejection_stops_before_continuation() {
+        let mut native = MockLLMProvider::new("post-transition-native");
+        native.set_tool_choice(Some(ToolChoice::Auto));
+        let call = ToolCall {
+            id: "post-transition-call".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::json!({"message": "hello"}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            "post-transition-exchange",
+            "fixture",
+            "native-tools",
+            ai_agents_core::NativeProviderTarget::new("https://fixture.invalid/", "fixture-model")
+                .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "echo", "args": {"message": "hello"}},
+                    "thoughtSignature": "post-transition-signature"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("post-transition-call", 0).unwrap()],
+        )
+        .unwrap();
+        native.add_response(
+            LLMResponse::new("", FinishReason::ToolCall)
+                .with_provider_state(state)
+                .unwrap()
+                .with_tool_calls(vec![call])
+                .unwrap(),
+        );
+        let observed_native = native.clone();
+        let yaml = r#"
+name: PostTransitionNativeReject
+system_prompt: test
+tools: [echo]
+hitl:
+  tools:
+    echo:
+      require_approval: true
+states:
+  initial: intake
+  states:
+    intake:
+      prompt: intake
+      transitions:
+        - to: active
+          guard:
+            context:
+              route:
+                eq: active
+    active:
+      prompt: active
+      llm: native
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("stale intake response")))
+            .llm_alias("native", Arc::new(native))
+            .auto_configure_features()
+            .unwrap()
+            .build()
+            .unwrap();
+        agent
+            .set_context("route", serde_json::json!("active"))
+            .unwrap();
+
+        let error = agent.chat("move to active").await.unwrap_err();
+
+        assert!(matches!(error, AgentError::HITLRejected(_)));
+        assert_eq!(observed_native.call_count(), 1);
+    }
+
+    #[test]
+    fn runtime_overflow_removes_a_past_signed_user_turn_as_one_prefix() {
+        let call = ToolCall {
+            id: "overflow-call".to_string(),
+            name: "calculator".to_string(),
+            arguments: serde_json::json!({"expression": "1 + 1"}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            "overflow-exchange",
+            "google",
+            "generateContent",
+            ai_agents_core::NativeProviderTarget::new("https://example.invalid/", "gemini-3")
+                .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "calculator", "args": {"expression": "1 + 1"}},
+                    "thoughtSignature": "overflow-signature"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("overflow-call", 0).unwrap()],
+        )
+        .unwrap();
+        let call_marker = ai_agents_core::encode_native_tool_call_markers(
+            std::slice::from_ref(&call),
+            Some(&state),
+        )
+        .unwrap();
+        let result_marker = ai_agents_core::encode_native_tool_result_marker(
+            &call,
+            serde_json::json!({"result": 2}),
+        )
+        .unwrap();
+        let history = vec![
+            ChatMessage::user("old question"),
+            ChatMessage::assistant(call_marker),
+            ChatMessage::function("calculator", result_marker),
+            ChatMessage::assistant("old answer"),
+            ChatMessage::user("new question"),
+        ];
+
+        let removable = RuntimeAgent::native_safe_prefix_at_least(&history, 1).unwrap();
+
+        assert_eq!(removable, 4);
+    }
+
+    #[test]
+    fn auxiliary_projection_does_not_interpret_user_marker_text() {
+        let user_text = serde_json::json!({
+            "_ai_agents_native_tool_call": true,
+            "id": "",
+            "tool": "user-data",
+            "arguments": {}
+        })
+        .to_string();
+
+        let projected =
+            RuntimeAgent::readable_native_messages(vec![ChatMessage::user(&user_text)]).unwrap();
+
+        assert_eq!(projected[0].content, user_text);
+    }
+
+    #[tokio::test]
+    async fn terminal_provider_history_error_skips_retry_and_static_fallback() {
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let recovery = RecoveryManager::new(ai_agents_recovery::ErrorRecoveryConfig {
+            default: ai_agents_recovery::RetryConfig {
+                max_retries: 3,
+                ..Default::default()
+            },
+            llm: ai_agents_recovery::LLMRecoveryConfig {
+                on_failure: LLMFailureAction::FallbackResponse {
+                    message: "must not be returned".to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let agent = AgentBuilder::new()
+            .system_prompt("Reject corrupted native history.")
+            .llm(Arc::new(TerminalHistoryProvider {
+                calls: Arc::clone(&calls),
+            }))
+            .recovery_manager(recovery)
+            .build()
+            .unwrap();
+
+        let error = agent.chat("continue").await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("native history integrity failure")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

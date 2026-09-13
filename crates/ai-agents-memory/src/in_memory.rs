@@ -6,6 +6,7 @@ use parking_lot::RwLock;
 use ai_agents_core::{ChatMessage, MemorySnapshot, Result};
 
 use super::Memory;
+use super::native::NativeRetentionInspection;
 
 pub struct InMemoryStore {
     messages: Arc<RwLock<Vec<ChatMessage>>>,
@@ -23,6 +24,23 @@ impl InMemoryStore {
     pub fn max_messages(&self) -> usize {
         self.max_messages
     }
+
+    // Computes the complete prefix that can be removed before mutating the store.
+    fn bounded_eviction_count(messages: &[ChatMessage], max_messages: usize) -> Result<usize> {
+        let inspection = NativeRetentionInspection::inspect(messages)?;
+        let required = messages.len().saturating_sub(max_messages);
+        if required == 0 {
+            return Ok(0);
+        }
+        inspection
+            .safe_prefix_len_between(required, messages.len())
+            .ok_or_else(|| {
+                ai_agents_core::AgentError::MemoryError(
+                    "message limit cannot preserve the protected signed native exchange"
+                        .to_string(),
+                )
+            })
+    }
 }
 
 impl Clone for InMemoryStore {
@@ -38,11 +56,11 @@ impl Clone for InMemoryStore {
 impl ai_agents_core::Memory for InMemoryStore {
     async fn add_message(&self, message: ChatMessage) -> Result<()> {
         let mut messages = self.messages.write();
-        messages.push(message);
-
-        while messages.len() > self.max_messages {
-            messages.remove(0);
-        }
+        let mut prospective = messages.clone();
+        prospective.push(message);
+        let evict_count = Self::bounded_eviction_count(&prospective, self.max_messages)?;
+        prospective.drain(..evict_count);
+        *messages = prospective;
 
         Ok(())
     }
@@ -68,17 +86,29 @@ impl ai_agents_core::Memory for InMemoryStore {
     }
 
     async fn restore(&self, snapshot: MemorySnapshot) -> Result<()> {
+        let mut prospective = snapshot.messages;
+        let evict_count = Self::bounded_eviction_count(&prospective, self.max_messages)?;
+        prospective.drain(..evict_count);
         let mut messages = self.messages.write();
-        *messages = snapshot.messages;
-        while messages.len() > self.max_messages {
-            messages.remove(0);
-        }
+        *messages = prospective;
         Ok(())
     }
 
     async fn evict_oldest(&self, count: usize) -> Result<Vec<ChatMessage>> {
         let mut messages = self.messages.write();
-        let evict_count = count.min(messages.len());
+        let requested = count.min(messages.len());
+        let inspection = NativeRetentionInspection::inspect(&messages)?;
+        let evict_count = if requested == 0 {
+            0
+        } else {
+            inspection
+                .safe_prefix_len_between(requested, messages.len())
+                .ok_or_else(|| {
+                    ai_agents_core::AgentError::MemoryError(
+                        "eviction would split the protected signed native exchange".to_string(),
+                    )
+                })?
+        };
         let evicted: Vec<ChatMessage> = messages.drain(..evict_count).collect();
         Ok(evicted)
     }
@@ -90,7 +120,10 @@ impl Memory for InMemoryStore {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_agents_core::{Memory as CoreMemory, Role};
+    use ai_agents_core::{
+        Memory as CoreMemory, NativeCallBinding, NativeProviderState, NativeProviderTarget, Role,
+        ToolCall, encode_native_tool_call_markers, encode_native_tool_result_marker,
+    };
 
     fn make_message(content: &str) -> ChatMessage {
         ChatMessage {
@@ -99,6 +132,38 @@ mod tests {
             name: None,
             timestamp: None,
         }
+    }
+
+    fn signed_exchange(exchange_id: &str) -> (ChatMessage, ChatMessage) {
+        let call = ToolCall {
+            id: format!("{exchange_id}-call"),
+            name: "lookup".to_string(),
+            arguments: serde_json::json!({"query":"fixture"}),
+        };
+        let state = NativeProviderState::new(
+            exchange_id,
+            "google",
+            "generateContent",
+            NativeProviderTarget::new("https://example.invalid/v1beta/", "fixture-model").unwrap(),
+            serde_json::json!({
+                "role":"model",
+                "parts":[{
+                    "functionCall":{"name":"lookup","args":{"query":"fixture"}},
+                    "thoughtSignature":"fixture-signature"
+                }]
+            }),
+            vec![NativeCallBinding::new(&call.id, 0).unwrap()],
+        )
+        .unwrap();
+        (
+            ChatMessage::assistant(
+                encode_native_tool_call_markers(std::slice::from_ref(&call), Some(&state)).unwrap(),
+            ),
+            ChatMessage::function(
+                "lookup",
+                encode_native_tool_result_marker(&call, serde_json::json!({"ok":true})).unwrap(),
+            ),
+        )
     }
 
     #[tokio::test]
@@ -211,5 +276,111 @@ mod tests {
         let remaining = store.get_messages(None).await.unwrap();
         assert_eq!(remaining.len(), 3);
         assert_eq!(remaining[0].content, "msg2");
+    }
+
+    #[tokio::test]
+    async fn signed_add_rejects_limit_that_would_split_protected_turn_atomically() {
+        let store = InMemoryStore::new(2);
+        let (assistant, result) = signed_exchange("active-add");
+        store
+            .add_message(make_message("current user"))
+            .await
+            .unwrap();
+        store.add_message(assistant.clone()).await.unwrap();
+
+        let error = store.add_message(result).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("protected signed native exchange")
+        );
+        let retained = store.get_messages(None).await.unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].content, "current user");
+        assert_eq!(retained[1].content, assistant.content);
+    }
+
+    #[tokio::test]
+    async fn signed_add_evicts_completed_past_turn_as_one_group() {
+        let store = InMemoryStore::new(3);
+        let (assistant, result) = signed_exchange("past-add");
+        store.add_message(make_message("old user")).await.unwrap();
+        store.add_message(assistant).await.unwrap();
+        store.add_message(result).await.unwrap();
+
+        store.add_message(make_message("new user")).await.unwrap();
+
+        let retained = store.get_messages(None).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, "new user");
+    }
+
+    #[tokio::test]
+    async fn signed_restore_failure_leaves_existing_history_unchanged() {
+        let store = InMemoryStore::new(2);
+        store.add_message(make_message("existing")).await.unwrap();
+        let (assistant, result) = signed_exchange("restore-active");
+        let snapshot = MemorySnapshot::new(vec![make_message("restored user"), assistant, result]);
+
+        let error = store.restore(snapshot).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("protected signed native exchange")
+        );
+        let retained = store.get_messages(None).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, "existing");
+    }
+
+    #[tokio::test]
+    async fn signed_eviction_expands_to_complete_past_turn() {
+        let store = InMemoryStore::new(10);
+        let (assistant, result) = signed_exchange("past-evict");
+        store.add_message(make_message("old user")).await.unwrap();
+        store.add_message(assistant).await.unwrap();
+        store.add_message(result).await.unwrap();
+        store.add_message(make_message("new user")).await.unwrap();
+
+        let evicted = store.evict_oldest(1).await.unwrap();
+
+        assert_eq!(evicted.len(), 3);
+        let retained = store.get_messages(None).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].content, "new user");
+    }
+
+    #[tokio::test]
+    async fn signed_eviction_rejects_protected_turn_without_mutation() {
+        let store = InMemoryStore::new(10);
+        let (assistant, result) = signed_exchange("active-evict");
+        store
+            .add_message(make_message("current user"))
+            .await
+            .unwrap();
+        store.add_message(assistant).await.unwrap();
+        store.add_message(result).await.unwrap();
+
+        let before = store.get_messages(None).await.unwrap();
+        let error = store.evict_oldest(1).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("protected signed native exchange")
+        );
+        let after = store.get_messages(None).await.unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>(),
+            before
+                .iter()
+                .map(|message| &message.content)
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -11,6 +11,7 @@ use ai_agents::tools::{
     QuestionHandler, ToolError, ToolSchemaPromptMode, WebSearchProvider, WebSearchRequest,
     WebSearchResponse, WebSearchResultItem, WebSearchSafeSearch, WebSearchTool,
 };
+use ai_agents::{NativeCallBinding, NativeProviderState, NativeProviderTarget};
 
 fn configure_host_integrations(
     agent: &RuntimeAgent,
@@ -80,6 +81,9 @@ fn facade_exposes_reviewed_v1_type_closure() {
     let _ = WebSearchTool::new();
     let _: Option<RuntimeControlHandle> = None;
     let _: Option<AgentStreamEvent> = None;
+    let _: Option<NativeCallBinding> = None;
+    let _: Option<NativeProviderState> = None;
+    let _: Option<NativeProviderTarget> = None;
     type HostIntegrationConfigurator = fn(
         &RuntimeAgent,
         Arc<dyn QuestionHandler>,

@@ -6,6 +6,8 @@ use async_trait::async_trait;
 
 use ai_agents_core::{ChatMessage, LLMProvider, Result, Role};
 
+use super::native::readable_projection;
+
 /// Summarizes conversation messages for memory compression.
 ///
 /// Built-in implementations: `LLMSummarizer` (uses an LLM to generate summaries)
@@ -59,12 +61,13 @@ impl LLMSummarizer {
         self
     }
 
-    fn format_messages(&self, messages: &[ChatMessage]) -> String {
-        messages
+    // Projects replay-bearing markers before building the auxiliary-model prompt.
+    fn format_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        Ok(readable_projection(messages)?
             .iter()
             .map(|m| format!("{}: {}", format_role(&m.role), m.content))
             .collect::<Vec<_>>()
-            .join("\n")
+            .join("\n"))
     }
 }
 
@@ -85,7 +88,7 @@ impl Summarizer for LLMSummarizer {
             return Ok(String::new());
         }
 
-        let conversation = self.format_messages(messages);
+        let conversation = self.format_messages(messages)?;
         let prompt = self
             .prompt_template
             .replace("{conversation}", &conversation);
@@ -136,7 +139,7 @@ pub struct NoopSummarizer;
 #[async_trait]
 impl Summarizer for NoopSummarizer {
     async fn summarize(&self, messages: &[ChatMessage]) -> Result<String> {
-        Ok(messages
+        Ok(readable_projection(messages)?
             .iter()
             .map(|m| m.content.clone())
             .collect::<Vec<_>>()
@@ -152,13 +155,19 @@ mod tests {
 
     struct MockLLMProvider {
         responses: Mutex<Vec<String>>,
+        requests: Mutex<Vec<Vec<ChatMessage>>>,
     }
 
     impl MockLLMProvider {
         fn new(responses: Vec<String>) -> Self {
             Self {
                 responses: Mutex::new(responses),
+                requests: Mutex::new(Vec::new()),
             }
+        }
+
+        fn requests(&self) -> Vec<Vec<ChatMessage>> {
+            self.requests.lock().clone()
         }
     }
 
@@ -166,9 +175,10 @@ mod tests {
     impl LLMProvider for MockLLMProvider {
         async fn complete(
             &self,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             _config: Option<&LLMConfig>,
         ) -> std::result::Result<LLMResponse, LLMError> {
+            self.requests.lock().push(messages.to_vec());
             let response = self
                 .responses
                 .lock()
@@ -208,6 +218,37 @@ mod tests {
         }
     }
 
+    fn signed_assistant_message() -> ChatMessage {
+        use ai_agents_core::{
+            NativeCallBinding, NativeProviderState, NativeProviderTarget, ToolCall,
+            encode_native_tool_call_markers,
+        };
+
+        let call = ToolCall {
+            id: "summary-call".to_string(),
+            name: "lookup".to_string(),
+            arguments: serde_json::json!({"query":"fixture"}),
+        };
+        let state = NativeProviderState::new(
+            "summary-exchange",
+            "google",
+            "generateContent",
+            NativeProviderTarget::new("https://example.invalid/v1beta/", "fixture-model").unwrap(),
+            serde_json::json!({
+                "role":"model",
+                "parts":[{
+                    "functionCall":{"name":"lookup","args":{"query":"fixture"}},
+                    "thoughtSignature":"fixture-signature"
+                }]
+            }),
+            vec![NativeCallBinding::new(&call.id, 0).unwrap()],
+        )
+        .unwrap();
+        ChatMessage::assistant(
+            encode_native_tool_call_markers(std::slice::from_ref(&call), Some(&state)).unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn test_llm_summarizer_basic() {
         let provider = Arc::new(MockLLMProvider::new(vec!["Test summary".to_string()]));
@@ -239,6 +280,49 @@ mod tests {
         let messages = vec![make_message(Role::User, "Test")];
         let summary = summarizer.summarize(&messages).await.unwrap();
         assert_eq!(summary, "Custom summary");
+    }
+
+    #[tokio::test]
+    async fn llm_summarizer_projects_native_provider_state_before_prompting() {
+        let provider = Arc::new(MockLLMProvider::new(vec!["Projected summary".to_string()]));
+        let summarizer = LLMSummarizer::new(provider.clone());
+
+        let summary = summarizer
+            .summarize(&[signed_assistant_message()])
+            .await
+            .unwrap();
+
+        assert_eq!(summary, "Projected summary");
+        let requests = provider.requests();
+        let prompt = &requests[0][0].content;
+        assert!(prompt.contains("native_tool_calls"));
+        assert!(!prompt.contains("fixture-signature"));
+        assert!(!prompt.contains("_ai_agents_provider_state"));
+    }
+
+    #[tokio::test]
+    async fn noop_summarizer_projects_native_provider_state() {
+        let summary = NoopSummarizer
+            .summarize(&[signed_assistant_message()])
+            .await
+            .unwrap();
+
+        assert!(summary.contains("native_tool_calls"));
+        assert!(!summary.contains("fixture-signature"));
+        assert!(!summary.contains("_ai_agents_provider_state"));
+    }
+
+    #[tokio::test]
+    async fn summarizer_does_not_promote_user_marker_text_to_native_history() {
+        let user_marker_text = signed_assistant_message().content;
+
+        let summary = NoopSummarizer
+            .summarize(&[ChatMessage::user(user_marker_text)])
+            .await
+            .unwrap();
+
+        assert!(summary.contains("fixture-signature"));
+        assert!(summary.contains("_ai_agents_provider_state"));
     }
 
     #[tokio::test]

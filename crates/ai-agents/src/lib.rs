@@ -127,8 +127,9 @@ pub mod hooks {
 pub mod llm {
     pub use ai_agents_core::{
         ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
-        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, Role, TaskContext, TokenUsage,
-        ToolChoice, ToolSelection,
+        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, NativeCallBinding,
+        NativeProviderState, NativeProviderTarget, Role, TaskContext, TokenUsage, ToolChoice,
+        ToolSelection,
     };
     pub use ai_agents_llm::LLMRegistry;
     pub use ai_agents_llm::multi::MultiLLMRouter;
@@ -558,7 +559,7 @@ pub use tools::{
 pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
 pub use llm::{
     ChatMessage, LLMProvider, LLMRegistry, LLMResponse, LLMToolDefinition, LLMToolRequest,
-    MultiLLMRouter, Role, ToolChoice,
+    MultiLLMRouter, NativeCallBinding, NativeProviderState, NativeProviderTarget, Role, ToolChoice,
 };
 
 pub use process::{ProcessConfig, ProcessData, ProcessProcessor};

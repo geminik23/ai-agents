@@ -1689,6 +1689,8 @@ fn split_stream_content(content: &str) -> Vec<String> {
 }
 
 /// Synchronized writer shared by every provider targeting one cassette path.
+const RECORD_ERROR_PREFIX: &str = "eval record contract error";
+
 struct CassetteWriter {
     path: PathBuf,
     file: Mutex<File>,
@@ -1744,7 +1746,7 @@ impl CassetteWriter {
     fn write_error(&self, error: impl std::fmt::Display) -> LLMError {
         LLMError::API {
             message: format!(
-                "failed to write LLM cassette '{}': {error}",
+                "{RECORD_ERROR_PREFIX}: failed to write LLM cassette '{}': {error}",
                 self.path.display()
             ),
             status: None,
@@ -1828,6 +1830,11 @@ impl LLMProvider for RecordingLLMProvider {
         self.inner.supports_tool_choice(choice)
     }
 
+    fn is_terminal_error(&self, error: &LLMError) -> bool {
+        matches!(error, LLMError::API { message, .. } if message.starts_with(RECORD_ERROR_PREFIX))
+            || self.inner.is_terminal_error(error)
+    }
+
     async fn complete_stream(
         &self,
         messages: &[ChatMessage],
@@ -1838,8 +1845,9 @@ impl LLMProvider for RecordingLLMProvider {
     > {
         let _ = (messages, config);
         Err(LLMError::API {
-            message: "record mode does not support streaming because the stream cannot be recorded atomically"
-                .to_string(),
+            message: format!(
+                "{RECORD_ERROR_PREFIX}: record mode does not support streaming because the stream cannot be recorded atomically"
+            ),
             status: None,
         })
     }
@@ -2703,6 +2711,60 @@ llm:
         assert_eq!(record.alias, "default");
     }
 
+    #[test]
+    fn cassette_round_trip_preserves_native_provider_state() {
+        let call = ai_agents_core::ToolCall {
+            id: "cassette-call".to_string(),
+            name: "lookup".to_string(),
+            arguments: json!({"query": "history"}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            "cassette-exchange",
+            "google",
+            "generateContent",
+            ai_agents_core::NativeProviderTarget::new(
+                "https://generativelanguage.googleapis.com/v1beta/",
+                "gemini-3.7-flash",
+            )
+            .unwrap(),
+            json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "lookup", "args": {"query": "history"}},
+                    "thoughtSignature": "cassette-fixture-signature"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("cassette-call", 0).unwrap()],
+        )
+        .unwrap();
+        let response = LLMResponse::new("", FinishReason::ToolCall)
+            .with_provider_state(state)
+            .unwrap()
+            .with_tool_calls(vec![call])
+            .unwrap();
+        let record = CassetteRecord {
+            alias: "default".to_string(),
+            model: "gemini-3.7-flash".to_string(),
+            request_hash: "fixture-hash".to_string(),
+            request_hash_version: Some("sha256-v2-tools".to_string()),
+            response,
+        };
+
+        let encoded = serde_json::to_string(&record).unwrap();
+        let restored: CassetteRecord = serde_json::from_str(&encoded).unwrap();
+
+        assert_eq!(
+            restored
+                .response
+                .provider_state()
+                .unwrap()
+                .unwrap()
+                .exchange_id(),
+            "cassette-exchange"
+        );
+        assert!(encoded.contains("cassette-fixture-signature"));
+    }
+
     #[tokio::test]
     async fn recording_preflight_failure_skips_inner_provider() {
         let dir = std::env::temp_dir().join(format!(
@@ -2757,6 +2819,7 @@ llm:
             .unwrap_err();
 
         assert!(error.to_string().contains("failed to write LLM cassette"));
+        assert!(provider.is_terminal_error(&error));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         drop(provider);
         let _ = std::fs::remove_dir_all(dir);
@@ -2868,6 +2931,7 @@ llm:
             Err(error) => error,
         };
         assert!(error.to_string().contains("does not support streaming"));
+        assert!(provider.is_terminal_error(&error));
         assert!(!provider.supports(LLMFeature::Streaming));
         drop(provider);
         let _ = std::fs::remove_dir_all(dir);

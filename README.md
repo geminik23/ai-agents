@@ -17,11 +17,11 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.5**
+> Status: **1.0.6**
 
 ## Features
 
-- **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); named aliases (default, router); auto-fallback on failure
+- **Multi-LLM with fallback** - 12 providers (OpenAI, Anthropic, Google, Ollama, DeepSeek, Groq, Mistral, Cohere, xAI, Phind, OpenRouter, any OpenAI-compatible); first-party Google GenerateContent preserves signed native tool history; named aliases (default, router); auto-fallback on failure
 - **State machine + skills** - hierarchical states, LLM-evaluated transitions, guard-based routing, entry/exit actions, reusable multi-step skills
 - **Built-in tools + MCP** - 30 canonical built-in IDs: `calculator`, `echo`, `datetime`, `json`, `random`, `file`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `patch`, `copy_path`, `move_path`, `delete_path`, `file_list`, `file_info`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `web_search`, `command`, `text`, `template`, `math`, and `http`; connect any MCP server for hundreds more
 - **Tool scoping, selection, policy, and context** - explicit top-level grants, state-level narrowing, opt-in `auto`/`required`/`specific`/`none` tool choice, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
@@ -183,7 +183,7 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 
 | Crate | Role |
 |-------|------|
-| [llm](https://crates.io/crates/llm) | Unified LLM provider interface (OpenAI, Anthropic, Google, Ollama, and more) |
+| [llm](https://crates.io/crates/llm) | Unified backend used for providers other than the normal first-party Google path |
 | [rmcp](https://crates.io/crates/rmcp) | Official Rust SDK for Model Context Protocol (MCP) |
 | [tokio](https://crates.io/crates/tokio) | Async runtime |
 | [minijinja](https://crates.io/crates/minijinja) | Jinja2-compatible template engine for system prompts and spawner templates |

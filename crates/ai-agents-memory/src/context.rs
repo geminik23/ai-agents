@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::native::NativeRetentionInspection;
 use super::token_budget::TokenAllocation;
 use ai_agents_core::{ChatMessage, Role};
 
@@ -14,6 +15,41 @@ fn prefix_at_char_boundary(text: &str, max_chars: usize) -> &str {
         Some((idx, _)) => &text[..idx],
         None => text,
     }
+}
+
+// Selects recent history from safe whole-turn boundaries. A protected signed suffix is retained
+// even when it exceeds the caller's allocation; the runtime performs the final hard-limit check.
+fn recent_suffix_start(messages: &[ChatMessage], token_budget: u32) -> usize {
+    let Ok(inspection) = NativeRetentionInspection::inspect(messages) else {
+        // The Vec-returning public helpers cannot surface malformed history. Keeping all input is
+        // fail-closed with respect to deletion and lets the runtime's checked boundary reject it.
+        return 0;
+    };
+    let mut start = inspection
+        .protected_suffix_start()
+        .unwrap_or(messages.len());
+    let mut used_tokens = messages[start..]
+        .iter()
+        .map(estimate_message_tokens)
+        .fold(0u32, u32::saturating_add);
+
+    while start > 0 {
+        let previous = inspection.previous_safe_prefix_len(start);
+        if previous == start {
+            break;
+        }
+        let group_tokens = messages[previous..start]
+            .iter()
+            .map(estimate_message_tokens)
+            .fold(0u32, u32::saturating_add);
+        if used_tokens.saturating_add(group_tokens) > token_budget {
+            break;
+        }
+        used_tokens = used_tokens.saturating_add(group_tokens);
+        start = previous;
+    }
+
+    start
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -62,6 +98,10 @@ impl ConversationContext {
     }
 
     /// Build LLM messages with per-component token budgets.
+    ///
+    /// Provider-state-bearing native exchanges are selected as complete signed user-turn groups.
+    /// The latest protected group is retained intact even when it exceeds the recent allocation;
+    /// callers that enforce a hard request limit must reject that over-budget result explicitly.
     pub fn to_llm_messages_with_allocation(
         &self,
         allocation: &TokenAllocation,
@@ -92,23 +132,8 @@ impl ConversationContext {
         }
 
         // Recent messages - capped to allocation.recent_messages tokens
-        let mut used_message_tokens = 0u32;
-        let mut messages_to_add: Vec<&ChatMessage> = Vec::new();
-
-        for msg in self.messages.iter().rev() {
-            let tokens = estimate_message_tokens(msg);
-            if used_message_tokens + tokens <= allocation.recent_messages {
-                used_message_tokens += tokens;
-                messages_to_add.push(msg);
-            } else {
-                break;
-            }
-        }
-
-        messages_to_add.reverse();
-        for msg in messages_to_add {
-            result.push(msg.clone());
-        }
+        let recent_start = recent_suffix_start(&self.messages, allocation.recent_messages);
+        result.extend(self.messages[recent_start..].iter().cloned());
 
         // TODO:
         // Facts - reserved for 'Session Management' feature, not injected yet.
@@ -116,6 +141,10 @@ impl ConversationContext {
         result
     }
 
+    /// Build a budgeted prompt without splitting provider-state-bearing signed user turns.
+    ///
+    /// A latest protected signed suffix remains intact when it alone exceeds `max_tokens`; the
+    /// runtime is responsible for rejecting the resulting hard-limit overflow before transport.
     pub fn to_llm_messages_with_budget(&self, max_tokens: u32) -> Vec<ChatMessage> {
         let mut result = Vec::new();
         let mut used_tokens = 0u32;
@@ -134,21 +163,9 @@ impl ConversationContext {
             }
         }
 
-        let mut messages_to_add: Vec<&ChatMessage> = Vec::new();
-        for msg in self.messages.iter().rev() {
-            let tokens = estimate_message_tokens(msg);
-            if used_tokens + tokens <= max_tokens {
-                used_tokens += tokens;
-                messages_to_add.push(msg);
-            } else {
-                break;
-            }
-        }
-
-        messages_to_add.reverse();
-        for msg in messages_to_add {
-            result.push(msg.clone());
-        }
+        let message_budget = max_tokens.saturating_sub(used_tokens);
+        let recent_start = recent_suffix_start(&self.messages, message_budget);
+        result.extend(self.messages[recent_start..].iter().cloned());
 
         result
     }
@@ -228,6 +245,10 @@ pub enum CompressResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ai_agents_core::{
+        NativeCallBinding, NativeProviderState, NativeProviderTarget, ToolCall,
+        encode_native_tool_call_markers, encode_native_tool_result_marker,
+    };
 
     fn make_message(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
@@ -236,6 +257,40 @@ mod tests {
             name: None,
             timestamp: None,
         }
+    }
+
+    fn signed_turn(exchange_id: &str) -> Vec<ChatMessage> {
+        let call = ToolCall {
+            id: format!("{exchange_id}-call"),
+            name: "lookup".to_string(),
+            arguments: serde_json::json!({"query":"fixture"}),
+        };
+        let state = NativeProviderState::new(
+            exchange_id,
+            "google",
+            "generateContent",
+            NativeProviderTarget::new("https://example.invalid/v1beta/", "fixture-model").unwrap(),
+            serde_json::json!({
+                "role":"model",
+                "parts":[{
+                    "functionCall":{"name":"lookup","args":{"query":"fixture"}},
+                    "thoughtSignature":"fixture-signature"
+                }]
+            }),
+            vec![NativeCallBinding::new(&call.id, 0).unwrap()],
+        )
+        .unwrap();
+        vec![
+            make_message(Role::User, "signed user request"),
+            ChatMessage::assistant(
+                encode_native_tool_call_markers(std::slice::from_ref(&call), Some(&state)).unwrap(),
+            ),
+            ChatMessage::function(
+                "lookup",
+                encode_native_tool_result_marker(&call, serde_json::json!({"ok":true})).unwrap(),
+            ),
+            make_message(Role::Assistant, "signed turn final response"),
+        ]
     }
 
     #[test]
@@ -398,6 +453,55 @@ mod tests {
 
         let result = ctx.to_llm_messages_with_allocation(&allocation);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn allocation_does_not_split_completed_signed_turn() {
+        let mut messages = signed_turn("allocation-past");
+        messages.push(make_message(Role::User, "latest"));
+        let latest_tokens = estimate_message_tokens(messages.last().unwrap());
+        let ctx = ConversationContext::with_messages(messages);
+        let allocation = TokenAllocation {
+            summary: 0,
+            recent_messages: latest_tokens,
+            facts: 0,
+            relationships: 0,
+        };
+
+        let selected = ctx.to_llm_messages_with_allocation(&allocation);
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].content, "latest");
+    }
+
+    #[test]
+    fn allocation_keeps_latest_signed_turn_even_when_group_exceeds_budget() {
+        let messages = signed_turn("allocation-active");
+        let ctx = ConversationContext::with_messages(messages.clone());
+        let allocation = TokenAllocation {
+            summary: 0,
+            recent_messages: 1,
+            facts: 0,
+            relationships: 0,
+        };
+
+        let selected = ctx.to_llm_messages_with_allocation(&allocation);
+
+        assert_eq!(selected.len(), messages.len());
+        assert_eq!(selected[0].content, "signed user request");
+        assert!(selected[1].content.contains("fixture-signature"));
+    }
+
+    #[test]
+    fn budget_keeps_latest_signed_turn_even_when_group_exceeds_budget() {
+        let messages = signed_turn("budget-active");
+        let ctx = ConversationContext::with_messages(messages.clone());
+
+        let selected = ctx.to_llm_messages_with_budget(1);
+
+        assert_eq!(selected.len(), messages.len());
+        assert_eq!(selected[0].content, "signed user request");
+        assert!(selected[1].content.contains("fixture-signature"));
     }
 
     #[test]

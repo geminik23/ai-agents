@@ -761,6 +761,12 @@ A streamed eval turn consumes the complete runtime event stream. Content chunks 
 | `record` | Creating or updating a cassette | Requires `--record`, preflights the cassette, calls the real provider, and appends synchronized JSONL records. Streaming is rejected before the call. |
 | `real` | Live provider smoke tests | Requires `--real-llm`, uses the provider configured by the agent YAML, and may incur network cost. |
 
+Native provider replay state is preserved in `LLMResponse` cassette records so a replay can reproduce the exact next-request identity. For Google native tool calls, this includes the original signed model content and therefore may contain opaque `thoughtSignature` values. Treat cassettes and session snapshots as sensitive replay artifacts even when normal JSON/Markdown/JUnit reports are redacted. Reports, observable payloads, judge prompts, and auxiliary model inputs use provider-state-free projections.
+
+Google usage maps `promptTokenCount` to prompt usage and adds `thoughtsTokenCount` to candidate tokens for completion usage. Provider-reported `totalTokenCount` remains authoritative. Scenario token/cost budgets therefore include reported thinking work; SSE cumulative usage is settled once rather than summed per frame. A dry configuration check does not exercise this wire mapping. Use deterministic Google wire/fake-HTTP tests for structure and an explicitly authorized live smoke run for service compatibility.
+
+Scenario budget rejection is a terminal harness decision: runtime retry, fallback providers, and static fallback responses cannot turn an exceeded hard budget into a passing response. Record-mode cassette append/flush errors and the unsupported record-streaming path are terminal for the same reason; a successful paid provider call is not issued again merely because its cassette could not be committed.
+
 ### Mock mode
 
 ```yaml

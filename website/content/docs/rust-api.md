@@ -488,6 +488,32 @@ impl LLMProvider for MyProvider {
 }
 ```
 
+Provider implementations that need opaque state for a native tool continuation can attach a `NativeProviderState` to `LLMResponse`. The provider state records a credential-free target, original provider content, and one binding per normalized runtime call. The runtime moves validated state into its native assistant marker, while memory preserves the signed exchange as one unit and observability uses a state-free projection.
+
+The target constructor accepts a provider-owned canonical destination identity and does not interpret it as a URL. Custom providers must exclude credentials and normalize any transport-specific identity before constructing the target. The first-party Google adapter separately requires an HTTP(S) base URL without user information, query parameters, or fragments. Framework observability and auxiliary model paths remove opaque state, but a custom `AgentHooks::on_llm_complete` implementation is a trusted host integration and may receive the runtime's replay-bearing native marker. Do not log that raw content; apply an application-level projection or record only safe dimensions such as provider, model, call count, and state size.
+
+```rust
+use ai_agents::{
+    NativeCallBinding, NativeProviderState, NativeProviderTarget,
+};
+
+let state = NativeProviderState::new(
+    "provider-response-id",
+    "my-provider",
+    "native-api",
+    NativeProviderTarget::new("https://provider.example/v1/", "model-name")?,
+    original_model_content,
+    vec![NativeCallBinding::new("runtime-call-id", 0)?],
+)?;
+
+let response = response.with_provider_state(state)?;
+# Ok::<(), ai_agents::LLMError>(())
+```
+
+`LLMProvider::is_terminal_error()` defaults to `false`. Override it only for local configuration, protocol, or native-history failures that retry or model/static fallback cannot repair. Wrappers around a provider must delegate this classification to the actual inner provider. Ordinary API, rate-limit, timeout, and transport errors should retain their existing recovery behavior.
+
+For `UnifiedLLMProvider`, normal `provider: google` completion methods use the first-party Google adapter. The public `build_llm()` method deliberately keeps its previous return type and constructs the upstream compatibility backend; direct callers of that escape hatch do not receive first-party Google signed-history handling.
+
 Existing custom providers compile without implementing tool-specific methods. They use the prompt protocol when an agent configures explicit tool choice. A custom provider can opt into native selection by implementing `complete_with_tools()`, returning `true` from `supports_tool_choice()`, and storing normalized calls in `LLMResponse` with `set_tool_calls()` or `with_tool_calls()`. The request uses `LLMToolRequest`, `LLMToolDefinition`, and `ToolChoice`; native calls are still executed only by the runtime's shared executor. `configured_tool_choice()` is optional and returns no override by default.
 
 Wire it in:

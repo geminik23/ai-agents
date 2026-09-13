@@ -23,6 +23,8 @@ tracing = { workspace = true }
 llm = { workspace = true }
 parking_lot = { workspace = true }
 minijinja = { workspace = true }
+reqwest = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }

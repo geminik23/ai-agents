@@ -1,6 +1,7 @@
 use ai_agents_core::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
     LLMToolDefinition, LLMToolRequest, Role, TokenUsage, ToolCall, ToolChoice,
+    native_readable_projection,
 };
 use async_trait::async_trait;
 use futures::stream::StreamExt;
@@ -10,6 +11,8 @@ use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::google::GoogleProvider;
 
 static NEXT_NORMALIZED_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -134,6 +137,7 @@ pub struct UnifiedLLMProvider {
     feature_overrides: HashMap<LLMFeature, bool>,
     tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
+    google: Option<GoogleProvider>,
 }
 
 impl std::fmt::Debug for UnifiedLLMProvider {
@@ -147,6 +151,7 @@ impl std::fmt::Debug for UnifiedLLMProvider {
             .field("feature_overrides", &self.feature_overrides)
             .field("tool_choice", &self.tool_choice)
             .field("client", &"<cached>")
+            .field("google", &self.google)
             .finish()
     }
 }
@@ -509,6 +514,17 @@ impl UnifiedLLMProvider {
             ));
         }
 
+        let google = if provider_type == ProviderType::Google {
+            Some(GoogleProvider::new(
+                model.to_string(),
+                actual_api_key.clone(),
+                actual_base_url.clone(),
+                default_config.clone(),
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             provider_type,
             model: model.to_string(),
@@ -518,6 +534,7 @@ impl UnifiedLLMProvider {
             feature_overrides: HashMap::new(),
             tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            google,
         })
     }
 
@@ -542,16 +559,25 @@ impl UnifiedLLMProvider {
 
     pub fn with_feature_override(mut self, feature: LLMFeature, enabled: bool) -> Self {
         self.feature_overrides.insert(feature, enabled);
+        if let Some(google) = &mut self.google {
+            google.set_feature_override(feature, enabled);
+        }
         self
     }
 
     pub fn with_feature_overrides(mut self, overrides: HashMap<LLMFeature, bool>) -> Self {
         self.feature_overrides.extend(overrides);
+        if let Some(google) = &mut self.google {
+            google.set_feature_overrides(&self.feature_overrides);
+        }
         self
     }
 
     pub fn with_tool_choice(mut self, choice: ToolChoice) -> Self {
-        self.tool_choice = Some(choice);
+        self.tool_choice = Some(choice.clone());
+        if let Some(google) = &mut self.google {
+            google.set_tool_choice(choice);
+        }
         self
     }
 
@@ -562,6 +588,20 @@ impl UnifiedLLMProvider {
             self.base_url.as_deref(),
             err,
         )
+    }
+
+    /// Removes replay-only state before a non-Google backend sees history while leaving caller-owned messages unchanged.
+    fn project_foreign_messages(messages: &[ChatMessage]) -> Result<Vec<ChatMessage>, LLMError> {
+        messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                if matches!(message.role, Role::Assistant | Role::Tool | Role::Function) {
+                    message.content = native_readable_projection(&message.content)?;
+                }
+                Ok(message)
+            })
+            .collect()
     }
 
     /// Convert a non-system ChatMessage to llm::chat::ChatMessage.
@@ -999,8 +1039,12 @@ impl LLMProvider for UnifiedLLMProvider {
         messages: &[ChatMessage],
         config: Option<&LLMConfig>,
     ) -> Result<LLMResponse, LLMError> {
+        if let Some(google) = &self.google {
+            return google.complete(messages, config).await;
+        }
+        let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
-        let (system_prompt, non_system_msgs) = extract_system_and_messages(messages);
+        let (system_prompt, non_system_msgs) = extract_system_and_messages(&projected_messages);
 
         let llm_messages: Vec<llm::chat::ChatMessage> = non_system_msgs
             .iter()
@@ -1046,6 +1090,10 @@ impl LLMProvider for UnifiedLLMProvider {
         config: Option<&LLMConfig>,
         request: &LLMToolRequest,
     ) -> Result<LLMResponse, LLMError> {
+        if let Some(google) = &self.google {
+            return google.complete_with_tools(messages, config, request).await;
+        }
+        let projected_messages = Self::project_foreign_messages(messages)?;
         let choice = &request.choice;
         if !self.supports_tool_choice(choice) {
             return Err(LLMError::Config(format!(
@@ -1069,7 +1117,7 @@ impl LLMProvider for UnifiedLLMProvider {
             )));
         }
 
-        let (system_prompt, non_system_msgs) = extract_system_and_messages(messages);
+        let (system_prompt, non_system_msgs) = extract_system_and_messages(&projected_messages);
         let llm_messages = self.convert_messages_with_tools(&non_system_msgs)?;
         let tools = request
             .tools
@@ -1123,8 +1171,12 @@ impl LLMProvider for UnifiedLLMProvider {
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
     {
+        if let Some(google) = &self.google {
+            return google.complete_stream(messages, config).await;
+        }
+        let projected_messages = Self::project_foreign_messages(messages)?;
         // Separate system messages from non-system messages
-        let (system_prompt, non_system_msgs) = extract_system_and_messages(messages);
+        let (system_prompt, non_system_msgs) = extract_system_and_messages(&projected_messages);
 
         let llm_messages: Vec<llm::chat::ChatMessage> = non_system_msgs
             .iter()
@@ -1241,6 +1293,12 @@ impl LLMProvider for UnifiedLLMProvider {
             // capabilities depend on the actual server. Users can check at runtime.
             _ => false,
         }
+    }
+
+    fn is_terminal_error(&self, error: &LLMError) -> bool {
+        self.google
+            .as_ref()
+            .is_some_and(|google| google.is_terminal_error(error))
     }
 }
 
@@ -1917,6 +1975,61 @@ mod tests {
         ] {
             assert!(!test_provider(provider_type).supports_tool_choice(&ToolChoice::Auto));
         }
+    }
+
+    #[test]
+    fn test_google_terminal_error_classification_delegates_to_first_party_backend() {
+        let google = test_provider(ProviderType::Google);
+        assert!(google.is_terminal_error(&LLMError::Config("bad config".to_string())));
+        assert!(google.is_terminal_error(&LLMError::Serialization("bad history".to_string())));
+        assert!(!google.is_terminal_error(&LLMError::Network("temporary".to_string())));
+
+        let openai = test_provider(ProviderType::OpenAI);
+        assert!(!openai.is_terminal_error(&LLMError::Config("legacy".to_string())));
+    }
+
+    #[test]
+    fn non_google_projection_removes_signed_provider_state_without_mutating_history() {
+        let call = ToolCall {
+            id: "foreign-call".to_string(),
+            name: "lookup".to_string(),
+            arguments: serde_json::json!({"query": "safe"}),
+        };
+        let state = ai_agents_core::NativeProviderState::new(
+            "foreign-exchange",
+            "google",
+            "generateContent",
+            ai_agents_core::NativeProviderTarget::new(
+                "https://generativelanguage.googleapis.com/v1beta/",
+                "gemini-3.7-flash",
+            )
+            .unwrap(),
+            serde_json::json!({
+                "role": "model",
+                "parts": [{
+                    "functionCall": {"name": "lookup", "args": {"query": "safe"}},
+                    "thoughtSignature": "must-not-reach-foreign-provider"
+                }]
+            }),
+            vec![ai_agents_core::NativeCallBinding::new("foreign-call", 0).unwrap()],
+        )
+        .unwrap();
+        let marker =
+            ai_agents_core::encode_native_tool_call_markers(&[call], Some(&state)).unwrap();
+        let original = vec![ChatMessage::assistant(marker)];
+
+        let projected = UnifiedLLMProvider::project_foreign_messages(&original).unwrap();
+
+        assert!(
+            !projected[0]
+                .content
+                .contains("must-not-reach-foreign-provider")
+        );
+        assert!(
+            original[0]
+                .content
+                .contains("must-not-reach-foreign-provider")
+        );
     }
 
     #[test]
