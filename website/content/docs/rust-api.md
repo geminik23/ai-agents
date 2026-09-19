@@ -227,7 +227,7 @@ while let Some(chunk) = stream.next().await {
 }
 ```
 
-When the selected LLM has explicit `tool_choice`, the runtime buffers that provider decision before emitting committed content or the existing `ToolCallStart`, `ToolCallEnd`, and `ToolResult` events. v1 does not expose provider-native incremental tool-call deltas as a separate API; agents that omit `tool_choice` keep the existing streaming path. The legacy `chat_stream()` contract remains available and still ends with `StreamChunk::Done {}`.
+When the selected LLM has explicit `tool_choice`, the runtime buffers that provider decision before emitting committed content or the existing `ToolCallStart`, `ToolCallEnd`, and `ToolResult` events. v1 does not expose provider-native incremental tool-call deltas as a separate API; agents that omit `tool_choice` keep the existing streaming path. Tool events are delivered after the tool batch completes; `ToolCallStart` events are emitted in admission order before any `ToolResult`, so they mark when each call was admitted rather than when it finished. Opening the main stream applies the configured LLM retry and `on_failure` fallback policy exactly like blocking execution; a provider failure after the first visible delta is terminal for that turn. Rejected input finalizes the turn as an authoritative response rather than a stream error, and disambiguation clarification responses carry the same `options` and `detection` metadata in `Final` as `chat()` returns. The legacy `chat_stream()` contract remains available and still ends with `StreamChunk::Done {}`.
 
 Use the complete event stream when the caller needs the authoritative final content, metadata, or committed tool-call records:
 

@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.6**
+> Status: **1.0.7**
 
 ## Features
 

@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 1.0.7 - 2026-09-19
+
+### Fixed
+- Streaming recovery: the main streaming provider call now applies the configured LLM retry and `on_failure` fallback policy when opening the stream; failures after the first visible delta remain terminal
+- Speculative branches: when skills are defined but no skill branch is scheduled (`speculative_skill_routing` off, capacity, or schedule failure), skill selection runs serially after transition routing resolves instead of committing a main draft that bypasses skills; parallel transition speculation is preserved
+- Buffered streaming routing: `buffer_until_routing_done` falls back to the serial path when reasoning is enabled, and resolves skill selection before releasing the buffer when skills are defined, so committed responses match blocking execution
+- Streaming transitions: post-response transitions with regeneration disabled no longer emit the committed content a second time
+- Streaming input rejection: rejected input finalizes the turn as an authoritative response instead of a stream error, matching blocking execution
+- Streaming clarification metadata: event-stream `Final` responses for disambiguation questions carry the same options and detection metadata as blocking responses
+- Streaming skill clarification: confirmation questions are recorded in memory under the same condition as blocking execution
+- Streaming preflight: pre-response deterministic transitions run under `buffer_until_routing_done` as well as `preflight_only`
+- Streaming tool events: `ToolCallStart` is emitted in admission order before results; memory write failures surface as stream errors instead of being ignored
+
+### Changed
+- Runtime internals: blocking and streaming loops share tool-call handling, post-loop application, skill commit, and the disambiguation gate
+
 ## 1.0.6 - 2026-09-13
 
 ### Changed

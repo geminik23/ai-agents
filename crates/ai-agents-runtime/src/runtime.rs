@@ -242,18 +242,18 @@ use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
 use ai_agents_core::traits::storage::StorageCapability;
 use ai_agents_core::{
-    AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMError, LLMProvider,
-    LLMResponse, LLMToolDefinition, LLMToolRequest, PermissionOutcome, Result, ToolActorContext,
-    ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification, ToolCallSource,
-    ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
+    AgentError, AgentSnapshot, AgentStorage, ChatMessage, FinishReason, LLMChunk, LLMError,
+    LLMFeature, LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, PermissionOutcome,
+    Result, ToolActorContext, ToolApprovalRecord, ToolApprovalStatus, ToolCallClassification,
+    ToolCallSource, ToolCancellationToken, ToolChoice, ToolExecutionContext, ToolExecutionLimits,
     ToolExecutionRecord, ToolExecutionRequest, ToolInvoker, ToolPolicyDecisionRecord, ToolResult,
     ToolSafetyMetadata, decode_native_tool_call_markers, encode_native_tool_call_markers,
     encode_native_tool_result_marker, inspect_native_history, native_readable_projection,
 };
 use ai_agents_disambiguation::{
-    ClarificationObserver, ClarificationParseFuture, ClarificationQuestionFuture,
-    ConfirmationParseFuture, DisambiguationConfig, DisambiguationContext, DisambiguationManager,
-    DisambiguationResult,
+    AmbiguityDetectionResult, ClarificationObserver, ClarificationParseFuture,
+    ClarificationQuestion, ClarificationQuestionFuture, ConfirmationParseFuture,
+    DisambiguationConfig, DisambiguationContext, DisambiguationManager, DisambiguationResult,
 };
 use ai_agents_hitl::{
     ApprovalHandler, ApprovalResolvedOutcome, ApprovalResult, ApprovalTrigger, HITLCheckResult,
@@ -328,6 +328,15 @@ struct MainToolProtocol {
 struct MainProviderResponse {
     response: LLMResponse,
     used_native_tools: bool,
+}
+
+//
+// Result of opening the main streaming provider call after recovery policy is applied.
+// A static fallback response is carried as text so the caller can emit it as one chunk and continue the shared post-response pipeline.
+//
+enum MainStreamSource {
+    Stream(Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>),
+    StaticResponse(String),
 }
 
 // Tracks the latest committed signed model response only to detect custom-memory loss before continuation; replay data remains owned by memory.
@@ -413,14 +422,41 @@ enum ParallelTransitionSelection {
 }
 
 /// Outcome of post_loop_processing - drives the caller's next step.
+//
+// Result of the root-turn disambiguation gate before input processing.
+// The gate owns clarification/confirmation questions as terminal responses and returns the input the internal loop must run on otherwise.
+//
+enum DisambiguationDispatch {
+    /// Run the internal loop on this (possibly enriched or replaced) input.
+    Proceed(String),
+    /// The turn ends here with an already-finalized response.
+    Terminal(AgentResponse),
+    /// A skill-level clarification resolved; re-check the skill before routing.
+    RecheckSkill {
+        skill_id: String,
+        enriched_input: String,
+        disambiguation_epoch: u64,
+        state_generation: Option<u64>,
+    },
+}
+
 enum PostLoopResult {
     /// No transition fired. Content is the LLM response for this turn.
     NoTransition(String),
-    /// Transition fired. Content is from plain post-transition re-generation.
-    Transitioned(String),
+    /// Transition fired.
+    /// `regenerated == false` means content is byte-identical to the input: the caller must not emit it again.
+    Transitioned { content: String, regenerated: bool },
     /// Transition fired into a state that requires full dispatch.
     /// Caller re-enters run_loop_internal to apply the correct handler.
     NeedsRedispatch,
+}
+
+/// Outcome of applying a `PostLoopResult`, shared by the blocking and streaming loops.
+struct AppliedPostLoop {
+    content: String,
+    transitioned: bool,
+    /// True when `content` replaces what the consumer already saw; false when it is byte-identical to the pre-transition content.
+    regenerated: bool,
 }
 
 struct StateTransitionReservation<'a> {
@@ -4351,6 +4387,84 @@ impl RuntimeAgent {
         ))
     }
 
+    /// Opens the main streaming provider call with the same retry, terminal-error, and `on_failure` policy as `complete_main_llm_with_recovery`.
+    ///
+    /// Recovery applies only to opening the stream. Once a delta has been yielded to the consumer the provider stream is terminal for this call:
+    /// retrying after visible output would duplicate or replace text the consumer already displayed.
+    /// Callers reach this path only when `protocol.choice.is_none()`; explicit tool choice buffers through the blocking helper instead,
+    /// so the blocking helper's "static fallback cannot satisfy required tool choice" rejection is not needed here.
+    async fn open_main_stream_with_recovery(
+        &self,
+        llm: Arc<dyn LLMProvider>,
+        messages: &[ChatMessage],
+        protocol: &MainToolProtocol,
+    ) -> Result<MainStreamSource> {
+        debug_assert!(
+            protocol.choice.is_none(),
+            "streaming raw path must not run with explicit tool choice"
+        );
+        let primary = self
+            .recovery_manager
+            .with_llm_retry(
+                "llm_stream_open",
+                None,
+                || {
+                    let llm = Arc::clone(&llm);
+                    async move {
+                        self.observe_purpose(
+                            ObservationPurpose::MainResponse,
+                            llm.complete_stream(messages, None),
+                        )
+                        .await
+                    }
+                },
+                |error| llm.is_terminal_error(error),
+            )
+            .await;
+
+        match primary {
+            Ok(stream) => Ok(MainStreamSource::Stream(stream)),
+            Err(ai_agents_recovery::RetryFailure::Terminal { error, .. }) => {
+                Err(AgentError::LLM(error.to_string()))
+            }
+            Err(failure) => {
+                let primary_error = AgentError::LLM(failure.into_error().to_string());
+                match &self.recovery_manager.config().llm.on_failure {
+                    LLMFailureAction::FallbackLlm { fallback_llm } => {
+                        let fallback = self.llm_registry.get(fallback_llm).map_err(|error| {
+                            AgentError::Config(format!(
+                                "Fallback LLM '{fallback_llm}' not found: {error}"
+                            ))
+                        })?;
+                        if fallback.supports(LLMFeature::Streaming) {
+                            let stream = self
+                                .observe_purpose(
+                                    ObservationPurpose::MainResponse,
+                                    fallback.complete_stream(messages, None),
+                                )
+                                .await
+                                .map_err(|error| AgentError::LLM(error.to_string()))?;
+                            Ok(MainStreamSource::Stream(stream))
+                        } else {
+                            let response = self
+                                .observe_purpose(
+                                    ObservationPurpose::MainResponse,
+                                    fallback.complete(messages, None),
+                                )
+                                .await
+                                .map_err(|error| AgentError::LLM(error.to_string()))?;
+                            Ok(MainStreamSource::StaticResponse(response.content))
+                        }
+                    }
+                    LLMFailureAction::FallbackResponse { message } => {
+                        Ok(MainStreamSource::StaticResponse(message.clone()))
+                    }
+                    LLMFailureAction::Error => Err(primary_error),
+                }
+            }
+        }
+    }
+
     /// Recognizes only validated native markers so malformed reserved data cannot fall through to prompt parsing.
     fn is_native_tool_call_content(content: &str) -> Result<bool> {
         decode_native_tool_call_markers(content)
@@ -6505,6 +6619,59 @@ impl RuntimeAgent {
         }
     }
 
+    // Only an open clarification question is written to history; a confirmation question is owned by the
+    // disambiguation manager until the next turn confirms it. Shared by the serial, speculative, and streaming paths.
+    fn skill_clarification_needs_memory_record(response: &AgentResponse) -> bool {
+        response
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("disambiguation"))
+            .and_then(|d| d.get("status"))
+            .and_then(|s| s.as_str())
+            == Some("awaiting_clarification")
+    }
+
+    //
+    // Commits a skill candidate that won selection over a main response draft.
+    // Shared by the blocking speculative path and buffered streaming so both finalize a skill turn identically:
+    // user message commit, skill commit (which may open clarification), memory record, and root-turn finish.
+    // Returns None only for the defensive NoMatch case; callers then fall back to the serial path.
+    //
+    async fn commit_winning_skill_candidate(
+        &self,
+        candidate: SkillCandidate,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+    ) -> Result<Option<AgentResponse>> {
+        self.commit_root_user_message(processed_input).await?;
+        match self
+            .commit_skill_candidate_route_result(candidate, processed_input)
+            .await?
+        {
+            SkillRouteResult::Response { skill_id, content } => self
+                .handle_skill_response(processed_input, &skill_id, content, input_context)
+                .await
+                .map(Some),
+            SkillRouteResult::NeedsClarification {
+                response,
+                ownership,
+            } => {
+                let admission = self
+                    .admit_optional_disambiguation_ownership(ownership)
+                    .await?;
+                if Self::skill_clarification_needs_memory_record(&response) {
+                    self.memory
+                        .add_message(ChatMessage::assistant(&response.content))
+                        .await?;
+                }
+                drop(admission);
+                self.finish_turn_if_root(&response).await?;
+                Ok(Some(response))
+            }
+            SkillRouteResult::NoMatch => Ok(None),
+        }
+    }
+
     /// Execute a skill with reasoning and reflection, returning the response string.
     async fn execute_skill(&self, skill: &SkillDefinition, input: &str) -> Result<String> {
         if let Some(ref executor) = self.skill_executor {
@@ -7410,7 +7577,9 @@ OVERALL: PASS/FAIL"#,
         let mut skill_pending = skill_enabled;
         let mut reasoning_pending = reasoning_enabled;
         let mut transition_finalized = !transition_enabled;
-        let mut skill_finalized = !skill_enabled;
+        // Skills that exist without a scheduled skill branch are resolved serially inside the loop below,
+        // so they start unfinalized; only "no skill branch and no skills at all" is finalized up front.
+        let mut skill_finalized = !skill_enabled && self.skill_router.is_none();
         let mut reasoning_finalized = !reasoning_enabled;
         let mut main_result: Option<Result<MainResponseDraft>> = None;
         let mut transition_candidate: Option<TransitionCandidate> = None;
@@ -7494,15 +7663,43 @@ OVERALL: PASS/FAIL"#,
                 transition_finalized = true;
             }
 
+            //
+            // Skills exist but no skill branch was scheduled (flag off, capacity, or schedule failure).
+            // Committing the main draft here would bypass skill routing, so resolve skill selection serially at the same point
+            // where the parallel branch result would have been consumed. Selection is side-effect free; commit still happens
+            // only through the shared skill-commit block below, preserving the "exactly one committed path" contract.
+            // Ordering matches the serial loop: transition → skill → reasoning → main. Waiting for transition resolution first
+            // avoids a router call that a winning transition would make irrelevant.
+            //
+            if transition_finalized
+                && !skill_finalized
+                && !skill_enabled
+                && self.skill_router.is_some()
+            {
+                match self.select_skill_candidate(processed_input).await {
+                    Ok(Some(candidate)) => skill_candidate = Some(candidate),
+                    Ok(None) => {}
+                    Err(error) => {
+                        // Serial selection failure ends the turn exactly as the serial path would.
+                        self.finalize_pending_branches(branch_set.cancel_pending());
+                        return Err(error);
+                    }
+                }
+                skill_finalized = true;
+            }
+
             if transition_finalized && skill_candidate.is_some() {
                 let candidate = skill_candidate.take().unwrap();
-                self.finalize_optional_branch(
-                    &skill_id,
-                    RuntimeOptimizationKind::SpeculativeSkillRouting,
-                    RuntimeCommitBehavior::SkillSelection,
-                    "committed",
-                    true,
-                );
+                // Branch telemetry exists only when a skill branch actually ran; serial selection has no branch to finalize.
+                if skill_enabled {
+                    self.finalize_optional_branch(
+                        &skill_id,
+                        RuntimeOptimizationKind::SpeculativeSkillRouting,
+                        RuntimeCommitBehavior::SkillSelection,
+                        "committed",
+                        true,
+                    );
+                }
                 if !main_pending {
                     self.finalize_branch_loss(
                         &main_id,
@@ -7522,40 +7719,9 @@ OVERALL: PASS/FAIL"#,
                     );
                 }
                 self.finalize_pending_branches(branch_set.cancel_pending());
-                self.commit_root_user_message(processed_input).await?;
-                return match self
-                    .commit_skill_candidate_route_result(candidate, processed_input)
-                    .await?
-                {
-                    SkillRouteResult::Response { skill_id, content } => self
-                        .handle_skill_response(processed_input, &skill_id, content, input_context)
-                        .await
-                        .map(Some),
-                    SkillRouteResult::NeedsClarification {
-                        response,
-                        ownership,
-                    } => {
-                        let admission = self
-                            .admit_optional_disambiguation_ownership(ownership)
-                            .await?;
-                        if response
-                            .metadata
-                            .as_ref()
-                            .and_then(|m| m.get("disambiguation"))
-                            .and_then(|d| d.get("status"))
-                            .and_then(|s| s.as_str())
-                            == Some("awaiting_clarification")
-                        {
-                            self.memory
-                                .add_message(ChatMessage::assistant(&response.content))
-                                .await?;
-                        }
-                        drop(admission);
-                        self.finish_turn_if_root(&response).await?;
-                        Ok(Some(response))
-                    }
-                    SkillRouteResult::NoMatch => Ok(None),
-                };
+                return self
+                    .commit_winning_skill_candidate(candidate, processed_input, input_context)
+                    .await;
             }
 
             if transition_finalized
@@ -8952,9 +9118,297 @@ Respond in JSON format:
         }
     }
 
+    /// Builds the terminal clarification response shared by the blocking and streaming disambiguation gate.
+    /// Metadata carries the options and detection so event-stream consumers receive the same authoritative shape as `chat()`.
+    fn disambiguation_question_response(
+        question: &ClarificationQuestion,
+        detection: &AmbiguityDetectionResult,
+        awaiting_confirmation: bool,
+    ) -> AgentResponse {
+        let status = if awaiting_confirmation {
+            "awaiting_confirmation"
+        } else {
+            "awaiting_clarification"
+        };
+        AgentResponse::new(&question.question).with_metadata(
+            "disambiguation",
+            serde_json::json!({
+                "status": status,
+                "options": question.options,
+                "clarifying": question.clarifying,
+                "detection": {
+                    "type": detection.ambiguity_type,
+                    "confidence": detection.confidence,
+                    "what_is_unclear": detection.what_is_unclear,
+                }
+            }),
+        )
+    }
+
+    /// Runs the disambiguation gate for one root turn and finalizes any terminal clarification response.
+    ///
+    /// Shared by `run_loop` and `run_loop_stream`. Every clarification or required confirmation is returned as its own
+    /// terminal root response before redispatch; the manager retains resolved input and pending skill ownership until a
+    /// later turn explicitly confirms it. Every branch that returns `Terminal` has already committed memory and called
+    /// `finish_turn_if_root`; the caller only has to surface the response. A failed redispatch admission clears
+    /// `pending_skill_id` in every branch so no stale skill ownership survives the error.
+    ///
+    /// `Proceed` carries the input the internal loop must run on. Some branches (`Abandoned` with a replacement input)
+    /// have already committed the original user message before returning it; the internal loop's own commit is then a no-op
+    /// because `root_user_message_committed` is set. Callers must not reset root-turn state between this call and the loop.
+    async fn resolve_disambiguation(&self, input: &str) -> Result<DisambiguationDispatch> {
+        let Some(ref disambiguator) = self.disambiguation_manager else {
+            return Ok(DisambiguationDispatch::Proceed(input.to_string()));
+        };
+        let disambiguation_context = self.build_disambiguation_context().await?;
+
+        // Get state-level disambiguation override
+        let state_override = self
+            .state_machine
+            .as_ref()
+            .and_then(|sm| sm.current_definition())
+            .and_then(|def| def.disambiguation.clone());
+
+        let state_generation = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| state_machine.generation());
+        let disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+        let mut disambiguation_result = self
+            .observe_purpose(
+                ObservationPurpose::DisambiguationDetection,
+                disambiguator.process_input_with_override(
+                    input,
+                    &disambiguation_context,
+                    state_override.as_ref(),
+                    None,
+                ),
+            )
+            .await?;
+        let current_state_generation = self
+            .state_machine
+            .as_ref()
+            .map(|state_machine| state_machine.generation());
+        if current_state_generation != state_generation
+            || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
+        {
+            disambiguator.clear_pending().await;
+            *self.pending_skill_id.write() = None;
+            disambiguation_result = DisambiguationResult::Abandoned { new_input: None };
+            info!(
+                confirmation_event = "invalidated",
+                invalidation_reason = "state_generation_changed",
+                "Disambiguation result invalidated before redispatch"
+            );
+        }
+        match disambiguation_result {
+            DisambiguationResult::Clear => {
+                debug!("Input is clear, proceeding normally");
+                Ok(DisambiguationDispatch::Proceed(input.to_string()))
+            }
+            DisambiguationResult::NeedsClarification {
+                question,
+                detection,
+            } => {
+                let admission = match self
+                    .admit_disambiguation_redispatch(disambiguation_epoch, state_generation)
+                    .await
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        *self.pending_skill_id.write() = None;
+                        return Err(error);
+                    }
+                };
+                let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
+                info!(
+                    ambiguity_type = ?detection.ambiguity_type,
+                    confidence = detection.confidence,
+                    "Input requires clarification"
+                );
+
+                // This branch also owns post-resolution confirmation questions.
+                // Do not clear pending_skill_id or redispatch until the manager returns Clarified on a later turn.
+                self.commit_root_user_message(input).await?;
+                self.memory
+                    .add_message(ChatMessage::assistant(&question.question))
+                    .await?;
+
+                let response = Self::disambiguation_question_response(
+                    &question,
+                    &detection,
+                    awaiting_confirmation,
+                );
+                drop(admission);
+                self.finish_turn_if_root(&response).await?;
+                Ok(DisambiguationDispatch::Terminal(response))
+            }
+            DisambiguationResult::Clarified {
+                enriched_input,
+                resolved,
+                ..
+            } => {
+                let admission = match self
+                    .admit_disambiguation_redispatch(disambiguation_epoch, state_generation)
+                    .await
+                {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        *self.pending_skill_id.write() = None;
+                        return Err(error);
+                    }
+                };
+                info!(
+                    resolved_count = resolved.len(),
+                    enriched = %enriched_input,
+                    "Input clarified, injecting resolved intent into context"
+                );
+
+                // Routing uses `resolved` (structured, deterministic)
+                // This is what makes post-disambiguation routing DETERMINISTIC
+                for (key, value) in &resolved {
+                    let context_key = format!("disambiguation.{}", key);
+                    let _ = self.context_manager.set(&context_key, value.clone());
+                }
+
+                if let Some(intent) = resolved.get("intent") {
+                    let _ = self.context_manager.set("resolved_intent", intent.clone());
+                }
+
+                let _ = self
+                    .context_manager
+                    .set("disambiguation.resolved", serde_json::Value::Bool(true));
+
+                // Check if this clarification was triggered by a skill-level override.
+                // If so, route directly to the matched skill instead of going through
+                // skill routing again (which might match a different skill).
+                let skill_id = self.pending_skill_id.read().clone();
+                drop(admission);
+                if let Some(skill_id) = skill_id {
+                    info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input");
+                    return Ok(DisambiguationDispatch::RecheckSkill {
+                        skill_id,
+                        enriched_input,
+                        disambiguation_epoch,
+                        state_generation,
+                    });
+                }
+                Ok(DisambiguationDispatch::Proceed(enriched_input))
+            }
+            DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
+                info!("Proceeding with best guess interpretation");
+
+                // Same skill-id re-check for best-guess path
+                let skill_id = self.pending_skill_id.read().clone();
+                if let Some(skill_id) = skill_id {
+                    info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input");
+                    return Ok(DisambiguationDispatch::RecheckSkill {
+                        skill_id,
+                        enriched_input,
+                        disambiguation_epoch,
+                        state_generation,
+                    });
+                }
+                Ok(DisambiguationDispatch::Proceed(enriched_input))
+            }
+            DisambiguationResult::GiveUp { reason } => {
+                *self.pending_skill_id.write() = None;
+                warn!(reason = %reason, "Disambiguation gave up");
+                let apology = self
+                    .generate_localized_apology(
+                        "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
+                        &reason,
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        format!("I'm sorry, I couldn't understand your request: {}", reason)
+                    });
+                let response = AgentResponse::new(&apology);
+                self.finish_turn_if_root(&response).await?;
+                Ok(DisambiguationDispatch::Terminal(response))
+            }
+            DisambiguationResult::Escalate { reason } => {
+                *self.pending_skill_id.write() = None;
+                info!(reason = %reason, "Escalating to human");
+                if let Some(ref hitl) = self.hitl_engine {
+                    let trigger =
+                        ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
+                    let mut context_map = HashMap::new();
+                    context_map.insert("original_input".to_string(), serde_json::json!(input));
+                    context_map.insert("reason".to_string(), serde_json::json!(&reason));
+                    let check_result = HITLCheckResult::required(
+                        trigger,
+                        context_map,
+                        format!("User request needs human assistance: {}", reason),
+                        Some(hitl.config().default_timeout_seconds),
+                    );
+                    let result = self.request_hitl_approval(check_result).await?;
+                    if matches!(
+                        result,
+                        ApprovalResult::Approved | ApprovalResult::Modified { .. }
+                    ) {
+                        // Approved escalation runs the original (not enriched) input.
+                        return Ok(DisambiguationDispatch::Proceed(input.to_string()));
+                    }
+                }
+                let apology = self
+                    .generate_localized_apology(
+                        "Explain briefly that you're transferring the user to a human agent for help.",
+                        &reason,
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        format!("I need human assistance to help with your request: {}", reason)
+                    });
+                let response = AgentResponse::new(&apology);
+                self.finish_turn_if_root(&response).await?;
+                Ok(DisambiguationDispatch::Terminal(response))
+            }
+            DisambiguationResult::Abandoned { new_input } => {
+                *self.pending_skill_id.write() = None;
+
+                info!(
+                    has_new_input = new_input.is_some(),
+                    "Clarification abandoned by user"
+                );
+
+                self.commit_root_user_message(input).await?;
+
+                match new_input {
+                    Some(fresh_input) => {
+                        // Topic switch: process the user's new input from scratch.
+                        // The LLM sees full conversation context including the abandoned exchange.
+                        Ok(DisambiguationDispatch::Proceed(fresh_input))
+                    }
+                    None => {
+                        // Pure abandonment: generate a brief acknowledgment.
+                        let ack = self
+                            .generate_localized_apology(
+                                "The user changed their mind about their previous request. \
+                                 Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
+                                 Do NOT apologize excessively. Be concise.",
+                                "User abandoned clarification",
+                            )
+                            .await
+                            .unwrap_or_else(|_| {
+                                "OK, no problem. What else can I help with?".to_string()
+                            });
+
+                        self.memory
+                            .add_message(ChatMessage::assistant(&ack))
+                            .await?;
+
+                        let response = AgentResponse::new(&ack);
+                        self.finish_turn_if_root(&response).await?;
+                        Ok(DisambiguationDispatch::Terminal(response))
+                    }
+                }
+            }
+        }
+    }
+
     //
-    // Blocking disambiguation returns every clarification or required confirmation as its own root response before redispatch.
-    // The manager retains resolved input and pending skill ownership until a later turn explicitly confirms it.
+    // Blocking root turn: readiness, lifecycle hooks, the shared disambiguation gate, then the internal loop.
     //
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
         //
@@ -8982,267 +9436,29 @@ Respond in JSON format:
         // This prevents resolved_intent from leaking across turns and causing incorrect deterministic routing on subsequent inputs.
         self.clear_disambiguation_context();
 
-        // Disambiguation check (before input processing)
-        if let Some(ref disambiguator) = self.disambiguation_manager {
-            let disambiguation_context = self.build_disambiguation_context().await?;
-
-            // Get state-level disambiguation override
-            let state_override = self
-                .state_machine
-                .as_ref()
-                .and_then(|sm| sm.current_definition())
-                .and_then(|def| def.disambiguation.clone());
-
-            let state_generation = self
-                .state_machine
-                .as_ref()
-                .map(|state_machine| state_machine.generation());
-            let disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
-            let mut disambiguation_result = self
-                .observe_purpose(
-                    ObservationPurpose::DisambiguationDetection,
-                    disambiguator.process_input_with_override(
-                        input,
-                        &disambiguation_context,
-                        state_override.as_ref(),
-                        None,
-                    ),
-                )
-                .await?;
-            let current_state_generation = self
-                .state_machine
-                .as_ref()
-                .map(|state_machine| state_machine.generation());
-            if current_state_generation != state_generation
-                || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
-            {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
-                disambiguation_result = DisambiguationResult::Abandoned { new_input: None };
-                info!(
-                    confirmation_event = "invalidated",
-                    invalidation_reason = "state_generation_changed",
-                    "Disambiguation result invalidated before redispatch"
-                );
+        // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
+        // responses itself; this loop only dispatches on the outcome.
+        let input_to_run = match self.resolve_disambiguation(input).await? {
+            DisambiguationDispatch::Terminal(response) => return Ok(response),
+            DisambiguationDispatch::RecheckSkill {
+                skill_id,
+                enriched_input,
+                disambiguation_epoch,
+                state_generation,
+            } => {
+                return self
+                    .recheck_skill_disambiguation(
+                        &skill_id,
+                        &enriched_input,
+                        disambiguation_epoch,
+                        state_generation,
+                    )
+                    .await;
             }
-            match disambiguation_result {
-                DisambiguationResult::Clear => {
-                    debug!("Input is clear, proceeding normally");
-                }
-                DisambiguationResult::NeedsClarification {
-                    question,
-                    detection,
-                } => {
-                    let admission = self
-                        .admit_disambiguation_redispatch(disambiguation_epoch, state_generation)
-                        .await?;
-                    let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
-                    info!(
-                        ambiguity_type = ?detection.ambiguity_type,
-                        confidence = detection.confidence,
-                        "Input requires clarification"
-                    );
+            DisambiguationDispatch::Proceed(input) => input,
+        };
 
-                    // This branch also owns post-resolution confirmation questions.
-                    // Do not clear pending_skill_id or redispatch until the manager returns Clarified on a later turn.
-                    self.commit_root_user_message(input).await?;
-                    self.memory
-                        .add_message(ChatMessage::assistant(&question.question))
-                        .await?;
-
-                    let status = if awaiting_confirmation {
-                        "awaiting_confirmation"
-                    } else {
-                        "awaiting_clarification"
-                    };
-                    let response = AgentResponse::new(&question.question).with_metadata(
-                        "disambiguation",
-                        serde_json::json!({
-                            "status": status,
-                            "options": question.options,
-                            "clarifying": question.clarifying,
-                            "detection": {
-                                "type": detection.ambiguity_type,
-                                "confidence": detection.confidence,
-                                "what_is_unclear": detection.what_is_unclear,
-                            }
-                        }),
-                    );
-                    drop(admission);
-                    self.finish_turn_if_root(&response).await?;
-                    return Ok(response);
-                }
-                DisambiguationResult::Clarified {
-                    enriched_input,
-                    resolved,
-                    ..
-                } => {
-                    let admission = match self
-                        .admit_disambiguation_redispatch(disambiguation_epoch, state_generation)
-                        .await
-                    {
-                        Ok(admission) => admission,
-                        Err(error) => {
-                            *self.pending_skill_id.write() = None;
-                            return Err(error);
-                        }
-                    };
-                    info!(
-                        resolved_count = resolved.len(),
-                        enriched = %enriched_input,
-                        "Input clarified, injecting resolved intent into context"
-                    );
-
-                    // Routing uses `resolved` (structured, deterministic)
-                    // This is what makes post-disambiguation routing DETERMINISTIC
-                    for (key, value) in &resolved {
-                        let context_key = format!("disambiguation.{}", key);
-                        let _ = self.context_manager.set(&context_key, value.clone());
-                    }
-
-                    if let Some(intent) = resolved.get("intent") {
-                        let _ = self.context_manager.set("resolved_intent", intent.clone());
-                    }
-
-                    let _ = self
-                        .context_manager
-                        .set("disambiguation.resolved", serde_json::Value::Bool(true));
-
-                    // Check if this clarification was triggered by a skill-level override.
-                    // If so, route directly to the matched skill instead of going through
-                    // skill routing again (which might match a different skill).
-                    let skill_id = self.pending_skill_id.read().clone();
-                    if let Some(skill_id) = skill_id {
-                        info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input");
-                        drop(admission);
-                        return self
-                            .recheck_skill_disambiguation(
-                                &skill_id,
-                                &enriched_input,
-                                disambiguation_epoch,
-                                state_generation,
-                            )
-                            .await;
-                    }
-
-                    drop(admission);
-                    return self.run_loop_internal(&enriched_input).await;
-                }
-                DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
-                    info!("Proceeding with best guess interpretation");
-
-                    // Same skill-id re-check for best-guess path
-                    let skill_id = self.pending_skill_id.read().clone();
-                    if let Some(skill_id) = skill_id {
-                        info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input");
-                        return self
-                            .recheck_skill_disambiguation(
-                                &skill_id,
-                                &enriched_input,
-                                disambiguation_epoch,
-                                state_generation,
-                            )
-                            .await;
-                    }
-
-                    return self.run_loop_internal(&enriched_input).await;
-                }
-                DisambiguationResult::GiveUp { reason } => {
-                    *self.pending_skill_id.write() = None;
-                    warn!(reason = %reason, "Disambiguation gave up");
-                    let apology = self
-                        .generate_localized_apology(
-                            "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
-                            &reason,
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            format!("I'm sorry, I couldn't understand your request: {}", reason)
-                        });
-                    let response = AgentResponse::new(&apology);
-                    self.finish_turn_if_root(&response).await?;
-                    return Ok(response);
-                }
-                DisambiguationResult::Escalate { reason } => {
-                    *self.pending_skill_id.write() = None;
-                    info!(reason = %reason, "Escalating to human");
-                    if let Some(ref hitl) = self.hitl_engine {
-                        let trigger =
-                            ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
-                        let mut context_map = HashMap::new();
-                        context_map.insert("original_input".to_string(), serde_json::json!(input));
-                        context_map.insert("reason".to_string(), serde_json::json!(&reason));
-                        let check_result = HITLCheckResult::required(
-                            trigger,
-                            context_map,
-                            format!("User request needs human assistance: {}", reason),
-                            Some(hitl.config().default_timeout_seconds),
-                        );
-                        let result = self.request_hitl_approval(check_result).await?;
-                        if matches!(
-                            result,
-                            ApprovalResult::Approved | ApprovalResult::Modified { .. }
-                        ) {
-                            return self.run_loop_internal(input).await;
-                        }
-                    }
-                    let apology = self
-                        .generate_localized_apology(
-                            "Explain briefly that you're transferring the user to a human agent for help.",
-                            &reason,
-                        )
-                        .await
-                        .unwrap_or_else(|_| {
-                            format!("I need human assistance to help with your request: {}", reason)
-                        });
-                    let response = AgentResponse::new(&apology);
-                    self.finish_turn_if_root(&response).await?;
-                    return Ok(response);
-                }
-                DisambiguationResult::Abandoned { new_input } => {
-                    *self.pending_skill_id.write() = None;
-
-                    info!(
-                        has_new_input = new_input.is_some(),
-                        "Clarification abandoned by user"
-                    );
-
-                    self.commit_root_user_message(input).await?;
-
-                    match new_input {
-                        Some(fresh_input) => {
-                            // Topic switch: process the user's new input from scratch.
-                            // The LLM sees full conversation context including the abandoned exchange.
-                            return self.run_loop_internal(&fresh_input).await;
-                        }
-                        None => {
-                            // Pure abandonment: generate a brief acknowledgment.
-                            let ack = self
-                                .generate_localized_apology(
-                                    "The user changed their mind about their previous request. \
-                                     Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
-                                     Do NOT apologize excessively. Be concise.",
-                                    "User abandoned clarification",
-                                )
-                                .await
-                                .unwrap_or_else(|_| {
-                                    "OK, no problem. What else can I help with?".to_string()
-                                });
-
-                            self.memory
-                                .add_message(ChatMessage::assistant(&ack))
-                                .await?;
-
-                            let response = AgentResponse::new(&ack);
-                            self.finish_turn_if_root(&response).await?;
-                            return Ok(response);
-                        }
-                    }
-                }
-            }
-        }
-
-        self.run_loop_internal(input).await
+        self.run_loop_internal(&input_to_run).await
     }
 
     /// Generate a localized response using the router LLM
@@ -9787,7 +10003,13 @@ Respond in JSON format:
             } => {
                 let mut all_tool_calls = Vec::new();
                 match self
-                    .handle_tool_calls(processed_input, &raw_content, calls, &mut all_tool_calls)
+                    .handle_tool_calls(
+                        processed_input,
+                        &raw_content,
+                        calls,
+                        &mut all_tool_calls,
+                        None,
+                    )
                     .await?
                 {
                     ToolCallOutcome::Rejected(response) => {
@@ -9863,7 +10085,9 @@ Respond in JSON format:
             let result = self
                 .post_loop_processing(processed_input, final_content)
                 .await?;
-            self.apply_post_loop_result(processed_input, result).await?
+            self.apply_post_loop_result(processed_input, result)
+                .await?
+                .content
         };
         let response = self.build_agent_response(AgentResponseParts {
             content: final_content,
@@ -9924,7 +10148,13 @@ Respond in JSON format:
             let content = response.content.trim();
             if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
                 match self
-                    .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
+                    .handle_tool_calls(
+                        processed_input,
+                        content,
+                        tool_calls,
+                        &mut all_tool_calls,
+                        None,
+                    )
                     .await?
                 {
                     ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
@@ -9954,13 +10184,19 @@ Respond in JSON format:
     }
 
     /// Handle tool calls: check transitions, execute tools in parallel, handle HITL rejection.
+    ///
+    /// Shared by the blocking and streaming loops. `events` collects streaming chunks in emission order when the caller
+    /// is a stream; the blocking loop passes `None`. Tool start events are pushed before execution so the collected order
+    /// reflects when each call was admitted, not when it finished.
     async fn handle_tool_calls(
         &self,
         processed_input: &str,
         content: &str,
         tool_calls: Vec<ToolCall>,
         all_tool_calls: &mut Vec<ToolCall>,
+        mut events: Option<&mut Vec<StreamChunk>>,
     ) -> Result<ToolCallOutcome> {
+        let include_tool_events = self.streaming.include_tool_events;
         // Check if a transition should fire before executing the LLM's tool call.
         // If a transition fires, on_enter actions handle the tool call correctly
         // (with proper URLs from YAML), so skip the LLM's tool call.
@@ -9975,6 +10211,12 @@ Respond in JSON format:
                     "(Transitioned to new state — tool call handled by workflow)",
                 ))
                 .await?;
+            if let Some(events) = events.as_deref_mut()
+                && self.streaming.include_state_events
+                && let Some(state) = self.current_state()
+            {
+                events.push(StreamChunk::state_transition(None, state));
+            }
             return Ok(ToolCallOutcome::TransitionFired);
         }
 
@@ -9985,12 +10227,29 @@ Respond in JSON format:
         self.remember_committed_native_exchange(content).await?;
         let native_tool_call = Self::is_native_tool_call_content(content)?;
 
+        if let Some(events) = events.as_deref_mut()
+            && include_tool_events
+        {
+            for tool_call in &tool_calls {
+                events.push(StreamChunk::tool_start(&tool_call.id, &tool_call.name));
+            }
+        }
         let results = self.execute_tools_parallel(&tool_calls).await;
         let mut rejection = None;
 
         for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
             match result {
                 Ok(output) => {
+                    if let Some(events) = events.as_deref_mut()
+                        && include_tool_events
+                    {
+                        events.push(StreamChunk::tool_result(
+                            &tool_call.id,
+                            &tool_call.name,
+                            &output,
+                            true,
+                        ));
+                    }
                     self.memory
                         .add_message(Self::tool_result_message(
                             tool_call,
@@ -10017,6 +10276,16 @@ Respond in JSON format:
                             rejection = Some(e.to_string());
                         }
                     }
+                    if let Some(events) = events.as_deref_mut()
+                        && include_tool_events
+                    {
+                        events.push(StreamChunk::tool_result(
+                            &tool_call.id,
+                            &tool_call.name,
+                            e.to_string(),
+                            false,
+                        ));
+                    }
                     self.memory
                         .add_message(Self::tool_result_message(
                             tool_call,
@@ -10027,6 +10296,11 @@ Respond in JSON format:
                 }
             }
             all_tool_calls.push(tool_call.clone());
+            if let Some(events) = events.as_deref_mut()
+                && include_tool_events
+            {
+                events.push(StreamChunk::tool_end(&tool_call.id));
+            }
         }
         if let Some(rejection) = rejection {
             self.memory
@@ -10149,7 +10423,10 @@ Respond in JSON format:
                 .add_message(ChatMessage::assistant(&content))
                 .await?;
             self.check_memory_compression().await?;
-            return Ok(PostLoopResult::Transitioned(content));
+            return Ok(PostLoopResult::Transitioned {
+                content,
+                regenerated: false,
+            });
         }
 
         // Check if the new state needs full dispatch.
@@ -10260,7 +10537,10 @@ Respond in JSON format:
             self.memory
                 .add_message(ChatMessage::assistant(&final_content))
                 .await?;
-            return Ok(PostLoopResult::Transitioned(final_content));
+            return Ok(PostLoopResult::Transitioned {
+                content: final_content,
+                regenerated: true,
+            });
         }
 
         // Exhausted post-transition iterations (unlikely). Return last content.
@@ -10269,7 +10549,10 @@ Respond in JSON format:
             .add_message(ChatMessage::assistant(&final_content))
             .await?;
 
-        Ok(PostLoopResult::Transitioned(final_content))
+        Ok(PostLoopResult::Transitioned {
+            content: final_content,
+            regenerated: true,
+        })
     }
 
     /// Build the final AgentResponse with all metadata.
@@ -10315,15 +10598,28 @@ Respond in JSON format:
 
     /// Consume a PostLoopResult. NeedsRedispatch re-enters run_loop_internal.
     /// The user message is already in memory - redispatch_depth suppresses re-adding it.
+    ///
+    /// Shared by the blocking and streaming loops. The streaming loop emits `content` only when `regenerated` is true,
+    /// because otherwise the consumer already received the same text as deltas.
     async fn apply_post_loop_result(
         &self,
         processed_input: &str,
         result: PostLoopResult,
-    ) -> Result<String> {
+    ) -> Result<AppliedPostLoop> {
         match result {
-            PostLoopResult::NoTransition(content) | PostLoopResult::Transitioned(content) => {
-                Ok(content)
-            }
+            PostLoopResult::NoTransition(content) => Ok(AppliedPostLoop {
+                content,
+                transitioned: false,
+                regenerated: false,
+            }),
+            PostLoopResult::Transitioned {
+                content,
+                regenerated,
+            } => Ok(AppliedPostLoop {
+                content,
+                transitioned: true,
+                regenerated,
+            }),
             PostLoopResult::NeedsRedispatch => {
                 const MAX_REDISPATCH_DEPTH: u32 = 3;
                 let current_depth = *self.redispatch_depth.read();
@@ -10336,7 +10632,12 @@ Respond in JSON format:
                     self.memory
                         .add_message(ChatMessage::assistant(&content))
                         .await?;
-                    return Ok(content);
+                    // Nothing new for the consumer to see, so the streaming loop must not emit an empty chunk.
+                    return Ok(AppliedPostLoop {
+                        content,
+                        transitioned: true,
+                        regenerated: false,
+                    });
                 }
                 *self.redispatch_depth.write() += 1;
                 if let Some(context) = self.active_turn_context.write().as_mut() {
@@ -10351,7 +10652,11 @@ Respond in JSON format:
                 if let Some(context) = self.active_turn_context.write().as_mut() {
                     context.exit_redispatch();
                 }
-                resp.map(|r| r.content)
+                resp.map(|r| AppliedPostLoop {
+                    content: r.content,
+                    transitioned: true,
+                    regenerated: true,
+                })
             }
         }
     }
@@ -10481,7 +10786,10 @@ Respond in JSON format:
                 format!("[Delegated to {}]: {}", delegate_id, response.content),
             )
             .await?;
-        let final_content = self.apply_post_loop_result(input, post_result).await?;
+        let final_content = self
+            .apply_post_loop_result(input, post_result)
+            .await?
+            .content;
 
         let mut result = AgentResponse::new(final_content);
 
@@ -10628,7 +10936,10 @@ Respond in JSON format:
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
-        let final_content = self.apply_post_loop_result(input, post_result).await?;
+        let final_content = self
+            .apply_post_loop_result(input, post_result)
+            .await?
+            .content;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -10746,7 +11057,10 @@ Respond in JSON format:
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
-        let final_content = self.apply_post_loop_result(input, post_result).await?;
+        let final_content = self
+            .apply_post_loop_result(input, post_result)
+            .await?
+            .content;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -10868,7 +11182,10 @@ Respond in JSON format:
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
-        let final_content = self.apply_post_loop_result(input, post_result).await?;
+        let final_content = self
+            .apply_post_loop_result(input, post_result)
+            .await?
+            .content;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -10989,7 +11306,10 @@ Respond in JSON format:
         let post_result = self
             .post_loop_processing(input, result.response.content.clone())
             .await?;
-        let final_content = self.apply_post_loop_result(input, post_result).await?;
+        let final_content = self
+            .apply_post_loop_result(input, post_result)
+            .await?
+            .content;
 
         let mut response = AgentResponse::new(final_content);
         let metadata = serde_json::json!({
@@ -11100,14 +11420,7 @@ Respond in JSON format:
                     .admit_optional_disambiguation_ownership(ownership)
                     .await?;
                 self.commit_root_user_message(processed_input).await?;
-                if let Some(q) = response
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.get("disambiguation"))
-                    .and_then(|d| d.get("status"))
-                    .and_then(|s| s.as_str())
-                    && q == "awaiting_clarification"
-                {
+                if Self::skill_clarification_needs_memory_record(&response) {
                     // Store the clarification question in memory so the next turn
                     // can be handled as a clarification response.
                     self.memory
@@ -11186,7 +11499,13 @@ Respond in JSON format:
 
             if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
                 match self
-                    .handle_tool_calls(processed_input, content, tool_calls, &mut all_tool_calls)
+                    .handle_tool_calls(
+                        processed_input,
+                        content,
+                        tool_calls,
+                        &mut all_tool_calls,
+                        None,
+                    )
                     .await?
                 {
                     ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
@@ -11229,7 +11548,9 @@ Respond in JSON format:
                 let result = self
                     .post_loop_processing(processed_input, final_content)
                     .await?;
-                self.apply_post_loop_result(processed_input, result).await?
+                self.apply_post_loop_result(processed_input, result)
+                    .await?
+                    .content
             };
 
             let reflected = reflection_metadata.is_some();
@@ -11271,25 +11592,36 @@ Respond in JSON format:
                 .await?;
             return Ok(StreamingDraftResult::new(draft, Vec::new()));
         }
+        // configured_tool_choice() is None here, so the protocol only carries the effective grant and the raw stream path applies.
+        let protocol = self.main_tool_protocol(llm.as_ref(), true).await?;
         let messages = self.build_messages_for_draft(processed_input).await?;
-        let mut stream = self
-            .observe_purpose(
-                ObservationPurpose::MainResponse,
-                llm.complete_stream(&messages, None),
-            )
-            .await
-            .map_err(|e| AgentError::LLM(e.to_string()))?;
+        let source = self
+            .open_main_stream_with_recovery(Arc::clone(&llm), &messages, &protocol)
+            .await?;
         let mut buffer = crate::optimization::StreamBranchBuffer::new(self.streaming.buffer_size)?;
         let mut chunks = Vec::new();
         let mut accumulated = String::new();
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = chunk_result.map_err(|e| AgentError::LLM(e.to_string()))?;
-            accumulated.push_str(&chunk.delta);
-            let stream_chunk = StreamChunk::content(chunk.delta);
-            if routing_resolved.load(Ordering::SeqCst) {
-                chunks.push(stream_chunk);
-            } else {
-                buffer.push(stream_chunk)?;
+        match source {
+            MainStreamSource::StaticResponse(text) => {
+                accumulated.push_str(&text);
+                let stream_chunk = StreamChunk::content(text);
+                if routing_resolved.load(Ordering::SeqCst) {
+                    chunks.push(stream_chunk);
+                } else {
+                    buffer.push(stream_chunk)?;
+                }
+            }
+            MainStreamSource::Stream(mut stream) => {
+                while let Some(chunk_result) = stream.next().await {
+                    let chunk = chunk_result.map_err(|e| AgentError::LLM(e.to_string()))?;
+                    accumulated.push_str(&chunk.delta);
+                    let stream_chunk = StreamChunk::content(chunk.delta);
+                    if routing_resolved.load(Ordering::SeqCst) {
+                        chunks.push(stream_chunk);
+                    } else {
+                        buffer.push(stream_chunk)?;
+                    }
+                }
             }
         }
         chunks.splice(0..0, buffer.drain());
@@ -11316,6 +11648,17 @@ Respond in JSON format:
     ) -> Result<Option<(AgentResponse, Vec<StreamChunk>)>> {
         let optimization = &self.runtime_config.optimization;
         if !optimization.enabled {
+            return Ok(None);
+        }
+        //
+        // Buffered streaming has no reasoning-judge branch. Any non-None effective reasoning mode must fall back
+        // to the serial path so the committed response matches what the blocking loop would produce.
+        // Skills are handled below by serial selection after routing resolves, mirroring try_speculative_branches.
+        //
+        if !matches!(
+            self.get_effective_reasoning_config().mode,
+            ReasoningMode::None
+        ) {
             return Ok(None);
         }
         let transition_enabled =
@@ -11428,10 +11771,63 @@ Respond in JSON format:
                     "discarded",
                     false,
                 );
-                routing_resolved.store(true, Ordering::SeqCst);
                 transition_finalized = true;
             }
-            if transition_finalized && let Some(result) = main_result.take() {
+            //
+            // Routing is resolved only after both the transition branch and, when skills exist, serial skill selection finish.
+            // Skill selection runs while the main stream is still buffered so a winning skill can discard the draft output.
+            // The main future is not polled during selection; the provider stream simply waits under backpressure.
+            //
+            if transition_finalized && !routing_resolved.load(Ordering::SeqCst) {
+                match self
+                    .resolve_buffered_skill_after_transition(processed_input, &routing_resolved)
+                    .await
+                {
+                    Ok(Some(candidate)) => {
+                        // Skill wins: drop the buffered stream future, finalize the main branch as lost, commit the skill.
+                        drop(main_future);
+                        drop(transition_future);
+                        self.finalize_branch_loss(
+                            &main_id,
+                            RuntimeOptimizationKind::BufferedStreamingRouting,
+                            RuntimeCommitBehavior::FinalResponse,
+                            main_pending,
+                            main_result.as_ref().map(|result| result.is_err()),
+                        );
+                        return match self
+                            .commit_winning_skill_candidate(
+                                candidate,
+                                processed_input,
+                                input_context,
+                            )
+                            .await?
+                        {
+                            Some(response) => Ok(Some((
+                                response.clone(),
+                                vec![StreamChunk::content(response.content)],
+                            ))),
+                            None => Ok(None),
+                        };
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        drop(main_future);
+                        drop(transition_future);
+                        self.finalize_branch_loss(
+                            &main_id,
+                            RuntimeOptimizationKind::BufferedStreamingRouting,
+                            RuntimeCommitBehavior::FinalResponse,
+                            main_pending,
+                            main_result.as_ref().map(|result| result.is_err()),
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+            if transition_finalized
+                && routing_resolved.load(Ordering::SeqCst)
+                && let Some(result) = main_result.take()
+            {
                 let stream_draft = match result {
                     Ok(stream_draft) => stream_draft,
                     Err(error) => {
@@ -11491,7 +11887,6 @@ Respond in JSON format:
                                 "discarded",
                                 false,
                             );
-                            routing_resolved.store(true, Ordering::SeqCst);
                             transition_finalized = true;
                         }
                         Ok(ParallelTransitionSelection::ReservationExhausted) => {
@@ -11520,13 +11915,33 @@ Respond in JSON format:
                                 "failed",
                                 false,
                             );
-                            routing_resolved.store(true, Ordering::SeqCst);
                             transition_finalized = true;
                         }
                     }
                 }
             }
         }
+    }
+
+    //
+    // Routing for buffered streaming is resolved only after both the transition branch and, when skills exist,
+    // serial skill selection finish. Returns Some(candidate) when a skill must be committed instead of the draft;
+    // `routing_resolved` is released only on the None path because a winning skill discards the buffered draft.
+    //
+    async fn resolve_buffered_skill_after_transition(
+        &self,
+        processed_input: &str,
+        routing_resolved: &AtomicBool,
+    ) -> Result<Option<SkillCandidate>> {
+        let candidate = if self.skill_router.is_some() {
+            self.select_skill_candidate(processed_input).await?
+        } else {
+            None
+        };
+        if candidate.is_none() {
+            routing_resolved.store(true, Ordering::SeqCst);
+        }
+        Ok(candidate)
     }
 
     /// Streaming agent pipeline
@@ -11537,7 +11952,6 @@ Respond in JSON format:
         input: &'a str,
         terminal: RuntimeStreamTerminalSlot,
     ) -> Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>> {
-        let include_tool_events = self.streaming.include_tool_events;
         let include_state_events = self.streaming.include_state_events;
 
         Box::pin(async_stream::stream! {
@@ -11565,27 +11979,38 @@ Respond in JSON format:
                     .rejection_reason
                     .unwrap_or_else(|| "Input rejected".to_string());
                 warn!(reason = %reason, "Input rejected (stream)");
-                yield StreamChunk::error(reason);
+                // Rejection is a committed response, not a runtime failure: it must finalize the root turn
+                // and surface as Final so blocking and streaming consumers observe the same contract.
+                let response = AgentResponse::new(&reason);
+                if let Err(e) = self.finish_turn_if_root(&response).await {
+                    yield StreamChunk::error(e.to_string());
+                    return;
+                }
+                yield StreamChunk::content(&reason);
+                record_runtime_stream_final(&terminal, response);
+                yield StreamChunk::Done {};
                 return;
             }
 
             let processed_input = &input_data.content;
 
+            let streaming_policy = self.runtime_config.optimization.streaming_policy;
+
+            //
+            // Preflight runs before buffered routing for both optimized policies, mirroring run_loop_internal.
+            // It runs sequentially, so even when transition extractors call a provider it cannot race the buffered main branch,
+            // and extractor calls do not consume speculative reservations.
+            // `Disabled` skips every optimized streaming step, including preflight.
+            //
             if self.runtime_config.optimization.enabled
-                && matches!(
-                    self.runtime_config.optimization.streaming_policy,
-                    crate::optimization::StreamingOptimizationPolicy::BufferUntilRoutingDone
+                && !matches!(
+                    streaming_policy,
+                    crate::optimization::StreamingOptimizationPolicy::Disabled
                 )
             {
-                //
-                // Buffered routing keeps stale stream output hidden until a branch winner is known.
-                // The boxed future prevents this stream state machine from becoming too large.
-                //
-                match Box::pin(self.try_buffered_streaming_branches(processed_input, &input_data.context)).await {
-                    Ok(Some((response, chunks))) => {
-                        for chunk in chunks {
-                            yield chunk;
-                        }
+                match self.try_pre_response_transition(processed_input).await {
+                    Ok(Some(response)) => {
+                        yield StreamChunk::content(&response.content);
                         record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
@@ -11600,13 +12025,19 @@ Respond in JSON format:
 
             if self.runtime_config.optimization.enabled
                 && matches!(
-                    self.runtime_config.optimization.streaming_policy,
-                    crate::optimization::StreamingOptimizationPolicy::PreflightOnly
+                    streaming_policy,
+                    crate::optimization::StreamingOptimizationPolicy::BufferUntilRoutingDone
                 )
             {
-                match self.try_pre_response_transition(processed_input).await {
-                    Ok(Some(response)) => {
-                        yield StreamChunk::content(&response.content);
+                //
+                // Buffered routing keeps stale stream output hidden until a branch winner is known.
+                // The boxed future prevents this stream state machine from becoming too large.
+                //
+                match Box::pin(self.try_buffered_streaming_branches(processed_input, &input_data.context)).await {
+                    Ok(Some((response, chunks))) => {
+                        for chunk in chunks {
+                            yield chunk;
+                        }
                         record_runtime_stream_final(&terminal, response);
                         yield StreamChunk::Done {};
                         return;
@@ -11690,7 +12121,13 @@ Respond in JSON format:
                         yield StreamChunk::error(e.to_string());
                         return;
                     }
-                    let _ = self.memory.add_message(ChatMessage::assistant(&response.content)).await;
+                    // Same record condition as the serial and speculative paths: only open clarification questions enter history.
+                    if Self::skill_clarification_needs_memory_record(&response)
+                        && let Err(e) = self.memory.add_message(ChatMessage::assistant(&response.content)).await
+                    {
+                        yield StreamChunk::error(e.to_string());
+                        return;
+                    }
                     drop(admission);
                     if let Err(e) = self.finish_turn_if_root(&response).await {
                         yield StreamChunk::error(e.to_string());
@@ -11836,31 +12273,36 @@ Respond in JSON format:
                     self.hooks.on_llm_complete(&response, llm_duration_ms).await;
                     response.content.trim().to_string()
                 } else {
-                    // Streaming LLM call
-                    let llm_stream = match self
-                        .observe_purpose(
-                            ObservationPurpose::MainResponse,
-                            llm.complete_stream(&messages, None),
-                        )
+                    // Streaming LLM call. Retry and fallback apply to opening the stream only (see open_main_stream_with_recovery).
+                    let source = match self
+                        .open_main_stream_with_recovery(Arc::clone(&llm), &messages, &protocol)
                         .await
                     {
-                        Ok(s) => s,
+                        Ok(source) => source,
                         Err(e) => {
                             yield StreamChunk::error(e.to_string());
                             return;
                         }
                     };
                     let mut accumulated = String::new();
-                    let mut stream_inner = llm_stream;
-                    while let Some(chunk_result) = stream_inner.next().await {
-                        match chunk_result {
-                            Ok(chunk) => {
-                                accumulated.push_str(&chunk.delta);
-                                yield StreamChunk::content(chunk.delta);
-                            }
-                            Err(e) => {
-                                yield StreamChunk::error(e.to_string());
-                                return;
+                    match source {
+                        MainStreamSource::StaticResponse(text) => {
+                            accumulated.push_str(&text);
+                            yield StreamChunk::content(text);
+                        }
+                        MainStreamSource::Stream(mut stream_inner) => {
+                            while let Some(chunk_result) = stream_inner.next().await {
+                                match chunk_result {
+                                    Ok(chunk) => {
+                                        accumulated.push_str(&chunk.delta);
+                                        yield StreamChunk::content(chunk.delta);
+                                    }
+                                    Err(e) => {
+                                        // Mid-stream failure is terminal: visible deltas cannot be retracted or safely regenerated.
+                                        yield StreamChunk::error(e.to_string());
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -11883,167 +12325,39 @@ Respond in JSON format:
                     }
                 };
                 if let Some(tool_calls) = parsed_tool_calls {
-                    let native_tool_call = match Self::is_native_tool_call_content(&content) {
-                        Ok(native) => native,
-                        Err(error) => {
-                            yield StreamChunk::error(error.to_string());
+                    // Shared with the blocking loop. Tool events are collected in emission order and yielded after the
+                    // batch completes; ToolCallStart order reflects admission order (see handle_tool_calls).
+                    let mut events = Vec::new();
+                    let outcome = self
+                        .handle_tool_calls(
+                            processed_input,
+                            &content,
+                            tool_calls,
+                            &mut all_tool_calls,
+                            Some(&mut events),
+                        )
+                        .await;
+                    for chunk in events.drain(..) {
+                        yield chunk;
+                    }
+                    match outcome {
+                        Ok(ToolCallOutcome::Continue) | Ok(ToolCallOutcome::TransitionFired) => continue,
+                        Ok(ToolCallOutcome::Rejected(response)) => {
+                            if let Err(finalize_error) = self.finish_turn_if_root(&response).await {
+                                yield StreamChunk::error(finalize_error.to_string());
+                                return;
+                            }
+                            let legacy_error = response.content.clone();
+                            record_runtime_stream_final(&terminal, response);
+                            yield StreamChunk::error(legacy_error);
+                            yield StreamChunk::Done {};
                             return;
                         }
-                    };
-                    // Emit tool events for streaming
-                    // First check transitions (same as blocking path)
-                    let transition_content = match native_readable_projection(&content) {
-                        Ok(content) => content,
-                        Err(error) => {
-                            yield StreamChunk::error(error.to_string());
-                            return;
-                        }
-                    };
-                    let transition_fired = match self.evaluate_transitions(processed_input, &transition_content).await {
-                        Ok(v) => v,
                         Err(e) => {
                             yield StreamChunk::error(e.to_string());
                             return;
                         }
-                    };
-                    if transition_fired {
-                        let _ = self.memory.add_message(ChatMessage::assistant(
-                            "(Transitioned to new state — tool call handled by workflow)",
-                        )).await;
-
-                        if include_state_events
-                            && let Some(state) = self.current_state()
-                        {
-                                yield StreamChunk::state_transition(None, state);
-                            }
-                        continue;
                     }
-
-                    // Store the assistant's tool-call message (same as blocking path)
-                    if let Err(error) = self.memory.add_message(ChatMessage::assistant(&content)).await {
-                        yield StreamChunk::error(error.to_string());
-                        return;
-                    }
-                    if let Err(error) = self.remember_committed_native_exchange(&content).await {
-                        yield StreamChunk::error(error.to_string());
-                        return;
-                    }
-
-                    // Execute tools with streaming events
-                    let results = self.execute_tools_parallel(&tool_calls).await;
-                    let mut rejection = None;
-
-                    for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
-                        if include_tool_events {
-                            yield StreamChunk::tool_start(&tool_call.id, &tool_call.name);
-                        }
-
-                        match result {
-                            Ok(output) => {
-                                if include_tool_events {
-                                    yield StreamChunk::tool_result(
-                                        &tool_call.id,
-                                        &tool_call.name,
-                                        &output,
-                                        true,
-                                    );
-                                }
-                                let result_message = match Self::tool_result_message(
-                                    tool_call,
-                                    &output,
-                                    native_tool_call,
-                                ) {
-                                    Ok(message) => message,
-                                    Err(error) => {
-                                        yield StreamChunk::error(error.to_string());
-                                        return;
-                                    }
-                                };
-                                if let Err(error) = self.memory.add_message(result_message).await {
-                                    yield StreamChunk::error(error.to_string());
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                if matches!(e, AgentError::HITLRejected(_)) && !native_tool_call {
-                                    let response = AgentResponse {
-                                        content: format!("Operation cancelled: {e}"),
-                                        metadata: None,
-                                        tool_calls: Some(all_tool_calls.clone()),
-                                    };
-                                    if let Err(error) = self.memory.add_message(ChatMessage::assistant(
-                                        format!("The operation was rejected by the approver: {e}"),
-                                    )).await {
-                                        yield StreamChunk::error(error.to_string());
-                                        return;
-                                    }
-                                    if let Err(finalize_error) = self.finish_turn_if_root(&response).await {
-                                        yield StreamChunk::error(finalize_error.to_string());
-                                        return;
-                                    }
-                                    let legacy_error = response.content.clone();
-                                    record_runtime_stream_final(&terminal, response);
-                                    yield StreamChunk::error(legacy_error);
-                                    yield StreamChunk::Done {};
-                                    return;
-                                }
-                                if rejection.is_none() && matches!(e, AgentError::HITLRejected(_)) {
-                                    rejection = Some(e.to_string());
-                                }
-                                if include_tool_events {
-                                    yield StreamChunk::tool_result(
-                                        &tool_call.id,
-                                        &tool_call.name,
-                                        e.to_string(),
-                                        false,
-                                    );
-                                }
-                                let result_message = match Self::tool_result_message(
-                                    tool_call,
-                                    &format!("Error: {}", e),
-                                    native_tool_call,
-                                ) {
-                                    Ok(message) => message,
-                                    Err(error) => {
-                                        yield StreamChunk::error(error.to_string());
-                                        return;
-                                    }
-                                };
-                                if let Err(error) = self.memory.add_message(result_message).await {
-                                    yield StreamChunk::error(error.to_string());
-                                    return;
-                                }
-                            }
-                        }
-                        all_tool_calls.push(tool_call.clone());
-
-                        if include_tool_events {
-                            yield StreamChunk::tool_end(&tool_call.id);
-                        }
-                    }
-                    if let Some(rejection) = rejection {
-                        if let Err(error) = self.memory.add_message(ChatMessage::assistant(
-                            format!("The operation was rejected by the approver: {rejection}"),
-                        )).await {
-                            yield StreamChunk::error(error.to_string());
-                            return;
-                        }
-                        let response = AgentResponse {
-                            content: format!("Operation cancelled: {rejection}"),
-                            metadata: None,
-                            tool_calls: Some(all_tool_calls.clone()),
-                        };
-                        if let Err(finalize_error) = self.finish_turn_if_root(&response).await {
-                            yield StreamChunk::error(finalize_error.to_string());
-                            return;
-                        }
-                        let legacy_error = response.content.clone();
-                        record_runtime_stream_final(&terminal, response);
-                        yield StreamChunk::error(legacy_error);
-                        yield StreamChunk::Done {};
-                        return;
-                    }
-                    continue;
                 }
 
                 // Extract thinking, process output
@@ -12105,55 +12419,30 @@ Respond in JSON format:
                     }
                 };
 
-                let (final_content, transitioned) = match post_result {
-                    PostLoopResult::NoTransition(content) => (content, false),
-                    PostLoopResult::Transitioned(content) => (content, true),
-                    PostLoopResult::NeedsRedispatch => {
-                        const MAX_REDISPATCH_DEPTH: u32 = 3;
-                        let current_depth = *self.redispatch_depth.read();
-                        let content = if current_depth >= MAX_REDISPATCH_DEPTH {
-                            warn!(
-                                depth = current_depth,
-                                "Post-transition re-dispatch depth limit reached (stream)"
-                            );
-                            let c = String::new();
-                            let _ = self.memory.add_message(ChatMessage::assistant(&c)).await;
-                            c
-                        } else {
-                            *self.redispatch_depth.write() += 1;
-                            if let Some(context) = self.active_turn_context.write().as_mut() {
-                                context.enter_redispatch();
-                            }
-                            info!(
-                                depth = current_depth + 1,
-                                "Re-dispatching for new state after transition (stream)"
-                            );
-                            let result = self.run_loop_internal(processed_input).await;
-                            *self.redispatch_depth.write() -= 1;
-                            if let Some(context) = self.active_turn_context.write().as_mut() {
-                                context.exit_redispatch();
-                            }
-                            match result {
-                                Ok(resp) => resp.content,
-                                Err(e) => {
-                                    yield StreamChunk::error(e.to_string());
-                                    return;
-                                }
-                            }
-                        };
-                        (content, true)
+                let applied = match self.apply_post_loop_result(processed_input, post_result).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        yield StreamChunk::error(e.to_string());
+                        return;
                     }
                 };
 
-                if transitioned {
+                if applied.transitioned {
                     if include_state_events
                         && let Some(state) = self.current_state()
                     {
-                            yield StreamChunk::state_transition(None, state);
-                        }
-                    // Yield the post-transition re-generated or re-dispatched content.
-                    yield StreamChunk::content(&final_content);
+                        yield StreamChunk::state_transition(None, state);
+                    }
+                    //
+                    // Only replacement content is emitted here. When regeneration is disabled the committed
+                    // content is what the consumer already received as deltas (or as the buffered yield above),
+                    // so emitting it again would duplicate visible output.
+                    //
+                    if applied.regenerated {
+                        yield StreamChunk::content(&applied.content);
+                    }
                 }
+                let final_content = applied.content;
 
                 // Build and finalize the same authoritative response shape before exposing the terminal event.
                 let final_response = self.build_agent_response(AgentResponseParts {
@@ -12210,366 +12499,51 @@ Respond in JSON format:
             // Clear stale disambiguation context from previous turns.
             self.clear_disambiguation_context();
 
-            // Disambiguation check (before input processing)
-            if let Some(ref disambiguator) = self.disambiguation_manager {
-                let disambiguation_context = match self.build_disambiguation_context().await {
-                    Ok(ctx) => ctx,
-                    Err(e) => {
-                        yield StreamChunk::error(e.to_string());
-                        return;
-                    }
-                };
-
-                let state_override = self
-                    .state_machine
-                    .as_ref()
-                    .and_then(|sm| sm.current_definition())
-                    .and_then(|def| def.disambiguation.clone());
-
-                let state_generation = self
-                    .state_machine
-                    .as_ref()
-                    .map(|state_machine| state_machine.generation());
-                let disambiguation_epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
-                let mut result = match self
-                    .observe_purpose(
-                        ObservationPurpose::DisambiguationDetection,
-                        disambiguator.process_input_with_override(
-                            input,
-                            &disambiguation_context,
-                            state_override.as_ref(),
-                            None,
-                        ),
-                    )
-                    .await
-                {
-                    Ok(r) => r,
-                    Err(e) => {
-                        yield StreamChunk::error(e.to_string());
-                        return;
-                    }
-                };
-                let current_state_generation = self
-                    .state_machine
-                    .as_ref()
-                    .map(|state_machine| state_machine.generation());
-                if current_state_generation != state_generation
-                    || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
-                {
-                    disambiguator.clear_pending().await;
-                    *self.pending_skill_id.write() = None;
-                    result = DisambiguationResult::Abandoned { new_input: None };
-                    info!(
-                        confirmation_event = "invalidated",
-                        invalidation_reason = "state_generation_changed",
-                        "Streaming disambiguation result invalidated before redispatch"
-                    );
+            // Disambiguation check (before input processing). Terminal clarification and confirmation questions end the
+            // stream here so enriched input cannot stream before explicit agreement; the shared gate has already
+            // committed memory and finished the root turn for those responses.
+            let input_to_run = match self.resolve_disambiguation(input).await {
+                Err(e) => {
+                    yield StreamChunk::error(e.to_string());
+                    return;
                 }
-                match result {
-                    DisambiguationResult::Clear => {
-                        debug!("Input is clear, proceeding normally (stream)");
-                    }
-                    DisambiguationResult::NeedsClarification {
-                        question,
-                        detection,
-                    } => {
-                        let admission = match self
-                            .admit_disambiguation_redispatch(
-                                disambiguation_epoch,
-                                state_generation,
-                            )
-                            .await
-                        {
-                            Ok(admission) => admission,
-                            Err(error) => {
-                                *self.pending_skill_id.write() = None;
-                                yield StreamChunk::error(error.to_string());
-                                return;
-                            }
-                        };
-                        let awaiting_confirmation = disambiguator.has_pending_confirmation().await;
-                        info!(
-                            ambiguity_type = ?detection.ambiguity_type,
-                            confidence = detection.confidence,
-                            "Input requires clarification (stream)"
-                        );
-                        // Confirmation uses the same terminal branch so enriched input cannot stream before explicit agreement.
-                        // Keep pending_skill_id intact for the later confirmed redispatch.
-                        if let Err(e) = self.commit_root_user_message(input).await {
-                            yield StreamChunk::error(e.to_string());
-                            return;
-                        }
-                        let _ = self
-                            .memory
-                            .add_message(ChatMessage::assistant(&question.question))
-                            .await;
-                        let status = if awaiting_confirmation {
-                            "awaiting_confirmation"
-                        } else {
-                            "awaiting_clarification"
-                        };
-                        let response = AgentResponse::new(&question.question).with_metadata(
-                            "disambiguation",
-                            serde_json::json!({ "status": status }),
-                        );
-                        drop(admission);
-                        if let Err(e) = self.finish_turn_if_root(&response).await {
-                            yield StreamChunk::error(e.to_string());
-                            return;
-                        }
-                        yield StreamChunk::content(&question.question);
-                        record_runtime_stream_final(&terminal, response);
-                        yield StreamChunk::Done {};
-                        return;
-                    }
-                    DisambiguationResult::Clarified {
-                        enriched_input,
-                        resolved,
-                        ..
-                    } => {
-                        let admission = match self
-                            .admit_disambiguation_redispatch(
-                                disambiguation_epoch,
-                                state_generation,
-                            )
-                            .await
-                        {
-                            Ok(admission) => admission,
-                            Err(error) => {
-                                *self.pending_skill_id.write() = None;
-                                yield StreamChunk::error(error.to_string());
-                                return;
-                            }
-                        };
-                        info!(
-                            resolved_count = resolved.len(),
-                            enriched = %enriched_input,
-                            "Input clarified (stream)"
-                        );
-                        for (key, value) in &resolved {
-                            let context_key = format!("disambiguation.{}", key);
-                            let _ = self.context_manager.set(&context_key, value.clone());
-                        }
-                        if let Some(intent) = resolved.get("intent") {
-                            let _ = self.context_manager.set("resolved_intent", intent.clone());
-                        }
-                        let _ = self
-                            .context_manager
-                            .set("disambiguation.resolved", serde_json::Value::Bool(true));
-
-                        // Check if this clarification was triggered by a skill-level override.
-                        // Re-run skill disambiguation to verify all required_clarity fields
-                        // are present before executing.
-                        let skill_id = self.pending_skill_id.read().clone();
-                        if let Some(skill_id) = skill_id {
-                            info!(skill_id = %skill_id, "Re-checking skill disambiguation on clarified input (stream)");
-                            drop(admission);
-                            match self
-                                .recheck_skill_disambiguation(
-                                    &skill_id,
-                                    &enriched_input,
-                                    disambiguation_epoch,
-                                    state_generation,
-                                )
-                                .await
-                            {
-                                Ok(resp) => {
-                                    yield StreamChunk::content(&resp.content);
-                                    record_runtime_stream_final(&terminal, resp);
-                                    yield StreamChunk::Done {};
-                                    return;
-                                }
-                                Err(e) => {
-                                    yield StreamChunk::error(e.to_string());
-                                    return;
-                                }
-                            }
-                        }
-
-                        // Forward to internal stream with enriched input.
-                        drop(admission);
-                        let mut inner = self.run_loop_internal_stream(
+                Ok(DisambiguationDispatch::Terminal(response)) => {
+                    yield StreamChunk::content(&response.content);
+                    record_runtime_stream_final(&terminal, response);
+                    yield StreamChunk::Done {};
+                    return;
+                }
+                Ok(DisambiguationDispatch::RecheckSkill {
+                    skill_id,
+                    enriched_input,
+                    disambiguation_epoch,
+                    state_generation,
+                }) => {
+                    match self
+                        .recheck_skill_disambiguation(
+                            &skill_id,
                             &enriched_input,
-                            Arc::clone(&terminal),
-                        );
-                        while let Some(chunk) = inner.next().await {
-                            yield chunk;
-                        }
-                        return;
-                    }
-                    DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
-                        info!("Proceeding with best guess (stream)");
-
-                        // Same skill-id re-check for best-guess path
-                        let skill_id = self.pending_skill_id.read().clone();
-                        if let Some(skill_id) = skill_id {
-                            info!(skill_id = %skill_id, "Re-checking skill disambiguation on best-guess input (stream)");
-                            match self
-                                .recheck_skill_disambiguation(
-                                    &skill_id,
-                                    &enriched_input,
-                                    disambiguation_epoch,
-                                    state_generation,
-                                )
-                                .await
-                            {
-                                Ok(resp) => {
-                                    yield StreamChunk::content(&resp.content);
-                                    record_runtime_stream_final(&terminal, resp);
-                                    yield StreamChunk::Done {};
-                                    return;
-                                }
-                                Err(e) => {
-                                    yield StreamChunk::error(e.to_string());
-                                    return;
-                                }
-                            }
-                        }
-
-                        let mut inner = self.run_loop_internal_stream(
-                            &enriched_input,
-                            Arc::clone(&terminal),
-                        );
-                        while let Some(chunk) = inner.next().await {
-                            yield chunk;
-                        }
-                        return;
-                    }
-                    DisambiguationResult::GiveUp { reason } => {
-                        *self.pending_skill_id.write() = None;
-                        warn!(reason = %reason, "Disambiguation gave up (stream)");
-                        let apology = self
-                            .generate_localized_apology(
-                                "Generate a brief, polite apology saying you couldn't understand the request. Be concise.",
-                                &reason,
-                            )
-                            .await
-                            .unwrap_or_else(|_| {
-                                format!("I'm sorry, I couldn't understand your request: {}", reason)
-                            });
-                        let response = AgentResponse::new(&apology);
-                        if let Err(e) = self.finish_turn_if_root(&response).await {
-                            yield StreamChunk::error(e.to_string());
+                            disambiguation_epoch,
+                            state_generation,
+                        )
+                        .await
+                    {
+                        Ok(resp) => {
+                            yield StreamChunk::content(&resp.content);
+                            record_runtime_stream_final(&terminal, resp);
+                            yield StreamChunk::Done {};
                             return;
                         }
-                        yield StreamChunk::content(&apology);
-                        record_runtime_stream_final(&terminal, response);
-                        yield StreamChunk::Done {};
-                        return;
-                    }
-                    DisambiguationResult::Escalate { reason } => {
-                        *self.pending_skill_id.write() = None;
-                        info!(reason = %reason, "Escalating to human (stream)");
-                        if let Some(ref hitl) = self.hitl_engine {
-                            let trigger =
-                                ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
-                            let mut context_map = HashMap::new();
-                            context_map.insert("original_input".to_string(), serde_json::json!(input));
-                            context_map.insert("reason".to_string(), serde_json::json!(&reason));
-                            let check_result = HITLCheckResult::required(
-                                trigger,
-                                context_map,
-                                format!("User request needs human assistance: {}", reason),
-                                Some(hitl.config().default_timeout_seconds),
-                            );
-                            match self.request_hitl_approval(check_result).await {
-                                Ok(ApprovalResult::Approved | ApprovalResult::Modified { .. }) => {
-                                    let mut inner = self.run_loop_internal_stream(
-                                        input,
-                                        Arc::clone(&terminal),
-                                    );
-                                    while let Some(chunk) = inner.next().await {
-                                        yield chunk;
-                                    }
-                                    return;
-                                }
-                                Ok(_) => {}
-                                Err(e) => {
-                                    yield StreamChunk::error(e.to_string());
-                                    return;
-                                }
-                            }
-                        }
-                        let apology = self
-                            .generate_localized_apology(
-                                "Explain briefly that you're transferring the user to a human agent for help.",
-                                &reason,
-                            )
-                            .await
-                            .unwrap_or_else(|_| {
-                                format!("I need human assistance to help with your request: {}", reason)
-                            });
-                        let response = AgentResponse::new(&apology);
-                        if let Err(e) = self.finish_turn_if_root(&response).await {
+                        Err(e) => {
                             yield StreamChunk::error(e.to_string());
                             return;
-                        }
-                        yield StreamChunk::content(&apology);
-                        record_runtime_stream_final(&terminal, response);
-                        yield StreamChunk::Done {};
-                        return;
-                    }
-                    DisambiguationResult::Abandoned { new_input } => {
-                        *self.pending_skill_id.write() = None;
-
-                        info!(
-                            has_new_input = new_input.is_some(),
-                            "Clarification abandoned by user (stream)"
-                        );
-
-                        if let Err(e) = self.commit_root_user_message(input).await {
-                            yield StreamChunk::error(e.to_string());
-                            return;
-                        }
-
-                        match new_input {
-                            Some(fresh_input) => {
-                                // Topic switch: forward to internal stream with fresh input.
-                                let mut inner = self.run_loop_internal_stream(
-                                    &fresh_input,
-                                    Arc::clone(&terminal),
-                                );
-                                while let Some(chunk) = inner.next().await {
-                                    yield chunk;
-                                }
-                                return;
-                            }
-                            None => {
-                                // Pure abandonment: generate a brief acknowledgment.
-                                let ack = self
-                                    .generate_localized_apology(
-                                        "The user changed their mind about their previous request. \
-                                         Generate a brief, friendly acknowledgment (e.g. 'OK, no problem. What else can I help with?'). \
-                                         Do NOT apologize excessively. Be concise.",
-                                        "User abandoned clarification",
-                                    )
-                                    .await
-                                    .unwrap_or_else(|_| {
-                                        "OK, no problem. What else can I help with?".to_string()
-                                    });
-
-                                let _ = self
-                                    .memory
-                                    .add_message(ChatMessage::assistant(&ack))
-                                    .await;
-
-                                let response = AgentResponse::new(&ack);
-                                if let Err(e) = self.finish_turn_if_root(&response).await {
-                                    yield StreamChunk::error(e.to_string());
-                                    return;
-                                }
-                                yield StreamChunk::content(&ack);
-                                record_runtime_stream_final(&terminal, response);
-                                yield StreamChunk::Done {};
-                                return;
-                            }
                         }
                     }
                 }
-            }
+                Ok(DisambiguationDispatch::Proceed(input)) => input,
+            };
 
-            // No disambiguation or Clear result — proceed with internal stream
-            let mut inner = self.run_loop_internal_stream(input, Arc::clone(&terminal));
+            let mut inner = self.run_loop_internal_stream(&input_to_run, Arc::clone(&terminal));
             while let Some(chunk) = inner.next().await {
                 yield chunk;
             }
@@ -13309,6 +13283,79 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
+    }
+
+    /// Collects one event stream into (content chunks joined, all chunks, Final).
+    async fn collect_stream_events(
+        agent: &RuntimeAgent,
+        input: &str,
+    ) -> (String, Vec<StreamChunk>, Option<AgentResponse>) {
+        use futures::StreamExt;
+        let mut events = agent.chat_stream_events(input).await.expect("stream opens");
+        let mut content = String::new();
+        let mut chunks = Vec::new();
+        let mut final_response = None;
+        while let Some(event) = events.next().await {
+            match event {
+                AgentStreamEvent::Chunk(chunk) => {
+                    if let StreamChunk::Content { text } = &chunk {
+                        content.push_str(text);
+                    }
+                    chunks.push(chunk);
+                }
+                AgentStreamEvent::Final(response) => final_response = Some(response),
+            }
+        }
+        (content, chunks, final_response)
+    }
+
+    fn metadata_keys(response: &AgentResponse) -> std::collections::BTreeSet<String> {
+        response
+            .metadata
+            .as_ref()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Runs the same input through a blocking agent and a streaming agent built by `build` and asserts the committed responses agree.
+    /// `build` must return a fresh agent each call so memory and state do not leak between the two paths.
+    async fn assert_blocking_streaming_parity<F>(
+        build: F,
+        input: &str,
+    ) -> (AgentResponse, AgentResponse, Vec<StreamChunk>)
+    where
+        F: Fn() -> RuntimeAgent,
+    {
+        let blocking_agent = build();
+        let streaming_agent = build();
+
+        let blocking = blocking_agent
+            .chat(input)
+            .await
+            .expect("blocking chat succeeds");
+        let (_, chunks, final_response) = collect_stream_events(&streaming_agent, input).await;
+        let streamed = final_response.expect("streaming must emit Final when blocking succeeds");
+
+        assert_eq!(
+            blocking.content, streamed.content,
+            "committed content differs"
+        );
+        assert_eq!(
+            metadata_keys(&blocking),
+            metadata_keys(&streamed),
+            "metadata key sets differ"
+        );
+        assert_eq!(
+            blocking.tool_calls.as_ref().map(Vec::len),
+            streamed.tool_calls.as_ref().map(Vec::len),
+            "tool call counts differ"
+        );
+        assert_eq!(
+            blocking_agent.current_state(),
+            streaming_agent.current_state(),
+            "final states differ"
+        );
+        (blocking, streamed, chunks)
     }
 
     fn signed_calculator_response(
@@ -20326,17 +20373,18 @@ states:
         assert!(available.is_empty());
     }
 
-    // Tool execution in chat flow
+    // Tool execution in chat flow: explanatory text plus the documented `{"tool": ..}` call shape.
     #[tokio::test]
     async fn test_integration_tool_execution() {
         // Mock LLM that returns a tool call then a final answer
         let mock = mock_with_responses(vec![
-            // First response: tool call
+            // First response: prose followed by the tool call the prompt asks for
             r#"I'll calculate that for you.
-[TOOL_CALL: {"name": "calculator", "arguments": {"expression": "2+2"}}]"#,
+{"tool": "calculator", "arguments": {"expression": "2+2"}}"#,
             // After tool result: final answer
             "The answer is 4.",
         ]);
+        let observed = mock.clone();
         let mut tools = ai_agents_tools::ToolRegistry::new();
         tools
             .register(Arc::new(ai_agents_tools::CalculatorTool))
@@ -20350,8 +20398,40 @@ states:
             .unwrap();
 
         let response = agent.chat("What is 2+2?").await.unwrap();
-        // The agent should eventually produce a response
-        assert!(!response.content.is_empty());
+
+        assert_eq!(response.content, "The answer is 4.");
+        assert_eq!(response.tool_calls.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            observed.call_count(),
+            2,
+            "tool result must trigger a second LLM call"
+        );
+        let history = agent.tool_call_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tool_id, "calculator");
+        assert_eq!(
+            history[0].result.get("result"),
+            Some(&serde_json::json!(4.0)),
+            "{:?}",
+            history[0].result
+        );
+    }
+
+    // The pre-1.0 `[TOOL_CALL: {"name": ..}]` marker was never a supported call shape: the tool prompt, docs,
+    // and examples all use `{"tool": ..}`. Pin that so the fixture is not copied back into new tests.
+    #[test]
+    fn legacy_tool_call_marker_is_plain_text() {
+        let agent = AgentBuilder::new()
+            .system_prompt("x")
+            .llm(Arc::new(mock_with_response("x")))
+            .build()
+            .unwrap();
+        let parsed = agent
+            .parse_tool_calls(
+                r#"[TOOL_CALL: {"name": "calculator", "arguments": {"expression": "2+2"}}]"#,
+            )
+            .unwrap();
+        assert!(parsed.is_none());
     }
 
     #[tokio::test]
@@ -22202,23 +22282,28 @@ memory:
         );
     }
 
-    // Tool skip: tool fails, on_failure: skip absorbs the error
+    // Tool skip: a registered tool fails during execution and on_failure: skip turns that into a skipped result.
+    // (An unregistered tool never reaches the skip branch; see test_unregistered_tool_call_records_unavailable_and_continues.)
     #[tokio::test]
     async fn test_tool_failure_skip() {
         use ai_agents_recovery::{
             ErrorRecoveryConfig, ToolFailureAction, ToolRecoveryConfig, ToolRetryConfig,
         };
 
-        // LLM requests a nonexistent tool, then responds after seeing the skip result
         let mock = mock_with_responses(vec![
-            r#"I'll use the nonexistent tool.
-[TOOL_CALL: {"name": "nonexistent_tool", "arguments": {}}]"#,
-            "The tool was unavailable, but I can still help you.",
+            r#"{"tool": "calculator", "arguments": {"expression": "not a number +"}}"#,
+            "The calculation was skipped, but I can still help you.",
         ]);
+        let observed = mock.clone();
+        let mut tools = ai_agents_tools::ToolRegistry::new();
+        tools
+            .register(Arc::new(ai_agents_tools::CalculatorTool))
+            .unwrap();
 
         let agent = AgentBuilder::new()
             .system_prompt("You are helpful.")
             .llm(Arc::new(mock))
+            .tools(tools)
             .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
                 tools: ToolRecoveryConfig {
                     default: ToolRetryConfig {
@@ -22233,12 +22318,1434 @@ memory:
             .build()
             .unwrap();
 
-        // The tool will fail (not found), but on_failure: skip absorbs the error
-        let response = agent.chat("Use the nonexistent tool").await;
-        assert!(
-            response.is_ok(),
-            "Expected Ok with skip policy, got: {:?}",
-            response
+        let response = agent.chat("Compute this").await.unwrap();
+
+        assert_eq!(
+            response.content,
+            "The calculation was skipped, but I can still help you."
         );
+        assert_eq!(observed.call_count(), 2);
+        // Skip converts the failed execution into a successful "skipped" payload that the model sees as the tool result.
+        let history = agent.tool_call_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tool_id, "calculator");
+        assert_eq!(
+            history[0].result.get("skipped"),
+            Some(&serde_json::json!(true)),
+            "{:?}",
+            history[0].result
+        );
+    }
+
+    // Calling a tool that is not registered records an unavailable result and lets the conversation continue.
+    #[tokio::test]
+    async fn test_unregistered_tool_call_records_unavailable_and_continues() {
+        let mock = mock_with_responses(vec![
+            r#"{"tool": "nonexistent_tool", "arguments": {}}"#,
+            "The tool was unavailable, but I can still help you.",
+        ]);
+        let observed = mock.clone();
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+
+        let response = agent.chat("Use the nonexistent tool").await.unwrap();
+
+        assert_eq!(
+            response.content,
+            "The tool was unavailable, but I can still help you."
+        );
+        assert_eq!(observed.call_count(), 2);
+        let history = agent.tool_call_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].tool_id, "nonexistent_tool");
+        assert_eq!(
+            history[0].result.pointer("/error/kind"),
+            Some(&serde_json::json!("tool_unavailable")),
+            "{:?}",
+            history[0].result
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocking / streaming parity: main stream recovery
+    // ---------------------------------------------------------------------
+
+    fn fallback_llm_recovery(fallback_llm: &str) -> RecoveryManager {
+        use ai_agents_recovery::{ErrorRecoveryConfig, LLMFailureAction, LLMRecoveryConfig};
+        RecoveryManager::new(ErrorRecoveryConfig {
+            llm: LLMRecoveryConfig {
+                on_failure: LLMFailureAction::FallbackLlm {
+                    fallback_llm: fallback_llm.to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_fallback_on_open_failure() {
+        let mut primary = MockLLMProvider::new("primary");
+        primary.set_error("Primary LLM is unavailable");
+        let mut fallback = MockLLMProvider::new("fallback");
+        fallback.set_response("Fallback response works!");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm_alias("default", Arc::new(primary))
+            .llm_alias("backup", Arc::new(fallback))
+            .recovery_manager(fallback_llm_recovery("backup"))
+            .build()
+            .unwrap();
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "Hello").await;
+        assert!(
+            !chunks.iter().any(StreamChunk::is_error),
+            "fallback must not surface as a stream error: {chunks:?}"
+        );
+        let final_response = final_response.expect("Final must be emitted after fallback");
+        assert!(content.contains("Fallback response"));
+        assert!(final_response.content.contains("Fallback response"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_fallback_response_static_message() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, LLMFailureAction, LLMRecoveryConfig};
+
+        let mut primary = MockLLMProvider::new("primary");
+        primary.set_error("Primary LLM is unavailable");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(primary))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                llm: LLMRecoveryConfig {
+                    on_failure: LLMFailureAction::FallbackResponse {
+                        message: "Service is temporarily unavailable.".to_string(),
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "Hello").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error));
+        let content_chunks = chunks.iter().filter(|c| c.is_content()).count();
+        assert_eq!(content_chunks, 1, "static fallback is one content chunk");
+        assert_eq!(content, "Service is temporarily unavailable.");
+        assert_eq!(
+            final_response.expect("Final").content,
+            "Service is temporarily unavailable."
+        );
+    }
+
+    /// Fails stream opening with a transient error a fixed number of times, then streams one chunk.
+    struct FailOnceStreamProvider {
+        remaining_failures: Arc<std::sync::atomic::AtomicUsize>,
+        open_attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for FailOnceStreamProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            Ok(LLMResponse::new("blocking path", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            self.open_attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(LLMError::Network("connection reset".to_string()));
+            }
+            Ok(Box::new(futures::stream::iter(vec![Ok(LLMChunk::new(
+                "Recovered after retry",
+                true,
+            ))])))
+        }
+
+        fn provider_name(&self) -> &str {
+            "fail-once-stream"
+        }
+
+        fn supports(&self, feature: LLMFeature) -> bool {
+            matches!(feature, LLMFeature::Streaming)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_retry_then_success() {
+        use ai_agents_recovery::{BackoffConfig, ErrorRecoveryConfig, RetryConfig};
+
+        let open_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = FailOnceStreamProvider {
+            remaining_failures: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            open_attempts: Arc::clone(&open_attempts),
+        };
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(provider))
+            .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                default: RetryConfig {
+                    max_retries: 1,
+                    backoff: BackoffConfig {
+                        initial_ms: 1,
+                        max_ms: 1,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            }))
+            .build()
+            .unwrap();
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "Hello").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(open_attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(content, "Recovered after retry");
+        assert_eq!(
+            final_response.expect("Final").content,
+            "Recovered after retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_llm_error_action_error_emits_terminal_error() {
+        let mut primary = MockLLMProvider::new("primary");
+        primary.set_error("Primary LLM is unavailable");
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(primary))
+            .build()
+            .unwrap();
+
+        let (_, chunks, final_response) = collect_stream_events(&agent, "Hello").await;
+        assert!(
+            final_response.is_none(),
+            "default Error action must not produce Final"
+        );
+        assert!(
+            chunks.iter().any(StreamChunk::is_error),
+            "default Error action must surface a stream error"
+        );
+    }
+
+    /// Streams one visible delta and then fails, so recovery must not restart the call.
+    struct MidStreamFailureProvider;
+
+    #[async_trait]
+    impl LLMProvider for MidStreamFailureProvider {
+        async fn complete(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            Ok(LLMResponse::new("blocking path", FinishReason::Stop))
+        }
+
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Ok(Box::new(futures::stream::iter(vec![
+                Ok(LLMChunk::new("Partial ", false)),
+                Err(LLMError::Network("connection dropped".to_string())),
+            ])))
+        }
+
+        fn provider_name(&self) -> &str {
+            "mid-stream-failure"
+        }
+
+        fn supports(&self, feature: LLMFeature) -> bool {
+            matches!(feature, LLMFeature::Streaming)
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_mid_stream_failure_is_terminal() {
+        let mut fallback = MockLLMProvider::new("fallback");
+        fallback.set_response("Fallback must not run");
+        let fallback_calls = fallback.clone();
+
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm_alias("default", Arc::new(MidStreamFailureProvider))
+            .llm_alias("backup", Arc::new(fallback))
+            .recovery_manager(fallback_llm_recovery("backup"))
+            .build()
+            .unwrap();
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "Hello").await;
+        assert_eq!(content, "Partial ");
+        assert!(chunks.iter().any(StreamChunk::is_error));
+        assert!(final_response.is_none());
+        assert_eq!(
+            fallback_calls.call_count(),
+            0,
+            "fallback must not run after a visible delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffered_streaming_draft_uses_fallback_llm() {
+        use futures::StreamExt;
+
+        let mut primary = MockLLMProvider::new("primary");
+        primary.set_error("Primary LLM is unavailable");
+        let fallback = mock_with_response("fallback one two");
+        let yaml = r#"
+name: BufferedFallbackAgent
+system_prompt: "You stream safely."
+llm:
+  default: default
+streaming:
+  enabled: true
+  buffer_size: 8
+runtime:
+  optimization:
+    enabled: true
+    max_speculative_llm_calls_per_turn: 2
+    speculative_state_transitions: true
+    streaming_policy: buffer_until_routing_done
+    max_parallel_runtime_tasks: 2
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Answer from triage."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(primary))
+            .llm_alias("backup", Arc::new(fallback))
+            .recovery_manager(fallback_llm_recovery("backup"))
+            .build()
+            .unwrap();
+
+        let mut stream = agent.chat_stream("hello").await.unwrap();
+        let mut content = String::new();
+        let mut error = None;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => content.push_str(&text),
+                StreamChunk::Error { message } => error = Some(message),
+                StreamChunk::Done {} => break,
+                _ => {}
+            }
+        }
+
+        assert_eq!(error, None);
+        assert_eq!(content, "fallback one two");
+    }
+
+    #[tokio::test]
+    async fn parity_llm_fallback_llm() {
+        let build = || {
+            let mut primary = MockLLMProvider::new("primary");
+            primary.set_error("Primary LLM is unavailable");
+            let mut fallback = MockLLMProvider::new("fallback");
+            fallback.set_response("Fallback response works!");
+            AgentBuilder::new()
+                .system_prompt("You are helpful.")
+                .llm_alias("default", Arc::new(primary))
+                .llm_alias("backup", Arc::new(fallback))
+                .recovery_manager(fallback_llm_recovery("backup"))
+                .build()
+                .unwrap()
+        };
+        assert_blocking_streaming_parity(build, "Hello").await;
+    }
+
+    #[tokio::test]
+    async fn parity_llm_fallback_response() {
+        use ai_agents_recovery::{ErrorRecoveryConfig, LLMFailureAction, LLMRecoveryConfig};
+        let build = || {
+            let mut primary = MockLLMProvider::new("primary");
+            primary.set_error("Primary LLM is unavailable");
+            AgentBuilder::new()
+                .system_prompt("You are helpful.")
+                .llm(Arc::new(primary))
+                .recovery_manager(RecoveryManager::new(ErrorRecoveryConfig {
+                    llm: LLMRecoveryConfig {
+                        on_failure: LLMFailureAction::FallbackResponse {
+                            message: "Service is temporarily unavailable.".to_string(),
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }))
+                .build()
+                .unwrap()
+        };
+        assert_blocking_streaming_parity(build, "Hello").await;
+    }
+
+    #[tokio::test]
+    async fn parity_basic_chat() {
+        let build = || {
+            AgentBuilder::new()
+                .system_prompt("You are helpful.")
+                .llm(Arc::new(mock_with_response("Plain answer")))
+                .build()
+                .unwrap()
+        };
+        assert_blocking_streaming_parity(build, "Hello").await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocking / streaming parity: skills beside speculative transitions
+    // ---------------------------------------------------------------------
+
+    /// Parallel guard transition plus one skill. `extra_optimization` is appended under `runtime.optimization`.
+    fn skills_with_parallel_transition_yaml(extra_optimization: &str, streaming: &str) -> String {
+        format!(
+            r#"
+name: SkillsBesideTransitionAgent
+system_prompt: "Use skills when they match."
+llm:
+  default: default
+  router: router
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+{streaming}
+runtime:
+  optimization:
+    enabled: true
+    speculative_state_transitions: true
+{extra_optimization}
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+skills:
+  - id: helper
+    description: "Answer helper requests"
+    trigger: "User asks for helper"
+    steps:
+      - prompt: "Answer the helper request: {{{{ user_input }}}}"
+        llm: skill
+"#
+        )
+    }
+
+    /// One provider per role. Racing or cancelled calls (losing speculative branches, dropped streams) consume no
+    /// mock response, so encoding role order in a single response queue makes tests timing-dependent.
+    /// MockLLMProvider takes the next response only after its latency wait; see its type-level docs.
+    struct RoleMocks {
+        main: MockLLMProvider,
+        router: MockLLMProvider,
+        skill: MockLLMProvider,
+    }
+
+    fn role_mocks(main: MockLLMProvider, router: MockLLMProvider) -> RoleMocks {
+        RoleMocks {
+            main,
+            router,
+            skill: mock_with_response("Skill step response"),
+        }
+    }
+
+    fn build_skills_beside_transition_agent(yaml: &str, mocks: RoleMocks) -> RuntimeAgent {
+        AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(mocks.main))
+            .llm_alias("router", Arc::new(mocks.router))
+            .llm_alias("skill", Arc::new(mocks.skill))
+            .build()
+            .unwrap()
+    }
+
+    fn branch_events_with_commit_behavior(agent: &RuntimeAgent, behavior: &str) -> usize {
+        agent
+            .observability()
+            .unwrap()
+            .raw_events()
+            .iter()
+            .filter(|event| event.dimensions.get("commit_behavior") == Some(&behavior.to_string()))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn test_speculative_transition_with_skills_and_no_skill_branch_routes_skill_serially() {
+        let default_mock = mock_with_response("Draft response");
+        let router_mock = mock_with_response("helper");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            "    max_speculative_llm_calls_per_turn: 2\n    max_parallel_runtime_tasks: 2",
+            "",
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+
+        let response = agent.chat("please use helper").await.unwrap();
+
+        assert_eq!(
+            response.metadata.as_ref().and_then(|m| m.get("skill_id")),
+            Some(&serde_json::json!("helper")),
+            "skill must route even without a skill branch: {response:?}"
+        );
+        assert_eq!(router_counter.call_count(), 1);
+        // Transition speculation still ran, but no skill branch telemetry exists because selection was serial.
+        assert!(branch_events_with_commit_behavior(&agent, "transition_decision") > 0);
+        assert_eq!(
+            branch_events_with_commit_behavior(&agent, "skill_selection"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_speculative_transition_with_skills_no_match_commits_draft() {
+        let default_mock = mock_with_response("Draft response");
+        let router_mock = mock_with_response("none");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            "    max_speculative_llm_calls_per_turn: 2\n    max_parallel_runtime_tasks: 2",
+            "",
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+
+        let response = agent.chat("just chat").await.unwrap();
+
+        assert_eq!(response.content, "Draft response");
+        assert!(
+            response
+                .metadata
+                .as_ref()
+                .is_none_or(|m| !m.contains_key("skill_id"))
+        );
+        assert_eq!(router_counter.call_count(), 1);
+        assert!(branch_events_with_commit_behavior(&agent, "final_response") > 0);
+    }
+
+    #[tokio::test]
+    async fn test_speculative_transition_win_skips_serial_skill_selection() {
+        let default_mock = mock_with_response("Billing answer");
+        let router_mock = mock_with_response("none");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            "    max_speculative_llm_calls_per_turn: 2\n    max_parallel_runtime_tasks: 2",
+            "",
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+        agent
+            .set_context("route", serde_json::json!("billing"))
+            .unwrap();
+
+        let response = agent.chat("billing please").await.unwrap();
+
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(response.content, "Billing answer");
+        // Exactly one router call: the serial route inside the billing redispatch. No pre-transition skill selection ran.
+        assert_eq!(router_counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_speculative_skill_capacity_exhausted_still_routes_skill_serially() {
+        let default_mock = mock_with_response("Draft response");
+        let router_mock = mock_with_response("helper");
+        let router_counter = router_mock.clone();
+        // Two slots: main draft + transition. The skill branch cannot be scheduled and must fall back to serial selection.
+        let yaml = skills_with_parallel_transition_yaml(
+            "    speculative_skill_routing: true\n    max_speculative_llm_calls_per_turn: 2\n    max_parallel_runtime_tasks: 2",
+            "",
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+
+        let response = agent.chat("please use helper").await.unwrap();
+
+        assert_eq!(
+            response.metadata.as_ref().and_then(|m| m.get("skill_id")),
+            Some(&serde_json::json!("helper"))
+        );
+        assert_eq!(router_counter.call_count(), 1);
+        assert_eq!(
+            branch_events_with_commit_behavior(&agent, "skill_selection"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_speculative_transition_and_skill_both_enabled_unchanged() {
+        let default_mock = mock_with_response("Draft response");
+        let router_mock = mock_with_response("helper");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            "    speculative_skill_routing: true\n    max_speculative_llm_calls_per_turn: 3\n    max_parallel_runtime_tasks: 3",
+            "",
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+
+        let response = agent.chat("please use helper").await.unwrap();
+
+        assert_eq!(
+            response.metadata.as_ref().and_then(|m| m.get("skill_id")),
+            Some(&serde_json::json!("helper"))
+        );
+        assert_eq!(router_counter.call_count(), 1);
+        // The skill branch really ran, so its telemetry is present.
+        assert!(branch_events_with_commit_behavior(&agent, "skill_selection") > 0);
+    }
+
+    const BUFFERED_STREAMING_YAML_FRAGMENT: &str = "streaming:\n  enabled: true\n  buffer_size: 16";
+    const BUFFERED_OPTIMIZATION_FRAGMENT: &str = "    max_speculative_llm_calls_per_turn: 2\n    streaming_policy: buffer_until_routing_done\n    max_parallel_runtime_tasks: 2";
+
+    #[tokio::test]
+    async fn test_buffered_streaming_skill_wins_after_transition_miss() {
+        let mut default_mock = mock_with_response("draft one two");
+        default_mock.set_latency(10);
+        let router_mock = mock_with_response("helper");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            BUFFERED_OPTIMIZATION_FRAGMENT,
+            BUFFERED_STREAMING_YAML_FRAGMENT,
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+
+        let (content, chunks, final_response) =
+            collect_stream_events(&agent, "please use helper").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert!(
+            !content.contains("draft"),
+            "buffered draft must be discarded when a skill wins: {content:?}"
+        );
+        let final_response = final_response.expect("Final");
+        assert_eq!(
+            final_response
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("skill_id")),
+            Some(&serde_json::json!("helper"))
+        );
+        assert_eq!(content, final_response.content);
+        assert_eq!(router_counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_buffered_streaming_skill_miss_releases_buffer_and_commits_draft() {
+        let mut default_mock = mock_with_response("draft one two");
+        default_mock.set_latency(10);
+        let router_mock = mock_with_response("none");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            BUFFERED_OPTIMIZATION_FRAGMENT,
+            BUFFERED_STREAMING_YAML_FRAGMENT,
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "just chat").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(content, "draft one two");
+        assert_eq!(final_response.expect("Final").content, "draft one two");
+        assert_eq!(router_counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_buffered_streaming_transition_win_skips_skill_selection() {
+        let default_mock = mock_with_response("Billing answer");
+        let router_mock = mock_with_response("none");
+        let router_counter = router_mock.clone();
+        let yaml = skills_with_parallel_transition_yaml(
+            BUFFERED_OPTIMIZATION_FRAGMENT,
+            BUFFERED_STREAMING_YAML_FRAGMENT,
+        );
+        let agent =
+            build_skills_beside_transition_agent(&yaml, role_mocks(default_mock, router_mock));
+        agent
+            .set_context("route", serde_json::json!("billing"))
+            .unwrap();
+
+        let (content, chunks, final_response) =
+            collect_stream_events(&agent, "billing please").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(content, "Billing answer");
+        assert_eq!(final_response.expect("Final").content, "Billing answer");
+        // Only the redispatch's serial route called the router; no pre-transition selection.
+        assert_eq!(router_counter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn parity_buffered_policy_with_skills() {
+        let yaml = skills_with_parallel_transition_yaml(
+            BUFFERED_OPTIMIZATION_FRAGMENT,
+            BUFFERED_STREAMING_YAML_FRAGMENT,
+        );
+        let build = || {
+            build_skills_beside_transition_agent(
+                &yaml,
+                role_mocks(
+                    mock_with_response("draft one two"),
+                    mock_with_response("helper"),
+                ),
+            )
+        };
+        let (blocking, _, _) = assert_blocking_streaming_parity(build, "please use helper").await;
+        assert_eq!(
+            blocking.metadata.as_ref().and_then(|m| m.get("skill_id")),
+            Some(&serde_json::json!("helper"))
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_buffered_policy_with_cot() {
+        let yaml = format!(
+            r#"
+name: BufferedCotAgent
+system_prompt: "Think first."
+llm:
+  default: default
+streaming:
+  enabled: true
+  buffer_size: 16
+reasoning:
+  mode: cot
+runtime:
+  optimization:
+    enabled: true
+    speculative_state_transitions: true
+{BUFFERED_OPTIMIZATION_FRAGMENT}
+states:
+  initial: triage
+  states:
+    triage:
+      prompt: "Triage state."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+          timing: parallel
+    billing:
+      prompt: "Billing state."
+"#
+        );
+        let build = || {
+            AgentBuilder::from_yaml(&yaml)
+                .unwrap()
+                .llm_alias(
+                    "default",
+                    Arc::new(mock_with_response(
+                        "<thinking>step by step</thinking>Reasoned answer",
+                    )),
+                )
+                .build()
+                .unwrap()
+        };
+        let (blocking, streamed, _) = assert_blocking_streaming_parity(build, "hello").await;
+        assert_eq!(blocking.content, "Reasoned answer");
+        let mode = streamed
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("reasoning"))
+            .and_then(|r| r.get("mode_used"))
+            .cloned();
+        // ReasoningMode uses serde's default snake_case rename, so `CoT` serializes as `co_t`.
+        assert_eq!(
+            mode,
+            Some(serde_json::to_value(ReasoningMode::CoT).unwrap())
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocking / streaming parity: post-response transition emission
+    // ---------------------------------------------------------------------
+
+    /// Post-response guard transition from `intake` to `billing`. `states_extra` is inserted under `states:`,
+    /// `billing_extra` under the billing state definition.
+    fn post_response_transition_yaml(states_extra: &str, billing_extra: &str) -> String {
+        format!(
+            r#"
+name: PostResponseTransitionAgent
+system_prompt: "You are helpful."
+streaming:
+  enabled: true
+states:
+  initial: intake
+{states_extra}
+  states:
+    intake:
+      prompt: "Intake"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+    billing:
+      prompt: "Billing"
+{billing_extra}
+"#
+        )
+    }
+
+    fn build_post_response_transition_agent(yaml: &str, mock: MockLLMProvider) -> RuntimeAgent {
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        agent
+            .set_context("route", serde_json::json!("billing"))
+            .unwrap();
+        agent
+    }
+
+    fn count_occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.matches(needle).count()
+    }
+
+    #[tokio::test]
+    async fn test_stream_transition_without_regeneration_emits_content_once() {
+        let yaml = post_response_transition_yaml("  regenerate_on_transition: false", "");
+        let agent =
+            build_post_response_transition_agent(&yaml, mock_with_response("Intake answer"));
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(
+            count_occurrences(&content, "Intake answer"),
+            1,
+            "committed content must not be emitted twice: {content:?}"
+        );
+        assert_eq!(final_response.expect("Final").content, content);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::StateTransition { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_transition_without_regeneration_buffered_emits_content_once() {
+        let yaml = post_response_transition_yaml("  regenerate_on_transition: false", "");
+        let mut mock = mock_with_response("Intake answer");
+        // Explicit tool choice forces the buffered decision path (runtime.rs buffered_decision).
+        mock.set_tool_choice(Some(ToolChoice::Auto));
+        let agent = build_post_response_transition_agent(&yaml, mock);
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(
+            count_occurrences(&content, "Intake answer"),
+            1,
+            "{content:?}"
+        );
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_state_regenerate_on_enter_false_emits_content_once() {
+        let yaml = post_response_transition_yaml("", "      regenerate_on_enter: false");
+        let agent =
+            build_post_response_transition_agent(&yaml, mock_with_response("Intake answer"));
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert_eq!(
+            count_occurrences(&content, "Intake answer"),
+            1,
+            "{content:?}"
+        );
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_transition_with_regeneration_emits_replacement() {
+        let yaml = post_response_transition_yaml("", "");
+        let agent = build_post_response_transition_agent(
+            &yaml,
+            mock_with_responses(vec!["Intake answer", "Billing answer"]),
+        );
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        // Documented behavior: stale deltas are already visible, the regenerated content follows.
+        assert_eq!(count_occurrences(&content, "Intake answer"), 1);
+        assert_eq!(count_occurrences(&content, "Billing answer"), 1);
+        assert_eq!(final_response.expect("Final").content, "Billing answer");
+    }
+
+    #[tokio::test]
+    async fn test_blocking_transition_without_regeneration_unchanged() {
+        let yaml = post_response_transition_yaml("  regenerate_on_transition: false", "");
+        let agent =
+            build_post_response_transition_agent(&yaml, mock_with_response("Intake answer"));
+
+        let response = agent.chat("hello").await.unwrap();
+
+        assert_eq!(response.content, "Intake answer");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+    }
+
+    #[tokio::test]
+    async fn parity_transition_regenerate_off() {
+        let yaml = post_response_transition_yaml("  regenerate_on_transition: false", "");
+        let build =
+            || build_post_response_transition_agent(&yaml, mock_with_response("Intake answer"));
+        assert_blocking_streaming_parity(build, "hello").await;
+    }
+
+    #[tokio::test]
+    async fn parity_transition_regenerate_on() {
+        let yaml = post_response_transition_yaml("", "");
+        let build = || {
+            build_post_response_transition_agent(
+                &yaml,
+                mock_with_responses(vec!["Intake answer", "Billing answer"]),
+            )
+        };
+        let (blocking, _, _) = assert_blocking_streaming_parity(build, "hello").await;
+        assert_eq!(blocking.content, "Billing answer");
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocking / streaming parity: contract alignment
+    // ---------------------------------------------------------------------
+
+    fn rejecting_process_processor() -> ProcessProcessor {
+        use ai_agents_process::ProcessConfig;
+        let validate_config = ai_agents_process::ValidateStage {
+            id: Some("length_check".to_string()),
+            condition: None,
+            config: ai_agents_process::ValidateConfig {
+                rules: vec![ai_agents_process::ValidationRule::MinLength {
+                    min_length: 10,
+                    on_fail: ai_agents_process::ValidationAction {
+                        action: ai_agents_process::ValidationActionType::Reject,
+                        message: None,
+                    },
+                }],
+                ..Default::default()
+            },
+        };
+        ProcessProcessor::new(ProcessConfig {
+            input: vec![ai_agents_process::ProcessStage::Validate(validate_config)],
+            ..Default::default()
+        })
+    }
+
+    /// Mirrors the blocking `test_integration_process_validate_reject` acceptance predicate.
+    fn looks_like_rejection(content: &str) -> bool {
+        content.contains("rejected")
+            || content.contains("Input rejected")
+            || content.contains("too short")
+            || content.contains("Too short")
+            || content.len() < 50
+    }
+
+    #[tokio::test]
+    async fn test_stream_input_rejection_is_final_response() {
+        let responses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hooks = Arc::new(ResponseCountingHooks {
+            responses: Arc::clone(&responses),
+        });
+        let mock = mock_with_response("Should not reach here.");
+        let llm_calls = mock.clone();
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock))
+            .process_processor(rejecting_process_processor())
+            .hooks(hooks.clone())
+            .build()
+            .unwrap();
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "Hi").await;
+
+        assert!(
+            !chunks.iter().any(StreamChunk::is_error),
+            "rejection is a response, not a stream error: {chunks:?}"
+        );
+        let final_response = final_response.expect("rejection must finalize as Final");
+        assert!(
+            looks_like_rejection(&final_response.content),
+            "Expected rejection response, got: {}",
+            final_response.content
+        );
+        assert_eq!(content, final_response.content);
+        assert_eq!(
+            llm_calls.call_count(),
+            0,
+            "rejected input must not reach the LLM"
+        );
+        assert_eq!(responses.load(Ordering::SeqCst), 1, "on_response must fire");
+    }
+
+    #[tokio::test]
+    async fn parity_input_rejection() {
+        let build = || {
+            AgentBuilder::new()
+                .system_prompt("You are helpful.")
+                .llm(Arc::new(mock_with_response("Should not reach here.")))
+                .process_processor(rejecting_process_processor())
+                .build()
+                .unwrap()
+        };
+        let (blocking, _, _) = assert_blocking_streaming_parity(build, "Hi").await;
+        assert!(
+            looks_like_rejection(&blocking.content),
+            "{}",
+            blocking.content
+        );
+    }
+
+    fn pre_response_transition_yaml(streaming_policy: &str) -> String {
+        format!(
+            r#"
+name: StreamingPreflightAgent
+system_prompt: "You route before streaming."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+    streaming_policy: {streaming_policy}
+streaming:
+  enabled: true
+  buffer_size: 16
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "OLD_STATE_SENTINEL"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+    billing:
+      prompt: "Billing state."
+"#
+        )
+    }
+
+    fn build_pre_response_transition_agent(yaml: &str) -> RuntimeAgent {
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("Billing streamed response")))
+            .build()
+            .unwrap();
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+        agent
+    }
+
+    #[tokio::test]
+    async fn test_stream_buffered_policy_runs_pre_response_deterministic_transition() {
+        let yaml = pre_response_transition_yaml("buffer_until_routing_done");
+        let agent = build_pre_response_transition_agent(&yaml);
+
+        let (content, chunks, final_response) =
+            collect_stream_events(&agent, "billing please").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(agent.current_state().as_deref(), Some("billing"));
+        assert!(content.contains("Billing streamed response"));
+        assert!(!content.contains("OLD_STATE_SENTINEL"));
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_disabled_policy_skips_preflight() {
+        let yaml = pre_response_transition_yaml("disabled");
+        let agent = build_pre_response_transition_agent(&yaml);
+
+        let (_, chunks, final_response) = collect_stream_events(&agent, "billing please").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert!(final_response.is_some());
+        // `disabled` skips every optimized streaming step including preflight, and `timing: pre_response`
+        // transitions are only committed by preflight, so the streaming turn stays in the old state.
+        // Blocking ignores `streaming_policy` and would transition; this asymmetry is documented.
+        assert_eq!(agent.current_state().as_deref(), Some("greeting"));
+    }
+
+    #[tokio::test]
+    async fn parity_pre_response_transition_buffered_policy() {
+        let yaml = pre_response_transition_yaml("buffer_until_routing_done");
+        let build = || build_pre_response_transition_agent(&yaml);
+        assert_blocking_streaming_parity(build, "billing please").await;
+    }
+
+    // ---------------------------------------------------------------------
+    // Blocking / streaming parity: shared helpers
+    // ---------------------------------------------------------------------
+
+    fn calculator_agent_with(mock: MockLLMProvider) -> RuntimeAgent {
+        let mut tools = ai_agents_tools::ToolRegistry::new();
+        tools
+            .register(Arc::new(ai_agents_tools::CalculatorTool))
+            .unwrap();
+        AgentBuilder::new()
+            .system_prompt("You are a calculator assistant.")
+            .llm(Arc::new(mock))
+            .tools(tools)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stream_tool_start_events_precede_results_for_batch() {
+        let mock = mock_with_responses(vec![
+            r#"[{"tool": "calculator", "arguments": {"expression": "1+1"}}, {"tool": "calculator", "arguments": {"expression": "2+2"}}]"#,
+            "Both answers are ready.",
+        ]);
+        let agent = calculator_agent_with(mock);
+
+        let (_, chunks, final_response) = collect_stream_events(&agent, "compute both").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        let final_response = final_response.expect("Final");
+        assert_eq!(final_response.tool_calls.as_ref().map(Vec::len), Some(2));
+
+        let tool_events: Vec<&StreamChunk> = chunks
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    StreamChunk::ToolCallStart { .. }
+                        | StreamChunk::ToolResult { .. }
+                        | StreamChunk::ToolCallEnd { .. }
+                )
+            })
+            .collect();
+        assert_eq!(tool_events.len(), 6, "{tool_events:?}");
+        // Both starts are emitted before any result: admission order, not completion order.
+        assert!(matches!(tool_events[0], StreamChunk::ToolCallStart { .. }));
+        assert!(matches!(tool_events[1], StreamChunk::ToolCallStart { .. }));
+        assert!(matches!(
+            tool_events[2],
+            StreamChunk::ToolResult { success: true, .. }
+        ));
+        assert!(matches!(tool_events[3], StreamChunk::ToolCallEnd { .. }));
+        assert!(matches!(
+            tool_events[4],
+            StreamChunk::ToolResult { success: true, .. }
+        ));
+        assert!(matches!(tool_events[5], StreamChunk::ToolCallEnd { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_stream_clarification_final_carries_options_and_detection() {
+        let responses = || {
+            vec![
+                r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                r#"{"question":"What should I send?","options":["report","invoice"]}"#,
+            ]
+        };
+        let (blocking_agent, _) = state_disambiguation_agent(responses(), true, None, true);
+        let (streaming_agent, _) = state_disambiguation_agent(responses(), true, None, true);
+
+        let blocking = blocking_agent.chat("Send it").await.unwrap();
+        let (_, chunks, streamed) = collect_stream_events(&streaming_agent, "Send it").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        let streamed = streamed.expect("clarification must finalize as Final");
+
+        assert_eq!(streamed.content, "What should I send?");
+        let streamed_meta = streamed
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("disambiguation"))
+            .cloned()
+            .expect("disambiguation metadata");
+        for key in ["status", "options", "clarifying", "detection"] {
+            assert!(
+                streamed_meta.get(key).is_some(),
+                "missing {key}: {streamed_meta}"
+            );
+        }
+        assert_eq!(
+            streamed_meta.get("detection").and_then(|d| d.get("type")),
+            Some(&serde_json::json!("missing_target"))
+        );
+        assert_eq!(
+            blocking
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("disambiguation")),
+            Some(&streamed_meta),
+            "blocking and streaming clarification metadata must be identical"
+        );
+    }
+
+    /// In-memory store whose Nth `add_message` fails, so formerly ignored streaming memory writes can be observed.
+    struct FailingMemory {
+        messages: parking_lot::RwLock<Vec<ChatMessage>>,
+        fail_on_add: usize,
+        adds: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Memory for FailingMemory {
+        async fn add_message(&self, message: ChatMessage) -> Result<()> {
+            let n = self.adds.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == self.fail_on_add {
+                return Err(AgentError::Other(format!(
+                    "simulated memory failure on add #{n}"
+                )));
+            }
+            self.messages.write().push(message);
+            Ok(())
+        }
+
+        async fn get_messages(&self, limit: Option<usize>) -> Result<Vec<ChatMessage>> {
+            let messages = self.messages.read();
+            Ok(match limit {
+                Some(n) if n < messages.len() => messages[messages.len() - n..].to_vec(),
+                _ => messages.clone(),
+            })
+        }
+
+        async fn clear(&self) -> Result<()> {
+            self.messages.write().clear();
+            Ok(())
+        }
+
+        fn len(&self) -> usize {
+            self.messages.read().len()
+        }
+
+        async fn restore(&self, snapshot: ai_agents_core::MemorySnapshot) -> Result<()> {
+            *self.messages.write() = snapshot.messages;
+            Ok(())
+        }
+    }
+
+    impl ai_agents_memory::Memory for FailingMemory {}
+
+    #[tokio::test]
+    async fn test_stream_memory_write_failure_surfaces_as_error() {
+        // Turn shape: user commit (add #1) → tool call → transition fires → workflow note (add #2, fails).
+        // Before the shared tool-call helper the streaming loop ignored that write failure and kept going.
+        let yaml = r#"
+name: TransitionOnToolCallAgent
+system_prompt: "You are helpful."
+streaming:
+  enabled: true
+states:
+  initial: intake
+  states:
+    intake:
+      prompt: "Intake"
+      transitions:
+        - to: billing
+          guard:
+            context:
+              route:
+                eq: billing
+    billing:
+      prompt: "Billing"
+"#;
+        let build = |fail_on_add: usize| {
+            let mut tools = ai_agents_tools::ToolRegistry::new();
+            tools
+                .register(Arc::new(ai_agents_tools::CalculatorTool))
+                .unwrap();
+            let agent = AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(mock_with_responses(vec![
+                    r#"{"tool": "calculator", "arguments": {"expression": "1+1"}}"#,
+                    "Billing answer",
+                ])))
+                .tools(tools)
+                .memory(Arc::new(FailingMemory {
+                    messages: parking_lot::RwLock::new(Vec::new()),
+                    fail_on_add,
+                    adds: std::sync::atomic::AtomicUsize::new(0),
+                }))
+                .build()
+                .unwrap();
+            agent
+                .set_context("route", serde_json::json!("billing"))
+                .unwrap();
+            agent
+        };
+
+        let blocking = build(2).chat("compute").await;
+        assert!(
+            blocking.is_err(),
+            "blocking must surface the memory failure"
+        );
+
+        let (_, chunks, final_response) = collect_stream_events(&build(2), "compute").await;
+        assert!(
+            final_response.is_none(),
+            "streaming must not finalize after a memory failure"
+        );
+        assert!(
+            chunks.iter().any(|c| matches!(c, StreamChunk::Error { message } if message.contains("simulated memory failure"))),
+            "streaming must surface the memory failure: {chunks:?}"
+        );
+
+        // Sanity: without the injected failure the same turn completes in both paths.
+        assert!(build(usize::MAX).chat("compute").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn parity_tool_execution() {
+        let build = || {
+            calculator_agent_with(mock_with_responses(vec![
+                r#"{"tool": "calculator", "arguments": {"expression": "2+2"}}"#,
+                "The answer is 4.",
+            ]))
+        };
+        let (blocking, _, chunks) = assert_blocking_streaming_parity(build, "What is 2+2?").await;
+        assert_eq!(blocking.content, "The answer is 4.");
+        assert!(
+            chunks
+                .iter()
+                .any(|c| matches!(c, StreamChunk::ToolResult { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn parity_disambiguation_clarification() {
+        let build = || {
+            state_disambiguation_agent(
+                vec![
+                    r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+                    r#"{"question":"What should I send?","options":null}"#,
+                ],
+                true,
+                None,
+                true,
+            )
+            .0
+        };
+        let (blocking, _, _) = assert_blocking_streaming_parity(build, "Send it").await;
+        assert_eq!(blocking.content, "What should I send?");
+    }
+
+    #[tokio::test]
+    async fn parity_reflection_enabled() {
+        let yaml = r#"
+name: ReflectionAgent
+system_prompt: "You are careful."
+reflection:
+  enabled: true
+  criteria:
+    - "Is the answer helpful?"
+"#;
+        let build = || {
+            AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(mock_with_responses(vec![
+                    "Main answer",
+                    "OVERALL: PASS\nCONFIDENCE: 0.9",
+                ])))
+                .build()
+                .unwrap()
+        };
+        let (blocking, streamed, _) = assert_blocking_streaming_parity(build, "hello").await;
+        assert_eq!(blocking.content, "Main answer");
+        assert!(metadata_keys(&streamed).contains("reflection"));
+    }
+
+    #[tokio::test]
+    async fn parity_cot_hidden_thinking() {
+        let yaml = r#"
+name: CotHiddenAgent
+system_prompt: "Think first."
+reasoning:
+  mode: cot
+  output: hidden
+"#;
+        let build = || {
+            AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(mock_with_response(
+                    "<thinking>step by step</thinking>Visible answer",
+                )))
+                .build()
+                .unwrap()
+        };
+        // Only the committed Final is compared here; provisional deltas may still carry the thinking tags (documented).
+        let (blocking, _, _) = assert_blocking_streaming_parity(build, "hello").await;
+        assert_eq!(blocking.content, "Visible answer");
+    }
+
+    #[tokio::test]
+    async fn parity_skill_route() {
+        let yaml = skills_with_parallel_transition_yaml(
+            "    max_speculative_llm_calls_per_turn: 2\n    max_parallel_runtime_tasks: 2",
+            "",
+        );
+        let build = || {
+            build_skills_beside_transition_agent(
+                &yaml,
+                role_mocks(
+                    mock_with_response("Draft response"),
+                    mock_with_response("helper"),
+                ),
+            )
+        };
+        assert_blocking_streaming_parity(build, "please use helper").await;
     }
 }

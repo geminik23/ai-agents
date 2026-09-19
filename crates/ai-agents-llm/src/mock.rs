@@ -8,7 +8,14 @@ use ai_agents_core::{
     LLMToolRequest, TokenUsage, ToolChoice,
 };
 
-/// Mock LLM provider for testing
+/// Mock LLM provider for testing.
+///
+/// Response consumption order: each of `complete`, `complete_with_tools`, and `complete_stream` records the call,
+/// awaits the configured latency, and only then takes the next queued response. A call that is dropped while
+/// waiting (for example a losing speculative branch or an abandoned stream) therefore consumes **no** response,
+/// and the next call receives the response the dropped call would have taken. Tests that race several calls
+/// against one provider must not encode role order in a single response queue; give each role its own
+/// provider instance instead.
 #[derive(Clone)]
 pub struct MockLLMProvider {
     inner: Arc<RwLock<MockLLMProviderInner>>,
