@@ -2229,6 +2229,8 @@ Self-evaluation: the agent checks its own response against criteria and retries 
 | `pass_threshold` | `f64` | `0.7` | Confidence threshold (0.0-1.0). The LLM must say PASS *and* report confidence at or above this value. |
 | `criteria` | `list` | `[]` | Natural-language quality criteria |
 
+With `enabled: true` or `auto`, streaming turns buffer the main response and emit it as one content chunk after evaluation, so the streamed text always matches the committed `Final`. In `auto` mode the judge decides whether to evaluate only after the response exists.
+
 ```yaml
 reflection:
   enabled: auto
@@ -2726,7 +2728,7 @@ streaming:
   enabled: true
 ```
 
-> **Note:** Content chunks can reach a streaming consumer before output processing, reflection, or transition replacement completes. `chat_stream_events()` exposes the processed authoritative response as its final event, but final processing does not retroactively sanitize provisional chunks that were already displayed. When a post-response transition fires with regeneration disabled, the already-streamed content is the committed content and is not emitted again. Configured LLM retry and `on_failure` fallback apply when the main stream is opened; a provider failure after the first visible delta ends the stream with an error instead of retrying. Rejected input (`process.input` validation) finalizes the turn as a normal response in both blocking and streaming execution.
+> **Note:** Content chunks can reach a streaming consumer before output processing, reflection, or transition replacement completes. `chat_stream_events()` exposes the processed authoritative response as its final event, but final processing does not retroactively sanitize provisional chunks that were already displayed. When a post-response transition fires with regeneration disabled, the already-streamed content is the committed content and is not emitted again. Configured LLM retry and `on_failure` fallback apply when the main stream is opened; a provider failure after the first visible delta ends the stream with an error instead of retrying. Rejected input (`process.input` validation) finalizes the turn as a normal response in both blocking and streaming execution. Turns with reflection `enabled: true` or `auto`, or with `reasoning.mode: cot` or `react`, buffer the main response and emit it as one content chunk so provisional output matches the committed content; plain turns keep token-level streaming.
 
 `metadata.cli.streaming: true` selects streaming for the CLI, and `--stream` overrides that frontend preference. A Rust host can call legacy `chat_stream()` for the existing chunk-plus-`Done` contract or `chat_stream_events()` for provisional chunks followed by one authoritative `Final(AgentResponse)`. The CLI, TUI, and streamed eval turns use the complete event stream so final content, metadata, and committed tool-call records remain available.
 

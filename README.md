@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.7**
+> Status: **1.0.8**
 
 ## Features
 
@@ -171,7 +171,6 @@ See the [full roadmap](https://ai-agents.rs/roadmap/) for what's shipped, what's
 | [Getting Started](https://ai-agents.rs/docs/getting-started/) | Install and run your first agent in under a minute |
 | [YAML Reference](https://ai-agents.rs/docs/yaml-reference/) | Complete spec for agent definition files |
 | [Built-in Tools](https://ai-agents.rs/docs/built-in-tools/) | Inputs, outputs, policy, and host requirements for all built-ins |
-
 | [CLI Guide](https://ai-agents.rs/docs/cli/) | All commands, flags, and REPL features |
 | [Rust API](https://ai-agents.rs/docs/rust-api/) | Embedding agents in your Rust application |
 | [Providers](https://ai-agents.rs/docs/providers/) | Setup for all 12 LLM providers |

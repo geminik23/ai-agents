@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 1.0.8 - 2026-09-19
+
+### Added
+- Streaming actor context: RuntimeAgent::chat_stream_events_with_actor_context runs one event-stream turn with turn-scoped actor identity, mirroring chat_with_actor_context
+
+### Changed
+- Streaming buffering: turns with reflection enabled or auto, or with reasoning mode cot or react, buffer the main response so provisional chunks match the committed content; the auto-reflection judge is no longer consulted before the response exists
 
 ## 1.0.7 - 2026-09-19
 

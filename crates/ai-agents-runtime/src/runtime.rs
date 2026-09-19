@@ -4465,6 +4465,24 @@ impl RuntimeAgent {
         }
     }
 
+    /// Decides whether the main provider response must be buffered instead of streamed as deltas.
+    ///
+    /// Buffering is required whenever committed content can differ from raw provider output in a way the consumer
+    /// must not see first: explicit tool choice (the provider decision must be validated before anything is shown),
+    /// reflection in any non-disabled mode (the response may be rewritten, and the auto judge needs the finished
+    /// response to decide), and CoT/ReAct reasoning (thinking must be formatted per `reasoning.output`).
+    /// Asking the reflection judge about an empty response before generation cannot answer either question, so the
+    /// decision is configuration-based and the judge runs once, after the response exists.
+    fn main_stream_must_buffer(
+        &self,
+        reasoning_mode: &ReasoningMode,
+        protocol: &MainToolProtocol,
+    ) -> bool {
+        protocol.choice.is_some()
+            || self.get_effective_reflection_config().requires_evaluation()
+            || matches!(reasoning_mode, ReasoningMode::CoT | ReasoningMode::React)
+    }
+
     /// Recognizes only validated native markers so malformed reserved data cannot fall through to prompt parsing.
     fn is_native_tool_call_content(content: &str) -> Result<bool> {
         decode_native_tool_call_markers(content)
@@ -12243,14 +12261,7 @@ Respond in JSON format:
                 self.hooks.on_llm_start(&messages).await;
                 let llm_start = Instant::now();
 
-                // Check if reflection is active — if so, suppress streaming for this LLM call
-                // because we may need to retry and the user would see a stale first attempt.
-                let reflection_active = self
-                    .should_reflect(processed_input, "")
-                    .await
-                    .unwrap_or_default();
-
-                let buffered_decision = reflection_active || protocol.choice.is_some();
+                let buffered_decision = self.main_stream_must_buffer(&reasoning_mode, &protocol);
                 let content = if buffered_decision {
                     //
                     // Explicit tool choice buffers the provider decision so no text or tool call is visible before the runtime validates and commits it.
@@ -12899,7 +12910,7 @@ Respond in JSON format:
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
         let RootTurnAdmission {
-            guard: root_turn_guard,
+            guard,
             identity_stack,
         } = self.acquire_root_turn().await?;
         //
@@ -12908,62 +12919,90 @@ Respond in JSON format:
         scope_runtime_gate_identity_stack(&identity_stack, self.init_storage()).await?;
         info!(input_len = input.len(), "Starting streaming chat events");
         let terminal = new_runtime_stream_terminal_slot();
-        let mut inner = self.run_loop_stream(input, Arc::clone(&terminal));
+        let inner = self.run_loop_stream(input, Arc::clone(&terminal));
         let observation_context = self.build_observation_context(None);
-        let stream: Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>> =
-            Box::pin(async_stream::stream! {
-                let mut root_turn_guard = Some(root_turn_guard);
-                loop {
-                    let next = scope_runtime_gate_identity_stack(&identity_stack, async {
-                        if let Some(context) = observation_context.as_ref() {
-                            with_observation_context(context.clone(), inner.next()).await
-                        } else {
-                            inner.next().await
-                        }
-                    })
-                    .await;
-                    match next {
-                        Some(StreamChunk::Done {}) => {
-                            let terminal_event = { terminal.write().take() };
-                            if let Some(response) = terminal_event {
-                                while scope_runtime_gate_identity_stack(&identity_stack, async {
-                                    if let Some(context) = observation_context.as_ref() {
-                                        with_observation_context(context.clone(), inner.next())
-                                            .await
-                                            .is_some()
-                                    } else {
-                                        inner.next().await.is_some()
-                                    }
-                                })
-                                .await
-                                {}
-                                if observation_context.is_some() {
-                                    scope_runtime_gate_identity_stack(
-                                        &identity_stack,
-                                        self.export_observability_if_configured(),
-                                    )
-                                    .await;
-                                }
-                                drop(root_turn_guard.take());
-                                yield AgentStreamEvent::Final(response);
-                                return;
-                            }
-                        }
-                        Some(StreamChunk::Error { message }) => {
-                            let finalized = { terminal.read().is_some() };
-                            if finalized {
-                                continue;
-                            }
-                            while scope_runtime_gate_identity_stack(&identity_stack, async {
-                                if let Some(context) = observation_context.as_ref() {
-                                    with_observation_context(context.clone(), inner.next())
-                                        .await
-                                        .is_some()
-                                } else {
-                                    inner.next().await.is_some()
-                                }
-                            })
+        Ok(self.drive_event_stream(
+            inner,
+            terminal,
+            guard,
+            identity_stack,
+            observation_context,
+            None,
+        ))
+    }
+
+    /// Streams one serialized root turn with turn-scoped actor context, mirroring `chat_with_actor_context`.
+    ///
+    /// The supplied context is visible to actor-scoped facts, relationship memory, orchestration, prompt templates,
+    /// and observability only for the lifetime of this stream. It does not mutate the runtime's global actor ID.
+    /// Emits the same `AgentStreamEvent` sequence and terminal contract as `chat_stream_events`.
+    pub async fn chat_stream_events_with_actor_context<'a>(
+        &'a self,
+        input: &'a str,
+        actor_context: crate::TurnActorContext,
+    ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        let RootTurnAdmission {
+            guard,
+            identity_stack,
+        } = self.acquire_root_turn().await?;
+        scope_runtime_gate_identity_stack(&identity_stack, self.init_storage()).await?;
+        info!(
+            input_len = input.len(),
+            "Starting streaming chat events with actor context"
+        );
+        let actor_id = actor_context.effective_actor_id().map(str::to_string);
+        let terminal = new_runtime_stream_terminal_slot();
+        let inner = self.run_loop_stream(input, Arc::clone(&terminal));
+        let observation_context = self.build_observation_context(actor_id);
+        Ok(self.drive_event_stream(
+            inner,
+            terminal,
+            guard,
+            identity_stack,
+            observation_context,
+            Some(actor_context),
+        ))
+    }
+
+    //
+    // Drives one root-turn event stream inside the captured gate identity stack, optional observation context, and
+    // optional turn actor context, releasing the root-turn guard at the authoritative terminal event or on drop.
+    // Every inner poll re-enters those scopes because the generator does not keep task-locals between polls; the
+    // actor scope sits inside the observation scope, matching the blocking actor entry point. Export runs under the
+    // identity stack only, also matching blocking. The legacy `chat_stream` keeps its own loop because it emits
+    // `Done` instead of `Final`.
+    //
+    fn drive_event_stream<'a>(
+        &'a self,
+        mut inner: Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>,
+        terminal: RuntimeStreamTerminalSlot,
+        root_turn_guard: tokio::sync::OwnedMutexGuard<()>,
+        identity_stack: RootTurnGateIdentityStack,
+        observation_context: Option<SpanContext>,
+        actor_context: Option<crate::TurnActorContext>,
+    ) -> Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>> {
+        Box::pin(async_stream::stream! {
+            let mut root_turn_guard = Some(root_turn_guard);
+            loop {
+                let next = poll_scoped_chunk(
+                    &mut inner,
+                    &identity_stack,
+                    observation_context.as_ref(),
+                    actor_context.as_ref(),
+                )
+                .await;
+                match next {
+                    Some(StreamChunk::Done {}) => {
+                        let terminal_event = { terminal.write().take() };
+                        if let Some(response) = terminal_event {
+                            while poll_scoped_chunk(
+                                &mut inner,
+                                &identity_stack,
+                                observation_context.as_ref(),
+                                actor_context.as_ref(),
+                            )
                             .await
+                            .is_some()
                             {}
                             if observation_context.is_some() {
                                 scope_runtime_gate_identity_stack(
@@ -12973,26 +13012,80 @@ Respond in JSON format:
                                 .await;
                             }
                             drop(root_turn_guard.take());
-                            yield AgentStreamEvent::Chunk(StreamChunk::Error { message });
-                            return;
-                        }
-                        Some(chunk) => yield AgentStreamEvent::Chunk(chunk),
-                        None => {
-                            if observation_context.is_some() {
-                                scope_runtime_gate_identity_stack(
-                                    &identity_stack,
-                                    self.export_observability_if_configured(),
-                                )
-                                .await;
-                            }
-                            drop(root_turn_guard.take());
+                            yield AgentStreamEvent::Final(response);
                             return;
                         }
                     }
+                    Some(StreamChunk::Error { message }) => {
+                        let finalized = { terminal.read().is_some() };
+                        if finalized {
+                            continue;
+                        }
+                        while poll_scoped_chunk(
+                            &mut inner,
+                            &identity_stack,
+                            observation_context.as_ref(),
+                            actor_context.as_ref(),
+                        )
+                        .await
+                        .is_some()
+                        {}
+                        if observation_context.is_some() {
+                            scope_runtime_gate_identity_stack(
+                                &identity_stack,
+                                self.export_observability_if_configured(),
+                            )
+                            .await;
+                        }
+                        drop(root_turn_guard.take());
+                        yield AgentStreamEvent::Chunk(StreamChunk::Error { message });
+                        return;
+                    }
+                    Some(chunk) => yield AgentStreamEvent::Chunk(chunk),
+                    None => {
+                        if observation_context.is_some() {
+                            scope_runtime_gate_identity_stack(
+                                &identity_stack,
+                                self.export_observability_if_configured(),
+                            )
+                            .await;
+                        }
+                        drop(root_turn_guard.take());
+                        return;
+                    }
                 }
-            });
-        Ok(stream)
+            }
+        })
     }
+}
+
+//
+// Polls one chunk from a root-turn stream with the gate identity stack, optional observation context, and optional
+// actor context re-entered for that poll. Observation wraps actor so nested spans and actor-scoped memory see the
+// same ancestry as the blocking actor entry point.
+//
+async fn poll_scoped_chunk<'a>(
+    inner: &mut Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>,
+    identity_stack: &RootTurnGateIdentityStack,
+    observation_context: Option<&SpanContext>,
+    actor_context: Option<&crate::TurnActorContext>,
+) -> Option<StreamChunk> {
+    scope_runtime_gate_identity_stack(identity_stack, async {
+        let next = inner.next();
+        match (observation_context, actor_context) {
+            (Some(observation), Some(actor)) => {
+                with_observation_context(
+                    observation.clone(),
+                    scope_actor_context(actor.clone(), next),
+                )
+                .await
+            }
+            (Some(observation), None) => with_observation_context(observation.clone(), next).await,
+            (None, Some(actor)) => scope_actor_context(actor.clone(), next).await,
+            (None, None) => next.await,
+        }
+    })
+    .await
 }
 
 #[async_trait]
@@ -14012,6 +14105,140 @@ mod tests {
             cycle_result
                 .expect_err("runtime A accepted a repeated gate identity")
                 .contains("reentrant root turn ownership")
+        );
+    }
+
+    /// Mock sequence that drives one skill-level clarification: top-level clear, router picks the skill,
+    /// skill disambiguation detects a missing field, and the clarifier asks for it.
+    fn skill_clarification_responses() -> Vec<&'static str> {
+        vec![
+            r#"{"is_ambiguous":false,"confidence":0.99,"ambiguity_type":null,"reasoning":"top-level clear","what_is_unclear":[],"detected_language":"en"}"#,
+            "send_report",
+            r#"{"is_ambiguous":true,"confidence":0.2,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+            r#"{"question":"What should I send?","options":null}"#,
+        ]
+    }
+
+    /// The skill route records its clarification question under the same condition in both loops.
+    ///
+    /// Only `awaiting_clarification` is reachable here: the disambiguation manager resolves a pending clarification
+    /// into a confirmation on the *next* turn, and that turn is owned by the root-turn gate rather than skill routing.
+    /// The shared condition therefore keeps the two loops aligned for the reachable case and stays defensive for the other.
+    #[tokio::test]
+    async fn test_stream_skill_clarification_memory_matches_blocking() {
+        let (blocking_agent, _) = state_disambiguation_agent_with_skills(
+            skill_clarification_responses(),
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+        let blocking = blocking_agent.chat("Send it").await.unwrap();
+        let blocking_messages = blocking_agent.memory.get_messages(None).await.unwrap();
+
+        let (streaming_agent, _) = state_disambiguation_agent_with_skills(
+            skill_clarification_responses(),
+            true,
+            None,
+            true,
+            vec![confirmation_skill()],
+        );
+        let (content, chunks, streamed) = collect_stream_events(&streaming_agent, "Send it").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        let streamed = streamed.expect("skill clarification must finalize as Final");
+        let streaming_messages = streaming_agent.memory.get_messages(None).await.unwrap();
+
+        assert_eq!(blocking.content, "What should I send?");
+        assert_eq!(streamed.content, blocking.content);
+        assert_eq!(content, streamed.content);
+        assert_eq!(
+            blocking
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("disambiguation")),
+            streamed
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("disambiguation")),
+        );
+        assert_eq!(
+            streamed
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("disambiguation"))
+                .and_then(|d| d.get("status"))
+                .and_then(Value::as_str),
+            Some("awaiting_clarification"),
+        );
+        let shape = |messages: &[ChatMessage]| {
+            messages
+                .iter()
+                .map(|m| (format!("{:?}", m.role), m.content.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shape(&blocking_messages), shape(&streaming_messages));
+        assert_eq!(
+            shape(&streaming_messages),
+            vec![
+                ("User".to_string(), "Send it".to_string()),
+                ("Assistant".to_string(), "What should I send?".to_string()),
+            ],
+        );
+        assert_eq!(
+            *streaming_agent.pending_skill_id.read(),
+            Some("send_report".to_string()),
+        );
+    }
+
+    /// A failed clarification write ends the turn in both loops instead of being ignored by the stream.
+    #[tokio::test]
+    async fn test_stream_skill_clarification_memory_failure_surfaces_as_error() {
+        // Turn shape: user commit (add #1) then the clarification question (add #2, forced to fail).
+        let build = || {
+            let mut mock = MockLLMProvider::new("skill-clarification");
+            mock.set_responses(
+                skill_clarification_responses()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                false,
+            );
+            AgentBuilder::new()
+                .system_prompt("Handle requests.")
+                .llm(Arc::new(mock.clone()))
+                .llm_alias("router", Arc::new(mock))
+                .state_machine(disambiguation_state_machine(None, true))
+                .skills(vec![confirmation_skill()])
+                .memory(Arc::new(FailingMemory {
+                    messages: parking_lot::RwLock::new(Vec::new()),
+                    fail_on_add: 2,
+                    adds: std::sync::atomic::AtomicUsize::new(0),
+                }))
+                .build()
+                .unwrap()
+                .with_disambiguation(DisambiguationConfig {
+                    enabled: true,
+                    ..Default::default()
+                })
+        };
+
+        let blocking = build().chat("Send it").await;
+        assert!(
+            blocking.is_err(),
+            "blocking must surface the failed clarification write: {blocking:?}"
+        );
+
+        let (_, chunks, streamed) = collect_stream_events(&build(), "Send it").await;
+        assert!(
+            streamed.is_none(),
+            "a failed write must not finalize the turn"
+        );
+        assert!(
+            chunks.iter().any(|chunk| matches!(
+                chunk,
+                StreamChunk::Error { message } if message.contains("simulated memory failure")
+            )),
+            "streaming must surface the failed clarification write: {chunks:?}"
         );
     }
 
@@ -23726,9 +23953,297 @@ reasoning:
                 .build()
                 .unwrap()
         };
-        // Only the committed Final is compared here; provisional deltas may still carry the thinking tags (documented).
-        let (blocking, _, _) = assert_blocking_streaming_parity(build, "hello").await;
+        let (blocking, streamed, chunks) = assert_blocking_streaming_parity(build, "hello").await;
         assert_eq!(blocking.content, "Visible answer");
+        // CoT streams are buffered, so the provisional chunks equal the committed content.
+        assert_eq!(content_chunks(&chunks).concat(), streamed.content);
+    }
+
+    // ---------------------------------------------------------------------
+    // Streaming buffer decision (reflection auto, CoT/ReAct) and actor-context event stream
+    // ---------------------------------------------------------------------
+
+    fn content_chunks(chunks: &[StreamChunk]) -> Vec<String> {
+        chunks
+            .iter()
+            .filter_map(|c| match c {
+                StreamChunk::Content { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reflection_auto_agent(main: MockLLMProvider, judge: MockLLMProvider) -> RuntimeAgent {
+        let yaml = r#"
+name: ReflectionAutoAgent
+system_prompt: "You are careful."
+llm:
+  default: default
+  router: router
+reflection:
+  enabled: auto
+  evaluator_llm: router
+  criteria:
+    - "Is the answer helpful?"
+"#;
+        AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(main))
+            .llm_alias("router", Arc::new(judge))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stream_reflection_auto_buffers_and_calls_judge_once_per_iteration() {
+        let judge = mock_with_responses(vec!["YES", "OVERALL: PASS\nCONFIDENCE: 0.9"]);
+        let judge_calls = judge.clone();
+        let agent = reflection_auto_agent(mock_with_response("Main answer one two"), judge);
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(
+            content_chunks(&chunks).len(),
+            1,
+            "auto reflection must buffer the main response: {chunks:?}"
+        );
+        assert_eq!(content, "Main answer one two");
+        assert_eq!(final_response.expect("Final").content, content);
+        // One should-reflect decision plus one evaluation; no judge probe runs before the response exists.
+        assert_eq!(judge_calls.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_stream_reflection_auto_rewrite_is_streamed() {
+        let judge = mock_with_responses(vec![
+            "YES",
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+            "OVERALL: PASS\nCONFIDENCE: 0.9",
+        ]);
+        let agent = reflection_auto_agent(
+            mock_with_responses(vec!["First attempt", "Improved answer"]),
+            judge,
+        );
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(content_chunks(&chunks).len(), 1, "{chunks:?}");
+        assert_eq!(
+            content, "Improved answer",
+            "the rewritten answer is what streams"
+        );
+        assert_eq!(final_response.expect("Final").content, "Improved answer");
+    }
+
+    fn reasoning_agent(mode: &str, output: &str) -> RuntimeAgent {
+        let yaml = format!(
+            r#"
+name: ReasoningStreamAgent
+system_prompt: "Think first."
+reasoning:
+  mode: {mode}
+  output: {output}
+"#
+        );
+        AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response(
+                "<thinking>step by step</thinking>Visible answer",
+            )))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_stream_cot_hidden_emits_no_thinking_tags() {
+        let agent = reasoning_agent("cot", "hidden");
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(content_chunks(&chunks).len(), 1, "{chunks:?}");
+        assert!(!content.contains("<thinking>"), "{content:?}");
+        assert_eq!(content, "Visible answer");
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_cot_visible_matches_final_format() {
+        let agent = reasoning_agent("cot", "visible");
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert!(content.starts_with("Thinking:"), "{content:?}");
+        assert!(content.contains("Answer:\nVisible answer"), "{content:?}");
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_react_buffers() {
+        let agent = reasoning_agent("react", "hidden");
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+        assert!(!chunks.iter().any(StreamChunk::is_error), "{chunks:?}");
+        assert_eq!(content_chunks(&chunks).len(), 1, "{chunks:?}");
+        assert_eq!(content, "Visible answer");
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    #[tokio::test]
+    async fn test_stream_plain_mode_still_streams_deltas() {
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock_with_response("one two three")))
+            .build()
+            .unwrap();
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+        assert!(
+            content_chunks(&chunks).len() >= 2,
+            "plain turns must keep token-level streaming: {chunks:?}"
+        );
+        assert_eq!(content, "one two three");
+        assert_eq!(final_response.expect("Final").content, content);
+    }
+
+    /// Records the turn actor context visible inside the turn.
+    struct ActorProbeHooks {
+        seen: parking_lot::Mutex<Option<crate::TurnActorContext>>,
+    }
+
+    #[async_trait]
+    impl AgentHooks for ActorProbeHooks {
+        async fn on_message_received(&self, _input: &str) {
+            *self.seen.lock() = current_turn_actor_context();
+        }
+    }
+
+    fn actor_probe_agent(hooks: Arc<ActorProbeHooks>) -> RuntimeAgent {
+        let yaml = r#"
+name: ActorStreamAgent
+system_prompt: "You are helpful."
+observability:
+  enabled: true
+  export:
+    write_raw_events: true
+"#;
+        AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("Hello actor")))
+            .hooks(hooks)
+            .build()
+            .unwrap()
+    }
+
+    async fn collect_actor_stream_final(
+        agent: &RuntimeAgent,
+        input: &str,
+        actor_context: crate::TurnActorContext,
+    ) -> AgentResponse {
+        use futures::StreamExt;
+        let mut events = agent
+            .chat_stream_events_with_actor_context(input, actor_context)
+            .await
+            .expect("stream opens");
+        let mut final_response = None;
+        while let Some(event) = events.next().await {
+            match event {
+                AgentStreamEvent::Final(response) => final_response = Some(response),
+                AgentStreamEvent::Chunk(StreamChunk::Error { message }) => {
+                    panic!("unexpected stream error: {message}")
+                }
+                AgentStreamEvent::Chunk(_) => {}
+            }
+        }
+        final_response.expect("Final")
+    }
+
+    #[tokio::test]
+    async fn test_stream_events_with_actor_context_scopes_actor_for_turn() {
+        let hooks = Arc::new(ActorProbeHooks {
+            seen: parking_lot::Mutex::new(None),
+        });
+        let agent = actor_probe_agent(Arc::clone(&hooks));
+        let actor_context = crate::TurnActorContext::new().with_origin_actor("customer_42");
+
+        let final_response = collect_actor_stream_final(&agent, "hi", actor_context).await;
+
+        assert_eq!(final_response.content, "Hello actor");
+        assert_eq!(
+            hooks
+                .seen
+                .lock()
+                .as_ref()
+                .and_then(|context| context.effective_actor_id().map(str::to_string)),
+            Some("customer_42".to_string()),
+            "the actor context must be visible inside the streaming turn"
+        );
+        assert!(
+            agent.actor_id().is_none(),
+            "a turn-scoped actor must not mutate the global actor ID"
+        );
+        let events = agent.observability().unwrap().raw_events();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.dimensions.get("actor") == Some(&"customer_42".to_string())),
+            "observation events must carry the actor dimension"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_events_with_actor_context_matches_blocking_actor_context() {
+        let actor_context = crate::TurnActorContext::new()
+            .with_origin_actor("customer_42")
+            .with_sender_agent("coordinator");
+
+        let blocking_hooks = Arc::new(ActorProbeHooks {
+            seen: parking_lot::Mutex::new(None),
+        });
+        let blocking_agent = actor_probe_agent(Arc::clone(&blocking_hooks));
+        let blocking = blocking_agent
+            .chat_with_actor_context("hi", actor_context.clone())
+            .await
+            .unwrap();
+
+        let streaming_hooks = Arc::new(ActorProbeHooks {
+            seen: parking_lot::Mutex::new(None),
+        });
+        let streaming_agent = actor_probe_agent(Arc::clone(&streaming_hooks));
+        let streamed =
+            collect_actor_stream_final(&streaming_agent, "hi", actor_context.clone()).await;
+
+        assert_eq!(blocking.content, streamed.content);
+        assert_eq!(metadata_keys(&blocking), metadata_keys(&streamed));
+        assert_eq!(
+            *blocking_hooks.seen.lock(),
+            *streaming_hooks.seen.lock(),
+            "both entry points must expose the same turn actor context"
+        );
+        assert_eq!(*streaming_hooks.seen.lock(), Some(actor_context));
+    }
+
+    #[tokio::test]
+    async fn test_stream_events_with_actor_context_releases_root_turn_on_drop() {
+        use futures::StreamExt;
+        let agent = AgentBuilder::new()
+            .system_prompt("You are helpful.")
+            .llm(Arc::new(mock_with_response("one two three")))
+            .build()
+            .unwrap();
+        {
+            let mut events = agent
+                .chat_stream_events_with_actor_context(
+                    "hi",
+                    crate::TurnActorContext::new().with_origin_actor("customer_42"),
+                )
+                .await
+                .unwrap();
+            // Take one provisional event and abandon the stream.
+            let _first = events.next().await;
+        }
+        let next = tokio::time::timeout(Duration::from_secs(5), agent.chat("next")).await;
+        assert!(
+            matches!(next, Ok(Ok(_))),
+            "the root turn must be released when the actor stream is dropped: {next:?}"
+        );
     }
 
     #[tokio::test]
