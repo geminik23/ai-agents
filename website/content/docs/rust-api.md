@@ -746,7 +746,7 @@ println!("{:?}", ctx);
 agent.refresh_context("pricing").await?;
 ```
 
-Context values are available to the agent's system prompt via template rendering and to tools during execution.
+Context values are available to the agent's system prompt via template rendering and to tools during execution. For a YAML `context` source with `type: runtime` and `required: true`, call `set_context` or `update_context` before each turn that needs the value. A missing top-level key fails blocking chat before model work; streaming reports a terminal error chunk without a `Final` response. A YAML `default` satisfies this presence check, and previously supplied values persist across turns and restored sessions. The check does not validate nested fields, types, non-null values, or whether the host refreshed the value this turn; validate these at the host boundary if required.
 
 ---
 

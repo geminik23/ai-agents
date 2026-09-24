@@ -4,7 +4,7 @@ description: "Injects user data at runtime — system prompt adapts to the user"
 
 # Context values are available in system_prompt as {{ context.KEY.FIELD }}
 # type: runtime means "the Rust host (or CLI) provides this data"
-# schema: declares the expected shape (documentation + validation)
+# schema: documents the expected shape; the host must validate nested fields
 # default: provides fallback values (essential for CLI usage)
 context:
   user:

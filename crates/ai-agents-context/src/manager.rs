@@ -151,6 +151,8 @@ impl ContextManager {
         self.providers.write().insert(name.to_string(), provider);
     }
 
+    /// Checks required runtime keys for top-level presence, including values supplied by defaults.
+    /// Nested shape, null values, and fresh host injection are not validated.
     pub fn validate(&self) -> Result<()> {
         for (key, source) in &self.schema {
             if source.is_required() && !self.values.read().contains_key(key) {
@@ -341,6 +343,25 @@ mod tests {
         assert!(manager.validate().is_err());
 
         manager.set("user", json!({"name": "Alice"})).unwrap();
+        assert!(manager.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_required_only_checks_top_level_presence() {
+        let schema = HashMap::from([(
+            "voice".to_string(),
+            ContextSource::Runtime {
+                required: true,
+                schema: Some(json!({"brief": "string"})),
+                default: None,
+            },
+        )]);
+        let manager = ContextManager::new(schema, "Test".into(), "1.0".into());
+
+        assert!(manager.validate().is_err());
+        manager.set("voice", Value::Null).unwrap();
+        assert!(manager.validate().is_ok());
+        manager.set("voice", json!({})).unwrap();
         assert!(manager.validate().is_ok());
     }
 

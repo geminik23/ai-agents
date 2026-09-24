@@ -1055,7 +1055,9 @@ The `context` map injects dynamic data into prompts. Values are available as `{{
 
 ### `type: runtime`
 
-Data provided by the Rust host (or CLI defaults). Best for per-user data.
+Data provided by the Rust host (or CLI defaults). Best for per-user data. `required` defaults to `false`. When `required: true`, each blocking or streaming turn checks that the top-level context key is present after initialization and per-turn refresh, before disambiguation or model work. Missing keys fail blocking chat with `Required context '<key>' not provided`; streaming turns emit a terminal error chunk without a final response. Supply the value before starting the turn.
+
+A configured `default` populates the key during initialization and satisfies `required`, so omit `default` if a missing host-supplied value must fail. Context persists across turns and session restore; `required` does not prove a fresh host value was supplied for each turn. It checks only top-level key presence, not `null`, nested fields, `schema` types, or value provenance. Hosts needing stronger guarantees must validate those values before calling the agent.
 
 ```yaml
 context:

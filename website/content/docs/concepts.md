@@ -340,7 +340,7 @@ Context provides dynamic data that gets injected into the agent's system prompt 
 
 Sources include: **runtime** (passed in by the caller), **builtin** (datetime, session info, agent metadata), **env**, **file**, optional feature-gated **HTTP** JSON sources, and **callback** providers registered by the host. Each source has a refresh policy - `once` (load at startup), `per_session` (reload each session), or `per_turn` (refresh every turn).
 
-Context values are available in the system prompt template, in state prompts, and in process pipeline stages. The state machine can also write to context via `on_enter` actions and `extract` blocks.
+Context values are available in the system prompt template, in state prompts, and in process pipeline stages. The state machine can also write to context via `on_enter` actions and `extract` blocks. For `type: runtime`, `required: true` checks that the top-level key exists at the start of each turn; a configured `default` counts as present. The example below therefore remains runnable without host injection. Omit `default` to reject a missing key, but use host validation if nested fields or fresh per-turn values must be guaranteed.
 
 ```yaml
 context:

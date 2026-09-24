@@ -9426,6 +9426,20 @@ Respond in JSON format:
     }
 
     //
+    // Initializes context once, then checks required runtime keys after each turn's refresh and before model work.
+    // The root-turn gate serializes this sequence; a failed initialization must be retried rather than marked complete.
+    async fn prepare_turn_context(&self) -> Result<()> {
+        if !self.context_initialized.load(Ordering::SeqCst) {
+            self.context_manager.initialize().await?;
+            self.context_initialized.store(true, Ordering::SeqCst);
+            debug!("Context manager initialized (defaults, env, builtins)");
+        }
+
+        self.check_turn_timeout().await?;
+        self.context_manager.refresh_per_turn().await?;
+        self.context_manager.validate()
+    }
+
     // Blocking root turn: readiness, lifecycle hooks, the shared disambiguation gate, then the internal loop.
     //
     async fn run_loop(&self, input: &str) -> Result<AgentResponse> {
@@ -9439,16 +9453,7 @@ Respond in JSON format:
 
         self.hooks.on_message_received(input).await;
 
-        // One-shot context initialization: load runtime defaults, resolve env vars,
-        // populate builtin sources (session, agent), etc.  This must happen before
-        // the first template render so that {{ context.* }} variables are available.
-        if !self.context_initialized.swap(true, Ordering::SeqCst) {
-            self.context_manager.initialize().await?;
-            debug!("Context manager initialized (defaults, env, builtins)");
-        }
-
-        self.check_turn_timeout().await?;
-        self.context_manager.refresh_per_turn().await?;
+        self.prepare_turn_context().await?;
 
         // Clear stale disambiguation context from previous turns.
         // This prevents resolved_intent from leaking across turns and causing incorrect deterministic routing on subsequent inputs.
@@ -12489,20 +12494,8 @@ Respond in JSON format:
             let _root_cleanup = RootTurnCleanup::new(self);
             self.hooks.on_message_received(input).await;
 
-            // One-shot context initialization (mirrors run_loop)
-            if !self.context_initialized.swap(true, Ordering::SeqCst) {
-                if let Err(e) = self.context_manager.initialize().await {
-                    yield StreamChunk::error(e.to_string());
-                    return;
-                }
-                debug!("Context manager initialized (defaults, env, builtins)");
-            }
-
-            if let Err(e) = self.check_turn_timeout().await {
-                yield StreamChunk::error(e.to_string());
-                return;
-            }
-            if let Err(e) = self.context_manager.refresh_per_turn().await {
+            // Share the blocking preflight so every stream entry point rejects missing required keys before routing.
+            if let Err(e) = self.prepare_turn_context().await {
                 yield StreamChunk::error(e.to_string());
                 return;
             }
@@ -24262,5 +24255,174 @@ observability:
             )
         };
         assert_blocking_streaming_parity(build, "please use helper").await;
+    }
+
+    // Builds a YAML agent whose required context is supplied by the host unless a default is declared.
+    fn required_context_agent(mock: MockLLMProvider, default: bool) -> RuntimeAgent {
+        let default_yaml = if default {
+            "    default:\n      brief: fallback\n"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            "name: RequiredContextAgent\nsystem_prompt: 'Voice: {{{{ context.voice.brief }}}}'\ncontext:\n  voice:\n    type: runtime\n    required: true\n{default_yaml}"
+        );
+        AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap()
+    }
+
+    struct FailOnceContextProvider {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContextProvider for FailOnceContextProvider {
+        async fn get(&self, _key: &str, _current_context: &Value) -> Result<Value> {
+            if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(AgentError::Other("context initialization failed".into()));
+            }
+            Ok(serde_json::json!({"brief": "ready"}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_context_initialization_retries_after_failure() {
+        let mock = mock_with_response("Voice response");
+        let calls = mock.clone();
+        let yaml = "name: CallbackAgent\nsystem_prompt: 'Voice: {{ context.voice.brief }}'\ncontext:\n  voice:\n    type: callback\n    name: flaky\n";
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock))
+            .build()
+            .unwrap();
+        let provider = Arc::new(FailOnceContextProvider {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+        });
+        agent.register_context_provider("flaky", provider.clone());
+
+        assert!(agent.chat("first").await.is_err());
+        assert_eq!(calls.call_count(), 0);
+        assert_eq!(
+            agent.chat("second").await.unwrap().content,
+            "Voice response"
+        );
+        assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_required_context_blocks_chat_until_supplied_and_after_removal() {
+        let mock = mock_with_response("Voice response");
+        let calls = mock.clone();
+        let agent = required_context_agent(mock, false);
+
+        let error = agent.chat("first").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Required context 'voice' not provided")
+        );
+        assert_eq!(calls.call_count(), 0);
+        assert!(agent.memory.get_messages(None).await.unwrap().is_empty());
+
+        agent
+            .set_context("voice.brief", serde_json::json!("ready"))
+            .unwrap();
+        assert_eq!(
+            agent.chat("second").await.unwrap().content,
+            "Voice response"
+        );
+        assert_eq!(calls.call_count(), 1);
+
+        agent.remove_context("voice");
+        let error = agent.chat("third").await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Required context 'voice' not provided")
+        );
+        assert_eq!(calls.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_required_context_default_satisfies_presence_check() {
+        let mock = mock_with_response("Fallback response");
+        let calls = mock.clone();
+        let agent = required_context_agent(mock, true);
+
+        assert_eq!(
+            agent.chat("hello").await.unwrap().content,
+            "Fallback response"
+        );
+        assert_eq!(
+            agent.context_manager().get_path("voice.brief"),
+            Some(serde_json::json!("fallback"))
+        );
+        assert_eq!(calls.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_required_context_blocks_legacy_stream_before_model_call() {
+        use futures::StreamExt;
+
+        let mock = mock_with_response("Voice response");
+        let calls = mock.clone();
+        let agent = required_context_agent(mock, false);
+        let mut stream = agent.chat_stream("first").await.unwrap();
+        assert!(
+            matches!(stream.next().await, Some(StreamChunk::Error { message }) if message.contains("Required context 'voice' not provided"))
+        );
+        assert!(stream.next().await.is_none());
+        drop(stream);
+        assert_eq!(calls.call_count(), 0);
+        assert!(agent.memory.get_messages(None).await.unwrap().is_empty());
+
+        agent
+            .set_context("voice.brief", serde_json::json!("ready"))
+            .unwrap();
+        assert_eq!(
+            agent.chat("second").await.unwrap().content,
+            "Voice response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_required_context_blocks_event_streams_without_final() {
+        use futures::StreamExt;
+
+        for actor_scoped in [false, true] {
+            let mock = mock_with_response("Voice response");
+            let calls = mock.clone();
+            let agent = required_context_agent(mock, false);
+            let mut events = if actor_scoped {
+                agent
+                    .chat_stream_events_with_actor_context(
+                        "first",
+                        crate::TurnActorContext::new().with_origin_actor("caller"),
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                agent.chat_stream_events("first").await.unwrap()
+            };
+            assert!(
+                matches!(events.next().await, Some(AgentStreamEvent::Chunk(StreamChunk::Error { message })) if message.contains("Required context 'voice' not provided"))
+            );
+            assert!(events.next().await.is_none());
+            drop(events);
+            assert_eq!(calls.call_count(), 0);
+            assert!(agent.memory.get_messages(None).await.unwrap().is_empty());
+
+            agent
+                .set_context("voice.brief", serde_json::json!("ready"))
+                .unwrap();
+            assert_eq!(
+                agent.chat("second").await.unwrap().content,
+                "Voice response"
+            );
+        }
     }
 }

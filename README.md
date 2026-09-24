@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.8**
+> Status: **1.0.9**
 
 ## Features
 
@@ -26,7 +26,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - **Built-in tools + MCP** - 30 canonical built-in IDs: `calculator`, `echo`, `datetime`, `json`, `random`, `file`, `glob`, `grep`, `file_read`, `file_write`, `file_edit`, `patch`, `copy_path`, `move_path`, `delete_path`, `file_list`, `file_info`, `git_status`, `git_diff`, `diagnostics`, `ask_user`, `todo`, `sleep`, `web_fetch`, `web_search`, `command`, `text`, `template`, `math`, and `http`; connect any MCP server for hundreds more
 - **Tool scoping, selection, policy, and context** - explicit top-level grants, state-level narrowing, opt-in `auto`/`required`/`specific`/`none` tool choice, policy bindings, review modes for filesystem mutation, post-approval final authorization, atomic rate admission, conservative mutation locking, read-before-write guards, command allowlists, and context-aware custom tools
 - **Input/output process pipeline** - deterministic normalization and formatting plus optional LLM-backed detection, extraction, sanitization, validation, and transformation
-- **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts
+- **Dynamic context** - runtime, file, HTTP, env, and callback sources with Jinja2 templates in prompts; required runtime keys are checked before each turn
 - **Memory stack** - CompactingMemory and token budgeting; file and Redis snapshot persistence; SQLite snapshots, session metadata/filtering/cleanup, actor facts, and relationship memory
 - **Agent persona** - structured identity, traits, goals, secrets, evolution, and reusable templates
 - **Dynamic agent spawning + multi-agent systems** - fail-closed child admission, bounded managed capacity, optional shared LLMs and namespaced storage, agent registry, actor-aware messaging, and router/pipeline/concurrent/group chat/handoff orchestration; active nested spawners are rejected in v1

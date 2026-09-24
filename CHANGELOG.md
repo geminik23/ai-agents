@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.9 - 2026-09-24
+
+### Fixed
+- Required runtime context: blocking and streaming turns now reject missing required keys before model work; failed context initialization can be retried on the next turn
+
 ## 1.0.8 - 2026-09-19
 
 ### Added
