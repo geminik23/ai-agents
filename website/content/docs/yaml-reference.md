@@ -2155,7 +2155,7 @@ Extra settings for `plan_and_execute` mode.
 |-------|------|---------|-------------|
 | `planner_llm` | `string` | `null` | LLM alias for plan generation |
 | `max_steps` | `u32` | `10` | Maximum plan steps to execute |
-| `available.tools` | `"all"` or `list` | `"all"` | Tools the planner may use. `"all"` allows every tool available to the agent. A list restricts to those IDs only. |
+| `available.tools` | `"all"` or `list` | `"all"` | Tools the planner may use after agent, runtime, and state scope narrowing. `"all"` preserves that effective set; a list narrows it further and cannot expose other registered tools. If the effective scope cannot be resolved, planning fails before the planner request. |
 | `available.skills` | `"all"` or `list` | `"all"` | Skills the planner may use. Same semantics as `available.tools`. |
 | `reflection.enabled` | `bool` | `true` | Enable plan-level reflection on step failures |
 | `reflection.on_step_failure` | `string` | `"replan"` | `replan`, `abort`, `skip`, or `continue` |

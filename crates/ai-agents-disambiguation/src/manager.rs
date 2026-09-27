@@ -1162,6 +1162,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prompt_projection_keeps_the_last_seven_messages_in_order() {
+        let detection = detection_response(false, 0.9);
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                recent_messages: 7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (manager, mock) = manager_with_config(config, vec![detection.as_str()]);
+        let context = DisambiguationContext::from_agent_state(
+            (0..8)
+                .map(|index| format!("User: HISTORY_{index}"))
+                .collect(),
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        assert!(
+            manager
+                .process_input("hello", &context)
+                .await
+                .unwrap()
+                .is_clear()
+        );
+        let call = mock.last_call().unwrap();
+        let prompt = &call.messages.last().unwrap().content;
+        assert!(!prompt.contains("HISTORY_0"), "{prompt}");
+        let mut previous = 0;
+        for index in 1..8 {
+            let marker = format!("HISTORY_{index}");
+            let position = prompt
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{marker} missing in {prompt}"));
+            assert!(position > previous, "{marker} is out of order in {prompt}");
+            previous = position;
+        }
+    }
+
+    #[tokio::test]
     async fn clarification_generation_and_parsing_use_the_same_projection() {
         let detection = detection_response(true, 0.1);
         let question = r#"{"question":"PENDING_QUESTION?","options":null}"#;
@@ -1376,6 +1421,66 @@ mod tests {
                 .unwrap()
                 .content
                 .contains("PRIVATE_QUESTION_MARKER")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_history_preserves_manager_owned_pending_clarification() {
+        let detection = detection_response(true, 0.1);
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                recent_messages: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (manager, mock) = manager_with_config(
+            config,
+            vec![
+                detection.as_str(),
+                CLARIFICATION_RESPONSE,
+                CLARIFIED_RESPONSE,
+            ],
+        );
+        let initial = DisambiguationContext::from_agent_state(
+            vec!["Assistant: HISTORY_QUESTION_MARKER?".into()],
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+        assert!(
+            manager
+                .process_input("send it", &initial)
+                .await
+                .unwrap()
+                .needs_clarification()
+        );
+
+        let response_context = DisambiguationContext::from_agent_state(
+            vec!["Assistant: HISTORY_QUESTION_MARKER?".into()],
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+        let result = manager
+            .process_input("Ada", &response_context)
+            .await
+            .unwrap();
+        assert!(matches!(result, DisambiguationResult::Clarified { .. }));
+        let calls = mock.call_history();
+        assert_eq!(calls.len(), 3);
+        let parse_prompt = &calls[2].messages.last().unwrap().content;
+        assert!(parse_prompt.contains("Please clarify."), "{parse_prompt}");
+        assert!(
+            !parse_prompt.contains("HISTORY_QUESTION_MARKER"),
+            "{parse_prompt}"
         );
     }
 

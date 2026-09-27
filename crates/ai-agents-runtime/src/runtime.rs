@@ -276,7 +276,7 @@ use ai_agents_process::{
 use ai_agents_reasoning::{
     CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
     ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
-    ReflectionMetadata, StepFailureAction,
+    ReflectionMetadata, ReflectionMode, StepFailureAction,
 };
 use ai_agents_recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, KeepRecentFilter, LLMFailureAction,
@@ -3827,6 +3827,11 @@ impl RuntimeAgent {
             return state_reflection.clone();
         }
         self.reflection_config.clone()
+    }
+
+    // Returns the current effective reflection mode for routing diagnostics without starting a reflection snapshot.
+    fn routing_reflection_mode(&self) -> ReflectionMode {
+        self.get_effective_reflection_config().enabled
     }
 
     fn get_skill_reasoning_config(&self, skill: &SkillDefinition) -> ReasoningConfig {
@@ -8644,6 +8649,7 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
         )
     }
 
+    // Generates a plan only after the effective tool scope is known so scope failures cannot expose the full registry to the planner.
     async fn generate_plan(&self, input: &str) -> Result<Plan> {
         let effective = self.get_effective_reasoning_config();
         let planning_config = effective.get_planning();
@@ -8655,10 +8661,7 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
             .or_else(|| self.llm_registry.default().ok())
             .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
 
-        let mut available_tool_ids: Vec<String> = self
-            .get_available_tool_ids()
-            .await
-            .unwrap_or_else(|_| self.tools.list_ids());
+        let mut available_tool_ids = self.get_available_tool_ids().await?;
         let mut available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
 
         // Apply planning-level tool and skill filters.
@@ -11426,11 +11429,13 @@ Respond in JSON format:
         let effective_reasoning = self.get_effective_reasoning_config();
         let reasoning_mode = self.determine_reasoning_mode(processed_input).await?;
         let auto_detected = matches!(effective_reasoning.mode, ReasoningMode::Auto);
+        // This diagnostic describes the current routing state, while response reflection takes its own later snapshot.
+        let reflection_enabled = self.routing_reflection_mode();
 
         info!(
             reasoning_mode = ?reasoning_mode,
             auto_detected = auto_detected,
-            reflection_enabled = ?self.reflection_config.enabled,
+            reflection_enabled = ?reflection_enabled,
             "Reasoning mode determined"
         );
 
@@ -23766,6 +23771,343 @@ states:
 
     impl ai_agents_memory::Memory for FailingMemory {}
 
+    /// In-memory store that can fail history reads while recording whether a scope evaluation reached memory.
+    struct ReadFailingMemory {
+        messages: parking_lot::RwLock<Vec<ChatMessage>>,
+        fail_on_read: Option<usize>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ReadFailingMemory {
+        // Creates a test memory whose first read either succeeds normally or fails with a stable marker.
+        fn new(fail_reads: bool) -> Self {
+            Self::fail_on_read(fail_reads.then_some(1))
+        }
+
+        // Creates a test memory that fails only the selected read while preserving earlier successful reads.
+        fn fail_on_read(fail_on_read: Option<usize>) -> Self {
+            Self {
+                messages: parking_lot::RwLock::new(Vec::new()),
+                fail_on_read,
+                reads: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        // Returns the number of history reads used to prove which runtime boundary was reached.
+        fn read_count(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl ai_agents_core::Memory for ReadFailingMemory {
+        // Stores messages normally so public turns can reach the later scope calculation.
+        async fn add_message(&self, message: ChatMessage) -> Result<()> {
+            self.messages.write().push(message);
+            Ok(())
+        }
+
+        // Fails only reads so tests distinguish scope evaluation from earlier message commits.
+        async fn get_messages(&self, limit: Option<usize>) -> Result<Vec<ChatMessage>> {
+            let read = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail_on_read == Some(read) {
+                return Err(AgentError::Other(
+                    "simulated scope memory failure".to_string(),
+                ));
+            }
+            let messages = self.messages.read();
+            Ok(match limit {
+                Some(n) if n < messages.len() => messages[messages.len() - n..].to_vec(),
+                _ => messages.clone(),
+            })
+        }
+
+        // Clears stored messages without changing the configured read failure mode.
+        async fn clear(&self) -> Result<()> {
+            self.messages.write().clear();
+            Ok(())
+        }
+
+        // Reports the current number of stored messages.
+        fn len(&self) -> usize {
+            self.messages.read().len()
+        }
+
+        // Restores messages without changing read counters or the configured failure mode.
+        async fn restore(&self, snapshot: ai_agents_core::MemorySnapshot) -> Result<()> {
+            *self.messages.write() = snapshot.messages;
+            Ok(())
+        }
+    }
+
+    impl ai_agents_memory::Memory for ReadFailingMemory {}
+
+    // Builds a plan-and-execute agent whose explicit state scope forces one evaluation-context history read.
+    fn scoped_planning_agent(
+        memory: Arc<ReadFailingMemory>,
+        planner: MockLLMProvider,
+    ) -> RuntimeAgent {
+        let yaml = r#"
+name: ScopedPlanningAgent
+system_prompt: "Plan safely."
+reasoning:
+  mode: plan_and_execute
+tools: [calculator]
+states:
+  initial: current
+  states:
+    current:
+      tools: [calculator]
+"#;
+        AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(planner))
+            .tool(Arc::new(CalculatorTool::new()))
+            .tool(Arc::new(FileWriteTool::new()))
+            .memory(memory)
+            .build()
+            .unwrap()
+    }
+
+    // Builds a disambiguation agent whose model-visible tool list depends on the same effective scope calculation.
+    fn scoped_disambiguation_agent(
+        memory: Arc<ReadFailingMemory>,
+        router: MockLLMProvider,
+        include_available_tools: bool,
+    ) -> RuntimeAgent {
+        let yaml = format!(
+            r#"
+name: ScopedDisambiguationAgent
+system_prompt: "Clarify safely."
+llm:
+  default: default
+  router: router
+disambiguation:
+  enabled: true
+  context:
+    recent_messages: 0
+    include_available_tools: {include_available_tools}
+tools: [calculator]
+states:
+  initial: current
+  states:
+    current:
+      tools: [calculator]
+"#
+        );
+        AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(mock_with_response("unused")))
+            .llm_alias("router", Arc::new(router))
+            .tool(Arc::new(CalculatorTool::new()))
+            .tool(Arc::new(FileWriteTool::new()))
+            .memory(memory)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn planning_scope_failure_stops_before_the_planner_in_blocking_and_streaming_turns() {
+        use futures::StreamExt;
+
+        let direct_memory = Arc::new(ReadFailingMemory::new(true));
+        let direct_planner = mock_with_response(r#"{"steps":[]}"#);
+        let direct_calls = direct_planner.clone();
+        let direct = scoped_planning_agent(direct_memory.clone(), direct_planner);
+        let error = direct.generate_plan("plan this").await.unwrap_err();
+        assert!(error.to_string().contains("simulated scope memory failure"));
+        assert_eq!(direct_memory.read_count(), 1);
+        assert_eq!(direct_calls.call_count(), 0);
+
+        let blocking_memory = Arc::new(ReadFailingMemory::new(true));
+        let blocking_planner = mock_with_response(r#"{"steps":[]}"#);
+        let blocking_calls = blocking_planner.clone();
+        let blocking = scoped_planning_agent(blocking_memory.clone(), blocking_planner);
+        let error = blocking.chat("plan this").await.unwrap_err();
+        assert!(error.to_string().contains("simulated scope memory failure"));
+        assert_eq!(blocking_memory.read_count(), 1);
+        assert_eq!(blocking_calls.call_count(), 0);
+        assert!(blocking.tool_call_history.read().is_empty());
+
+        let streaming_memory = Arc::new(ReadFailingMemory::new(true));
+        let streaming_planner = mock_with_response(r#"{"steps":[]}"#);
+        let streaming_calls = streaming_planner.clone();
+        let streaming = scoped_planning_agent(streaming_memory.clone(), streaming_planner);
+        let (_, chunks, final_response) = collect_stream_events(&streaming, "plan this").await;
+        assert!(final_response.is_none());
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Error { message } if message.contains("simulated scope memory failure")
+        )));
+        assert!(!chunks.iter().any(StreamChunk::is_done));
+        assert_eq!(streaming_memory.read_count(), 1);
+        assert_eq!(streaming_calls.call_count(), 0);
+        assert!(streaming.tool_call_history.read().is_empty());
+
+        let legacy_memory = Arc::new(ReadFailingMemory::new(true));
+        let legacy_planner = mock_with_response(r#"{"steps":[]}"#);
+        let legacy_calls = legacy_planner.clone();
+        let legacy = scoped_planning_agent(legacy_memory.clone(), legacy_planner);
+        let mut stream = legacy.chat_stream("plan this").await.unwrap();
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Error { message } if message.contains("simulated scope memory failure")
+        )));
+        assert!(!chunks.iter().any(StreamChunk::is_done));
+        assert_eq!(legacy_memory.read_count(), 1);
+        assert_eq!(legacy_calls.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn replanning_scope_failure_does_not_issue_a_second_planner_request() {
+        let memory = Arc::new(ReadFailingMemory::fail_on_read(Some(4)));
+        let planner = mock_with_response(
+            r#"{"steps":[{"id":"step1","description":"invalid calculation","action_type":"tool","action_target":"calculator","args":{"expression":"not valid"},"dependencies":[]}]}"#,
+        );
+        let planner_calls = planner.clone();
+        let agent = scoped_planning_agent(memory.clone(), planner);
+
+        let result = agent.chat("plan this").await;
+        assert!(
+            result.is_err(),
+            "expected replan scope failure, got {result:?}; reads={}, planner_calls={}",
+            memory.read_count(),
+            planner_calls.call_count()
+        );
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("simulated scope memory failure"));
+        assert_eq!(memory.read_count(), 4);
+        assert_eq!(planner_calls.call_count(), 1);
+        let records = agent.tool_call_history.read();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].tool_id, "calculator");
+    }
+
+    #[tokio::test]
+    async fn planning_prompt_uses_only_the_effective_tool_scope() {
+        let memory = Arc::new(ReadFailingMemory::new(false));
+        let planner = mock_with_response(r#"{"steps":[]}"#);
+        let planner_calls = planner.clone();
+        let agent = scoped_planning_agent(memory.clone(), planner);
+
+        let plan = agent.generate_plan("plan this").await.unwrap();
+        assert!(!plan.steps.is_empty());
+        assert_eq!(memory.read_count(), 1);
+        assert_eq!(planner_calls.call_count(), 1);
+        let call = planner_calls.last_call().unwrap();
+        let prompt = &call.messages[0].content;
+        assert!(prompt.contains("- calculator ("), "{prompt}");
+        assert!(!prompt.contains("file_write"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn planning_with_no_granted_tools_keeps_a_normal_empty_scope() {
+        let yaml = r#"
+name: EmptyPlanningAgent
+system_prompt: "Plan safely."
+reasoning:
+  mode: plan_and_execute
+tools: []
+"#;
+        let planner = mock_with_response(r#"{"steps":[]}"#);
+        let planner_calls = planner.clone();
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(planner))
+            .tool(Arc::new(CalculatorTool::new()))
+            .build()
+            .unwrap();
+
+        agent.generate_plan("plan this").await.unwrap();
+        let call = planner_calls.last_call().unwrap();
+        let prompt = &call.messages[0].content;
+        assert!(prompt.contains("Available tools: none"), "{prompt}");
+        assert!(!prompt.contains("- calculator ("), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn planning_filter_can_narrow_the_effective_scope_to_empty() {
+        let yaml = r#"
+name: FilteredPlanningAgent
+system_prompt: "Plan safely."
+reasoning:
+  mode: plan_and_execute
+  planning:
+    available:
+      tools: []
+tools: [calculator]
+states:
+  initial: current
+  states:
+    current:
+      tools: [calculator]
+"#;
+        let memory = Arc::new(ReadFailingMemory::new(false));
+        let planner = mock_with_response(r#"{"steps":[]}"#);
+        let planner_calls = planner.clone();
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(planner))
+            .tool(Arc::new(CalculatorTool::new()))
+            .memory(memory.clone())
+            .build()
+            .unwrap();
+
+        agent.generate_plan("plan this").await.unwrap();
+        assert_eq!(memory.read_count(), 1);
+        let call = planner_calls.last_call().unwrap();
+        let prompt = &call.messages[0].content;
+        assert!(prompt.contains("Available tools: none"), "{prompt}");
+        assert!(!prompt.contains("- calculator ("), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn disambiguation_scope_failure_never_reaches_a_model_or_final_response() {
+        let direct_memory = Arc::new(ReadFailingMemory::new(true));
+        let direct_router = mock_with_response("unused");
+        let direct_calls = direct_router.clone();
+        let direct = scoped_disambiguation_agent(direct_memory.clone(), direct_router, true);
+        let error = direct.build_disambiguation_context().await.unwrap_err();
+        assert!(error.to_string().contains("simulated scope memory failure"));
+        assert_eq!(direct_memory.read_count(), 1);
+        assert_eq!(direct_calls.call_count(), 0);
+
+        let blocking_memory = Arc::new(ReadFailingMemory::new(true));
+        let blocking_router = mock_with_response("unused");
+        let blocking_calls = blocking_router.clone();
+        let blocking = scoped_disambiguation_agent(blocking_memory.clone(), blocking_router, true);
+        let error = blocking.chat("send it").await.unwrap_err();
+        assert!(error.to_string().contains("simulated scope memory failure"));
+        assert_eq!(blocking_memory.read_count(), 1);
+        assert_eq!(blocking_calls.call_count(), 0);
+
+        let streaming_memory = Arc::new(ReadFailingMemory::new(true));
+        let streaming_router = mock_with_response("unused");
+        let streaming_calls = streaming_router.clone();
+        let streaming =
+            scoped_disambiguation_agent(streaming_memory.clone(), streaming_router, true);
+        let (_, chunks, final_response) = collect_stream_events(&streaming, "send it").await;
+        assert!(final_response.is_none());
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            StreamChunk::Error { message } if message.contains("simulated scope memory failure")
+        )));
+        assert!(!chunks.iter().any(StreamChunk::is_done));
+        assert_eq!(streaming_memory.read_count(), 1);
+        assert_eq!(streaming_calls.call_count(), 0);
+
+        let skipped_memory = Arc::new(ReadFailingMemory::new(true));
+        let skipped_router = mock_with_response("unused");
+        let skipped = scoped_disambiguation_agent(skipped_memory.clone(), skipped_router, false);
+        let context = skipped.build_disambiguation_context().await.unwrap();
+        assert!(context.available_tools.is_empty());
+        assert_eq!(skipped_memory.read_count(), 0);
+    }
+
     #[tokio::test]
     async fn test_stream_memory_write_failure_surfaces_as_error() {
         // Turn shape: user commit (add #1) → tool call → transition fires → workflow note (add #2, fails).
@@ -23925,6 +24267,49 @@ states:
     }
 
     #[tokio::test]
+    async fn runtime_zero_history_preserves_pending_clarification_across_turns() {
+        let yaml = r#"
+name: ZeroHistoryPendingAgent
+system_prompt: "Help."
+llm:
+  default: default
+  router: router
+disambiguation:
+  enabled: true
+  context:
+    recent_messages: 0
+    include_available_tools: false
+"#;
+        let main = mock_with_response("Final answer");
+        let main_calls = main.clone();
+        let router = mock_with_responses(vec![
+            r#"{"is_ambiguous":true,"confidence":0.1,"ambiguity_type":"missing_target","reasoning":"target missing","what_is_unclear":["target"],"detected_language":"en"}"#,
+            r#"{"question":"Who should receive it?","options":null}"#,
+            r#"{"status":"answered","selected_option":null,"enriched_input":"Send it to Ada","resolved":{"recipient":"Ada"}}"#,
+        ]);
+        let router_calls = router.clone();
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(main))
+            .llm_alias("router", Arc::new(router))
+            .build()
+            .unwrap();
+
+        let clarification = agent.chat("Send it").await.unwrap();
+        assert_eq!(clarification.content, "Who should receive it?");
+        let response = agent.chat("Ada").await.unwrap();
+        assert_eq!(response.content, "Final answer");
+        assert_eq!(router_calls.call_count(), 3);
+        assert_eq!(main_calls.call_count(), 1);
+        let calls = router_calls.call_history();
+        let parse_prompt = &calls[2].messages.last().unwrap().content;
+        assert!(
+            parse_prompt.contains("Who should receive it?"),
+            "{parse_prompt}"
+        );
+    }
+
+    #[tokio::test]
     async fn parity_reflection_enabled() {
         let yaml = r#"
 name: ReflectionAgent
@@ -23987,6 +24372,32 @@ states:
             .llm_alias("evaluator", Arc::new(evaluator))
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn routing_log_reports_the_effective_state_reflection_mode() {
+        let yaml = r#"
+name: ReflectionLogAgent
+system_prompt: "Be concise."
+reflection:
+  enabled: true
+states:
+  initial: active
+  states:
+    active:
+      prompt: "Answer directly."
+      reflection:
+        enabled: false
+"#;
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("answer")))
+            .build()
+            .unwrap();
+        assert!(matches!(
+            agent.routing_reflection_mode(),
+            ReflectionMode::Disabled
+        ));
     }
 
     #[tokio::test]
@@ -24469,6 +24880,12 @@ skills:
             )),
             vec!["alpha", "beta"]
         );
+        assert_eq!(
+            available_skill_ids(&skill_scope_agent(
+                "states:\n  initial: current\n  states:\n    current:\n      prompt: current\n"
+            )),
+            vec!["alpha", "beta"]
+        );
         assert!(
             available_skill_ids(&skill_scope_agent(
                 "states:\n  initial: current\n  states:\n    current:\n      skills: [unknown]\n"
@@ -24526,6 +24943,21 @@ skills:
         let fallback_prompt = &fallback_call.messages[0].content;
         assert!(fallback_prompt.contains("- alpha:"));
         assert!(fallback_prompt.contains("- beta:"));
+
+        let (omitted, omitted_calls) = skill_scope_agent_with_router(
+            "states:\n  initial: current\n  states:\n    current:\n      prompt: current\n",
+        );
+        assert!(
+            omitted
+                .select_skill_candidate("route")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let omitted_call = omitted_calls.last_call().unwrap();
+        let omitted_prompt = &omitted_call.messages[0].content;
+        assert!(omitted_prompt.contains("- alpha:"));
+        assert!(omitted_prompt.contains("- beta:"));
 
         let (unknown, unknown_calls) = skill_scope_agent_with_router(
             "states:\n  initial: current\n  states:\n    current:\n      skills: [unknown]\n",

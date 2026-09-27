@@ -241,7 +241,12 @@ mod tests {
     #[derive(Clone, Copy)]
     enum TestFailure {
         Network,
+        RateLimit,
         Config,
+        ModelNotFound,
+        ContentFiltered,
+        Serialization,
+        Other,
         Api(Option<u16>),
     }
 
@@ -251,6 +256,8 @@ mod tests {
         failure: Option<TestFailure>,
         terminal: bool,
         calls: AtomicUsize,
+        stream_calls: AtomicUsize,
+        requests: parking_lot::Mutex<Vec<Vec<String>>>,
     }
 
     impl CountingProvider {
@@ -261,6 +268,8 @@ mod tests {
                 failure: None,
                 terminal: false,
                 calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+                requests: parking_lot::Mutex::new(Vec::new()),
             }
         }
 
@@ -271,6 +280,8 @@ mod tests {
                 failure: Some(failure),
                 terminal,
                 calls: AtomicUsize::new(0),
+                stream_calls: AtomicUsize::new(0),
+                requests: parking_lot::Mutex::new(Vec::new()),
             }
         }
 
@@ -278,10 +289,27 @@ mod tests {
             self.calls.load(Ordering::SeqCst)
         }
 
+        fn stream_call_count(&self) -> usize {
+            self.stream_calls.load(Ordering::SeqCst)
+        }
+
+        fn last_request(&self) -> Vec<String> {
+            self.requests
+                .lock()
+                .last()
+                .cloned()
+                .expect("provider request")
+        }
+
         fn error(&self) -> LLMError {
             match self.failure.expect("configured failure") {
                 TestFailure::Network => LLMError::Network("temporary".into()),
+                TestFailure::RateLimit => LLMError::RateLimit { retry_after: None },
                 TestFailure::Config => LLMError::Config("invalid".into()),
+                TestFailure::ModelNotFound => LLMError::ModelNotFound("missing".into()),
+                TestFailure::ContentFiltered => LLMError::ContentFiltered("filtered".into()),
+                TestFailure::Serialization => LLMError::Serialization("invalid JSON".into()),
+                TestFailure::Other => LLMError::Other("other".into()),
                 TestFailure::Api(status) => LLMError::API {
                     message: "api failure".into(),
                     status,
@@ -294,10 +322,16 @@ mod tests {
     impl LLMProvider for CountingProvider {
         async fn complete(
             &self,
-            _messages: &[ChatMessage],
+            messages: &[ChatMessage],
             _config: Option<&LLMConfig>,
         ) -> Result<LLMResponse, LLMError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.requests.lock().push(
+                messages
+                    .iter()
+                    .map(|message| message.content.clone())
+                    .collect(),
+            );
             if self.failure.is_some() {
                 Err(self.error())
             } else {
@@ -316,6 +350,7 @@ mod tests {
             Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>,
             LLMError,
         > {
+            self.stream_calls.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(futures::stream::empty()))
         }
 
@@ -428,6 +463,23 @@ mod tests {
 
         let response = router.complete(&messages, None).await.unwrap();
         assert_eq!(response.content, "Hello from primary");
+    }
+
+    #[tokio::test]
+    async fn complete_stream_calls_only_the_primary_provider() {
+        let primary = Arc::new(CountingProvider::success("primary", "unused"));
+        let specialized = Arc::new(CountingProvider::success("specialized", "unused"));
+        let router = MultiLLMRouter::new(primary.clone()).with_classifier(specialized.clone());
+
+        let _stream = router
+            .complete_stream(&[ChatMessage::user("hello")], None)
+            .await
+            .unwrap();
+
+        assert_eq!(primary.stream_call_count(), 1);
+        assert_eq!(specialized.stream_call_count(), 0);
+        assert_eq!(primary.call_count(), 0);
+        assert_eq!(specialized.call_count(), 0);
     }
 
     #[tokio::test]
@@ -772,6 +824,105 @@ mod tests {
             Err(LLMError::Network(_))
         ));
         assert_eq!(primary.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn every_capability_without_a_specialized_provider_calls_primary_once() {
+        for operation in CapabilityOperation::ALL {
+            let primary = Arc::new(CountingProvider::success(
+                "primary",
+                operation.valid_response(),
+            ));
+            let router = MultiLLMRouter::new(primary.clone());
+
+            invoke_operation(&router, operation).await.unwrap();
+            assert_eq!(primary.call_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_specialized_capability_uses_only_the_successful_specialized_provider() {
+        for operation in CapabilityOperation::ALL {
+            let primary = Arc::new(CountingProvider::success(
+                "primary",
+                operation.valid_response(),
+            ));
+            let specialized = Arc::new(CountingProvider::success(
+                "specialized",
+                operation.valid_response(),
+            ));
+            let router = router_for_operation(operation, primary.clone(), specialized.clone());
+
+            invoke_operation(&router, operation).await.unwrap();
+            assert_eq!(specialized.call_count(), 1);
+            assert_eq!(primary.call_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_specialized_capability_falls_back_once_on_rate_limit() {
+        for operation in CapabilityOperation::ALL {
+            let primary = Arc::new(CountingProvider::success(
+                "primary",
+                operation.valid_response(),
+            ));
+            let specialized = Arc::new(CountingProvider::failure(
+                "specialized",
+                TestFailure::RateLimit,
+                false,
+            ));
+            let router = router_for_operation(operation, primary.clone(), specialized.clone());
+
+            invoke_operation(&router, operation).await.unwrap();
+            assert_eq!(specialized.call_count(), 1);
+            assert_eq!(primary.call_count(), 1);
+            assert_eq!(specialized.last_request(), primary.last_request());
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_failing_provider_arc_is_called_once_for_every_capability() {
+        for operation in CapabilityOperation::ALL {
+            let primary = Arc::new(CountingProvider::failure(
+                "primary",
+                TestFailure::Network,
+                false,
+            ));
+            let router = router_for_operation(operation, primary.clone(), primary.clone());
+
+            assert!(matches!(
+                invoke_operation(&router, operation).await,
+                Err(LLMError::Network(_))
+            ));
+            assert_eq!(primary.call_count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_capability_rejects_non_fallback_error_variants() {
+        for operation in CapabilityOperation::ALL {
+            for failure in [
+                TestFailure::Config,
+                TestFailure::ModelNotFound,
+                TestFailure::ContentFiltered,
+                TestFailure::Serialization,
+                TestFailure::Other,
+                TestFailure::Api(Some(400)),
+                TestFailure::Api(None),
+            ] {
+                let primary = Arc::new(CountingProvider::success(
+                    "primary",
+                    operation.valid_response(),
+                ));
+                let specialized =
+                    Arc::new(CountingProvider::failure("specialized", failure, false));
+                let router = router_for_operation(operation, primary.clone(), specialized.clone());
+
+                assert!(invoke_operation(&router, operation).await.is_err());
+                assert_eq!(specialized.call_count(), 1);
+                assert_eq!(primary.call_count(), 0);
+            }
+        }
     }
 
     #[tokio::test]
