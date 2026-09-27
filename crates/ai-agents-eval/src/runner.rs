@@ -2561,6 +2561,89 @@ scenarios:
     }
 
     #[test]
+    fn runner_default_judge_is_strict_and_redacts_failures() {
+        std::thread::Builder::new()
+            .name("eval-judge-contract-test".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Runtime::new().unwrap();
+                runtime.block_on(async {
+                    let dir = std::env::temp_dir().join(format!(
+                        "ai_agents_eval_judge_contract_test_{}",
+                        uuid::Uuid::new_v4()
+                    ));
+                    std::fs::create_dir_all(&dir).unwrap();
+                    write_test_agent(&dir);
+                    let strict_json = r#"{"criteria_scores":[{"name":"relevance","score":0.9,"explanation":"ok"}],"overall_score":0.9,"overall_feedback":"ok","passed":false}"#;
+                    let success_yaml = format!(
+                        r#"
+name: Strict Judge Success
+agent: agent.yaml
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Agent answer"
+      - '{strict_json}'
+scenarios:
+  - id: strict-success
+    turns:
+      - input: Hello
+        assert:
+          judge:
+            criteria: ["Relevant"]
+"#
+                    );
+                    let success =
+                        run_test_suite(&dir, "strict-success.yaml", &success_yaml).await;
+                    assert_eq!(success.passed, 1);
+
+                    let fenced_yaml = format!(
+                        r#"
+name: Strict Judge Failure
+agent: agent.yaml
+settings:
+  redact_outputs: true
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - "Agent answer"
+      - |
+        ```json
+        {strict_json}
+        ```
+scenarios:
+  - id: strict-failure
+    turns:
+      - input: Hello
+        assert:
+          judge:
+            criteria: ["Relevant"]
+"#
+                    );
+                    let failure =
+                        run_test_suite(&dir, "strict-failure.yaml", &fenced_yaml).await;
+                    assert_eq!(failure.failed, 1);
+                    assert_eq!(
+                        failure.scenarios[0].failure_category,
+                        Some(FailureCategory::JudgeError)
+                    );
+                    let turn = &failure.scenarios[0].attempts[0].turns[0];
+                    assert_eq!(turn.input.value, "[redacted]");
+                    assert_eq!(turn.response.value, "[redacted]");
+                    let serialized = serde_json::to_string(&failure).unwrap();
+                    assert!(!serialized.contains("Agent answer"));
+                    assert!(!serialized.contains("criteria_scores"));
+                    let _ = std::fs::remove_dir_all(dir);
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn runner_executes_mocked_suite_and_redacts_outputs() {
         std::thread::Builder::new()
             .name("eval-runner-test".to_string())

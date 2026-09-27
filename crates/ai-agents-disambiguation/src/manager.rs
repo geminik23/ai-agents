@@ -89,6 +89,45 @@ impl DisambiguationManager {
         &self.config
     }
 
+    // Projects only model-visible context while retaining the original control context for ownership and local skip checks.
+    fn prompt_context(&self, source: &DisambiguationContext) -> DisambiguationContext {
+        let mut prompt = source.clone();
+        let recent_limit = self.config.context.recent_messages;
+        if recent_limit == 0 {
+            prompt.recent_messages.clear();
+        } else if prompt.recent_messages.len() > recent_limit {
+            let start = prompt.recent_messages.len() - recent_limit;
+            prompt.recent_messages = prompt.recent_messages.split_off(start);
+        }
+        prompt.previous_questions = prompt
+            .recent_messages
+            .iter()
+            .rev()
+            .find(|message| message.starts_with("Assistant:"))
+            .filter(|message| message.trim_end().ends_with('?'))
+            .map(|message| {
+                message
+                    .strip_prefix("Assistant:")
+                    .unwrap_or(message)
+                    .trim()
+                    .to_string()
+            })
+            .into_iter()
+            .collect();
+        if !self.config.context.include_state {
+            prompt.current_state = None;
+            prompt.state_prompt = None;
+        }
+        if !self.config.context.include_available_tools {
+            prompt.available_tools.clear();
+        }
+        // Skills and user context are not rendered by the current prompt contract.
+        // Clearing them prevents default-true compatibility fields from becoming implicit data export.
+        prompt.available_skills.clear();
+        prompt.user_context.clear();
+        prompt
+    }
+
     pub fn with_clarification_observer(mut self, observer: Arc<dyn ClarificationObserver>) -> Self {
         self.clarifier = self.clarifier.with_observer(observer);
         self
@@ -216,10 +255,16 @@ impl DisambiguationManager {
             return Ok(DisambiguationResult::Clear);
         }
 
-        // Check skip conditions
+        // Local skip controls use the authoritative context while model-assisted checks see only the configured projection.
+        let skip_prompt_context = self.prompt_context(context);
         if self
             .detector
-            .should_skip(input, context, &self.config.skip_when)
+            .should_skip_with_prompt_context(
+                input,
+                context,
+                &skip_prompt_context,
+                &self.config.skip_when,
+            )
             .await?
         {
             return Ok(DisambiguationResult::Clear);
@@ -230,14 +275,15 @@ impl DisambiguationManager {
         let threshold = self.get_effective_threshold(state_override, skill_override);
         let required_clarity =
             self.get_required_clarity(&context.required_clarity, state_override, skill_override);
-        let mut context = context.clone();
-        context.required_clarity = required_clarity.clone();
+        let mut control_context = context.clone();
+        control_context.required_clarity = required_clarity.clone();
+        let prompt_context = self.prompt_context(&control_context);
 
         // Preserve the detector's raw payload, then normalize only the effective
         // boolean. Confidence and all structured evidence remain unchanged.
         let mut detection = self
             .detector
-            .detect_with_threshold(input, &context, threshold)
+            .detect_with_threshold(input, &prompt_context, threshold)
             .await?;
         let detector_is_ambiguous = detection.is_ambiguous;
         detection.is_ambiguous = detection.confidence < threshold;
@@ -301,7 +347,7 @@ impl DisambiguationManager {
                     .generate(
                         input,
                         &forced_detection,
-                        &context,
+                        &prompt_context,
                         custom_template,
                         &required_clarity,
                     )
@@ -313,8 +359,8 @@ impl DisambiguationManager {
                     question: question.clone(),
                     detection: forced_detection.clone(),
                     attempts: 1,
-                    origin_state: context.current_state.clone(),
-                    origin_state_generation: Self::context_state_generation(&context),
+                    origin_state: control_context.current_state.clone(),
+                    origin_state_generation: Self::context_state_generation(&control_context),
                     phase: PendingPhase::Clarification {
                         required_clarity: required_clarity.clone(),
                         require_confirmation: state_override
@@ -377,7 +423,7 @@ impl DisambiguationManager {
             .generate(
                 input,
                 &detection,
-                &context,
+                &prompt_context,
                 custom_template,
                 &required_clarity,
             )
@@ -390,8 +436,8 @@ impl DisambiguationManager {
             question: question.clone(),
             detection: detection.clone(),
             attempts: 1,
-            origin_state: context.current_state.clone(),
-            origin_state_generation: Self::context_state_generation(&context),
+            origin_state: control_context.current_state.clone(),
+            origin_state_generation: Self::context_state_generation(&control_context),
             phase: PendingPhase::Clarification {
                 required_clarity: required_clarity.clone(),
                 require_confirmation: state_override
@@ -421,13 +467,14 @@ impl DisambiguationManager {
                 "Pending clarification phase is unavailable".to_string(),
             ));
         };
+        let prompt_context = self.prompt_context(context);
         let parse_result = self
             .clarifier
             .parse_response(
                 &pending.original_input,
                 &pending.question,
                 response,
-                context,
+                &prompt_context,
             )
             .await?;
 
@@ -514,9 +561,14 @@ impl DisambiguationManager {
                     return self.handle_max_attempts(&pending.original_input);
                 }
 
-                // Update context with previous question
-                let mut new_context = context.clone();
-                new_context.add_previous_question(pending.question.question.clone());
+                // Re-questions retain manager-owned pending context but never regain hidden runtime fields.
+                let mut new_context = prompt_context.clone();
+                if !new_context
+                    .previous_questions
+                    .contains(&pending.question.question)
+                {
+                    new_context.add_previous_question(pending.question.question.clone());
+                }
                 new_context.increment_attempts();
 
                 // Generate a new clarification question
@@ -866,6 +918,7 @@ impl DisambiguationContext {
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::{ContextConfig, SkipCondition};
     use super::*;
     use ai_agents_llm::mock::MockLLMProvider;
 
@@ -1047,6 +1100,283 @@ mod tests {
         );
 
         assert!(ctx.previous_questions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prompt_projection_applies_history_state_and_tool_controls() {
+        let detection = detection_response(false, 0.9);
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                recent_messages: 1,
+                include_state: false,
+                include_available_tools: false,
+                include_available_skills: true,
+                include_user_context: true,
+            },
+            ..Default::default()
+        };
+        let (manager, mock) = manager_with_config(config, vec![detection.as_str()]);
+        let context = DisambiguationContext::from_agent_state(
+            vec![
+                "User: OLD_HISTORY_MARKER".into(),
+                "User: NEW_HISTORY_MARKER".into(),
+            ],
+            Some("PRIVATE_STATE_MARKER".into()),
+            Some("PRIVATE_STATE_PROMPT".into()),
+            vec!["PRIVATE_TOOL_MARKER".into()],
+            vec!["PRIVATE_SKILL_MARKER".into()],
+            vec![],
+            HashMap::from([(
+                "private".into(),
+                serde_json::json!("PRIVATE_CONTEXT_MARKER"),
+            )]),
+        );
+
+        assert!(
+            manager
+                .process_input("hello", &context)
+                .await
+                .unwrap()
+                .is_clear()
+        );
+        let prompt = mock
+            .last_call()
+            .unwrap()
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .clone();
+        assert!(prompt.contains("NEW_HISTORY_MARKER"), "{prompt}");
+        for hidden in [
+            "OLD_HISTORY_MARKER",
+            "PRIVATE_STATE_MARKER",
+            "PRIVATE_STATE_PROMPT",
+            "PRIVATE_TOOL_MARKER",
+            "PRIVATE_SKILL_MARKER",
+            "PRIVATE_CONTEXT_MARKER",
+        ] {
+            assert!(!prompt.contains(hidden), "{hidden} leaked in {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clarification_generation_and_parsing_use_the_same_projection() {
+        let detection = detection_response(true, 0.1);
+        let question = r#"{"question":"PENDING_QUESTION?","options":null}"#;
+        let unclear =
+            r#"{"status":"unclear","selected_option":null,"enriched_input":null,"resolved":{}}"#;
+        let re_question = r#"{"question":"A different question?","options":null}"#;
+        let mut config = DisambiguationConfig {
+            enabled: true,
+            detection: super::super::config::DetectionConfig {
+                threshold: 0.7,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.clarification.max_attempts = 3;
+        let (manager, mock) = manager_with_config(
+            config,
+            vec![detection.as_str(), question, unclear, re_question],
+        );
+        let initial_context = DisambiguationContext::from_agent_state(
+            vec!["User: HISTORY_MARKER".into()],
+            Some("STATE_MARKER".into()),
+            Some("STATE_PROMPT_MARKER".into()),
+            vec!["TOOL_MARKER".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+        assert!(
+            manager
+                .process_input("send it", &initial_context)
+                .await
+                .unwrap()
+                .needs_clarification()
+        );
+
+        let pending_context = DisambiguationContext::from_agent_state(
+            vec!["Assistant: PENDING_QUESTION?".into()],
+            Some("STATE_MARKER".into()),
+            Some("STATE_PROMPT_MARKER".into()),
+            vec!["TOOL_MARKER".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+        assert!(
+            manager
+                .process_input("not sure", &pending_context)
+                .await
+                .unwrap()
+                .needs_clarification()
+        );
+
+        let calls = mock.call_history();
+        assert_eq!(calls.len(), 4);
+        for index in [1, 2, 3] {
+            let prompt = &calls[index].messages.last().unwrap().content;
+            assert!(prompt.contains("STATE_MARKER"), "call {index}: {prompt}");
+            assert!(
+                prompt.contains("STATE_PROMPT_MARKER"),
+                "call {index}: {prompt}"
+            );
+            assert!(prompt.contains("TOOL_MARKER"), "call {index}: {prompt}");
+        }
+        let parse_prompt = &calls[2].messages.last().unwrap().content;
+        assert_eq!(parse_prompt.matches("PENDING_QUESTION?").count(), 1);
+        let re_question_prompt = &calls[3].messages.last().unwrap().content;
+        assert_eq!(re_question_prompt.matches("PENDING_QUESTION?").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn hidden_state_and_tools_do_not_reappear_in_clarification_prompt() {
+        let detection = detection_response(true, 0.1);
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                include_state: false,
+                include_available_tools: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (manager, mock) =
+            manager_with_config(config, vec![detection.as_str(), CLARIFICATION_RESPONSE]);
+        let context = DisambiguationContext::from_agent_state(
+            vec![],
+            Some("PRIVATE_STATE_MARKER".into()),
+            Some("PRIVATE_STATE_PROMPT".into()),
+            vec!["PRIVATE_TOOL_MARKER".into()],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        assert!(
+            manager
+                .process_input("send it", &context)
+                .await
+                .unwrap()
+                .needs_clarification()
+        );
+        let calls = mock.call_history();
+        let prompt = &calls[1].messages.last().unwrap().content;
+        for hidden in [
+            "PRIVATE_STATE_MARKER",
+            "PRIVATE_STATE_PROMPT",
+            "PRIVATE_TOOL_MARKER",
+        ] {
+            assert!(!prompt.contains(hidden), "{hidden} leaked in {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn state_visibility_does_not_disable_local_in_state_skip() {
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                include_state: false,
+                ..Default::default()
+            },
+            skip_when: vec![SkipCondition::InState {
+                states: vec!["private".into()],
+            }],
+            ..Default::default()
+        };
+        let (manager, mock) = manager_with_config(config, vec![]);
+
+        let result = manager
+            .process_input("hello", &DisambiguationContext::new().with_state("private"))
+            .await
+            .unwrap();
+
+        assert!(result.is_clear());
+        assert_eq!(mock.call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn custom_skip_uses_projected_state_context() {
+        let detection = detection_response(false, 0.9);
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                include_state: false,
+                ..Default::default()
+            },
+            skip_when: vec![SkipCondition::Custom {
+                condition: "Always inspect this condition".into(),
+            }],
+            ..Default::default()
+        };
+        let (manager, mock) = manager_with_config(config, vec!["no", detection.as_str()]);
+
+        assert!(
+            manager
+                .process_input(
+                    "hello",
+                    &DisambiguationContext::new().with_state("PRIVATE_STATE_MARKER"),
+                )
+                .await
+                .unwrap()
+                .is_clear()
+        );
+        let calls = mock.call_history();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            !calls[0]
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("PRIVATE_STATE_MARKER")
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_history_disables_memory_derived_question_skip() {
+        let detection = detection_response(false, 0.9);
+        let config = DisambiguationConfig {
+            enabled: true,
+            context: ContextConfig {
+                recent_messages: 0,
+                ..Default::default()
+            },
+            skip_when: vec![SkipCondition::AnsweringAgentQuestion],
+            ..Default::default()
+        };
+        let (manager, mock) = manager_with_config(config, vec![detection.as_str()]);
+        let context = DisambiguationContext::from_agent_state(
+            vec!["Assistant: PRIVATE_QUESTION_MARKER?".into()],
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![],
+            HashMap::new(),
+        );
+
+        assert!(
+            manager
+                .process_input("answer", &context)
+                .await
+                .unwrap()
+                .is_clear()
+        );
+        assert_eq!(mock.call_count(), 1);
+        assert!(
+            !mock
+                .last_call()
+                .unwrap()
+                .messages
+                .last()
+                .unwrap()
+                .content
+                .contains("PRIVATE_QUESTION_MARKER")
+        );
     }
 
     #[tokio::test]

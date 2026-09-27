@@ -186,14 +186,21 @@ impl LLMJudge {
             .complete(&[ChatMessage::user(&prompt)], None)
             .await
             .map_err(|error| EvalError::Judge(error.to_string()))?;
-        let value = extract_json(&llm_response.content)
-            .ok_or_else(|| EvalError::Judge("judge did not return JSON".into()))?;
+        let value = if self.config.require_json {
+            serde_json::from_str(llm_response.content.trim())
+                .map_err(|_| EvalError::Judge("judge did not return strict JSON".into()))?
+        } else {
+            extract_json(&llm_response.content)
+                .ok_or_else(|| EvalError::Judge("judge did not return JSON".into()))?
+        };
         let mut result: JudgeResult = serde_json::from_value(value)
-            .map_err(|error| EvalError::Judge(format!("invalid judge JSON: {}", error)))?;
+            .map_err(|_| EvalError::Judge("judge JSON has an invalid result structure".into()))?;
         result.passed = result.overall_score >= threshold;
-        if !self.config.require_json {
-            result.raw_response = Some(llm_response.content);
-        }
+        result.raw_response = if self.config.require_json {
+            None
+        } else {
+            Some(llm_response.content)
+        };
         Ok(result)
     }
 }
@@ -256,4 +263,92 @@ fn default_weight() -> f32 {
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_agents_core::{FinishReason, LLMResponse};
+    use ai_agents_llm::mock::MockLLMProvider;
+
+    fn assertion() -> JudgeAssertion {
+        JudgeAssertion {
+            llm: None,
+            pass_threshold: 0.75,
+            criteria: vec![JudgeCriterion::Text("Relevant".into())],
+        }
+    }
+
+    fn result_json(extra: &str) -> String {
+        format!(
+            r#"{{"criteria_scores":[{{"name":"Relevant","score":0.9,"explanation":"ok"}}],"overall_score":0.9,"overall_feedback":"ok","passed":false{extra}}}"#
+        )
+    }
+
+    fn judge(response: String, require_json: bool) -> LLMJudge {
+        let mut provider = MockLLMProvider::new("judge");
+        provider.add_response(LLMResponse::new(response, FinishReason::Stop));
+        LLMJudge::new(
+            Arc::new(provider),
+            JudgeConfig {
+                require_json,
+                ..JudgeConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn strict_judge_requires_the_entire_response_to_be_json() {
+        let strict = judge(format!("result: {}", result_json("")), true);
+        let error = strict.evaluate("answer", &assertion()).await.unwrap_err();
+        assert!(error.to_string().contains("strict JSON"));
+
+        let strict = judge(format!("\n {} \n", result_json("")), true);
+        let result = strict.evaluate("answer", &assertion()).await.unwrap();
+        assert!(result.passed);
+        assert!(result.raw_response.is_none());
+    }
+
+    #[tokio::test]
+    async fn lenient_judge_extracts_json_and_keeps_the_actual_response() {
+        let response = format!("result: {}", result_json(""));
+        let result = judge(response.clone(), false)
+            .evaluate("answer", &assertion())
+            .await
+            .unwrap();
+
+        assert!(result.passed);
+        assert_eq!(result.raw_response.as_deref(), Some(response.as_str()));
+    }
+
+    #[tokio::test]
+    async fn framework_owns_the_raw_response_field() {
+        let injected = ",\"raw_response\":\"MODEL_VALUE\"";
+        let strict = judge(result_json(injected), true)
+            .evaluate("answer", &assertion())
+            .await
+            .unwrap();
+        assert!(strict.raw_response.is_none());
+
+        let response = result_json(injected);
+        let lenient = judge(response.clone(), false)
+            .evaluate("answer", &assertion())
+            .await
+            .unwrap();
+        assert_eq!(lenient.raw_response.as_deref(), Some(response.as_str()));
+    }
+
+    #[tokio::test]
+    async fn invalid_result_errors_do_not_include_model_values() {
+        let response = r#"{"criteria_scores":[],"overall_score":"PRIVATE_SENTINEL","overall_feedback":"ok","passed":false}"#;
+        for require_json in [true, false] {
+            let error = judge(response.to_string(), require_json)
+                .evaluate("answer", &assertion())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("invalid result structure"));
+            assert!(!error.contains("PRIVATE_SENTINEL"));
+        }
+    }
 }
