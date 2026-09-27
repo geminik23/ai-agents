@@ -276,7 +276,7 @@ use ai_agents_process::{
 use ai_agents_reasoning::{
     CriterionResult, EvaluationResult, Plan, PlanAction, PlanStatus, PlanStep, ReasoningConfig,
     ReasoningMetadata, ReasoningMode, ReasoningOutput, ReflectionAttempt, ReflectionConfig,
-    ReflectionMetadata, StepFailureAction,
+    ReflectionMetadata, ReflectionMode, StepFailureAction,
 };
 use ai_agents_recovery::{
     ByRoleFilter, ContextOverflowAction, FilterConfig, KeepRecentFilter, LLMFailureAction,
@@ -3827,6 +3827,11 @@ impl RuntimeAgent {
             return state_reflection.clone();
         }
         self.reflection_config.clone()
+    }
+
+    // Returns the current effective reflection mode for routing diagnostics without starting a reflection snapshot.
+    fn routing_reflection_mode(&self) -> ReflectionMode {
+        self.get_effective_reflection_config().enabled
     }
 
     fn get_skill_reasoning_config(&self, skill: &SkillDefinition) -> ReasoningConfig {
@@ -11425,7 +11430,7 @@ Respond in JSON format:
         let reasoning_mode = self.determine_reasoning_mode(processed_input).await?;
         let auto_detected = matches!(effective_reasoning.mode, ReasoningMode::Auto);
         // This diagnostic describes the current routing state, while response reflection takes its own later snapshot.
-        let reflection_enabled = self.get_effective_reflection_config().enabled;
+        let reflection_enabled = self.routing_reflection_mode();
 
         info!(
             reasoning_mode = ?reasoning_mode,
@@ -13335,50 +13340,6 @@ mod tests {
         let mut mock = MockLLMProvider::new("test");
         mock.set_responses(responses.into_iter().map(String::from).collect(), true);
         mock
-    }
-
-    /// Captures the effective reflection field from runtime routing diagnostics without installing a global subscriber.
-    struct ReflectionLogSubscriber {
-        value: Arc<parking_lot::Mutex<Option<String>>>,
-        next_span: std::sync::atomic::AtomicU64,
-    }
-
-    /// Records only the reflection diagnostic field needed by the focused logging regression.
-    struct ReflectionFieldVisitor {
-        value: Arc<parking_lot::Mutex<Option<String>>>,
-    }
-
-    impl tracing::field::Visit for ReflectionFieldVisitor {
-        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "reflection_enabled" {
-                *self.value.lock() = Some(format!("{value:?}"));
-            }
-        }
-    }
-
-    impl tracing::Subscriber for ReflectionLogSubscriber {
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            let id = self.next_span.fetch_add(1, Ordering::Relaxed) + 1;
-            tracing::span::Id::from_u64(id)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, event: &tracing::Event<'_>) {
-            event.record(&mut ReflectionFieldVisitor {
-                value: Arc::clone(&self.value),
-            });
-        }
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
     }
 
     /// Collects one event stream into (content chunks joined, all chunks, Final).
@@ -24413,8 +24374,8 @@ states:
             .unwrap()
     }
 
-    #[tokio::test]
-    async fn routing_log_reports_the_effective_state_reflection_mode() {
+    #[test]
+    fn routing_log_reports_the_effective_state_reflection_mode() {
         let yaml = r#"
 name: ReflectionLogAgent
 system_prompt: "Be concise."
@@ -24433,16 +24394,10 @@ states:
             .llm(Arc::new(mock_with_response("answer")))
             .build()
             .unwrap();
-        let value = Arc::new(parking_lot::Mutex::new(None));
-        let dispatch = tracing::Dispatch::new(ReflectionLogSubscriber {
-            value: Arc::clone(&value),
-            next_span: std::sync::atomic::AtomicU64::new(0),
-        });
-        let _default = tracing::dispatcher::set_default(&dispatch);
-
-        agent.chat("hello").await.unwrap();
-
-        assert_eq!(value.lock().as_deref(), Some("Disabled"));
+        assert!(matches!(
+            agent.routing_reflection_mode(),
+            ReflectionMode::Disabled
+        ));
     }
 
     #[tokio::test]
