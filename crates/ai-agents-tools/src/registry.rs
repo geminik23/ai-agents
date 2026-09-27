@@ -1269,6 +1269,7 @@ mod tests {
         refresh_calls: AtomicUsize,
         active_refreshes: AtomicUsize,
         max_active_refreshes: AtomicUsize,
+        failures_remaining: AtomicUsize,
     }
 
     #[async_trait]
@@ -1315,6 +1316,17 @@ mod tests {
             self.started.notify_one();
             let permit = self.permits.acquire().await.expect("refresh permit");
             permit.forget();
+            if self
+                .failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(ToolProviderError::ConfigError(
+                    "simulated refresh failure".to_string(),
+                ));
+            }
             Ok(())
         }
     }
@@ -1501,6 +1513,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_refresh_rejects_raw_duplicates_before_get_tool() {
+        let registry = ToolRegistry::new();
+        let provider = Arc::new(TestProvider::new(
+            "duplicate_refresh",
+            vec![descriptor("a")],
+            ["a"],
+        ));
+        registry.register_provider(provider.clone()).await.unwrap();
+        let original = registry.get("a").unwrap();
+        let version = registry.version();
+        let get_calls = provider.get_call_count();
+
+        for available in [vec!["a"], Vec::new()] {
+            provider.set_snapshot(vec![descriptor("a"), descriptor("a")], available);
+            assert!(
+                registry
+                    .refresh_provider("duplicate_refresh")
+                    .await
+                    .is_err()
+            );
+            assert!(Arc::ptr_eq(&original, &registry.get("a").unwrap()));
+            assert_eq!(registry.version(), version);
+            assert_eq!(provider.get_call_count(), get_calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_registration_rejects_foreign_none_before_get_tool() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool { id: "owned".into() }))
+            .unwrap();
+        let original = registry.get("owned").unwrap();
+        let version = registry.version();
+        let provider = Arc::new(TestProvider::new(
+            "foreign_none",
+            vec![descriptor("owned")],
+            [],
+        ));
+
+        assert!(registry.register_provider(provider.clone()).await.is_err());
+        assert_eq!(provider.get_call_count(), 0);
+        assert!(Arc::ptr_eq(&original, &registry.get("owned").unwrap()));
+        assert_eq!(registry.version(), version);
+        assert!(!registry.list_providers().contains(&"foreign_none".into()));
+    }
+
+    #[tokio::test]
     async fn provider_snapshot_skips_valid_missing_tool() {
         let registry = ToolRegistry::new();
         let provider = Arc::new(TestProvider::new(
@@ -1530,6 +1590,52 @@ mod tests {
         registry.refresh_provider("empty").await.unwrap();
         assert!(registry.is_empty());
         assert_eq!(registry.list_providers(), vec!["empty".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn provider_refresh_commits_one_complete_snapshot() {
+        let registry = ToolRegistry::new();
+        let provider = Arc::new(TestProvider::new(
+            "complete_refresh",
+            vec![
+                descriptor("a").with_aliases(ToolAliases::new().with_name("en", "old a")),
+                descriptor("b").with_aliases(ToolAliases::new().with_name("en", "old b")),
+            ],
+            ["a", "b"],
+        ));
+        registry.register_provider(provider.clone()).await.unwrap();
+        let old_a = registry.get("a").unwrap();
+        let version = registry.version();
+
+        provider.set_snapshot(
+            vec![
+                ToolDescriptor::new(
+                    "a",
+                    "replacement a",
+                    "replacement description",
+                    serde_json::json!({"type": "object"}),
+                )
+                .with_aliases(ToolAliases::new().with_name("en", "new a")),
+                descriptor("c").with_aliases(ToolAliases::new().with_name("en", "new c")),
+            ],
+            ["a", "c"],
+        );
+        registry.refresh_provider("complete_refresh").await.unwrap();
+
+        assert!(!Arc::ptr_eq(&old_a, &registry.get("a").unwrap()));
+        assert!(registry.get("b").is_none());
+        assert!(registry.get("c").is_some());
+        assert!(registry.resolve("old a").is_none());
+        assert!(registry.resolve("old b").is_none());
+        assert_eq!(
+            registry.resolve("new a").unwrap().identity.canonical_id,
+            "a"
+        );
+        assert_eq!(
+            registry.resolve("new c").unwrap().identity.canonical_id,
+            "c"
+        );
+        assert_eq!(registry.version(), version + 1);
     }
 
     #[tokio::test]
@@ -1589,6 +1695,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_refresh_rejects_another_provider_owner_before_get_tool() {
+        let registry = ToolRegistry::new();
+        let first = Arc::new(TestProvider::new(
+            "first_owner",
+            vec![descriptor("a")],
+            ["a"],
+        ));
+        let second = Arc::new(TestProvider::new(
+            "second_owner",
+            vec![descriptor("b")],
+            ["b"],
+        ));
+        registry.register_provider(first.clone()).await.unwrap();
+        registry.register_provider(second).await.unwrap();
+        let original_a = registry.get("a").unwrap();
+        let original_b = registry.get("b").unwrap();
+        let version = registry.version();
+        let get_calls = first.get_call_count();
+
+        first.set_snapshot(vec![descriptor("b")], ["b"]);
+        assert!(registry.refresh_provider("first_owner").await.is_err());
+        assert_eq!(first.get_call_count(), get_calls);
+        assert!(Arc::ptr_eq(&original_a, &registry.get("a").unwrap()));
+        assert!(Arc::ptr_eq(&original_b, &registry.get("b").unwrap()));
+        assert_eq!(registry.version(), version);
+    }
+
+    #[tokio::test]
     async fn provider_refresh_serializes_same_registration() {
         let registry = Arc::new(ToolRegistry::new());
         let provider = Arc::new(BlockingRefreshProvider {
@@ -1599,6 +1733,7 @@ mod tests {
             refresh_calls: AtomicUsize::new(0),
             active_refreshes: AtomicUsize::new(0),
             max_active_refreshes: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(0),
         });
         registry.register_provider(provider.clone()).await.unwrap();
 
@@ -1634,6 +1769,7 @@ mod tests {
             refresh_calls: AtomicUsize::new(0),
             active_refreshes: AtomicUsize::new(0),
             max_active_refreshes: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(0),
         });
         registry.register_provider(provider.clone()).await.unwrap();
         let version = registry.version();
@@ -1659,6 +1795,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_refresh_error_releases_queued_refresh() {
+        let registry = Arc::new(ToolRegistry::new());
+        let provider = Arc::new(BlockingRefreshProvider {
+            id: "failing".into(),
+            tool_id: "failing_tool".into(),
+            started: Arc::new(Notify::new()),
+            permits: Arc::new(Semaphore::new(0)),
+            refresh_calls: AtomicUsize::new(0),
+            active_refreshes: AtomicUsize::new(0),
+            max_active_refreshes: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(1),
+        });
+        registry.register_provider(provider.clone()).await.unwrap();
+        let version = registry.version();
+
+        let first_started = provider.started.notified();
+        let first_registry = registry.clone();
+        let first = tokio::spawn(async move { first_registry.refresh_provider("failing").await });
+        first_started.await;
+
+        let second_registry = registry.clone();
+        let second = tokio::spawn(async move { second_registry.refresh_provider("failing").await });
+        tokio::task::yield_now().await;
+        provider.permits.add_permits(1);
+        assert!(first.await.unwrap().is_err());
+        assert_eq!(registry.version(), version);
+
+        let second_started = provider.started.notified();
+        second_started.await;
+        provider.permits.add_permits(1);
+        second.await.unwrap().unwrap();
+        assert_eq!(provider.refresh_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.max_active_refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(registry.version(), version + 1);
+    }
+
+    #[tokio::test]
     async fn independent_provider_refreshes_do_not_share_an_io_lock() {
         let registry = Arc::new(ToolRegistry::new());
         let first = Arc::new(BlockingRefreshProvider {
@@ -1669,6 +1842,7 @@ mod tests {
             refresh_calls: AtomicUsize::new(0),
             active_refreshes: AtomicUsize::new(0),
             max_active_refreshes: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(0),
         });
         let second = Arc::new(BlockingRefreshProvider {
             id: "second".into(),
@@ -1678,6 +1852,7 @@ mod tests {
             refresh_calls: AtomicUsize::new(0),
             active_refreshes: AtomicUsize::new(0),
             max_active_refreshes: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(0),
         });
         registry.register_provider(first.clone()).await.unwrap();
         registry.register_provider(second.clone()).await.unwrap();
@@ -1714,6 +1889,7 @@ mod tests {
             refresh_calls: AtomicUsize::new(0),
             active_refreshes: AtomicUsize::new(0),
             max_active_refreshes: AtomicUsize::new(0),
+            failures_remaining: AtomicUsize::new(0),
         });
         registry.register_provider(provider.clone()).await.unwrap();
         let version_after_registration = registry.version();
@@ -1763,6 +1939,32 @@ mod tests {
         assert!(registry.resolve("검색").is_none());
         assert!(registry.unregister_provider("provider_c"));
         assert_eq!(registry.resolve("검색").unwrap().identity.canonical_id, "a");
+    }
+
+    #[tokio::test]
+    async fn localized_aliases_keep_plain_lookup_ambiguous_across_languages() {
+        let registry = ToolRegistry::new();
+        let english = Arc::new(TestProvider::new(
+            "english",
+            vec![descriptor("a").with_aliases(ToolAliases::new().with_name("en", "shared"))],
+            ["a"],
+        ));
+        let korean = Arc::new(TestProvider::new(
+            "korean",
+            vec![descriptor("b").with_aliases(ToolAliases::new().with_name("ko", "shared"))],
+            ["b"],
+        ));
+        registry.register_provider(english).await.unwrap();
+        registry.register_provider(korean).await.unwrap();
+
+        assert!(registry.resolve("shared").is_none());
+        assert_eq!(registry.get_by_alias("shared", "en").unwrap().id(), "a");
+        assert_eq!(registry.get_by_alias("shared", "ko").unwrap().id(), "b");
+        assert!(registry.unregister_provider("korean"));
+        assert_eq!(
+            registry.resolve("shared").unwrap().identity.canonical_id,
+            "a"
+        );
     }
 
     #[test]
@@ -1882,6 +2084,7 @@ mod tests {
         registry
             .register(Arc::new(TestTool { id: "a".into() }))
             .unwrap();
+        let captured_version = registry.version();
         let mapped = registry.map_tools(|tool| {
             assert!(registry.get("a").is_some());
             registry.set_tool_aliases("a", ToolAliases::new().with_name("en", "alias"));
@@ -1891,6 +2094,8 @@ mod tests {
         assert!(registry.resolve("alias").is_some());
         assert!(mapped.resolve("alias").is_none());
         assert!(mapped.get("a").is_some());
+        assert_eq!(mapped.version(), captured_version);
+        assert_eq!(registry.version(), captured_version + 1);
     }
 
     #[test]
@@ -1912,6 +2117,48 @@ mod tests {
         assert!(registry.get_by_alias("계산기", "ko").is_some());
         assert!(registry.get_by_alias("計算機", "ja").is_some());
         assert!(registry.get("calculator").is_some());
+    }
+
+    #[test]
+    fn alias_lookup_and_mutation_complete_without_lock_inversion() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(TestTool { id: "a".into() }))
+            .unwrap();
+        registry.set_tool_aliases("a", ToolAliases::new().with_name("en", "alias-0"));
+        let registry = Arc::new(registry);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let reader_registry = registry.clone();
+        let reader_barrier = barrier.clone();
+        let reader = std::thread::spawn(move || {
+            reader_barrier.wait();
+            for index in 0..100 {
+                let _ = reader_registry.resolve(&format!("alias-{index}"));
+                let _ = reader_registry.get_by_alias("alias-0", "en");
+            }
+        });
+        let writer_registry = registry.clone();
+        let writer = std::thread::spawn(move || {
+            barrier.wait();
+            for index in 1..100 {
+                writer_registry.set_tool_aliases(
+                    "a",
+                    ToolAliases::new().with_name("en", format!("alias-{index}")),
+                );
+            }
+        });
+
+        reader.join().unwrap();
+        writer.join().unwrap();
+        assert_eq!(
+            registry.resolve("alias-99").unwrap().identity.canonical_id,
+            "a"
+        );
+        assert_eq!(
+            registry.resolve("alias-0").unwrap().identity.canonical_id,
+            "a"
+        );
     }
 
     #[test]

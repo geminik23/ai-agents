@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.11 - 2026-09-27
+
+### Fixed
+- Planning tool scope: failures to resolve effective tool availability now stop before planner invocation instead of exposing all registered tools
+
 ## 1.0.10 - 2026-09-27
 
 ### Changed

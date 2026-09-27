@@ -399,6 +399,7 @@ This keeps the reasoning-specific cap as a tighter limit inside the agent's over
 
 For `plan_and_execute` mode, a plan-level reflection loop retries failed plans.
 When `planning.reflection.enabled` is true and a step fails, the runtime checks `on_step_failure` to decide whether to replan, abort, or skip.
+The planner sees only the effective agent, runtime, and state-narrowed tool scope before any planning-level filter is applied. If that scope cannot be resolved, the turn fails before the planner request instead of exposing the complete registry.
 Multi-step plan output is synthesized into a coherent response via the LLM rather than returning only the last step's raw result.
 
 Reflection adds self-evaluation. After producing an answer, the agent scores it against criteria you define (accuracy, completeness, tone). The LLM must say PASS and report a confidence score at or above `pass_threshold` for the evaluation to succeed. If it fails, the agent retries. Both reasoning and reflection can be overridden at the state or skill level. One effective reflection configuration is selected when reflection starts; its gate, evaluator, criteria, and `max_retries` remain consistent through that response. `max_retries: 0` still performs the initial evaluation but does not regenerate.
