@@ -12,7 +12,8 @@ description: "Per-state reasoning overrides for cost-efficient agents"
 # In that state, output is hidden (default), not tagged.
 # To get tagged output in the state, declare it explicitly.
 #
-# Same pattern applies to reflection: overrides per state and to per-skill overrides via skills[].reasoning.
+# The same full-replacement pattern applies to reflection state overrides and to per-skill reasoning/reflection overrides.
+# The runtime snapshots the effective reflection config when evaluation starts, so its gate, evaluator, criteria, and max_retries stay consistent for that response.
 #
 # This lets you:
 #   - Use CoT only for complex analysis states
@@ -69,6 +70,7 @@ states:
         output: visible                  # must be declared here, not inherited from agent level
       reflection:
         enabled: true
+        max_retries: 2                   # retries after the initial evaluation; 0 evaluates once without rewriting
         criteria:
           - "Response breaks the problem into clear steps"
           - "Response reaches a definitive conclusion"

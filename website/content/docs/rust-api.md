@@ -444,6 +444,8 @@ let control = agent.runtime_control();
 
 `web_fetch` prompt extraction also uses the runtime LLM registry when a router or default model is available, so nested extraction calls flow through the normal observed provider path. The built-in `web_search` is separate from provider-native LLM search options: it requires an explicit tool grant, a host-installed `WebSearchProvider`, and shared-executor evidence.
 
+`ToolProvider` is a different contract from `LLMProvider`: it advertises a collection of tool descriptors and resolves executable `Tool` objects. Provider registration and refresh validate the complete raw descriptor snapshot before publishing anything. Duplicate descriptor IDs and IDs owned by another registration reject the entire update even when `get_tool()` returns `None`; a valid unique descriptor whose executable object is unavailable is omitted. Refreshes for one registration are serialized, and a refresh started before unregister/re-register cannot publish into the replacement registration. Tool, provider, display-name, alias, and registry-version changes become visible together. Exact canonical IDs take priority; normalized names and aliases resolve only when one tool owns the claim. `map_tools()` captures one registry snapshot and invokes the wrapper callback after releasing registry locks.
+
 ### Direct subcrate boundaries
 
 The curated `ai-agents` facade exports normal host integration for questions, diagnostics, commands, and web search, including `WebSearchProvider` request and response types. Add a matching direct `ai-agents-tools` dependency only for lower-level custom web-fetch transport or resolver injection (`WebFetchTransport`, `WebFetchResolver`, and their request/response types) or eval-oriented `StaticWebSearchProvider` and `UnavailableWebSearchProvider` helpers. A custom web-fetch transport must return one HTTP response per call without automatically following redirects so `WebFetchTool` can validate every hop. A socket-opening implementation must override validated sending, connect only to the supplied approved addresses, and honor `max_response_bytes` while reading each response; the compatibility default cannot enforce a host transport's DNS, proxy, or egress behavior.
@@ -511,6 +513,8 @@ let response = response.with_provider_state(state)?;
 ```
 
 `LLMProvider::is_terminal_error()` defaults to `false`. Override it only for local configuration, protocol, or native-history failures that retry or model/static fallback cannot repair. Wrappers around a provider must delegate this classification to the actual inner provider. Ordinary API, rate-limit, timeout, and transport errors should retain their existing recovery behavior.
+
+`MultiLLMRouter` uses specialized providers for `select_tool`, `generate_tool_args`, `evaluate_yesno`, and `classify`. With its default fallback enabled, a specialized `Network`, `RateLimit`, or API 408/429/500/502/503/504 error retries that capability once with the primary provider when the selected and primary `Arc`s differ. Provider-terminal errors, configuration or serialization/parsing failures, model-not-found, content filtering, `Other`, API responses outside that allowlist, and status-less API errors do not fallback. If the primary attempt fails, its error is returned. Normal completion, tool completion, streaming, and `process_task` already use primary and are not part of this capability fallback.
 
 For `UnifiedLLMProvider`, normal `provider: google` completion methods use the first-party Google adapter. The public `build_llm()` method deliberately keeps its previous return type and constructs the upstream compatibility backend; direct callers of that escape hatch do not receive first-party Google signed-history handling.
 
@@ -747,6 +751,8 @@ agent.refresh_context("pricing").await?;
 ```
 
 Context values are available to the agent's system prompt via template rendering and to tools during execution. For a YAML `context` source with `type: runtime` and `required: true`, call `set_context` or `update_context` before each turn that needs the value. A missing top-level key fails blocking chat before model work; streaming reports a terminal error chunk without a `Final` response. A YAML `default` satisfies this presence check, and previously supplied values persist across turns and restored sessions. The check does not validate nested fields, types, non-null values, or whether the host refreshed the value this turn; validate these at the host boundary if required.
+
+Non-runtime context is initialized on the first turn. `per_turn` sources are resolved by initialization and again by that first turn's refresh, then once before every later turn. The current `reset()` clears conversation/state ownership but preserves context and the initialized flag. `restore_state()` restores snapshot context without changing that flag: a fresh runtime resolves its sources on the first post-restore turn and can overwrite restored non-runtime values. A runtime initialized before restore keeps restored `once` and `per_session` values, while its next turn replaces restored `per_turn` values. `per_session` is not automatically invoked by reset or restore; call `refresh_context()` for a specific source or construct a new runtime when the host needs an explicit session boundary.
 
 ---
 

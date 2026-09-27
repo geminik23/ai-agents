@@ -368,7 +368,7 @@ Each state shapes the LLM's behavior for a phase of the conversation.
 | `prompt_mode` | `string` | `"append"` | How to combine with system_prompt: `append`, `replace`, `prepend` |
 | `llm` | `string` | `null` | Override the LLM alias for this state |
 | `tools` | `list` | *inherit* | Tool IDs available in this state. `[]` = no tools. Omit = inherit current grant. State tools can only narrow top-level `tools:` |
-| `skills` | `list` | *inherit* | Skill IDs available in this state |
+| `skills` | `list` | `[]` | Automatic skill-routing candidates. Parent and child lists are combined when `inherit_parent: true`; when the final effective list is empty, routing falls back to all agent skills. Omitted and explicit `[]` are currently equivalent. A non-empty list containing only unknown IDs yields no candidates. This is not a tool-style authorization boundary. |
 | `max_turns` | `u32` | `null` | Auto-transition via `timeout_to` after this many turns |
 | `timeout_to` | `string` | `null` | State to enter when `max_turns` is exceeded |
 | `transitions` | `list` | `[]` | Transition rules (see below) |
@@ -1029,7 +1029,7 @@ A state cannot expose a tool that is absent from the effective grant. The runtim
 
 ### `tool_aliases`
 
-Multi-language names and descriptions for tools. Lets the same tool appear with localized names to the LLM.
+Multi-language names and descriptions for tools. Lets the same tool appear with localized names to the LLM. Alias lookup succeeds only when one currently registered canonical tool owns the normalized name for the requested language; ambiguous names require an exact canonical ID. Removing and re-registering a provider does not transfer host aliases to the new registration.
 
 | Detail | Value |
 |--------|-------|
@@ -1052,6 +1052,8 @@ tool_aliases:
 ## Context
 
 The `context` map injects dynamic data into prompts. Values are available as `{{ context.<name>.field }}` in any Jinja2 template.
+
+Non-runtime sources are resolved when the runtime first initializes. `per_turn` sources are then resolved before each turn, so they resolve twice on the first turn: once during initialization and once during per-turn refresh. `once` and `per_session` are both initialized at that first-use boundary today; `RuntimeAgent::reset()` preserves context and does not start a new context session, and loading a snapshot does not automatically invoke `refresh_per_session()`. A snapshot restored into a fresh, not-yet-initialized runtime can therefore be overwritten by initialization. An already initialized runtime preserves restored `once` and `per_session` values, but the next turn replaces restored `per_turn` values. Use explicit source refresh or a newly built runtime when the host requires a new value; do not treat `per_session` as an automatic reset/load hook.
 
 ### `type: runtime`
 
@@ -1143,7 +1145,7 @@ Load a JSON object from an HTTP endpoint. This source requires the `http-context
 | `url` | string | required | URL template rendered from current context |
 | `method` | string | `GET` | `GET`, `POST`, `PUT`, or `DELETE` |
 | `headers` | map | `{}` | Header value templates |
-| `refresh` | enum | `per_session` | `once`, `per_session`, or `per_turn` |
+| `refresh` | enum | `per_session` | `per_turn` reloads before each turn. `once` and `per_session` currently resolve during first runtime initialization; reset/load does not automatically create a new context refresh boundary. |
 | `timeout_ms` | integer | none | Request timeout in milliseconds |
 | `fallback` | JSON value | none | Value returned when HTTP support is unavailable or the request/JSON decode fails |
 
@@ -1555,14 +1557,15 @@ Persist sessions in a SQLite database.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `path` | `string` | - | Path to the `.db` file |
-| `table` | `string` | `null` | Custom table name |
+| `table` | `string` | `null` | Accepted compatibility field. The current backend still stores sessions in the fixed `sessions` and `session_tags` tables; this value does not select a custom table. |
 
 ```yaml
 storage:
   type: sqlite
   path: "./agent_sessions.db"
-  table: "custom_sessions"
 ```
+
+Do not use `table` for tenant isolation or data separation. Actor facts and relationships also use their existing fixed SQLite tables. A future explicit storage option will be required before custom session-table placement is supported without hiding data previously written to `sessions`.
 
 ### `type: redis`
 
@@ -2313,15 +2316,15 @@ If the user switches to a different topic during clarification, the new input is
 
 ### `disambiguation.context`
 
-Controls what information is fed into the detection prompt for context-aware analysis.
+Controls model-visible information used by disambiguation. Internal state ownership, required fields, declared intents, and local `in_state` skip checks remain available to the runtime even when their display fields are hidden.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `recent_messages` | `usize` | `5` | How many recent messages to include |
-| `include_state` | `bool` | `true` | Include current state name and prompt |
-| `include_available_tools` | `bool` | `true` | List tool names in detection prompt |
-| `include_available_skills` | `bool` | `true` | List skill triggers in detection prompt |
-| `include_user_context` | `bool` | `true` | Include runtime user context |
+| `recent_messages` | `usize` | `5` | Maximum chronological recent messages in detection and clarification prompts. `0` sends no history and disables the memory-derived previous-question skip. Active pending clarification remains manager-owned. |
+| `include_state` | `bool` | `true` | Include current state name and prompt in model requests. Local `in_state` checks and confirmation ownership still use the actual state. |
+| `include_available_tools` | `bool` | `true` | Include currently granted/state-scoped tool IDs. Scope resolution errors fail the turn instead of exposing the full registry. |
+| `include_available_skills` | `bool` | `true` | Compatibility field; current detector and clarifier prompts do not render skill payloads. |
+| `include_user_context` | `bool` | `true` | Compatibility field; current detector and clarifier prompts do not render host user context. Reserved ownership metadata is never model-visible. |
 
 ### `disambiguation.skip_when`
 
@@ -2517,7 +2520,7 @@ observability:
 | `cost.pricing` | `map` | `{}` | Provider/model pricing keyed as `provider/model`; inline values override `pricing_file` |
 | `language.paths` | `list` | common language paths | Dotted context paths used for the `language` dimension |
 | `aggregation.dimensions` | `list` | `[model, purpose]` | Dimensions for aggregate tables; supports `agent`, `actor`, `model`, `provider`, `alias`, `purpose`, `language`, `state`, `tool`, `skill`, `orchestration_pattern`, `status`, `branch_status`, `runtime_optimization`, `commit_behavior`, `speculative`, and `background`; `runtime_optimization` is reported with the output key `optimization` |
-| `aggregation.percentiles` | `list` | `[0.5, 0.9, 0.95, 0.99]` | Percentiles reported for latency |
+| `aggregation.percentiles` | `list` | `[0.5, 0.9, 0.95, 0.99]` | Validated compatibility setting. Current aggregate latency output remains fixed at p50/p90/p95/p99, and report summaries expose p50/p90/p99; changing this list does not alter those schemas. |
 | `aggregation.window_size` | `usize` | `1000` | Rolling event window used for aggregate metrics |
 | `privacy.include_prompts` | `bool` | `false` | Retain redacted prompt text in raw event payloads |
 | `privacy.include_responses` | `bool` | `false` | Retain redacted response text in raw event payloads |
@@ -3176,7 +3179,7 @@ settings:
 | `fail_fast` | `bool` | `false` | Stop after the first failed or errored scenario; runs serially |
 | `redact_outputs` | `bool` | `true` | Store `[redacted]` for inputs, responses, and string assertion details; raw evidence is omitted from JSON outputs |
 | `temperature` | `f32?` | `null` | Override agent LLM temperatures during eval. This is useful for more deterministic live-provider smoke tests. |
-| `seed` | `u64?` | `null` | Adds a provider-specific `seed` value to LLM extra config when providers support deterministic seeding. |
+| `seed` | `u64?` | `null` | Stores `extra.seed` in the eval LLM configuration. Current built-in adapters do not forward that top-level key to provider requests or include it in client-cache identity; custom providers may interpret it. Do not claim deterministic live eval from this field. |
 
 `isolation: scenario` is the recommended default. It creates a fresh runtime and temp workspace per scenario attempt. `isolation: turn` resets conversation state between direct turns, while still reapplying fixture/scenario context. `isolation: suite` and `isolation: none` are rejected until shared-run isolation has a stronger public contract.
 

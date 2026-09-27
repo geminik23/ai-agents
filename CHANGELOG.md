@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.0.10 - 2026-09-27
+
+### Changed
+- Judge responses: default evaluation judges now require the complete response to be valid JSON; lenient Rust configuration still accepts embedded JSON and owns raw-response retention
+- Specialized LLM fallback: transient network, rate-limit, and selected server errors retry one specialized capability call with the primary provider while configuration, parsing, terminal, and non-transient errors remain unchanged
+- Tool provider descriptors: duplicate or foreign-owned canonical IDs reject the complete registration or refresh even when an executable tool is unavailable
+
+### Fixed
+- Tool provider registry: registration, refresh, removal, aliases, snapshots, and version evidence publish atomically; same-provider refreshes serialize and stale registrations cannot overwrite replacements
+- Reflection overrides: state-specific evaluation gates, criteria, evaluators, and retry limits now remain consistent through the complete response reflection loop
+- Disambiguation context: configured history, state, and tool visibility now applies to detector, skip, and clarification model requests without weakening state ownership or local state checks
+- Evaluation privacy: malformed judge result errors no longer include model-supplied values
+
 ## 1.0.9 - 2026-09-24
 
 ### Fixed

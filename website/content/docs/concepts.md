@@ -199,6 +199,8 @@ Skills are **stateless and single-shot**: the executor runs each step as an isol
 
 Skills can define their own reasoning and reflection settings independently of the agent-level defaults. You can also put skills in external `.skill.yaml` files and reference them by path.
 
+State `skills` lists limit automatic routing candidates, not execution authority. With parent inheritance enabled, parent and child lists are combined. If the final effective list is empty - including omitted or explicit `skills: []` with no inherited entries - the runtime currently falls back to all agent skills. A non-empty list whose IDs do not match loaded skills produces no candidates. This differs from the narrow-only security meaning of state `tools`.
+
 ```yaml
 tools:
   - datetime
@@ -338,7 +340,7 @@ memory:
 
 Context provides dynamic data that gets injected into the agent's system prompt at render time. The system prompt is a Jinja2 template, and context values are its variables.
 
-Sources include: **runtime** (passed in by the caller), **builtin** (datetime, session info, agent metadata), **env**, **file**, optional feature-gated **HTTP** JSON sources, and **callback** providers registered by the host. Each source has a refresh policy - `once` (load at startup), `per_session` (reload each session), or `per_turn` (refresh every turn).
+Sources include: **runtime** (passed in by the caller), **builtin** (datetime, session info, agent metadata), **env**, **file**, optional feature-gated **HTTP** JSON sources, and **callback** providers registered by the host. `per_turn` sources resolve during initial setup and again in the first turn's refresh, then once before every later turn. `once` and `per_session` currently resolve during first runtime initialization; `reset()` preserves context, and restoring a session does not automatically invoke a per-session refresh. A fresh runtime can initialize over restored non-runtime values. An already initialized runtime preserves restored `once` and `per_session` values, while the next turn refreshes `per_turn` values. Use explicit refresh or runtime reconstruction when the host needs a new context session boundary.
 
 Context values are available in the system prompt template, in state prompts, and in process pipeline stages. The state machine can also write to context via `on_enter` actions and `extract` blocks. For `type: runtime`, `required: true` checks that the top-level key exists at the start of each turn; a configured `default` counts as present. The example below therefore remains runnable without host injection. Omit `default` to reject a missing key, but use host validation if nested fields or fresh per-turn values must be guaranteed.
 
@@ -399,7 +401,7 @@ For `plan_and_execute` mode, a plan-level reflection loop retries failed plans.
 When `planning.reflection.enabled` is true and a step fails, the runtime checks `on_step_failure` to decide whether to replan, abort, or skip.
 Multi-step plan output is synthesized into a coherent response via the LLM rather than returning only the last step's raw result.
 
-Reflection adds self-evaluation. After producing an answer, the agent scores it against criteria you define (accuracy, completeness, tone). The LLM must say PASS and report a confidence score at or above `pass_threshold` for the evaluation to succeed. If it fails, the agent retries. Both reasoning and reflection can be overridden at the state or skill level.
+Reflection adds self-evaluation. After producing an answer, the agent scores it against criteria you define (accuracy, completeness, tone). The LLM must say PASS and report a confidence score at or above `pass_threshold` for the evaluation to succeed. If it fails, the agent retries. Both reasoning and reflection can be overridden at the state or skill level. One effective reflection configuration is selected when reflection starts; its gate, evaluator, criteria, and `max_retries` remain consistent through that response. `max_retries: 0` still performs the initial evaluation but does not regenerate.
 
 When a state transition fires mid-turn and the target state has a `reasoning:` override (or the agent-level mode is non-`none`), the runtime re-enters the full dispatch path for the new state in the same turn. CoT/ReAct prompt injection, auto-detection, and the plan-and-execute handler all activate immediately - the user does not need to send another message for the new state's reasoning config to take effect.
 

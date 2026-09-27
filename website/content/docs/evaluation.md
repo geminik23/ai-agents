@@ -940,7 +940,7 @@ assert:
         weight: 1.0
 ```
 
-If `llm` is omitted, the runner uses the router alias, then the default alias. The judge must return strict JSON. Judge failures are categorized separately from deterministic assertion failures.
+If `llm` is omitted, the runner uses the router alias, then the default alias. The runner's default judge requires the complete trimmed response to be valid JSON; prose or Markdown fences around the object fail instead of being silently extracted. The lower-level Rust `JudgeConfig` can set `require_json: false` to retain embedded-object extraction and keep the actual provider response in `raw_response`. With strict mode, `raw_response` is always cleared even if the model injects that field. Invalid structure errors do not include model-supplied values. Judge failures are categorized separately from deterministic assertion failures.
 
 A judge sees the final response plus limited scenario context. It does not see raw tool records, state history, denied-tool evidence, or dry-run flags. Check those with structural assertions instead.
 

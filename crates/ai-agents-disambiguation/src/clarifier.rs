@@ -370,17 +370,23 @@ What is unclear: {}
             ));
         }
 
-        if !context.recent_messages.is_empty() {
-            prompt.push_str(&format!(
-                "\nRecent conversation:\n{}\n",
-                context.recent_messages.join("\n")
-            ));
-        }
+        append_projected_context(&mut prompt, context);
 
-        if !context.previous_questions.is_empty() {
+        let previous_questions: Vec<&str> = context
+            .previous_questions
+            .iter()
+            .map(String::as_str)
+            .filter(|question| {
+                !context
+                    .recent_messages
+                    .iter()
+                    .any(|message| message.contains(question))
+            })
+            .collect();
+        if !previous_questions.is_empty() {
             prompt.push_str(&format!(
                 "\nPrevious clarification questions asked:\n{}\n",
-                context.previous_questions.join("\n")
+                previous_questions.join("\n")
             ));
             prompt.push_str("Ask something different from the previous questions.\n");
         }
@@ -466,7 +472,7 @@ IMPORTANT:
         original_input: &str,
         question: &ClarificationQuestion,
         user_response: &str,
-        _context: &DisambiguationContext,
+        context: &DisambiguationContext,
     ) -> String {
         let mut prompt = format!(
             r#"Original user request: "{}"
@@ -482,6 +488,12 @@ We asked for clarification: "{}"
                 prompt.push_str(&format!("- {}: {}\n", opt.id, opt.label));
             }
         }
+
+        let mut parse_context = context.clone();
+        parse_context
+            .recent_messages
+            .retain(|message| !message.contains(&question.question));
+        append_projected_context(&mut prompt, &parse_context);
 
         prompt.push_str(&format!(
             r#"
@@ -650,6 +662,27 @@ pub enum ClarificationParseResult {
     Abandoned,
     /// User switched to a completely different topic
     TopicSwitch,
+}
+
+fn append_projected_context(prompt: &mut String, context: &DisambiguationContext) {
+    if !context.recent_messages.is_empty() {
+        prompt.push_str(&format!(
+            "\nRecent conversation:\n{}\n",
+            context.recent_messages.join("\n")
+        ));
+    }
+    if let Some(state) = context.current_state.as_deref() {
+        prompt.push_str(&format!("\nCurrent state: {state}\n"));
+        if let Some(state_prompt) = context.state_prompt.as_deref() {
+            prompt.push_str(&format!("State instructions: {}\n", state_prompt.trim()));
+        }
+    }
+    if !context.available_tools.is_empty() {
+        prompt.push_str(&format!(
+            "\nAvailable actions/tools: {}\n",
+            context.available_tools.join(", ")
+        ));
+    }
 }
 
 fn language_name(code: &str) -> &str {

@@ -143,8 +143,14 @@ pub trait ToolProvider: Send + Sync {
 
     fn provider_type(&self) -> ToolProviderType;
 
+    /// Lists one candidate snapshot whose canonical IDs must be unique.
+    ///
+    /// The registry rejects duplicate IDs and IDs owned by another registration even when
+    /// `get_tool` returns `None`. A valid descriptor without an executable object is omitted
+    /// from the published snapshot rather than treated as a provider-wide failure.
     async fn list_tools(&self) -> Vec<ToolDescriptor>;
 
+    /// Resolves an executable object for a descriptor in the current candidate snapshot.
     async fn get_tool(&self, tool_id: &str) -> Option<Arc<dyn Tool>>;
 
     async fn execute(
@@ -164,6 +170,10 @@ pub trait ToolProvider: Send + Sync {
         false
     }
 
+    /// Refreshes provider-owned discovery state before the registry rebuilds its snapshot.
+    ///
+    /// The registry serializes this operation with list/get collection for the same registration,
+    /// but provider-internal side effects are not rolled back when registry publication fails.
     async fn refresh(&self) -> Result<(), ToolProviderError> {
         Ok(())
     }

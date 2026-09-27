@@ -3843,13 +3843,25 @@ impl RuntimeAgent {
             .unwrap_or_else(|| self.get_effective_reflection_config())
     }
 
+    // Builds authoritative disambiguation control state while bounding history and tool data before any model projection.
     async fn build_disambiguation_context(&self) -> Result<DisambiguationContext> {
-        let recent_messages: Vec<String> =
-            Self::readable_native_messages(self.memory.get_messages(Some(5)).await?)?
-                .iter()
-                .rev()
-                .map(|m| format!("{:?}: {}", m.role, m.content))
-                .collect();
+        let context_config = self
+            .disambiguation_manager
+            .as_ref()
+            .map(|manager| manager.config().context.clone())
+            .unwrap_or_default();
+        let recent_messages = if context_config.recent_messages == 0 {
+            Vec::new()
+        } else {
+            Self::readable_native_messages(
+                self.memory
+                    .get_messages(Some(context_config.recent_messages))
+                    .await?,
+            )?
+            .iter()
+            .map(|message| format!("{:?}: {}", message.role, message.content))
+            .collect()
+        };
 
         let current_state = self.current_state().map(|s| s.to_string());
 
@@ -3861,10 +3873,11 @@ impl RuntimeAgent {
             .and_then(|sm| sm.current_definition())
             .and_then(|def| def.prompt.clone());
 
-        let available_tools: Vec<String> = self
-            .get_available_tool_ids()
-            .await
-            .unwrap_or_else(|_| self.tools.list_ids());
+        let available_tools = if context_config.include_available_tools {
+            self.get_available_tool_ids().await?
+        } else {
+            Vec::new()
+        };
 
         let available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
 
@@ -6740,6 +6753,7 @@ impl RuntimeAgent {
         self.execute_skill(&skill, input).await
     }
 
+    // Uses one explicit reflection configuration for both skill and ordinary response gating.
     async fn should_reflect_with_config(
         &self,
         input: &str,
@@ -8616,53 +8630,6 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
         })
     }
 
-    async fn should_reflect(&self, input: &str, response: &str) -> Result<bool> {
-        let effective_config = self.get_effective_reflection_config();
-
-        if !effective_config.requires_evaluation() {
-            return Ok(false);
-        }
-
-        if effective_config.is_enabled() {
-            return Ok(true);
-        }
-
-        let evaluator_llm = effective_config
-            .evaluator_llm
-            .as_ref()
-            .and_then(|alias| self.llm_registry.get(alias).ok())
-            .or_else(|| self.llm_registry.router().ok())
-            .or_else(|| self.llm_registry.default().ok());
-
-        let Some(llm) = evaluator_llm else {
-            return Ok(false);
-        };
-
-        let response_preview: String = response.chars().take(500).collect();
-        let prompt = format!(
-            r#"Should this response be evaluated for quality? Consider if it's a complex or important response.
-
-User query: "{}"
-Response: "{}"
-
-Answer YES or NO only."#,
-            input, response_preview
-        );
-
-        let messages = vec![ChatMessage::user(&prompt)];
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::ReflectionDecision,
-                llm.complete(&messages, None),
-            )
-            .await;
-
-        match result {
-            Ok(resp) => Ok(resp.content.trim().to_uppercase().contains("YES")),
-            Err(_) => Ok(false),
-        }
-    }
-
     fn build_cot_system_prompt(&self, base_prompt: &str) -> String {
         format!(
             "{}\n\n<instruction>\nThink through this step by step before answering:\n1. Understand what is being asked\n2. Break down the problem\n3. Work through each part\n4. Provide your final answer\n\nShow your thinking process, then give your final answer.\n</instruction>",
@@ -9097,12 +9064,6 @@ Respond in JSON format:
             Ok(resp) => Ok(resp.content.trim().to_string()),
             Err(_) => Ok(context),
         }
-    }
-
-    async fn evaluate_response(&self, input: &str, response: &str) -> Result<EvaluationResult> {
-        let effective_config = self.get_effective_reflection_config();
-        self.evaluate_response_with_config(input, response, &effective_config)
-            .await
     }
 
     fn extract_thinking(&self, content: &str) -> (Option<String>, String) {
@@ -10340,25 +10301,30 @@ Respond in JSON format:
         Ok(ToolCallOutcome::Continue)
     }
 
-    /// Run the reflection loop on a response, returning (improved_content, reflection_metadata).
+    /// Runs response reflection with one effective configuration snapshot for gating, evaluation, and retry bounds.
     async fn run_reflection(
         &self,
         llm: &dyn LLMProvider,
         processed_input: &str,
         mut content: String,
     ) -> Result<(String, Option<ReflectionMetadata>)> {
-        let should_reflect = self.should_reflect(processed_input, &content).await?;
+        let config = self.get_effective_reflection_config();
+        let should_reflect = self
+            .should_reflect_with_config(processed_input, &content, &config)
+            .await?;
         if !should_reflect {
             return Ok((content, None));
         }
 
         info!("Starting response reflection evaluation");
         let mut attempts = 0u32;
-        let max_retries = self.reflection_config.max_retries;
+        let max_retries = config.max_retries;
         let mut history: Vec<ReflectionAttempt> = Vec::new();
 
         loop {
-            let evaluation = self.evaluate_response(processed_input, &content).await?;
+            let evaluation = self
+                .evaluate_response_with_config(processed_input, &content, &config)
+                .await?;
 
             if evaluation.passed || attempts >= max_retries {
                 info!(
@@ -23904,6 +23870,61 @@ states:
     }
 
     #[tokio::test]
+    async fn runtime_disambiguation_uses_configured_recent_history_projection() {
+        let yaml = r#"
+name: DisambiguationContextAgent
+system_prompt: "Help."
+llm:
+  default: default
+  router: router
+disambiguation:
+  enabled: true
+  detection:
+    llm: router
+  context:
+    recent_messages: 1
+    include_state: false
+    include_available_tools: false
+states:
+  initial: private_state
+  states:
+    private_state:
+      prompt: "PRIVATE_STATE_PROMPT"
+"#;
+        let main = mock_with_responses(vec!["FIRST_MAIN_MARKER", "SECOND_MAIN_MARKER"]);
+        let router = mock_with_responses(vec![
+            r#"{"is_ambiguous":false,"confidence":0.9,"ambiguity_type":null,"reasoning":"clear","what_is_unclear":[],"detected_language":"en"}"#,
+            r#"{"is_ambiguous":false,"confidence":0.9,"ambiguity_type":null,"reasoning":"clear","what_is_unclear":[],"detected_language":"en"}"#,
+        ]);
+        let router_calls = router.clone();
+        let agent = AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(main))
+            .llm_alias("router", Arc::new(router))
+            .build()
+            .unwrap();
+
+        agent.chat("FIRST_USER_MARKER").await.unwrap();
+        agent.chat("SECOND_USER_MARKER").await.unwrap();
+
+        let calls = router_calls.call_history();
+        assert_eq!(calls.len(), 2);
+        let second_prompt = &calls[1].messages.last().unwrap().content;
+        assert!(
+            second_prompt.contains("FIRST_MAIN_MARKER"),
+            "{second_prompt}"
+        );
+        assert!(
+            !second_prompt.contains("FIRST_USER_MARKER"),
+            "{second_prompt}"
+        );
+        assert!(
+            !second_prompt.contains("PRIVATE_STATE_PROMPT"),
+            "{second_prompt}"
+        );
+    }
+
+    #[tokio::test]
     async fn parity_reflection_enabled() {
         let yaml = r#"
 name: ReflectionAgent
@@ -23926,6 +23947,160 @@ reflection:
         let (blocking, streamed, _) = assert_blocking_streaming_parity(build, "hello").await;
         assert_eq!(blocking.content, "Main answer");
         assert!(metadata_keys(&streamed).contains("reflection"));
+    }
+
+    fn state_reflection_agent(
+        global_retries: u32,
+        state_retries: u32,
+        main: MockLLMProvider,
+        evaluator: MockLLMProvider,
+    ) -> RuntimeAgent {
+        let yaml = format!(
+            r#"
+name: StateReflectionAgent
+system_prompt: "You are careful."
+llm:
+  default: default
+  router: evaluator
+reflection:
+  enabled: true
+  evaluator_llm: evaluator
+  max_retries: {global_retries}
+  criteria:
+    - "Global criterion"
+states:
+  initial: active
+  states:
+    active:
+      prompt: "Handle the active state."
+      reflection:
+        enabled: true
+        evaluator_llm: evaluator
+        max_retries: {state_retries}
+        criteria:
+          - "State criterion"
+"#
+        );
+        AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm_alias("default", Arc::new(main))
+            .llm_alias("evaluator", Arc::new(evaluator))
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn state_reflection_zero_retries_overrides_global_limit() {
+        let main = mock_with_response("First answer");
+        let main_calls = main.clone();
+        let evaluator = mock_with_response("OVERALL: FAIL\nCONFIDENCE: 0.1");
+        let evaluator_calls = evaluator.clone();
+        let agent = state_reflection_agent(2, 0, main, evaluator);
+
+        let response = agent.chat("hello").await.unwrap();
+        let reflection = response
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("reflection"))
+            .expect("reflection metadata");
+
+        assert_eq!(response.content, "First answer");
+        assert_eq!(reflection["attempts"], 1);
+        assert_eq!(main_calls.call_count(), 1);
+        assert_eq!(evaluator_calls.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn state_reflection_retry_limit_overrides_zero_global_limit() {
+        let main = mock_with_responses(vec!["First answer", "Second answer", "Third answer"]);
+        let main_calls = main.clone();
+        let evaluator = mock_with_responses(vec![
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+        ]);
+        let evaluator_calls = evaluator.clone();
+        let agent = state_reflection_agent(0, 2, main, evaluator);
+
+        let response = agent.chat("hello").await.unwrap();
+        let reflection = response
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("reflection"))
+            .expect("reflection metadata");
+
+        assert_eq!(response.content, "Third answer");
+        assert_eq!(reflection["attempts"], 3);
+        assert_eq!(main_calls.call_count(), 3);
+        assert_eq!(evaluator_calls.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn state_reflection_override_is_preserved_in_event_stream_metadata() {
+        let main = mock_with_responses(vec!["First answer", "Second answer", "Third answer"]);
+        let main_calls = main.clone();
+        let evaluator = mock_with_responses(vec![
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+            "OVERALL: FAIL\nCONFIDENCE: 0.1",
+        ]);
+        let evaluator_calls = evaluator.clone();
+        let agent = state_reflection_agent(0, 2, main, evaluator);
+
+        let (content, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+        let final_response = final_response.expect("successful stream Final");
+        let reflection = final_response
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("reflection"))
+            .expect("reflection metadata");
+
+        assert_eq!(content, "Third answer");
+        assert!(!chunks.iter().any(StreamChunk::is_error));
+        assert_eq!(reflection["attempts"], 3);
+        assert_eq!(main_calls.call_count(), 3);
+        assert_eq!(evaluator_calls.call_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn state_reflection_override_preserves_legacy_stream_completion() {
+        use futures::StreamExt;
+
+        let main = mock_with_response("First answer");
+        let main_calls = main.clone();
+        let evaluator = mock_with_response("OVERALL: FAIL\nCONFIDENCE: 0.1");
+        let evaluator_calls = evaluator.clone();
+        let agent = state_reflection_agent(2, 0, main, evaluator);
+        let mut stream = agent.chat_stream("hello").await.unwrap();
+        let mut content = String::new();
+        let mut done = 0;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                StreamChunk::Content { text } => content.push_str(&text),
+                StreamChunk::Done {} => done += 1,
+                StreamChunk::Error { message } => panic!("unexpected error: {message}"),
+                _ => {}
+            }
+        }
+
+        assert_eq!(content, "First answer");
+        assert_eq!(done, 1);
+        assert_eq!(main_calls.call_count(), 1);
+        assert_eq!(evaluator_calls.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn reflection_evaluator_error_emits_no_event_stream_final() {
+        let main = mock_with_response("First answer");
+        let mut evaluator = MockLLMProvider::new("evaluator");
+        evaluator.set_error("judge failed");
+        let agent = state_reflection_agent(0, 2, main, evaluator);
+
+        let (_, chunks, final_response) = collect_stream_events(&agent, "hello").await;
+
+        assert!(final_response.is_none());
+        assert!(chunks.iter().any(StreamChunk::is_error));
+        assert!(!chunks.iter().any(StreamChunk::is_done));
     }
 
     #[tokio::test]
@@ -24239,6 +24414,132 @@ observability:
         );
     }
 
+    fn skill_scope_agent_with_router(states: &str) -> (RuntimeAgent, MockLLMProvider) {
+        let yaml = format!(
+            r#"
+name: SkillScopeAgent
+system_prompt: "Route skills."
+skills:
+  - id: alpha
+    description: "Alpha"
+    trigger: "alpha"
+    steps:
+      - prompt: "alpha {{{{ user_input }}}}"
+  - id: beta
+    description: "Beta"
+    trigger: "beta"
+    steps:
+      - prompt: "beta {{{{ user_input }}}}"
+{states}
+"#
+        );
+        let router = mock_with_response("none");
+        let calls = router.clone();
+        let agent = AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm(Arc::new(router))
+            .build()
+            .unwrap();
+        (agent, calls)
+    }
+
+    fn skill_scope_agent(states: &str) -> RuntimeAgent {
+        skill_scope_agent_with_router(states).0
+    }
+
+    fn available_skill_ids(agent: &RuntimeAgent) -> Vec<String> {
+        let mut ids: Vec<String> = agent
+            .get_available_skills()
+            .into_iter()
+            .map(|skill| skill.id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn state_skill_scope_characterizes_empty_inheritance_and_unknown_ids() {
+        assert_eq!(
+            available_skill_ids(&skill_scope_agent("")),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(
+            available_skill_ids(&skill_scope_agent(
+                "states:\n  initial: current\n  states:\n    current:\n      skills: []\n"
+            )),
+            vec!["alpha", "beta"]
+        );
+        assert!(
+            available_skill_ids(&skill_scope_agent(
+                "states:\n  initial: current\n  states:\n    current:\n      skills: [unknown]\n"
+            ))
+            .is_empty()
+        );
+        assert_eq!(
+            available_skill_ids(&skill_scope_agent(
+                "states:\n  initial: parent\n  states:\n    parent:\n      skills: [alpha]\n      initial: child\n      states:\n        child:\n          skills: []\n"
+            )),
+            vec!["alpha"]
+        );
+        assert_eq!(
+            available_skill_ids(&skill_scope_agent(
+                "states:\n  initial: parent\n  states:\n    parent:\n      skills: [alpha]\n      initial: child\n      states:\n        child:\n          skills: [beta]\n"
+            )),
+            vec!["alpha", "beta"]
+        );
+        assert_eq!(
+            available_skill_ids(&skill_scope_agent(
+                "states:\n  initial: parent\n  states:\n    parent:\n      skills: [alpha]\n      initial: child\n      states:\n        child:\n          inherit_parent: false\n          skills: []\n"
+            )),
+            vec!["alpha", "beta"]
+        );
+    }
+
+    #[tokio::test]
+    async fn state_skill_scope_reaches_the_router_candidate_prompt() {
+        let (inherited, inherited_calls) = skill_scope_agent_with_router(
+            "states:\n  initial: parent\n  states:\n    parent:\n      skills: [alpha]\n      initial: child\n      states:\n        child:\n          skills: []\n",
+        );
+        assert!(
+            inherited
+                .select_skill_candidate("route")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let inherited_call = inherited_calls.last_call().unwrap();
+        let inherited_prompt = &inherited_call.messages[0].content;
+        assert!(inherited_prompt.contains("- alpha:"));
+        assert!(!inherited_prompt.contains("- beta:"));
+
+        let (fallback_all, fallback_calls) = skill_scope_agent_with_router(
+            "states:\n  initial: current\n  states:\n    current:\n      skills: []\n",
+        );
+        assert!(
+            fallback_all
+                .select_skill_candidate("route")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let fallback_call = fallback_calls.last_call().unwrap();
+        let fallback_prompt = &fallback_call.messages[0].content;
+        assert!(fallback_prompt.contains("- alpha:"));
+        assert!(fallback_prompt.contains("- beta:"));
+
+        let (unknown, unknown_calls) = skill_scope_agent_with_router(
+            "states:\n  initial: current\n  states:\n    current:\n      skills: [unknown]\n",
+        );
+        assert!(
+            unknown
+                .select_skill_candidate("route")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(unknown_calls.call_count(), 0);
+    }
+
     #[tokio::test]
     async fn parity_skill_route() {
         let yaml = skills_with_parallel_transition_yaml(
@@ -24274,6 +24575,19 @@ observability:
             .unwrap()
     }
 
+    struct CountingContextProvider {
+        marker: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ContextProvider for CountingContextProvider {
+        async fn get(&self, _key: &str, _current_context: &Value) -> Result<Value> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            Ok(serde_json::json!({"call": call, "marker": self.marker}))
+        }
+    }
+
     struct FailOnceContextProvider {
         attempts: std::sync::atomic::AtomicUsize,
     }
@@ -24286,6 +24600,132 @@ observability:
             }
             Ok(serde_json::json!({"brief": "ready"}))
         }
+    }
+
+    fn session_context_agent(
+        provider: Arc<CountingContextProvider>,
+        refresh: &str,
+    ) -> RuntimeAgent {
+        let yaml = format!(
+            "name: SessionContextAgent\nsystem_prompt: 'Call: {{{{ context.session_data.call }}}}'\ncontext:\n  session_data:\n    type: callback\n    name: counter\n    refresh: {refresh}\n"
+        );
+        let agent = AgentBuilder::from_yaml(&yaml)
+            .unwrap()
+            .llm(Arc::new(mock_with_response("ok")))
+            .build()
+            .unwrap();
+        agent.register_context_provider("counter", provider);
+        agent
+    }
+
+    #[tokio::test]
+    async fn session_context_characterizes_reset_and_restore_lifecycle() {
+        let original_provider = Arc::new(CountingContextProvider {
+            marker: "original",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let original = session_context_agent(original_provider.clone(), "per_session");
+        original.chat("first").await.unwrap();
+        original.chat("second").await.unwrap();
+        assert_eq!(original_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(original.get_context()["session_data"]["call"], 1);
+        assert_eq!(original.get_context()["session_data"]["marker"], "original");
+
+        original.reset().await.unwrap();
+        original.chat("after reset").await.unwrap();
+        assert_eq!(original_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(original.get_context()["session_data"]["call"], 1);
+        assert_eq!(original.get_context()["session_data"]["marker"], "original");
+        let snapshot = original.save_state().await.unwrap();
+
+        let fresh_provider = Arc::new(CountingContextProvider {
+            marker: "fresh",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fresh = session_context_agent(fresh_provider.clone(), "per_session");
+        fresh.restore_state(snapshot.clone()).await.unwrap();
+        fresh.chat("fresh restore").await.unwrap();
+        assert_eq!(fresh_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fresh.get_context()["session_data"]["call"], 1);
+        assert_eq!(fresh.get_context()["session_data"]["marker"], "fresh");
+
+        let warm_provider = Arc::new(CountingContextProvider {
+            marker: "warm",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let warm = session_context_agent(warm_provider.clone(), "per_session");
+        warm.chat("warmup").await.unwrap();
+        assert_eq!(warm_provider.calls.load(Ordering::SeqCst), 1);
+        warm.restore_state(snapshot).await.unwrap();
+        warm.chat("warm restore").await.unwrap();
+        assert_eq!(warm_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(warm.get_context()["session_data"]["call"], 1);
+        assert_eq!(warm.get_context()["session_data"]["marker"], "original");
+    }
+
+    #[tokio::test]
+    async fn once_context_is_not_refreshed_by_later_turns_or_reset() {
+        let provider = Arc::new(CountingContextProvider {
+            marker: "once",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let agent = session_context_agent(provider.clone(), "once");
+
+        agent.chat("first").await.unwrap();
+        agent.chat("second").await.unwrap();
+        agent.reset().await.unwrap();
+        agent.chat("after reset").await.unwrap();
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.get_context()["session_data"]["marker"], "once");
+    }
+
+    #[tokio::test]
+    async fn per_turn_context_refreshes_after_initialization_and_restore() {
+        let original_provider = Arc::new(CountingContextProvider {
+            marker: "original-per-turn",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let original = session_context_agent(original_provider.clone(), "per_turn");
+        original.chat("first").await.unwrap();
+        assert_eq!(original_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(original.get_context()["session_data"]["call"], 2);
+        original.chat("second").await.unwrap();
+        assert_eq!(original_provider.calls.load(Ordering::SeqCst), 3);
+        original.reset().await.unwrap();
+        original.chat("after reset").await.unwrap();
+        assert_eq!(original_provider.calls.load(Ordering::SeqCst), 4);
+        let snapshot = original.save_state().await.unwrap();
+
+        let fresh_provider = Arc::new(CountingContextProvider {
+            marker: "fresh-per-turn",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let fresh = session_context_agent(fresh_provider.clone(), "per_turn");
+        fresh.restore_state(snapshot.clone()).await.unwrap();
+        fresh.chat("fresh restore").await.unwrap();
+        assert_eq!(fresh_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            fresh.get_context()["session_data"]["marker"],
+            "fresh-per-turn"
+        );
+        assert_eq!(fresh.get_context()["session_data"]["call"], 2);
+
+        let warm_provider = Arc::new(CountingContextProvider {
+            marker: "warm-per-turn",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let warm = session_context_agent(warm_provider.clone(), "per_turn");
+        warm.chat("warmup").await.unwrap();
+        assert_eq!(warm_provider.calls.load(Ordering::SeqCst), 2);
+        warm.restore_state(snapshot).await.unwrap();
+        warm.chat("warm restore").await.unwrap();
+        assert_eq!(warm_provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            warm.get_context()["session_data"]["marker"],
+            "warm-per-turn"
+        );
+        assert_eq!(warm.get_context()["session_data"]["call"], 3);
     }
 
     #[tokio::test]

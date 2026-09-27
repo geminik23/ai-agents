@@ -24,11 +24,23 @@ impl AmbiguityDetector {
         }
     }
 
-    /// Check if input should be skipped based on skip conditions
+    /// Checks skip conditions when callers use one context for control and model prompts.
     pub async fn should_skip(
         &self,
         input: &str,
         context: &DisambiguationContext,
+        skip_conditions: &[SkipCondition],
+    ) -> Result<bool> {
+        self.should_skip_with_prompt_context(input, context, context, skip_conditions)
+            .await
+    }
+
+    /// Keeps local state control authoritative while model-assisted skip checks use a projected context.
+    pub(crate) async fn should_skip_with_prompt_context(
+        &self,
+        input: &str,
+        control_context: &DisambiguationContext,
+        prompt_context: &DisambiguationContext,
         skip_conditions: &[SkipCondition],
     ) -> Result<bool> {
         for condition in skip_conditions {
@@ -40,7 +52,7 @@ impl AmbiguityDetector {
                     }
                 }
                 SkipCondition::InState { states } => {
-                    if let Some(ref current) = context.current_state
+                    if let Some(ref current) = control_context.current_state
                         && states.contains(current)
                     {
                         debug!(state = %current, "Skipping: in excluded state");
@@ -54,10 +66,13 @@ impl AmbiguityDetector {
                     }
                 }
                 SkipCondition::AnsweringAgentQuestion => {
-                    if !context.previous_questions.is_empty() {
+                    if !prompt_context.previous_questions.is_empty() {
                         // Syntactic pre-filter passed (last assistant message ends with '?').
                         // Now do a semantic check: is the user actually answering that question?
-                        if self.is_answering_previous_question(input, context).await? {
+                        if self
+                            .is_answering_previous_question(input, prompt_context)
+                            .await?
+                        {
                             debug!("Skipping: answering agent question (semantic match)");
                             return Ok(true);
                         }
@@ -72,7 +87,7 @@ impl AmbiguityDetector {
                 }
                 SkipCondition::Custom { condition } => {
                     if self
-                        .evaluate_custom_condition(input, context, condition)
+                        .evaluate_custom_condition(input, prompt_context, condition)
                         .await?
                     {
                         debug!(condition = %condition, "Skipping: custom condition");
