@@ -150,9 +150,9 @@ error_recovery:
 
 ---
 
-### Auxiliary roles in the development tree
+### Auxiliary roles in 1.1
 
-The unreleased hierarchical router targets 1.1 and assigns existing auxiliary calls independent aliases through a fixed subsystem/role tree. Local selectors take priority over leaf, group, router, and main defaults. Scalar router remains a legacy boundary; `{}` explicitly opts into hierarchy even without overrides. Model inheritance is configuration selection, not retry after a provider failure.
+The hierarchical router in 1.1 assigns existing auxiliary calls independent aliases through a fixed subsystem/role tree. Local selectors take priority over leaf, group, router, and main defaults. Scalar router remains a legacy boundary; `{}` explicitly opts into hierarchy even without overrides. Model inheritance is configuration selection, not retry after a provider failure.
 
 State/skill decisions, processing, judges, memory, orchestration decisions, generation/repair, approval wording, and web extraction can use different aliases. Participant and manager agents remain ordinary turns with their own models. Role settings never grant tools, approve operations, enable features, or enlarge speculative budgets. Host custom evaluators, memory, and custom tools retain their implementation ownership.
 

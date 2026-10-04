@@ -15,7 +15,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.0"
+ai-agents = "1.1"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -35,14 +35,14 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.0", features = ["full"] }
+ai-agents = { version = "1.1", features = ["full"] }
 ```
 
 ---
 
-## Auxiliary routing migration (unreleased)
+## Auxiliary routing migration (1.1)
 
-The development tree targets a 1.1 routing release with an explicitly approved, one-time Rust source-compatibility exception. This is not an ordinarily source-compatible SemVer minor; published 1.0.11 does not contain these types.
+Version 1.1.0 introduces hierarchical routing with an explicitly approved, one-time Rust source-compatibility exception. This is not an ordinarily source-compatible SemVer minor. The following migration applies to Rust consumers moving from 1.0.x; scalar YAML selection retains legacy behavior.
 
 - `LLMSelector.router` changes from `Option<String>` to `Option<RouterSelector>`. `Alias(String)` preserves scalar configuration; `Hierarchical(Box<RouterRolesConfig>)` is explicit opt-in. The opt-in tree is boxed to keep scalar agent construction compact.
 - `DetectionConfig.llm`, `LlmGenerateConfig.llm`, `ContextExtractor.llm`, and `ToolCondition::Semantic.llm` change from `String` to `Option<String>`. Use `None` for omission and `Some(alias)` for an explicit override. Their YAML serializers omit `None`; present null is rejected.
@@ -931,7 +931,7 @@ Automatic updates run after successful turns when `memory.relationships.auto_upd
 Persistent relationship memory requires `StorageCapability::ActorRelationships`, currently provided only by SQLite among the built-in backends. Enable it with the `sqlite` feature:
 
 ```toml
-ai-agents = { version = "1.0", features = ["sqlite"] }
+ai-agents = { version = "1.1", features = ["sqlite"] }
 ```
 
 Configure storage in your YAML:

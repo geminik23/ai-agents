@@ -287,9 +287,9 @@ llm:
   router: router
 ```
 
-### Hierarchical auxiliary routing (unreleased)
+### Hierarchical auxiliary routing (1.1)
 
-This development-tree contract targets 1.1; it is not available in published 1.0.11. Values are literal aliases in the existing `llms` registry, not provider configurations or references to other roles.
+Hierarchical auxiliary routing is supported in 1.1. Values are literal aliases in the existing `llms` registry, not provider configurations or references to other roles.
 
 ```yaml
 llm:

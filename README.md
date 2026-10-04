@@ -17,7 +17,7 @@ A Rust framework for building AI agents from a single YAML specification. No cod
 - Explicit safety controls - fail-closed tool grants, policy, HITL approvals, error recovery
 - Extensible - custom LLMs, tools, memory, storage, hooks
 
-> Status: **1.0.11**
+> Status: **1.1.0**
 
 ## Features
 
@@ -39,7 +39,7 @@ Ordinary model-callable tools are fail-closed through explicit grants. Optional 
 
 ## Feature Status
 
-ai-agents.rs 1.0 includes YAML and Rust agent construction, blocking and streaming chat, tools, state machines, skills, memory, storage, evaluation, observability, spawning, orchestration, and the CLI/TUI.
+ai-agents.rs 1.1 includes YAML and Rust agent construction, blocking and streaming chat, tools, state machines, skills, memory, storage, evaluation, observability, spawning, orchestration, and the CLI/TUI.
 
 Redis storage is experimental and currently supports snapshots only. Noop storage does not persist data.
 
@@ -53,7 +53,7 @@ The published crates and CLI require Rust 1.88 or newer.
 
 ```toml
 [dependencies]
-ai-agents = "1.0"
+ai-agents = "1.1"
 ```
 
 ## Quick Start
@@ -142,7 +142,7 @@ See the [examples/](examples/) directory for more.
 
 ```sh
 # Install from crates.io
-cargo install ai-agents-cli
+cargo install ai-agents-cli --version 1.1.0
 
 # Or run directly from source
 cargo run -p ai-agents-cli -- run agent.yaml
