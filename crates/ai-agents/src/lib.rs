@@ -133,6 +133,7 @@ pub mod llm {
     };
     pub use ai_agents_llm::LLMRegistry;
     pub use ai_agents_llm::multi::MultiLLMRouter;
+    pub use ai_agents_llm::routing::*;
 
     pub mod providers {
         pub use ai_agents_llm::providers::{ProviderBuilder, ProviderType, UnifiedLLMProvider};
@@ -263,6 +264,7 @@ pub mod skill {
 }
 
 pub mod spec {
+    pub use ai_agents_llm::routing::*;
     pub use ai_agents_observability::ObservabilityConfig;
     pub use ai_agents_runtime::spec::{
         AgentSpec, AutoSpawnEntry, CliHitlMetadata, CliHitlStyle, CliMetadata, CliPromptStyle,
@@ -561,6 +563,7 @@ pub use llm::{
     ChatMessage, LLMProvider, LLMRegistry, LLMResponse, LLMToolDefinition, LLMToolRequest,
     MultiLLMRouter, NativeCallBinding, NativeProviderState, NativeProviderTarget, Role, ToolChoice,
 };
+pub use llm::{LLMRole, LLMSelectionSource, ResolvedRoleLLM, RouterRolesConfig, RouterSelector};
 
 pub use process::{ProcessConfig, ProcessData, ProcessProcessor};
 pub use recovery::{

@@ -195,7 +195,40 @@ impl AgentRegistry {
             .collect()
     }
 
-    /// List all registered agents with their specs serialized as YAML for session persistence.
+    /// Serializes hierarchy children from prepared runtime definitions without modifying their retained specs.
+    pub(crate) fn persistence_entries(
+        &self,
+    ) -> ai_agents_core::Result<Vec<ai_agents_core::SpawnedAgentEntry>> {
+        let agents = self.agents.read();
+        let mut entries = Vec::with_capacity(agents.len());
+        for child in agents.values() {
+            if child.spec.llm.router_roles().is_none()
+                && child.agent.llm_registry().router_roles().is_none()
+            {
+                match serde_yaml::to_string(&child.spec) {
+                    Ok(spec_yaml) => entries.push(ai_agents_core::SpawnedAgentEntry {
+                        id: child.id.clone(),
+                        name: child.spec.name.clone(),
+                        spec_yaml,
+                    }),
+                    Err(error) => {
+                        warn!(agent_id = %child.id, error = %error, "Failed to serialize agent spec")
+                    }
+                }
+            } else {
+                let spec = child.agent.prepared_persistence_spec(&child.spec)?;
+                let spec_yaml = serde_yaml::to_string(&spec)?;
+                entries.push(ai_agents_core::SpawnedAgentEntry {
+                    id: child.id.clone(),
+                    name: child.spec.name.clone(),
+                    spec_yaml,
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    /// List original registered specs for introspection; authoritative session save uses prepared declarations.
     pub fn list_with_specs(&self) -> Vec<ai_agents_core::SpawnedAgentEntry> {
         let agents = self.agents.read();
         agents

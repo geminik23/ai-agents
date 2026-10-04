@@ -70,6 +70,22 @@ impl ClarificationGenerator {
         self
     }
 
+    // Each clarification operation has its own role unless the umbrella local alias is explicit.
+    fn role_llm(
+        &self,
+        role: ai_agents_llm::LLMRole,
+    ) -> std::result::Result<Arc<dyn ai_agents_llm::LLMProvider>, ai_agents_llm::LLMError> {
+        match self
+            .llm_registry
+            .resolve_role_override(role, self.config.llm.as_deref())?
+        {
+            Some(resolved) => Ok(resolved.provider),
+            None => self
+                .llm_registry
+                .get(self.config.llm.as_deref().unwrap_or("router")),
+        }
+    }
+
     /// Generate a clarification question based on detection result
     pub async fn generate(
         &self,
@@ -86,9 +102,11 @@ impl ClarificationGenerator {
 
         let llm_alias = self.config.llm.as_deref().unwrap_or("router");
 
-        let llm = self.llm_registry.get(llm_alias).map_err(|_| {
-            AgentError::Config(format!("LLM '{}' not found for clarification", llm_alias))
-        })?;
+        let llm = self
+            .role_llm(ai_agents_llm::LLMRole::DisambiguationClarification)
+            .map_err(|_| {
+                AgentError::Config(format!("LLM '{}' not found for clarification", llm_alias))
+            })?;
 
         let style = self.determine_style(detection);
         let prompt =
@@ -127,9 +145,11 @@ impl ClarificationGenerator {
         enriched_input: &str,
     ) -> Result<ClarificationQuestion> {
         let llm_alias = self.config.llm.as_deref().unwrap_or("router");
-        let llm = self.llm_registry.get(llm_alias).map_err(|_| {
-            AgentError::Config(format!("LLM '{}' not found for confirmation", llm_alias))
-        })?;
+        let llm = self
+            .role_llm(ai_agents_llm::LLMRole::DisambiguationConfirmation)
+            .map_err(|_| {
+                AgentError::Config(format!("LLM '{}' not found for confirmation", llm_alias))
+            })?;
         let prompt = format!(
             r#"Original user request: "{}"
 
@@ -180,12 +200,14 @@ Output ONLY valid JSON, no other text."#,
         user_response: &str,
     ) -> Result<ConfirmationDecision> {
         let llm_alias = self.config.llm.as_deref().unwrap_or("router");
-        let llm = self.llm_registry.get(llm_alias).map_err(|_| {
-            AgentError::Config(format!(
-                "LLM '{}' not found for confirmation parsing",
-                llm_alias
-            ))
-        })?;
+        let llm = self
+            .role_llm(ai_agents_llm::LLMRole::DisambiguationConfirmationParse)
+            .map_err(|_| {
+                AgentError::Config(format!(
+                    "LLM '{}' not found for confirmation parsing",
+                    llm_alias
+                ))
+            })?;
         let prompt = format!(
             r#"Original user request: "{}"
 
@@ -243,9 +265,11 @@ Output ONLY valid JSON, no other text."#,
     ) -> Result<ClarificationParseResult> {
         let llm_alias = self.config.llm.as_deref().unwrap_or("router");
 
-        let llm = self.llm_registry.get(llm_alias).map_err(|_| {
-            AgentError::Config(format!("LLM '{}' not found for parsing", llm_alias))
-        })?;
+        let llm = self
+            .role_llm(ai_agents_llm::LLMRole::DisambiguationParse)
+            .map_err(|_| {
+                AgentError::Config(format!("LLM '{}' not found for parsing", llm_alias))
+            })?;
 
         let prompt = self.build_parse_prompt(original_input, question, user_response, context);
 
@@ -701,6 +725,75 @@ fn language_name(code: &str) -> &str {
         "vi" => "Vietnamese",
         "th" => "Thai",
         _ => "the same",
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use ai_agents_llm::mock::MockLLMProvider;
+    use ai_agents_llm::{DisambiguationRouterConfig, RouterRolesConfig};
+
+    #[tokio::test]
+    async fn hierarchy_clarification_operations_call_separate_leaf_providers() {
+        let mut registry = LLMRegistry::new();
+        let mut providers = Vec::new();
+        for (alias, output) in [
+            ("question", r#"{"question":"Which item?"}"#),
+            (
+                "parse",
+                r#"{"status":"answered","enriched_input":"item one"}"#,
+            ),
+            ("confirm", r#"{"question":"Confirm item one?"}"#),
+            ("confirm_parse", r#"{"status":"confirmed"}"#),
+        ] {
+            let mut provider = MockLLMProvider::new(alias);
+            provider.set_response(output);
+            registry.register(alias, Arc::new(provider.clone()));
+            providers.push(provider);
+        }
+        let main = MockLLMProvider::new("main");
+        registry.register("main", Arc::new(main.clone()));
+        registry.set_default("main");
+        registry.set_router_roles(RouterRolesConfig {
+            disambiguation: Some(DisambiguationRouterConfig {
+                clarification: Some("question".into()),
+                parse: Some("parse".into()),
+                confirmation: Some("confirm".into()),
+                confirmation_parse: Some("confirm_parse".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let generator =
+            ClarificationGenerator::new(ClarificationConfig::default(), Arc::new(registry));
+        let context = DisambiguationContext::default();
+        let question = generator
+            .generate(
+                "item",
+                &AmbiguityDetectionResult::default(),
+                &context,
+                None,
+                &[],
+            )
+            .await
+            .unwrap();
+        generator
+            .parse_response("item", &question, "one", &context)
+            .await
+            .unwrap();
+        let confirmation = generator
+            .generate_confirmation("item", "one", "item one")
+            .await
+            .unwrap();
+        generator
+            .parse_confirmation_response("item", "item one", &confirmation, "yes")
+            .await
+            .unwrap();
+        for provider in providers {
+            assert_eq!(provider.call_count(), 1);
+        }
+        assert_eq!(main.call_count(), 0);
     }
 }
 

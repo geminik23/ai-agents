@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use ai_agents_core::{Tool, ToolResult};
-use ai_agents_llm::LLMRegistry;
+use ai_agents_llm::{LLMRegistry, LLMRole};
 use ai_agents_tools::generate_schema;
 
 use super::types::RoutingMethod;
@@ -63,6 +63,7 @@ impl Tool for RouteToAgentTool {
         generate_schema::<RouteToAgentInput>()
     }
 
+    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input = match args.get("input").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -80,9 +81,9 @@ impl Tool for RouteToAgentTool {
             _ => RoutingMethod::Llm,
         };
 
-        let llm = match self.llm.get("router") {
-            Ok(p) => p,
-            Err(_) => return ToolResult::error("no router LLM configured"),
+        let llm = match super::role_provider(&self.llm, LLMRole::OrchestrationRouting, None) {
+            Ok(Some(p)) => p,
+            _ => return ToolResult::error("no router LLM configured"),
         };
 
         let route_future = super::route(
@@ -156,6 +157,7 @@ impl Tool for PipelineProcessTool {
         generate_schema::<PipelineProcessInput>()
     }
 
+    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input = match args.get("input").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -259,6 +261,7 @@ impl Tool for ConcurrentAskTool {
         generate_schema::<ConcurrentAskInput>()
     }
 
+    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let question = match args.get("question").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -290,19 +293,26 @@ impl Tool for ConcurrentAskTool {
 
         let aggregation = ai_agents_state::AggregationConfig {
             strategy,
-            synthesizer_llm: Some("router".to_string()),
+            synthesizer_llm: if self.llm.router_roles().is_some() {
+                None
+            } else {
+                Some("router".to_string())
+            },
             synthesizer_prompt: None,
             vote: None,
         };
 
-        let llm = self.llm.get("router").ok();
+        let providers = match super::AggregationProviders::resolve(&self.llm, None) {
+            Ok(providers) => providers,
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
 
-        let concurrent_future = super::concurrent(
+        let concurrent_future = super::concurrent_with_llms(
             &self.registry,
             question,
             &agents,
             &aggregation,
-            llm.as_deref(),
+            providers.as_refs(),
             None,
             None,
             ai_agents_state::PartialFailureAction::ProceedWithAvailable,
@@ -379,6 +389,7 @@ impl Tool for GroupDiscussionTool {
         generate_schema::<GroupDiscussionInput>()
     }
 
+    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let topic = match args.get("topic").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -427,9 +438,25 @@ impl Tool for GroupDiscussionTool {
             context_mode: None,
         };
 
-        let llm = self.llm.get("router").ok();
-
-        let group_future = super::group_chat(&self.registry, topic, &config, llm.as_deref(), None);
+        let speaker = match super::role_provider(&self.llm, LLMRole::OrchestrationSpeaker, None) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
+        let consensus = match super::role_provider(&self.llm, LLMRole::OrchestrationConsensus, None)
+        {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e.to_string()),
+        };
+        let group_future = super::group_chat_with_llms(
+            &self.registry,
+            topic,
+            &config,
+            super::GroupLLMs {
+                speaker: speaker.as_deref(),
+                consensus: consensus.as_deref(),
+            },
+            None,
+        );
         let group_result = if let Some(context) = current_turn_actor_context() {
             scope_actor_context(context, group_future).await
         } else {
@@ -503,6 +530,7 @@ impl Tool for HandoffConversationTool {
         generate_schema::<HandoffConversationInput>()
     }
 
+    // Resolves captured auxiliary roles without widening tool grants or changing participant ownership.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let input = match args.get("input").and_then(|v| v.as_str()) {
             Some(s) => s,
@@ -526,9 +554,9 @@ impl Tool for HandoffConversationTool {
             .map(|v| v as u32)
             .unwrap_or(5);
 
-        let llm = match self.llm.get("router") {
-            Ok(p) => p,
-            Err(_) => return ToolResult::error("no router LLM configured"),
+        let llm = match super::role_provider(&self.llm, LLMRole::OrchestrationHandoff, None) {
+            Ok(Some(p)) => p,
+            _ => return ToolResult::error("no router LLM configured"),
         };
 
         let handoff_future = super::handoff(

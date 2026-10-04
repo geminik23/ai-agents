@@ -40,6 +40,37 @@ ai-agents = { version = "1.0", features = ["full"] }
 
 ---
 
+## Auxiliary routing migration (unreleased)
+
+The development tree targets a 1.1 routing release with an explicitly approved, one-time Rust source-compatibility exception. This is not an ordinarily source-compatible SemVer minor; published 1.0.11 does not contain these types.
+
+- `LLMSelector.router` changes from `Option<String>` to `Option<RouterSelector>`. `Alias(String)` preserves scalar configuration; `Hierarchical(Box<RouterRolesConfig>)` is explicit opt-in. The opt-in tree is boxed to keep scalar agent construction compact.
+- `DetectionConfig.llm`, `LlmGenerateConfig.llm`, `ContextExtractor.llm`, and `ToolCondition::Semantic.llm` change from `String` to `Option<String>`. Use `None` for omission and `Some(alias)` for an explicit override. Their YAML serializers omit `None`; present null is rejected.
+- `with_router(alias)` remains the scalar constructor. Use `with_router_roles(config)` for hierarchy. Resolve roles with `LLMRegistry::resolve_role_override()`; `Ok(None)` means legacy mode, not an unspecified hierarchy leaf. Never turn a hierarchy error into legacy fallback with `.ok()`.
+
+```rust
+use ai_agents::llm::{RouterRolesConfig, StateRouterConfig};
+use ai_agents::spec::LLMSelector;
+
+let scalar = LLMSelector::new("main").with_router("fast");
+let hierarchy = LLMSelector::new("main").with_router_roles(RouterRolesConfig {
+    default: Some("fast".to_string()),
+    state: Some(StateRouterConfig {
+        transition: Some("precise".to_string()),
+        ..Default::default()
+    }),
+    ..Default::default()
+});
+```
+
+Replace an old `router: Some("fast".into())` struct literal with `router: Some(RouterSelector::Alias("fast".into()))`, or prefer the constructor. Replace an explicitly assigned local string with `Some(string)`; do not replace an omitted local with `Some("router")`, because that suppresses role inheritance.
+
+Hierarchy preflight uses the actual registry, including host-provided aliases. External skills are prepared once. After generated tools/shared children begin capturing providers, provider/settings changes fail at the next fallible gate or final build, including replacement under the same alias. Finish provider registration before configuring the spawner. Legacy builder chaining retains its prior behavior.
+
+Low-level orchestration retains the one-provider `concurrent()` and `group_chat()` wrappers. Additive `concurrent_with_llms()`, `group_chat_with_llms()`, and `aggregation::aggregate_with_llms()` accept separate aggregation/group providers. `LLMSummarizer::new(provider)` still shares one provider between summarize and merge; `with_merge_llm()` separates the merge provider. Custom injected implementations are not forcibly rewired.
+
+Use `RuntimeAgent::try_new()` for fallible low-level hierarchy construction; `new()` remains a compatibility convenience and panics on invalid hierarchy construction. The recommended `AgentBuilder` path returns configuration errors. Child snapshot serialization uses prepared skill declarations without modifying `SpawnedAgent.spec`; retained restore compares routing configuration and does not hot-swap live models or prompts.
+
 ## AgentBuilder
 
 `AgentBuilder` is the main entry point. There are three ways to create an agent.

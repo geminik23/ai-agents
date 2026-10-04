@@ -31,6 +31,7 @@ pub trait Summarizer: Send + Sync {
 
 pub struct LLMSummarizer {
     llm: Arc<dyn LLMProvider>,
+    merge_llm: Arc<dyn LLMProvider>,
     prompt_template: String,
     merge_prompt_template: String,
     max_batch_size: usize,
@@ -39,11 +40,18 @@ pub struct LLMSummarizer {
 impl LLMSummarizer {
     pub fn new(llm: Arc<dyn LLMProvider>) -> Self {
         Self {
+            merge_llm: llm.clone(),
             llm,
             prompt_template: DEFAULT_SUMMARY_PROMPT.to_string(),
             merge_prompt_template: DEFAULT_MERGE_PROMPT.to_string(),
             max_batch_size: 20,
         }
+    }
+
+    /// Uses a separate provider for merging while keeping the one-provider constructor compatible.
+    pub fn with_merge_llm(mut self, llm: Arc<dyn LLMProvider>) -> Self {
+        self.merge_llm = llm;
+        self
     }
 
     pub fn with_prompt(mut self, prompt: impl Into<String>) -> Self {
@@ -117,7 +125,7 @@ impl Summarizer for LLMSummarizer {
 
         let llm_messages = vec![ChatMessage::user(&prompt)];
 
-        let response = self.llm.complete(&llm_messages, None).await?;
+        let response = self.merge_llm.complete(&llm_messages, None).await?;
         Ok(response.content.trim().to_string())
     }
 }

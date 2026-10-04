@@ -108,6 +108,9 @@ impl<'a> MessageResolver<'a> {
                         .await
                     {
                         Ok(message) => return Ok(Some(message)),
+                        Err(error @ AgentError::Config(_)) if registry.router_roles().is_some() => {
+                            return Err(error);
+                        }
                         Err(_) => return Ok(None),
                     }
                 }
@@ -157,9 +160,17 @@ impl<'a> MessageResolver<'a> {
             target_lang, description, context_str
         );
 
-        let llm = registry.get(&config.llm).map_err(|e| {
-            AgentError::Other(format!("Failed to get LLM for message generation: {}", e))
-        })?;
+        let llm = match registry
+            .resolve_role_override(ai_agents_llm::LLMRole::HitlMessage, config.llm.as_deref())
+            .map_err(|e| AgentError::Config(e.to_string()))?
+        {
+            Some(resolved) => resolved.provider,
+            None => registry
+                .get(config.llm.as_deref().unwrap_or("router"))
+                .map_err(|e| {
+                    AgentError::Other(format!("Failed to get LLM for message generation: {}", e))
+                })?,
+        };
 
         let response = llm
             .complete(&[ChatMessage::user(&prompt)], None)

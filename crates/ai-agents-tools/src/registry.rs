@@ -142,6 +142,7 @@ pub struct ToolRegistry {
     file_versions: FileVersionStore,
 
     web_fetch_extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
+    framework_web_fetch: Option<Arc<crate::builtin::WebFetchTool>>,
 
     web_search_provider: WebSearchProviderSlot,
 }
@@ -157,6 +158,7 @@ impl ToolRegistry {
             todo_store: TodoStore::default(),
             file_versions: FileVersionStore::default(),
             web_fetch_extractor: Arc::new(RwLock::new(None)),
+            framework_web_fetch: None,
             web_search_provider: Arc::new(RwLock::new(Arc::new(UnavailableWebSearchProvider))),
         }
     }
@@ -348,6 +350,11 @@ impl ToolRegistry {
         self.todo_store.list()
     }
 
+    // Retain ownership only for the concrete framework built-in, never for arbitrary host tools.
+    pub(crate) fn mark_framework_web_fetch(&mut self, tool: Arc<crate::builtin::WebFetchTool>) {
+        self.framework_web_fetch = Some(tool);
+    }
+
     /// Returns the shared web-fetch extractor slot.
     pub fn web_fetch_extractor_slot(&self) -> Arc<RwLock<Option<Arc<dyn LLMProvider>>>> {
         Arc::clone(&self.web_fetch_extractor)
@@ -451,16 +458,71 @@ impl ToolRegistry {
     }
 
     /// Maps one consistent registry snapshot without invoking user callbacks under registry locks.
-    pub fn map_tools<F>(&self, mut f: F) -> ToolRegistry
+    pub fn map_tools<F>(&self, f: F) -> ToolRegistry
+    where
+        F: FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>,
+    {
+        self.map_tools_with_web_ownership(f, false)
+    }
+
+    /// Forks concrete framework web tools for hierarchy construction without cloning opaque host tools.
+    pub fn map_tools_agent_local_web<F>(&self, f: F) -> ToolRegistry
+    where
+        F: FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>,
+    {
+        self.map_tools_with_web_ownership(f, true)
+    }
+
+    // Legacy mapping preserves slots; explicit hierarchy mapping forks only tracked concrete built-ins.
+    fn map_tools_with_web_ownership<F>(&self, mut f: F, agent_local: bool) -> ToolRegistry
     where
         F: FnMut(Arc<dyn Tool>) -> Arc<dyn Tool>,
     {
         let snapshot = self.state.read().clone();
+        let local_web_slot = Arc::new(RwLock::new(None));
+        let mut forked_web = false;
+        let mut mapped_web = None;
         let mut mapped_state = snapshot.clone();
         mapped_state.tools.clear();
         for (id, tool_ref) in snapshot.tools {
             let mapped_ref = match tool_ref {
-                ToolRef::Builtin(tool) => ToolRef::Builtin(f(tool)),
+                ToolRef::Builtin(tool) => {
+                    let source: Option<Arc<dyn Tool>> = self
+                        .framework_web_fetch
+                        .as_ref()
+                        .map(|owned| owned.clone() as Arc<dyn Tool>);
+                    if agent_local
+                        && id == "web_fetch"
+                        && source
+                            .as_ref()
+                            .is_some_and(|owned| Arc::ptr_eq(owned, &tool))
+                    {
+                        let fork = Arc::new(
+                            self.framework_web_fetch
+                                .as_ref()
+                                .expect("owned web tool")
+                                .fork_with_extractor(local_web_slot.clone()),
+                        );
+                        let unwrapped = fork.clone() as Arc<dyn Tool>;
+                        let wrapped = f(unwrapped.clone());
+                        if Arc::ptr_eq(&wrapped, &unwrapped) {
+                            mapped_web = Some(fork);
+                        }
+                        forked_web = true;
+                        ToolRef::Builtin(wrapped)
+                    } else {
+                        let wrapped = f(tool.clone());
+                        if id == "web_fetch"
+                            && source
+                                .as_ref()
+                                .is_some_and(|owned| Arc::ptr_eq(owned, &tool))
+                            && Arc::ptr_eq(&wrapped, &tool)
+                        {
+                            mapped_web = self.framework_web_fetch.clone();
+                        }
+                        ToolRef::Builtin(wrapped)
+                    }
+                }
                 ToolRef::Provider {
                     provider_id,
                     registration_epoch,
@@ -482,7 +544,12 @@ impl ToolRegistry {
         mapped.command_runner = Arc::clone(&self.command_runner);
         mapped.todo_store = self.todo_store.clone();
         mapped.file_versions = self.file_versions.clone();
-        mapped.web_fetch_extractor = Arc::clone(&self.web_fetch_extractor);
+        mapped.web_fetch_extractor = if forked_web {
+            local_web_slot
+        } else {
+            Arc::clone(&self.web_fetch_extractor)
+        };
+        mapped.framework_web_fetch = mapped_web;
         mapped.web_search_provider = Arc::clone(&self.web_search_provider);
         mapped
     }

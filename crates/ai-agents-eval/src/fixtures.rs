@@ -893,6 +893,15 @@ pub fn build_tool_registry(
     fixtures: &FixturesConfig,
     log: RecordingToolLog,
 ) -> Result<ToolRegistry> {
+    build_tool_registry_for_routing(fixtures, log, false)
+}
+
+// Connect harness-owned extraction only for the explicit hierarchy opt-in.
+pub(crate) fn build_tool_registry_for_routing(
+    fixtures: &FixturesConfig,
+    log: RecordingToolLog,
+    hierarchy: bool,
+) -> Result<ToolRegistry> {
     let builtin = create_builtin_registry();
     let mut registry = ToolRegistry::new();
     let provider: Arc<dyn DiagnosticsProvider> = if let Some(diagnostics) = &fixtures.diagnostics {
@@ -951,14 +960,27 @@ pub fn build_tool_registry(
     let web_fetch = fixtures
         .web_fetch_transport
         .as_ref()
-        .map(build_web_fetch_fixture_tool)
+        .map(|config| {
+            build_web_fetch_fixture_tool(
+                config,
+                hierarchy.then(|| registry.web_fetch_extractor_slot()),
+            )
+        })
         .transpose()?;
     for id in builtin.list_ids() {
         if fixtures.tools.contains_key(&id) {
             continue;
         }
         let tool = if id == "web_fetch" {
-            web_fetch.clone().or_else(|| builtin.get(&id))
+            web_fetch.clone().or_else(|| {
+                if hierarchy {
+                    Some(Arc::new(WebFetchTool::with_extractor_slot(
+                        registry.web_fetch_extractor_slot(),
+                    )) as Arc<dyn Tool>)
+                } else {
+                    builtin.get(&id)
+                }
+            })
         } else {
             builtin.get(&id)
         };
@@ -976,7 +998,12 @@ pub fn build_tool_registry(
     Ok(registry)
 }
 
-fn build_web_fetch_fixture_tool(config: &WebFetchTransportFixtureConfig) -> Result<Arc<dyn Tool>> {
+type FixtureExtractorSlot = Arc<parking_lot::RwLock<Option<Arc<dyn LLMProvider>>>>;
+
+fn build_web_fetch_fixture_tool(
+    config: &WebFetchTransportFixtureConfig,
+    extractor: Option<FixtureExtractorSlot>,
+) -> Result<Arc<dyn Tool>> {
     let mut routes = HashMap::new();
     for route in &config.routes {
         let normalized_url = reqwest::Url::parse(&route.url)
@@ -1002,10 +1029,12 @@ fn build_web_fetch_fixture_tool(config: &WebFetchTransportFixtureConfig) -> Resu
             )));
         }
     }
-    Ok(Arc::new(WebFetchTool::with_transport_and_resolver(
-        Arc::new(FixtureWebFetchTransport { routes }),
-        Arc::new(FixtureWebFetchResolver),
-    )))
+    let transport = Arc::new(FixtureWebFetchTransport { routes });
+    let resolver = Arc::new(FixtureWebFetchResolver);
+    Ok(Arc::new(match extractor {
+        Some(slot) => WebFetchTool::with_extractor_slot_and_transport(slot, transport, resolver),
+        None => WebFetchTool::with_transport_and_resolver(transport, resolver),
+    }))
 }
 
 fn header_value<'a>(headers: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
@@ -1251,7 +1280,9 @@ pub fn build_llm_registry(
 
     let default_alias = spec.llm.get_default_alias();
     registry.set_default(default_alias);
-    if let Some(router) = spec.llm.get_router_alias() {
+    if let Some(config) = spec.llm.router_roles() {
+        registry.set_router_roles(config.clone());
+    } else if let Some(router) = spec.llm.get_router_alias() {
         registry.set_router(router);
     }
 

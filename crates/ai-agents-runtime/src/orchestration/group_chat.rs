@@ -31,6 +31,24 @@ pub async fn group_chat(
     llm: Option<&dyn LLMProvider>,
     hooks: Option<&dyn AgentHooks>,
 ) -> Result<GroupChatResult> {
+    group_chat_with_llms(
+        registry,
+        topic,
+        config,
+        super::GroupLLMs::shared(llm),
+        hooks,
+    )
+    .await
+}
+
+/// Separates direct speaker and consensus decisions without changing manager or participant agents.
+pub async fn group_chat_with_llms(
+    registry: &AgentRegistry,
+    topic: &str,
+    config: &GroupChatStateConfig,
+    llms: super::GroupLLMs<'_>,
+    hooks: Option<&dyn AgentHooks>,
+) -> Result<GroupChatResult> {
     if config.participants.is_empty() {
         return Err(AgentError::Config("No participants in group chat".into()));
     }
@@ -43,11 +61,11 @@ pub async fn group_chat(
     let mut last_content_hash = String::new();
 
     if matches!(config.style, ChatStyle::MakerChecker) {
-        return run_maker_checker(registry, topic, config, llm, hooks).await;
+        return run_maker_checker(registry, topic, config, llms.speaker, hooks).await;
     }
 
     if matches!(config.style, ChatStyle::Debate) {
-        return run_debate(registry, topic, config, llm, hooks).await;
+        return run_debate(registry, topic, config, llms.speaker, hooks).await;
     }
 
     let method = config
@@ -65,7 +83,7 @@ pub async fn group_chat(
         }
 
         let speakers_count = if matches!(method, TurnMethod::LlmDirected) {
-            let llm_ref = llm.ok_or_else(|| {
+            let llm_ref = llms.speaker.ok_or_else(|| {
                 AgentError::Config("LlmDirected turn method requires an LLM provider".into())
             })?;
 
@@ -184,7 +202,7 @@ pub async fn group_chat(
                 config.termination.method,
                 TerminationMethod::ConsensusReached
             ))
-            && let Some(llm) = llm
+            && let Some(llm) = llms.consensus
             && check_consensus(llm, &transcript).await?
         {
             return Ok(build_result(

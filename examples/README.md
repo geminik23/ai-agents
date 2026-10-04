@@ -418,11 +418,14 @@ cargo run -p ai-agents-cli -- run examples/yaml/hitl/hitl_multilingual.yaml
 
 ### `yaml/reasoning/`
 
+Development example: `hierarchical_routing.yaml` demonstrates independent state/skill roles, reasoning group defaults, and an explicit process-stage alias override. It targets the upcoming 1.1 routing contract; `eval/mocked/reasoning/hierarchical_routing_mocked.yaml` verifies its deterministic state and context outcomes without credentials.
+
 Progressive reasoning and reflection examples - from single-mode isolation to per-state overrides.
 
 | File | Description |
 |------|-------------|
 | `reasoning_cot.yaml` | Chain-of-thought with tagged output and visible step-by-step thinking |
+| `hierarchical_routing.yaml` | Unreleased hierarchical auxiliary aliases with state/skill roles, reasoning defaults, and a local process override |
 | `reasoning_plan.yaml` | Plan-and-execute with planner LLM, tool filtering, and plan-level reflection (replan on failure) |
 | `reasoning_reflection.yaml` | Self-evaluation with domain-specific criteria, confidence threshold, and retry loop |
 | `reasoning_with_state.yaml` | Per-state reasoning overrides - full replacement semantics (not merge) |

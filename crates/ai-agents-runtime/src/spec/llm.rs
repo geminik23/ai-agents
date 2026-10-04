@@ -1,6 +1,7 @@
 //! LLM configuration types
 
 use ai_agents_core::ToolChoice;
+pub use ai_agents_llm::{RouterRolesConfig, RouterSelector};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -167,7 +168,8 @@ pub struct LLMSelector {
     #[serde(default = "default_alias")]
     pub default: String,
     #[serde(default)]
-    pub router: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router: Option<RouterSelector>,
 }
 
 fn default_alias() -> String {
@@ -191,8 +193,15 @@ impl LLMSelector {
         }
     }
 
+    /// Installs a hierarchy while retaining explicit opt-in even when it is empty.
+    pub fn with_router_roles(mut self, config: RouterRolesConfig) -> Self {
+        self.router = Some(RouterSelector::Hierarchical(Box::new(config)));
+        self
+    }
+
+    /// Preserves the scalar legacy constructor while storing the new selector type.
     pub fn with_router(mut self, router: impl Into<String>) -> Self {
-        self.router = Some(router.into());
+        self.router = Some(RouterSelector::Alias(router.into()));
         self
     }
 }
@@ -344,7 +353,10 @@ another_field: 123
     fn test_llm_selector_with_router() {
         let selector = LLMSelector::new("main").with_router("cheap");
         assert_eq!(selector.default, "main");
-        assert_eq!(selector.router, Some("cheap".to_string()));
+        assert_eq!(
+            selector.router,
+            Some(RouterSelector::Alias("cheap".to_string()))
+        );
     }
 
     #[test]
@@ -386,7 +398,10 @@ router: router_llm
 "#;
         let selector: LLMSelector = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(selector.default, "main");
-        assert_eq!(selector.router, Some("router_llm".to_string()));
+        assert_eq!(
+            selector.router,
+            Some(RouterSelector::Alias("router_llm".to_string()))
+        );
     }
 
     #[test]

@@ -13,6 +13,10 @@ use tracing::{debug, error, info, instrument, warn};
 const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
 const MAX_TOOL_FALLBACK_HOPS: usize = 16;
 
+#[cfg(test)]
+#[path = "routing_tests.rs"]
+mod routing_tests;
+
 /// Keeps the strong identity of one non-reentrant root-turn gate.
 pub(crate) type RootTurnGate = Arc<tokio::sync::Mutex<()>>;
 
@@ -754,12 +758,64 @@ struct RegistryLLMGetter {
 }
 
 impl LLMGetter for RegistryLLMGetter {
+    /// Keeps hierarchy configuration failures distinct from false semantic conditions.
+    fn get_condition_llm(&self, alias: Option<&str>) -> Result<Option<Arc<dyn LLMProvider>>> {
+        Ok(
+            match self
+                .registry
+                .resolve_role_override(ai_agents_llm::LLMRole::ToolsCondition, alias)
+                .map_err(|e| AgentError::Config(e.to_string()))?
+            {
+                Some(resolved) => Some(resolved.provider),
+                None => self.get_llm(alias.unwrap_or("router")),
+            },
+        )
+    }
     fn get_llm(&self, alias: &str) -> Option<Arc<dyn LLMProvider>> {
         self.registry.get(alias).ok()
     }
 }
 
 impl RuntimeAgent {
+    // Legacy selection remains owned by the caller; hierarchy failures never enter that closure.
+    fn role_llm<F>(
+        &self,
+        role: ai_agents_llm::LLMRole,
+        local: Option<&str>,
+        legacy: F,
+    ) -> Result<Arc<dyn LLMProvider>>
+    where
+        F: FnOnce() -> Result<Arc<dyn LLMProvider>>,
+    {
+        match self
+            .llm_registry
+            .resolve_role_override(role, local)
+            .map_err(|e| AgentError::Config(e.to_string()))?
+        {
+            Some(resolved) => Ok(resolved.provider),
+            None => legacy(),
+        }
+    }
+
+    // Optional legacy consumers keep missing-provider degradation without hiding hierarchy errors.
+    fn optional_role_llm<F>(
+        &self,
+        role: ai_agents_llm::LLMRole,
+        local: Option<&str>,
+        legacy: F,
+    ) -> Result<Option<Arc<dyn LLMProvider>>>
+    where
+        F: FnOnce() -> Option<Arc<dyn LLMProvider>>,
+    {
+        match self
+            .llm_registry
+            .resolve_role_override(role, local)
+            .map_err(|e| AgentError::Config(e.to_string()))?
+        {
+            Some(resolved) => Ok(Some(resolved.provider)),
+            None => Ok(legacy()),
+        }
+    }
     /// Constructs a runtime with one gate shared by every external root-turn entry point.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -771,8 +827,40 @@ impl RuntimeAgent {
         system_prompt: String,
         max_iterations: u32,
     ) -> Self {
+        Self::try_new(
+            info,
+            llm_registry,
+            memory,
+            tools,
+            skills,
+            system_prompt,
+            max_iterations,
+        )
+        .expect("Invalid hierarchical runtime routing; use RuntimeAgent::try_new")
+    }
+
+    /// Constructs auxiliary consumers fallibly while preserving legacy optional selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        info: AgentInfo,
+        llm_registry: Arc<LLMRegistry>,
+        memory: Arc<dyn Memory>,
+        tools: Arc<ToolRegistry>,
+        skills: Vec<SkillDefinition>,
+        system_prompt: String,
+        max_iterations: u32,
+    ) -> Result<Self> {
+        llm_registry
+            .validate_router_roles()
+            .map_err(|error| AgentError::Config(error.to_string()))?;
         let (skill_router, skill_executor) = if !skills.is_empty() {
-            let router_llm = llm_registry.router().ok();
+            let router_llm = match llm_registry
+                .resolve_role_override(ai_agents_llm::LLMRole::SkillsSelection, None)
+                .map_err(|e| AgentError::Config(e.to_string()))?
+            {
+                Some(resolved) => Some(resolved.provider),
+                None => llm_registry.router().ok(),
+            };
             let router = router_llm.map(|llm| SkillRouter::new(llm, skills.clone()));
             let executor = SkillExecutor::new(llm_registry.clone(), tools.clone());
             (router, Some(executor))
@@ -783,7 +871,7 @@ impl RuntimeAgent {
         let context_manager =
             ContextManager::new(HashMap::new(), info.name.clone(), info.version.clone());
 
-        Self {
+        Ok(Self {
             info,
             llm_registry,
             memory,
@@ -846,7 +934,7 @@ impl RuntimeAgent {
             resource_locks: new_tool_resource_locks(),
             runtime_control: Arc::new(RuntimeControlState::default()),
             root_turn_gate: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        })
     }
 
     pub fn with_declared_tool_ids(mut self, ids: Option<Vec<String>>) -> Self {
@@ -2393,7 +2481,7 @@ impl RuntimeAgent {
         }
 
         self.validate_storage_requirements(storage.as_deref())?;
-        self.complete_facts_init().await;
+        self.complete_facts_init().await?;
         Ok(())
     }
 
@@ -2446,13 +2534,14 @@ impl RuntimeAgent {
 
     /// Initialize fact store and extractor from stored config and current storage.
     /// Called from init_storage() so facts are ready before the first turn.
-    async fn complete_facts_init(&self) {
+    // Initializes captured fact extraction only after configuration has been validated.
+    async fn complete_facts_init(&self) -> Result<()> {
         if self.fact_store.read().is_some() {
-            return;
+            return Ok(());
         }
         let storage = match self.storage.read().clone() {
             Some(s) => s,
-            None => return,
+            None => return Ok(()),
         };
 
         let facts_enabled = self
@@ -2467,7 +2556,7 @@ impl RuntimeAgent {
             .unwrap_or(false);
 
         if !facts_enabled && !actor_memory_enabled {
-            return;
+            return Ok(());
         }
 
         let fc = self.facts_config.clone().unwrap_or_default();
@@ -2478,12 +2567,17 @@ impl RuntimeAgent {
         ));
 
         let extractor: Option<Arc<dyn ai_agents_facts::FactExtractor>> = if facts_enabled {
-            let extractor_llm = fc
-                .extractor_llm
-                .as_ref()
-                .and_then(|alias| self.llm_registry.get(alias).ok())
-                .or_else(|| self.llm_registry.router().ok())
-                .or_else(|| self.llm_registry.default().ok());
+            let extractor_llm = self.optional_role_llm(
+                ai_agents_llm::LLMRole::MemoryFacts,
+                fc.extractor_llm.as_deref(),
+                || {
+                    fc.extractor_llm
+                        .as_ref()
+                        .and_then(|alias| self.llm_registry.get(alias).ok())
+                        .or_else(|| self.llm_registry.router().ok())
+                        .or_else(|| self.llm_registry.default().ok())
+                },
+            )?;
             extractor_llm.map(|llm| {
                 Arc::new(ai_agents_facts::LLMFactExtractor::new(llm, fc.clone()))
                     as Arc<dyn ai_agents_facts::FactExtractor>
@@ -2500,6 +2594,7 @@ impl RuntimeAgent {
             actor_memory_enabled,
             "facts storage initialized"
         );
+        Ok(())
     }
 
     fn convert_storage_config(&self) -> StorageStorageConfig {
@@ -2947,11 +3042,59 @@ impl RuntimeAgent {
         Ok(snapshot)
     }
 
-    /// Save state including spawned agents manifest for session persistence.
+    /// Builds a persistence-only declaration from actual prepared skills without rereading external files.
+    pub(crate) fn prepared_persistence_spec(
+        &self,
+        spec: &crate::spec::AgentSpec,
+    ) -> Result<crate::spec::AgentSpec> {
+        if spec.llm.router_roles().is_none() {
+            if self.llm_registry.router_roles().is_some() {
+                return Err(AgentError::Config(
+                    "Hierarchy runtime has no matching declared child spec".into(),
+                ));
+            }
+            return Ok(spec.clone());
+        }
+        if spec.llm.router_roles() != self.llm_registry.router_roles()
+            || spec.llm.get_default_alias() != self.llm_registry.default_alias()
+        {
+            return Err(AgentError::Config(
+                "Hierarchy child spec does not match its live LLM routing".into(),
+            ));
+        }
+        let mut prepared = spec.clone();
+        prepared.skills = self
+            .skills
+            .iter()
+            .cloned()
+            .map(ai_agents_skills::SkillRef::Inline)
+            .collect();
+        prepared.reasoning = self.reasoning_config.clone();
+        prepared.error_recovery = self.recovery_manager.config().clone();
+        if let Some(manager) = &self.disambiguation_manager {
+            prepared.disambiguation = manager.config().clone();
+        }
+        if let Some(config) = &self.facts_config {
+            prepared.memory.facts = Some(config.clone());
+        }
+        prepared.reflection = self.reflection_config.clone();
+        if let Some(processor) = &self.process_processor {
+            prepared.process = processor.config().clone();
+        }
+        if let Some(engine) = &self.hitl_engine {
+            prepared.hitl = Some(engine.config().clone());
+        }
+        if let Some(machine) = &self.state_machine {
+            prepared.states = Some(machine.config().clone());
+        }
+        Ok(prepared)
+    }
+
+    /// Save state including spawned agents manifest, failing before storage on incomplete hierarchy declarations.
     pub async fn save_state_full(&self) -> Result<AgentSnapshot> {
         let mut snapshot = self.save_state().await?;
         if let Some(ref registry) = self.spawner_registry {
-            let entries = registry.list_with_specs();
+            let entries = registry.persistence_entries()?;
             if !entries.is_empty() {
                 snapshot = snapshot.with_spawned_agents(entries);
             }
@@ -3228,10 +3371,35 @@ impl RuntimeAgent {
                 )));
             }
             let spec = crate::spec::AgentSpec::from_yaml_strict(&entry.spec_yaml)?;
+            if spec.llm.router_roles().is_some()
+                && spec
+                    .skills
+                    .iter()
+                    .any(|skill| !matches!(skill, ai_agents_skills::SkillRef::Inline(_)))
+            {
+                return Err(AgentError::Config(format!(
+                    "Cannot restore child '{}': hierarchy snapshot requires prepared inline skills",
+                    entry.id
+                )));
+            }
             spawner
                 .as_ref()
                 .expect("non-empty manifests require a spawner")
                 .validate_explicit_child(&entry.id, &spec)?;
+            if let Some(live) = registry
+                .as_ref()
+                .and_then(|registry| registry.get_spawned(&entry.id))
+                && (spec.llm.router_roles().is_some()
+                    || live.agent.llm_registry.router_roles().is_some())
+            {
+                let live_spec = live.agent.prepared_persistence_spec(&live.spec)?;
+                if spec.routing_projection()? != live_spec.routing_projection()? {
+                    return Err(AgentError::Config(format!(
+                        "Cannot restore child '{}': hierarchical LLM routing differs from the live child",
+                        entry.id
+                    )));
+                }
+            }
             prepared.push((entry.id, spec));
         }
 
@@ -3446,6 +3614,7 @@ impl RuntimeAgent {
         }
     }
 
+    // Selects overflow summarization independently of compacting memory and keeps native-safe boundaries.
     async fn summarize_context(
         &self,
         messages: &mut Vec<ChatMessage>,
@@ -3494,16 +3663,22 @@ impl RuntimeAgent {
             .map(|p| format!("{}\n\n{}", p, conversation_text))
             .unwrap_or(default_prompt);
 
-        let summarizer = if let Some(alias) = summarizer_llm {
-            self.llm_registry
-                .get(alias)
-                .map_err(|e| AgentError::Config(e.to_string()))?
-        } else {
-            self.llm_registry
-                .router()
-                .or_else(|_| self.llm_registry.default())
-                .map_err(|e| AgentError::Config(e.to_string()))?
-        };
+        let summarizer = self.role_llm(
+            ai_agents_llm::LLMRole::ContextSummarize,
+            summarizer_llm,
+            || {
+                Ok(if let Some(alias) = summarizer_llm {
+                    self.llm_registry
+                        .get(alias)
+                        .map_err(|e| AgentError::Config(e.to_string()))?
+                } else {
+                    self.llm_registry
+                        .router()
+                        .or_else(|_| self.llm_registry.default())
+                        .map_err(|e| AgentError::Config(e.to_string()))?
+                })
+            },
+        )?;
 
         let summary_msgs = vec![ChatMessage::user(&summary_prompt)];
         let response = self
@@ -3574,6 +3749,7 @@ impl RuntimeAgent {
     }
 
     /// Reads the live runtime narrowing and returns the current deterministic effective tool IDs.
+    // Scope evaluation propagates hierarchy configuration failures instead of treating them as false conditions.
     async fn get_available_tool_ids(&self) -> Result<Vec<String>> {
         Ok(self.get_available_tool_ids_snapshot().await?.tool_ids)
     }
@@ -3628,6 +3804,11 @@ impl RuntimeAgent {
                 let condition_matches = if let Some(condition) = tool_ref.condition() {
                     match evaluator.evaluate(condition, &eval_ctx).await {
                         Ok(matches) => matches,
+                        Err(error @ AgentError::Config(_))
+                            if self.llm_registry.router_roles().is_some() =>
+                        {
+                            return Err(error);
+                        }
                         Err(error) => {
                             warn!(tool = tool_id, error = %error, "Error evaluating tool condition");
                             false
@@ -6759,6 +6940,7 @@ impl RuntimeAgent {
     }
 
     // Uses one explicit reflection configuration for both skill and ordinary response gating.
+    // Selects the decision provider without changing auto-reflection execution degradation.
     async fn should_reflect_with_config(
         &self,
         input: &str,
@@ -6773,12 +6955,18 @@ impl RuntimeAgent {
             return Ok(true);
         }
 
-        let evaluator_llm = config
-            .evaluator_llm
-            .as_ref()
-            .and_then(|alias| self.llm_registry.get(alias).ok())
-            .or_else(|| self.llm_registry.router().ok())
-            .or_else(|| self.llm_registry.default().ok());
+        let evaluator_llm = self.optional_role_llm(
+            ai_agents_llm::LLMRole::ReasoningReflectionDecision,
+            config.evaluator_llm.as_deref(),
+            || {
+                config
+                    .evaluator_llm
+                    .as_ref()
+                    .and_then(|alias| self.llm_registry.get(alias).ok())
+                    .or_else(|| self.llm_registry.router().ok())
+                    .or_else(|| self.llm_registry.default().ok())
+            },
+        )?;
 
         let Some(llm) = evaluator_llm else {
             return Ok(false);
@@ -6865,19 +7053,26 @@ Answer YES or NO only."#,
         }
     }
 
+    // Evaluates with the effective snapshot provider; response rewriting remains on the state model.
     async fn evaluate_response_with_config(
         &self,
         input: &str,
         response: &str,
         config: &ReflectionConfig,
     ) -> Result<EvaluationResult> {
-        let evaluator_llm = config
-            .evaluator_llm
-            .as_ref()
-            .and_then(|alias| self.llm_registry.get(alias).ok())
-            .or_else(|| self.llm_registry.router().ok())
-            .or_else(|| self.llm_registry.default().ok())
-            .ok_or_else(|| AgentError::Config("No LLM available for evaluation".into()))?;
+        let evaluator_llm = self.role_llm(
+            ai_agents_llm::LLMRole::ReasoningReflectionEvaluation,
+            config.evaluator_llm.as_deref(),
+            || {
+                config
+                    .evaluator_llm
+                    .as_ref()
+                    .and_then(|alias| self.llm_registry.get(alias).ok())
+                    .or_else(|| self.llm_registry.router().ok())
+                    .or_else(|| self.llm_registry.default().ok())
+                    .ok_or_else(|| AgentError::Config("No LLM available for evaluation".into()))
+            },
+        )?;
 
         let criteria = &config.criteria;
         let criteria_list = criteria
@@ -7351,7 +7546,7 @@ OVERALL: PASS/FAIL"#,
             let staged_for_eval = if use_extractors {
                 if extracted_staged.is_none() {
                     extracted_staged =
-                        Some(self.run_context_extractors_staged(processed_input).await);
+                        Some(self.run_context_extractors_staged(processed_input).await?);
                 }
                 extracted_staged.as_ref().unwrap_or(&empty_staged)
             } else {
@@ -8047,6 +8242,7 @@ OVERALL: PASS/FAIL"#,
     // Parallel transition prompts must not depend on assistant response text.
     // Keep this branch response-independent or it can race against invalid context.
     //
+    // Uses the same role as serial transitions without changing response-independent reservations.
     async fn select_parallel_transition_candidate(
         &self,
         processed_input: &str,
@@ -8079,11 +8275,12 @@ OVERALL: PASS/FAIL"#,
         if when_transitions.is_empty() {
             return Ok(ParallelTransitionSelection::NoMatch);
         }
-        let llm = self
-            .llm_registry
-            .router()
-            .or_else(|_| self.llm_registry.default())
-            .map_err(|e| AgentError::Config(e.to_string()))?;
+        let llm = self.role_llm(ai_agents_llm::LLMRole::StateTransition, None, || {
+            self.llm_registry
+                .router()
+                .or_else(|_| self.llm_registry.default())
+                .map_err(|e| AgentError::Config(e.to_string()))
+        })?;
         let conditions = when_transitions
             .iter()
             .enumerate()
@@ -8316,13 +8513,17 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
-    async fn run_context_extractors_staged(&self, user_message: &str) -> HashMap<String, Value> {
+    // Stages extracted values without swallowing hierarchy alias errors or committing branch writes.
+    async fn run_context_extractors_staged(
+        &self,
+        user_message: &str,
+    ) -> Result<HashMap<String, Value>> {
         let extractors = match &self.state_machine {
             Some(sm) => match sm.current_definition() {
                 Some(def) if !def.extract.is_empty() => def.extract.clone(),
-                _ => return HashMap::new(),
+                _ => return Ok(HashMap::new()),
             },
-            None => return HashMap::new(),
+            None => return Ok(HashMap::new()),
         };
 
         let mut staged = HashMap::new();
@@ -8344,14 +8545,22 @@ OVERALL: PASS/FAIL"#,
                 continue;
             };
 
-            let llm = match self
-                .llm_registry
-                .get(&extractor.llm)
-                .or_else(|_| self.llm_registry.get("router"))
-                .or_else(|_| self.llm_registry.get("default"))
-            {
+            let llm = match self.role_llm(
+                ai_agents_llm::LLMRole::StateExtract,
+                extractor.llm.as_deref(),
+                || {
+                    self.llm_registry
+                        .get(extractor.llm.as_deref().unwrap_or("router"))
+                        .or_else(|_| self.llm_registry.get("router"))
+                        .or_else(|_| self.llm_registry.get("default"))
+                        .map_err(|e| AgentError::Config(e.to_string()))
+                },
+            ) {
                 Ok(llm) => llm,
                 Err(e) => {
+                    if self.llm_registry.router_roles().is_some() {
+                        return Err(e);
+                    }
                     warn!(key = %extractor.key, error = %e, "Extractor LLM not found");
                     continue;
                 }
@@ -8382,7 +8591,7 @@ OVERALL: PASS/FAIL"#,
                 }
             }
         }
-        staged
+        Ok(staged)
     }
 
     fn commit_staged_context_writes(&self, staged: &HashMap<String, Value>) {
@@ -8394,9 +8603,11 @@ OVERALL: PASS/FAIL"#,
     }
 
     /// Run context extractors for the current state on the user's input.
-    async fn run_context_extractors(&self, user_message: &str) {
-        let staged = self.run_context_extractors_staged(user_message).await;
+    // Commits only successfully staged extraction after exact role resolution.
+    async fn run_context_extractors(&self, user_message: &str) -> Result<()> {
+        let staged = self.run_context_extractors_staged(user_message).await?;
         self.commit_staged_context_writes(&staged);
+        Ok(())
     }
 
     async fn check_memory_compression(&self) -> Result<()> {
@@ -8580,10 +8791,14 @@ OVERALL: PASS/FAIL"#,
     async fn determine_reasoning_mode(&self, input: &str) -> Result<ReasoningMode> {
         match self.determine_reasoning_mode_strict(input).await {
             Ok(mode) => Ok(mode),
+            Err(error @ AgentError::Config(_)) if self.llm_registry.router_roles().is_some() => {
+                Err(error)
+            }
             Err(_) => Ok(ReasoningMode::None),
         }
     }
 
+    // Selects an auxiliary judge only for auto mode and propagates hierarchy configuration errors.
     async fn determine_reasoning_mode_strict(&self, input: &str) -> Result<ReasoningMode> {
         let effective_config = self.get_effective_reasoning_config();
 
@@ -8591,12 +8806,18 @@ OVERALL: PASS/FAIL"#,
             return Ok(effective_config.mode.clone());
         }
 
-        let judge_llm = effective_config
-            .judge_llm
-            .as_ref()
-            .and_then(|alias| self.llm_registry.get(alias).ok())
-            .or_else(|| self.llm_registry.router().ok())
-            .or_else(|| self.llm_registry.default().ok());
+        let judge_llm = self.optional_role_llm(
+            ai_agents_llm::LLMRole::ReasoningSelection,
+            effective_config.judge_llm.as_deref(),
+            || {
+                effective_config
+                    .judge_llm
+                    .as_ref()
+                    .and_then(|alias| self.llm_registry.get(alias).ok())
+                    .or_else(|| self.llm_registry.router().ok())
+                    .or_else(|| self.llm_registry.default().ok())
+            },
+        )?;
 
         let Some(llm) = judge_llm else {
             return Ok(ReasoningMode::None);
@@ -8650,16 +8871,23 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
     }
 
     // Generates a plan only after the effective tool scope is known so scope failures cannot expose the full registry to the planner.
+    // Resolves the planner independently while preserving fail-closed scope checks before invocation.
     async fn generate_plan(&self, input: &str) -> Result<Plan> {
         let effective = self.get_effective_reasoning_config();
         let planning_config = effective.get_planning();
 
-        let planner_llm = planning_config
-            .and_then(|c| c.planner_llm.as_ref())
-            .and_then(|alias| self.llm_registry.get(alias).ok())
-            .or_else(|| self.llm_registry.router().ok())
-            .or_else(|| self.llm_registry.default().ok())
-            .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))?;
+        let planner_llm = self.role_llm(
+            ai_agents_llm::LLMRole::ReasoningPlanning,
+            planning_config.and_then(|c| c.planner_llm.as_deref()),
+            || {
+                planning_config
+                    .and_then(|c| c.planner_llm.as_ref())
+                    .and_then(|alias| self.llm_registry.get(alias).ok())
+                    .or_else(|| self.llm_registry.router().ok())
+                    .or_else(|| self.llm_registry.default().ok())
+                    .ok_or_else(|| AgentError::Config("No LLM available for planning".into()))
+            },
+        )?;
 
         let mut available_tool_ids = self.get_available_tool_ids().await?;
         let mut available_skills: Vec<String> = self.skills.iter().map(|s| s.id.clone()).collect();
@@ -9449,12 +9677,15 @@ Respond in JSON format:
     }
 
     /// Generate a localized response using the router LLM
+    // Selects localized failure-response generation without inheriting clarification locals.
     async fn generate_localized_apology(&self, instruction: &str, reason: &str) -> Result<String> {
-        let llm = self.llm_registry.router().map_err(|e| {
-            AgentError::LLM(format!(
-                "Router LLM not available for localized response: {}",
-                e
-            ))
+        let llm = self.role_llm(ai_agents_llm::LLMRole::DisambiguationResponse, None, || {
+            self.llm_registry.router().map_err(|e| {
+                AgentError::LLM(format!(
+                    "Router LLM not available for localized response: {}",
+                    e
+                ))
+            })
         })?;
 
         let recent: Vec<String> = self
@@ -10397,7 +10628,7 @@ Respond in JSON format:
         self.increment_turn();
 
         // Run context extractors so guards can check freshly-extracted values.
-        self.run_context_extractors(processed_input).await;
+        self.run_context_extractors(processed_input).await?;
 
         let transitioned = self.evaluate_transitions(processed_input, &content).await?;
 
@@ -10694,6 +10925,7 @@ Respond in JSON format:
     }
 
     // Handle delegation: forward user input to a registry agent.
+    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
     async fn handle_delegated_state(
         &self,
         input: &str,
@@ -10735,7 +10967,12 @@ Respond in JSON format:
                     input,
                     &context_mode,
                     &*self.memory,
-                    self.llm_registry.get("router").ok().as_deref(),
+                    self.optional_role_llm(
+                        ai_agents_llm::LLMRole::OrchestrationSummary,
+                        None,
+                        || self.llm_registry.get("router").ok(),
+                    )?
+                    .as_deref(),
                 ),
             )
             .await?;
@@ -10806,6 +11043,7 @@ Respond in JSON format:
     }
 
     // Handle concurrent execution: run multiple registry agents in parallel and aggregate.
+    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
     async fn handle_concurrent_state(
         &self,
         input: &str,
@@ -10831,7 +11069,12 @@ Respond in JSON format:
                     input,
                     &context_mode,
                     &*self.memory,
-                    self.llm_registry.get("router").ok().as_deref(),
+                    self.optional_role_llm(
+                        ai_agents_llm::LLMRole::OrchestrationSummary,
+                        None,
+                        || self.llm_registry.get("router").ok(),
+                    )?
+                    .as_deref(),
                 ),
             )
             .await?;
@@ -10845,12 +11088,10 @@ Respond in JSON format:
 
         let start = Instant::now();
 
-        let llm_name = config
-            .aggregation
-            .synthesizer_llm
-            .as_deref()
-            .unwrap_or("router");
-        let llm_provider = self.llm_registry.get(llm_name).ok();
+        let providers = crate::orchestration::AggregationProviders::resolve(
+            &self.llm_registry,
+            config.aggregation.synthesizer_llm.as_deref(),
+        )?;
 
         let vote_parallelism = if self.runtime_config.optimization.enabled
             && self
@@ -10868,12 +11109,12 @@ Respond in JSON format:
                 ObservationPurpose::OrchestrationAggregation,
                 scope_actor_context(
                     self.outbound_actor_context(),
-                    crate::orchestration::concurrent(
+                    crate::orchestration::concurrent_with_llms(
                         registry,
                         &effective_input,
                         &config.agents,
                         &config.aggregation,
-                        llm_provider.as_deref(),
+                        providers.as_refs(),
                         config.min_required,
                         config.timeout_ms,
                         config.on_partial_failure.clone(),
@@ -10955,6 +11196,7 @@ Respond in JSON format:
     }
 
     // Handle group chat: run a multi-turn multi-agent conversation.
+    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
     async fn handle_group_chat_state(
         &self,
         input: &str,
@@ -10970,7 +11212,16 @@ Respond in JSON format:
 
         let start = Instant::now();
 
-        let llm_provider = self.llm_registry.get("router").ok();
+        let speaker = crate::orchestration::role_provider(
+            &self.llm_registry,
+            ai_agents_llm::LLMRole::OrchestrationSpeaker,
+            None,
+        )?;
+        let consensus = crate::orchestration::role_provider(
+            &self.llm_registry,
+            ai_agents_llm::LLMRole::OrchestrationConsensus,
+            None,
+        )?;
 
         // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
@@ -10981,7 +11232,12 @@ Respond in JSON format:
                     input,
                     &context_mode,
                     &*self.memory,
-                    self.llm_registry.get("router").ok().as_deref(),
+                    self.optional_role_llm(
+                        ai_agents_llm::LLMRole::OrchestrationSummary,
+                        None,
+                        || self.llm_registry.get("router").ok(),
+                    )?
+                    .as_deref(),
                 ),
             )
             .await?;
@@ -10999,11 +11255,14 @@ Respond in JSON format:
                 ObservationPurpose::OrchestrationConversation,
                 scope_actor_context(
                     self.outbound_actor_context(),
-                    crate::orchestration::group_chat(
+                    crate::orchestration::group_chat_with_llms(
                         registry,
                         &effective_topic,
                         config,
-                        llm_provider.as_deref(),
+                        crate::orchestration::GroupLLMs {
+                            speaker: speaker.as_deref(),
+                            consensus: consensus.as_deref(),
+                        },
                         Some(&*self.hooks),
                     ),
                 ),
@@ -11077,6 +11336,7 @@ Respond in JSON format:
     }
 
     // Handle pipeline: run agents sequentially with per-stage input templates.
+    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
     async fn handle_pipeline_state(
         &self,
         input: &str,
@@ -11113,7 +11373,12 @@ Respond in JSON format:
                     input,
                     &context_mode,
                     &*self.memory,
-                    self.llm_registry.get("router").ok().as_deref(),
+                    self.optional_role_llm(
+                        ai_agents_llm::LLMRole::OrchestrationSummary,
+                        None,
+                        || self.llm_registry.get("router").ok(),
+                    )?
+                    .as_deref(),
                 ),
             )
             .await?;
@@ -11200,6 +11465,7 @@ Respond in JSON format:
     }
 
     // Handle handoff: LLM-directed agent-to-agent control transfer.
+    // Keeps handoff decisions and delegate summary on separate auxiliary roles.
     async fn handle_handoff_state(
         &self,
         input: &str,
@@ -11213,10 +11479,11 @@ Respond in JSON format:
             )
         })?;
 
-        let llm = self
-            .llm_registry
-            .get("router")
-            .map_err(|_| AgentError::Config("Handoff state requires a router LLM.".into()))?;
+        let llm = self.role_llm(ai_agents_llm::LLMRole::OrchestrationHandoff, None, || {
+            self.llm_registry
+                .get("router")
+                .map_err(|_| AgentError::Config("Handoff state requires a router LLM.".into()))
+        })?;
 
         let start = Instant::now();
 
@@ -11229,7 +11496,12 @@ Respond in JSON format:
                     input,
                     &context_mode,
                     &*self.memory,
-                    self.llm_registry.get("router").ok().as_deref(),
+                    self.optional_role_llm(
+                        ai_agents_llm::LLMRole::OrchestrationSummary,
+                        None,
+                        || self.llm_registry.get("router").ok(),
+                    )?
+                    .as_deref(),
                 ),
             )
             .await?;

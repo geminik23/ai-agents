@@ -8,6 +8,9 @@ build_search_index = true
 generate_feeds = true
 feed_filenames = ["atom.xml"]
 
+# These guides show agent template syntax literally, not as site content variables.
+skip_content_templating = ["docs/**", "examples/**"]
+
 # Taxonomies
 taxonomies = [
     { name = "tags", feed = true, paginate_by = 20 },

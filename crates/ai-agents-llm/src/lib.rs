@@ -6,6 +6,7 @@ pub mod multi;
 pub mod prompts;
 pub mod providers;
 pub mod registry;
+pub mod routing;
 
 pub use ai_agents_core::{
     ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
@@ -13,3 +14,4 @@ pub use ai_agents_core::{
     ToolChoice, ToolSelection,
 };
 pub use registry::LLMRegistry;
+pub use routing::*;
