@@ -1,0 +1,27 @@
+{
+  "mode": "mock",
+  "source_revision": "ebef4ebc84fcc0ecf8c34b2554c8d396f05d1b54",
+  "source_hashes": {
+    "catalog/home-agents.toml": "9a753d93e98a0be09d45a394703dc57ce95836dec2928c336e62e56697f40826",
+    "static/agents/assistant.yaml": "1bbeecc0a079c716c0f60fc2ed5b521d1180c4eb4e789788fc2482742a45822c",
+    "static/agents/translator.yaml": "cc483ef8b5eb13380b0fa66be36dc93fbebf1e0f6c4170551a5841715ac46ec7",
+    "static/agents/tutor.yaml": "20f12b2f48ab5e68a807bda998ff8eefd444a58b73099e2fec7807c8c9eb2970"
+  },
+  "agents": [
+    {
+      "id": "assistant",
+      "input": "Help me plan a focused morning.",
+      "response": "Pick one important task.\nWork on it for 45 minutes without notifications.\nTake a short break, then review your progress."
+    },
+    {
+      "id": "translator",
+      "input": "회의를 내일로 옮겨 주세요.",
+      "response": "Please move the meeting to tomorrow."
+    },
+    {
+      "id": "tutor",
+      "input": "What is a loop?",
+      "response": "A loop repeats an action. For example, a program can say hello to each name in a list.\n\nIf the list has three names, how many greetings will it print?"
+    }
+  ]
+}

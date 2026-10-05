@@ -133,8 +133,9 @@
     const button = document.createElement("button");
     button.type = "button";
     button.className = "code-copy-button";
-    button.textContent = "Copy";
-    button.setAttribute("aria-label", "Copy code");
+    const copyLabel = pre.dataset.copyLabel || "Copy";
+    button.textContent = copyLabel;
+    button.setAttribute("aria-label", pre.dataset.copyLabel || "Copy code");
     const status = document.createElement("span");
     status.className = "code-copy-status";
     status.setAttribute("role", "status");
@@ -150,10 +151,10 @@
         button.textContent = "Copied";
         status.textContent = "Code copied.";
       } catch (_) {
-        button.textContent = "Copy";
+        button.textContent = copyLabel;
         status.textContent = "Could not copy. Select the code and copy it manually.";
       }
-      resetTimer = setTimeout(function () { button.textContent = "Copy"; }, 2500);
+      resetTimer = setTimeout(function () { button.textContent = copyLabel; }, 2500);
     });
   });
 

@@ -1,6 +1,6 @@
 base_url = "https://ai-agents.rs"
 title = "AI Agents Framework"
-description = "One YAML = Any Agent. A Rust framework for building AI agents from a single YAML specification."
+description = "Define AI agents in YAML and extend them in Rust. Build conversations, controlled tool execution, stateful workflows, and multi-agent systems."
 
 # Compilation & build
 compile_sass = true
@@ -45,6 +45,8 @@ anchors = "on"
 # Extra site-wide variables
 # Access these in templates via `config.extra.<key>`
 [extra]
+home_title = "ai-agents.rs — YAML-first AI Agent Framework in Rust"
+site_name = "ai-agents.rs"
 github = "https://github.com/geminik23/ai-agents"
 crates_io = "https://crates.io/crates/ai-agents"
 docs_rs = "https://docs.rs/ai-agents"

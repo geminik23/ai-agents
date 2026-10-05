@@ -1,0 +1,176 @@
+{
+  "mode": "mock",
+  "scenario": "approve-reject-timeout",
+  "source_revision": "ebef4ebc84fcc0ecf8c34b2554c8d396f05d1b54",
+  "source_suite": "examples/eval/mocked/hitl/hitl_basic_mocked.yaml",
+  "source_agent": "examples/yaml/hitl/hitl_basic.yaml",
+  "suite_sha256": "8103bb840c959d090d120f0a8b1f90b7ca82c57b185377d27bcdffbdec271083",
+  "agent_sha256": "abd3bf5d9b8517f3712904a95f5f05b4f04afa9688d031a89fde6b1db42fa345",
+  "report_sha256": "dd914b234bc84e46ec282fe5122be4b5f8eacbea5be454a83b8889cd31b3f800",
+  "turns": [
+    {
+      "id": "approved",
+      "label": "Approve",
+      "title": "Approved request",
+      "description": "The approval fixture accepts the request. The HTTP tool fixture executes and returns status 200.",
+      "executed": true,
+      "success": true,
+      "checks_passed": 10,
+      "approval_matches": 1,
+      "assertions": [
+        {
+          "name": "response_not_empty",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_not_contains",
+          "passed": true
+        },
+        {
+          "name": "response_not_contains",
+          "passed": true
+        },
+        {
+          "name": "approval_requested",
+          "passed": true
+        },
+        {
+          "name": "approval_requested",
+          "passed": true
+        },
+        {
+          "name": "tool_called",
+          "passed": true
+        },
+        {
+          "name": "tool_called",
+          "passed": true
+        },
+        {
+          "name": "all",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "id": "rejected",
+      "label": "Reject",
+      "title": "Rejected request",
+      "description": "The approval fixture rejects the request. The tool execution check confirms that the HTTP implementation did not run.",
+      "executed": false,
+      "success": false,
+      "checks_passed": 11,
+      "approval_matches": 1,
+      "assertions": [
+        {
+          "name": "response_not_empty",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_not_contains",
+          "passed": true
+        },
+        {
+          "name": "response_not_contains",
+          "passed": true
+        },
+        {
+          "name": "approval_requested",
+          "passed": true
+        },
+        {
+          "name": "approval_requested",
+          "passed": true
+        },
+        {
+          "name": "tool_called",
+          "passed": true
+        },
+        {
+          "name": "all",
+          "passed": true
+        }
+      ]
+    },
+    {
+      "id": "timeout",
+      "label": "Time out",
+      "title": "Approval timeout",
+      "description": "The approval fixture returns a timeout. The configured timeout policy rejects the request, and the HTTP implementation does not run.",
+      "executed": false,
+      "success": false,
+      "checks_passed": 11,
+      "approval_matches": 1,
+      "assertions": [
+        {
+          "name": "response_not_empty",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_contains",
+          "passed": true
+        },
+        {
+          "name": "response_not_contains",
+          "passed": true
+        },
+        {
+          "name": "response_not_contains",
+          "passed": true
+        },
+        {
+          "name": "approval_requested",
+          "passed": true
+        },
+        {
+          "name": "approval_requested",
+          "passed": true
+        },
+        {
+          "name": "tool_called",
+          "passed": true
+        },
+        {
+          "name": "all",
+          "passed": true
+        }
+      ]
+    }
+  ]
+}

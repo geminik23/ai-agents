@@ -1,0 +1,28 @@
+{% set presets = load_data(path="catalog/home-agents.toml") %}
+{% set conversations = load_data(path="catalog/home-conversations.json") %}
+<div class="agent-showcase" data-tabs>
+    <div class="agent-showcase-heading"><span>Choose an agent</span><div class="agent-preset-tabs" role="tablist" aria-label="Agent examples">
+        {% for agent in presets.agents %}<button type="button" role="tab" id="agent-tab-{{ agent.id }}" aria-controls="agent-panel-{{ agent.id }}" aria-selected="{% if loop.first %}true{% else %}false{% endif %}">{{ agent.name }}</button>{% endfor %}
+    </div></div>
+    {% for agent in presets.agents %}
+    {% set definition = load_data(path=agent.yaml_path, format="plain") %}
+    {% set definition_lines = definition | split(pat="\n") %}
+    <section class="agent-preset-panel" id="agent-panel-{{ agent.id }}" role="tabpanel" aria-labelledby="agent-tab-{{ agent.id }}" tabindex="0">
+        <div class="agent-definition">
+            <div class="agent-panel-heading"><span class="agent-stage">01 / Define</span><span>{{ agent.id }}.yaml</span></div>
+            <pre class="code-block" data-copy-label="Copy YAML"><code>{% for line in definition_lines %}<span{% if loop.index <= 4 %} class="agent-definition-personality"{% endif %}>{{ line }}</span>{% if not loop.last %}{{ "\n" }}{% endif %}{% endfor %}</code></pre>
+            <p class="agent-definition-note">Change the name and instructions. That's your agent.</p>
+        </div>
+        <div class="agent-conversation">
+            <div class="agent-panel-heading"><span class="agent-stage">02 / Converse</span><span>Example conversation</span></div>
+            {% for exchange in conversations.agents %}{% if exchange.id == agent.id %}
+            <div class="agent-chat-message agent-chat-user"><span class="agent-chat-speaker">You</span><p>{{ exchange.input }}</p></div>
+            <div class="agent-chat-message agent-chat-reply"><span class="agent-chat-speaker"><span class="agent-avatar" aria-hidden="true">↳</span>{{ agent.name }}</span><p>{{ exchange.response }}</p></div>
+            {% endif %}{% endfor %}
+            <p class="agent-purpose">{{ agent.description }}</p>
+        </div>
+        <div class="agent-run-strip"><div><span class="agent-stage">03 / Run it</span><code>ai-agents-cli run {{ agent.id }}.yaml</code></div><a href="{{ get_url(path=agent.download_path) }}" download="{{ agent.id }}.yaml">Download YAML <span aria-hidden="true">↓</span></a><a href="{{ get_url(path='@/docs/getting-started.md') }}#your-first-agent-cli">Setup &amp; run <span aria-hidden="true">→</span></a></div>
+    </section>
+    {% endfor %}
+    <details class="agent-demo-about"><summary>About these examples</summary><p>Each complete YAML definition was run through the framework with a fixed mock response to make this recorded demo reproducible. The page makes no model requests. Download a definition and run it with your configured provider to get real model responses.</p></details>
+</div>

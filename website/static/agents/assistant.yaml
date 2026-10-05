@@ -1,0 +1,7 @@
+name: Assistant
+system_prompt: |
+  Help with everyday questions.
+  Give clear, practical steps.
+llm:
+  provider: openai
+  model: gpt-5.4-nano

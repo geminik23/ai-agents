@@ -2,12 +2,15 @@
 title = "Concepts"
 weight = 7
 template = "docs.html"
-description = "Core concepts and architecture of AI Agents Framework."
+description = "Understand the ai-agents Rust runtime: YAML definitions, tools, states, memory, multi-agent coordination, and execution safety."
+
+[extra]
+seo_title = "AI Agent Architecture and Runtime Concepts"
 +++
 
 <!--# Concepts-->
 
-This page explains how the framework is organized and how its pieces fit together. Each section gives you enough context to understand the big picture - for full configuration details, see the [YAML Reference](@/docs/yaml-reference.md).
+The ai-agents framework connects YAML agent definitions to a Rust runtime. This guide explains how tools, state machines, memory, and multi-agent coordination fit together, including the boundaries that govern execution. Each section gives you enough context to understand the big picture - for full configuration details, see the [YAML Reference](@/docs/yaml-reference.md).
 
 ---
 

@@ -1,0 +1,63 @@
+{# One source for browser, search, and sharing metadata; visible headings stay independent. #}
+{% set seo_title = config.extra.home_title %}
+{% set seo_description = config.description %}
+{% set seo_type = "website" %}
+{% if page is defined %}
+    {% set seo_title = page.extra.seo_title | default(value=page.title) %}
+    {% set seo_title = seo_title ~ " | " ~ config.extra.site_name %}
+    {% if page.description %}
+        {% set seo_description = page.description %}
+    {% else %}
+        {% set seo_description = page.content | striptags | truncate(length=160) %}
+    {% endif %}
+    {% if page.date %}{% set seo_type = "article" %}{% endif %}
+{% elif term is defined %}
+    {% set seo_title = (term.name | title) ~ " articles | " ~ config.extra.site_name %}
+    {% set seo_description = "Articles about " ~ term.name ~ " in the AI Agents Rust framework: design decisions, architecture, and releases." %}
+{% elif taxonomy is defined %}
+    {% set seo_title = "Blog topics | " ~ config.extra.site_name %}
+    {% set seo_description = "Browse AI Agents articles by topic, including Rust agent architecture, design, philosophy, and releases." %}
+{% elif section is defined and current_path != "/" %}
+    {% set seo_title = section.extra.seo_title | default(value=section.title) %}
+    {% set seo_title = seo_title ~ " | " ~ config.extra.site_name %}
+    {% if section.description %}
+        {% set seo_description = section.description %}
+    {% else %}
+        {% set seo_description = section.content | striptags | truncate(length=160) %}
+    {% endif %}
+{% endif %}
+{% if current_url is defined %}
+    {% set seo_url = current_url %}
+    {# Later archive pages describe distinct content and must not canonicalize to page one. #}
+    {% if paginator is defined %}
+        {% if paginator.current_index == 1 %}
+            {% set seo_url = paginator.first %}
+        {% else %}
+            {% set seo_url = paginator.base_url ~ paginator.current_index ~ "/" %}
+            {% set seo_title = seo_title ~ " — Page " ~ paginator.current_index %}
+            {% set seo_description = seo_description ~ " Page " ~ paginator.current_index ~ "." %}
+        {% endif %}
+    {% endif %}
+    <link rel="canonical" href="{{ seo_url }}" />
+    <meta property="og:url" content="{{ seo_url }}" />
+{% endif %}
+<title>{{ seo_title }}</title>
+<meta name="description" content="{{ seo_description }}" />
+<meta property="og:title" content="{{ seo_title }}" />
+<meta property="og:description" content="{{ seo_description }}" />
+<meta property="og:type" content="{{ seo_type }}" />
+<meta property="og:site_name" content="{{ config.extra.site_name }}" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="{{ seo_title }}" />
+<meta name="twitter:description" content="{{ seo_description }}" />
+{% if current_path is defined and current_path == "/" %}
+<script type="application/ld+json">
+{
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "ai-agents.rs",
+    "alternateName": "AI Agents Framework",
+    "url": {{ seo_url | json_encode | safe }}
+}
+</script>
+{% endif %}

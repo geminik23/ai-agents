@@ -1,0 +1,84 @@
+// Runtime explanations share the site's reading width and semantic color tokens.
+.experience-lead { color: var(--text-muted); font-size: 1.15rem; line-height: 1.7; }
+.experience-note { color: var(--text-muted); font-size: 0.8rem; line-height: 1.65; }
+.execution-demo { border: 1px solid var(--border-strong); border-radius: 12px; background: var(--bg-surface); overflow: hidden; min-width: 0; box-shadow: var(--shadow-soft); }
+.execution-heading { display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem; padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); font-size: 0.8rem; font-weight: 600; color: var(--text-heading); }
+.execution-indicator { width: 7px; height: 7px; border-radius: 50%; background: var(--accent-text); }
+.execution-mode { margin-left: auto; font-size: 0.7rem; font-weight: 400; color: var(--text-muted); }
+.execution-config { background: var(--code-bg); padding: 1rem 1.25rem; }
+.execution-file { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem; }
+.execution-config pre.code-block { margin: 0.5rem 0 0; border: 0; border-radius: 0; padding: 0; background: transparent; }
+.home-page .hero-demo .execution-config .code-block code { padding: 0; font-size: 0.8rem; line-height: 1.55; }
+.execution-config .code-copy-wrap { margin: 0.5rem 0 0; }
+.execution-tabs { display: flex; border-block: 1px solid var(--border); padding-inline: 0.5rem; gap: 0.25rem; }
+.execution-tabs button { flex: 1; min-height: 44px; padding: 0.75rem 0.5rem; color: var(--text-muted); background: transparent; border: 0; border-bottom: 2px solid transparent; font: inherit; font-size: 0.8rem; cursor: pointer; }
+.execution-tabs button[aria-selected="true"] { color: var(--accent-text); border-bottom-color: var(--accent-text); }
+.execution-tabs button:hover { background: var(--bg-surface-2); color: var(--text-heading); }
+.execution-outcome { padding: 1.1rem 1.25rem; }
+.execution-outcome h2 { font-size: 0.9rem; margin: 0 0 1rem; }
+.execution-flow { list-style: none; margin: 0; padding: 0; }
+.execution-flow li { display: flex; gap: 0.8rem; position: relative; padding-bottom: 1rem; }
+.execution-flow li:not(:last-child)::before { content: ""; width: 1px; position: absolute; top: 26px; left: 12px; bottom: 0; background: var(--border-strong); }
+.execution-node { width: 25px; height: 25px; flex: 0 0 25px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 50%; color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem; }
+.execution-flow li > div { min-width: 0; }
+.execution-flow strong { display: block; color: var(--text-heading); font-weight: 550; font-size: 0.85rem; }
+.execution-flow div > span { display: block; color: var(--text-muted); font-size: 0.75rem; margin-top: 0.15rem; }
+.execution-terminal .execution-node { background: var(--accent-muted); border-color: var(--accent-text); color: var(--accent-text); }
+.execution-evidence { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: 6px; padding: 0.7rem 0; }
+.execution-evidence > div { padding-inline: 0.75rem; min-width: 0; }
+.execution-evidence > div + div { border-left: 1px solid var(--border); }
+.execution-evidence span { display: block; font-size: 0.65rem; color: var(--text-muted); }
+.execution-evidence strong { display: block; font-size: 1rem; font-family: var(--font-mono); color: var(--text-heading); margin-top: 0.15rem; }
+.execution-details { font-size: 0.75rem; margin-top: 1rem; color: var(--text-muted); }
+.execution-details summary { cursor: pointer; color: var(--link); padding: 0.25rem 0; }
+.execution-details p { margin: 0.6rem 0; }
+.execution-footer { border-top: 1px solid var(--border); padding: 1rem 1.25rem; }
+.execution-footer p { font-size: 0.7rem; color: var(--text-muted); margin: 0 0 0.65rem; line-height: 1.7; }
+.execution-footer a { font-size: 0.8rem; font-weight: 600; }
+.home-page .hero-runtime .hero-inner { align-items: start; }
+.home-page .hero-runtime .hero-copy { padding-block: 1.75rem; }
+.home-paths { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
+.home-path { padding: 1.4rem; border: 1px solid var(--border); border-radius: 8px; min-width: 0; }
+.home-path:hover { border-color: var(--accent-text); background: var(--bg-surface); }
+.home-path span { color: var(--accent-text); font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; }
+.home-path h3 { font-size: 1rem; color: var(--text-heading); margin: 0.7rem 0; }
+.home-path p { font-size: 0.85rem; color: var(--text-muted); margin: 0; }
+.home-role-feature { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; align-items: center; }
+.home-role-preview { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+.home-role-preview li { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.8rem 1rem; border: 1px solid var(--border); border-radius: 6px; color: var(--text-muted); font-size: 0.85rem; }
+.home-role-preview li:first-child { border-color: var(--accent-text); color: var(--text-heading); background: var(--accent-muted); }
+.home-role-preview code { font-size: 0.8rem; }
+.role-explorer > h1 { font-size: clamp(2rem, 4vw, 3rem); letter-spacing: -0.04em; }
+.role-workbench { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 2rem; align-items: start; margin-block: 2.5rem; }
+.role-controls { border: 1px solid var(--border); border-radius: 10px; padding: 1.5rem; background: var(--bg-surface); }
+.role-controls h2 { font-size: 1.05rem; margin: 0 0 0.75rem; }
+.role-controls > p { color: var(--text-muted); font-size: 0.875rem; }
+.role-chain { list-style: none; padding: 0; margin: 1.5rem 0; display: grid; gap: 0.75rem; }
+.role-chain li { display: grid; grid-template-columns: minmax(0, 1fr) 105px; gap: 0.6rem; padding: 0.85rem; border: 1px solid var(--border); border-radius: 6px; }
+.role-chain li.is-selected { border-color: var(--accent-text); background: var(--accent-muted); }
+.role-chain label { display: flex; gap: 0.7rem; align-items: start; min-width: 0; font-size: 0.85rem; color: var(--text-heading); }
+.role-chain label > span:last-child { min-width: 0; }
+.role-chain small { display: block; margin-top: 0.25rem; overflow-wrap: anywhere; font-family: var(--font-mono); font-size: 0.65rem; color: var(--text-muted); }
+.role-step { color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem; padding-top: 0.2rem; }
+.role-chain select { min-width: 0; width: 100%; align-self: start; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--bg); color: var(--text); padding: 0.6rem; font: inherit; font-size: 0.8rem; min-height: 44px; }
+.role-level-status { grid-column: 1 / -1; color: var(--text-muted); font-size: 0.7rem; padding-left: 1.7rem; }
+.is-selected .role-level-status { color: var(--accent-text); }
+.role-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; }
+.role-actions .btn { font-size: 0.8rem; padding: 0.65rem 0.85rem; cursor: pointer; }
+.role-preview { min-width: 0; }
+.role-preview .code-window-header { justify-content: space-between; gap: 1rem; }
+.role-preview .code-window-title { margin: 0; }
+.role-preview .demo-label { font-size: 0.7rem; color: var(--text-muted); }
+.role-preview pre.code-block { padding: 1rem; margin: 0; }
+.role-preview pre code { font-size: 0.8rem; }
+.role-preview .code-copy-wrap { margin: 0; }
+.role-result { padding: 1.4rem; margin-bottom: 1rem; border: 1px solid var(--accent-text); border-radius: 8px; background: var(--accent-muted); }
+.role-result > span { display: block; font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
+.role-result > strong { display: block; font-family: var(--font-mono); color: var(--text-heading); font-size: 2rem; margin-block: 0.3rem; }
+.role-result p { font-size: 0.85rem; margin: 0; color: var(--text); }
+.experience-footnote { margin-top: 2rem; padding: 1.5rem; border: 1px solid var(--border); border-radius: 8px; }
+.experience-footnote h2 { font-size: 1.15rem; margin: 0 0 0.75rem; }
+.experience-footnote p { color: var(--text-muted); }
+@media (max-width: 1023px) { .home-paths { grid-template-columns: repeat(2, minmax(0, 1fr)); } .role-workbench { gap: 1.25rem; } .role-controls { padding: 1rem; } }
+@media (max-width: 767px) { .home-role-feature, .role-workbench { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; } .home-page .hero-runtime .hero-copy { padding: 0; } }
+@media (max-width: 479px) { .home-paths { grid-template-columns: minmax(0, 1fr); } .execution-heading, .execution-config, .execution-outcome, .execution-footer { padding-inline: 1rem; } .role-chain li { grid-template-columns: minmax(0, 1fr) 95px; padding: 0.65rem; } }

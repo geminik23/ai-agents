@@ -3,9 +3,8 @@
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <meta name="description" content="{% if page is defined and page.description %}{{ page.description }}{% elif section is defined and section.description %}{{ section.description }}{% else %}{{ config.description }}{% endif %}" />
+        {% include "partials/seo.html" %}
         <meta name="generator" content="Zola" />
-        <title>{% block title %}{{ config.title }}{% endblock title %}</title>
         <script>
             // Restore appearance before styles load; restricted storage retains the dark default.
             try {
@@ -39,7 +38,7 @@
                 </a>
                 <nav class="site-nav" aria-label="Main navigation">
                     <ul class="nav-links">
-                        <li><a href="{{ get_url(path='@/docs/_index.md') }}"{% if nav_parts[1] == "docs" %} aria-current="page"{% endif %}>Docs</a></li>
+                        <li><a href="{{ get_url(path='@/docs/_index.md') }}"{% if nav_parts[1] == "docs" or nav_parts[1] == "explore" %} aria-current="page"{% endif %}>Docs</a></li>
                         <li><a href="{{ get_url(path='@/examples/_index.md') }}"{% if nav_parts[1] == "examples" %} aria-current="page"{% endif %}>Examples</a></li>
                         <li><a href="{{ get_url(path='@/roadmap.md') }}"{% if nav_parts[1] == "roadmap" %} aria-current="page"{% endif %}>Roadmap</a></li>
                         <li><a href="{{ get_url(path='@/blog/_index.md') }}"{% if nav_parts[1] == "blog" %} aria-current="page"{% endif %}>Blog</a></li>

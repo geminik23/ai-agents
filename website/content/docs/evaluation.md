@@ -336,7 +336,7 @@ Important parts:
 | `scenarios` | Test cases with optional hard provider budgets and direct turns or advanced steps. |
 | `assert` | Assertions evaluated after a turn. |
 
-`settings.timeout_per_turn_ms` and a turn-level `timeout_ms` bound the whole turn, including provider calls, HITL waits, resource-lock waits, tool attempts and retries, streaming collection, and finalization. `settings.timeout_per_scenario_ms` separately bounds the complete scenario attempt across its turns and steps. These are different from `tool_security.*.timeout_ms`, which applies to each individual `Tool::execute` invocation attempt, and from `command.timeout_ms`, which bounds the direct child process. No timeout layer promises rollback of effects that already escaped to a filesystem, process, network, or custom integration.
+`settings.timeout_per_turn_ms` and a turn-level `timeout_ms` bound the chat or stream operation, including provider calls, HITL waits, resource-lock waits, tool attempts and retries, streaming collection, and runtime finalization. The subsequent evaluation background-task flush and assertion or judge work are outside that per-turn timeout. `settings.timeout_per_scenario_ms` separately bounds the complete scenario attempt across its turns and steps. These are different from `tool_security.*.timeout_ms`, which applies to each individual `Tool::execute` invocation attempt, and from `command.timeout_ms`, which bounds the direct child process. No timeout layer promises rollback of effects that already escaped to a filesystem, process, network, or custom integration.
 
 ---
 

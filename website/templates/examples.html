@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block scripts %}<script src="{{ get_url(path='js/examples.js') }}" defer></script>{% endblock scripts %}
+{% block content %}
+<div class="container section-padding examples-shell">
+    <header class="examples-header">
+        <p class="examples-eyebrow">Build from a working example</p>
+        <h1>What do you want your agent to do?</h1>
+        <p>Choose a starting point, follow the execution flow, and adapt the original YAML. Each guide includes setup steps and links to its source.</p>
+        <a href="#full-catalog" class="examples-catalog-link">Browse the complete example catalog <span aria-hidden="true">↓</span></a>
+    </header>
+    <section aria-label="Find an example" data-example-gallery>
+        <form class="examples-filters" data-example-filters hidden role="search" aria-label="Filter examples">
+            <label class="examples-search">Search examples
+                <input type="search" name="query" placeholder="Try approval, memory, or local" autocomplete="off" aria-controls="example-cards">
+            </label>
+            <label>Goal
+                <select name="goal" aria-controls="example-cards"><option value="">Any goal</option></select>
+            </label>
+            <label>Feature
+                <select name="feature" aria-controls="example-cards"><option value="">Any feature</option></select>
+            </label>
+            <label>Setup
+                <select name="setup" aria-controls="example-cards"><option value="">Any setup</option></select>
+            </label>
+            <button class="btn btn-outline" type="reset">Reset filters</button>
+        </form>
+        <p class="examples-count" data-example-count role="status" aria-live="polite" aria-atomic="true">{{ section.pages | length }} starting points</p>
+        <div class="examples-grid" id="example-cards">
+            {% for example in section.pages %}
+            <article class="example-card" data-example-card data-goal="{{ example.extra.goal }}" data-features="{{ example.extra.features | join(sep='|') }}" data-setup="{{ example.extra.setup }}">
+                <p class="example-goal">{{ example.extra.goal }}</p>
+                <h2><a href="{{ example.permalink }}">{{ example.title }} <span aria-hidden="true">↗</span></a></h2>
+                <p>{{ example.description }}</p>
+                <ul class="example-features" aria-label="Features">
+                    {% for feature in example.extra.features %}<li>{{ feature }}</li>{% endfor %}
+                </ul>
+                <div class="example-card-footer">
+                    <span>{{ example.extra.setup }}</span>
+                    {% if example.extra.mocked_eval %}<span class="example-check">Mocked check included</span>{% else %}<span>Local server required</span>{% endif %}
+                </div>
+            </article>
+            {% endfor %}
+        </div>
+        <div class="examples-empty" data-example-empty hidden>
+            <h2>No matching examples</h2>
+            <p>Try a broader search or clear your filters to see all starting points.</p>
+            <button class="btn btn-outline" type="button" data-example-reset>Show all examples</button>
+        </div>
+    </section>
+    <section class="examples-full-catalog" id="full-catalog" aria-labelledby="catalog-title">
+        <h2 id="catalog-title">Complete example catalog</h2>
+        <p>Explore all runnable agents, Rust integrations, and evaluation suites from the repository README.</p>
+        <div class="page-content">{{ section.content | safe }}</div>
+    </section>
+</div>
+{% endblock content %}

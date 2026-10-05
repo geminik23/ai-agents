@@ -1,0 +1,112 @@
+# Curated learning paths. YAML and eval suites remain the runnable sources of truth.
+[[recipes]]
+slug = "first-chat"
+title = "Start a conversation"
+summary = "Build a small conversational agent, then verify its response without an API key."
+goal = "Conversation"
+features = ["Conversation", "Memory"]
+setup = "Hosted model"
+source = "examples/yaml/basic/simple_chat.yaml"
+eval = "examples/eval/mocked/basic/simple_chat_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for interactive chat. The mocked check below needs no provider key."]
+flow = ["Read the system prompt and the user message.", "Generate a response with the configured model.", "Retain conversation messages in memory for the running session."]
+customize = ["Change system_prompt to define the assistant's purpose.", "Select a provider/model and adjust memory.max_messages."]
+docs = ["getting-started", "providers", "evaluation"]
+
+[[recipes]]
+slug = "local-chat"
+title = "Chat with a local model"
+summary = "Use the native Ollama provider with a model running on your own machine."
+goal = "Conversation"
+features = ["Conversation", "Local model"]
+setup = "Local model"
+source = "examples/yaml/basic/ollama_chat.yaml"
+prerequisites = ["Install Ollama and start its server with `ollama serve`.", "Pull the configured model with `ollama pull llama3.2`. No hosted provider key is needed."]
+flow = ["Send the conversation to the local Ollama server.", "Generate with llama3.2 and the configured context window.", "Keep recent messages in memory during this process."]
+customize = ["Choose a model you have pulled locally.", "Tune num_ctx, keep_alive, and num_gpu for your machine."]
+docs = ["providers", "getting-started"]
+
+[[recipes]]
+slug = "use-tools"
+title = "Let an agent use tools"
+summary = "Give an agent explicit access to a calculator, the clock, and an echo tool."
+goal = "Tools and approval"
+features = ["Tools"]
+setup = "Hosted model"
+source = "examples/yaml/basic/simple_tools.yaml"
+eval = "examples/eval/mocked/basic/simple_tools_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for interactive execution.", "The three declared tools are built in; no external tool server is required."]
+flow = ["Expose only the tools declared in the agent configuration.", "Let the model request a useful tool, or answer directly.", "Return the tool result to the model for its response."]
+customize = ["Change the declared tools to fit your task.", "Keep tool grants explicit; a prompt that mentions a tool does not grant access."]
+docs = ["built-in-tools", "yaml-reference", "evaluation"]
+
+[[recipes]]
+slug = "support-states"
+title = "Guide a support conversation"
+summary = "Route requests through support states, nested troubleshooting, escalation, and clarification."
+goal = "Workflow"
+features = ["States", "Memory"]
+setup = "Hosted model"
+source = "examples/yaml/state-machine/support_state_machine.yaml"
+eval = "examples/eval/mocked/state-machine/support_state_machine_technical_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for the response and transition models.", "This example guides a conversation; it does not connect to a real order or ticket system."]
+flow = ["Start in greeting and evaluate semantic transition conditions.", "Enter a support branch; technical support starts in its nested gathering_info state.", "Use global escalation or fallback clarification when their conditions apply.", "Move toward closing as the conversation is resolved."]
+customize = ["Replace support categories, state prompts, and transition conditions.", "Tune the clarification threshold and escalation rules for your workflow."]
+docs = ["concepts", "yaml-reference", "evaluation"]
+
+[[recipes]]
+slug = "approve-tools"
+title = "Ask before making a request"
+summary = "Pause HTTP tool calls for human approval and inspect approval, rejection, and timeout evidence."
+goal = "Tools and approval"
+features = ["Tools", "Approval"]
+setup = "Hosted model + HTTP"
+source = "examples/yaml/hitl/hitl_basic.yaml"
+eval = "examples/eval/mocked/hitl/hitl_basic_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for interactive execution.", "Run in an interactive terminal to answer the approval prompt. Approved HTTP calls make real network requests.", "The mocked check supplies HTTP and approval fixtures, so it makes no real HTTP request."]
+flow = ["The model requests an HTTP operation.", "Show the request arguments and wait for a human decision.", "Execute approved calls; return rejection or timeout outcomes without executing the HTTP request."]
+customize = ["Change approval_context and approval_message to show the information a reviewer needs.", "Adjust timeout behavior and per-tool approval rules."]
+docs = ["built-in-tools", "yaml-reference", "evaluation"]
+
+[[recipes]]
+slug = "delegate-support"
+title = "Delegate to specialist agents"
+summary = "Use state transitions to select a billing or technical specialist and forward the conversation."
+goal = "Workflow"
+features = ["States", "Multi-agent"]
+setup = "Hosted model"
+source = "examples/yaml/orchestration/customer_support_router.yaml"
+supporting = ["examples/yaml/orchestration/agents/billing_agent.yaml", "examples/yaml/orchestration/agents/technical_agent.yaml"]
+eval = "examples/eval/mocked/orchestration/customer_support_router_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for the parent and specialist agents.", "Keep the full repository checkout: the parent loads both specialist YAML files from the neighboring agents directory."]
+flow = ["Spawn the declared billing and technical agents at startup.", "Evaluate transitions from the routing state.", "Delegate the user message to the selected specialist.", "Return to routing when the resolution or new-question condition matches."]
+customize = ["Edit each specialist's prompt in its supporting file.", "Add a specialist together with its auto_spawn entry and delegate state."]
+docs = ["concepts", "yaml-reference", "evaluation"]
+
+[[recipes]]
+slug = "conversation-memory"
+title = "Remember the conversation"
+summary = "Keep a bounded message history while an agent is running."
+goal = "Conversation"
+features = ["Memory"]
+setup = "Hosted model"
+source = "examples/yaml/memory/memory_basic.yaml"
+eval = "examples/eval/mocked/memory/memory_basic_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for interactive execution.", "In-memory history is lost when this process restarts; this example does not configure durable actor memory."]
+flow = ["Add conversation messages to in-memory storage.", "Include retained history in subsequent turns.", "Apply the configured 50-message retention limit."]
+customize = ["Adjust memory.max_messages for the conversation you expect.", "Explore other memory and storage examples when you need compaction or persistence."]
+docs = ["concepts", "yaml-reference"]
+
+[[recipes]]
+slug = "model-roles"
+title = "Choose models by responsibility"
+summary = "Route auxiliary work to named models while keeping the main response model explicit."
+goal = "Model routing"
+features = ["Model roles", "States", "Skills", "Process"]
+setup = "Hosted model"
+source = "examples/yaml/reasoning/hierarchical_routing.yaml"
+eval = "examples/eval/mocked/reasoning/hierarchical_routing_mocked.yaml"
+prerequisites = ["Set OPENAI_API_KEY for interactive execution with the configured models.", "The mocked check provides responses for each alias and requires no model credentials."]
+flow = ["Detect language with an explicit local model override.", "Select a skill or reasoning path using its configured role.", "Generate the response with the main model.", "Evaluate the state transition with the state role's model."]
+customize = ["Assign provider/model settings to the llms aliases.", "Set local, role, group, or router defaults to control inheritance. A role alias does not enable a feature or provide error fallback."]
+docs = ["yaml-reference", "providers", "evaluation"]

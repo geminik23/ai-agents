@@ -1,5 +1,11 @@
+{% set getting_started_url = get_url(path="@/docs/getting-started.md") %}
 <nav class="docs-page-navigation" aria-label="Documentation pages">
+    <p class="docs-nav-group-label">Learn</p>
     <ul class="docs-page-list">
-        {% for doc in docs_section.pages %}<li><a href="{{ doc.permalink }}"{% if doc.path == current_path %} aria-current="page"{% endif %}>{{ doc.title }}</a></li>{% endfor %}
+        {% for doc in docs_section.pages %}{% set is_learning_guide = doc.extra.learning_guide | default(value=false) %}{% if doc.permalink == getting_started_url or is_learning_guide %}<li><a href="{{ doc.permalink }}"{% if doc.path == current_path %} aria-current="page"{% endif %}>{{ doc.title }}</a></li>{% endif %}{% endfor %}
+    </ul>
+    <p class="docs-nav-group-label">Reference</p>
+    <ul class="docs-page-list">
+        {% for doc in docs_section.pages %}{% set is_learning_guide = doc.extra.learning_guide | default(value=false) %}{% if doc.permalink != getting_started_url and not is_learning_guide %}<li><a href="{{ doc.permalink }}"{% if doc.path == current_path %} aria-current="page"{% endif %}>{{ doc.title }}</a></li>{% endif %}{% endfor %}
     </ul>
 </nav>

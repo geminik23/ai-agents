@@ -1,0 +1,73 @@
+// The first screen connects a complete definition to its conversation and run command.
+.home-page .hero-agents { padding: 3.5rem 0 2.5rem; }
+.hero-project-meta { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 1rem 2rem; margin-bottom: 1.75rem; }
+.hero-product-type { margin: 0; color: var(--text-heading); font-size: clamp(1.15rem, 2vw, 1.5rem); line-height: 1.4; font-weight: 650; letter-spacing: -0.025em; }
+.hero-product-type span { color: var(--accent-text); }
+.hero-agents .hero-intro { display: grid; grid-template-columns: 1fr 1fr; gap: 3rem; align-items: center; margin-bottom: 2.25rem; }
+.hero-agents .hero-heading { margin-bottom: 0; font-size: clamp(2.8rem, 5vw, 4.25rem); }
+.hero-agents .hero-message { min-width: 0; }
+.home-page .hero-agents .hero-subtitle { margin-bottom: 0.6rem; font-size: clamp(1.2rem, 2vw, 1.5rem); color: var(--text-heading); }
+.home-page .hero-agents .hero-description { margin: 0 0 1.1rem; max-width: none; font-size: 0.95rem; }
+.agent-showcase { border: 1px solid var(--border-strong); border-radius: 12px; background: var(--bg-surface); overflow: hidden; box-shadow: var(--shadow-soft); min-width: 0; }
+.agent-showcase-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1rem; padding: 0.75rem 1.5rem; border-bottom: 1px solid var(--border); }
+.agent-showcase-heading > span { color: var(--text-muted); font-size: 0.8rem; }
+.agent-preset-tabs { display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.agent-preset-tabs button { min-height: 40px; padding: 0.5rem 1rem; border: 1px solid transparent; border-radius: 5px; color: var(--text-muted); background: transparent; font: inherit; font-size: 0.85rem; cursor: pointer; }
+.agent-preset-tabs button:hover { color: var(--text-heading); background: var(--bg-surface-2); }
+.agent-preset-tabs button[aria-selected="true"] { color: var(--accent-text); background: var(--accent-muted); border-color: var(--accent-text); }
+.agent-preset-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.agent-preset-panel + .agent-preset-panel { border-top: 1px solid var(--border); }
+[data-tabs-ready] .agent-preset-panel { border-top: 0; }
+.agent-definition, .agent-conversation { padding: 1.35rem 1.5rem; min-width: 0; }
+.agent-definition { background: var(--code-bg); display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+.agent-panel-heading { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem; margin-bottom: 1rem; }
+.agent-stage { font-family: var(--font-sans); font-size: 0.68rem; font-weight: 650; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.agent-definition .code-block { background: transparent; margin: 0; padding: 0; border: 0; border-radius: 0; }
+.agent-definition .code-block code { padding: 2.5rem 0 0; font-size: 0.9rem; line-height: 1.75; color: var(--code-text); }
+.agent-definition .code-copy-wrap { margin: 0; }
+.agent-definition .code-copy-button { top: 0; right: 0; }
+.agent-definition-personality { color: var(--accent-text); }
+.agent-definition-note { margin: auto 0 0; padding-top: 1rem; font-size: 0.75rem; color: var(--text-muted); }
+.agent-conversation { display: flex; flex-direction: column; min-height: 320px; }
+.agent-chat-message { font-size: 0.9rem; }
+.agent-chat-message p { white-space: pre-line; line-height: 1.7; margin: 0.5rem 0 0; }
+.agent-chat-speaker { display: flex; align-items: center; gap: 0.45rem; font-size: 0.72rem; font-weight: 650; color: var(--text-muted); }
+.agent-chat-user { padding: 0.8rem 1rem; margin: 0.1rem 0 1.25rem 1.5rem; background: var(--bg-surface-2); border: 1px solid var(--border); border-radius: 8px 8px 2px 8px; }
+.agent-chat-user p { color: var(--text-heading); }
+.agent-chat-reply { padding: 0 0.25rem; }
+.agent-chat-reply .agent-chat-speaker { color: var(--accent-text); }
+.agent-avatar { font-size: 1rem; line-height: 1; }
+.agent-purpose { margin: auto 0 0; padding-top: 1.25rem; color: var(--text-muted); font-size: 0.75rem; }
+.agent-run-strip { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 1rem 1.5rem; align-items: center; padding: 1rem 1.5rem; border-top: 1px solid var(--border); background: var(--bg); }
+.agent-run-strip > div { display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem 1rem; margin-right: auto; min-width: 0; }
+.agent-run-strip code { color: var(--code-text); font-size: 0.8rem; overflow-wrap: anywhere; }
+.agent-run-strip > a { font-size: 0.8rem; font-weight: 600; }
+.agent-demo-about { padding: 0.6rem 1.5rem; border-top: 1px solid var(--border); font-size: 0.7rem; color: var(--text-muted); }
+.agent-demo-about summary { cursor: pointer; }
+.agent-demo-about p { margin: 0.5rem 0; }
+.hero-install-bar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem 2rem; margin-top: 1.5rem; }
+.hero-install-bar > div { display: flex; flex-wrap: wrap; align-items: center; gap: 0.65rem 1rem; min-width: 0; }
+.hero-install-bar span, .hero-install-bar p { font-size: 0.75rem; color: var(--text-muted); margin: 0; }
+.hero-install-bar code { color: var(--text); font-size: 0.8rem; }
+.approval-demo-section { margin-bottom: 2rem; }
+.approval-demo-section > h2 { font-size: 1.3rem; }
+.approval-demo-section .execution-demo { max-width: 100%; }
+.approval-demo-section .execution-config .code-block code { padding: 2.5rem 0 0; font-size: 0.875rem; }
+.approval-demo-section .execution-config .code-copy-wrap { margin: 0.5rem 0 0; }
+@media (max-width: 767px) {
+  .home-page .hero-agents { padding-top: 2rem; }
+  .hero-agents .hero-intro { grid-template-columns: minmax(0, 1fr); gap: 1.25rem; margin-bottom: 1.75rem; }
+  .agent-showcase-heading { padding: 0.75rem 1rem; gap: 0.5rem; }
+  .agent-preset-tabs { width: 100%; }
+  .agent-preset-tabs button { flex: 1; min-height: 44px; padding-inline: 0.5rem; }
+  .agent-preset-panel { grid-template-columns: minmax(0, 1fr); }
+  .agent-definition { border-right: 0; border-bottom: 1px solid var(--border); }
+  .agent-definition, .agent-conversation { padding: 1rem; }
+  .agent-definition .code-block code { font-size: 0.76rem; }
+  .agent-conversation { min-height: 280px; }
+  .agent-chat-message { font-size: 0.85rem; }
+  .agent-run-strip { padding: 1rem; }
+  .agent-run-strip > div { width: 100%; }
+  .agent-run-strip code { font-size: 0.72rem; }
+  .agent-demo-about { padding-inline: 1rem; }
+}

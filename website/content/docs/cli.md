@@ -2,10 +2,13 @@
 title = "CLI Guide"
 weight = 3
 template = "docs.html"
-description = "Command-line interface reference for ai-agents-cli."
+description = "Install ai-agents-cli to run YAML agents, validate configuration, and execute evaluation suites from the command line."
+
+[extra]
+seo_title = "AI Agents CLI: Run, Validate, and Evaluate YAML Agents"
 +++
 
-The `ai-agents-cli` crate gives you a ready-made command-line tool for running any YAML-defined agent. Install it, point it at a file, and you're in a live REPL session.
+The `ai-agents-cli` crate runs YAML-defined agents on the ai-agents Rust runtime. Use it to start a conversation, validate an agent configuration, or run evaluation suites from the terminal. For provider setup and your first conversation, follow [Getting Started](@/docs/getting-started.md).
 
 ---
 

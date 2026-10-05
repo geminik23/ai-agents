@@ -1,0 +1,27 @@
+# Public demo inputs. Fixed responses make the recorded walkthrough reproducible.
+[[agents]]
+id = "assistant"
+name = "Assistant"
+description = "A helpful assistant for everyday questions."
+yaml_path = "static/agents/assistant.yaml"
+download_path = "agents/assistant.yaml"
+input = "Help me plan a focused morning."
+response = "Pick one important task.\nWork on it for 45 minutes without notifications.\nTake a short break, then review your progress."
+
+[[agents]]
+id = "translator"
+name = "Translator"
+description = "A translator with one clear responsibility."
+yaml_path = "static/agents/translator.yaml"
+download_path = "agents/translator.yaml"
+input = "회의를 내일로 옮겨 주세요."
+response = "Please move the meeting to tomorrow."
+
+[[agents]]
+id = "tutor"
+name = "Tutor"
+description = "A tutor that explains and checks understanding."
+yaml_path = "static/agents/tutor.yaml"
+download_path = "agents/tutor.yaml"
+input = "What is a loop?"
+response = "A loop repeats an action. For example, a program can say hello to each name in a list.\n\nIf the list has three names, how many greetings will it print?"

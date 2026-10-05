@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container section-padding example-detail">
+    <nav class="example-breadcrumb" aria-label="Breadcrumb"><a href="{{ get_url(path='@/examples/_index.md') }}">Examples</a><span aria-hidden="true"> / </span><span aria-current="page">{{ page.title }}</span></nav>
+    <article>
+        <header class="example-detail-header">
+            <p class="examples-eyebrow">{{ page.extra.goal }} · {{ page.extra.setup }}</p>
+            <h1>{{ page.title }}</h1>
+            <p>{{ page.description }}</p>
+            <ul class="example-features" aria-label="Features">{% for feature in page.extra.features %}<li>{{ feature }}</li>{% endfor %}</ul>
+        </header>
+        <nav class="example-sections" aria-label="On this page">
+            <a href="#before-you-run">Setup</a>
+            <a href="#how-it-works">Flow</a>
+            <a href="#run-the-agent">Run</a>
+            <a href="#check-the-behavior">Check</a>
+            <a href="#original-yaml">YAML</a>
+        </nav>
+        {% if page.slug == "approve-tools" %}
+        <section class="approval-demo-section" aria-labelledby="approval-demo-heading">
+            <h2 id="approval-demo-heading">Explore approval outcomes</h2>
+            {% include "partials/execution-demo.html" %}
+        </section>
+        {% endif %}
+        <div class="page-content">{{ page.content | safe }}</div>
+    </article>
+</div>
+{% endblock content %}

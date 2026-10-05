@@ -1,0 +1,77 @@
+// Curated recipes share the site's container width and progressively enhanced controls.
+.examples-shell, .example-detail { min-width: 0; }
+.examples-header, .example-detail-header { margin-bottom: 2rem; }
+.examples-eyebrow, .example-goal {
+  color: var(--accent-text);
+  font-size: .78rem;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+}
+.examples-catalog-link { display: inline-block; font-weight: 600; }
+.examples-filters {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.6fr) repeat(3, minmax(130px, 1fr)) auto;
+  gap: .8rem;
+  align-items: end;
+  padding: 1.2rem;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  label { display: grid; gap: .4rem; min-width: 0; font-size: .85rem; font-weight: 600; }
+  input, select {
+    width: 100%; min-width: 0; min-height: 44px;
+    border: 1px solid var(--border-strong); border-radius: 6px;
+    padding: .65rem; color: var(--text); background: var(--bg);
+    font: inherit;
+  }
+  button { min-height: 44px; white-space: nowrap; }
+}
+.examples-count { margin: 1rem 0; color: var(--text-muted); font-size: .9rem; }
+.examples-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.2rem; }
+.example-card {
+  min-width: 0; display: flex; flex-direction: column;
+  padding: 1.5rem; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--bg-surface);
+  h2 { font-size: 1.2rem; line-height: 1.4; }
+  h2 a { color: var(--text-heading); }
+  h2 a:hover { color: var(--link-hover); }
+  h2 a span { color: var(--link); }
+  p { font-size: .95rem; }
+  .example-goal { font-size: .75rem; }
+  &:focus-within { border-color: var(--accent-text); }
+}
+.example-features {
+  display: flex; flex-wrap: wrap; gap: .4rem .8rem;
+  list-style: none; padding: 0; margin: 0 0 1.25rem;
+  li { font-size: .78rem; font-weight: 600; color: var(--text); }
+  li::before { content: "·"; margin-right: .4rem; color: var(--accent-text); }
+}
+.example-card-footer {
+  display: flex; flex-direction: column; gap: .3rem; margin-top: auto;
+  padding-top: 1rem; border-top: 1px solid var(--border);
+  font-size: .78rem; color: var(--text-muted);
+  .example-check { color: var(--success); }
+}
+.examples-empty { padding: 2.5rem 1rem; text-align: center; border: 1px dashed var(--border-strong); border-radius: 12px; }
+.examples-full-catalog { margin-top: 4rem; padding-top: 2rem; border-top: 1px solid var(--border); min-width: 0; }
+.example-breadcrumb { display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 2rem; font-size: .9rem; }
+.example-sections {
+  display: flex; flex-wrap: wrap; gap: .5rem; margin-bottom: 2rem;
+  a { padding: .5rem .9rem; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 6px; }
+  a:hover { border-color: var(--link); }
+}
+.example-detail .page-content { min-width: 0; }
+// Explicit hidden rules beat the grid/flex display modes and remove hidden links from focus order.
+.examples-filters[hidden], .example-card[hidden], .examples-empty[hidden] { display: none; }
+@media (max-width: 1100px) {
+  .examples-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .examples-search { grid-column: 1 / -1; }
+  .examples-filters button { grid-column: 1 / -1; justify-self: start; }
+  .examples-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 600px) {
+  .examples-grid, .examples-filters { grid-template-columns: minmax(0, 1fr); }
+  .examples-filters button { width: 100%; }
+  .example-card { padding: 1.25rem; }
+}

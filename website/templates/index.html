@@ -1,49 +1,27 @@
 {% extends "base.html" %}
-{% block title %}{{ config.title }} — One YAML = Any Agent{% endblock title %}
+
 {% block content %}
 <div class="home-page">
-    <section class="hero" aria-labelledby="hero-heading">
-        <div class="hero-inner container">
-            <div class="hero-copy">
-                <p class="hero-kicker">Rust-native agent framework</p>
-                <h1 class="hero-heading" id="hero-heading">One YAML =<br />Any Agent.</h1>
-                <p class="hero-subtitle">Define behavior in YAML. Control how tools run. Test what your agent does.</p>
-                <p class="hero-description">Start with a conversation and grow into stateful workflows, reusable skills, and collaborating agents - on the same Rust runtime.</p>
-                <div class="hero-actions">
-                    <a href="{{ get_url(path='@/docs/getting-started.md') }}" class="btn btn-primary">Get Started <span aria-hidden="true">→</span></a>
-                    <a href="{{ get_url(path='@/examples/_index.md') }}" class="btn btn-outline">Explore Examples</a>
-                </div>
-                <div class="home-install">
-                    <span class="home-install-label">Install the CLI</span>
-                    <pre class="code-block code-block--terminal"><code>cargo install ai-agents-cli</code></pre>
-                </div>
-                <p class="hero-prerequisites">Rust 1.88+ and a configured provider. <a href="{{ get_url(path='@/docs/getting-started.md') }}">Setup guide</a></p>
+    <section class="hero hero-agents" aria-labelledby="hero-heading">
+        <div class="container">
+            <div class="hero-project-meta">
+                <p class="hero-product-type"><span>Rust-native</span> agent framework</p>
                 <div class="hero-badges" aria-label="Project links">
-                    <a href="{{ config.extra.crates_io }}" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/crates/v/ai-agents?style=flat-square&amp;color=c93632" alt="Published crates.io version" loading="lazy" /></a>
-                    <a href="{{ config.extra.docs_rs }}" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/docsrs/ai-agents?style=flat-square&amp;label=docs.rs" alt="Rust API documentation on docs.rs" loading="lazy" /></a>
-                    <a href="{{ config.extra.github }}/blob/main/LICENSE-APACHE" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/crates/l/ai-agents?style=flat-square" alt="Apache-2.0 license" loading="lazy" /></a>
+                    <a href="{{ config.extra.crates_io }}" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/crates/v/ai-agents?style=flat-square&amp;color=c93632" alt="Published crates.io version" /></a>
+                    <a href="{{ config.extra.docs_rs }}" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/docsrs/ai-agents?style=flat-square&amp;label=docs.rs" alt="Rust API documentation on docs.rs" /></a>
+                    <a href="{{ config.extra.github }}/blob/main/LICENSE-APACHE" target="_blank" rel="noopener noreferrer"><img src="https://img.shields.io/crates/l/ai-agents?style=flat-square" alt="Apache-2.0 license" /></a>
                 </div>
             </div>
-            <div class="hero-demo">
-                <div class="code-window">
-                    <div class="code-window-header"><span class="code-window-title">agent.yaml</span><span class="demo-label">Configuration example</span></div>
-                    <pre class="code-block"><code class="language-yaml"><span class="code-key">name</span>: <span class="code-string">SupportAgent</span>
-<span class="code-key">system_prompt</span>: <span class="code-string">"Help customers with clear answers."</span>
-<span class="code-key">llm</span>:
-  <span class="code-key">provider</span>: <span class="code-string">openai</span>
-  <span class="code-key">model</span>: <span class="code-string">gpt-5.4-nano</span>
-<span class="code-key">tools</span>:
-  - <span class="code-string">calculator</span></code></pre>
-                    <div class="demo-explanation">
-                        <p class="demo-explanation-title">A small definition. An explicit tool grant.</p>
-                        <p>The model can request <code>calculator</code>; the runtime resolves and executes the call through its shared tool executor.</p>
-                        <p class="demo-caption">Illustrative configuration, not a live session.</p>
-                    </div>
-                </div>
-                <a class="home-text-link" href="{{ get_url(path='@/docs/yaml-reference.md') }}">Explore the YAML reference <span aria-hidden="true">→</span></a>
+            <div class="hero-intro">
+                <div class="hero-copy"><h1 class="hero-heading" id="hero-heading">One YAML =<br />Any Agent.</h1></div>
+                <div class="hero-message"><p class="hero-subtitle">Define behavior in YAML. Control how tools run. Test what your agent does.</p><p class="hero-description">Start with a conversation and grow into stateful workflows, reusable skills, and collaborating agents - on the same Rust runtime.</p><div class="hero-actions"><a href="{{ get_url(path='@/docs/getting-started.md') }}" class="btn btn-primary">Get Started <span aria-hidden="true">→</span></a><a href="{{ get_url(path='@/examples/_index.md') }}" class="btn btn-outline">Explore Examples</a></div></div>
             </div>
+            {% include "partials/agent-demo.html" %}
+            <div class="hero-install-bar"><div><span>Install the CLI</span><code>cargo install ai-agents-cli</code></div><p>Rust 1.88+ · <a href="{{ get_url(path='@/docs/getting-started.md') }}">Configure your provider</a></p></div>
         </div>
     </section>
+
+    {% include "partials/agent-growth.html" %}
 
     <section class="home-values home-section" aria-labelledby="values-heading">
         <div class="container">
@@ -60,11 +38,30 @@
         <div class="container">
             <div class="home-section-intro"><p class="home-eyebrow">Patterns to start from</p><h2 class="section-heading" id="cases-heading">One runtime. Different workflows.</h2><p class="section-subtitle">Explore runnable examples and adapt their behavior to your application.</p></div>
             <div class="home-case-grid">
-                <article class="home-case"><p class="home-case-kind">Stateful support</p><h3>Guide a conversation</h3><p>Route requests through support branches, gather details in nested states, and escalate when needed.</p><p class="home-case-flow">Greeting → support branch → resolution</p><a class="home-text-link" href="{{ config.extra.github }}/blob/main/examples/yaml/state-machine/support_state_machine.yaml">View state machine example <span aria-hidden="true">↗</span></a><a class="home-case-doc" href="{{ get_url(path='@/docs/concepts.md') }}#state-machine">How states work</a></article>
-                <article class="home-case"><p class="home-case-kind">Human oversight</p><h3>Review a tool request</h3><p>Pause HTTP tool calls for approval. An approved request runs; a rejected request returns an outcome the agent can explain.</p><p class="home-case-flow">Request → human approval → tool result</p><a class="home-text-link" href="{{ config.extra.github }}/blob/main/examples/yaml/hitl/hitl_basic.yaml">View approval example <span aria-hidden="true">↗</span></a><a class="home-case-doc" href="{{ get_url(path='@/docs/yaml-reference.md') }}#hitl-human-in-the-loop">Configure approvals</a></article>
-                <article class="home-case"><p class="home-case-kind">Multi-agent routing</p><h3>Delegate to a specialist</h3><p>Start billing and technical agents from YAML, then delegate customer messages through routing states.</p><p class="home-case-flow">Triage → specialist agent → response</p><a class="home-text-link" href="{{ config.extra.github }}/blob/main/examples/yaml/orchestration/customer_support_router.yaml">View router example <span aria-hidden="true">↗</span></a><a class="home-case-doc" href="{{ get_url(path='@/docs/concepts.md') }}#multi-agent-orchestration">Explore orchestration</a></article>
+                <article class="home-case"><p class="home-case-kind">Stateful support</p><h3>Guide a conversation</h3><p>Route requests through support branches, gather details in nested states, and escalate when needed.</p><p class="home-case-flow">Greeting → support branch → resolution</p><a class="home-text-link" href="{{ get_url(path='@/examples/recipe-support-states.md') }}">Build a state workflow <span aria-hidden="true">↗</span></a><a class="home-case-doc" href="{{ get_url(path='@/docs/concepts.md') }}#state-machine">How states work</a></article>
+                <article class="home-case"><p class="home-case-kind">Conversation memory</p><h3>Build on what was said</h3><p>Keep recent messages available so the next answer can use the context of your conversation.</p><p class="home-case-flow">First turn → retained history → follow-up</p><a class="home-text-link" href="{{ get_url(path='@/examples/recipe-conversation-memory.md') }}">Try conversation memory <span aria-hidden="true">→</span></a><a class="home-case-doc" href="{{ get_url(path='@/docs/memory-and-identity.md') }}">Choose what to remember</a></article>
+                <article class="home-case"><p class="home-case-kind">Multi-agent routing</p><h3>Delegate to a specialist</h3><p>Start billing and technical agents from YAML, then delegate customer messages through routing states.</p><p class="home-case-flow">Triage → specialist agent → response</p><a class="home-text-link" href="{{ get_url(path='@/examples/recipe-delegate-support.md') }}">Connect specialist agents <span aria-hidden="true">↗</span></a><a class="home-case-doc" href="{{ get_url(path='@/docs/concepts.md') }}#multi-agent-orchestration">Explore orchestration</a></article>
             </div>
-            <p class="home-case-note">These examples require a configured model provider. The approval example makes real HTTP requests when approved.</p>
+            <p class="home-case-note">Start from a complete YAML example, then adapt its prompts and behavior to your application.</p>
+        </div>
+    </section>
+
+    <section class="home-section" aria-labelledby="paths-heading">
+        <div class="container">
+            <div class="home-section-intro"><p class="home-eyebrow">Choose a starting point</p><h2 class="section-heading" id="paths-heading">Start where you are.</h2><p class="section-subtitle">A configuration file, a Rust application, a local model, or a deterministic test.</p></div>
+            <div class="home-paths">
+                <a class="home-path" href="{{ get_url(path='@/docs/getting-started.md') }}#your-first-agent-cli"><span>01 / CLI</span><h3>Run your first YAML →</h3><p>Configure a provider and start a conversation in the terminal.</p></a>
+                <a class="home-path" href="{{ get_url(path='@/docs/getting-started.md') }}#your-first-agent-rust"><span>02 / Rust</span><h3>Embed in your app →</h3><p>Use the same runtime with your own tools, storage, and hooks.</p></a>
+                <a class="home-path" href="{{ get_url(path='@/examples/recipe-local-chat.md') }}"><span>03 / Local</span><h3>Use a local model →</h3><p>Connect Ollama and run a downloaded model on your machine.</p></a>
+                <a class="home-path" href="{{ get_url(path='@/docs/getting-started.md') }}#start-with-a-mocked-evaluation"><span>04 / No API key</span><h3>Test the runtime →</h3><p>Run fixed model responses and check the execution evidence.</p></a>
+            </div>
+        </div>
+    </section>
+
+    <section class="home-section" aria-labelledby="roles-heading">
+        <div class="container home-role-feature">
+            <div><p class="home-eyebrow">Models by responsibility</p><h2 class="section-heading" id="roles-heading">One response model.<br />Specialists for the supporting work.</h2><p class="experience-lead">Use a fast alias for detection, another for state decisions, and a local override when one operation needs something different.</p><a class="home-text-link" href="{{ get_url(path='@/explore/roles.md') }}">Try the role selection explorer <span aria-hidden="true">→</span></a></div>
+            <div><ol class="home-role-preview" aria-label="Auxiliary model selection priority"><li><span>01 · Local override</span><code>precise ← selected</code></li><li><span>02 · Role leaf</span><code>process.detect</code></li><li><span>03 · Group default</span><code>process.default</code></li><li><span>04 · Router default</span><code>router.default</code></li><li><span>05 · Main alias</span><code>llm.default</code></li></ol><p class="experience-note">The first configured alias wins. An invalid alias is a configuration error.</p></div>
         </div>
     </section>
 
@@ -113,7 +110,7 @@
                 <div class="tab-panel" role="tabpanel" id="tab-api" aria-labelledby="btn-api" tabindex="0">
                     <h3 class="quickstart-method-heading">From the Rust API</h3>
                     <p>Provide an LLM implementation and configure the agent directly.</p>
-                    <div class="code-window"><div class="code-window-header"><span class="code-window-title">main.rs</span></div><pre class="code-block"><code class="language-rust"><span class="code-keyword">use</span> ai_agents::{AgentBuilder, UnifiedLLMProvider, ProviderType};
+                    <div class="code-window"><div class="code-window-header"><span class="code-window-title">main.rs</span></div><pre class="code-block"><code class="language-rust"><span class="code-keyword">use</span> ai_agents::{Agent, AgentBuilder, UnifiedLLMProvider, ProviderType};
 <span class="code-keyword">use</span> std::sync::Arc;
 
 <span class="code-attribute">#[tokio::main]</span>

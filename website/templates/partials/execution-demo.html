@@ -1,0 +1,26 @@
+{% set execution = load_data(path="catalog/execution-demo.json") %}
+<div class="execution-demo" data-tabs>
+    <div class="execution-heading"><span class="execution-indicator" aria-hidden="true"></span><span>One agent. Three outcomes.</span><span class="execution-mode">Recorded mock</span></div>
+    <div class="execution-config"><span class="execution-file">hitl_basic.yaml · excerpt</span><pre class="code-block"><code>tools: [http]
+hitl:
+  on_timeout: reject
+  tools:
+    http:
+      require_approval: true</code></pre></div>
+    <div class="execution-tabs" role="tablist" aria-label="Recorded approval outcomes">
+        {% for turn in execution.turns %}<button type="button" role="tab" id="case-{{ turn.id }}" aria-controls="outcome-{{ turn.id }}" aria-selected="{% if loop.first %}true{% else %}false{% endif %}">{{ turn.label }}</button>{% endfor %}
+    </div>
+    {% for turn in execution.turns %}
+    <section class="execution-outcome" id="outcome-{{ turn.id }}" role="tabpanel" aria-labelledby="case-{{ turn.id }}" tabindex="0">
+        <h2>{{ turn.title }}</h2>
+        <ol class="execution-flow">
+            <li><span class="execution-node" aria-hidden="true">1</span><div><strong>Model requests <code>http</code></strong><span>Fixed model response from the public fixture</span></div></li>
+            <li><span class="execution-node" aria-hidden="true">2</span><div><strong>{% if turn.id == "approved" %}Approval accepted{% elif turn.id == "rejected" %}Approval rejected{% else %}Approval times out{% endif %}</strong><span>{% if turn.id == "timeout" %}Timeout policy resolves to rejection{% else %}Deterministic approval fixture{% endif %}</span></div></li>
+            <li class="execution-terminal"><span class="execution-node" aria-hidden="true">{% if turn.executed %}✓{% else %}–{% endif %}</span><div><strong>{% if turn.executed %}Tool fixture executes{% else %}Tool does not execute{% endif %}</strong><span>{% if turn.executed %}Result check: HTTP status 200{% else %}A cancellation response finalizes the turn{% endif %}</span></div></li>
+        </ol>
+        <div class="execution-evidence"><div><span>executed</span><strong>{{ turn.executed }}</strong></div><div><span>success</span><strong>{{ turn.success }}</strong></div><div><span>checks passed</span><strong>{{ turn.checks_passed }}</strong></div></div>
+        <details class="execution-details"><summary>What this verifies</summary><p>{{ turn.description }}</p><p>The checks verify the approval outcome, whether the tool executed, and the returned result. These are recorded test outcomes, not an interactive approval request.</p><a href="{{ config.extra.github }}/blob/{{ execution.source_revision }}/{{ execution.source_suite }}">Inspect the public scenario ↗</a></details>
+    </section>
+    {% endfor %}
+    <div class="execution-footer"><p>Actual runtime evaluation with model, HTTP, and approval fixtures. No live model or HTTP request. Select a recorded outcome to inspect its checks. <a href="{{ config.extra.github }}/tree/{{ execution.source_revision }}">Evaluated source revision ↗</a></p><a href="#run-the-agent">Run and test this example →</a></div>
+</div>
