@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.1.0 - 2026-10-05
+
+### Added
+- Auxiliary model routing: typed router defaults and role-specific aliases cover state, skills, processing, reasoning, memory, orchestration, spawning, web extraction, approval text, and evaluation judges
+
+### Changed
+- Rust configuration compatibility: 1.1 includes a one-time approved source-breaking change for router selectors and four local alias fields, with migration guidance; scalar YAML selection remains legacy
+- Hierarchical child snapshots: loaded skill declarations are saved inline in a persistence-only spec copy, and retained-child routing differences fail before restore mutation
+
 ## 1.0.11 - 2026-09-27
 
 ### Fixed

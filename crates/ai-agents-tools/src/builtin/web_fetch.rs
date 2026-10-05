@@ -174,6 +174,7 @@ pub struct WebFetchTool {
     resolver: Arc<dyn WebFetchResolver>,
     cache: Arc<RwLock<WebFetchCache>>,
     extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
+    extractor_binding: RwLock<(Option<Arc<dyn LLMProvider>>, u64)>,
 }
 
 impl WebFetchTool {
@@ -210,7 +211,38 @@ impl WebFetchTool {
             resolver,
             cache: Arc::new(RwLock::new(WebFetchCache::new(MAX_CACHE_ENTRIES))),
             extractor,
+            extractor_binding: RwLock::new((None, 0)),
         }
+    }
+}
+
+impl WebFetchTool {
+    // Framework registry copies retain transport/resolver handles but start with agent-local extraction and cache.
+    pub(crate) fn fork_with_extractor(
+        &self,
+        extractor: Arc<RwLock<Option<Arc<dyn LLMProvider>>>>,
+    ) -> Self {
+        Self::with_extractor_slot_and_transport(
+            extractor,
+            self.transport.clone(),
+            self.resolver.clone(),
+        )
+    }
+
+    // Capture the provider once so extraction and cache identity cannot diverge across an await.
+    fn capture_extractor(&self) -> (Option<Arc<dyn LLMProvider>>, u64) {
+        let provider = self.extractor.read().clone();
+        let mut binding = self.extractor_binding.write();
+        let unchanged = match (&binding.0, &provider) {
+            (Some(previous), Some(current)) => Arc::ptr_eq(previous, current),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            binding.0 = provider.clone();
+            binding.1 = binding.1.wrapping_add(1);
+        }
+        (provider, binding.1)
     }
 }
 
@@ -519,14 +551,20 @@ impl Tool for WebFetchTool {
         {
             return result;
         }
+        let (extraction_provider, binding_generation) = if input.prompt.is_some() {
+            self.capture_extractor()
+        } else {
+            (None, 0)
+        };
         let cache_key = format!(
-            "{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}",
             input.url,
             input.prompt.as_deref().unwrap_or(""),
             max_output_chars,
             max_response_bytes,
             max_redirects,
-            policy_cache_fingerprint(&policy)
+            policy_cache_fingerprint(&policy),
+            binding_generation
         );
         if cache_lifetime.is_some() {
             let cached_output = { self.cache.write().get(&cache_key, Instant::now()) };
@@ -645,7 +683,7 @@ impl Tool for WebFetchTool {
         let mut final_content = content;
         let mut extraction_error = None;
         if let Some(prompt) = input.prompt.as_deref()
-            && let Some(extractor) = { self.extractor.read().clone() }
+            && let Some(extractor) = extraction_provider
         {
             match extract_with_llm(extractor, prompt, &final_content).await {
                 Ok(answer) => {

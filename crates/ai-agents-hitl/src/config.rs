@@ -96,15 +96,15 @@ impl Default for MessageLanguageConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmGenerateConfig {
-    #[serde(default = "default_router")]
-    pub llm: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "ai_agents_llm::deserialize_present_alias"
+    )]
+    pub llm: Option<String>,
 
     #[serde(default = "default_true")]
     pub include_context: bool,
-}
-
-fn default_router() -> String {
-    "router".to_string()
 }
 
 fn default_true() -> bool {
@@ -114,7 +114,7 @@ fn default_true() -> bool {
 impl Default for LlmGenerateConfig {
     fn default() -> Self {
         Self {
-            llm: default_router(),
+            llm: None,
             include_context: default_true(),
         }
     }
@@ -407,7 +407,7 @@ tools:
         );
 
         let llm_config = config.message_language.llm_generate.as_ref().unwrap();
-        assert_eq!(llm_config.llm, "router");
+        assert_eq!(llm_config.llm.as_deref(), Some("router"));
         assert!(llm_config.include_context);
     }
 
@@ -585,7 +585,7 @@ states:
     #[test]
     fn test_llm_generate_config_defaults() {
         let config = LlmGenerateConfig::default();
-        assert_eq!(config.llm, "router");
+        assert_eq!(config.llm, None);
         assert!(config.include_context);
     }
 }

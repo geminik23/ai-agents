@@ -122,7 +122,22 @@ impl JudgeResolver {
     }
 
     pub fn resolve(&self, alias: Option<&str>) -> Result<LLMJudge> {
-        let llm = if let Some(alias) = alias {
+        self.resolve_role(ai_agents_llm::LLMRole::EvaluationResponse, alias)
+    }
+
+    /// Selects a judge role without activating the unused suite-wide alias field.
+    pub fn resolve_role(
+        &self,
+        role: ai_agents_llm::LLMRole,
+        alias: Option<&str>,
+    ) -> Result<LLMJudge> {
+        let llm = if let Some(resolved) = self
+            .registry
+            .resolve_role_override(role, alias)
+            .map_err(|error| EvalError::Judge(error.to_string()))?
+        {
+            resolved.provider
+        } else if let Some(alias) = alias {
             self.registry
                 .get(alias)
                 .map_err(|error| EvalError::Judge(error.to_string()))?

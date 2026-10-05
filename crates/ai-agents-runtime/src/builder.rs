@@ -7,8 +7,8 @@ use ai_agents_context::ContextManager;
 use ai_agents_core::{AgentError, AgentStorage, LLMFeature, LLMProvider, Result, Tool};
 use ai_agents_hitl::{ApprovalHandler, HITLEngine, RejectAllHandler};
 use ai_agents_hooks::{AgentHooks, CompositeHooks};
-use ai_agents_llm::LLMRegistry;
 use ai_agents_llm::providers::{ProviderType, UnifiedLLMProvider};
+use ai_agents_llm::{LLMRegistry, LLMRole};
 use ai_agents_memory::{
     CompactingMemory, InMemoryStore, LLMSummarizer, Memory, NoopSummarizer, Summarizer,
 };
@@ -122,6 +122,9 @@ pub struct AgentBuilder {
     observability_manager: Option<Arc<ObservabilityManager>>,
     resource_locks: Option<ToolResourceLocks>,
     llm_registry_observed: bool,
+    skills_prepared: bool,
+    routing_frozen: Option<LLMRegistry>,
+    routing_dirty: bool,
 }
 
 impl AgentBuilder {
@@ -162,6 +165,9 @@ impl AgentBuilder {
             observability_manager: None,
             resource_locks: None,
             llm_registry_observed: false,
+            skills_prepared: false,
+            routing_frozen: None,
+            routing_dirty: false,
         }
     }
 
@@ -208,6 +214,9 @@ impl AgentBuilder {
             observability_manager: None,
             resource_locks: None,
             llm_registry_observed: false,
+            skills_prepared: false,
+            routing_frozen: None,
+            routing_dirty: false,
         }
     }
 
@@ -267,7 +276,11 @@ impl AgentBuilder {
         Ok(Self::from_spec(spec))
     }
 
+    /// Constructs declared providers without consuming auxiliary routing until registrations are complete.
     pub fn auto_configure_llms(mut self) -> Result<Self> {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         let spec = self
             .spec
             .as_ref()
@@ -528,12 +541,20 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Registers a main provider; changes after hierarchy consumers are frozen fail at the next gate.
     pub fn llm(mut self, llm: Arc<dyn LLMProvider>) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.llm = Some(llm);
         self
     }
 
+    /// Registers an exact alias without validating an incomplete builder configuration.
     pub fn llm_alias(mut self, alias: impl Into<String>, provider: Arc<dyn LLMProvider>) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         if self.llm_registry.is_none() {
             self.llm_registry = Some(LLMRegistry::new());
         }
@@ -545,11 +566,15 @@ impl AgentBuilder {
 
     /// Set a raw LLM registry that may still need observability wrapping.
     pub fn llm_registry(mut self, registry: LLMRegistry) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.llm_registry = Some(registry);
         self.llm_registry_observed = false;
         self
     }
 
+    /// Accepts inherited handles while retaining child-local settings at the consuming gate.
     pub(crate) fn authoritative_llm_registry(
         mut self,
         registry: LLMRegistry,
@@ -599,17 +624,29 @@ impl AgentBuilder {
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn skill(mut self, skill: SkillDefinition) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.skills.push(skill);
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn skills(mut self, skills: Vec<SkillDefinition>) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.skills.extend(skills);
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn skill_loader(mut self, loader: SkillLoader) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.skill_loader = Some(loader);
         self
     }
@@ -640,7 +677,11 @@ impl AgentBuilder {
         self
     }
 
+    /// Configures recovery locals before auxiliary consumers freeze their construction snapshot.
     pub fn recovery_manager(mut self, manager: RecoveryManager) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.recovery_manager = Some(manager);
         self
     }
@@ -650,7 +691,11 @@ impl AgentBuilder {
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn process_processor(mut self, processor: ProcessProcessor) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.process_processor = Some(processor);
         self
     }
@@ -669,12 +714,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn state_machine(mut self, machine: Arc<StateMachine>) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.state_machine = Some(machine);
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn transition_evaluator(mut self, evaluator: Arc<dyn TransitionEvaluator>) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.transition_evaluator = Some(evaluator);
         self
     }
@@ -689,7 +742,11 @@ impl AgentBuilder {
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn hitl_engine(mut self, engine: HITLEngine) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.hitl_engine = Some(engine);
         self
     }
@@ -704,12 +761,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn reasoning(mut self, config: ReasoningConfig) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.reasoning = Some(config);
         self
     }
 
+    /// Updates configured local routing inputs before the hierarchy consuming gate freezes them.
     pub fn reflection(mut self, config: ReflectionConfig) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.reflection = Some(config);
         self
     }
@@ -731,6 +796,9 @@ impl AgentBuilder {
 
     /// Provide a shared observability manager instead of creating one from YAML.
     pub fn observability(mut self, manager: Arc<ObservabilityManager>) -> Self {
+        if self.routing_frozen.is_some() {
+            self.routing_dirty = true;
+        }
         self.observability_manager = Some(manager);
         self
     }
@@ -766,8 +834,144 @@ impl AgentBuilder {
             .map_err(|e| AgentError::Config(e.to_string()))
     }
 
+    /// Prepares external definitions once and validates hierarchy before consumers capture providers.
+    pub(crate) fn prepare_routing(&mut self, freeze: bool) -> Result<()> {
+        if self.routing_frozen.as_ref().is_some_and(|frozen| {
+            self.routing_dirty
+                || !self
+                    .llm_registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.same_bindings(frozen))
+        }) {
+            return Err(AgentError::Config(
+                "Hierarchical LLM bindings changed after consumer construction".into(),
+            ));
+        }
+        let hierarchy_requested = self.spec.as_ref().map_or_else(
+            || {
+                self.llm_registry
+                    .as_ref()
+                    .is_some_and(|registry| registry.router_roles().is_some())
+            },
+            |spec| spec.llm.router_roles().is_some(),
+        );
+        if !hierarchy_requested {
+            if let (Some(spec), Some(registry)) = (&self.spec, &mut self.llm_registry)
+                && registry.router_roles().is_some()
+            {
+                spec.install_routing(registry);
+            }
+            return Ok(());
+        }
+        if let Some(spec) = &self.spec {
+            spec.validate()?;
+        }
+        if let Some(llm) = &self.llm {
+            let registry = self.llm_registry.get_or_insert_with(LLMRegistry::new);
+            if !registry.has("default") {
+                registry.register("default", llm.clone());
+            }
+        }
+        if let Some(spec) = &self.spec {
+            let registry = self.llm_registry.get_or_insert_with(LLMRegistry::new);
+            spec.install_routing(registry);
+        }
+        let hierarchy = self
+            .llm_registry
+            .as_ref()
+            .is_some_and(|registry| registry.router_roles().is_some());
+        if !hierarchy {
+            return Ok(());
+        }
+        if !self.skills_prepared {
+            if let Some(spec) = &self.spec {
+                let mut loader = self.skill_loader.take().unwrap_or_default();
+                if let Some(dir) = &self.yaml_dir {
+                    loader.set_base_dir(dir);
+                }
+                self.skills.extend(loader.load_refs(&spec.skills)?);
+            }
+            self.skills_prepared = true;
+        }
+        let registry = self
+            .llm_registry
+            .as_ref()
+            .expect("hierarchy registry exists");
+        registry
+            .validate_router_roles()
+            .map_err(|e| AgentError::Config(e.to_string()))?;
+        let mut prepared = self.spec.clone().unwrap_or_default();
+        if let Some(recovery) = &self.recovery_manager {
+            prepared.error_recovery = recovery.config().clone();
+        }
+        prepared.llm = crate::spec::LLMConfigOrSelector::Selector(
+            crate::spec::LLMSelector::new(registry.default_alias())
+                .with_router_roles(registry.router_roles().expect("hierarchy exists").clone()),
+        );
+        if let Some(processor) = &self.process_processor {
+            prepared.process = processor.config().clone();
+        }
+        if let Some(engine) = &self.hitl_engine {
+            prepared.hitl = Some(engine.config().clone());
+        }
+        prepared.skills = self
+            .skills
+            .iter()
+            .cloned()
+            .map(ai_agents_skills::SkillRef::Inline)
+            .collect();
+        if let Some(state) = &self.state_machine {
+            prepared.states = Some(state.config().clone());
+        }
+        if let Some(reasoning) = &self.reasoning {
+            prepared.reasoning = reasoning.clone();
+        }
+        if let Some(reflection) = &self.reflection {
+            prepared.reflection = reflection.clone();
+        }
+        for alias in prepared.referenced_llm_aliases() {
+            registry.get(&alias).map_err(|_| {
+                AgentError::Config(format!(
+                    "Configured local LLM alias '{alias}' is not registered"
+                ))
+            })?;
+        }
+        if self.transition_evaluator.is_some() {
+            if registry
+                .router_roles()
+                .and_then(|roles| roles.state.as_ref())
+                .and_then(|state| state.transition.as_ref())
+                .is_some()
+            {
+                return Err(AgentError::Config(
+                    "Custom evaluator conflicts with llm.router.state.transition".into(),
+                ));
+            }
+            if prepared.has_semantic_parallel_transition() {
+                return Err(AgentError::Config(
+                    "Custom evaluator cannot implement hierarchical semantic parallel transitions"
+                        .into(),
+                ));
+            }
+        }
+        if freeze {
+            self.routing_frozen = Some(registry.clone());
+        }
+        Ok(())
+    }
+
+    /// Supplies the same prepared registry to additive construction adapters.
+    /// Reports framework wrapping status to avoid observing inherited handles twice.
+    pub(crate) fn prepared_registry_observed(&self) -> bool {
+        self.llm_registry_observed
+    }
+
+    pub(crate) fn prepared_registry(&self) -> Option<&LLMRegistry> {
+        self.llm_registry.as_ref()
+    }
+
     /// Wraps the builder registry once and refreshes any stored process processor registry.
-    fn wrap_llm_registry_for_observability(&mut self) -> Result<()> {
+    pub(crate) fn wrap_llm_registry_for_observability(&mut self) -> Result<()> {
         if self.llm_registry_observed {
             return Ok(());
         }
@@ -782,6 +986,9 @@ impl AgentBuilder {
         let wrapped_arc = Arc::new(wrapped.clone());
         if let Some(processor) = self.process_processor.take() {
             self.process_processor = Some(processor.with_llm_registry(wrapped_arc));
+        }
+        if self.routing_frozen.is_some() {
+            self.routing_frozen = Some(wrapped.clone());
         }
         self.llm_registry = Some(wrapped);
         self.llm_registry_observed = true;
@@ -798,6 +1005,7 @@ impl AgentBuilder {
     /// Wire spawner tools when the spec has a `spawner:` section.
     /// Call after `auto_configure_llms()` and `auto_configure_features()`.
     pub async fn auto_configure_spawner(mut self) -> Result<Self> {
+        self.prepare_routing(false)?;
         let spawner_config = match self.spec.as_ref().and_then(|s| s.spawner.as_ref()) {
             Some(c) => c.clone(),
             None => return Ok(self),
@@ -818,6 +1026,7 @@ impl AgentBuilder {
         }
 
         self.wrap_llm_registry_for_observability()?;
+        self.prepare_routing(true)?;
         let observability_manager = self.observability_manager.clone();
 
         use crate::spawner::{
@@ -983,7 +1192,9 @@ impl AgentBuilder {
         Ok(self)
     }
 
+    /// Finalizes one consistent hierarchy before runtime components capture selected handles.
     pub fn build(mut self) -> Result<RuntimeAgent> {
+        self.prepare_routing(false)?;
         let resource_locks = self.shared_resource_locks();
         // Capture actor memory and facts configs before partial moves of spec consume fields.
         let actor_memory_config = self
@@ -1004,6 +1215,13 @@ impl AgentBuilder {
 
         let mut tools = self.tools.unwrap_or_default();
 
+        if self
+            .llm_registry
+            .as_ref()
+            .is_some_and(|registry| registry.router_roles().is_some())
+        {
+            tools = tools.map_tools_agent_local_web(|tool| tool);
+        }
         // ERROR NOTE: Don't include tools prompt here
         // - it will be added AFTER template rendering in get_effective_system_prompt() to avoid Jinja2 parsing JSON braces
         let system_prompt = base_prompt;
@@ -1017,7 +1235,8 @@ impl AgentBuilder {
             AgentInfo::new("agent", "Agent", "1.0.0")
         };
 
-        if let Some(ref spec) = self.spec
+        if !self.skills_prepared
+            && let Some(ref spec) = self.spec
             && !spec.skills.is_empty()
         {
             let mut loader = self.skill_loader.take().unwrap_or_default();
@@ -1055,13 +1274,7 @@ impl AgentBuilder {
         }
 
         if let Some(ref spec) = self.spec {
-            let default_alias = spec.llm.get_default_alias();
-            let router_alias = spec.llm.get_router_alias();
-
-            llm_registry.set_default(&default_alias);
-            if let Some(router) = router_alias {
-                llm_registry.set_router(&router);
-            }
+            spec.install_routing(&mut llm_registry);
         }
 
         if llm_registry.is_empty() {
@@ -1082,20 +1295,50 @@ impl AgentBuilder {
             self.llm_registry_observed = true;
         }
 
+        let memory_local = self
+            .spec
+            .as_ref()
+            .and_then(|spec| spec.memory.summarizer_llm.as_deref());
+        let (role_summary, role_merge) = if self.memory.is_none()
+            && self
+                .spec
+                .as_ref()
+                .is_some_and(|spec| spec.memory.is_compacting())
+        {
+            (
+                llm_registry
+                    .resolve_role_override(LLMRole::MemorySummarize, memory_local)
+                    .map_err(|e| AgentError::Config(e.to_string()))?
+                    .map(|resolved| resolved.provider),
+                llm_registry
+                    .resolve_role_override(LLMRole::MemoryMerge, memory_local)
+                    .map_err(|e| AgentError::Config(e.to_string()))?
+                    .map(|resolved| resolved.provider),
+            )
+        } else {
+            (None, None)
+        };
         // Create memory after LLM registry is ready (needed for CompactingMemory summarizer)
         let memory = self.memory.unwrap_or_else(|| {
             if let Some(ref spec) = self.spec {
                 if spec.memory.is_compacting() {
-                    let summarizer_llm = spec
-                        .memory
-                        .summarizer_llm
-                        .as_ref()
-                        .and_then(|alias| llm_registry.get(alias).ok())
-                        .or_else(|| llm_registry.router().ok())
-                        .or_else(|| llm_registry.default().ok());
+                    let summarizer_llm = role_summary.or_else(|| {
+                        spec.memory
+                            .summarizer_llm
+                            .as_ref()
+                            .and_then(|alias| llm_registry.get(alias).ok())
+                            .or_else(|| llm_registry.router().ok())
+                            .or_else(|| llm_registry.default().ok())
+                    });
 
                     let summarizer: Arc<dyn Summarizer> = match summarizer_llm {
-                        Some(llm) => Arc::new(LLMSummarizer::new(llm)),
+                        Some(llm) => {
+                            let mut summarizer = LLMSummarizer::new(llm);
+                            if let Some(merge) = role_merge {
+                                summarizer = summarizer.with_merge_llm(merge);
+                            }
+                            Arc::new(summarizer)
+                        }
                         None => Arc::new(NoopSummarizer),
                     };
                     let config = spec.memory.to_compacting_config();
@@ -1151,13 +1394,22 @@ impl AgentBuilder {
                 if config.enabled {
                     let evaluator: Option<Arc<dyn RelationshipEvaluatorTrait>> =
                         if config.auto_update.enabled {
-                            let llm = config
-                                .auto_update
-                                .llm
-                                .as_ref()
-                                .and_then(|alias| llm_registry.get(alias).ok())
-                                .or_else(|| llm_registry.router().ok())
-                                .or_else(|| llm_registry.default().ok());
+                            let llm = match llm_registry
+                                .resolve_role_override(
+                                    LLMRole::MemoryRelationships,
+                                    config.auto_update.llm.as_deref(),
+                                )
+                                .map_err(|e| AgentError::Config(e.to_string()))?
+                            {
+                                Some(resolved) => Some(resolved.provider),
+                                None => config
+                                    .auto_update
+                                    .llm
+                                    .as_ref()
+                                    .and_then(|alias| llm_registry.get(alias).ok())
+                                    .or_else(|| llm_registry.router().ok())
+                                    .or_else(|| llm_registry.default().ok()),
+                            };
                             llm.map(|llm| {
                                 Arc::new(RelationshipEvaluator::new(llm))
                                     as Arc<dyn RelationshipEvaluatorTrait>
@@ -1178,12 +1430,17 @@ impl AgentBuilder {
 
         let tools_arc = Arc::new(tools);
         let llm_registry_arc = Arc::new(llm_registry);
-        tools_arc.set_web_fetch_extractor(
-            llm_registry_arc
+        let web_provider = match llm_registry_arc
+            .resolve_role_override(LLMRole::WebExtract, None)
+            .map_err(|e| AgentError::Config(e.to_string()))?
+        {
+            Some(resolved) => Some(resolved.provider),
+            None => llm_registry_arc
                 .router()
                 .ok()
                 .or_else(|| llm_registry_arc.default().ok()),
-        );
+        };
+        tools_arc.set_web_fetch_extractor(web_provider);
 
         // Build the effective tool grant.
         // YAML top-level tools are explicit ordinary grants, while feature flags such as spawner management, persona evolution, and orchestration tools are explicit feature grants.
@@ -1281,7 +1538,7 @@ impl AgentBuilder {
             }
         }
 
-        let mut agent = RuntimeAgent::new(
+        let mut agent = RuntimeAgent::try_new(
             info,
             llm_registry_arc.clone(),
             memory,
@@ -1289,7 +1546,7 @@ impl AgentBuilder {
             self.skills,
             system_prompt,
             max_iterations,
-        )
+        )?
         .with_shared_resource_locks(resource_locks)
         .with_declared_tool_ids(declared_tool_ids);
 
@@ -1326,14 +1583,27 @@ impl AgentBuilder {
             agent.register_message_filter(name, filter);
         }
 
+        let role_transition = if self.transition_evaluator.is_none()
+            && (self.state_machine.is_some()
+                || self.spec.as_ref().is_some_and(|spec| spec.states.is_some()))
+        {
+            llm_registry_arc
+                .resolve_role_override(LLMRole::StateTransition, None)
+                .map_err(|e| AgentError::Config(e.to_string()))?
+                .map(|resolved| resolved.provider)
+        } else {
+            None
+        };
         // Configure state machine from spec or builder
         if let Some(state_machine) = self.state_machine {
             let evaluator = self.transition_evaluator.unwrap_or_else(|| {
-                let eval_llm = llm_registry_arc
-                    .get("evaluator")
-                    .or_else(|_| llm_registry_arc.router())
-                    .or_else(|_| llm_registry_arc.default())
-                    .expect("At least one LLM required for transition evaluator");
+                let eval_llm = role_transition.clone().unwrap_or_else(|| {
+                    llm_registry_arc
+                        .get("evaluator")
+                        .or_else(|_| llm_registry_arc.router())
+                        .or_else(|_| llm_registry_arc.default())
+                        .expect("At least one LLM required for transition evaluator")
+                });
                 Arc::new(LLMTransitionEvaluator::new(eval_llm))
             });
             agent = agent.with_state_machine(state_machine, evaluator);
@@ -1342,11 +1612,13 @@ impl AgentBuilder {
         {
             let state_machine = StateMachine::new(state_config.clone())?;
             let evaluator = self.transition_evaluator.unwrap_or_else(|| {
-                let eval_llm = llm_registry_arc
-                    .get("evaluator")
-                    .or_else(|_| llm_registry_arc.router())
-                    .or_else(|_| llm_registry_arc.default())
-                    .expect("At least one LLM required for transition evaluator");
+                let eval_llm = role_transition.clone().unwrap_or_else(|| {
+                    llm_registry_arc
+                        .get("evaluator")
+                        .or_else(|_| llm_registry_arc.router())
+                        .or_else(|_| llm_registry_arc.default())
+                        .expect("At least one LLM required for transition evaluator")
+                });
                 Arc::new(LLMTransitionEvaluator::new(eval_llm))
             });
             agent = agent.with_state_machine(Arc::new(state_machine), evaluator);

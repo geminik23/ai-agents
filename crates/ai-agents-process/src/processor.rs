@@ -100,6 +100,11 @@ impl ProcessProcessor {
         }
     }
 
+    /// Exposes the configured stages for provider-free construction preflight.
+    pub fn config(&self) -> &ProcessConfig {
+        &self.config
+    }
+
     pub fn with_llm_registry(mut self, registry: Arc<LLMRegistry>) -> Self {
         self.llm_registry = Some(registry);
         self
@@ -212,6 +217,14 @@ impl ProcessProcessor {
                     }
                     Ok(d)
                 }
+                Err(error @ AgentError::Config(_))
+                    if self
+                        .llm_registry
+                        .as_ref()
+                        .is_some_and(|registry| registry.router_roles().is_some()) =>
+                {
+                    Err(error)
+                }
                 Err(e) => {
                     let mut fallback_data = data_clone;
                     match self.config.settings.on_stage_error.default {
@@ -289,7 +302,7 @@ impl ProcessProcessor {
         config: &DetectConfig,
         mut data: ProcessData,
     ) -> Result<ProcessData> {
-        let llm = self.get_llm(config.llm.as_deref())?;
+        let llm = self.get_llm(ai_agents_llm::LLMRole::ProcessDetect, config.llm.as_deref())?;
 
         let detection_types: Vec<&str> = config
             .detect
@@ -349,7 +362,10 @@ impl ProcessProcessor {
         config: &ExtractConfig,
         mut data: ProcessData,
     ) -> Result<ProcessData> {
-        let llm = self.get_llm(config.llm.as_deref())?;
+        let llm = self.get_llm(
+            ai_agents_llm::LLMRole::ProcessExtract,
+            config.llm.as_deref(),
+        )?;
 
         let schema_desc: Vec<String> = config
             .schema
@@ -398,7 +414,10 @@ impl ProcessProcessor {
         config: &SanitizeConfig,
         mut data: ProcessData,
     ) -> Result<ProcessData> {
-        let llm = self.get_llm(config.llm.as_deref())?;
+        let llm = self.get_llm(
+            ai_agents_llm::LLMRole::ProcessSanitize,
+            config.llm.as_deref(),
+        )?;
 
         let mut instructions = Vec::new();
 
@@ -476,7 +495,10 @@ impl ProcessProcessor {
             None => return Ok(data),
         };
 
-        let llm = self.get_llm(config.llm.as_deref())?;
+        let llm = self.get_llm(
+            ai_agents_llm::LLMRole::ProcessTransform,
+            config.llm.as_deref(),
+        )?;
 
         let full_prompt = format!("{}\n\nOriginal text:\n{}", prompt, data.content);
 
@@ -574,7 +596,10 @@ impl ProcessProcessor {
 
         // LLM-based validation
         if !config.criteria.is_empty() {
-            let llm = self.get_llm(config.llm.as_deref())?;
+            let llm = self.get_llm(
+                ai_agents_llm::LLMRole::ProcessValidate,
+                config.llm.as_deref(),
+            )?;
 
             let criteria_list = config
                 .criteria
@@ -846,12 +871,23 @@ impl ProcessProcessor {
         current
     }
 
-    fn get_llm(&self, alias: Option<&str>) -> Result<Arc<dyn LLMProvider>> {
+    // Resolve a stage role exactly before applying the owning legacy selection chain.
+    fn get_llm(
+        &self,
+        role: ai_agents_llm::LLMRole,
+        alias: Option<&str>,
+    ) -> Result<Arc<dyn LLMProvider>> {
         let registry = self
             .llm_registry
             .as_ref()
             .ok_or_else(|| AgentError::Config("LLM registry not configured for process".into()))?;
 
+        if let Some(resolved) = registry
+            .resolve_role_override(role, alias)
+            .map_err(|e| AgentError::Config(e.to_string()))?
+        {
+            return Ok(resolved.provider);
+        }
         match alias {
             Some(name) => registry
                 .get(name)

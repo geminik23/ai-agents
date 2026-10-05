@@ -176,11 +176,13 @@ pub fn create_builtin_registry() -> ToolRegistry {
     registry
         .register(Arc::new(SleepTool::new()))
         .expect("failed to register sleep");
+    let web_fetch = Arc::new(WebFetchTool::with_extractor_slot(
+        registry.web_fetch_extractor_slot(),
+    ));
     registry
-        .register(Arc::new(WebFetchTool::with_extractor_slot(
-            registry.web_fetch_extractor_slot(),
-        )))
+        .register(web_fetch.clone())
         .expect("failed to register web_fetch");
+    registry.mark_framework_web_fetch(web_fetch);
     registry
         .register(Arc::new(WebSearchTool::with_provider_slot(
             registry.web_search_provider_slot(),

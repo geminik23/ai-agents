@@ -23,7 +23,7 @@ use crate::evidence::{
 };
 use crate::fixtures::{
     AttemptFixtureContext, AttemptWorkspace, LlmFixtureMode, RecordingToolLog,
-    WorkspacePolicyFixtureConfig, build_approval_handler, build_llm_registry, build_tool_registry,
+    WorkspacePolicyFixtureConfig, build_approval_handler, build_llm_registry,
     resolve_fixture_context, start_mock_server,
 };
 use crate::judge::{JudgeConfig, JudgeResolver};
@@ -807,7 +807,11 @@ impl EvalRunner {
                     budget.wrap(provider, config)
                 });
         }
-        let tool_registry = build_tool_registry(&self.suite.fixtures, tool_log.clone())?;
+        let tool_registry = crate::fixtures::build_tool_registry_for_routing(
+            &self.suite.fixtures,
+            tool_log.clone(),
+            spec.llm.router_roles().is_some(),
+        )?;
         let agent_base_dir = agent_path.parent().unwrap_or_else(|| Path::new("."));
         let mut builder = AgentBuilder::from_spec_with_base_dir(spec, agent_base_dir)
             .llm_registry(llm_registry)
@@ -912,6 +916,9 @@ impl EvalRunner {
             approval_log,
             llm_log,
         } = params;
+        if let Some(assertion) = &turn.assertions {
+            crate::assertion::preflight_judge_aliases(assertion, agent.llm_registry())?;
+        }
         apply_context_value(agent, &turn_runtime_context(turn))?;
         if let Some(actor) = &turn.actor {
             agent.set_actor_id(actor)?;
@@ -1489,6 +1496,89 @@ impl Drop for EnvGuard {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn hierarchy_web_extraction_uses_fixture_alias_and_cache_through_runner() {
+        let directory = std::env::temp_dir().join(format!(
+            "hierarchical-web-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("agent.yaml"),
+            r#"
+name: routed-web
+system_prompt: Fetch information.
+llms:
+  main: {provider: openai, model: mock-main}
+  extraction: {provider: openai, model: mock-extraction}
+llm:
+  default: main
+  router:
+    web:
+      extract: extraction
+tools: [web_fetch]
+"#,
+        )
+        .unwrap();
+        std::fs::write(directory.join("suite.yaml"),r#"
+name: Hierarchical Web Extraction
+agent: agent.yaml
+settings:
+  retries: 0
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main:
+        - '{"tool":"web_fetch","arguments":{"url":"https://fixture.example/data","prompt":"Extract."}}'
+        - '{"tool":"web_fetch","arguments":{"url":"https://fixture.example/data","prompt":"Extract."}}'
+        - DONE
+      extraction:
+        - EXTRACTED
+        - UNEXPECTED_EXTRA_CALL
+  web_fetch_transport:
+    routes:
+      - url: https://fixture.example/data
+        status: 200
+        body: RAW
+scenarios:
+  - id: extraction-and-cache
+    turns:
+      - input: Fetch twice.
+        assert:
+          all:
+            - response_contains: DONE
+            - tool_called:
+                id: web_fetch
+                count_gte: 2
+                executed: true
+                success: true
+                result_path: {path: content, eq: EXTRACTED}
+            - tool_called:
+                id: web_fetch
+                executed: true
+                success: true
+                result_path: {path: from_cache, eq: true}
+"#).unwrap();
+        let result =
+            EvalRunner::from_file(directory.join("suite.yaml"), EvalRunnerOptions::default())
+                .unwrap()
+                .run()
+                .await
+                .unwrap();
+        assert_eq!(result.passed, 1, "{result:?}");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
 

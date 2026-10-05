@@ -4,11 +4,19 @@ set -eu
 if ! command -v zola >/dev/null 2>&1; then
   mkdir -p .bin
   if [ ! -x .bin/zola ]; then
-    curl -L https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz \
+    curl -L https://github.com/getzola/zola/releases/download/v0.23.6/zola-v0.23.6-x86_64-unknown-linux-gnu.tar.gz \
       | tar -xz -C .bin
     chmod +x .bin/zola
   fi
   PATH="$PWD/.bin:$PATH"
+fi
+
+# Match the CI pin before generating content or parsing version-specific settings.
+ZOLA_VERSION="$(zola --version)"
+if [ "$ZOLA_VERSION" != "zola 0.23.6" ]; then
+  echo "error: website build requires Zola 0.23.6 (CI pin); found $ZOLA_VERSION" >&2
+  echo "Install the pinned version: cargo install zola --version 0.23.6 --locked" >&2
+  exit 1
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

@@ -9,6 +9,49 @@ use crate::evidence::{
 };
 use crate::judge::{JudgeAssertion, JudgeInput, JudgeResolver};
 
+// Validate only the current agent's reachable assertion tree before a turn spends provider budget.
+pub(crate) fn preflight_judge_aliases(
+    assertion: &Assertion,
+    registry: &ai_agents_llm::LLMRegistry,
+) -> crate::Result<()> {
+    if registry.router_roles().is_none() {
+        return Ok(());
+    }
+    if let Some(criteria) = assertion
+        .judge
+        .as_ref()
+        .or(assertion.response_semantic.as_ref())
+    {
+        registry
+            .resolve_role_override(
+                ai_agents_llm::LLMRole::EvaluationResponse,
+                criteria.llm.as_deref(),
+            )
+            .map_err(|error| {
+                crate::EvalError::Config(format!("Invalid assertion judge alias: {error}"))
+            })?;
+    }
+    if assertion
+        .facts_include
+        .as_ref()
+        .is_some_and(|facts| facts.semantic.is_some())
+    {
+        registry
+            .resolve_role_override(ai_agents_llm::LLMRole::EvaluationFacts, None)
+            .map_err(|error| crate::EvalError::Config(error.to_string()))?;
+    }
+    for child in assertion
+        .all
+        .iter()
+        .flatten()
+        .chain(assertion.any.iter().flatten())
+        .chain(assertion.not.iter().map(|child| child.as_ref()))
+    {
+        preflight_judge_aliases(child, registry)?;
+    }
+    Ok(())
+}
+
 /// Collection of assertion clauses evaluated against one turn.
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -1668,7 +1711,7 @@ async fn evaluate_facts(
     let mut passed = !facts.is_empty();
     if let Some(semantic) = &assertion.semantic {
         if let Some(resolver) = judge_resolver {
-            match resolver.resolve(None) {
+            match resolver.resolve_role(ai_agents_llm::LLMRole::EvaluationFacts, None) {
                 Ok(judge) => {
                     let criteria = JudgeAssertion {
                         llm: None,
@@ -2013,6 +2056,97 @@ mod tests {
         AggregatedMetrics, CostBreakdown, CostStats, LatencyStats, ObservabilityReport,
         ReportSummary, TokenBreakdown, TokenStats,
     };
+
+    #[tokio::test]
+    async fn hierarchy_response_and_facts_assertions_use_distinct_judges_and_local_override() {
+        use ai_agents_llm::mock::MockLLMProvider;
+        use ai_agents_llm::{EvaluationRouterConfig, LLMRegistry, RouterRolesConfig};
+        use std::sync::Arc;
+        let mut registry = LLMRegistry::new();
+        let mut providers = Vec::new();
+        for alias in ["response", "facts", "local", "main"] {
+            let mut provider = MockLLMProvider::new(alias);
+            provider.set_response(r#"{"criteria_scores":[{"name":"Relevant","score":0.9,"explanation":"ok"}],"overall_score":0.9,"overall_feedback":"ok","passed":false}"#);
+            registry.register(alias, Arc::new(provider.clone()));
+            providers.push(provider);
+        }
+        registry.set_default("main");
+        registry.set_router_roles(RouterRolesConfig {
+            evaluation: Some(EvaluationRouterConfig {
+                response: Some("response".into()),
+                facts: Some("facts".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let resolver = JudgeResolver::new(
+            Arc::new(registry),
+            crate::judge::JudgeConfig {
+                llm: Some("main".into()),
+                ..Default::default()
+            },
+        );
+        let evidence = evidence();
+        let context = AssertionEvalContext {
+            evidence: &evidence,
+            response: "answer",
+            user_input: None,
+            scenario_id: None,
+            language: None,
+            judge_resolver: Some(&resolver),
+        };
+        let criteria = JudgeAssertion {
+            llm: None,
+            pass_threshold: 0.75,
+            criteria: vec![crate::judge::JudgeCriterion::Text("Relevant".into())],
+        };
+        let assertion = Assertion {
+            response_semantic: Some(criteria.clone()),
+            facts_include: Some(FactsAssertion {
+                actor: None,
+                category: None,
+                semantic: Some("A preference".into()),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            evaluate_assertion(&assertion, context).await,
+            AssertionOutcome::Passed(_)
+        ));
+        let assertion = Assertion {
+            response_semantic: Some(JudgeAssertion {
+                llm: Some("local".into()),
+                ..criteria
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            evaluate_assertion(&assertion, context).await,
+            AssertionOutcome::Passed(_)
+        ));
+        for (provider, expected) in providers.iter().zip([1, 1, 1, 0]) {
+            assert_eq!(provider.call_count(), expected);
+        }
+    }
+
+    #[test]
+    fn hierarchy_judge_alias_preflight_precedes_calls_and_preserves_legacy() {
+        use ai_agents_llm::mock::MockLLMProvider;
+        use ai_agents_llm::{LLMRegistry, RouterRolesConfig};
+        let mut registry = LLMRegistry::new();
+        let provider = MockLLMProvider::new("main");
+        registry.register("main", std::sync::Arc::new(provider.clone()));
+        registry.set_default("main");
+        registry.set_router_roles(RouterRolesConfig::default());
+        let assertion: Assertion =
+            serde_yaml::from_str("not:\n  judge:\n    llm: missing\n    criteria: [Relevant.]\n")
+                .unwrap();
+        assert!(preflight_judge_aliases(&assertion, &registry).is_err());
+        assert_eq!(provider.call_count(), 0);
+        registry.clear_router();
+        assert!(preflight_judge_aliases(&assertion, &registry).is_ok());
+        assert_eq!(provider.call_count(), 0);
+    }
 
     fn evidence() -> TurnEvidence {
         TurnEvidence {

@@ -1,0 +1,85 @@
+name: HierarchicalRoutingAgent
+version: "1.0.0"
+description: "Independent state, skill, process, and reasoning model aliases"
+
+# Hierarchical routing - use separate models for responses and auxiliary work.
+# Use this pattern when classification and state decisions need different models.
+# Requires OPENAI_API_KEY for CLI chat; the mocked suite needs no keys.
+#
+# Usage:
+#   cargo run -p ai-agents-cli -- run examples/yaml/reasoning/hierarchical_routing.yaml
+#
+# Change provider/model settings first, then assign aliases to responsibilities.
+# Selection: local alias -> role leaf -> group default -> router default -> main.
+# Main responses and skill prompt steps keep the agent's default model.
+# NOTE: A role alias does not enable that feature or retry failed model calls.
+#
+# Flow: input -> language detection -> skill selection
+#             -> match -> skill prompt -> response -> state transition
+#             -> no match -> reasoning selection -> main response -> state transition
+system_prompt: "Explain that model selection follows the configured responsibilities."
+
+# Reuse registered aliases; tune each model for its latency and quality needs.
+llms:
+  main: { provider: openai, model: gpt-5.4-mini }
+  fast: { provider: openai, model: gpt-5.4-nano }
+  precise: { provider: openai, model: gpt-5.4-mini }
+  classifier: { provider: openai, model: gpt-5.4-nano }
+  structured: { provider: openai, model: gpt-5.4-nano }
+  planner: { provider: openai, model: gpt-5.4-mini }
+llm:
+  default: main          # Responses and prompt steps; omitted: default alias.
+  router:                # Mapping opts into roles; omitted: legacy selection.
+    default: fast        # Auxiliary model; omitted: main alias.
+    state:
+      transition: precise  # Transition judgment; omitted: inherited alias.
+    skills:
+      selection: classifier  # Trigger matching; omitted: inherited alias.
+    process:
+      default: classifier  # Shared stage model; omitted: router default.
+      detect: fast         # Detection model; omitted: group default.
+    reasoning:
+      default: precise   # Shared reasoning model; omitted: router default.
+      selection: fast    # Mode judgment; omitted: group default.
+      planning: planner  # Plan generation; omitted: group default.
+
+# Override only language detection without changing reasoning or transitions.
+process:
+  input:
+    # Step 0: Detect language and make the result available to later prompts.
+    - type: detect
+      config:
+        llm: structured       # Explicit model; omitted: role inheritance.
+        detect: [language]    # Aspects to detect; omitted: [].
+        store_in_context:     # Copy detected values to context; omitted: {}.
+          language: detected_language
+
+# Ask the selection model whether this request needs reasoning or a plan.
+# The planner alias is used only when plan_and_execute is selected.
+reasoning:
+  mode: auto  # Choose per request; default: none.
+
+# Offer an inline summary workflow; unmatched requests use ordinary chat.
+skills:
+  - id: summarize
+    description: "Summarize a supplied passage"
+    trigger: "The user explicitly requests a passage summary"  # Matching rule; required.
+    steps:
+      # Step 0: Summarize with the agent default model, not the selection model.
+      - prompt: "Summarize the supplied passage."
+
+# Mark an explanation complete without generating a second response.
+# No fallback transition is configured; an unmet rule leaves the state unchanged.
+states:
+  initial: ready                   # Entry state; required.
+  regenerate_on_transition: false   # Keep the first response; default: true.
+  states:
+    ready:
+      transitions:
+        - to: done
+          # Semantic completion rule; omitted: no LLM condition.
+          when: "The response has explained model selection"
+    done: {}
+
+# This example needs no tools; prompt-based skills can run without tool grants.
+tools: []  # Grant no ordinary tools; omission also grants none.

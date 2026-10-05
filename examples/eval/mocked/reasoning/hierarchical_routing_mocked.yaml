@@ -1,0 +1,32 @@
+name: Hierarchical Routing Mocked Eval
+agent: ../../../yaml/reasoning/hierarchical_routing.yaml
+settings:
+  retries: 0
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      structured:
+        - '{"language":"ko"}'
+      classifier:
+        - "0"
+      fast:
+        - none
+      main:
+        - ROUTED_MAIN_RESPONSE
+      precise:
+        - "1"
+      planner:
+        - UNEXPECTED_PLANNER_CALL
+scenarios:
+  - id: role-routing-with-local-override
+    tags: [reasoning, routing, state, mock]
+    turns:
+      - input: Explain model selection.
+        assert:
+          all:
+            - response_contains: ROUTED_MAIN_RESPONSE
+            - state: done
+            - state_history_contains: done
+            - context_path: {path: detected_language, eq: ko}
+            - tool_not_called: command

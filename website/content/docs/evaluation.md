@@ -28,6 +28,14 @@ agent.yaml
 
 ---
 
+## Hierarchical alias fixtures (1.1)
+
+Version 1.1 supports hierarchical auxiliary routing. Assign fixture responses independently with `fixtures.llm.responses_by_alias` for each named alias. `evaluation.response` selects response judges and `evaluation.facts` selects semantic fact judges; an explicit response assertion alias still wins. This does not activate the otherwise unused `JudgeConfig.llm` as a global selector.
+
+Hierarchy agents also connect harness-owned `web_fetch` tools, including `fixtures.web_fetch_transport`, to the runtime's wrapped `web.extract` provider. A transport fixture replaces HTTP/DNS, not the extraction operation. Cache hits perform no extra extraction call. A whole-tool entry in `fixtures.tools.web_fetch` remains a mock and performs no real extraction, even if a transport fixture is also present. Scalar/omitted/null router suites retain their existing behavior.
+
+Assert exact structural outcomes and provider calls where available, not merely nonempty output. The mocked hierarchical-routing example checks the declared state transition and local process override; unit regressions additionally check per-role call counts and runner-level web extraction/cache evidence. Provider-backed evaluation still requires explicit authorization and retains budget, record/replay, and redaction controls.
+
 ## Quick start: no API key
 
 The fastest eval suite uses a mocked LLM response. This tests the runner, agent build path, assertions, and report generation without calling a provider.

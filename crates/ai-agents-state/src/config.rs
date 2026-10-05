@@ -137,8 +137,16 @@ fn default_true() -> bool {
     true
 }
 
-fn default_extractor_llm() -> String {
-    "router".to_string()
+// Preserve omitted aliases while rejecting explicit null in formerly string-only fields.
+fn deserialize_present_alias<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(alias) => Ok(Some(alias)),
+        _ => Err(serde::de::Error::custom(
+            "expected a present alias string; null is not supported",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,8 +187,12 @@ pub enum ToolCondition {
     },
     Semantic {
         when: String,
-        #[serde(default = "default_semantic_llm")]
-        llm: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_alias"
+        )]
+        llm: Option<String>,
         #[serde(default = "default_threshold")]
         threshold: f32,
     },
@@ -188,10 +200,6 @@ pub enum ToolCondition {
     All(Vec<ToolCondition>),
     Any(Vec<ToolCondition>),
     Not(Box<ToolCondition>),
-}
-
-fn default_semantic_llm() -> String {
-    "router".to_string()
 }
 
 fn default_threshold() -> f32 {
@@ -347,9 +355,13 @@ pub struct ContextExtractor {
     #[serde(default)]
     pub llm_extract: Option<String>,
 
-    /// LLM alias for extraction (default: "router").
-    #[serde(default = "default_extractor_llm")]
-    pub llm: String,
+    /// Explicit alias; omission uses the agent role or the legacy implicit router.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_alias"
+    )]
+    pub llm: Option<String>,
 
     /// If true, extraction failure is logged as a warning.
     #[serde(default)]
@@ -1549,7 +1561,7 @@ states:
             Some("The user's email address")
         );
         assert!(!state.extract[0].required);
-        assert_eq!(state.extract[0].llm, "router");
+        assert_eq!(state.extract[0].llm, None);
         assert_eq!(state.extract[1].key, "order_id");
         assert!(state.extract[1].required);
         assert!(state.extract[1].llm_extract.is_some());

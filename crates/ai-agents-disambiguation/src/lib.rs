@@ -69,7 +69,7 @@ enabled: true
 "#;
         let config: DisambiguationConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.is_enabled());
-        assert_eq!(config.detection.llm, "router");
+        assert_eq!(config.detection.llm, None);
         assert_eq!(config.detection.threshold, 0.7);
     }
 
@@ -109,7 +109,7 @@ cache:
 "#;
         let config: DisambiguationConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.is_enabled());
-        assert_eq!(config.detection.llm, "fast");
+        assert_eq!(config.detection.llm.as_deref(), Some("fast"));
         assert_eq!(config.detection.threshold, 0.8);
         assert_eq!(config.detection.aspects.len(), 3);
         assert_eq!(config.clarification.style, ClarificationStyle::Options);

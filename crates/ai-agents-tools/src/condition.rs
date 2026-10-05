@@ -62,6 +62,11 @@ impl EvaluationContext {
 #[async_trait]
 pub trait LLMGetter: Send + Sync {
     fn get_llm(&self, alias: &str) -> Option<Arc<dyn LLMProvider>>;
+
+    /// Resolves the semantic condition provider while retaining legacy custom getters.
+    fn get_condition_llm(&self, alias: Option<&str>) -> Result<Option<Arc<dyn LLMProvider>>> {
+        Ok(self.get_llm(alias.unwrap_or("router")))
+    }
 }
 
 pub struct ConditionEvaluator<G: LLMGetter> {
@@ -91,7 +96,10 @@ impl<G: LLMGetter> ConditionEvaluator<G> {
                 when,
                 llm,
                 threshold,
-            } => self.evaluate_semantic(when, llm, *threshold, ctx).await,
+            } => {
+                self.evaluate_semantic(when, llm.as_deref(), *threshold, ctx)
+                    .await
+            }
             ToolCondition::Time(matcher) => Ok(self.evaluate_time(matcher)),
             ToolCondition::All(conditions) => {
                 for cond in conditions {
@@ -261,14 +269,17 @@ impl<G: LLMGetter> ConditionEvaluator<G> {
     async fn evaluate_semantic(
         &self,
         condition: &str,
-        llm_alias: &str,
+        llm_alias: Option<&str>,
         threshold: f32,
         ctx: &EvaluationContext,
     ) -> Result<bool> {
-        let llm = match self.llm_getter.get_llm(llm_alias) {
+        let llm = match self.llm_getter.get_condition_llm(llm_alias)? {
             Some(l) => l,
             None => {
-                tracing::warn!(llm = llm_alias, "LLM not found for semantic evaluation");
+                tracing::warn!(
+                    llm = llm_alias.unwrap_or("router"),
+                    "LLM not found for semantic evaluation"
+                );
                 return Ok(false);
             }
         };

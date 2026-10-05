@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::routing::{LLMRole, ResolvedRoleLLM, RouterRolesConfig};
 use ai_agents_core::{LLMError, LLMProvider};
 
 #[derive(Clone)]
@@ -8,6 +9,8 @@ pub struct LLMRegistry {
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     default_alias: String,
     router_alias: Option<String>,
+    // Keep the opt-in tree out of by-value registries and builder futures, including legacy agents.
+    router_roles: Option<Box<RouterRolesConfig>>,
 }
 
 impl std::fmt::Debug for LLMRegistry {
@@ -26,6 +29,7 @@ impl LLMRegistry {
             providers: HashMap::new(),
             default_alias: "default".to_string(),
             router_alias: None,
+            router_roles: None,
         }
     }
 
@@ -38,7 +42,82 @@ impl LLMRegistry {
     }
 
     pub fn set_router(&mut self, alias: impl Into<String>) {
+        self.router_roles = None;
         self.router_alias = Some(alias.into());
+    }
+
+    /// Installs agent-local hierarchy without registering or probing providers.
+    pub fn set_router_roles(&mut self, config: RouterRolesConfig) {
+        self.router_alias = None;
+        self.router_roles = Some(Box::new(config));
+    }
+
+    pub fn router_roles(&self) -> Option<&RouterRolesConfig> {
+        self.router_roles.as_deref()
+    }
+
+    pub fn clear_router(&mut self) {
+        self.router_alias = None;
+        self.router_roles = None;
+    }
+
+    /// Resolves hierarchy exactly and leaves subsystem-specific legacy selection to its owner.
+    pub fn resolve_role_override(
+        &self,
+        role: LLMRole,
+        local_alias: Option<&str>,
+    ) -> Result<Option<ResolvedRoleLLM>, LLMError> {
+        let Some(config) = &self.router_roles else {
+            return Ok(None);
+        };
+        let (alias, source) = config.select(role, local_alias, &self.default_alias);
+        if alias.trim().is_empty() {
+            return Err(LLMError::Config(format!(
+                "Invalid {}: empty alias",
+                role.as_path()
+            )));
+        }
+        let provider = self.get(alias).map_err(|_| {
+            LLMError::Config(format!(
+                "Invalid llm.router.{}: alias '{}' is not registered",
+                role.as_path(),
+                alias
+            ))
+        })?;
+        Ok(Some(ResolvedRoleLLM {
+            role,
+            alias: alias.to_string(),
+            source,
+            provider,
+        }))
+    }
+
+    /// Validates all configured tree aliases without executing a provider.
+    pub fn validate_router_roles(&self) -> Result<(), LLMError> {
+        if let Some(config) = &self.router_roles {
+            config.validate()?;
+            for (path, alias) in config.configured_aliases() {
+                self.get(alias).map_err(|_| {
+                    LLMError::Config(format!("Invalid {path}: alias '{alias}' is not registered"))
+                })?;
+            }
+            self.default()?;
+        }
+        Ok(())
+    }
+
+    /// Compares configuration and base handles before constructing irreversible consumers.
+    pub fn same_bindings(&self, other: &Self) -> bool {
+        self.default_alias == other.default_alias
+            && self.router_alias == other.router_alias
+            && self.router_roles == other.router_roles
+            && self.providers.len() == other.providers.len()
+            && self.providers.iter().all(|(alias, provider)| {
+                other
+                    .providers
+                    .get(alias)
+                    .is_some_and(|other| Arc::ptr_eq(provider, other))
+            })
     }
 
     pub fn get(&self, alias: &str) -> Result<Arc<dyn LLMProvider>, LLMError> {
@@ -53,6 +132,9 @@ impl LLMRegistry {
     }
 
     pub fn router(&self) -> Result<Arc<dyn LLMProvider>, LLMError> {
+        if let Some(config) = &self.router_roles {
+            return self.get(config.default.as_deref().unwrap_or(&self.default_alias));
+        }
         match &self.router_alias {
             Some(alias) => self.get(alias),
             None => self.default(),
@@ -87,6 +169,7 @@ impl LLMRegistry {
         if let Some(router) = &self.router_alias {
             mapped.set_router(router.clone());
         }
+        mapped.router_roles = self.router_roles.clone();
         mapped
     }
 
@@ -146,6 +229,69 @@ mod tests {
         fn supports(&self, _feature: LLMFeature) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn registry_keeps_routing_tree_out_of_inline_storage() {
+        // Registries move through builder futures even in legacy mode; inline role trees overflowed Windows eval stacks.
+        let max_inline_size = 16 * std::mem::size_of::<usize>();
+        assert!(
+            std::mem::size_of::<LLMRegistry>() <= max_inline_size,
+            "LLMRegistry must remain compact when auxiliary roles are added"
+        );
+    }
+
+    #[test]
+    fn hierarchy_clones_compare_by_value_and_keep_independent_trees() {
+        let mut registry = LLMRegistry::new();
+        registry.set_router_roles(RouterRolesConfig {
+            default: Some("fast".into()),
+            ..Default::default()
+        });
+        let mut cloned = registry.clone();
+        assert!(registry.same_bindings(&cloned));
+
+        cloned.router_roles.as_mut().unwrap().default = Some("precise".into());
+        assert_eq!(
+            registry.router_roles().unwrap().default.as_deref(),
+            Some("fast")
+        );
+        assert!(!registry.same_bindings(&cloned));
+
+        cloned.set_router("legacy");
+        assert!(cloned.router_roles().is_none());
+        assert!(registry.router_roles().is_some());
+    }
+
+    #[tokio::test]
+    async fn hierarchy_clone_and_map_resolve_wrapped_handles_for_every_role() {
+        use crate::routing::{LLMRole, LLMSelectionSource, RouterRolesConfig};
+        let mut registry = LLMRegistry::new();
+        let original = Arc::new(MockProvider {
+            name: "original".into(),
+        });
+        registry.register("main", original.clone());
+        registry.set_default("main");
+        registry.set_router_roles(RouterRolesConfig::default());
+        let clone = registry.clone();
+        let wrapped = clone.map_providers(|_, _| {
+            Arc::new(MockProvider {
+                name: "wrapped".into(),
+            })
+        });
+        for role in LLMRole::ALL {
+            let resolved = wrapped.resolve_role_override(*role, None).unwrap().unwrap();
+            assert_eq!(resolved.source, LLMSelectionSource::Default);
+            assert_eq!(
+                resolved.provider.complete(&[], None).await.unwrap().content,
+                "Response from wrapped"
+            );
+            assert!(Arc::ptr_eq(
+                &resolved.provider,
+                &wrapped.get("main").unwrap()
+            ));
+        }
+        assert_eq!(registry.default().unwrap().provider_name(), "original");
     }
 
     #[test]

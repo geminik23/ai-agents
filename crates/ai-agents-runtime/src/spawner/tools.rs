@@ -116,6 +116,7 @@ impl Tool for GenerateAgentTool {
         generate_schema::<GenerateAgentInput>()
     }
 
+    // Keeps template bypass and one repair attempt while separating generation and repair providers.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let description = match args.get("description").and_then(|v| v.as_str()) {
             Some(d) => d,
@@ -163,12 +164,19 @@ impl Tool for GenerateAgentTool {
 
         //
         // LLM generation
-        let llm: Arc<dyn LLMProvider> = match self.llm.router() {
-            Ok(l) => l,
-            Err(_) => match self.llm.default() {
+        let llm: Arc<dyn LLMProvider> = match self
+            .llm
+            .resolve_role_override(ai_agents_llm::LLMRole::SpawnerGeneration, None)
+        {
+            Ok(Some(resolved)) => resolved.provider,
+            Ok(None) => match self.llm.router() {
                 Ok(l) => l,
-                Err(e) => return ToolResult::error(format!("no LLM available: {}", e)),
+                Err(_) => match self.llm.default() {
+                    Ok(l) => l,
+                    Err(e) => return ToolResult::error(format!("no LLM available: {}", e)),
+                },
             },
+            Err(error) => return ToolResult::error(error.to_string()),
         };
 
         let prompt = build_generation_prompt(name, description);
@@ -208,9 +216,17 @@ impl Tool for GenerateAgentTool {
                     ChatMessage::user(retry_prompt),
                 ];
 
+                let repair_llm = match self
+                    .llm
+                    .resolve_role_override(ai_agents_llm::LLMRole::SpawnerRepair, None)
+                {
+                    Ok(Some(resolved)) => resolved.provider,
+                    Ok(None) => llm.clone(),
+                    Err(error) => return ToolResult::error(error.to_string()),
+                };
                 let retry_yaml = match with_observation_purpose(
                     ObservationPurpose::OrchestrationRouting,
-                    llm.complete(&retry_messages, None),
+                    repair_llm.complete(&retry_messages, None),
                 )
                 .await
                 {

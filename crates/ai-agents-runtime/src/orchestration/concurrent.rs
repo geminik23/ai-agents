@@ -30,6 +30,33 @@ pub async fn concurrent(
     on_partial_failure: PartialFailureAction,
     vote_parallelism: Option<usize>,
 ) -> Result<ConcurrentResult> {
+    concurrent_with_llms(
+        registry,
+        input,
+        agents,
+        aggregation_config,
+        super::AggregationLLMs::shared(llm),
+        min_required,
+        timeout_ms,
+        on_partial_failure,
+        vote_parallelism,
+    )
+    .await
+}
+
+/// Runs participant turns with unchanged ownership and uses captured role providers only for aggregation.
+#[allow(clippy::too_many_arguments)]
+pub async fn concurrent_with_llms(
+    registry: &AgentRegistry,
+    input: &str,
+    agents: &[ConcurrentAgentRef],
+    aggregation_config: &AggregationConfig,
+    llms: super::AggregationLLMs<'_>,
+    min_required: Option<usize>,
+    timeout_ms: Option<u64>,
+    on_partial_failure: PartialFailureAction,
+    vote_parallelism: Option<usize>,
+) -> Result<ConcurrentResult> {
     if agents.is_empty() {
         return Err(AgentError::Config(
             "No agents for concurrent execution".into(),
@@ -156,10 +183,10 @@ pub async fn concurrent(
         .collect();
 
     let strategy_name = format!("{:?}", aggregation_config.strategy);
-    let response = aggregation::aggregate(
+    let response = aggregation::aggregate_with_llms(
         &results,
         aggregation_config,
-        llm,
+        llms,
         &agent_weights,
         vote_parallelism,
     )

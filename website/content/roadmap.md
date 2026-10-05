@@ -4,7 +4,7 @@ template = "page.html"
 description = "What's shipped, what's next, and where the framework is headed."
 +++
 
-This page tracks what shipped through stable v1.0 and the planned post-v1 directions. Post-v1 release assignments remain intentionally unfrozen.
+This page tracks the released stable v1 foundation, preparation of 1.1.0, and future directions. Hierarchical LLM routing is implemented for 1.1; publication remains a separate release step. Other future release assignments remain intentionally unfrozen.
 
 ---
 
@@ -15,6 +15,7 @@ This page tracks what shipped through stable v1.0 and the planned post-v1 direct
 | ✅ Done | Released and available in the stable v1 line |
 | Implemented on main | Implemented maintenance work not yet included in a published release |
 | Current | Active maintenance or implementation focus |
+| Prepared | Implemented and validated locally; publication is a separate step |
 | Planned | Planned, but release target is unassigned |
 | Planned after v1.0 | Planned beyond the stable v1 foundation; exact release unassigned |
 | Planned optional | Optional companion product or workspace; not required for the core runtime |
@@ -50,6 +51,7 @@ This page tracks what shipped through stable v1.0 and the planned post-v1 direct
 
 | Target | Focus | Summary |
 | --- | --- | --- |
+| **1.1.0, prepared** | Hierarchical LLM Routing | Auxiliary role aliases with local overrides, validated bindings, child snapshots, and documented Rust API migration |
 | **Post-v1, unassigned** | Generalized Autonomy Runner | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events |
 | **Post-v1, unassigned** | Information Lifecycle | Retrieval and evidence contracts, extensible RAG, evidence access policy, and maintenance scheduling implemented in the sequence below |
 | **Post-v1, unassigned** | Python Runtime Bindings | First package scope: YAML loading and validation, chat, streaming, context, sessions, actor memory, relationships, and observability; task-run bindings follow later after the Generalized Autonomy Runner |
@@ -108,6 +110,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | ✅ Done | rc.15 |
 | **Built-in Tool Expansion** | Safe discovery, repository inspection, diagnostics, interactive questions, session todos, bounded waits, web retrieval primitives, context-aware tool policy, file write/edit, patch review, and controlled validation commands | ✅ Done | rc.16 |
 | **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | ✅ Done | v1.0.0 |
+| **Hierarchical LLM Routing** | Typed auxiliary role defaults and local aliases across execution, orchestration, memory, spawning, web extraction, and evaluation | Prepared | 1.1.0; one-time documented Rust source-compatibility exception |
 | **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned after v1.0 | Release unassigned |
 | **Python Runtime Bindings** | Native Python package initially covering YAML loading and validation, chat and streaming, context injection, sessions, actor memory, relationships, and observability through the Rust runtime. Task-run bindings are a later integration after the Generalized Autonomy Runner ships, not part of the first Python package scope. | Planned after v1.0 | Release unassigned |
 | **OpenTelemetry Exporter** | Export privacy-safe `ai-agents` runtime traces through OTLP to external observability backends such as LangSmith, Grafana Tempo, Jaeger, and Datadog. Covers LLM calls, tool calls, skill routing, state transitions, memory operations, multi-agent handoffs, speculative branch outcomes, eval metadata, latency, token usage, and cost estimates. | Planned after v1.0 | Release unassigned; builds on existing observability and tracing |

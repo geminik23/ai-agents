@@ -38,8 +38,12 @@ impl DisambiguationConfig {
 /// Detection configuration - how to identify ambiguous inputs
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectionConfig {
-    #[serde(default = "default_llm")]
-    pub llm: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "ai_agents_llm::deserialize_present_alias"
+    )]
+    pub llm: Option<String>,
 
     #[serde(default = "default_threshold")]
     pub threshold: f32,
@@ -49,10 +53,6 @@ pub struct DetectionConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-}
-
-fn default_llm() -> String {
-    "router".to_string()
 }
 
 fn default_threshold() -> f32 {
@@ -71,7 +71,7 @@ fn default_aspects() -> Vec<AmbiguityAspect> {
 impl Default for DetectionConfig {
     fn default() -> Self {
         Self {
-            llm: default_llm(),
+            llm: None,
             threshold: default_threshold(),
             aspects: default_aspects(),
             prompt: None,
@@ -342,7 +342,7 @@ enabled: true
 "#;
         let config: DisambiguationConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.enabled);
-        assert_eq!(config.detection.llm, "router");
+        assert_eq!(config.detection.llm, None);
     }
 
     #[test]
@@ -373,7 +373,7 @@ cache:
 "#;
         let config: DisambiguationConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.enabled);
-        assert_eq!(config.detection.llm, "fast");
+        assert_eq!(config.detection.llm.as_deref(), Some("fast"));
         assert_eq!(config.detection.threshold, 0.8);
         assert_eq!(config.detection.aspects.len(), 2);
         assert_eq!(config.clarification.style, ClarificationStyle::Options);

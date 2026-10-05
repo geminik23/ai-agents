@@ -20,6 +20,24 @@ pub async fn aggregate(
     agent_weights: &HashMap<String, f64>,
     vote_parallelism: Option<usize>,
 ) -> Result<AgentResponse> {
+    aggregate_with_llms(
+        results,
+        config,
+        super::AggregationLLMs::shared(llm),
+        agent_weights,
+        vote_parallelism,
+    )
+    .await
+}
+
+/// Aggregates with separate role providers while preserving declaration ordering and failure policy.
+pub async fn aggregate_with_llms(
+    results: &[AgentResult],
+    config: &AggregationConfig,
+    llms: super::AggregationLLMs<'_>,
+    agent_weights: &HashMap<String, f64>,
+    vote_parallelism: Option<usize>,
+) -> Result<AgentResponse> {
     let successful: Vec<&AgentResult> = results.iter().filter(|r| r.success).collect();
 
     if successful.is_empty() {
@@ -50,17 +68,26 @@ pub async fn aggregate(
         }
         AggregationStrategy::LlmSynthesis => {
             debug!("Aggregation strategy: llm_synthesis");
-            let llm = llm.ok_or_else(|| {
+            let llm = llms.synthesis.ok_or_else(|| {
                 AgentError::Config("LLM required for llm_synthesis aggregation".into())
             })?;
             synthesize_with_llm(llm, &successful, config.synthesizer_prompt.as_deref()).await
         }
         AggregationStrategy::Voting => {
             debug!("Aggregation strategy: voting");
-            let llm = llm
+            let llm = llms
+                .vote
                 .ok_or_else(|| AgentError::Config("LLM required for voting aggregation".into()))?;
             let vote_config = config.vote.as_ref();
-            vote_with_llm(llm, results, vote_config, agent_weights, vote_parallelism).await
+            vote_with_llm(
+                llm,
+                llms.tiebreak,
+                results,
+                vote_config,
+                agent_weights,
+                vote_parallelism,
+            )
+            .await
         }
     }
 }
@@ -145,6 +172,7 @@ async fn extract_vote(
 /// Extract votes from agent responses via LLM and tally them.
 async fn vote_with_llm(
     llm: &dyn LLMProvider,
+    tiebreak_llm: Option<&dyn LLMProvider>,
     results: &[AgentResult],
     vote_config: Option<&VoteConfig>,
     agent_weights: &HashMap<String, f64>,
@@ -274,7 +302,14 @@ async fn vote_with_llm(
                     .cloned()
                     .unwrap_or_else(|| tied[0].clone())
             }
-            TiebreakerStrategy::RouterDecides => resolve_tie_with_llm(llm, &tied).await?,
+            TiebreakerStrategy::RouterDecides => {
+                resolve_tie_with_llm(
+                    tiebreak_llm
+                        .ok_or_else(|| AgentError::Config("LLM required for tie-break".into()))?,
+                    &tied,
+                )
+                .await?
+            }
         }
     };
 

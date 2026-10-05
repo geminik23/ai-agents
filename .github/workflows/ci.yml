@@ -224,11 +224,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/zola"
           curl --fail --location --proto '=https' --tlsv1.2 \
             --output "$RUNNER_TEMP/zola.tar.gz" \
-            https://github.com/getzola/zola/releases/download/v0.22.1/zola-v0.22.1-x86_64-unknown-linux-gnu.tar.gz
-          echo "0ca09aa40376aaa9ddfb512ff9ad963262ef95edb0d0f2d5ec6961b6f5cf22ef  $RUNNER_TEMP/zola.tar.gz" \
+            https://github.com/getzola/zola/releases/download/v0.23.6/zola-v0.23.6-x86_64-unknown-linux-gnu.tar.gz
+          echo "8f5132b3522412d04e395e0b25f6d68613ad272a873e54a2b3ebf664873024a4  $RUNNER_TEMP/zola.tar.gz" \
             | sha256sum --check --strict
           tar -xzf "$RUNNER_TEMP/zola.tar.gz" -C "$RUNNER_TEMP/zola"
           echo "$RUNNER_TEMP/zola" >> "$GITHUB_PATH"
+      - name: Verify pinned Zola version
+        run: test "$(zola --version)" = "zola 0.23.6"
       - name: Build website
         run: sh website/build.sh build
       - name: Verify generated examples are synchronized

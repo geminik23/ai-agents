@@ -287,6 +287,60 @@ llm:
   router: router
 ```
 
+### Hierarchical auxiliary routing (1.1)
+
+Hierarchical auxiliary routing is supported in 1.1. Values are literal aliases in the existing `llms` registry, not provider configurations or references to other roles.
+
+```yaml
+llm:
+  default: main
+  router:
+    default: fast
+    state:
+      transition: precise
+    skills:
+      selection: classifier
+    process:
+      default: fast
+      extract: structured
+    reasoning:
+      default: precise
+      selection: fast
+      planning: planner
+```
+
+For each auxiliary call, selection is **explicit local alias → role leaf → group.default → router.default → llm.default**. A local selector covering several operations still overrides all of them: for example, `reflection.evaluator_llm` covers decision and evaluation, and `aggregation.synthesizer_llm` covers synthesis, vote extraction, and tie-breaking. Omit that local selector to separate the leaf models.
+
+Every group below supports an optional `default`. Groups are mappings, not scalar shortcuts.
+
+| Group | Role leaves |
+|-------|-------------|
+| `state` | `transition`, `extract` |
+| `skills` | `selection` |
+| `tools` | `condition` |
+| `process` | `detect`, `extract`, `sanitize`, `transform`, `validate` |
+| `disambiguation` | `detection`, `skip`, `clarification`, `parse`, `confirmation`, `confirmation_parse`, `response` |
+| `reasoning` | `selection`, `planning`, `reflection_decision`, `reflection_evaluation` |
+| `memory` | `summarize`, `merge`, `facts`, `relationships` |
+| `context` | `summarize` |
+| `orchestration` | `routing`, `handoff`, `speaker`, `consensus`, `synthesis`, `vote`, `tiebreak`, `summary` |
+| `hitl` | `message` |
+| `spawner` | `generation`, `repair` |
+| `web` | `extract` |
+| `evaluation` | `response`, `facts` |
+
+`disambiguation.skip` covers the existing social, previous-question, complete-response, and custom-condition checks. `orchestration.vote` covers both serial and parallel extraction. Role configuration does not enable a feature or introduce additional model calls. Main/state responses, skill prompt steps, state action prompts, plan execution, and reflection rewriting retain their existing model selection.
+
+- Omitted/null/scalar `router` retains legacy subsystem selection and missing-alias behavior. A mapping, including `{}`, opts into the new resolution contract. Scalar `fast` and `{ default: fast }` are not universally equivalent legacy configurations.
+- Omitted/null tree defaults, groups, and leaves inherit; null does not disable a feature. Unknown keys, incorrect types, and empty/whitespace-only tree aliases fail.
+- All explicit tree aliases must exist, even for inactive roles. Reachable local aliases are validated against the actual host/fixture/inherited registry before consumers or declared child topology are constructed. Aliases are not trimmed or lowercased.
+- An invalid selected alias is a configuration error, not a reason to try a parent default. Provider execution failures retain subsystem recovery; inheritance is not a retry/fallback chain.
+- An explicit local `llm: router` means the literal registry alias. Omission is retained separately in detection, extraction, semantic tool conditions, and generated approval text. Explicit null is rejected in these four local fields.
+- Host custom transition evaluators are not replaced. An explicit transition leaf conflicts with a custom evaluator; hierarchy with custom evaluation and semantic parallel transitions is rejected. Deterministic parallel transitions and legacy behavior remain supported.
+- Shared children own their routing settings. Child hierarchy replaces rather than merges the parent tree. A legacy child of a hierarchy parent does not inherit the parent hierarchy; omitted router in a legacy-parent/legacy-child pair retains historical scalar mapping inheritance.
+
+Hierarchy child session snapshots store the already-loaded skill definitions inline in a persistence-only spec copy. Original YAML and retained source references are not rewritten; inherited aliases are not materialized into locals. Fresh restore does not reread those external skill files. Retained child routing mismatches fail before session/topology mutation, using prepared configuration rather than current disk content. Prompt-only differences do not trigger routing hot-swap. Other external resources and provider availability remain host responsibilities. Legacy reference-only snapshots retain their existing file dependencies.
+
 ### Supported Providers
 
 | Provider | `provider` value | API Key Env Var | Notes |

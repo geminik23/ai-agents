@@ -183,6 +183,21 @@ pub async fn auto_configure_spawner(
         None => return Ok((builder, None)),
     };
 
+    let prepared_registry;
+    let llm_registry = if spec.llm.router_roles().is_some() {
+        if let Some(registry) = llm_registry {
+            let mut configured = registry.clone();
+            spec.install_routing(&mut configured);
+            builder = builder.llm_registry(configured);
+        }
+        builder.prepare_routing(false)?;
+        builder.wrap_llm_registry_for_observability()?;
+        builder.prepare_routing(true)?;
+        prepared_registry = builder.prepared_registry().cloned();
+        prepared_registry.as_ref()
+    } else {
+        llm_registry
+    };
     let mut spawner = AgentSpawner::new().with_resource_locks(builder.shared_resource_locks());
 
     if spawner_config.shared_llms {
@@ -191,7 +206,11 @@ pub async fn auto_configure_spawner(
                 "spawner.shared_llms requires the parent LLM registry to be configured".to_string(),
             )
         })?;
-        spawner = spawner.with_shared_llms(registry.clone());
+        spawner = if spec.llm.router_roles().is_some() && builder.prepared_registry_observed() {
+            spawner.with_shared_observed_llms(registry.clone())
+        } else {
+            spawner.with_shared_llms(registry.clone())
+        };
     }
 
     if !spawner_config.shared_context.is_empty() {

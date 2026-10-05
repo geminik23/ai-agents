@@ -122,12 +122,25 @@ impl AmbiguityDetector {
         context: &DisambiguationContext,
         effective_threshold: f32,
     ) -> Result<AmbiguityDetectionResult> {
-        let llm = self.llm_registry.get(&self.config.llm).map_err(|_| {
-            AgentError::Config(format!(
-                "LLM '{}' not found for disambiguation",
-                self.config.llm
-            ))
-        })?;
+        let llm = match self
+            .llm_registry
+            .resolve_role_override(
+                ai_agents_llm::LLMRole::DisambiguationDetection,
+                self.config.llm.as_deref(),
+            )
+            .map_err(|e| AgentError::Config(e.to_string()))?
+        {
+            Some(resolved) => resolved.provider,
+            None => self
+                .llm_registry
+                .get(self.config.llm.as_deref().unwrap_or("router"))
+                .map_err(|_| {
+                    AgentError::Config(format!(
+                        "LLM '{}' not found for disambiguation",
+                        self.config.llm.as_deref().unwrap_or("router")
+                    ))
+                })?,
+        };
 
         let prompt = self.build_detection_prompt(input, context, effective_threshold);
         let messages = vec![
@@ -339,15 +352,34 @@ IMPORTANT: Output ONLY valid JSON, no other text."#,
         })
     }
 
+    // Configuration errors are not semantic false; only legacy lookup failure remains optional.
+    fn skip_llm(&self) -> Result<Option<Arc<dyn ai_agents_llm::LLMProvider>>> {
+        Ok(
+            match self
+                .llm_registry
+                .resolve_role_override(
+                    ai_agents_llm::LLMRole::DisambiguationSkip,
+                    self.config.llm.as_deref(),
+                )
+                .map_err(|e| AgentError::Config(e.to_string()))?
+            {
+                Some(resolved) => Some(resolved.provider),
+                None => self
+                    .llm_registry
+                    .get(self.config.llm.as_deref().unwrap_or("router"))
+                    .ok(),
+            },
+        )
+    }
+
     /// LLM-based check for whether the user's input answers the assistant's last question.
     async fn is_answering_previous_question(
         &self,
         input: &str,
         context: &DisambiguationContext,
     ) -> Result<bool> {
-        let llm = match self.llm_registry.get(&self.config.llm) {
-            Ok(l) => l,
-            Err(_) => return Ok(false),
+        let Some(llm) = self.skip_llm()? else {
+            return Ok(false);
         };
 
         let last_question = context
@@ -384,9 +416,8 @@ Answer only "yes" or "no"."#,
     }
 
     async fn is_social_message(&self, input: &str) -> Result<bool> {
-        let llm = match self.llm_registry.get(&self.config.llm) {
-            Ok(l) => l,
-            Err(_) => return Ok(false),
+        let Some(llm) = self.skip_llm()? else {
+            return Ok(false);
         };
 
         let prompt = format!(
@@ -414,9 +445,8 @@ Answer only "yes" or "no"."#,
     }
 
     async fn is_complete_tool_response(&self, input: &str) -> Result<bool> {
-        let llm = match self.llm_registry.get(&self.config.llm) {
-            Ok(l) => l,
-            Err(_) => return Ok(false),
+        let Some(llm) = self.skip_llm()? else {
+            return Ok(false);
         };
 
         let prompt = format!(
@@ -441,9 +471,8 @@ Answer only "yes" or "no"."#,
         context: &DisambiguationContext,
         condition: &str,
     ) -> Result<bool> {
-        let llm = match self.llm_registry.get(&self.config.llm) {
-            Ok(l) => l,
-            Err(_) => return Ok(false),
+        let Some(llm) = self.skip_llm()? else {
+            return Ok(false);
         };
 
         let prompt = format!(
@@ -464,6 +493,55 @@ Answer only "yes" or "no"."#,
         })?;
 
         Ok(response.content.trim().to_lowercase().starts_with("yes"))
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use ai_agents_llm::mock::MockLLMProvider;
+    use ai_agents_llm::{DisambiguationRouterConfig, RouterRolesConfig};
+
+    #[tokio::test]
+    async fn hierarchy_detection_and_all_four_skips_use_distinct_roles() {
+        let mut registry = LLMRegistry::new();
+        let mut detection = MockLLMProvider::new("detection");
+        detection.set_response(r#"{"is_ambiguous":false,"confidence":1.0}"#);
+        let mut skip = MockLLMProvider::new("skip");
+        skip.set_response("yes");
+        let main = MockLLMProvider::new("main");
+        registry.register("main", Arc::new(main.clone()));
+        registry.set_default("main");
+        registry.register("detection", Arc::new(detection.clone()));
+        registry.register("skip", Arc::new(skip.clone()));
+        registry.set_router_roles(RouterRolesConfig {
+            disambiguation: Some(DisambiguationRouterConfig {
+                detection: Some("detection".into()),
+                skip: Some("skip".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let detector = AmbiguityDetector::new(DetectionConfig::default(), Arc::new(registry));
+        let context = DisambiguationContext::default();
+        detector.detect("item", &context).await.unwrap();
+        assert!(detector.is_social_message("hello").await.unwrap());
+        assert!(
+            detector
+                .is_answering_previous_question("one", &context)
+                .await
+                .unwrap()
+        );
+        assert!(detector.is_complete_tool_response("one").await.unwrap());
+        assert!(
+            detector
+                .evaluate_custom_condition("one", &context, "clear")
+                .await
+                .unwrap()
+        );
+        assert_eq!(detection.call_count(), 1);
+        assert_eq!(skip.call_count(), 4);
+        assert_eq!(main.call_count(), 0);
     }
 }
 

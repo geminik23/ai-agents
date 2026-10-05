@@ -7,6 +7,7 @@ pub mod spawner;
 pub(crate) mod storage;
 mod tool;
 
+pub use ai_agents_llm::{LLMRole, RouterRolesConfig, RouterSelector};
 pub use llm::{CliHitlMetadata, CliHitlStyle, CliMetadata, CliPromptStyle, LLMConfig, LLMSelector};
 pub use memory::MemoryConfig;
 pub use provider::ToolAliasesConfig;
@@ -192,10 +193,25 @@ impl LLMConfigOrSelector {
         }
     }
 
+    /// Returns the explicit hierarchy without confusing root defaults with scalar legacy mapping.
+    pub fn router_roles(&self) -> Option<&RouterRolesConfig> {
+        match self {
+            Self::Selector(s) => match &s.router {
+                Some(RouterSelector::Hierarchical(config)) => Some(config),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Returns only scalar selection; hierarchy defaults are not legacy router aliases.
     pub fn get_router_alias(&self) -> Option<String> {
         match self {
             LLMConfigOrSelector::Config(_) => None,
-            LLMConfigOrSelector::Selector(s) => s.router.clone(),
+            LLMConfigOrSelector::Selector(s) => match &s.router {
+                Some(RouterSelector::Alias(alias)) => Some(alias.clone()),
+                _ => None,
+            },
         }
     }
 }
@@ -238,12 +254,21 @@ fn insert_alias(aliases: &mut BTreeSet<String>, alias: Option<&String>) {
     }
 }
 
-fn collect_reasoning_aliases(config: &ReasoningConfig, aliases: &mut BTreeSet<String>) {
+// Auto mode can reach planning, but legacy admission retains its historical collector.
+fn collect_reasoning_aliases(
+    config: &ReasoningConfig,
+    aliases: &mut BTreeSet<String>,
+    legacy: bool,
+) {
     if !config.is_enabled() {
         return;
     }
-    insert_alias(aliases, config.judge_llm.as_ref());
-    if config.needs_planning() {
+    if legacy || matches!(config.mode, ai_agents_reasoning::ReasoningMode::Auto) {
+        insert_alias(aliases, config.judge_llm.as_ref());
+    }
+    if config.needs_planning()
+        || (!legacy && matches!(config.mode, ai_agents_reasoning::ReasoningMode::Auto))
+    {
         insert_alias(
             aliases,
             config
@@ -260,14 +285,20 @@ fn collect_reflection_aliases(config: &ReflectionConfig, aliases: &mut BTreeSet<
     }
 }
 
-fn collect_process_aliases(config: &ProcessConfig, aliases: &mut BTreeSet<String>) {
-    fn collect_stage(stage: &ProcessStage, aliases: &mut BTreeSet<String>) {
+// Collect only reachable hierarchy model stages while retaining conservative legacy admission.
+fn collect_process_aliases(config: &ProcessConfig, aliases: &mut BTreeSet<String>, legacy: bool) {
+    // Conditional branches can both become reachable with runtime context.
+    fn collect_stage(stage: &ProcessStage, aliases: &mut BTreeSet<String>, legacy: bool) {
         let alias = match stage {
             ProcessStage::Detect(stage) => stage.config.llm.as_ref(),
             ProcessStage::Extract(stage) => stage.config.llm.as_ref(),
             ProcessStage::Sanitize(stage) => stage.config.llm.as_ref(),
-            ProcessStage::Transform(stage) => stage.config.llm.as_ref(),
-            ProcessStage::Validate(stage) => stage.config.llm.as_ref(),
+            ProcessStage::Transform(stage) if legacy || stage.config.prompt.is_some() => {
+                stage.config.llm.as_ref()
+            }
+            ProcessStage::Validate(stage) if legacy || !stage.config.criteria.is_empty() => {
+                stage.config.llm.as_ref()
+            }
             ProcessStage::Conditional(stage) => {
                 for nested in stage
                     .config
@@ -275,7 +306,7 @@ fn collect_process_aliases(config: &ProcessConfig, aliases: &mut BTreeSet<String
                     .iter()
                     .chain(&stage.config.else_stages)
                 {
-                    collect_stage(nested, aliases);
+                    collect_stage(nested, aliases, legacy);
                 }
                 None
             }
@@ -285,30 +316,52 @@ fn collect_process_aliases(config: &ProcessConfig, aliases: &mut BTreeSet<String
     }
 
     for stage in config.input.iter().chain(&config.output) {
-        collect_stage(stage, aliases);
+        collect_stage(stage, aliases, legacy);
     }
 }
 
-fn collect_tool_condition_aliases(condition: &ToolCondition, aliases: &mut BTreeSet<String>) {
+// Legacy child admission retains implicit references; hierarchy collects only explicit locals.
+fn collect_tool_condition_aliases(
+    condition: &ToolCondition,
+    aliases: &mut BTreeSet<String>,
+    legacy: bool,
+) {
     match condition {
         ToolCondition::Semantic { llm, .. } => {
-            aliases.insert(llm.clone());
+            if let Some(alias) = llm {
+                aliases.insert(alias.clone());
+            } else if legacy {
+                aliases.insert("router".into());
+            }
         }
         ToolCondition::All(conditions) | ToolCondition::Any(conditions) => {
             for condition in conditions {
-                collect_tool_condition_aliases(condition, aliases);
+                collect_tool_condition_aliases(condition, aliases, legacy);
             }
         }
-        ToolCondition::Not(condition) => collect_tool_condition_aliases(condition, aliases),
+        ToolCondition::Not(condition) => collect_tool_condition_aliases(condition, aliases, legacy),
         _ => {}
     }
 }
 
-fn collect_state_aliases(config: &StateConfig, aliases: &mut BTreeSet<String>) {
-    fn collect_definition(definition: &StateDefinition, aliases: &mut BTreeSet<String>) {
+// Recursively collect state locals without synthesizing hierarchy overrides.
+fn collect_state_aliases(config: &StateConfig, aliases: &mut BTreeSet<String>, legacy: bool) {
+    // Traverse declared states while keeping response, action, and auxiliary aliases distinct.
+    fn collect_definition(
+        definition: &StateDefinition,
+        aliases: &mut BTreeSet<String>,
+        legacy: bool,
+    ) {
         insert_alias(aliases, definition.llm.as_ref());
         for extractor in &definition.extract {
-            aliases.insert(extractor.llm.clone());
+            if !legacy && extractor.description.is_none() && extractor.llm_extract.is_none() {
+                continue;
+            }
+            if let Some(alias) = &extractor.llm {
+                aliases.insert(alias.clone());
+            } else if legacy {
+                aliases.insert("router".into());
+            }
         }
         for action in definition
             .on_enter
@@ -322,30 +375,30 @@ fn collect_state_aliases(config: &StateConfig, aliases: &mut BTreeSet<String>) {
         }
         for tool in definition.tools.iter().flatten() {
             if let Some(condition) = tool.condition() {
-                collect_tool_condition_aliases(condition, aliases);
+                collect_tool_condition_aliases(condition, aliases, legacy);
             }
         }
         if let Some(reasoning) = definition.reasoning.as_ref() {
-            collect_reasoning_aliases(reasoning, aliases);
+            collect_reasoning_aliases(reasoning, aliases, legacy);
         }
         if let Some(reflection) = definition.reflection.as_ref() {
             collect_reflection_aliases(reflection, aliases);
         }
         if let Some(process) = definition.process.as_ref() {
-            collect_process_aliases(process, aliases);
+            collect_process_aliases(process, aliases, legacy);
         }
         if let Some(concurrent) = definition.concurrent.as_ref() {
             insert_alias(aliases, concurrent.aggregation.synthesizer_llm.as_ref());
         }
         if let Some(states) = definition.states.as_ref() {
             for definition in states.values() {
-                collect_definition(definition, aliases);
+                collect_definition(definition, aliases, legacy);
             }
         }
     }
 
     for definition in config.states.values() {
-        collect_definition(definition, aliases);
+        collect_definition(definition, aliases, legacy);
     }
 }
 
@@ -482,8 +535,143 @@ fn collect_unsupported_yaml_keys(
 }
 
 impl AgentSpec {
+    /// Applies child-local hierarchy while preserving scalar inheritance between legacy agents.
+    pub(crate) fn install_routing(&self, registry: &mut ai_agents_llm::LLMRegistry) {
+        registry.set_default(self.llm.get_default_alias());
+        if let Some(config) = self.llm.router_roles() {
+            registry.set_router_roles(config.clone());
+        } else {
+            if registry.router_roles().is_some() {
+                registry.clear_router();
+            }
+            if let Some(alias) = self.llm.get_router_alias() {
+                registry.set_router(alias);
+            }
+        }
+    }
+
+    /// Detects the unsupported custom-evaluator combination without rejecting deterministic parallel routes.
+    pub(crate) fn has_semantic_parallel_transition(&self) -> bool {
+        // Only response-independent semantic candidates require the framework parallel provider.
+        fn transition(t: &Transition) -> bool {
+            matches!(t.timing, TransitionTiming::Parallel)
+                && !t.requires_response
+                && !t.when.trim().is_empty()
+        }
+        // Nested definitions must obey the same custom-evaluator admission boundary.
+        fn definitions(states: &HashMap<String, StateDefinition>) -> bool {
+            states.values().any(|state| {
+                state.transitions.iter().any(transition)
+                    || state.states.as_ref().is_some_and(definitions)
+            })
+        }
+        self.states.as_ref().is_some_and(|config| {
+            config.global_transitions.iter().any(transition) || definitions(&config.states)
+        })
+    }
+
+    /// Compares declarative routing and prepared local selectors, not prompt content or file provenance.
+    pub(crate) fn routing_projection(&self) -> Result<serde_json::Value> {
+        // Preserve selector positions and activation without comparing model prompt payloads.
+        fn project(value: &serde_json::Value, process: bool) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    let mut out = serde_json::Map::new();
+                    for (key, value) in fields {
+                        if matches!(
+                            key.as_str(),
+                            "args"
+                                | "schema"
+                                | "metadata"
+                                | "context"
+                                | "extra"
+                                | "description"
+                                | "system_prompt"
+                                | "trigger"
+                        ) {
+                            continue;
+                        }
+                        if key == "llm" && value.is_object() {
+                            out.insert(key.clone(), project(value, process));
+                        } else if matches!(
+                            key.as_str(),
+                            "llm"
+                                | "planner_llm"
+                                | "evaluator_llm"
+                                | "summarizer_llm"
+                                | "synthesizer_llm"
+                                | "extractor_llm"
+                                | "judge_llm"
+                                | "enabled"
+                                | "mode"
+                                | "strategy"
+                                | "type"
+                                | "method"
+                                | "id"
+                                | "stage"
+                                | "auto_extract"
+                                | "style"
+                        ) {
+                            if !value.is_null() {
+                                out.insert(key.clone(), value.clone());
+                            }
+                        } else if process && matches!(key.as_str(), "prompt" | "criteria") {
+                            out.insert(
+                                key.clone(),
+                                serde_json::Value::Bool(
+                                    !value.is_null()
+                                        && value.as_array().is_none_or(|values| !values.is_empty()),
+                                ),
+                            );
+                        } else if value.is_object() || value.is_array() {
+                            let child = project(value, process || key == "process");
+                            if child.as_object().is_none_or(|fields| !fields.is_empty()) {
+                                out.insert(key.clone(), child);
+                            }
+                        }
+                    }
+                    serde_json::Value::Object(out)
+                }
+                serde_json::Value::Array(values) => serde_json::Value::Array(
+                    values.iter().map(|value| project(value, process)).collect(),
+                ),
+                _ => serde_json::Value::Null,
+            }
+        }
+        let serialized =
+            serde_json::to_value(self).map_err(|e| AgentError::Config(e.to_string()))?;
+        let mut out = serde_json::Map::new();
+        out.insert(
+            "llm".into(),
+            serde_json::to_value(&self.llm).map_err(|e| AgentError::Config(e.to_string()))?,
+        );
+        for key in [
+            "skills",
+            "states",
+            "reasoning",
+            "reflection",
+            "process",
+            "hitl",
+            "memory",
+            "error_recovery",
+            "disambiguation",
+        ] {
+            if let Some(value) = serialized.get(key) {
+                out.insert(key.into(), project(value, key == "process"));
+            }
+        }
+        Ok(serde_json::Value::Object(out))
+    }
+
+    /// Collects explicit local references and mode-aware legacy child admission requirements.
     pub(crate) fn referenced_llm_aliases(&self) -> BTreeSet<String> {
         let mut aliases = BTreeSet::new();
+        let legacy = self.llm.router_roles().is_none();
+        if let Some(config) = self.llm.router_roles() {
+            for (_, alias) in config.configured_aliases() {
+                aliases.insert(alias.into());
+            }
+        }
 
         if self.memory.memory_type == "compacting" {
             insert_alias(&mut aliases, self.memory.summarizer_llm.as_ref());
@@ -500,11 +688,11 @@ impl AgentSpec {
             insert_alias(&mut aliases, relationships.auto_update.llm.as_ref());
         }
 
-        collect_reasoning_aliases(&self.reasoning, &mut aliases);
+        collect_reasoning_aliases(&self.reasoning, &mut aliases, legacy);
         collect_reflection_aliases(&self.reflection, &mut aliases);
-        collect_process_aliases(&self.process, &mut aliases);
+        collect_process_aliases(&self.process, &mut aliases, legacy);
         if let Some(states) = self.states.as_ref() {
-            collect_state_aliases(states, &mut aliases);
+            collect_state_aliases(states, &mut aliases, legacy);
         }
 
         match &self.error_recovery.llm.on_failure {
@@ -525,13 +713,22 @@ impl AgentSpec {
         }
 
         if self.disambiguation.is_enabled() {
-            aliases.insert(self.disambiguation.detection.llm.clone());
+            if let Some(alias) = &self.disambiguation.detection.llm {
+                aliases.insert(alias.clone());
+            } else if legacy {
+                aliases.insert("router".into());
+            }
             insert_alias(&mut aliases, self.disambiguation.clarification.llm.as_ref());
         }
-        if let Some(hitl) = self.hitl.as_ref()
+        if legacy
+            && let Some(hitl) = self.hitl.as_ref()
             && let Some(generate) = hitl.message_language.llm_generate.as_ref()
         {
-            aliases.insert(generate.llm.clone());
+            if let Some(alias) = &generate.llm {
+                aliases.insert(alias.clone());
+            } else if legacy {
+                aliases.insert("router".into());
+            }
         }
 
         for skill in &self.skills {
@@ -539,7 +736,7 @@ impl AgentSpec {
                 continue;
             };
             if let Some(reasoning) = skill.reasoning.as_ref() {
-                collect_reasoning_aliases(reasoning, &mut aliases);
+                collect_reasoning_aliases(reasoning, &mut aliases, legacy);
             }
             if let Some(reflection) = skill.reflection.as_ref() {
                 collect_reflection_aliases(reflection, &mut aliases);
@@ -551,6 +748,48 @@ impl AgentSpec {
             }
         }
 
+        if !legacy {
+            // Collect reachable generated-message locals across global and nested HITL overrides.
+            fn collect(value: &serde_json::Value, aliases: &mut BTreeSet<String>) {
+                match value {
+                    serde_json::Value::Object(fields) => {
+                        let reachable = fields.get("strategy").and_then(|value| value.as_str())
+                            == Some("llm_generate")
+                            || fields
+                                .get("fallback")
+                                .and_then(|value| value.as_array())
+                                .is_some_and(|values| {
+                                    values
+                                        .iter()
+                                        .any(|value| value.as_str() == Some("llm_generate"))
+                                });
+                        if reachable
+                            && let Some(alias) = fields
+                                .get("llm_generate")
+                                .and_then(|v| v.get("llm"))
+                                .and_then(|v| v.as_str())
+                        {
+                            aliases.insert(alias.into());
+                        }
+                        for value in fields.values() {
+                            collect(value, aliases);
+                        }
+                    }
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            collect(value, aliases);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(hitl) = &self.hitl {
+                collect(
+                    &serde_json::to_value(hitl).expect("serializable HITL config"),
+                    &mut aliases,
+                );
+            }
+        }
         aliases
     }
 
@@ -607,7 +846,13 @@ impl AgentSpec {
         Ok(spec)
     }
 
+    /// Validates structure without requiring host-supplied provider aliases to exist yet.
     pub fn validate(&self) -> Result<()> {
+        if let Some(config) = self.llm.router_roles() {
+            config
+                .validate()
+                .map_err(|e| AgentError::InvalidSpec(e.to_string()))?;
+        }
         if self.name.is_empty() {
             return Err(AgentError::InvalidSpec(
                 "Agent name cannot be empty".to_string(),
@@ -1793,7 +2038,7 @@ llms:
 "#;
         let spec: AgentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.has_disambiguation());
-        assert_eq!(spec.disambiguation.detection.llm, "router");
+        assert_eq!(spec.disambiguation.detection.llm, None);
         assert_eq!(spec.disambiguation.detection.threshold, 0.7);
         assert_eq!(spec.disambiguation.clarification.max_attempts, 2);
     }
