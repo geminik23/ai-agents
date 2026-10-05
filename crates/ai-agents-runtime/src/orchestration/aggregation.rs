@@ -369,10 +369,106 @@ async fn resolve_tie_with_llm(llm: &dyn LLMProvider, tied_choices: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ai_agents_core::AgentResponse;
+    use ai_agents_core::{
+        AgentResponse, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMResponse,
+    };
     use ai_agents_llm::mock::MockLLMProvider;
     use ai_agents_state::AggregationStrategy;
-    use std::time::Instant;
+    use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use tokio::sync::Semaphore;
+
+    #[derive(Default)]
+    struct VoteActivity {
+        started: Vec<usize>,
+        active: usize,
+        peak: usize,
+    }
+
+    struct ControlledVoteProvider {
+        gates: [Semaphore; 3],
+        activity: Mutex<VoteActivity>,
+    }
+
+    impl ControlledVoteProvider {
+        // Give each request its own gate so completion order cannot change its response.
+        fn new() -> Self {
+            Self {
+                gates: std::array::from_fn(|_| Semaphore::new(0)),
+                activity: Mutex::new(VoteActivity::default()),
+            }
+        }
+
+        // Check polled progress rather than inferring concurrency from elapsed time.
+        fn assert_activity(&self, started: &[usize], active: usize, peak: usize) {
+            let activity = self.activity.lock();
+            assert_eq!(activity.started, started);
+            assert_eq!(activity.active, active);
+            assert_eq!(activity.peak, peak);
+        }
+    }
+
+    struct ActiveVote<'a>(&'a Mutex<VoteActivity>);
+
+    impl Drop for ActiveVote<'_> {
+        // Pending provider futures must release their activity on cancellation as well as completion.
+        fn drop(&mut self) {
+            self.0.lock().active -= 1;
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ControlledVoteProvider {
+        // Block only on the matching request gate and avoid a separate tiebreaker call.
+        async fn complete(
+            &self,
+            messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<LLMResponse, LLMError> {
+            let id = match messages.last().map(|message| message.content.as_str()) {
+                Some("first") => 0,
+                Some("second") => 1,
+                Some("third") => 2,
+                other => {
+                    return Err(LLMError::Config(format!(
+                        "Unexpected vote request: {other:?}"
+                    )));
+                }
+            };
+            {
+                let mut activity = self.activity.lock();
+                assert!(!activity.started.contains(&id), "Duplicate vote request");
+                activity.started.push(id);
+                activity.active += 1;
+                activity.peak = activity.peak.max(activity.active);
+            }
+            let _active = ActiveVote(&self.activity);
+            self.gates[id].acquire().await.unwrap().forget();
+            Ok(LLMResponse::new("A", FinishReason::Stop))
+        }
+
+        // The fixture exercises only completion calls and must not hide an unexpected stream path.
+        async fn complete_stream(
+            &self,
+            _messages: &[ChatMessage],
+            _config: Option<&LLMConfig>,
+        ) -> std::result::Result<
+            Box<dyn futures::Stream<Item = std::result::Result<LLMChunk, LLMError>> + Unpin + Send>,
+            LLMError,
+        > {
+            Err(LLMError::Config("Unexpected streaming vote request".into()))
+        }
+
+        // Identify the controlled test provider without introducing production configuration.
+        fn provider_name(&self) -> &str {
+            "controlled-votes"
+        }
+
+        // Voting uses plain completion and requires no specialized provider features.
+        fn supports(&self, _feature: LLMFeature) -> bool {
+            false
+        }
+    }
 
     fn agent_result(index: usize, id: &str, content: &str) -> AgentResult {
         AgentResult {
@@ -385,14 +481,10 @@ mod tests {
         }
     }
 
+    // Serial extraction must leave later requests unstarted until the current request completes.
     #[tokio::test]
     async fn vote_extraction_is_serial_without_parallelism() {
-        let mut llm = MockLLMProvider::new("votes");
-        llm.set_responses(
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            false,
-        );
-        llm.set_latency(25);
+        let llm = ControlledVoteProvider::new();
         let results = vec![
             agent_result(0, "a", "first"),
             agent_result(1, "b", "second"),
@@ -404,22 +496,29 @@ mod tests {
             synthesizer_prompt: None,
             vote: None,
         };
-        let started = Instant::now();
-        let _ = aggregate(&results, &config, Some(&llm), &HashMap::new(), None)
-            .await
-            .unwrap();
-        assert!(started.elapsed() >= std::time::Duration::from_millis(60));
-        assert_eq!(llm.call_count(), 3);
+        let weights = HashMap::new();
+        let mut operation = Box::pin(aggregate(&results, &config, Some(&llm), &weights, None));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0], 1, 1);
+        llm.gates[0].add_permits(1);
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0, 1], 1, 1);
+        llm.gates[1].add_permits(1);
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0, 1, 2], 1, 1);
+        llm.gates[2].add_permits(1);
+        let response = operation.await.unwrap();
+        llm.assert_activity(&[0, 1, 2], 0, 1);
+        assert_eq!(
+            response.content,
+            "Vote result: A\n\nVotes:\n- a: A\n- b: A\n- c: A"
+        );
     }
 
+    // A completed slot cannot start the next batch until every request in the current chunk finishes.
     #[tokio::test]
     async fn vote_extraction_uses_bounded_parallelism_when_enabled() {
-        let mut llm = MockLLMProvider::new("votes");
-        llm.set_responses(
-            vec!["A".to_string(), "B".to_string(), "C".to_string()],
-            false,
-        );
-        llm.set_latency(50);
+        let llm = ControlledVoteProvider::new();
         let results = vec![
             agent_result(0, "a", "first"),
             agent_result(1, "b", "second"),
@@ -431,12 +530,45 @@ mod tests {
             synthesizer_prompt: None,
             vote: None,
         };
-        let started = Instant::now();
-        let _ = aggregate(&results, &config, Some(&llm), &HashMap::new(), Some(2))
-            .await
-            .unwrap();
-        assert!(started.elapsed() < std::time::Duration::from_millis(140));
-        assert_eq!(llm.call_count(), 3);
+        let weights = HashMap::new();
+        let mut operation = Box::pin(aggregate(&results, &config, Some(&llm), &weights, Some(2)));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0, 1], 2, 2);
+        llm.gates[1].add_permits(1);
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0, 1], 1, 2);
+        llm.gates[0].add_permits(1);
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0, 1, 2], 1, 2);
+        llm.gates[2].add_permits(1);
+        let response = operation.await.unwrap();
+        llm.assert_activity(&[0, 1, 2], 0, 2);
+        assert_eq!(
+            response.content,
+            "Vote result: A\n\nVotes:\n- a: A\n- b: A\n- c: A"
+        );
+    }
+
+    // Dropping aggregation must drop pending provider calls rather than leave activity behind.
+    #[tokio::test]
+    async fn dropping_vote_extraction_releases_active_requests() {
+        let llm = ControlledVoteProvider::new();
+        let results = vec![
+            agent_result(0, "a", "first"),
+            agent_result(1, "b", "second"),
+        ];
+        let config = AggregationConfig {
+            strategy: AggregationStrategy::Voting,
+            synthesizer_llm: None,
+            synthesizer_prompt: None,
+            vote: None,
+        };
+        let weights = HashMap::new();
+        let mut operation = Box::pin(aggregate(&results, &config, Some(&llm), &weights, Some(2)));
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        llm.assert_activity(&[0, 1], 2, 2);
+        drop(operation);
+        llm.assert_activity(&[0, 1], 0, 2);
     }
 
     #[tokio::test]
