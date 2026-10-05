@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container section-padding learning-hub">
+    <header class="learning-header">
+        <p class="page-eyebrow">Define in YAML. Extend in Rust.</p>
+        <h1>{{ section.title }}</h1>
+        <p class="learning-lead">Build an agent. Understand its execution. Verify its behavior.</p>
+        <div class="learning-intro">{{ section.content | safe }}</div>
+    </header>
+    <section class="learning-section" aria-labelledby="start-heading">
+        <div class="learning-section-heading"><span class="learning-step">01</span><div><h2 id="start-heading">Choose your starting point</h2><p>Use a hosted model, your own application, a local model, or a fixed test response.</p></div></div>
+        <div class="learning-start-grid">
+        {% for start in section.extra.starts %}
+            {% set target = get_page(path=start.path) %}
+            <a class="learning-card learning-start-card" href="{{ target.permalink }}#{{ start.anchor }}">
+                <span class="learning-card-label">{{ start.label }}</span><h3>{{ start.title }} <span aria-hidden="true">↗</span></h3><p>{{ start.description }}</p>
+            </a>
+        {% endfor %}
+        </div>
+    </section>
+    <section class="learning-section" aria-labelledby="build-heading">
+        <div class="learning-section-heading"><span class="learning-step">02</span><div><h2 id="build-heading">Build the behavior you need</h2><p>Focused guides connect a design choice, a working example, and its execution contract.</p></div></div>
+        <div class="learning-guide-grid">
+        {% for doc in section.pages %}{% set is_learning_guide = doc.extra.learning_guide | default(value=false) %}{% if is_learning_guide %}
+            <a class="learning-card learning-guide-card" href="{{ doc.permalink }}"><h3>{{ doc.title }} <span aria-hidden="true">→</span></h3><p>{{ doc.description }}</p><span class="learning-card-action">Read the guide</span></a>
+        {% endif %}{% endfor %}
+            <a class="learning-card learning-guide-card learning-example-card" href="{{ get_url(path='@/examples/_index.md') }}"><span class="learning-card-label">Put it together</span><h3>Find a working example <span aria-hidden="true">→</span></h3><p>Choose a goal, inspect its YAML, and follow the commands to run and test it.</p><span class="learning-card-action">Explore examples</span></a>
+        </div>
+    </section>
+    <section class="learning-section" aria-labelledby="reference-heading">
+        <div class="learning-section-heading"><span class="learning-step">03</span><div><h2 id="reference-heading">Keep the reference close</h2><p>Look up fields, interfaces, providers, commands, and runtime contracts.</p></div></div>
+        <div class="learning-reference-grid">
+        {% for doc in section.pages %}{% set is_learning_guide = doc.extra.learning_guide | default(value=false) %}{% if not is_learning_guide %}
+            <a class="learning-reference" href="{{ doc.permalink }}"><h3>{{ doc.title }} <span aria-hidden="true">↗</span></h3><p>{{ doc.description }}</p></a>
+        {% endif %}{% endfor %}
+        </div>
+    </section>
+</div>
+{% endblock content %}

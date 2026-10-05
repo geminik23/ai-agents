@@ -31,14 +31,25 @@ mkdir -p "$CONTENT_DIR"
 cat > "$CONTENT_DIR/_index.md" << 'FRONTMATTER'
 +++
 title = "Examples"
-template = "section.html"
-description = "Browse example agents — from simple chatbots to complex workflows."
+template = "examples.html"
+description = "Run YAML agent examples on the ai-agents Rust runtime: conversations, local models, tools, memory, state workflows, and multi-agent routing."
 sort_by = "weight"
+[extra]
+seo_title = "YAML Agent Examples for Rust"
 +++
 
 FRONTMATTER
 
 tail -n +3 "$PROJECT_ROOT/examples/README.md" >> "$CONTENT_DIR/_index.md"
+
+# Curated learning pages embed the repository YAML rather than maintaining copies.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "error: website build requires Python 3.11 or newer for example pages" >&2
+  exit 1
+fi
+python3 "$SCRIPT_DIR/scripts/generate_examples.py"
+python3 "$SCRIPT_DIR/scripts/capture_execution_demo.py" --check
+python3 "$SCRIPT_DIR/scripts/home_agent_demos.py"
 
 echo "Done. Building site..."
 

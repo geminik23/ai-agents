@@ -1,7 +1,5 @@
 {% extends "base.html" %}
 
-{% block title %}{{ term.name | title }} — {{ config.title }}{% endblock title %}
-
 {% block content %}
 <div class="container section-padding">
   <h1>
@@ -9,7 +7,8 @@
   </h1>
 
   <div class="blog-list">
-    {% for page in term.pages %}
+    {% if paginator is defined %}{% set posts = paginator.pages %}{% else %}{% set posts = term.pages %}{% endif %}
+    {% for page in posts %}
     <article class="blog-card">
       <h2><a href="{{ page.permalink }}">{{ page.title }}</a></h2>
       <div class="blog-meta">
@@ -28,6 +27,14 @@
     </article>
     {% endfor %}
   </div>
+
+  {% if paginator is defined and paginator.number_pagers > 1 %}
+  <nav aria-label="Tag archive pages">
+    {% if paginator.previous %}<a href="{{ paginator.previous }}">&larr; Newer posts</a>{% endif %}
+    <span class="text-muted">Page {{ paginator.current_index }} of {{ paginator.number_pagers }}</span>
+    {% if paginator.next %}<a href="{{ paginator.next }}">Older posts &rarr;</a>{% endif %}
+  </nav>
+  {% endif %}
 
   <p class="back-link"><a href="{{ get_url(path='@/blog/_index.md') }}">&larr; Back to Blog</a></p>
 </div>

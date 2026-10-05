@@ -1,0 +1,47 @@
+// The shared tab controller alone hides panels; all four additions remain readable without JavaScript.
+.agent-growth { border-top: 1px solid var(--border); }
+.growth-workspace { border: 1px solid var(--border); border-radius: 12px; background: var(--bg-surface); min-width: 0; overflow: hidden; }
+.growth-tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; padding: 0.75rem 1rem 0; border-bottom: 1px solid var(--border); background: var(--bg); }
+.growth-tabs button { display: inline-flex; gap: 0.65rem; align-items: center; padding: 0.9rem 1rem; min-height: 48px; background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--text-muted); font: inherit; font-size: 0.9rem; font-weight: 600; cursor: pointer; }
+.growth-tabs button span { font-family: var(--font-mono); font-size: 0.7rem; opacity: 0.8; }
+.growth-tabs button:hover { color: var(--text-heading); background: var(--bg-surface); }
+.growth-tabs button[aria-selected="true"] { color: var(--accent-text); border-bottom-color: var(--accent-text); }
+.growth-instructions { margin: 0; padding: 1.1rem 1.75rem; font-size: 0.8rem; color: var(--text-muted); line-height: 1.7; border-bottom: 1px solid var(--border); }
+.growth-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); align-items: start; gap: 2.5rem; padding: 2rem; min-width: 0; }
+.growth-panel[hidden] { display: none; }
+.growth-panel + .growth-panel { border-top: 1px solid var(--border); }
+[data-tabs-ready] > .growth-panel { border-top: 0; }
+.growth-code { min-width: 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--code-bg); }
+.growth-code-heading { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; justify-content: space-between; padding: 0.8rem 1rem; background: var(--code-header); border-bottom: 1px solid var(--border); color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem; }
+.growth-code-heading span:last-child { color: var(--accent-text); }
+.growth-code .code-block { border: 0; border-radius: 0; }
+.growth-code .code-block code { padding: 1.4rem; font-size: 0.8rem; line-height: 1.9; border-radius: 0; }
+.growth-explanation { min-width: 0; padding: 0.15rem 0; }
+.growth-kind { color: var(--accent-text); font-size: 0.7rem; font-weight: 650; text-transform: uppercase; letter-spacing: 0.07em; margin: 0 0 0.6rem; }
+.growth-explanation h3 { font-size: clamp(1.3rem, 2.3vw, 1.65rem); line-height: 1.3; letter-spacing: -0.025em; margin: 0 0 1rem; }
+.growth-explanation > p:not(.growth-kind) { color: var(--text-muted); line-height: 1.8; font-size: 0.9rem; }
+.growth-illustration { padding: 1rem 1.15rem; border-left: 2px solid var(--accent-text); background: var(--accent-muted); margin: 1.5rem 0; border-radius: 0 6px 6px 0; }
+.growth-illustration > span { display: block; font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-muted); margin-bottom: 0.5rem; }
+.growth-illustration p { margin: 0; font-size: 0.85rem; line-height: 1.9; color: var(--text-heading); }
+.growth-illustration b { padding-inline: 0.3rem; color: var(--accent-text); font-weight: 400; }
+.growth-contract a { text-decoration: underline; text-underline-offset: 0.2em; }
+.growth-contract code, .growth-instructions code { overflow-wrap: anywhere; }
+.growth-links { display: flex; flex-direction: column; align-items: flex-start; gap: 0.7rem; margin-top: 1.5rem; }
+.growth-links a { color: var(--link); font-size: 0.85rem; font-weight: 600; }
+.growth-links a:last-child { font-size: 0.8rem; font-weight: 400; text-decoration: underline; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 0.2em; }
+.growth-links a:hover { color: var(--link-hover); }
+.growth-footnote { padding: 1rem 1.75rem; margin: 0; border-top: 1px solid var(--border); font-size: 0.75rem; line-height: 1.75; color: var(--text-muted); }
+@media (max-width: 1023px) {
+  .growth-panel { gap: 1.5rem; padding: 1.5rem; }
+}
+@media (max-width: 767px) {
+  .growth-panel { grid-template-columns: minmax(0, 1fr); }
+  .growth-tabs { padding: 0.5rem 0.5rem 0; gap: 0; }
+  .growth-tabs button { justify-content: center; flex: 1 0 45%; padding: 0.75rem 0.4rem; font-size: 0.8rem; }
+  .growth-instructions, .growth-footnote { padding-inline: 1.25rem; }
+  .growth-code .code-block code { padding: 1.1rem; }
+}
+@media (max-width: 399px) {
+  .growth-panel { padding: 1rem; }
+  .growth-tabs button span { display: none; }
+}

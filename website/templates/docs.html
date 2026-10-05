@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}{{ page.title }} | Docs — {{ config.title }}{% endblock title %}
+
 {% block scripts %}<script src="{{ get_url(path='js/docs.js') }}" defer></script>{% endblock scripts %}
 {% block content %}
 {% set docs_section = get_section(path="docs/_index.md") %}

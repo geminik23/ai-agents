@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+
+{% block scripts %}<script src="{{ get_url(path='js/roles.js') }}" defer></script>{% endblock scripts %}
+{% block content %}
+<article class="container section-padding role-explorer">
+    <p class="page-eyebrow">Explore / Model selection</p>
+    <h1>{{ page.title }}</h1>
+    <p class="experience-lead">Give each responsibility the model it needs. Change a setting and follow the selection from a local override to the agent default.</p>
+    <p class="experience-note">Interactive configuration explanation · no model requests</p>
+    <div class="role-workbench" data-role-explorer>
+        <form class="role-controls" aria-label="Model selection settings">
+            <h2>Configure <code>process.detect</code></h2>
+            <p>Choose a registered alias, or inherit from the next level.</p>
+            <ol class="role-chain">
+                <li data-role-level="local"><label for="role-local"><span class="role-step">01</span><span>Local override<small>Detection stage · config.llm</small></span></label><select disabled id="role-local" name="local"><option value="">Inherit</option><option value="fast">fast</option><option value="precise" selected>precise</option><option value="main">main</option></select><span class="role-level-status">Selected</span></li>
+                <li data-role-level="role"><label for="role-leaf"><span class="role-step">02</span><span>Role leaf<small>llm.router.process.detect</small></span></label><select disabled id="role-leaf" name="role"><option value="">Inherit</option><option value="fast" selected>fast</option><option value="precise">precise</option><option value="main">main</option></select><span class="role-level-status">Overridden</span></li>
+                <li data-role-level="group"><label for="role-group"><span class="role-step">03</span><span>Group default<small>llm.router.process.default</small></span></label><select disabled id="role-group" name="group"><option value="" selected>Inherit</option><option value="fast">fast</option><option value="precise">precise</option><option value="main">main</option></select><span class="role-level-status">Inherits</span></li>
+                <li data-role-level="router"><label for="role-router"><span class="role-step">04</span><span>Router default<small>llm.router.default</small></span></label><select disabled id="role-router" name="router"><option value="">Inherit</option><option value="fast" selected>fast</option><option value="precise">precise</option><option value="main">main</option></select><span class="role-level-status">Overridden</span></li>
+                <li data-role-level="main"><label for="role-main"><span class="role-step">05</span><span>Main alias<small>llm.default</small></span></label><select disabled id="role-main" name="main"><option value="main" selected>main</option><option value="fast">fast</option><option value="precise">precise</option></select><span class="role-level-status">Overridden</span></li>
+            </ol>
+            <div class="role-actions"><button disabled type="button" data-role-inherit class="btn btn-outline">Inherit everything</button><button disabled type="reset" class="btn btn-outline">Reset example</button></div>
+        </form>
+        <div class="role-preview">
+            <div class="role-result" role="status" aria-live="polite" aria-atomic="true"><span class="home-eyebrow">Selected alias</span><strong data-role-result>precise</strong><p data-role-reason>The local override selects precise for process.detect.</p></div>
+            <div class="code-window"><div class="code-window-header"><span class="code-window-title">agent.yaml</span><span class="demo-label">Copy and adapt</span></div><pre class="code-block"><code data-role-yaml>name: RoleExplorer
+system_prompt: "Answer clearly."
+llms:
+  main: { provider: openai, model: gpt-5.4-mini }
+  fast: { provider: openai, model: gpt-5.4-nano }
+  precise: { provider: openai, model: gpt-5.4-mini }
+llm:
+  default: main
+  router:
+    default: fast
+    process:
+      detect: fast
+process:
+  input:
+    - type: detect
+      config:
+        llm: precise
+        detect: [language]
+tools: []</code></pre></div>
+            <p class="experience-note">Running this YAML uses your configured OpenAI credentials. The explorer itself does not run it.</p>
+        </div>
+    </div>
+    <noscript><p class="callout callout-info">Enable JavaScript to change the selection. The initial configuration above selects <code>precise</code> through its local override.</p></noscript>
+    <div class="page-content">{{ page.content | safe }}</div>
+    <div class="experience-footnote"><h2>One selection rule, existing execution contracts.</h2><p>A role setting chooses a model for an enabled feature. It does not enable tools, approve a request, or turn a missing alias into a fallback. An omitted or scalar router keeps legacy selection; an empty mapping opts into hierarchical inheritance.</p><a class="home-text-link" href="{{ get_url(path='@/examples/recipe-model-roles.md') }}">Run the complete example →</a></div>
+</article>
+{% endblock content %}

@@ -2,13 +2,16 @@
 title = "Getting Started"
 weight = 1
 template = "docs.html"
-description = "Install and run your first AI agent in under a minute."
+description = "Start with the CLI, embed in Rust, use a local model, or run a no-key evaluation."
 +++
+
+Choose a path: [CLI conversation](#your-first-agent-cli), [Rust application](#your-first-agent-rust), [local Ollama](#start-with-a-local-model), or [mocked evaluation](#start-with-a-mocked-evaluation).
 
 ## Prerequisites
 
 - **Rust 1.88 or newer** - install from [rust-lang.org](https://rust-lang.org/tools/install) if you don't have it
-- **An LLM API key** - OpenAI is recommended for the quickstart, but any of the 12 supported providers works
+- **A model for live conversations** - the hosted quickstart uses an OpenAI API key; [local Ollama](#start-with-a-local-model) needs no hosted provider key.
+- **No model or API key for mocked evaluation** - the [evaluation path](#start-with-a-mocked-evaluation) supplies fixed model responses.
 
 ## Installation
 
@@ -73,6 +76,12 @@ You're now in a REPL session. Type a message and press Enter. The agent responds
 
 ## Your First Agent (Rust)
 
+Add Tokio to the library dependencies so the asynchronous entry point can run:
+
+```toml
+tokio = { version = "1", features = ["full"] }
+```
+
 Create a `main.rs` that loads the same YAML file programmatically:
 
 ```rust
@@ -98,7 +107,7 @@ This is the same builder chain used by the CLI. `auto_configure_mcp()` and `auto
 Or build an agent entirely in code without YAML:
 
 ```rust
-use ai_agents::{AgentBuilder, UnifiedLLMProvider, ProviderType};
+use ai_agents::{Agent, AgentBuilder, UnifiedLLMProvider, ProviderType};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -117,6 +126,55 @@ async fn main() -> ai_agents::Result<()> {
 ```
 
 Run it with `cargo run`. That's all you need - one YAML, a few lines of Rust.
+
+---
+
+## Start With a Local Model
+
+Install [Ollama](https://ollama.com), start its local server, and download the model you want to use. If the server is already running, only the pull command is needed. Run the pull command in a second terminal while `serve` is running.
+
+```sh
+ollama serve
+```
+
+```sh
+ollama pull llama3.1
+```
+
+Save this complete agent as `local-agent.yaml`:
+
+```yaml
+name: LocalAgent
+system_prompt: "You are a helpful assistant."
+llm:
+  provider: ollama
+  model: llama3.1
+```
+
+Then run:
+
+```sh
+ai-agents-cli run local-agent.yaml
+```
+
+The model runs through your local Ollama server, with no hosted provider API key. The initial model download requires network access and enough local disk space; model performance depends on your hardware. See [Ollama configuration](@/docs/providers.md#ollama) to change the server address or context window.
+
+## Start With a Mocked Evaluation
+
+Use this path to try agent construction, runtime execution, assertions, and reports without installing a model or setting an API key. It uses the repository's agent and suite files, so first follow the source checkout instructions under [Installation](#installation).
+
+From the repository root:
+
+```sh
+cargo run -p ai-agents-cli -- eval \
+  --agent examples/yaml/basic/simple_chat.yaml \
+  --scenarios examples/eval/mocked/basic/simple_chat_mocked.yaml \
+  --output target/eval/mocked/basic/simple_chat_mocked
+```
+
+This suite supplies a fixed greeting and checks the response. Open `target/eval/mocked/basic/simple_chat_mocked/summary.md` for the result. Compilation may download dependencies; the scenario itself does not call a model provider.
+
+Continue with [Test and Observe](@/docs/test-and-observe.md) to inspect evidence, add assertions, and distinguish mocked regression tests from live model checks.
 
 ---
 
@@ -219,6 +277,10 @@ metadata:
 ---
 
 ## Next Steps
+
+- **[Build Agent Behavior](@/docs/build-behavior.md)** - choose states, skills, context, and processing steps
+- **[Control Execution](@/docs/control-execution.md)** - grant tools explicitly and add approval
+- **[Test and Observe](@/docs/test-and-observe.md)** - verify the behavior you build
 
 - **[YAML Reference](@/docs/yaml-reference.md)** - the complete spec for agent definition files
 

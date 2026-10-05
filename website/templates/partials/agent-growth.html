@@ -1,0 +1,94 @@
+<section class="agent-growth home-section" aria-labelledby="growth-heading">
+    <div class="container">
+        <div class="home-section-intro">
+            <p class="home-eyebrow">Grow from the same YAML</p>
+            <h2 class="section-heading" id="growth-heading">Add the behavior your agent needs.</h2>
+            <p class="section-subtitle">Give it tools, conversation memory, a workflow, or a specialist to work with.</p>
+        </div>
+        <div class="growth-workspace" data-tabs>
+            <div class="growth-tabs" role="tablist" aria-label="Ways to extend your agent">
+                <button type="button" role="tab" id="growth-tab-tools" aria-controls="growth-tools" aria-selected="true"><span aria-hidden="true">01</span>Tools</button>
+                <button type="button" role="tab" id="growth-tab-memory" aria-controls="growth-memory" aria-selected="false"><span aria-hidden="true">02</span>Memory</button>
+                <button type="button" role="tab" id="growth-tab-states" aria-controls="growth-states" aria-selected="false"><span aria-hidden="true">03</span>States</button>
+                <button type="button" role="tab" id="growth-tab-agents" aria-controls="growth-agents" aria-selected="false"><span aria-hidden="true">04</span>Multiple agents</button>
+            </div>
+            <p class="growth-instructions">Keep your name, prompt, and model. Each tab shows a separate addition to your <code>agent.yaml</code>.</p>
+            <div class="growth-panel" id="growth-tools" role="tabpanel" aria-labelledby="growth-tab-tools" tabindex="0">
+                <div class="growth-code">
+                    <div class="growth-code-heading"><span>Add to agent.yaml</span><span>Tools</span></div>
+                    <pre class="code-block"><code class="language-yaml"><span class="code-key">tools</span>:
+  - <span class="code-key">name</span>: <span class="code-string">calculator</span>
+  - <span class="code-key">name</span>: <span class="code-string">datetime</span>
+  - <span class="code-key">name</span>: <span class="code-string">echo</span></code></pre>
+                </div>
+                <div class="growth-explanation">
+                    <p class="growth-kind">Tools</p><h3>Let the agent take an action.</h3>
+                    <p>Make a calculator, clock, and echo tool available to the model. It can request a useful tool, read the result, and respond.</p>
+                    <div class="growth-illustration"><span>Illustrative flow</span><p>“What is 24 × 17?” <b aria-hidden="true">→</b> calculator <b aria-hidden="true">→</b> response</p></div>
+                    <p class="growth-contract">A tool declaration grants access; it does not force a tool call. These three tools are built in.</p>
+                    <div class="growth-links"><a href="{{ get_url(path='@/examples/recipe-use-tools.md') }}">Run the tools example <span aria-hidden="true">→</span></a><a href="{{ get_url(path='@/docs/control-execution.md') }}">Understand tool access</a></div>
+                </div>
+            </div>
+            <div class="growth-panel" id="growth-memory" role="tabpanel" aria-labelledby="growth-tab-memory" tabindex="0">
+                <div class="growth-code">
+                    <div class="growth-code-heading"><span>Add to agent.yaml</span><span>Memory</span></div>
+                    <pre class="code-block"><code class="language-yaml"><span class="code-key">memory</span>:
+  <span class="code-key">type</span>: <span class="code-string">in-memory</span>
+  <span class="code-key">max_messages</span>: <span class="code-string">50</span></code></pre>
+                </div>
+                <div class="growth-explanation">
+                    <p class="growth-kind">Memory</p><h3>Keep the conversation in context.</h3>
+                    <p>Retain a bounded window of 50 messages and include that history in later turns. The model can use what was said earlier in the conversation.</p>
+                    <div class="growth-illustration"><span>Illustrative flow</span><p>“My name is Mira.” <b aria-hidden="true">→</b> retained history <b aria-hidden="true">→</b> “What is my name?”</p></div>
+                    <p class="growth-contract">This is conversation memory in the running process. Use storage to resume saved conversations, or actor memory to retain facts about returning people.</p>
+                    <div class="growth-links"><a href="{{ get_url(path='@/examples/recipe-conversation-memory.md') }}">Run the memory example <span aria-hidden="true">→</span></a><a href="{{ get_url(path='@/docs/memory-and-identity.md') }}">Choose what to remember</a></div>
+                </div>
+            </div>
+            <div class="growth-panel" id="growth-states" role="tabpanel" aria-labelledby="growth-tab-states" tabindex="0">
+                <div class="growth-code">
+                    <div class="growth-code-heading"><span>Add to agent.yaml</span><span>States</span></div>
+                    <pre class="code-block"><code class="language-yaml"><span class="code-key">states</span>:
+  <span class="code-key">initial</span>: <span class="code-string">greeting</span>
+  <span class="code-key">states</span>:
+    <span class="code-key">greeting</span>:
+      <span class="code-key">prompt</span>: <span class="code-string">"Ask how you can help the customer."</span>
+      <span class="code-key">transitions</span>:
+        - <span class="code-key">to</span>: <span class="code-string">technical_support</span>
+          <span class="code-key">when</span>: <span class="code-string">"User describes a technical issue"</span>
+    <span class="code-key">technical_support</span>:
+      <span class="code-key">prompt</span>: <span class="code-string">"Gather details and suggest troubleshooting steps."</span></code></pre>
+                </div>
+                <div class="growth-explanation">
+                    <p class="growth-kind">States</p><h3>Give each phase its own instructions.</h3>
+                    <p>Start with a greeting, then move into technical support when the transition condition matches. The active state supplies the instructions for that phase.</p>
+                    <div class="growth-illustration"><span>Illustrative flow</span><p>Greeting <b aria-hidden="true">→</b> “I cannot log in.” <b aria-hidden="true">→</b> technical support</p></div>
+                    <p class="growth-contract">This is a shortened adaptation of the support example. Natural-language conditions use model evaluation. The full example adds nested states, escalation, and clarification.</p>
+                    <div class="growth-links"><a href="{{ get_url(path='@/examples/recipe-support-states.md') }}">Run the support example <span aria-hidden="true">→</span></a><a href="{{ get_url(path='@/docs/build-behavior.md') }}">Design agent behavior</a></div>
+                </div>
+            </div>
+            <div class="growth-panel" id="growth-agents" role="tabpanel" aria-labelledby="growth-tab-agents" tabindex="0">
+                <div class="growth-code">
+                    <div class="growth-code-heading"><span>Add to agent.yaml</span><span>Multiple agents</span></div>
+                    <pre class="code-block"><code class="language-yaml"><span class="code-key">spawner</span>:
+  <span class="code-key">auto_spawn</span>:
+    - <span class="code-key">id</span>: <span class="code-string">billing</span>
+      <span class="code-key">agent</span>: <span class="code-string">agents/billing_agent.yaml</span>
+
+<span class="code-key">states</span>:
+  <span class="code-key">initial</span>: <span class="code-string">billing_help</span>
+  <span class="code-key">states</span>:
+    <span class="code-key">billing_help</span>:
+      <span class="code-key">delegate</span>: <span class="code-string">billing</span></code></pre>
+                </div>
+                <div class="growth-explanation">
+                    <p class="growth-kind">Multiple agents</p><h3>Bring in a specialist.</h3>
+                    <p>Load a billing agent from its own YAML and delegate messages to it. The parent keeps the user conversation while the child handles the specialist task.</p>
+                    <div class="growth-illustration"><span>Illustrative flow</span><p>User <b aria-hidden="true">→</b> parent <b aria-hidden="true">→</b> billing specialist <b aria-hidden="true">→</b> response</p></div>
+                    <p class="growth-contract">Requires the child file <a href="{{ config.extra.github }}/blob/main/examples/yaml/orchestration/agents/billing_agent.yaml"><code>agents/billing_agent.yaml</code></a> relative to your agent file, with its own model configured. This excerpt delegates directly; the full recipe routes between billing and technical specialists.</p>
+                    <div class="growth-links"><a href="{{ get_url(path='@/examples/recipe-delegate-support.md') }}">Run the specialist example <span aria-hidden="true">→</span></a><a href="{{ get_url(path='@/docs/multi-agent-patterns.md') }}">Choose a coordination pattern</a></div>
+                </div>
+            </div>
+            <p class="growth-footnote">The flows explain how each configuration changes an agent. They are illustrations, not live conversations or recorded execution results.</p>
+        </div>
+    </div>
+</section>

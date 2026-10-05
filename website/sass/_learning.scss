@@ -1,0 +1,33 @@
+// Learning surfaces share the site container; cards wrap without restricting prose width.
+.learning-header h1 { font-size: clamp(2rem, 5vw, 4rem); letter-spacing: -0.045em; margin: 0 0 1rem; }
+.learning-lead { font-size: clamp(1.15rem, 2vw, 1.5rem); color: var(--text-heading); margin-bottom: 1rem; }
+.learning-intro { color: var(--text-muted); line-height: 1.8; }
+.learning-section { margin-top: 3.5rem; }
+.learning-section-heading { display: flex; align-items: flex-start; gap: 1rem; margin-bottom: 1.5rem; }
+.learning-section-heading h2 { margin: 0 0 0.5rem; font-size: 1.5rem; letter-spacing: -0.025em; }
+.learning-section-heading p { margin: 0; color: var(--text-muted); line-height: 1.6; }
+.learning-step { display: grid; place-items: center; width: 2.25rem; height: 2.25rem; flex-shrink: 0; border: 1px solid var(--border); border-radius: 7px; color: var(--accent-text); font-family: var(--font-mono); font-size: 0.8rem; }
+.learning-start-grid, .learning-guide-grid, .learning-reference-grid { display: grid; gap: 1rem; }
+.learning-start-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.learning-guide-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.learning-reference-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.learning-card { display: flex; flex-direction: column; min-width: 0; padding: 1.5rem; border: 1px solid var(--border); border-radius: 9px; background: var(--bg-surface); color: var(--text); text-decoration: none; }
+.learning-card:hover { border-color: var(--accent-text); background: var(--bg-surface-2); }
+.learning-card h3, .learning-reference h3 { font-size: 1.05rem; color: var(--text-heading); margin: 0 0 0.75rem; line-height: 1.45; }
+.learning-card h3 span, .learning-reference h3 span { color: var(--accent-text); }
+.learning-card p, .learning-reference p { color: var(--text-muted); font-size: 0.9rem; line-height: 1.75; margin: 0; }
+.learning-card-label { font-size: 0.7rem; font-weight: 650; letter-spacing: 0.04em; color: var(--accent-text); margin-bottom: 1rem; }
+.learning-card-action { font-size: 0.8rem; color: var(--accent-text); margin-top: auto; padding-top: 1.5rem; }
+.learning-example-card { background: var(--accent-muted); }
+.learning-reference { min-width: 0; padding: 1.25rem; border-bottom: 1px solid var(--border); text-decoration: none; }
+.learning-reference:hover { background: var(--bg-surface); border-radius: 5px; }
+.docs-nav-group-label { color: var(--text-heading); font-size: 0.7rem; font-weight: 650; letter-spacing: 0.05em; text-transform: uppercase; margin: 1.5rem 0.75rem 0.5rem; }
+.docs-nav-group-label:first-child { margin-top: 0; }
+@media (max-width: 1023px) {
+  .learning-start-grid, .learning-guide-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 599px) {
+  .learning-start-grid, .learning-guide-grid, .learning-reference-grid { grid-template-columns: minmax(0, 1fr); }
+  .learning-card { padding: 1.25rem; }
+  .learning-section { margin-top: 2.5rem; }
+}

@@ -2,10 +2,13 @@
 title = "Built-in Tools"
 weight = 8
 template = "docs.html"
-description = "Canonical inputs, outputs, safety, policy, host integration, and eval coverage for all 30 built-in tools."
+description = "Configure built-in tools for YAML agents: inputs, outputs, access grants, execution policies, host integrations, and evaluation coverage."
+
+[extra]
+seo_title = "Built-in Tools for YAML Agents"
 +++
 
-The runtime registers 30 canonical built-ins. A YAML agent can expose one only by granting its canonical ID in top-level `tools:`; omitted or empty `tools:` grants no ordinary tools, and state-level lists can narrow but not widen that grant. See the [YAML Reference](@/docs/yaml-reference.md) for tool security and scoping, [Concepts](@/docs/concepts.md) for the runtime model, and the [Examples catalog](@/examples/_index.md) for runnable agents.
+The ai-agents Rust runtime registers 30 canonical built-in tools for YAML agents, including calculation, file operations, repository inspection, and web access. A YAML agent can expose one only by granting its canonical ID in top-level `tools:`; omitted or empty `tools:` grants no ordinary tools, and state-level lists can narrow but not widen that grant. See the [YAML Reference](@/docs/yaml-reference.md) for tool security and scoping, [Concepts](@/docs/concepts.md) for the runtime model, and the [Examples catalog](@/examples/_index.md) for runnable agents.
 
 ## Canonical inventory
 

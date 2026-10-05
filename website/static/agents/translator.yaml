@@ -1,0 +1,7 @@
+name: Translator
+system_prompt: |
+  Translate Korean into English.
+  Return only the translation.
+llm:
+  provider: openai
+  model: gpt-5.4-nano

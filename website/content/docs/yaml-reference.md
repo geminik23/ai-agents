@@ -2,12 +2,15 @@
 title = "YAML Reference"
 weight = 2
 template = "docs.html"
-description = "Complete reference for agent YAML specification fields."
+description = "Configure YAML agents in the ai-agents Rust framework: prompts, models, tools, states, memory, and execution policies."
+
+[extra]
+seo_title = "YAML Agent Configuration Reference"
 +++
 
 <!--# YAML Reference-->
 
-This is the complete reference for every field you can use in an agent YAML file. Each section covers one top-level key, shows its type, default, and a working snippet.
+Define an AI agent in YAML and run it through the ai-agents Rust runtime. This reference documents the configuration fields for prompts, models, tools, states, memory, and execution policies. Each section covers one top-level key, shows its type, default, and a working snippet.
 
 Fixed framework-owned objects reject unknown fields. Misspelled top-level and nested keys therefore fail parsing instead of being ignored. Documented extension maps remain open where values are intentionally provider- or host-specific, including additional provider options inside an `llm` configuration, structured tool and MCP settings, and custom tool settings under `tool_security.tools.<tool_id>.config`. Because those maps intentionally accept provider or host keys, validation cannot distinguish every extension from a nearby framework-field typo. Mapping keys must be strings, and YAML merge keys (`<<`) are rejected rather than being inconsistently retained inside extension maps.
 

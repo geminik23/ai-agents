@@ -2,10 +2,13 @@
 title = "Rust API"
 weight = 5
 template = "docs.html"
-description = "Embedding AI Agents in your Rust application."
+description = "Embed YAML-defined AI agents in Rust with AgentBuilder, or build agents programmatically with custom tools, providers, memory, and hooks."
+
+[extra]
+seo_title = "Build and Embed AI Agents in Rust"
 +++
 
-Use `ai-agents` as a library to build, configure, and run agents entirely from Rust. Everything the CLI can do, you can do programmatically - plus custom tools, providers, memory backends, hooks, and more.
+Use the `ai-agents` Rust crate to load YAML definitions with `AgentBuilder` or construct agents programmatically. This guide covers embedding the runtime in your application and extending it with tools, providers, memory backends, and hooks. Start with [dependencies and a first agent](@/docs/getting-started.md#your-first-agent-rust), then use this reference for integration details.
 
 ---
 
