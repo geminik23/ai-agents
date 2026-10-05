@@ -17,7 +17,7 @@ title %} {% block content %}
         {% if page.taxonomies.tags %}
         <div style="margin-bottom: 2rem">
             {% for tag in page.taxonomies.tags %}
-            <a class="badge-tag" href="{{ get_taxonomy_url(kind='tags', name=tag) }}">
+            <a class="badge-tag" data-tag="{{ tag | slugify }}" href="{{ get_taxonomy_url(kind='tags', name=tag) }}">
                 {{ tag }}
             </a>
             {% endfor %}

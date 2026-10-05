@@ -1,0 +1,5 @@
+<nav class="docs-page-navigation" aria-label="Documentation pages">
+    <ul class="docs-page-list">
+        {% for doc in docs_section.pages %}<li><a href="{{ doc.permalink }}"{% if doc.path == current_path %} aria-current="page"{% endif %}>{{ doc.title }}</a></li>{% endfor %}
+    </ul>
+</nav>

@@ -5,6 +5,10 @@ Examples are organized by usage style:
 - `yaml/` - YAML-first examples run with `ai-agents-cli`
 - `rust/` - Rust examples for embedding, extension, and custom integrations
 
+Browse by goal: [YAML agents](#yaml-examples), [Rust integration](#rust-examples), or [evaluation suites](#evaluation-examples).
+
+Within YAML: [start small](#yaml-basic), [state workflows](#yaml-state-machine), [tools](#yaml-tools), [human approvals](#yaml-hitl), and [multi-agent orchestration](#yaml-orchestration).
+
 ## Quick Start
 
 ### Run a YAML example

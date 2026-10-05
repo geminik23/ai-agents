@@ -1,0 +1,14 @@
+<nav class="docs-toc-nav" data-toc aria-label="Page sections">
+    <ul class="docs-toc-list">
+        {% for item in page.toc %}
+        <li>
+            <a href="{{ item.permalink }}">{{ item.title }}</a>
+            {% if item.children %}
+            <details class="docs-toc-children"><summary aria-label="Subsections of {{ item.title }}">Subsections <span aria-hidden="true">⌄</span></summary><ul>
+                {% for child in item.children %}<li><a href="{{ child.permalink }}">{{ child.title }}</a></li>{% endfor %}
+            </ul></details>
+            {% endif %}
+        </li>
+        {% endfor %}
+    </ul>
+</nav>

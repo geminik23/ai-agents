@@ -22,8 +22,8 @@ smart_punctuation = true
 
 [markdown.highlighting]
 style = "class"
-light_theme = "vitesse-light"
-dark_theme = "vitesse-black"
+light_theme = "github-light-high-contrast"
+dark_theme = "github-dark-high-contrast"
 
 # Search
 [search]

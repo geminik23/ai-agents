@@ -4,7 +4,7 @@ template = "page.html"
 description = "What's shipped, what's next, and where the framework is headed."
 +++
 
-This page tracks the released stable v1 foundation, preparation of 1.1.0, and future directions. Hierarchical LLM routing is implemented for 1.1; publication remains a separate release step. Other future release assignments remain intentionally unfrozen.
+This page tracks the released stable v1 foundation, hierarchical LLM routing in v1.1.0, and future directions. Future release assignments remain intentionally unfrozen.
 
 ---
 
@@ -22,36 +22,10 @@ This page tracks the released stable v1 foundation, preparation of 1.1.0, and fu
 
 ---
 
-## What's Shipped
-
-| Release | Highlights |
-| --- | --- |
-| **Pre-RC** | Core framework: YAML agents, tools, skills, states, hooks, HITL, streaming, error recovery, process pipeline |
-| **rc.1** | CompactingMemory, token budgeting, SQLite/Redis storage |
-| **rc.2** | Tool provider system, multi-language aliases, TrustLevel |
-| **rc.3** | Workspace refactoring - modular crates for parallel compilation and feature isolation |
-| **rc.4** | Reasoning & reflection - Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation |
-| **rc.5** | Intent disambiguation - LLM-based ambiguity detection and clarification |
-| **rc.6** | MCP integration, tool scoping, intent-based routing, `openai-compatible` provider |
-| **rc.7** | Dynamic agent spawning - runtime agent creation, registry, template system |
-| **rc.8** | Multi-agent orchestration - router, pipeline, concurrent, group chat, handoff patterns |
-| **rc.9** | Agent persona - structured identity, evolution, secrets, templates; dot-path refactor |
-| **rc.10** | CLI context injection (`--context`, `--context-file`, `--plain`) and ratatui TUI with side panels, streaming, themes |
-| **rc.11** | Session management and key facts - cross-session actor memory, key facts extraction, session metadata, and CLI/TUI actor commands |
-| **rc.12** | Relationship memory - actor-scoped trust, sentiment, rapport, two-sided relationships, actor-aware inter-agent context, and relationship inspection in the REPL/TUI |
-| **rc.13** | LLM provider enhancements and observability - capability overrides, Ollama options, privacy-safe tracing, cost metrics, reports, raw events, and Prometheus text export |
-| **rc.14** | Evaluation framework - YAML and JSONL scenario suites, fixtures, assertions, judges, strict redaction, observability overlay, and CI reports |
-| **rc.15** | Runtime latency optimization + speculative branch execution - pre-response routing, background actor-memory maintenance, stable orchestration ordering, parallel transition decisions, speculative skill and reasoning branches, buffered streaming, branch observability, and eval flush support |
-| **rc.16** | Built-in tool expansion - canonical tool identity, read-only discovery tools, mutation tools with dry-run review, command allowlists, interactive questions, session todos, bounded waits, web retrieval, diagnostics, tool policy enforcement, live example eval suites, and committed fixture files |
-| **v1.0.0** | Stable foundation - frozen public contracts, Rust 1.88 MSRV, strict validation, focused safety hardening, release checks, and synchronized documentation |
-
----
-
 ## Up Next
 
 | Target | Focus | Summary |
 | --- | --- | --- |
-| **1.1.0, prepared** | Hierarchical LLM Routing | Auxiliary role aliases with local overrides, validated bindings, child snapshots, and documented Rust API migration |
 | **Post-v1, unassigned** | Generalized Autonomy Runner | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run events |
 | **Post-v1, unassigned** | Information Lifecycle | Retrieval and evidence contracts, extensible RAG, evidence access policy, and maintenance scheduling implemented in the sequence below |
 | **Post-v1, unassigned** | Python Runtime Bindings | First package scope: YAML loading and validation, chat, streaming, context, sessions, actor memory, relationships, and observability; task-run bindings follow later after the Generalized Autonomy Runner |
@@ -110,7 +84,7 @@ Every planned feature and its current status. Entries are ordered by release tar
 | **Speculative Branch Execution** | Bounded speculative main drafts, parallel response-independent transitions, skill routing, auto reasoning, buffered streaming, and branch observability finalization | ✅ Done | rc.15 |
 | **Built-in Tool Expansion** | Safe discovery, repository inspection, diagnostics, interactive questions, session todos, bounded waits, web retrieval primitives, context-aware tool policy, file write/edit, patch review, and controlled validation commands | ✅ Done | rc.16 |
 | **Stable Foundation Release** | Dynamic spawning, orchestration, persona, actor memory, relationship memory, CLI/TUI, runtime optimization, built-in tools, and release hardening | ✅ Done | v1.0.0 |
-| **Hierarchical LLM Routing** | Typed auxiliary role defaults and local aliases across execution, orchestration, memory, spawning, web extraction, and evaluation | Prepared | 1.1.0; one-time documented Rust source-compatibility exception |
+| **Hierarchical LLM Routing** | Typed auxiliary role defaults and local aliases across execution, orchestration, memory, spawning, web extraction, and evaluation | ✅ Done | v1.1.0; one-time documented Rust source-compatibility exception |
 | **Generalized Autonomy Runner** | YAML-configured task runs with lifecycle stages, todos, completion gates, validation loops, pause/resume, and task-run event streaming for code, research, support, operations, and workflow agents | Planned after v1.0 | Release unassigned |
 | **Python Runtime Bindings** | Native Python package initially covering YAML loading and validation, chat and streaming, context injection, sessions, actor memory, relationships, and observability through the Rust runtime. Task-run bindings are a later integration after the Generalized Autonomy Runner ships, not part of the first Python package scope. | Planned after v1.0 | Release unassigned |
 | **OpenTelemetry Exporter** | Export privacy-safe `ai-agents` runtime traces through OTLP to external observability backends such as LangSmith, Grafana Tempo, Jaeger, and Datadog. Covers LLM calls, tool calls, skill routing, state transitions, memory operations, multi-agent handoffs, speculative branch outcomes, eval metadata, latency, token usage, and cost estimates. | Planned after v1.0 | Release unassigned; builds on existing observability and tracing |
@@ -137,3 +111,31 @@ Every planned feature and its current status. Entries are ordered by release tar
 ---
 
 *This roadmap reflects current plans and may change as priorities evolve.*
+
+---
+
+## What's Shipped
+
+| Release | Highlights |
+| --- | --- |
+| **Pre-RC** | Core framework: YAML agents, tools, skills, states, hooks, HITL, streaming, error recovery, process pipeline |
+| **rc.1** | CompactingMemory, token budgeting, SQLite/Redis storage |
+| **rc.2** | Tool provider system, multi-language aliases, TrustLevel |
+| **rc.3** | Workspace refactoring - modular crates for parallel compilation and feature isolation |
+| **rc.4** | Reasoning & reflection - Chain-of-Thought, ReAct, Plan-and-Execute, self-evaluation |
+| **rc.5** | Intent disambiguation - LLM-based ambiguity detection and clarification |
+| **rc.6** | MCP integration, tool scoping, intent-based routing, `openai-compatible` provider |
+| **rc.7** | Dynamic agent spawning - runtime agent creation, registry, template system |
+| **rc.8** | Multi-agent orchestration - router, pipeline, concurrent, group chat, handoff patterns |
+| **rc.9** | Agent persona - structured identity, evolution, secrets, templates; dot-path refactor |
+| **rc.10** | CLI context injection (`--context`, `--context-file`, `--plain`) and ratatui TUI with side panels, streaming, themes |
+| **rc.11** | Session management and key facts - cross-session actor memory, key facts extraction, session metadata, and CLI/TUI actor commands |
+| **rc.12** | Relationship memory - actor-scoped trust, sentiment, rapport, two-sided relationships, actor-aware inter-agent context, and relationship inspection in the REPL/TUI |
+| **rc.13** | LLM provider enhancements and observability - capability overrides, Ollama options, privacy-safe tracing, cost metrics, reports, raw events, and Prometheus text export |
+| **rc.14** | Evaluation framework - YAML and JSONL scenario suites, fixtures, assertions, judges, strict redaction, observability overlay, and CI reports |
+| **rc.15** | Runtime latency optimization + speculative branch execution - pre-response routing, background actor-memory maintenance, stable orchestration ordering, parallel transition decisions, speculative skill and reasoning branches, buffered streaming, branch observability, and eval flush support |
+| **rc.16** | Built-in tool expansion - canonical tool identity, read-only discovery tools, mutation tools with dry-run review, command allowlists, interactive questions, session todos, bounded waits, web retrieval, diagnostics, tool policy enforcement, live example eval suites, and committed fixture files |
+| **v1.0.0** | Stable foundation - frozen public contracts, Rust 1.88 MSRV, strict validation, focused safety hardening, release checks, and synchronized documentation |
+| **v1.1.0** | Hierarchical LLM Routing - auxiliary role aliases with local overrides, validated bindings, child snapshots, and documented Rust API migration |
+
+---

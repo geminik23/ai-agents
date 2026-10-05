@@ -1,0 +1,166 @@
+// Homepage layout. Shared code blocks, buttons, and theme tokens stay in style.scss.
+.home-page {
+  min-width: 0;
+
+  .hero {
+    padding: clamp(3rem, 7vw, 6rem) 0 4rem;
+  }
+
+  .hero-inner {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: clamp(2rem, 5vw, 5rem);
+    align-items: center;
+    min-width: 0;
+  }
+
+  .hero-copy {
+    min-width: 0;
+    max-width: none;
+    margin: 0;
+    text-align: left;
+  }
+
+  .hero-kicker, .home-eyebrow {
+    color: var(--accent-text);
+    font-size: 0.75rem;
+    font-weight: 650;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin: 0 0 1rem;
+  }
+
+  .hero-heading {
+    font-size: clamp(2.6rem, 4.6vw, 4.35rem);
+    letter-spacing: -0.05em;
+    line-height: 1.05;
+    white-space: normal;
+    margin-bottom: 1.5rem;
+  }
+
+  .hero-subtitle {
+    font-size: clamp(1.15rem, 2vw, 1.35rem);
+    line-height: 1.55;
+    color: var(--text-heading);
+    margin: 0 0 1rem;
+    max-width: 36ch;
+  }
+
+  .hero-description {
+    max-width: 47ch;
+    color: var(--text-muted);
+    margin-bottom: 1.75rem;
+  }
+
+  .hero-actions {
+    display: flex;
+    justify-content: flex-start;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .home-install { margin-top: 1.75rem; min-width: 0; }
+  .home-install-label { display: block; font-size: 0.8rem; color: var(--text-muted); margin-bottom: 0.5rem; }
+  .home-install .code-block {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0;
+    max-width: 100%;
+  }
+  .home-install .code-block code { padding: 0.85rem 4.5rem 0.85rem 1rem; font-size: 0.825rem; }
+  .hero-prerequisites { margin: 0.65rem 0 1.25rem; color: var(--text-muted); font-size: 0.8rem; }
+  .hero-prerequisites a { text-decoration: underline; text-underline-offset: 0.18em; }
+  .hero-badges { display: flex; justify-content: flex-start; align-items: center; flex-wrap: wrap; gap: 0.5rem; margin: 0; }
+  .hero-badges img { height: 20px; width: auto; }
+  .hero-badges a { line-height: 0; }
+
+  .hero-demo { min-width: 0; margin: 0; width: 100%; display: grid; gap: 1rem; }
+  .hero-demo .code-window { box-shadow: var(--shadow-soft); }
+  .code-window { box-shadow: none; }
+  .code-window-header { justify-content: space-between; }
+  .code-window-title { margin: 0; }
+  .demo-label { font-size: 0.7rem; color: var(--text-muted); }
+  .hero-demo .code-block { padding: 0; }
+  .hero-demo .code-block code { padding: 1.5rem; font-size: 0.875rem; }
+  .demo-explanation { padding: 1.5rem; border-top: 1px solid var(--border); background: var(--bg-surface); }
+  .demo-explanation p { color: var(--text-muted); font-size: 0.9rem; margin: 0 0 0.75rem; }
+  .demo-explanation .demo-explanation-title { color: var(--text-heading); font-weight: 600; }
+  .demo-explanation .demo-caption { font-size: 0.75rem; margin: 1rem 0 0; }
+
+  .home-section { padding: 4rem 0; border-top: 1px solid var(--border); }
+  .home-section-intro { max-width: 65ch; margin-bottom: 2rem; }
+  .section-heading { text-align: left; margin: 0 0 0.75rem; font-size: clamp(1.65rem, 3vw, 2.15rem); letter-spacing: -0.035em; }
+  .section-subtitle { text-align: left; max-width: 60ch; color: var(--text-muted); margin: 0; }
+  .home-text-link { display: inline-flex; align-items: baseline; gap: 0.5rem; font-size: 0.875rem; font-weight: 600; color: var(--link); }
+  .home-text-link:hover { color: var(--link-hover); }
+
+  .home-value-grid, .home-case-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2rem; }
+  .home-value { min-width: 0; padding-right: 1rem; }
+  .home-number { display: block; font-family: var(--font-mono); font-size: 0.8rem; color: var(--accent-text); margin-bottom: 1.25rem; }
+  .home-value h3, .home-case h3 { font-size: 1.15rem; line-height: 1.35; margin: 0 0 0.75rem; }
+  .home-value p { color: var(--text-muted); font-size: 0.95rem; margin-bottom: 1.25rem; }
+
+  .home-cases { background: var(--bg-surface); }
+  .home-case { min-width: 0; padding: 1.5rem; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); display: flex; flex-direction: column; }
+  .home-case-kind { color: var(--accent-text); font-size: 0.75rem; font-weight: 600; margin-bottom: 1rem; }
+  .home-case > p:not(.home-case-kind) { color: var(--text-muted); font-size: 0.9rem; }
+  .home-case .home-case-flow { font-family: var(--font-mono); font-size: 0.75rem; line-height: 1.6; padding-top: 1rem; border-top: 1px solid var(--border); margin-top: auto; }
+  .home-case-doc { margin-top: 0.65rem; color: var(--link); font-size: 0.8rem; }
+  .home-case-doc:hover { color: var(--link-hover); }
+  .home-case-note { margin: 1.25rem 0 0; font-size: 0.8rem; color: var(--text-muted); }
+
+  .quickstart-inner { max-width: 920px; margin: 0 auto; }
+  .quickstart-setup { color: var(--text-muted); font-size: 0.875rem; }
+  .quickstart-setup a { text-decoration: underline; text-underline-offset: 0.2em; }
+  .quickstart-tabs { display: flex; flex-wrap: wrap; gap: 0.25rem; border-bottom: 1px solid var(--border); }
+  .tab-btn { color: var(--text-muted); font-family: var(--font-sans); font-size: 0.9rem; font-weight: 600; padding: 0.9rem 1rem; background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer; }
+  .tab-btn:hover { color: var(--text-heading); }
+  .tab-btn[aria-selected="true"] { color: var(--accent-text); border-bottom-color: var(--accent-text); }
+  // Only the shared tab controller hides panels, so all methods remain readable without JS.
+  .tab-panel { display: block; min-width: 0; padding-top: 1.75rem; }
+  .tab-panel[hidden] { display: none; }
+  .tab-panel + .tab-panel { margin-top: 2rem; }
+  [data-tabs-ready] .tab-panel { margin-top: 0; }
+  .tab-panel > p { color: var(--text-muted); font-size: 0.925rem; }
+  .quickstart-method-heading { font-size: 1.1rem; margin-bottom: 0.75rem; }
+  .quickstart .code-window { margin: 0 0 1.25rem; }
+  .quickstart .code-block { padding: 0; border-radius: 8px; }
+  .quickstart .code-block code { padding: 1.25rem 1.5rem; }
+  .quickstart .home-text-link { margin-top: 1rem; }
+
+  .providers { text-align: left; }
+  .provider-list { display: flex; flex-wrap: wrap; justify-content: flex-start; gap: 0.75rem; margin: 0 0 1.5rem; padding: 0; list-style: none; }
+  .provider-badge { border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 1rem; font-size: 0.875rem; color: var(--text); background: var(--bg-surface); }
+  .provider-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+
+  .cta { padding: 0 0 4rem; }
+  .cta-inner { display: flex; justify-content: space-between; align-items: center; gap: 2rem; padding: 2.5rem; border: 1px solid var(--border); border-radius: 12px; background: var(--bg-surface); text-align: left; box-shadow: none; }
+  .cta-inner > div { min-width: 0; }
+  .cta-heading { font-size: 1.55rem; letter-spacing: -0.025em; margin-bottom: 0.75rem; }
+  .cta-subtitle { margin: 0; max-width: 48ch; color: var(--text-muted); font-size: 0.95rem; }
+  .cta-actions { display: flex; flex-wrap: wrap; gap: 0.75rem; flex-shrink: 0; }
+
+  @media (max-width: 1023px) {
+    .hero-inner { gap: 2rem; }
+    .home-value-grid, .home-case-grid { gap: 1.25rem; }
+    .home-case { padding: 1.25rem; }
+    .cta-inner { align-items: flex-start; flex-direction: column; }
+  }
+
+  @media (max-width: 767px) {
+    .hero { padding: 3rem 0; }
+    .hero-inner { grid-template-columns: minmax(0, 1fr); gap: 2.5rem; }
+    .hero-heading { font-size: clamp(2.65rem, 9vw, 3.75rem); }
+    .hero-description { max-width: 60ch; }
+    .home-section { padding: 3rem 0; }
+    .home-value-grid, .home-case-grid { grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
+    .home-value { padding-right: 0; }
+    .home-value + .home-value { border-top: 1px solid var(--border); padding-top: 1.5rem; }
+    .home-number { margin-bottom: 0.75rem; }
+    .home-case { padding: 1.5rem; }
+    .cta-inner { padding: 1.5rem; }
+    .cta-actions { flex-shrink: 1; }
+    .tab-btn { padding: 0.8rem 0.75rem; font-size: 0.85rem; }
+    .code-window-header { flex-wrap: wrap; }
+  }
+}

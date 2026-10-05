@@ -9,7 +9,7 @@
   <div class="taxonomy-list">
     {% for term in terms %}
     <a href="{{ term.permalink }}" class="taxonomy-item">
-      <span class="badge-tag">{{ term.name }}</span>
+      <span class="badge-tag" data-tag="{{ term.name | slugify }}">{{ term.name }}</span>
       <span class="taxonomy-count">{{ term.pages | length }}</span>
     </a>
     {% endfor %}

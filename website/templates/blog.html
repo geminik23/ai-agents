@@ -28,7 +28,7 @@ content %}
             {% endif %} {% if page.taxonomies.tags is defined and page.taxonomies.tags %}
             <div style="margin-top: 0.5rem">
                 {% for tag in page.taxonomies.tags %}
-                <a href="{{ get_taxonomy_url(kind='tags', name=tag) }}" class="badge-tag"
+                <a href="{{ get_taxonomy_url(kind='tags', name=tag) }}" class="badge-tag" data-tag="{{ tag | slugify }}"
                     >{{ tag }}</a
                 >
                 {% endfor %}

@@ -83,3 +83,7 @@ EOF
 Global styles live in `sass/style.scss`. Zola compiles Sass automatically.
 The site uses CSS custom properties for dark/light theming - edit the `:root`
 and `[data-theme="light"]` blocks to change colors.
+
+Zola generates `giallo-light.css` and `giallo-dark.css` from the configured
+high-contrast syntax themes during each build. Do not add copies to `static/`:
+static assets are copied after generation and would overwrite those styles.

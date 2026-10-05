@@ -5,17 +5,10 @@ template = "section.html"
 transparent = false
 +++
 
-Welcome to the AI Agents Framework documentation. These guides cover everything you need to build, configure, and run AI agents - from a single YAML file to complex multi-agent pipelines.
+Define an agent in YAML, run it with the CLI, or embed the same runtime in your Rust application. Choose a starting point, then use the references below as your agent grows.
 
-Here's what you'll find:
+**Start with YAML.** Follow [Getting Started](@/docs/getting-started.md) to configure a provider and run your first conversation. The [CLI Guide](@/docs/cli.md) covers streaming, context injection, and interactive commands.
 
-- **Getting Started** - Install the CLI or library and run your first agent in under a minute.
-- **Concepts** - Understand the architecture, agent lifecycle, state machine, tools, memory, and other core ideas.
-- **YAML Reference** - The complete spec for agent definition files: prompts, tools, LLM config, state, handoffs, and more.
-- **CLI Guide** - All commands, flags, and REPL features available in `ai-agents-cli`.
-- **Evaluation** - Run scenario suites with fixtures, assertions, LLM modes, judges, and CI reports.
-- **Built-in Tools** - Review canonical inputs, outputs, safety classes, policy bindings, and host requirements for all built-ins.
-- **Rust API** - Use the framework as a library with `AgentBuilder`, runtime hooks, and custom tool functions.
-- **Provider Setup** - Configuration details for all 12 supported LLM providers, including local options like Ollama.
+**Embed in Rust.** The [Rust API](@/docs/rust-api.md) explains the builder, custom tools, hooks, and host integrations. Read [Concepts](@/docs/concepts.md) for the runtime's execution and safety contracts.
 
-Pick a topic from the sidebar, or start with [Getting Started](@/docs/getting-started.md) if this is your first time.
+Use the header search to look up a YAML field or tool name, or pick a guide below.
