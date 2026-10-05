@@ -1,0 +1,4 @@
+# <workspace>/.cargo/config.toml
+
+[build]
+target-dir = "/mnt/data/rust_targets/ai-agents"
