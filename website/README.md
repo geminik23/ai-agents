@@ -4,14 +4,14 @@ Source for [ai-agents.rs](https://ai-agents.rs), built with [Zola](https://www.g
 
 ## Prerequisites
 
-Install Zola:
+Install Zola **0.23.6**, matching the CI pin. Earlier versions do not support the site's `skip_content_templating` configuration.
 
 ```sh
 # via cargo
-cargo install zola
+cargo install zola --version 0.23.6 --locked
 
 # or download a prebuilt binary from
-# https://github.com/getzola/zola/releases
+# https://github.com/getzola/zola/releases/tag/v0.23.6
 ```
 
 ## Build & Serve
