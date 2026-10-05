@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.1.1 - 2026-10-05
+
+### Fixed
+- Evaluation execution: reduce nested construction stack usage to avoid stack overflow in affected embedded suite and reset/retry paths without requiring enlarged thread stacks
+
 ## 1.1.0 - 2026-10-05
 
 ### Added

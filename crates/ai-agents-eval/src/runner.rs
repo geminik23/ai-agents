@@ -769,7 +769,16 @@ impl EvalRunner {
         })
     }
 
-    async fn build_agent(&self, params: BuildAgentParams<'_>) -> Result<RuntimeAgent> {
+    // Keep construction state out of attempt futures while retaining same-task polling and drop cleanup.
+    fn build_agent<'a>(
+        &'a self,
+        params: BuildAgentParams<'a>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<RuntimeAgent>> + 'a>> {
+        Box::pin(self.build_agent_inner(params))
+    }
+
+    // Preserve the builder order and fixture bindings for initial construction and full resets.
+    async fn build_agent_inner(&self, params: BuildAgentParams<'_>) -> Result<RuntimeAgent> {
         let BuildAgentParams {
             agent_path,
             base_dir,
@@ -826,6 +835,15 @@ impl EvalRunner {
             .auto_configure_mcp()
             .await
             .map_err(|error| EvalError::Config(error.to_string()))?;
+
+        // Only the cancellation regression pauses here; normal builds have no extra suspension point.
+        #[cfg(test)]
+        if let Ok(gate) = tests::CONSTRUCTION_GATE.try_with(Arc::clone) {
+            gate.acquire()
+                .await
+                .expect("Construction test gate is open")
+                .forget();
+        }
 
         if let Some(approval_handler) = approval_handler {
             builder = builder.approval_handler(approval_handler);
@@ -1586,6 +1604,10 @@ scenarios:
 mod tests {
     use super::*;
 
+    tokio::task_local! {
+        pub(super) static CONSTRUCTION_GATE: Arc<tokio::sync::Semaphore>;
+    }
+
     fn attempt_workspace(id: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ai-agents-eval-{id}"))
     }
@@ -2240,11 +2262,197 @@ llm:
             .unwrap()
     }
 
+    // Creating the heap-owned construction future must defer parsing and retain fail-closed preflight.
+    #[tokio::test]
+    async fn construction_is_lazy_and_rejects_invalid_hierarchy_before_calls() {
+        let workspace = AttemptWorkspace::create(None).unwrap();
+        let path = workspace.workspace.join("agent.yaml");
+        let runner = EvalRunner {
+            suite_path: workspace.workspace.join("suite.yaml"),
+            suite: parse_eval_suite_yaml("name: construction\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\nscenarios:\n  - id: check\n    turns:\n      - input: hello\n").unwrap(),
+            options: EvalRunnerOptions::default(),
+        };
+        let llm_log = RecordingLlmLog::default();
+        let create_build = || {
+            runner.build_agent(BuildAgentParams {
+                agent_path: &path,
+                base_dir: &workspace.workspace,
+                attempt_context: &workspace,
+                tool_log: RecordingToolLog::new(),
+                approval_log: RecordingApprovalLog::default(),
+                llm_log: llm_log.clone(),
+                approval_handler: None,
+                budget: None,
+            })
+        };
+        let unpolled = create_build();
+        assert_eq!(Arc::strong_count(&llm_log.records), 2);
+        drop(unpolled);
+        assert_eq!(Arc::strong_count(&llm_log.records), 1);
+        let build = create_build();
+        assert!(!path.exists());
+        std::fs::write(&path, "name: invalid\nsystem_prompt: Test\nllms:\n  main: {provider: openai, model: mock}\nllm:\n  default: main\n  router:\n    state:\n      transition: missing\n").unwrap();
+        let error = match build.await {
+            Ok(_) => panic!("Missing hierarchy alias must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert_eq!(llm_log.len(), 0);
+    }
+
+    // A polled construction must release its partially built hooks without taking ownership of the caller's workspace.
+    #[tokio::test]
+    async fn dropping_pending_construction_releases_builder_hooks() {
+        let workspace = AttemptWorkspace::create(None).unwrap();
+        write_test_agent(&workspace.workspace);
+        let path = workspace.workspace.join("agent.yaml");
+        let workspace_path = workspace.workspace.clone();
+        let runner = EvalRunner {
+            suite_path: workspace.workspace.join("suite.yaml"),
+            suite: parse_eval_suite_yaml("name: pending-build\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\n    responses: [ok]\nscenarios:\n  - id: check\n    turns:\n      - input: hello\n").unwrap(),
+            options: EvalRunnerOptions::default(),
+        };
+        let llm_log = RecordingLlmLog::default();
+        let approval_log = RecordingApprovalLog::default();
+        let build = runner.build_agent(BuildAgentParams {
+            agent_path: &path,
+            base_dir: &workspace.workspace,
+            attempt_context: &workspace,
+            tool_log: RecordingToolLog::new(),
+            approval_log: approval_log.clone(),
+            llm_log: llm_log.clone(),
+            approval_handler: None,
+            budget: None,
+        });
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut pending = Box::pin(CONSTRUCTION_GATE.scope(gate.clone(), build));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        assert_eq!(Arc::strong_count(&llm_log.records), 2);
+        assert_eq!(Arc::strong_count(&approval_log.records), 2);
+        assert_eq!(
+            Arc::strong_count(&gate),
+            3,
+            "The polled construction must hold its gate"
+        );
+        assert_eq!(llm_log.len(), 0);
+        drop(pending);
+        assert_eq!(Arc::strong_count(&llm_log.records), 1);
+        assert_eq!(Arc::strong_count(&approval_log.records), 1);
+        assert_eq!(Arc::strong_count(&gate), 1);
+        assert!(workspace_path.exists());
+        drop(workspace);
+        assert!(!workspace_path.exists());
+    }
+
+    // Cancellation after boxed construction must release the caller-owned workspace and pending model future.
+    #[tokio::test]
+    async fn dropping_constructed_turn_releases_attempt_workspace() {
+        let source = AttemptWorkspace::create(None).unwrap();
+        write_test_agent(&source.workspace);
+        let agent_path = source.workspace.join("agent.yaml");
+        let runner = EvalRunner {
+            suite_path: source.workspace.join("suite.yaml"),
+            suite: parse_eval_suite_yaml("name: drop\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\n    responses: [ok]\n    delays_by_alias: {default: 60000}\nscenarios:\n  - id: pending\n    turns:\n      - input: hello\n").unwrap(),
+            options: EvalRunnerOptions::default(),
+        };
+        let workspace = AttemptWorkspace::create(None).unwrap();
+        let workspace_path = workspace.workspace.clone();
+        let base_dir = source.workspace.clone();
+        let llm_log = RecordingLlmLog::default();
+        let future_log = llm_log.clone();
+        let mut operation = Box::pin(async move {
+            let agent = runner
+                .build_agent(BuildAgentParams {
+                    agent_path: &agent_path,
+                    base_dir: &base_dir,
+                    attempt_context: &workspace,
+                    tool_log: RecordingToolLog::new(),
+                    approval_log: RecordingApprovalLog::default(),
+                    llm_log: future_log,
+                    approval_handler: None,
+                    budget: None,
+                })
+                .await
+                .unwrap();
+            agent.chat("hello").await.unwrap();
+            drop(agent);
+            drop(workspace);
+        });
+        assert!(futures::poll!(operation.as_mut()).is_pending());
+        assert_eq!(
+            llm_log.len(),
+            1,
+            "The turn must reach the pending fixture provider"
+        );
+        assert!(workspace_path.exists());
+        drop(operation);
+        assert!(!workspace_path.exists());
+        assert_eq!(llm_log.len(), 1);
+    }
+
+    // Parallel scenario futures must preserve declaration order, full rebuilds, and stream finalization.
+    #[tokio::test]
+    async fn parallel_scenarios_preserve_order_and_full_reset_fixtures() {
+        let source = AttemptWorkspace::create(None).unwrap();
+        write_test_agent(&source.workspace);
+        let runner = EvalRunner {
+            suite_path: source.workspace.join("suite.yaml"),
+            suite: parse_eval_suite_yaml(
+                r#"
+name: parallel-reset
+agent: agent.yaml
+settings:
+  parallel: true
+  max_concurrent: 2
+  retries: 0
+fixtures:
+  llm:
+    mode: mock
+    responses: [ok]
+scenarios:
+  - id: rebuild
+    steps:
+      - !run
+        turns:
+          - input: before
+            assert: {response_contains: ok}
+      - !reset_agent
+        profile: full_runtime
+      - !run
+        turns:
+          - input: after
+            assert: {response_contains: ok}
+  - id: stream
+    turns:
+      - input: streaming
+        stream: true
+        assert: {response_contains: ok}
+"#,
+            )
+            .unwrap(),
+            options: EvalRunnerOptions::default(),
+        };
+        let result = runner.run().await.unwrap();
+        assert_eq!(result.passed, 2, "{result:?}");
+        assert_eq!(result.scenarios[0].id, "rebuild");
+        assert_eq!(result.scenarios[1].id, "stream");
+        let turns = &result.scenarios[0].attempts[0].turns;
+        assert_eq!(turns.len(), 2);
+        assert!(
+            turns
+                .iter()
+                .all(|turn| turn.response_present && turn.evidence.llm_requests.len() == 1)
+        );
+        let messages = &turns[1].evidence.llm_requests[0].messages;
+        assert!(!messages.iter().any(|message| message.content == "before"));
+        assert!(messages.iter().any(|message| message.content == "after"));
+        assert!(result.scenarios[1].attempts[0].turns[0].response_present);
+    }
+
     #[test]
     fn runtime_error_expectations_retain_turns_and_control_retries() {
         std::thread::Builder::new()
             .name("eval-runtime-error-test".to_string())
-            .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
@@ -2358,7 +2566,6 @@ scenarios:
     fn scenario_budget_is_shared_across_retries_and_agent_resets() {
         std::thread::Builder::new()
             .name("eval-budget-lifecycle-test".to_string())
-            .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
@@ -2454,7 +2661,6 @@ scenarios:
     fn captures_composed_llm_requests_per_turn_across_reset() {
         std::thread::Builder::new()
             .name("eval-llm-evidence-test".to_string())
-            .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
@@ -2577,7 +2783,6 @@ scenarios:
     fn observability_evidence_is_scoped_to_each_turn() {
         std::thread::Builder::new()
             .name("eval-turn-observability-test".to_string())
-            .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
@@ -2654,7 +2859,6 @@ scenarios:
     fn runner_default_judge_is_strict_and_redacts_failures() {
         std::thread::Builder::new()
             .name("eval-judge-contract-test".to_string())
-            .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
@@ -2737,7 +2941,6 @@ scenarios:
     fn runner_executes_mocked_suite_and_redacts_outputs() {
         std::thread::Builder::new()
             .name("eval-runner-test".to_string())
-            .stack_size(16 * 1024 * 1024)
             .spawn(|| {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
