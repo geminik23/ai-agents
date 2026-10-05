@@ -1,0 +1,42 @@
+// Static decoration stays behind the content and never intercepts selection or clicks.
+.hero-agents {
+  position: relative;
+  isolation: isolate;
+  > .container { position: relative; z-index: 1; }
+}
+.hero-background {
+  --scene-dot: rgba(228, 155, 145, 0.23);
+  --scene-wash: rgba(192, 51, 43, 0.13);
+  --grid-step: 24px;
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  user-select: none;
+  contain: paint;
+  mask-image: linear-gradient(#000 0%, #000 65%, transparent 100%);
+}
+.hero-background-wash, .hero-background-grid {
+  position: absolute;
+  inset: 0;
+}
+.hero-background-wash {
+  background: radial-gradient(ellipse 52% 440px at 32% 80px, var(--scene-wash), transparent 85%),
+    radial-gradient(ellipse 32% 600px at 100% 380px, var(--scene-wash), transparent 85%);
+}
+.hero-background-grid {
+  background-image: radial-gradient(circle, var(--scene-dot) 1px, transparent 1.3px);
+  background-size: var(--grid-step) var(--grid-step);
+  mask-image: linear-gradient(90deg, #000, rgba(0, 0, 0, 0.2) 35%, rgba(0, 0, 0, 0.2) 70%, #000);
+}
+[data-theme="light"] .hero-background {
+  --scene-dot: rgba(151, 82, 65, 0.22);
+  --scene-wash: rgba(191, 83, 55, 0.07);
+}
+@media (max-width: 767px) {
+  .hero-background { --grid-step: 20px; }
+  .hero-background-grid { mask-image: linear-gradient(90deg, #000, transparent 25%, transparent 75%, #000); }
+  .hero-background-wash { background: radial-gradient(ellipse 100% 400px at 100% 180px, var(--scene-wash), transparent 90%); }
+}
+@media (forced-colors: active) { .hero-background { display: none; } }

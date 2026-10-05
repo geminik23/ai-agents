@@ -187,3 +187,11 @@ normal build only checks hashes and does not run a model or agent. Recording
 exports only the declared public exchange, not full evaluation reports or local
 paths. The expansion panels below the homepage demo are independent YAML excerpts;
 the multi-agent panel also needs the linked specialist definition.
+
+## Homepage background
+
+The hero's static dot grid and soft background color live in
+`templates/partials/hero-background.html` and `sass/_hero-background.scss`.
+The decoration uses CSS only, with theme and mobile adjustments. It has no
+pointer effects, animations, scripts, or interactive controls. Forced colors
+hides the decoration; foreground content and controls remain independent.
