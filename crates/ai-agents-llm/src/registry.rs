@@ -9,7 +9,8 @@ pub struct LLMRegistry {
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     default_alias: String,
     router_alias: Option<String>,
-    router_roles: Option<RouterRolesConfig>,
+    // Keep the opt-in tree out of by-value registries and builder futures, including legacy agents.
+    router_roles: Option<Box<RouterRolesConfig>>,
 }
 
 impl std::fmt::Debug for LLMRegistry {
@@ -48,11 +49,11 @@ impl LLMRegistry {
     /// Installs agent-local hierarchy without registering or probing providers.
     pub fn set_router_roles(&mut self, config: RouterRolesConfig) {
         self.router_alias = None;
-        self.router_roles = Some(config);
+        self.router_roles = Some(Box::new(config));
     }
 
     pub fn router_roles(&self) -> Option<&RouterRolesConfig> {
-        self.router_roles.as_ref()
+        self.router_roles.as_deref()
     }
 
     pub fn clear_router(&mut self) {
@@ -228,6 +229,38 @@ mod tests {
         fn supports(&self, _feature: LLMFeature) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn registry_keeps_routing_tree_out_of_inline_storage() {
+        // Registries move through builder futures even in legacy mode; inline role trees overflowed Windows eval stacks.
+        let max_inline_size = 16 * std::mem::size_of::<usize>();
+        assert!(
+            std::mem::size_of::<LLMRegistry>() <= max_inline_size,
+            "LLMRegistry must remain compact when auxiliary roles are added"
+        );
+    }
+
+    #[test]
+    fn hierarchy_clones_compare_by_value_and_keep_independent_trees() {
+        let mut registry = LLMRegistry::new();
+        registry.set_router_roles(RouterRolesConfig {
+            default: Some("fast".into()),
+            ..Default::default()
+        });
+        let mut cloned = registry.clone();
+        assert!(registry.same_bindings(&cloned));
+
+        cloned.router_roles.as_mut().unwrap().default = Some("precise".into());
+        assert_eq!(
+            registry.router_roles().unwrap().default.as_deref(),
+            Some("fast")
+        );
+        assert!(!registry.same_bindings(&cloned));
+
+        cloned.set_router("legacy");
+        assert!(cloned.router_roles().is_none());
+        assert!(registry.router_roles().is_some());
     }
 
     #[tokio::test]
