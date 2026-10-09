@@ -291,6 +291,7 @@ Current weather in {{ steps[0].args.location }}: {{ steps[0].result.temperature 
             .unwrap();
         let executor = SkillExecutor::new(Arc::new(registry), Arc::new(tools));
         let skill = SkillDefinition {
+            autonomy: None,
             id: "tool_skill".to_string(),
             description: "Uses a tool".to_string(),
             trigger: "test".to_string(),

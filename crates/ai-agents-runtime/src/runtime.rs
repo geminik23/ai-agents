@@ -13948,6 +13948,7 @@ mod tests {
     /// Defines a prompt skill whose provider call proves committed execution.
     fn confirmation_skill() -> SkillDefinition {
         SkillDefinition {
+            autonomy: None,
             id: "send_report".to_string(),
             description: "Send a report after clarification".to_string(),
             trigger: "When the user asks to send a report".to_string(),

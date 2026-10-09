@@ -1,3 +1,4 @@
+use ai_agents_core::autonomy::AutonomyOverride;
 use ai_agents_disambiguation::SkillDisambiguationOverride;
 use ai_agents_reasoning::{ReasoningConfig, ReflectionConfig};
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SkillDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autonomy: Option<AutonomyOverride>,
     #[serde(alias = "skill")]
     pub id: String,
     pub description: String,
