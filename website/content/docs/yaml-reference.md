@@ -1642,6 +1642,18 @@ storage:
   ttl_seconds: 86400
 ```
 
+#### Redis operational boundary
+
+Redis remains **Experimental** and snapshot-only. The service integration job targets a single writable Redis **7.4.10** server using the pinned official Alpine image; it does not establish a minimum Redis version or validate Cluster, Sentinel, failover, TLS, or managed-service deployments. Enable the `redis-storage` Cargo feature. A key prefix separates names but is not an ACL or tenant-authorization boundary.
+
+- Each save replaces the snapshot and native bookkeeping together, refreshes any configured TTL, and updates global and agent-owner indexes. Saving without a TTL clears an existing key TTL. Zero or out-of-range save TTLs fail at save time, not URL/config construction time.
+- Expired entries are removed lazily when the relevant index is listed. This is not generic session metadata, filtered listing, `ExpiryCleanup`, or CLI `/cleanup` support. Missing or corrupt payloads are not silently treated as successful loads.
+- Each operation opens a new connection. The backend configures neither connection/response deadlines nor automatic operation retries. Hosts must bound waits and decide recovery. A transport error or dropped future after submission does not prove that a mutation was unapplied; retrying it blindly can overwrite a newer write or refresh its TTL.
+- Lua scripts serialize their execution, but do not roll back earlier writes on every script error. Predictable validation errors are checked before mutation; this is not an all-failure transaction guarantee.
+- Redis persistence, replication and eviction settings remain deployment responsibilities. Save success does not promise disk fsync or lossless failover. External key edits or eviction can remove bookkeeping independently. Listing and legacy index migration scan the entire selected index, so large-index latency is not bounded by this contract.
+
+See [Session Persistence](@/docs/rust-api.md#session-persistence) for the Redis-native Rust helpers and their cleanup semantics.
+
 ---
 
 ## Process Pipeline

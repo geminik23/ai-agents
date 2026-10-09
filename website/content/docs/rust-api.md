@@ -824,6 +824,25 @@ Storage methods advertise support through `AgentStorage::supports(StorageCapabil
 
 Redis's `storage.ttl_seconds` expires Redis snapshot keys directly; it does not implement generic session metadata or `ExpiryCleanup`. `NamespacedStorage` derives snapshot, metadata, filtering, facts, relationships, and actor-deletion support from its inner backend, but intentionally does not forward backend-global expiry cleanup.
 
+### Redis-native helpers
+
+With `redis-storage` enabled, `RedisStorage` also exposes backend-specific bookkeeping helpers. These do **not** add capabilities to `AgentStorage`:
+
+| Helper | Meaning |
+|--------|---------|
+| `get_meta` | Read native `RedisSessionMeta`; absent values return `None`, malformed values return a persistence error. |
+| `exists` | Check snapshot-key existence, not JSON validity or index consistency. |
+| `list_sessions_by_agent` | List the agent's indexed snapshots and lazily prune stale ownership entries. |
+| `set_ttl` | Retimes snapshot and native metadata together. Zero deletes an existing valid session. A missing snapshot is a no-op; existing snapshots with missing or malformed metadata fail. |
+| `expire_sessions` | Sweep indexed snapshots whose parsed `updated_at` is strictly before the UTC cutoff. Count actual deletions and skip observed payload/metadata changed before deletion. |
+
+The expiry helper preserves RFC3339 instant comparison, including offsets and fractional seconds. Missing metadata and invalid timestamps are skipped; malformed metadata returns an error. A sweep can already have deleted earlier eligible entries before a later error. It is not a transaction over the entire session list, generic TTL cleanup, a revision/ABA guarantee, or a distributed lock. Changed observations are conservatively skipped until a later sweep; raw payload equality is checked as well as metadata equality so an unchanged timestamp does not authorize deleting a different snapshot.
+
+`RedisStorage::new()` parses the URL without connecting. Each subsequent operation opens a connection, with no backend-configured deadline or automatic operation retry. A caller timeout bounds waiting, not server-side effects; submission followed by connection loss may leave the write outcome unknown. Bound operations at the host layer and do not blindly retry uncertain mutations.
+
+Redis stays Experimental. The CI service target is a single writable Redis 7.4.10 instance, not a declaration of support for every older version or distributed deployment. See the [Redis operational boundary](@/docs/yaml-reference.md#redis-operational-boundary) for TTL, durability, index-size, and deployment limitations.
+
+
 ---
 
 ## Actor Memory & Key Facts
