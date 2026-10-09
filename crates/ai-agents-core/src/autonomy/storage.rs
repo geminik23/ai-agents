@@ -124,6 +124,13 @@ pub enum TaskRunMutation {
         payload: Value,
         release: bool,
     },
+    /// Host control-plane CAS; runtime adapters require an auditable authenticated host action.
+    HostControl {
+        expected_revision: u64,
+        owner_token: Option<String>,
+        status: TaskRunStatus,
+        payload: Value,
+    },
     RequestCancel {
         expected_revision: u64,
     },
@@ -210,6 +217,9 @@ impl TaskRunSnapshot {
             | TaskRunMutation::Checkpoint {
                 expected_revision, ..
             }
+            | TaskRunMutation::HostControl {
+                expected_revision, ..
+            }
             | TaskRunMutation::RequestCancel { expected_revision }
             | TaskRunMutation::AcknowledgeCancel {
                 expected_revision, ..
@@ -261,6 +271,29 @@ impl TaskRunSnapshot {
                 next.status = *status;
                 next.payload = payload.clone();
                 if *release {
+                    next.owner_token = None;
+                }
+            }
+            TaskRunMutation::HostControl {
+                owner_token,
+                status,
+                payload,
+                ..
+            } => {
+                if self.owner_token != *owner_token {
+                    return Err(Conflict.into());
+                }
+                if (*status == TaskRunStatus::Running) != owner_token.is_some()
+                    && !status.is_terminal()
+                {
+                    return Err(InvalidCheckpoint.into());
+                }
+                if self.cancel_requested {
+                    return Err(NotResumable.into());
+                }
+                next.status = *status;
+                next.payload = payload.clone();
+                if status.is_terminal() {
                     next.owner_token = None;
                 }
             }

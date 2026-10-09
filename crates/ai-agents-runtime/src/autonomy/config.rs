@@ -364,6 +364,12 @@ fn validate_validation(config: &ValidationConfig, in_stage: bool) -> Result<()> 
             || check.adapter.trim().is_empty()
             || check.contract_version == Some(0)
             || check.timeout_seconds == Some(0)
+            || check
+                .max_evaluation_rounds
+                .is_some_and(|n| n == 0 || n > 32)
+            || check
+                .max_observations_per_round
+                .is_some_and(|n| n == 0 || n > 16)
             || (check.schedule == Some(ai_agents_core::autonomy::ValidationSchedule::StageEnd)
                 && !in_stage)
         {

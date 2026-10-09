@@ -125,11 +125,13 @@ pub struct AgentBuilder {
     skills_prepared: bool,
     routing_frozen: Option<LLMRegistry>,
     routing_dirty: bool,
+    autonomy_extensions: Option<Arc<crate::autonomy::FrozenAutonomyExtensions>>,
 }
 
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
+            autonomy_extensions: None,
             reasoning: None,
             reflection: None,
             spec: None,
@@ -171,6 +173,12 @@ impl AgentBuilder {
         }
     }
 
+    /// Freezes host adapters before runtime construction without granting or exposing their observation tools.
+    pub fn autonomy_extensions(mut self, registry: crate::autonomy::AutonomyExtensions) -> Self {
+        self.autonomy_extensions = Some(registry.freeze());
+        self
+    }
+
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
@@ -180,6 +188,7 @@ impl AgentBuilder {
 
         Self {
             spec: Some(spec),
+            autonomy_extensions: None,
             llm: None,
             llm_registry: None,
             memory: None,
@@ -1553,6 +1562,10 @@ impl AgentBuilder {
             }
         }
 
+        let extensions = self
+            .autonomy_extensions
+            .take()
+            .unwrap_or_else(|| crate::autonomy::AutonomyExtensions::builtins().freeze());
         let mut agent = RuntimeAgent::try_new(
             info,
             llm_registry_arc.clone(),
@@ -1562,6 +1575,7 @@ impl AgentBuilder {
             system_prompt,
             max_iterations,
         )?
+        .with_autonomy_extensions(extensions)
         .with_shared_resource_locks(resource_locks)
         .with_declared_tool_ids(declared_tool_ids);
 

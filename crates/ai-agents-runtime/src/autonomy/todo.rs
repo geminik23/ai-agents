@@ -29,6 +29,7 @@ impl RunTodoAdapter {
     /// Starts with an empty run list so a prior session cannot prove this objective complete.
     pub fn begin(store: TodoStore, key: &TaskRunKey) -> Result<Self> {
         let binding = TodoRunBinding {
+            objective_revision: 0,
             agent_id: key.agent_id.clone(),
             run_id: key.run_id.clone(),
             token: uuid::Uuid::new_v4().to_string(),

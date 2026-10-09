@@ -705,6 +705,7 @@ pub struct RuntimeAgent {
     runtime_control: Arc<RuntimeControlState>,
     /// Serializes independent externally initiated root turns across blocking and streaming APIs.
     root_turn_gate: RootTurnGate,
+    autonomy_extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -960,7 +961,57 @@ impl RuntimeAgent {
             resource_locks: new_tool_resource_locks(),
             runtime_control: Arc::new(RuntimeControlState::default()),
             root_turn_gate: Arc::new(tokio::sync::Mutex::new(())),
+            autonomy_extensions: crate::autonomy::AutonomyExtensions::builtins().freeze(),
         })
+    }
+
+    /// Captures immutable host bindings before the builder publishes this runtime.
+    pub(crate) fn with_autonomy_extensions(
+        mut self,
+        extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
+    ) -> Self {
+        self.autonomy_extensions = extensions;
+        self
+    }
+
+    /// Returns the canonical store for explicit host bindings, not another mutable task authority.
+    pub fn todo_store(&self) -> ai_agents_tools::TodoStore {
+        self.tools.todo_store()
+    }
+
+    /// Reports construction-time inventory; every invocation still rechecks policy, availability and state narrowing.
+    pub fn validation_capabilities(&self) -> crate::autonomy::ValidationCapabilities {
+        let scope = self.runtime_control.tool_scope_override.read().clone();
+        crate::autonomy::ValidationCapabilities {
+            tools: self
+                .get_top_level_tool_ids_for_scope(scope.as_deref())
+                .into_iter()
+                .filter(|id| self.validation_operation_available(id))
+                .collect(),
+            judge: self.llm_registry.default().is_ok(),
+            planner: self.llm_registry.default().is_ok(),
+            host_revisions: false,
+        }
+    }
+
+    /// Capability presence does not authorize a call; host-bound calls retain the complete shared execution path.
+    pub(crate) fn validation_operation_available(&self, tool: &str) -> bool {
+        self.tools.resolve(tool).is_some() && self.host_tool_unavailability(tool).is_none()
+    }
+
+    /// Provides frozen adapters for selected-profile preflight without replacing live bindings.
+    pub fn autonomy_extensions(&self) -> &Arc<crate::autonomy::FrozenAutonomyExtensions> {
+        &self.autonomy_extensions
+    }
+
+    /// Matches explicit host validation authority and uses the ordinary executor; labels or model arguments cannot mint permits.
+    pub async fn invoke_host_validation(
+        &self,
+        binding: &str,
+        request: ToolExecutionRequest,
+        context: &crate::autonomy::HostValidationContext<'_>,
+    ) -> Result<ToolExecutionRecord> {
+        crate::autonomy::invoke_bound(self, binding, request, context).await
     }
 
     pub fn with_declared_tool_ids(mut self, ids: Option<Vec<String>>) -> Self {
@@ -3792,7 +3843,27 @@ impl RuntimeAgent {
         &self,
         scope_override: Option<&[String]>,
     ) -> Result<AvailableToolIdsSnapshot> {
+        self.get_available_tool_ids_with_validation_grant(scope_override, None)
+            .await
+    }
+
+    /// Adds only a matched execution-local host grant, then applies unchanged runtime and state narrowing.
+    async fn get_available_tool_ids_with_validation_grant(
+        &self,
+        scope_override: Option<&[String]>,
+        extra: Option<&str>,
+    ) -> Result<AvailableToolIdsSnapshot> {
         let mut available = self.get_top_level_tool_ids_for_scope(scope_override);
+        if let Some(extra) = extra
+            && scope_override.is_none_or(|ids| {
+                ids.iter()
+                    .any(|id| self.tools.canonical_id(id).as_deref() == Some(extra))
+            })
+            && self.tools.resolve(extra).is_some()
+            && !available.iter().any(|id| id == extra)
+        {
+            available.push(extra.to_owned());
+        }
         let (state_generation, state_scopes) = self
             .state_machine
             .as_ref()
@@ -5348,6 +5419,8 @@ impl RuntimeAgent {
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
     ///
+    /// Host validation replaces only the ordinary grant predicate for a matched private invocation scope, never provider-visible exposure, state/runtime narrowing, policy, approval or final generation admission.
+    /// Its exact arguments are rechecked after HITL so a modified call cannot reuse the original fixed-operation authority.
     /// A failed request selected for fallback releases its guards and finalizes its own record before the fallback starts as a separate shared-executor request. Canonical ancestry crosses that boundary so alias-mediated cycles and overlong acyclic chains stop before the start hook, approval, locks, or invocation while retaining terminal completion evidence.
     async fn execute_tool_record_inner(
         &self,
@@ -5403,7 +5476,19 @@ impl RuntimeAgent {
 
         let canonical_id = resolved.identity.canonical_id.clone();
 
-        let initial_scope_snapshot = self.get_available_tool_ids_snapshot().await?;
+        let extra = crate::autonomy::validation_extra_grant(
+            &self.info.id,
+            &request,
+            &canonical_id,
+            &request.arguments,
+        );
+        let scope_override = self.runtime_control.tool_scope_override.read().clone();
+        let initial_scope_snapshot = self
+            .get_available_tool_ids_with_validation_grant(
+                scope_override.as_deref(),
+                extra.as_deref(),
+            )
+            .await?;
         if !initial_scope_snapshot
             .tool_ids
             .iter()
@@ -5495,6 +5580,9 @@ impl RuntimeAgent {
             metadata.insert("policy_snapshot".to_string(), policy_snapshot.clone());
         }
 
+        if let Some(binding) = crate::autonomy::validation_metadata(&request) {
+            metadata.insert("host_validation".into(), binding);
+        }
         let mut approval_record = Some(ToolApprovalRecord {
             status: ToolApprovalStatus::NotRequired,
             reason: None,
@@ -5536,6 +5624,16 @@ impl RuntimeAgent {
             );
             self.finish_tool_record(&record).await;
             return Ok(record);
+        }
+        if crate::autonomy::validation_requires_approval(&request)
+            && matches!(
+                security_result,
+                SecurityCheckResult::Allow | SecurityCheckResult::Warn { .. }
+            )
+        {
+            security_result = SecurityCheckResult::RequireConfirmation {
+                message: "Host validation binding requires approval".into(),
+            };
         }
         match &security_result {
             SecurityCheckResult::Allow => {}
@@ -6106,15 +6204,18 @@ impl RuntimeAgent {
         let binding_security_result = security_engine
             .validate_tool_execution_with_bindings(&canonical_id, &executed_arguments, &bindings)
             .await?;
-        let approval_confirmation_required = matches!(
-            binding_security_result,
-            SecurityCheckResult::RequireConfirmation { .. }
-        ) || security_engine
-            .classification_approval_message(
-                &canonical_id,
-                &resolved.tool.classify_call(&executed_arguments),
-            )
-            .is_some();
+        let approval_confirmation_required =
+            crate::autonomy::validation_requires_approval(&request)
+                || matches!(
+                    binding_security_result,
+                    SecurityCheckResult::RequireConfirmation { .. }
+                )
+                || security_engine
+                    .classification_approval_message(
+                        &canonical_id,
+                        &resolved.tool.classify_call(&executed_arguments),
+                    )
+                    .is_some();
         let approval_binding = approval_record.as_ref().and_then(|record| {
             matches!(
                 record.status,
@@ -6323,8 +6424,15 @@ impl RuntimeAgent {
         // Admission must reject any later state transition, reset, or restore before consuming rate capacity or invoking the tool.
         //
         let available_snapshot = self
-            .get_available_tool_ids_snapshot_for_scope(
+            .get_available_tool_ids_with_validation_grant(
                 control_snapshot.tool_scope_override.as_deref(),
+                crate::autonomy::validation_extra_grant(
+                    &self.info.id,
+                    &request,
+                    &canonical_id,
+                    &final_arguments,
+                )
+                .as_deref(),
             )
             .await?;
         versions.state = available_snapshot.state_generation;
@@ -6336,7 +6444,12 @@ impl RuntimeAgent {
             "state_generation_snapshot".to_string(),
             serde_json::to_value(available_snapshot.state_generation).unwrap_or(Value::Null),
         );
-        if !available_snapshot
+        if !crate::autonomy::validation_arguments_valid(
+            &self.info.id,
+            &request,
+            &canonical_id,
+            &final_arguments,
+        ) || !available_snapshot
             .tool_ids
             .iter()
             .any(|tool_id| tool_id == &canonical_id)
@@ -6391,12 +6504,14 @@ impl RuntimeAgent {
             }
             SecurityCheckResult::Allow | SecurityCheckResult::RequireConfirmation { .. } => {}
         }
-        let final_confirmation_required = matches!(
-            final_security_result,
-            SecurityCheckResult::RequireConfirmation { .. }
-        ) || security_engine
-            .classification_approval_message(&canonical_id, &classification)
-            .is_some();
+        let final_confirmation_required = crate::autonomy::validation_requires_approval(&request)
+            || matches!(
+                final_security_result,
+                SecurityCheckResult::RequireConfirmation { .. }
+            )
+            || security_engine
+                .classification_approval_message(&canonical_id, &classification)
+                .is_some();
         let stale_approval = approval_binding.as_ref().is_some_and(|binding| {
             binding.is_stale(
                 &canonical_id,
@@ -8893,7 +9008,7 @@ Respond with ONLY the mode name (none, cot, react, or plan_and_execute)."#,
 
     // Generates a plan only after the effective tool scope is known so scope failures cannot expose the full registry to the planner.
     // Resolves the planner independently while preserving fail-closed scope checks before invocation.
-    async fn generate_plan(&self, input: &str) -> Result<Plan> {
+    pub(crate) async fn generate_plan(&self, input: &str) -> Result<Plan> {
         let effective = self.get_effective_reasoning_config();
         let planning_config = effective.get_planning();
 

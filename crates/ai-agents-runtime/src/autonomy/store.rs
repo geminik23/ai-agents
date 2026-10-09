@@ -70,6 +70,40 @@ impl ScopedTaskRunStore {
         )
     }
 
+    /// Applies an explicit host-only action at a safe checkpoint with CAS, audit, host ceilings and unchanged consumed resources.
+    pub async fn apply_host_action(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        action: super::HostControlAction,
+        host: &super::AutonomyHostCeilings,
+    ) -> Result<TaskRunSnapshot> {
+        let previous = self
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if previous.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let old: TaskCheckpointPayload = serde_json::from_value(previous.payload.clone())?;
+        let (payload, status) = super::prepare_host_control(&previous, action, host)?;
+        let mutation = TaskRunMutation::HostControl {
+            expected_revision,
+            owner_token: previous.owner_token.clone(),
+            status,
+            payload: serde_json::to_value(&payload)?,
+        };
+        let proposed = previous.transition(&mutation, chrono::Utc::now())?;
+        self.validate(&proposed)?;
+        payload.validate_successor_with_control(&old, proposed.revision, false, true)?;
+        let saved = self
+            .storage
+            .mutate_task_run(&self.key(run_id), &mutation)
+            .await?;
+        self.validate(&saved)?;
+        Ok(saved)
+    }
+
     // Never accept a caller-selected agent or actor identity as authority for another scope.
     fn validate(&self, snapshot: &TaskRunSnapshot) -> Result<()> {
         if snapshot.key.agent_id != self.agent_id || snapshot.actor_id != self.actor_id {
@@ -109,6 +143,11 @@ impl TaskRunStore for ScopedTaskRunStore {
 
     /// Checks the proposed payload before CAS; concurrent changes still fail in the backend.
     async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot> {
+        if matches!(mutation, TaskRunMutation::HostControl { .. }) {
+            return Err(AgentError::Config(
+                "host mutations require apply_host_action preflight".into(),
+            ));
+        }
         let previous = self
             .load(run_id)
             .await?

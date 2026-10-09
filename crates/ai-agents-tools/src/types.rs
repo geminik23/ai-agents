@@ -1062,6 +1062,8 @@ pub struct TodoItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TodoRunBinding {
+    #[serde(default)]
+    pub objective_revision: u64,
     pub agent_id: String,
     pub run_id: String,
     pub token: String,
@@ -1117,6 +1119,11 @@ impl TodoStore {
     /// Remove every todo item.
     pub fn clear(&self) {
         self.inner.write().items.clear();
+    }
+
+    /// Confirms a host alias observes the same canonical authority rather than an unrelated JSON-returning tool.
+    pub fn shares_store(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     /// Binds a new run atomically and discards only the prior unbound session list.

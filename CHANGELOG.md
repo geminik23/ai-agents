@@ -4,9 +4,10 @@
 
 ### Added
 - Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; autonomous execution remains unavailable
+- Task validation: development-only tri-state completion, versioned host adapters, resumable observations, progress and bounded replanning on existing execution boundaries; the autonomous runner remains unavailable
 
 ### Changed
-- Rust configuration compatibility: typed autonomy fields on agent, state, and skill definitions require existing struct literals to be updated; enabled task execution remains unavailable until the runner is installed
+- Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled task execution remains unavailable until the runner is installed
 
 ### Fixed
 - Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn

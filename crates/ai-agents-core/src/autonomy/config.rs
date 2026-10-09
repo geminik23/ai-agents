@@ -140,6 +140,10 @@ pub struct ValidationCheck {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_evaluation_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_observations_per_round: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<serde_json::Value>,
 }
 

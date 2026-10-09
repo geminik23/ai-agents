@@ -543,10 +543,12 @@ pub use agent::{
     TurnBranchScheduler, TurnOptimizationContext,
 };
 pub use autonomy::{
-    AutonomyConfig, AutonomyHostCeilings, AutonomyMode, AutonomyOverride, AutonomyProfile,
-    AutonomyScope, CompletionGate, EffectiveAutonomyProfile, RunTodoAdapter, ScopedTaskRunStore,
-    TaskCheckpointPayload, TaskRun, TaskRunKey, TaskRunMutation, TaskRunResult, TaskRunSnapshot,
-    TaskRunStatus, TaskRunStorageError, TaskRunStore, TaskRuntimeCheckpoint,
+    AutonomyConfig, AutonomyExtensions, AutonomyHostCeilings, AutonomyMode, AutonomyOverride,
+    AutonomyProfile, AutonomyScope, AutonomyValidator, CompletionGate, CompletionGateEvaluator,
+    EffectiveAutonomyProfile, EvaluationScope, GateOutcome, HostControlAction, ProgressAdapter,
+    RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload, TaskRun, TaskRunKey,
+    TaskRunMutation, TaskRunResult, TaskRunSnapshot, TaskRunStatus, TaskRunStorageError,
+    TaskRunStore, TaskRuntimeCheckpoint, TaskValidationJournal, ValidationDriverState,
 };
 pub use error::{AgentError, Result};
 pub use memory::{

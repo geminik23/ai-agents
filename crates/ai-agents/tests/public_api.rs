@@ -126,6 +126,44 @@ fn autonomy_storage_api_is_additive_and_separates_results_from_envelopes() {
 }
 
 #[test]
+fn autonomy_evaluation_migration_exposes_bounded_host_primitives() {
+    use ai_agents::autonomy::{
+        AutonomyExtensions, ValidationCapabilities, ValidationCheck, ValidationConfig,
+        ValidationSchedule,
+    };
+    use ai_agents::{AutonomyProfile, CompletionGateEvaluator, GateOutcome};
+    let check = ValidationCheck {
+        id: "quality".into(),
+        adapter: "builtin.evidence".into(),
+        contract_version: Some(1),
+        required: Some(true),
+        schedule: Some(ValidationSchedule::Completion),
+        timeout_seconds: None,
+        max_evaluation_rounds: Some(2),
+        max_observations_per_round: Some(1),
+        config: Some(
+            "{\"assertion\":{\"path\":\"ready\",\"exists\":true}}"
+                .parse()
+                .unwrap(),
+        ),
+    };
+    let profile = AutonomyProfile {
+        validation: Some(ValidationConfig {
+            checks: Some(vec![check]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bound = AutonomyExtensions::builtins()
+        .freeze()
+        .bind(&profile, &ValidationCapabilities::default())
+        .unwrap();
+    assert_eq!(bound.checks.len(), 1);
+    assert_eq!(GateOutcome::Unknown.negate(), GateOutcome::Unknown);
+    assert!(CompletionGateEvaluator::default().redact);
+}
+
+#[test]
 fn facade_exposes_reviewed_v1_type_closure() {
     let mut templates = HashMap::new();
     templates.insert(

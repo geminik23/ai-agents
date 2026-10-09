@@ -648,6 +648,7 @@ impl TaskCheckpointPayload {
             if todos.binding.agent_id != envelope.key.agent_id
                 || todos.binding.run_id != envelope.key.run_id
                 || todos.binding.token.is_empty()
+                || todos.binding.objective_revision != self.objective_revision
             {
                 return Err(invalid());
             }
@@ -816,17 +817,31 @@ impl TaskCheckpointPayload {
         revision: u64,
         reconciled: bool,
     ) -> Result<()> {
+        self.validate_successor_with_control(previous, revision, reconciled, false)
+    }
+
+    /// Host control may revise only explicitly authorized objective/ceilings, while every effect and resource invariant remains protected.
+    pub(crate) fn validate_successor_with_control(
+        &self,
+        previous: &Self,
+        revision: u64,
+        reconciled: bool,
+        host_control: bool,
+    ) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
         if self.config_identity != previous.config_identity
             || self.profile != previous.profile
-            || self.limits != previous.limits
+            || (!host_control && self.limits != previous.limits)
             || serde_json::to_value(&self.settings)? != serde_json::to_value(&previous.settings)?
-            || self.clocks.expires_at != previous.clocks.expires_at
+            || (!host_control && self.clocks.expires_at != previous.clocks.expires_at)
             || self.clocks.active_millis < previous.clocks.active_millis
             || self.clocks.interrupted_interval_millis < previous.clocks.interrupted_interval_millis
             || self.progress.replans < previous.progress.replans
             || self.progress.observation_sequence < previous.progress.observation_sequence
             || self.objective_revision < previous.objective_revision
+            || (!host_control
+                && (self.objective_revision != previous.objective_revision
+                    || self.objective != previous.objective))
             || (self.objective != previous.objective
                 && self.objective_revision
                     != previous
@@ -948,10 +963,12 @@ impl TaskCheckpointPayload {
             }
         }
         if let Some(prior) = &previous.todos
-            && self
-                .todos
-                .as_ref()
-                .is_none_or(|next| next.binding != prior.binding)
+            && self.todos.as_ref().is_none_or(|next| {
+                next.binding != prior.binding
+                    && !(host_control
+                        && self.objective_revision != previous.objective_revision
+                        && next.items.is_empty())
+            })
         {
             return Err(invalid());
         }
