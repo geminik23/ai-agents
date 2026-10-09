@@ -107,6 +107,7 @@ mod tests {
 
     fn msg(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role,
             content: content.to_string(),
             name: None,

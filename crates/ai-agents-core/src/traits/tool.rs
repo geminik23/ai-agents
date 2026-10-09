@@ -98,6 +98,22 @@ pub trait Tool: Send + Sync {
         ToolCallClassification::from_metadata(&self.safety_metadata())
     }
 
+    /// Declares use of the coordinating task's canonical todo authority instead of a captured participant-local list.
+    fn manages_task_todos(&self) -> bool {
+        false
+    }
+
+    /// Computes an implementation-bound footprint from final approved arguments under executor resource protection.
+    /// None is unsupported even when call metadata claims read-only; enumeration must stop at max_targets.
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> Result<Option<crate::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
+
     /// Returns a [`ToolInfo`] struct from the above methods.
     fn info(&self) -> ToolInfo {
         ToolInfo {

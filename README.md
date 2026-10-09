@@ -43,7 +43,7 @@ ai-agents.rs 1.1 includes YAML and Rust agent construction, blocking and streami
 
 Redis storage is experimental and currently supports snapshots only. Noop storage does not persist data.
 
-Retrieval/RAG, generalized background scheduling, Python bindings, and the Generalized Autonomy Runner are planned but are not currently available.
+Retrieval/RAG, generalized background scheduling, Python bindings, and the complete Generalized Autonomy Runner remain unavailable. The development tree includes a restricted explicit Rust standalone task API; enabled YAML task execution and the full task contract are not available. These development APIs are not the published 1.1.1 release contract.
 
 See [Concepts](https://ai-agents.rs/docs/concepts/) for architecture details and [Providers](https://ai-agents.rs/docs/providers/) for per-provider setup.
 

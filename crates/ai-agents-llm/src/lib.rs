@@ -1,6 +1,10 @@
 //! LLM providers for AI Agents framework
 
 pub mod capability;
+mod managed;
+pub use managed::{
+    current_invocation_admission, managed_completion, managed_provider, scope_invocation_admission,
+};
 pub mod mock;
 pub mod multi;
 pub mod prompts;

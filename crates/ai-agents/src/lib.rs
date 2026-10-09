@@ -79,7 +79,7 @@
 //! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
 //! | `full` | All optional features enabled |
 
-/// Autonomy configuration and checkpoint types; task execution is not available until the runner is installed.
+/// Development autonomy primitives and restricted standalone execution; complete YAML task execution remains unavailable.
 pub mod autonomy {
     pub use ai_agents_runtime::autonomy::*;
 }
@@ -132,9 +132,9 @@ pub mod hooks {
 pub mod llm {
     pub use ai_agents_core::{
         ChatMessage, FinishReason, LLMCapability, LLMChunk, LLMConfig, LLMError, LLMFeature,
-        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, NativeCallBinding,
-        NativeProviderState, NativeProviderTarget, Role, TaskContext, TokenUsage, ToolChoice,
-        ToolSelection,
+        LLMProvider, LLMResponse, LLMToolDefinition, LLMToolRequest, MessageProvenance,
+        NativeCallBinding, NativeProviderState, NativeProviderTarget, Role, TaskContext,
+        TokenUsage, ToolChoice, ToolSelection,
     };
     pub use ai_agents_llm::LLMRegistry;
     pub use ai_agents_llm::multi::MultiLLMRouter;
@@ -575,7 +575,8 @@ pub use tools::{
 pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
 pub use llm::{
     ChatMessage, LLMProvider, LLMRegistry, LLMResponse, LLMToolDefinition, LLMToolRequest,
-    MultiLLMRouter, NativeCallBinding, NativeProviderState, NativeProviderTarget, Role, ToolChoice,
+    MessageProvenance, MultiLLMRouter, NativeCallBinding, NativeProviderState,
+    NativeProviderTarget, Role, ToolChoice,
 };
 pub use llm::{LLMRole, LLMSelectionSource, ResolvedRoleLLM, RouterRolesConfig, RouterSelector};
 

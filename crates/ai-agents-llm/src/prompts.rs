@@ -383,6 +383,7 @@ mod tests {
             available_tools: vec!["calculator".to_string()],
             memory_slots: std::collections::HashMap::new(),
             recent_messages: vec![ChatMessage {
+                provenance: None,
                 role: Role::User,
                 content: "What's 2 + 2?".to_string(),
                 name: None,

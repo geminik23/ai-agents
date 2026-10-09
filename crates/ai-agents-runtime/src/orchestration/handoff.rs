@@ -161,7 +161,7 @@ async fn evaluate_handoff(
 
     let response = with_observation_purpose(
         ObservationPurpose::OrchestrationRouting,
-        llm.complete(&messages, None),
+        ai_agents_llm::managed_completion(llm, &messages, None),
     )
     .await
     .map_err(|e| AgentError::LLM(format!("Handoff decision failed: {}", e)))?;

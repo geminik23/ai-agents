@@ -815,31 +815,26 @@ pub fn resolve_profile(
         }};
     }
     // A ceiling alone is not proof of a priced provider or trusted write footprint.
-    if enabled && let Some(cost) = &raw.max_cost_usd {
-        if host
+    // Prepared providers and final executor admission supply capability proof after numeric resolution.
+    if enabled
+        && let Some(cost) = &raw.max_cost_usd
+        && host
             .max_cost_usd
             .as_ref()
             .is_none_or(|ceiling| cost.micro_usd() > ceiling.micro_usd())
-        {
-            return Err(AgentError::InvalidSpec(
-                "priced cost exceeds or lacks a host ceiling".into(),
-            ));
-        }
+    {
         return Err(AgentError::InvalidSpec(
-            "priced cost needs a verified provider accounting binding before task admission".into(),
+            "priced cost exceeds or lacks a host ceiling".into(),
         ));
     }
-    if enabled && let Some(paths) = raw.max_declared_write_paths {
-        if host
+    if enabled
+        && let Some(paths) = raw.max_declared_write_paths
+        && host
             .max_declared_write_paths
             .is_none_or(|ceiling| paths > ceiling)
-        {
-            return Err(AgentError::InvalidSpec(
-                "declared write paths exceed or lack a host ceiling".into(),
-            ));
-        }
+    {
         return Err(AgentError::InvalidSpec(
-            "declared write paths need a verified footprint binding before task admission".into(),
+            "declared write paths exceed or lack a host ceiling".into(),
         ));
     }
     Ok(EffectiveAutonomyProfile {
@@ -1103,7 +1098,7 @@ states:
 
     // Numeric host ceilings are not evidence of priced or footprint enforcement.
     #[test]
-    fn unsupported_hard_caps_fail_closed_even_with_numeric_host_ceilings() {
+    fn hard_cap_resolution_requires_ceilings_but_does_not_mint_capabilities() {
         let mut config: AutonomyConfig =
             serde_yaml::from_str("enabled: true\ncompletion: {state: done}").unwrap();
         let host = AutonomyHostCeilings {
@@ -1112,7 +1107,7 @@ states:
             ..Default::default()
         };
         config.defaults.max_cost_usd = Some(UsdAmount::parse("2.00").unwrap());
-        let error = resolve_profile(
+        let resolved = resolve_profile(
             &config,
             AutonomyScope::Task,
             None,
@@ -1121,15 +1116,11 @@ states:
             Some("Task"),
             &host,
         )
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("verified provider accounting binding")
-        );
+        .unwrap();
+        assert_eq!(resolved.max_cost_usd.unwrap().micro_usd(), 2_000_000);
         config.defaults.max_cost_usd = None;
         config.defaults.max_declared_write_paths = Some(2);
-        let error = resolve_profile(
+        let resolved = resolve_profile(
             &config,
             AutonomyScope::Task,
             None,
@@ -1138,8 +1129,20 @@ states:
             Some("Task"),
             &host,
         )
-        .unwrap_err();
-        assert!(error.to_string().contains("verified footprint binding"));
+        .unwrap();
+        assert_eq!(resolved.max_declared_write_paths, Some(2));
+        assert!(
+            resolve_profile(
+                &config,
+                AutonomyScope::Task,
+                None,
+                None,
+                None,
+                Some("Task"),
+                &AutonomyHostCeilings::default()
+            )
+            .is_err()
+        );
     }
 
     // Inactive profiles must not block chat, while installed state overrides cannot bypass refusal.
@@ -1168,7 +1171,7 @@ states:
             .state_machine(machine)
             .build();
         assert!(
-            matches!(result, Err(AgentError::Config(message)) if message.contains("runner is installed"))
+            matches!(result, Err(AgentError::Config(message)) if message.contains("runner integration is installed"))
         );
     }
 
@@ -1255,7 +1258,7 @@ states:
             Ok(_) => panic!("enabled autonomy cannot silently use chat"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("runner is installed"));
+        assert!(error.contains("runner integration is installed"));
 
         let skill: SkillDefinition = serde_yaml::from_str("id: work\ndescription: Work\ntrigger: Work\nsteps: []\nautonomy: {enabled: true, mode: skill_until_complete, completion: {state: done}}\n").unwrap();
         let error = match AgentBuilder::new()
@@ -1267,7 +1270,7 @@ states:
             Ok(_) => panic!("programmatic skill autonomy cannot silently use chat"),
             Err(error) => error.to_string(),
         };
-        assert!(error.contains("runner is installed"));
+        assert!(error.contains("runner integration is installed"));
 
         let disabled = spec_with_autonomy(
             "name: Agent\nsystem_prompt: Helpful.\nautonomy: {enabled: false, completion: {state: done}}\n",
@@ -1305,7 +1308,7 @@ states:
             .llm(Arc::new(MockLLMProvider::new("test")))
             .build();
         assert!(
-            matches!(result, Err(AgentError::Config(message)) if message.contains("runner is installed"))
+            matches!(result, Err(AgentError::Config(message)) if message.contains("runner integration is installed"))
         );
         std::fs::write(
             &path,

@@ -180,6 +180,28 @@ impl LLMProvider for ObservedLLMProvider {
         }
     }
 
+    fn manages_invocation_admission(&self) -> bool {
+        self.inner.manages_invocation_admission()
+    }
+
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.inner.priced_capability_identity()
+    }
+    fn request_cost_bound(
+        &self,
+        request: &ai_agents_core::autonomy::ProviderRequest<'_>,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostBound>, LLMError> {
+        self.inner.request_cost_bound(request)
+    }
+    fn settle_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        response: &LLMResponse,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError>
+    {
+        self.inner.settle_request_cost(bound, response)
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
@@ -272,6 +294,19 @@ impl Tool for ObservedTool {
 
     fn classify_call(&self, args: &Value) -> ToolCallClassification {
         self.inner.classify_call(args)
+    }
+
+    fn manages_task_todos(&self) -> bool {
+        self.inner.manages_task_todos()
+    }
+
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.inner.declared_write_footprint(args, ctx, max_targets)
     }
 
     fn policy_bindings(&self) -> ToolPolicyBindings {

@@ -239,6 +239,7 @@ impl FactExtractor for LLMFactExtractor {
         let prompt = self.build_prompt(messages, existing_facts, categories);
 
         let extraction_messages = vec![ChatMessage {
+            provenance: None,
             role: Role::User,
             content: prompt,
             name: None,

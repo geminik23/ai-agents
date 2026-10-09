@@ -488,8 +488,9 @@ impl CliRepl {
                     }
                 };
                 match self.agent.remove_context(key) {
-                    Some(_) => println!("  Removed: {}", key),
-                    None => println!("  Key not found: {}", key),
+                    Ok(Some(_)) => println!("  Removed: {}", key),
+                    Ok(None) => println!("  Key not found: {}", key),
+                    Err(error) => eprintln!("  Context removal failed: {}", error),
                 }
             }
             Some(other) => {

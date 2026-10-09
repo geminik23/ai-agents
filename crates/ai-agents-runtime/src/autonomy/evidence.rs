@@ -168,7 +168,7 @@ impl EvaluationEvidence {
         let mut output = self.clone();
         output.tools = unique(&self.tools, |o| {
             super::canonical_identity(
-                &serde_json::json!({"key":o.identity.key,"objective":o.identity.objective_revision,"cycle":o.identity.cycle,"attempt":o.identity.attempt,"call":o.value.call_id}),
+                &serde_json::json!({"key":o.identity.key,"objective":o.identity.objective_revision,"cycle":o.identity.cycle,"attempt":o.identity.attempt,"call":o.value.call_id,"runtime":o.value.metadata.get("_task_runtime_id"),"child_operation":o.value.metadata.get("_task_child_operation")}),
             )
         })?;
         output.commands = unique(&self.commands, |o| {

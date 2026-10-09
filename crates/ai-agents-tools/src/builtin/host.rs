@@ -339,6 +339,19 @@ impl Tool for AskUserTool {
 
 #[async_trait]
 impl Tool for TodoTool {
+    fn manages_task_todos(&self) -> bool {
+        true
+    }
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.todo.memory.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "todo"
     }
@@ -386,28 +399,33 @@ impl Tool for TodoTool {
             Ok(input) => input,
             Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
         };
+        let store = match crate::current_task_todo_store() {
+            Ok(Some(store)) => store,
+            Ok(None) => self.store.clone(),
+            Err(error) => return ToolResult::error(error.to_string()),
+        };
         let (operation, updated) = match input.operation {
             TodoOperation::List => ("list", None),
             TodoOperation::Set => {
                 let items = input.items.into_iter().map(TodoItem::from).collect();
-                self.store.set(items);
+                if !store.try_set(items) {
+                    return ToolResult::error("todo list exceeds the run's max_open_todos");
+                }
                 ("set", None)
             }
             TodoOperation::Update => {
                 let Some(id) = input.id.as_deref() else {
                     return ToolResult::error("id is required for todo update");
                 };
-                let updated = self
-                    .store
-                    .update(id, input.content, input.active_form, input.status);
+                let updated = store.update(id, input.content, input.active_form, input.status);
                 ("update", Some(updated))
             }
             TodoOperation::Clear => {
-                self.store.clear();
+                store.clear();
                 ("clear", None)
             }
         };
-        let items = self.store.list();
+        let items = store.list();
         let output = TodoOutput {
             operation: operation.to_string(),
             count: items.len(),
@@ -420,6 +438,16 @@ impl Tool for TodoTool {
 
 #[async_trait]
 impl Tool for SleepTool {
+    fn declared_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.sleep.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "sleep"
     }

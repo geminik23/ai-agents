@@ -3,11 +3,14 @@
 ## Unreleased
 
 ### Added
-- Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; autonomous execution remains unavailable
-- Task validation: development-only tri-state completion, versioned host adapters, resumable observations, progress and bounded replanning on existing execution boundaries; the autonomous runner remains unavailable
+- Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
+- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; suspended/restart execution remains unfinished
+- Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; full autonomous execution remains unavailable
+- Task validation: development-only tri-state completion, versioned host adapters, resumable observations, progress and bounded replanning on existing execution boundaries; full runner integration remains unavailable
 
 ### Changed
-- Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled task execution remains unavailable until the runner is installed
+- Rust task compatibility: message literals include optional provenance, actor/context mutation APIs report ownership errors, and additive provider billing, tool footprint and task-todo methods declare capabilities; existing serialized messages remain readable
+- Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
 - Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn

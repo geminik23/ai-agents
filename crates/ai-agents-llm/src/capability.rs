@@ -55,6 +55,7 @@ impl LLMCapability for DefaultLLMCapability {
             .build();
 
         let messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::User,
             content: prompt,
@@ -96,6 +97,7 @@ impl LLMCapability for DefaultLLMCapability {
         let prompt = ToolArgsPromptBuilder::new(tool_id, schema.clone(), user_input).build();
 
         let messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::User,
             content: prompt,
@@ -116,6 +118,7 @@ impl LLMCapability for DefaultLLMCapability {
             .build();
 
         let messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::User,
             content: prompt,
@@ -147,6 +150,7 @@ impl LLMCapability for DefaultLLMCapability {
         let prompt = ClassificationPromptBuilder::new(input, categories.to_vec()).build();
 
         let messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::User,
             content: prompt,
@@ -178,6 +182,7 @@ impl LLMCapability for DefaultLLMCapability {
         let prompt = TaskProcessingPromptBuilder::new(system_prompt, context.clone()).build();
 
         let mut messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::System,
             content: prompt,
@@ -359,6 +364,7 @@ mod tests {
             available_tools: vec!["calculator".to_string()],
             memory_slots: HashMap::new(),
             recent_messages: vec![ChatMessage {
+                provenance: None,
                 timestamp: None,
                 role: Role::User,
                 content: "What's 2 + 2?".to_string(),

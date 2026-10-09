@@ -14,6 +14,9 @@ const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state
 const MAX_TOOL_FALLBACK_HOPS: usize = 16;
 
 #[cfg(test)]
+#[path = "autonomy/boundary_tests.rs"]
+mod autonomy_boundary_tests;
+#[cfg(test)]
 #[path = "routing_tests.rs"]
 mod routing_tests;
 
@@ -56,7 +59,12 @@ pub(crate) type ToolResourceLocks = Arc<RwLock<HashMap<String, Weak<tokio::sync:
 struct ToolResourceGuards {
     guards: Vec<tokio::sync::OwnedMutexGuard<()>>,
     locks: ToolResourceLocks,
+    task_owner: Option<Arc<crate::autonomy::RunOwner>>,
+    retain_on_drop: bool,
+    effect_custody: Arc<AtomicBool>,
 }
+
+tokio::task_local! { static TOOL_EFFECT_CUSTODY: Arc<AtomicBool>; }
 
 //
 // Couples one acquired root-turn gate with the immutable ancestry owner that must remain active through hooks, orchestration, and stream polling.
@@ -80,7 +88,21 @@ struct RuntimeSessionRestorePoint {
 }
 
 impl Drop for ToolResourceGuards {
+    // Once a task invocation may have started, drop/error cannot assert that its host effects stopped.
     fn drop(&mut self) {
+        if (self.retain_on_drop || self.effect_custody.load(Ordering::SeqCst))
+            && let Some(owner) = self.task_owner.take()
+        {
+            let retained = Self {
+                guards: std::mem::take(&mut self.guards),
+                locks: self.locks.clone(),
+                task_owner: None,
+                retain_on_drop: false,
+                effect_custody: Arc::new(AtomicBool::new(false)),
+            };
+            owner.retain_effect_guard(retained);
+            return;
+        }
         self.guards.clear();
         self.locks.write().retain(|_, lock| lock.strong_count() > 0);
     }
@@ -705,6 +727,10 @@ pub struct RuntimeAgent {
     runtime_control: Arc<RuntimeControlState>,
     /// Serializes independent externally initiated root turns across blocking and streaming APIs.
     root_turn_gate: RootTurnGate,
+    /// A foreground run retains this reservation between turns and after abandoned work.
+    autonomy_owner: crate::autonomy::RunOwnerSlot,
+    /// Session mutations and direct host operations exclude run reservation without changing ordinary root reentry.
+    autonomy_mutations: tokio::sync::RwLock<()>,
     autonomy_extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
 }
 
@@ -880,6 +906,11 @@ impl RuntimeAgent {
         llm_registry
             .validate_router_roles()
             .map_err(|error| AgentError::Config(error.to_string()))?;
+        let root_turn_gate = Arc::new(tokio::sync::Mutex::new(()));
+        let memory: Arc<dyn Memory> = Arc::new(crate::autonomy::TaskMemory::new(
+            memory,
+            root_turn_gate.clone(),
+        ));
         let (skill_router, skill_executor) = if !skills.is_empty() {
             let router_llm = match llm_registry
                 .resolve_role_override(ai_agents_llm::LLMRole::SkillsSelection, None)
@@ -960,7 +991,9 @@ impl RuntimeAgent {
             background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
             resource_locks: new_tool_resource_locks(),
             runtime_control: Arc::new(RuntimeControlState::default()),
-            root_turn_gate: Arc::new(tokio::sync::Mutex::new(())),
+            root_turn_gate,
+            autonomy_owner: Arc::new(RwLock::new(None)),
+            autonomy_mutations: tokio::sync::RwLock::new(()),
             autonomy_extensions: crate::autonomy::AutonomyExtensions::builtins().freeze(),
         })
     }
@@ -1131,7 +1164,16 @@ impl RuntimeAgent {
         current_turn_actor_context()
     }
 
+    // An admitted task retains one actor/storage scope even if context resolution updates session defaults.
     fn effective_actor_id(&self) -> Option<String> {
+        if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate) {
+            return input.owner.actor_id.clone();
+        }
+        if let Some(execution) = crate::autonomy::current_execution()
+            && Arc::ptr_eq(&execution.owner.gate, &self.root_turn_gate)
+        {
+            return execution.owner.actor_id.clone();
+        }
         self.current_turn_actor_context()
             .and_then(|ctx| ctx.effective_actor_id().map(|id| id.to_string()))
             .or_else(|| self.actor_id.read().clone())
@@ -1228,6 +1270,19 @@ impl RuntimeAgent {
         actor_context: crate::TurnActorContext,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some(execution) = crate::autonomy::current_execution()
+                && !current_runtime_gate_identity_stack()
+                    .iter()
+                    .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+            {
+                let result = self
+                    .run_task_participant(input, Some(actor_context), execution.clone())
+                    .await;
+                if result.is_err() && crate::autonomy::child_required() {
+                    execution.stop("required_child_failure");
+                }
+                return result;
+            }
             let RootTurnAdmission {
                 guard,
                 identity_stack,
@@ -1257,6 +1312,13 @@ impl RuntimeAgent {
 
     /// Rejects recursive ownership before waiting, then acquires the external root-turn gate and builds one immutable extended ancestry snapshot.
     async fn acquire_root_turn(&self) -> Result<RootTurnAdmission> {
+        self.check_autonomy_access()?;
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.stop("unsupported_child_participation");
+            return Err(AgentError::Config(
+                "autonomy child participation is not installed".into(),
+            ));
+        }
         let gate_identity = Arc::clone(&self.root_turn_gate);
         let current_identity_stack = current_runtime_gate_identity_stack();
         if current_identity_stack
@@ -1269,6 +1331,7 @@ impl RuntimeAgent {
             )));
         }
         let guard = Arc::clone(&gate_identity).lock_owned().await;
+        self.check_autonomy_access()?;
         //
         // Root admission is the only place that extends ancestry, so later scopes can preserve the complete chain with an `Arc` clone.
         //
@@ -1279,6 +1342,353 @@ impl RuntimeAgent {
             guard,
             identity_stack: identity_stack.into(),
         })
+    }
+
+    // Direct operations must carry the private runtime-qualified owner, not a request source label.
+    fn check_autonomy_operation(&self) -> Result<()> {
+        if let Some(owner) = self.autonomy_owner.read().as_ref() {
+            let permitted = crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .is_some_and(|input| Arc::ptr_eq(&input.owner, owner))
+                || crate::autonomy::current_execution().is_some_and(|execution| {
+                    Arc::ptr_eq(&execution.owner, owner) || execution.participants.owns(owner)
+                });
+            if !permitted {
+                return Err(AgentError::Other(
+                    "runtime is reserved by an autonomy run".into(),
+                ));
+            }
+            owner.check()?;
+            if crate::autonomy::current_execution()
+                .is_some_and(|execution| execution.stop_reason().is_some())
+            {
+                return Err(AgentError::Other("autonomy execution has stopped".into()));
+            }
+        } else if crate::autonomy::current_execution().is_some() {
+            return Err(AgentError::Config(
+                "autonomy child participation is not installed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // External entry cannot use a run ID or task label to enter a reserved runtime.
+    fn check_autonomy_access(&self) -> Result<()> {
+        if let Some(owner) = self.autonomy_owner.read().as_ref() {
+            return Err(AgentError::Other(format!(
+                "RuntimeAgent '{}' is busy with autonomy run '{}'",
+                self.info.id, owner.run_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Checks prepared consumer capabilities before standalone or inherited child work begins.
+    pub(crate) fn preflight_standalone_autonomy(&self) -> Result<()> {
+        if self.disambiguation_manager.is_some() {
+            return Err(AgentError::Config(
+                "task disambiguation continuation is not installed".into(),
+            ));
+        }
+        if self.llm_registry.aliases().iter().any(|alias| {
+            self.llm_registry
+                .get(alias)
+                .is_ok_and(|provider| !provider.manages_invocation_admission())
+        }) {
+            return Err(AgentError::Config(
+                "frozen provider lacks task admission capability".into(),
+            ));
+        }
+        if !self.memory.supports_task_admission() {
+            return Err(AgentError::Config(
+                "memory lacks provenance/admission capability".into(),
+            ));
+        }
+        if self.actor_memory_config.is_some()
+            || self.facts_config.is_some()
+            || self.relationship_manager.is_some()
+        {
+            return Err(AgentError::Config(
+                "autonomy actor maintenance admission is not installed".into(),
+            ));
+        }
+
+        if self.runtime_config.optimization.enabled {
+            return Err(AgentError::Config(
+                "autonomy speculative settlement is not installed".into(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Runs a child under its own gate and reservation, while all providers/tools use the inherited run ledger.
+    /// The child outcome is checkpointed before aggregation can observe it; drop or failed acknowledgement retains recovery protection.
+    fn run_task_participant<'a>(
+        &'a self,
+        input: &'a str,
+        actor: Option<crate::TurnActorContext>,
+        execution: Arc<crate::autonomy::RunExecution>,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            self.preflight_standalone_autonomy()?;
+            self.preflight_priced_autonomy(
+                ai_agents_core::autonomy::InvocationAdmission::requires_priced_llm(
+                    execution.as_ref(),
+                ),
+            )?;
+            if let Some((store, _)) = execution.task_todos()
+                && self
+                    .validation_capabilities()
+                    .tools
+                    .iter()
+                    .any(|id| id == "todo")
+                && self
+                    .tools
+                    .get("todo")
+                    .is_some_and(|tool| !tool.manages_task_todos())
+                && !self.todo_store().shares_store(&store)
+            {
+                return Err(AgentError::Config(
+                    "child todo implementation does not share the canonical task authority".into(),
+                ));
+            }
+            let ancestry = current_runtime_gate_identity_stack();
+            if ancestry
+                .iter()
+                .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+            {
+                return Err(AgentError::Other("reentrant task participant".into()));
+            }
+            let lock = self.root_turn_gate.clone().lock_owned();
+            let guard = tokio::time::timeout(execution.remaining_duration(), async {
+                tokio::pin!(lock);
+                loop {
+                    tokio::select! { guard = &mut lock => return Ok(guard), _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) { return Err(AgentError::Other("child root admission cancelled".into())); }
+                    } }
+                }
+            }).await.map_err(|_| AgentError::Other("child root admission deadline exceeded".into()))??;
+            let _mutations = self.autonomy_mutations.try_write().map_err(|_| {
+                AgentError::Other("child runtime has an active host operation".into())
+            })?;
+            let owner = if let Some(owner) = execution.participants.owner_for(&self.root_turn_gate)
+            {
+                if self
+                    .autonomy_owner
+                    .read()
+                    .as_ref()
+                    .is_none_or(|current| !Arc::ptr_eq(current, &owner))
+                {
+                    return Err(AgentError::Other("child runtime owner changed".into()));
+                }
+                owner.check()?;
+                if actor
+                    .as_ref()
+                    .and_then(|context| context.effective_actor_id())
+                    .is_some_and(|actor| owner.actor_id.as_deref() != Some(actor))
+                {
+                    return Err(AgentError::Other(
+                        "child actor scope differs from its admitted binding".into(),
+                    ));
+                }
+                owner
+            } else {
+                self.check_autonomy_access()?;
+                crate::autonomy::RunOwner::new(
+                    execution.run_id.clone(),
+                    self.root_turn_gate.clone(),
+                    actor
+                        .as_ref()
+                        .and_then(|context| context.effective_actor_id().map(str::to_string))
+                        .or_else(|| self.effective_actor_id()),
+                )?
+            };
+            // Box ledger futures before nesting runtime polling; checkpoints contain large exact continuation DTOs.
+            let mut lease =
+                Box::pin(execution.enroll_child(owner.clone(), self.autonomy_owner.clone()))
+                    .await?;
+            drop(_mutations);
+            let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(owner.clone());
+            let operation = execution.next_child_operation(&self.info.id);
+            let mut identities = ancestry.to_vec();
+            identities.push(self.root_turn_gate.clone());
+            let identities: RootTurnGateIdentityStack = identities.into();
+            let turn = crate::autonomy::AutonomyTurnInput {
+                owner,
+                objective: input.into(),
+                controller_message:
+                    serde_json::json!({"delegated_objective":input,"operation":operation})
+                        .to_string(),
+                source: crate::autonomy::AutonomyTurnSource::ChildObjective,
+            };
+            let result = scope_runtime_gate_identity_stack(
+                &identities,
+                crate::autonomy::scope_turn(
+                    turn,
+                    Box::pin(async {
+                        self.init_storage().await?;
+                        if let Some(cached) = execution
+                            .cached_child(&operation, input, &self.info.id)
+                            .await?
+                        {
+                            return Ok(cached);
+                        }
+                        let initial = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
+                            self.save_state_full().await?,
+                        )?;
+                        Box::pin(execution.checkpoint_child(&operation, initial, input, None))
+                            .await?;
+
+                        let outcome = crate::autonomy::scope_child_operation(
+                            operation.clone(),
+                            crate::autonomy::scope_child_requirement(
+                                crate::autonomy::child_required(),
+                                async {
+                                    if let Some(actor) = actor {
+                                        scope_actor_context(actor, Box::pin(self.run_loop(input)))
+                                            .await
+                                    } else {
+                                        Box::pin(self.run_loop(input)).await
+                                    }
+                                },
+                            ),
+                        )
+                        .await;
+                        self.export_observability_if_configured().await;
+                        let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
+                            self.save_state_full().await?,
+                        )?;
+                        Box::pin(execution.checkpoint_child(
+                            &operation,
+                            runtime,
+                            input,
+                            Some(&outcome),
+                        ))
+                        .await?;
+                        Ok::<_, AgentError>(outcome)
+                    }),
+                ),
+            )
+            .await;
+            match result {
+                Ok(outcome) => {
+                    lease.acknowledge();
+                    cleanup.finish();
+                    drop(guard);
+                    outcome
+                }
+                Err(error) => Err(error),
+            }
+        })
+    }
+
+    /// Renders one accepted objective from immutable invocation data before the run owns or mutates the runtime.
+    pub(crate) fn render_autonomy_objective(&self, template: &str, input: &str) -> Result<String> {
+        let mut environment = minijinja::Environment::new();
+        environment.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        environment.render_str(template, serde_json::json!({"input":input,"objective":input,"context":self.context_manager.get_all(),"state":self.current_state()})).map_err(|error| AgentError::TemplateError(error.to_string()))
+    }
+
+    /// Checks frozen provider participants before creating a hard-priced run; each actual request still needs a bound.
+    pub(crate) fn preflight_priced_autonomy(&self, priced: bool) -> Result<()> {
+        if priced
+            && self.llm_registry.aliases().iter().any(|alias| {
+                self.llm_registry
+                    .get(alias)
+                    .is_ok_and(|provider| provider.priced_capability_identity().is_none())
+            })
+        {
+            return Err(AgentError::Config(
+                "priced cost needs a verified provider accounting binding before task admission"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reserves a runtime under the root gate; subsequent turns use the private capability, not public chat.
+    pub(crate) async fn reserve_autonomy_run(
+        &self,
+        run_id: String,
+    ) -> Result<Arc<crate::autonomy::RunOwner>> {
+        let admission = self.acquire_root_turn().await?;
+        scope_runtime_gate_identity_stack(&admission.identity_stack, self.init_storage()).await?;
+        self.flush_background_tasks().await?;
+        // Never wait for mutations while holding the root gate: their hooks may need that same gate.
+        let _mutations = self
+            .autonomy_mutations
+            .try_write()
+            .map_err(|_| AgentError::Other("runtime has an active host operation".into()))?;
+        let owner = crate::autonomy::RunOwner::new(
+            run_id,
+            self.root_turn_gate.clone(),
+            self.effective_actor_id(),
+        )?;
+        *self.autonomy_owner.write() = Some(owner.clone());
+        drop(admission);
+        Ok(owner)
+    }
+
+    /// Releases only the exact owner after its controller has acknowledged settlement or recovery.
+    pub(crate) async fn release_autonomy_run(
+        &self,
+        owner: &Arc<crate::autonomy::RunOwner>,
+    ) -> Result<()> {
+        let _gate = self.root_turn_gate.lock().await;
+        let mut current = self.autonomy_owner.write();
+        if current
+            .as_ref()
+            .is_none_or(|active| !Arc::ptr_eq(active, owner))
+        {
+            return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
+        }
+        *current = None;
+        Ok(())
+    }
+
+    /// Executes an admitted controller turn while retaining native history, redispatch ownership and one finalizer.
+    pub(crate) async fn run_autonomy_turn(
+        &self,
+        input: crate::autonomy::AutonomyTurnInput,
+    ) -> Result<AgentResponse> {
+        let active = self.autonomy_owner.read().clone();
+        if active
+            .as_ref()
+            .is_none_or(|owner| !Arc::ptr_eq(owner, &input.owner))
+        {
+            return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
+        }
+        input.owner.check()?;
+        let stack = current_runtime_gate_identity_stack();
+        if stack
+            .iter()
+            .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+        {
+            return Err(AgentError::Other("reentrant autonomy turn".into()));
+        }
+        let guard = self.root_turn_gate.clone().lock_owned().await;
+        if self
+            .autonomy_owner
+            .read()
+            .as_ref()
+            .is_none_or(|owner| !Arc::ptr_eq(owner, &input.owner))
+        {
+            return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
+        }
+        input.owner.check()?;
+        let mut identities = stack.to_vec();
+        identities.push(self.root_turn_gate.clone());
+        let identities: RootTurnGateIdentityStack = identities.into();
+        let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(input.owner.clone());
+        let objective = input.objective.clone();
+        let result = scope_runtime_gate_identity_stack(
+            &identities,
+            crate::autonomy::scope_turn(input, Box::pin(self.run_loop(&objective))),
+        )
+        .await;
+        cleanup.finish();
+        drop(guard);
+        result
     }
 
     /// Run one serialized turn with turn-scoped actor context without mutating the runtime's global actor ID.
@@ -1409,6 +1819,11 @@ impl RuntimeAgent {
 
     /// Set the current actor ID (player, user, another agent, etc.).
     pub fn set_actor_id(&self, actor_id: &str) -> ai_agents_core::Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         *self.actor_id.write() = Some(actor_id.to_string());
         {
             let mut meta = self.session_metadata.write();
@@ -1420,10 +1835,16 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Clear the current actor binding while retaining the session actor roster.
-    pub fn clear_actor_id(&self) {
+    /// Clears the actor binding only outside unrelated task ownership, retaining the session actor roster.
+    pub fn clear_actor_id(&self) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         *self.actor_id.write() = None;
         self.session_metadata.write().actor_id = None;
+        Ok(())
     }
 
     /// Set the current actor ID. Convenience wrapper around set_actor_id.
@@ -1473,11 +1894,20 @@ impl RuntimeAgent {
         self.record_session_actor_if_needed();
         self.maybe_load_actor_memory().await;
         self.maybe_load_actor_relationship().await;
-        *self.messages_since_extraction.write() += 1;
+        if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            *self.messages_since_extraction.write() += 1;
+        }
     }
 
     /// Post-turn lifecycle shared by streaming and non-streaming paths.
     async fn post_turn_session_lifecycle(&self) -> Result<()> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            return Ok(());
+        }
         if *self.redispatch_depth.read() > 0 {
             return Ok(());
         }
@@ -1535,8 +1965,13 @@ impl RuntimeAgent {
         }
     }
 
-    /// Writes the processed user message once for the root turn.
+    /// Commits one root objective or provenance-tagged delegated input; controller continuation and redispatch do not duplicate it.
     async fn commit_root_user_message(&self, processed_input: &str) -> Result<()> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| !input.initial_work())
+        {
+            return Ok(());
+        }
         if *self.redispatch_depth.read() > 0 {
             return Ok(());
         }
@@ -1637,8 +2072,13 @@ impl RuntimeAgent {
         }
     }
 
-    /// Runs post-turn facts and relationship maintenance according to runtime policy.
+    /// Runs post-turn facts and relationships only for conversational input, never controller-only turns.
     async fn run_post_turn_maintenance(&self) -> Result<()> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            return Ok(());
+        }
         let optimization = &self.runtime_config.optimization;
         if !optimization.enabled {
             self.auto_extract_facts().await;
@@ -1687,6 +2127,7 @@ impl RuntimeAgent {
         Ok(())
     }
 
+    // Schedules actor facts from a provenance-filtered snapshot, never controller-derived history.
     async fn schedule_facts_background(&self) -> Result<()> {
         let policy = self.runtime_config.optimization.post_turn.facts.clone();
         let should_extract = self
@@ -1720,7 +2161,7 @@ impl RuntimeAgent {
                 return Ok(());
             }
         };
-        let messages = Self::readable_native_messages(messages)?;
+        let messages = Self::actor_memory_messages(messages)?;
         let recent: Vec<_> = messages
             .iter()
             .rev()
@@ -1796,6 +2237,7 @@ impl RuntimeAgent {
             .await
     }
 
+    // Schedules relationship maintenance from actor-visible history without changing provider replay history.
     async fn schedule_relationship_background(&self) -> Result<()> {
         let policy = self
             .runtime_config
@@ -1823,7 +2265,7 @@ impl RuntimeAgent {
                 return Ok(());
             }
         };
-        let messages = Self::readable_native_messages(messages)?;
+        let messages = Self::actor_memory_messages(messages)?;
         let storage = self.storage.read().clone();
         let hooks = Arc::clone(&self.hooks);
         let agent_id = self.info.id.clone();
@@ -2055,6 +2497,7 @@ impl RuntimeAgent {
         self.extract_facts_with_source(last_n, "manual").await
     }
 
+    // Extracts only actor-visible messages while retaining exact task/native history in the backing memory.
     async fn extract_facts_with_source(
         &self,
         last_n: usize,
@@ -2065,7 +2508,7 @@ impl RuntimeAgent {
             None => return Ok(vec![]),
         };
 
-        let messages = Self::readable_native_messages(self.memory.get_messages(None).await?)?;
+        let messages = Self::actor_memory_messages(self.memory.get_messages(None).await?)?;
         let recent: Vec<_> = messages.iter().rev().take(last_n).rev().cloned().collect();
 
         if recent.is_empty() {
@@ -2408,6 +2851,7 @@ impl RuntimeAgent {
         Ok(())
     }
 
+    // Updates relationships from conversational evidence only; task-derived output is not actor evidence.
     async fn auto_update_relationship(&self) {
         let Some(manager) = self.relationship_manager.as_ref() else {
             return;
@@ -2428,7 +2872,7 @@ impl RuntimeAgent {
                 return;
             }
         };
-        let messages = match Self::readable_native_messages(messages) {
+        let messages = match Self::actor_memory_messages(messages) {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(actor = %actor_id, error = %error, "failed to project native history for relationship update");
@@ -2873,28 +3317,55 @@ impl RuntimeAgent {
         self.message_filters.write().insert(name.into(), filter);
     }
 
+    /// Updates host context only under compatible run ownership; raw host handles remain trusted integrations.
     pub fn set_context(&self, key: &str, value: Value) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         self.context_manager.update(key, value)
     }
 
+    /// Context updates use the same reservation exclusion as set_context, including between child turns.
     pub fn update_context(&self, path: &str, value: Value) -> Result<()> {
-        self.context_manager.update(path, value)
+        self.set_context(path, value)
     }
 
     pub fn get_context(&self) -> HashMap<String, Value> {
         self.build_context_with_overlays()
     }
 
-    pub fn remove_context(&self, key: &str) -> Option<Value> {
-        self.context_manager.remove(key)
+    /// Reports ownership denial rather than disguising a reserved-runtime mutation as a missing key.
+    pub fn remove_context(&self, key: &str) -> Result<Option<Value>> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        Ok(self.context_manager.remove(key))
     }
 
+    /// Holds mutation admission through provider refresh so reservation cannot begin while host context is changing.
     pub async fn refresh_context(&self, key: &str) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_operation()?;
         self.context_manager.refresh(key).await
     }
 
-    pub fn register_context_provider(&self, name: &str, provider: Arc<dyn ContextProvider>) {
+    /// Provider replacement is a context mutation and cannot change a reserved participant's backing authority.
+    pub fn register_context_provider(
+        &self,
+        name: &str,
+        provider: Arc<dyn ContextProvider>,
+    ) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
         self.context_manager.register_provider(name, provider);
+        Ok(())
     }
 
     pub fn current_state(&self) -> Option<String> {
@@ -2965,6 +3436,8 @@ impl RuntimeAgent {
 
     /// Applies a manual transition after reserving its exit actions and keeping async lifecycle work outside the commit lock.
     pub async fn transition_to(&self, state: &str) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_operation()?;
         let Some(ref sm) = self.state_machine else {
             return Ok(());
         };
@@ -3179,8 +3652,11 @@ impl RuntimeAgent {
         Ok(snapshot)
     }
 
-    /// Restores persisted state after invalidating any pending confirmation ownership.
+    /// Restores ordinary session state only outside a foreground task; it is not task continuation resume.
     pub async fn restore_state(&self, snapshot: AgentSnapshot) -> Result<()> {
+        self.check_autonomy_access()?;
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         let _admission = self.disambiguation_admission.write().await;
         if self.state_transition_reserved.load(Ordering::SeqCst) {
             return Err(AgentError::Other(
@@ -3251,43 +3727,52 @@ impl RuntimeAgent {
         })
     }
 
+    // Protects this complete restore component, including actor/session identity after memory restoration.
     async fn apply_session_restore_unchecked(
         &self,
         session_id: &str,
         stored: StoredSessionRestore,
     ) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         self.restore_state(stored.snapshot).await?;
         let metadata = stored.metadata.unwrap_or_default();
         if let Some(actor_id) = metadata.actor_id.as_deref() {
             self.set_actor_id(actor_id)?;
         } else {
-            self.clear_actor_id();
+            self.clear_actor_id()?;
         }
         self.set_session_metadata(metadata);
         *self.current_session_id.write() = Some(session_id.to_string());
         Ok(())
     }
 
+    // Rollback uses the same reservation exclusion as forward restoration across all identity updates.
     async fn restore_session_restore_point(
         &self,
         restore_point: &RuntimeSessionRestorePoint,
     ) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         self.restore_state(restore_point.snapshot.clone()).await?;
         if let Some(actor_id) = restore_point.actor_id.as_deref() {
             self.set_actor_id(actor_id)?;
         } else {
-            self.clear_actor_id();
+            self.clear_actor_id()?;
         }
         self.set_session_metadata(restore_point.metadata.clone());
         *self.current_session_id.write() = restore_point.session_id.clone();
         Ok(())
     }
 
+    // A foreground task cannot reserve a partially applied session or prevent its rollback.
     async fn apply_session_restore(
         &self,
         session_id: &str,
         stored: StoredSessionRestore,
     ) -> Result<()> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         let before = self.capture_session_restore_point().await?;
         if let Err(error) = self
             .apply_session_restore_unchecked(session_id, stored)
@@ -4228,6 +4713,7 @@ impl RuntimeAgent {
             .await
     }
 
+    // Ephemeral controller instructions enter only provider messages, never the stored user or actor history.
     async fn build_messages_internal(
         &self,
         fire_persona_hooks: bool,
@@ -4248,6 +4734,14 @@ impl RuntimeAgent {
         messages.extend(history);
         if let Some(user_message) = ephemeral_user_message {
             messages.push(ChatMessage::user(user_message));
+        }
+        if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            && !input.controller_message.is_empty()
+        {
+            messages.push(ChatMessage::system(format!(
+                "Autonomy controller instruction (not a user statement):\n{}",
+                input.controller_message
+            )));
         }
 
         let total_tokens = self.estimate_total_tokens(&messages);
@@ -4880,7 +5374,13 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    // Removes opaque replay state before messages enter auxiliary semantic systems while leaving stored history untouched.
+    // Actor extraction excludes task-derived messages after restore, while semantic runtime subsystems retain task history.
+    fn actor_memory_messages(mut messages: Vec<ChatMessage>) -> Result<Vec<ChatMessage>> {
+        messages.retain(|message| message.provenance.is_none());
+        Self::readable_native_messages(messages)
+    }
+
+    // Removes opaque replay state before auxiliary semantic systems consume otherwise complete task/conversation history.
     fn readable_native_messages(mut messages: Vec<ChatMessage>) -> Result<Vec<ChatMessage>> {
         for message in &mut messages {
             if matches!(
@@ -5142,8 +5642,14 @@ impl RuntimeAgent {
         }
     }
 
-    /// Sends a finalized tool record to hooks, history, and error handling.
+    /// Acknowledges task evidence before hooks; persistence failure stops later admission and cannot establish completion.
     async fn finish_tool_record(&self, record: &ToolExecutionRecord) {
+        if let Some(execution) = crate::autonomy::current_execution()
+            && let Err(error) = Box::pin(execution.capture_tool_record(record, &self.info.id)).await
+        {
+            execution.stop("evidence_storage_failure");
+            warn!(error = %error, "task execution evidence was not acknowledged");
+        }
         let result = ToolResult {
             success: record.success,
             output: record.model_output_string(),
@@ -5165,7 +5671,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Releases resource locks before hooks run because hooks may invoke another tool.
+    /// Releases settled locks before hooks; unknown task effects retain protection under the reserved owner.
     async fn finish_tool_record_after_resource_guards(
         &self,
         resource_guards: ToolResourceGuards,
@@ -5226,7 +5732,7 @@ impl RuntimeAgent {
         Ok((limits, timeout))
     }
 
-    /// Invokes a resolved tool once with one fresh attempt deadline, timeout, cancellation, and actor context.
+    /// Reserves each actual task attempt after final policy admission, then settles it before publishing execution evidence.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
@@ -5243,42 +5749,117 @@ impl RuntimeAgent {
             ));
         }
         //
-        // The tool observes the same checked timeout enforced below, starting immediately before this invocation attempt.
-        // Each retry receives a new deadline rather than inheriting time spent in policy handling or earlier attempts.
+        // Acknowledgement may await storage, so cancellation and generations are checked again before the first tool poll.
         //
-        ctx.deadline = Some(
-            chrono::Utc::now()
-                .checked_add_signed(timeout.deadline_delta)
-                .ok_or_else(|| {
-                    AgentError::Config(
-                        "effective tool timeout_ms exceeds the current UTC deadline range"
-                            .to_string(),
-                    )
-                })?,
-        );
+        let state_generation = self.state_machine.as_ref().map(|state| state.generation());
         //
         // Mark invocation inside the future so cancellation before the first poll remains executed false.
         //
         let invoked = Arc::new(AtomicBool::new(false));
         let invoked_by_future = Arc::clone(&invoked);
         let actor_context = current_turn_actor_context();
-        let future = async move {
+        let effect_custody = TOOL_EFFECT_CUSTODY.try_with(Arc::clone).ok();
+        let custody_for_future = effect_custody.clone();
+        let execution = crate::autonomy::current_execution();
+        if let Some(execution) = &execution {
+            ctx.cancellation = ctx.cancellation.with_secondary(
+                execution.cancellation.clone(),
+                Some("task cancellation".into()),
+            );
+        }
+        let mut admitted_footprint = None;
+        let attempt = if let Some(execution) = &execution {
+            let (id, footprint) =
+                Box::pin(execution.admit_tool(tool.as_ref(), &args, &ctx)).await?;
+            admitted_footprint = footprint;
+            Some(id)
+        } else {
+            None
+        };
+        let timer_duration = execution.as_ref().map_or(timeout.timer, |run| {
+            timeout.timer.min(run.remaining_duration())
+        });
+        let deadline_delta = if timer_duration == timeout.timer {
+            timeout.deadline_delta
+        } else {
+            chrono::Duration::from_std(timer_duration)
+                .map_err(|_| AgentError::Config("tool deadline overflow".into()))?
+        };
+        ctx.deadline = Some(
+            chrono::Utc::now()
+                .checked_add_signed(deadline_delta)
+                .ok_or_else(|| AgentError::Config("tool deadline overflow".into()))?,
+        );
+        // Revalidate with the exact final context, including deadline, that the implementation will receive.
+        // Storage admission can wait; changed entry targets must not reuse the previously reserved union.
+        let footprint_changed = if let Some(footprint) = &admitted_footprint {
+            let limit = tool.declared_write_footprint(&args, &ctx, footprint.targets.len().max(1));
+            match limit {
+                Ok(Some(current)) => &current != footprint,
+                _ => true,
+            }
+        } else {
+            false
+        };
+        if footprint_changed
+            || execution.as_ref().is_some_and(|run| {
+                !run.progress_allows(&args, &ctx)
+                    || !run.allows_tool(&ctx.canonical_id)
+                    || self.tools.version() != ctx.registry_version
+            })
+            || self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+            || execution
+                .as_ref()
+                .is_some_and(|run| run.stop_reason().is_some())
+            || self.runtime_control.version.load(Ordering::SeqCst) != ctx.runtime_control_version
+            || self
+                .runtime_safety_snapshot()
+                .tool_security
+                .policy_version()
+                != ctx.policy_version
+            || self.state_machine.as_ref().map(|state| state.generation()) != state_generation
+        {
+            if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                Box::pin(execution.settle(attempt, serde_json::json!({"not_invoked":true}), false))
+                    .await?;
+            }
+            return Ok((
+                ToolResult::error("Tool authorization or cancellation changed before invocation"),
+                false,
+                true,
+                false,
+            ));
+        }
+        let mut future = Box::pin(async move {
+            if let Some(custody) = &custody_for_future {
+                custody.store(true, Ordering::SeqCst);
+            }
             invoked_by_future.store(true, Ordering::SeqCst);
             if let Some(actor_context) = actor_context {
                 scope_actor_context(actor_context, tool.execute(args, ctx)).await
             } else {
                 tool.execute(args, ctx).await
             }
-        };
-        tokio::pin!(future);
-        let timer = tokio::time::sleep(timeout.timer);
+        });
+        let timer = tokio::time::sleep(timer_duration);
         tokio::pin!(timer);
         let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
         loop {
             tokio::select! {
-                result = &mut future => return Ok((result, false, false, true)),
+                result = &mut future => {
+                    drop(future);
+                    if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                        Box::pin(execution.settle(attempt, serde_json::to_value(&result)?, false)).await?;
+                    }
+                    if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
+                    return Ok((result, false, false, true));
+                }
                 _ = &mut timer => {
+                    drop(future);
+                    if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                        Box::pin(execution.settle(attempt, serde_json::json!({"timed_out":true}), true)).await?;
+                    }
                     return Ok((
                         ToolResult::error("Tool execution timed out"),
                         true,
@@ -5287,7 +5868,13 @@ impl RuntimeAgent {
                     ));
                 }
                 _ = cancel_tick.tick() => {
-                    if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+                    if self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                        || execution.as_ref().is_some_and(|run| run.stop_reason().is_some())
+                    {
+                        drop(future);
+                        if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
+                            Box::pin(execution.settle(attempt, serde_json::json!({"cancelled":true}), true)).await?;
+                        }
                         return Ok((
                             ToolResult::error("Tool execution cancelled by runtime control"),
                             false,
@@ -5314,7 +5901,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Acquires all declared resource locks in stable key order and supports emergency cancellation while waiting.
+    /// Acquires declared locks in stable order; run cancellation and deadline stops also bound waits on retained uncertain-effect protection.
     async fn acquire_tool_resource_locks(&self, keys: &[String]) -> Option<ToolResourceGuards> {
         let locks = {
             let mut table = self.resource_locks.write();
@@ -5334,7 +5921,12 @@ impl RuntimeAgent {
         let mut resource_guards = ToolResourceGuards {
             guards: Vec::with_capacity(locks.len()),
             locks: Arc::clone(&self.resource_locks),
+            task_owner: crate::autonomy::current_execution()
+                .map(|execution| execution.owner.clone()),
+            retain_on_drop: false,
+            effect_custody: Arc::new(AtomicBool::new(false)),
         };
+        let execution = crate::autonomy::current_execution();
         let mut locks = locks.into_iter();
         while let Some(lock) = locks.next() {
             let mut lock = Box::pin(lock.lock_owned());
@@ -5345,7 +5937,7 @@ impl RuntimeAgent {
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
+                        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) || execution.as_ref().is_some_and(|run| ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())) {
                             drop(lock);
                             drop(locks);
                             drop(resource_guards);
@@ -5378,9 +5970,10 @@ impl RuntimeAgent {
         let mut attempts = 0;
         let mut invoked = false;
         loop {
-            let (result, timed_out, cancelled, attempt_invoked) = self
-                .execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout)
-                .await?;
+            let (result, timed_out, cancelled, attempt_invoked) = Box::pin(
+                self.execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout),
+            )
+            .await?;
             invoked |= attempt_invoked;
             if result.success || timed_out || cancelled || attempts >= max_retries {
                 return Ok((result, timed_out, cancelled, invoked));
@@ -5427,6 +6020,8 @@ impl RuntimeAgent {
         request: ToolExecutionRequest,
         fallback_state: ToolFallbackState,
     ) -> Result<ToolExecutionRecord> {
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_operation()?;
         let started_at = chrono::Utc::now();
         let start = Instant::now();
         info!(tool = %request.requested_name, args = %request.arguments, "Executing tool");
@@ -6562,7 +7157,7 @@ impl RuntimeAgent {
         // Hold conflict locks across final generation admission and invocation.
         // Completion hooks and fallback execution run only after these guards are released.
         //
-        let Some(resource_guards) = self.acquire_tool_resource_locks(&resource_lock_keys).await
+        let Some(mut resource_guards) = self.acquire_tool_resource_locks(&resource_lock_keys).await
         else {
             //
             // Cancellation while lock admission waits is terminal runtime-control evidence, even though the non-executed result retains its denial policy outcome.
@@ -6637,7 +7232,7 @@ impl RuntimeAgent {
             actor_id: turn_actor
                 .as_ref()
                 .and_then(|context| context.effective_actor_id().map(str::to_string))
-                .or_else(|| self.actor_id()),
+                .or_else(|| self.effective_actor_id()),
             origin_actor_id: turn_actor
                 .as_ref()
                 .and_then(|context| context.origin_actor_id.clone()),
@@ -6670,17 +7265,24 @@ impl RuntimeAgent {
             policy_snapshot,
             custom_config: security_engine.custom_config(&canonical_id),
         };
-        let (mut result, timed_out, cancelled, invoked) = self
-            .run_tool_with_retries(
-                &canonical_id,
-                resolved.tool.clone(),
-                executed_arguments.clone(),
-                tool_context,
-                timeout,
-                tool_config.max_retries,
+        // Arm custody only on the first implementation poll; progress or capability denial is proven non-invocation.
+        let (mut result, timed_out, cancelled, invoked) = TOOL_EFFECT_CUSTODY
+            .scope(
+                resource_guards.effect_custody.clone(),
+                self.run_tool_with_retries(
+                    &canonical_id,
+                    resolved.tool.clone(),
+                    executed_arguments.clone(),
+                    tool_context,
+                    timeout,
+                    tool_config.max_retries,
+                ),
             )
             .await?;
 
+        //
+        // A known returned result is quiescent; timeout/cancellation after invocation is not proof that effects stopped.
+        resource_guards.retain_on_drop = invoked && (timed_out || cancelled);
         //
         // Runtime cancellation is terminal for the logical request. Recovery fallback must not mask the cancelled record or start new work after the host asked active execution to stop.
         //
@@ -6967,8 +7569,13 @@ impl RuntimeAgent {
         Ok(SkillRouteResult::Response { skill_id, content })
     }
 
-    /// Result of skill routing.
+    /// Routes only the accepted task input to a script; controller continuations use native/model history without replaying that segment.
     async fn try_skill_route(&self, input: &str) -> Result<SkillRouteResult> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+        {
+            return Ok(SkillRouteResult::NoMatch);
+        }
         if let Some(candidate) = self.select_skill_candidate(input).await? {
             self.commit_skill_candidate_route_result(candidate, input)
                 .await
@@ -7295,8 +7902,13 @@ OVERALL: PASS/FAIL"#,
         Ok(EvaluationResult::new(overall_pass, confidence).with_criteria(criteria_results))
     }
 
-    /// Process input through the pipeline (state-level override or agent-level).
+    /// Processes each accepted or delegated objective once; controller continuation does not repeat extraction.
     async fn process_input(&self, input: &str) -> Result<ProcessData> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+        {
+            return Ok(ProcessData::new(input));
+        }
         if let Some(processor) = self.get_state_process_processor() {
             let purpose = observation_purpose_for_process(processor.input_purpose_hint());
             return self
@@ -8491,7 +9103,13 @@ OVERALL: PASS/FAIL"#,
             if let Some(context) = self.active_turn_context.write().as_mut() {
                 context.mark_post_turn_lifecycle_completed();
             }
-            self.hooks.on_response(response).await;
+            let mut projected_response = response.clone();
+            if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate) {
+                projected_response.metadata.get_or_insert_with(HashMap::new).insert(
+                    "autonomy_input".into(), serde_json::json!({"run_id":input.owner.run_id,"source":format!("{:?}",input.source)})
+                );
+            }
+            self.hooks.on_response(&projected_response).await;
             self.end_root_turn();
         }
         Ok(())
@@ -8934,8 +9552,14 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
-    // Selects an auxiliary judge only for auto mode and propagates hierarchy configuration errors.
+    // Controller continuations must not rebuild an already executed plan or rerun its completed tools.
+    // Initial task inputs retain ordinary reasoning selection and managed provider/tool admission.
     async fn determine_reasoning_mode_strict(&self, input: &str) -> Result<ReasoningMode> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+        {
+            return Ok(ReasoningMode::None);
+        }
         let effective_config = self.get_effective_reasoning_config();
 
         if !matches!(effective_config.mode, ReasoningMode::Auto) {
@@ -9779,7 +10403,11 @@ Respond in JSON format:
         let _root_cleanup = RootTurnCleanup::new(self);
         info!(input_len = input.len(), "Starting chat");
 
-        self.hooks.on_message_received(input).await;
+        if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| turn.controller_only())
+        {
+            self.hooks.on_message_received(input).await;
+        }
 
         self.prepare_turn_context().await?;
 
@@ -9789,7 +10417,14 @@ Respond in JSON format:
 
         // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
         // responses itself; this loop only dispatches on the outcome.
-        let input_to_run = match self.resolve_disambiguation(input).await? {
+        let dispatch = if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+        {
+            DisambiguationDispatch::Proceed(input.to_string())
+        } else {
+            self.resolve_disambiguation(input).await?
+        };
+        let input_to_run = match dispatch {
             DisambiguationDispatch::Terminal(response) => return Ok(response),
             DisambiguationDispatch::RecheckSkill {
                 skill_id,
@@ -9809,7 +10444,8 @@ Respond in JSON format:
             DisambiguationDispatch::Proceed(input) => input,
         };
 
-        self.run_loop_internal(&input_to_run).await
+        // Box the large turn pipeline before nesting child polling on the caller's test or host thread stack.
+        Box::pin(self.run_loop_internal(&input_to_run)).await
     }
 
     /// Generate a localized response using the router LLM
@@ -11723,7 +12359,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // run_loop_internal: blocking (non-streaming) agent pipeline.
+    // Shares the blocking turn pipeline across ordinary roots and owned task participants.
+    // Boxed composition dispatch keeps nested participants from multiplying large future stack frames.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         self.begin_root_turn();
         // Resolve actor_id from context, reload facts if actor changed, bump counter.
@@ -11744,6 +12381,9 @@ Respond in JSON format:
                 .rejection_reason
                 .unwrap_or_else(|| "Input rejected".to_string());
             warn!(reason = %reason, "Input rejected");
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.stop("input_rejected");
+            }
             let response = AgentResponse::new(reason);
             self.finish_turn_if_root(&response).await?;
             return Ok(response);
@@ -11755,34 +12395,30 @@ Respond in JSON format:
             return Ok(response);
         }
 
-        // Handle orchestration states (delegate, concurrent, group_chat, pipeline, handoff).
-        if let Some(ref sm) = self.state_machine
+        // Controller continuation works from committed aggregate history, not by rerunning completed initial child flows.
+        if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work())
+            && let Some(ref sm) = self.state_machine
             && let Some(def) = sm.current_definition()
         {
             if let Some(ref delegate_id) = def.delegate {
-                return self
-                    .handle_delegated_state(processed_input, delegate_id, &def)
+                return Box::pin(self.handle_delegated_state(processed_input, delegate_id, &def))
                     .await;
             }
             if let Some(ref concurrent_config) = def.concurrent {
-                return self
-                    .handle_concurrent_state(processed_input, concurrent_config)
+                return Box::pin(self.handle_concurrent_state(processed_input, concurrent_config))
                     .await;
             }
             if let Some(ref group_chat_config) = def.group_chat {
-                return self
-                    .handle_group_chat_state(processed_input, group_chat_config)
+                return Box::pin(self.handle_group_chat_state(processed_input, group_chat_config))
                     .await;
             }
             if let Some(ref pipeline_config) = def.pipeline {
-                return self
-                    .handle_pipeline_state(processed_input, pipeline_config)
+                return Box::pin(self.handle_pipeline_state(processed_input, pipeline_config))
                     .await;
             }
             if let Some(ref handoff_config) = def.handoff {
-                return self
-                    .handle_handoff_state(processed_input, handoff_config)
-                    .await;
+                return Box::pin(self.handle_handoff_state(processed_input, handoff_config)).await;
             }
         }
 
@@ -12932,8 +13568,11 @@ Respond in JSON format:
         &self.skills
     }
 
-    /// Clears conversation and pending runtime ownership through one reset contract.
+    /// Clears conversation and pending ownership only when no foreground task reserves the runtime.
     async fn reset_runtime_state(&self) -> Result<()> {
+        self.check_autonomy_access()?;
+        let _mutations = self.autonomy_mutations.read().await;
+        self.check_autonomy_access()?;
         let _admission = self.disambiguation_admission.write().await;
         if self.state_transition_reserved.load(Ordering::SeqCst) {
             return Err(AgentError::Other(
@@ -13015,7 +13654,8 @@ Respond in JSON format:
         ctx
     }
 
-    /// Send a HITL check result through the approval flow and return the full ApprovalResult.
+    /// Preserves the ordinary approval contract while bounding task waits by shared cancellation and remaining time.
+    /// A cancelled or expired wait is a failed admission, not a resumable pause or proof of effect rollback.
     async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
             return Ok(ApprovalResult::Approved);
@@ -13025,7 +13665,29 @@ Respond in JSON format:
 
         let timeout = request.timeout;
 
-        let raw_result = if let Some(duration) = timeout {
+        let raw_result = if let Some(execution) = crate::autonomy::current_execution() {
+            let duration = timeout.map_or(execution.remaining_duration(), |duration| {
+                duration.min(execution.remaining_duration())
+            });
+            let waiting = async {
+                let approval = self.approval_handler.request_approval(request.clone());
+                tokio::pin!(approval);
+                loop {
+                    tokio::select! { result = &mut approval => return result, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) { return ApprovalResult::Rejected { reason: Some("task approval wait cancelled or expired".into()) }; }
+                    } }
+                }
+            };
+            match tokio::time::timeout(duration, waiting).await {
+                Ok(result) => result,
+                Err(_) => {
+                    if execution.remaining_duration().is_zero() {
+                        execution.stop("time_violation");
+                    }
+                    ApprovalResult::timeout()
+                }
+            }
+        } else if let Some(duration) = timeout {
             match tokio::time::timeout(
                 duration,
                 self.approval_handler.request_approval(request.clone()),
@@ -13462,6 +14124,19 @@ impl ToolInvoker for RuntimeAgent {
 impl Agent for RuntimeAgent {
     /// Runs one blocking external root turn with task-local ownership visible through finalization, hooks, orchestration, and export.
     async fn chat(&self, input: &str) -> Result<AgentResponse> {
+        if let Some(execution) = crate::autonomy::current_execution()
+            && !current_runtime_gate_identity_stack()
+                .iter()
+                .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+        {
+            let result = self
+                .run_task_participant(input, None, execution.clone())
+                .await;
+            if result.is_err() && crate::autonomy::child_required() {
+                execution.stop("required_child_failure");
+            }
+            return result;
+        }
         let RootTurnAdmission {
             guard,
             identity_stack,
@@ -25596,7 +26271,9 @@ skills:
             .llm(Arc::new(mock_with_response("ok")))
             .build()
             .unwrap();
-        agent.register_context_provider("counter", provider);
+        agent
+            .register_context_provider("counter", provider)
+            .unwrap();
         agent
     }
 
@@ -25723,7 +26400,9 @@ skills:
         let provider = Arc::new(FailOnceContextProvider {
             attempts: std::sync::atomic::AtomicUsize::new(0),
         });
-        agent.register_context_provider("flaky", provider.clone());
+        agent
+            .register_context_provider("flaky", provider.clone())
+            .unwrap();
 
         assert!(agent.chat("first").await.is_err());
         assert_eq!(calls.call_count(), 0);
@@ -25759,7 +26438,7 @@ skills:
         );
         assert_eq!(calls.call_count(), 1);
 
-        agent.remove_context("voice");
+        agent.remove_context("voice").unwrap();
         let error = agent.chat("third").await.unwrap_err();
         assert!(
             error

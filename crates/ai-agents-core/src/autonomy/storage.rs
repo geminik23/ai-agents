@@ -62,6 +62,8 @@ pub enum TaskRunStorageError {
     InvalidCheckpoint,
     #[error("task checkpoint exceeds its size limit")]
     CheckpointTooLarge,
+    #[error("task final admission deadline expired")]
+    AdmissionExpired,
 }
 
 impl From<TaskRunStorageError> for AgentError {
@@ -124,6 +126,16 @@ pub enum TaskRunMutation {
         payload: Value,
         release: bool,
     },
+    /// Live final admission is checked inside the backend's write boundary, not only before awaiting storage.
+    FinalCheckpoint {
+        expected_revision: u64,
+        owner_token: String,
+        status: TaskRunStatus,
+        payload: Value,
+        release: bool,
+        deadline: std::time::Instant,
+        expires_at: Option<DateTime<Utc>>,
+    },
     /// Host control-plane CAS; runtime adapters require an auditable authenticated host action.
     HostControl {
         expected_revision: u64,
@@ -149,6 +161,24 @@ pub enum TaskRunMutation {
         expected_revision: u64,
         payload: Value,
     },
+}
+
+impl TaskRunMutation {
+    /// Completion cannot pass a live monotonic or original-expiry deadline after waiting for a write lock.
+    pub fn validate_final_deadline(&self, now: DateTime<Utc>) -> Result<()> {
+        if let Self::FinalCheckpoint {
+            status: TaskRunStatus::Completed,
+            deadline,
+            expires_at,
+            ..
+        } = self
+            && (std::time::Instant::now() >= *deadline
+                || expires_at.is_some_and(|expiry| now >= expiry))
+        {
+            return Err(TaskRunStorageError::AdmissionExpired.into());
+        }
+        Ok(())
+    }
 }
 
 impl TaskRunSnapshot {
@@ -217,6 +247,9 @@ impl TaskRunSnapshot {
             | TaskRunMutation::Checkpoint {
                 expected_revision, ..
             }
+            | TaskRunMutation::FinalCheckpoint {
+                expected_revision, ..
+            }
             | TaskRunMutation::HostControl {
                 expected_revision, ..
             }
@@ -237,6 +270,7 @@ impl TaskRunSnapshot {
         if self.status.is_terminal() {
             return Err(NotResumable.into());
         }
+        mutation.validate_final_deadline(now)?;
         let mut next = self.clone();
         match mutation {
             TaskRunMutation::Claim { owner_token, .. } => {
@@ -255,15 +289,25 @@ impl TaskRunSnapshot {
                 payload,
                 release,
                 ..
+            }
+            | TaskRunMutation::FinalCheckpoint {
+                owner_token,
+                status,
+                payload,
+                release,
+                ..
             } => {
                 if self.owner_token.as_deref() != Some(owner_token) {
                     return Err(Conflict.into());
                 }
+                // A cancelled owner may still persist known settlement, but cannot publish completion or clear cancellation.
                 if (*status == TaskRunStatus::Running) == *release
                     || (self.cancel_requested
                         && !matches!(
                             status,
-                            TaskRunStatus::Cancelled | TaskRunStatus::RecoveryRequired
+                            TaskRunStatus::Running
+                                | TaskRunStatus::Cancelled
+                                | TaskRunStatus::RecoveryRequired
                         ))
                 {
                     return Err(InvalidCheckpoint.into());

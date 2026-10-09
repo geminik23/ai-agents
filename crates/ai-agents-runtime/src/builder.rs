@@ -344,7 +344,7 @@ impl AgentBuilder {
                     provider = provider.with_tool_choice(choice);
                 }
 
-                registry.register(alias, Arc::new(provider));
+                registry.register(alias, ai_agents_llm::managed_provider(Arc::new(provider)));
             }
 
             let default_alias = spec.llm.get_default_alias();
@@ -403,7 +403,7 @@ impl AgentBuilder {
                 provider = provider.with_tool_choice(choice);
             }
 
-            self.llm = Some(Arc::new(provider));
+            self.llm = Some(ai_agents_llm::managed_provider(Arc::new(provider)));
             self.llm_registry_observed = false;
         }
 
@@ -555,7 +555,7 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
-        self.llm = Some(llm);
+        self.llm = Some(ai_agents_llm::managed_provider(llm));
         self
     }
 
@@ -568,7 +568,7 @@ impl AgentBuilder {
             self.llm_registry = Some(LLMRegistry::new());
         }
         if let Some(ref mut registry) = self.llm_registry {
-            registry.register(alias, provider);
+            registry.register(alias, ai_agents_llm::managed_provider(provider));
         }
         self
     }
@@ -578,7 +578,8 @@ impl AgentBuilder {
         if self.routing_frozen.is_some() {
             self.routing_dirty = true;
         }
-        self.llm_registry = Some(registry);
+        self.llm_registry =
+            Some(registry.map_providers(|_, provider| ai_agents_llm::managed_provider(provider)));
         self.llm_registry_observed = false;
         self
     }
@@ -1201,7 +1202,7 @@ impl AgentBuilder {
         Ok(self)
     }
 
-    /// Finalizes one consistent hierarchy, validates loaded autonomy overrides, and refuses enabled tasks until the controller exists.
+    /// Finalizes one consistent hierarchy and refuses enabled declarations until the complete task integration exists.
     pub fn build(mut self) -> Result<RuntimeAgent> {
         self.prepare_routing(false)?;
         let resource_locks = self.shared_resource_locks();
@@ -1267,7 +1268,7 @@ impl AgentBuilder {
         crate::autonomy::validate_loaded_skills(config, &self.skills)?;
         if crate::autonomy::has_enabled_declaration(config, states, &self.skills) {
             return Err(AgentError::Config(
-                "autonomy task execution is not available until the runner is installed".into(),
+                "autonomy task execution is not available until the complete runner integration is installed".into(),
             ));
         }
 

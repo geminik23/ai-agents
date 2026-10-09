@@ -45,6 +45,7 @@ pub async fn concurrent(
 }
 
 /// Runs participant turns with unchanged ownership and uses captured role providers only for aggregation.
+/// Captured task admission crosses JoinSet boundaries so a child cannot escape shared limits or fail-closed participation checks.
 #[allow(clippy::too_many_arguments)]
 pub async fn concurrent_with_llms(
     registry: &AgentRegistry,
@@ -80,59 +81,71 @@ pub async fn concurrent_with_llms(
         let actor_context = current_turn_actor_context();
         let observation_context = current_observation_context();
         let gate_identity_stack = gate_identity_stack.clone();
+        let execution = crate::autonomy::current_execution();
+        let required = crate::autonomy::child_required()
+            && matches!(on_partial_failure, PartialFailureAction::Abort);
 
         join_set.spawn(async move {
-            scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
-                let agent_start = Instant::now();
-                let run = async {
-                    if let Some(context) = actor_context {
-                        agent.chat_with_actor_context(&input_owned, context).await
-                    } else {
-                        agent.chat(&input_owned).await
-                    }
-                };
-                let result = if let Some(t) = timeout {
-                    match tokio::time::timeout(tokio::time::Duration::from_millis(t), async {
-                        if let Some(context) = observation_context.clone() {
+            crate::autonomy::scope_child_requirement(
+                required,
+                crate::autonomy::scope_inherited_execution(
+                    execution,
+                    scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
+                        let agent_start = Instant::now();
+                        let run = async {
+                            if let Some(context) = actor_context {
+                                agent.chat_with_actor_context(&input_owned, context).await
+                            } else {
+                                agent.chat(&input_owned).await
+                            }
+                        };
+                        let result = if let Some(t) = timeout {
+                            match tokio::time::timeout(
+                                tokio::time::Duration::from_millis(t),
+                                async {
+                                    if let Some(context) = observation_context.clone() {
+                                        with_observation_context(context, run).await
+                                    } else {
+                                        run.await
+                                    }
+                                },
+                            )
+                            .await
+                            {
+                                Ok(r) => r,
+                                Err(_) => Err(AgentError::Other(format!(
+                                    "Agent {} timed out after {}ms",
+                                    agent_id, t
+                                ))),
+                            }
+                        } else if let Some(context) = observation_context {
                             with_observation_context(context, run).await
                         } else {
                             run.await
-                        }
-                    })
-                    .await
-                    {
-                        Ok(r) => r,
-                        Err(_) => Err(AgentError::Other(format!(
-                            "Agent {} timed out after {}ms",
-                            agent_id, t
-                        ))),
-                    }
-                } else if let Some(context) = observation_context {
-                    with_observation_context(context, run).await
-                } else {
-                    run.await
-                };
+                        };
 
-                let duration_ms = agent_start.elapsed().as_millis() as u64;
-                match result {
-                    Ok(response) => AgentResult {
-                        agent_index,
-                        agent_id,
-                        response: Some(response),
-                        duration_ms,
-                        success: true,
-                        error: None,
-                    },
-                    Err(e) => AgentResult {
-                        agent_index,
-                        agent_id,
-                        response: None,
-                        duration_ms,
-                        success: false,
-                        error: Some(e.to_string()),
-                    },
-                }
-            })
+                        let duration_ms = agent_start.elapsed().as_millis() as u64;
+                        match result {
+                            Ok(response) => AgentResult {
+                                agent_index,
+                                agent_id,
+                                response: Some(response),
+                                duration_ms,
+                                success: true,
+                                error: None,
+                            },
+                            Err(e) => AgentResult {
+                                agent_index,
+                                agent_id,
+                                response: None,
+                                duration_ms,
+                                success: false,
+                                error: Some(e.to_string()),
+                            },
+                        }
+                    }),
+                ),
+            )
             .await
         });
     }
@@ -154,6 +167,11 @@ pub async fn concurrent_with_llms(
 
     // Abort on any failure if configured.
     if failed_count > 0 && matches!(on_partial_failure, PartialFailureAction::Abort) {
+        if crate::autonomy::child_required()
+            && let Some(execution) = crate::autonomy::current_execution()
+        {
+            execution.stop("required_child_failure");
+        }
         let failed_agents: Vec<_> = results
             .iter()
             .filter(|r| !r.success)
@@ -170,6 +188,11 @@ pub async fn concurrent_with_llms(
     if let Some(min) = min_required
         && success_count < min
     {
+        if crate::autonomy::child_required()
+            && let Some(execution) = crate::autonomy::current_execution()
+        {
+            execution.stop("required_child_failure");
+        }
         return Err(AgentError::Other(format!(
             "Only {} of {} required agents succeeded",
             success_count, min

@@ -252,6 +252,7 @@ pub struct ToolActorContext {
 pub struct ToolCancellationToken {
     cancelled: Arc<AtomicBool>,
     reason: Option<String>,
+    secondary: Vec<(Arc<AtomicBool>, Option<String>)>,
 }
 
 impl std::fmt::Debug for ToolCancellationToken {
@@ -272,16 +273,45 @@ impl Default for ToolCancellationToken {
 impl ToolCancellationToken {
     /// Create a cancellation observer from shared runtime state.
     pub fn new(cancelled: Arc<AtomicBool>, reason: Option<String>) -> Self {
-        Self { cancelled, reason }
+        Self {
+            cancelled,
+            reason,
+            secondary: Vec::new(),
+        }
     }
 
-    /// Returns true when the runtime has requested cooperative cancellation.
+    /// Observes run cancellation in addition to runtime emergency control without replacing either authority.
+    pub fn with_secondary(mut self, cancelled: Arc<AtomicBool>, reason: Option<String>) -> Self {
+        if !Arc::ptr_eq(&self.cancelled, &cancelled)
+            && !self
+                .secondary
+                .iter()
+                .any(|(flag, _)| Arc::ptr_eq(flag, &cancelled))
+        {
+            self.secondary.push((cancelled, reason));
+        }
+        self
+    }
+
+    /// Returns true when the runtime or an inherited run has requested cooperative cancellation.
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+            || self
+                .secondary
+                .iter()
+                .any(|(flag, _)| flag.load(Ordering::SeqCst))
     }
 
     /// Returns the current cancellation reason when one was provided.
     pub fn reason(&self) -> Option<&str> {
+        if !self.cancelled.load(Ordering::SeqCst)
+            && let Some((_, reason)) = self
+                .secondary
+                .iter()
+                .find(|(flag, _)| flag.load(Ordering::SeqCst))
+        {
+            return reason.as_deref();
+        }
         self.reason.as_deref()
     }
 }

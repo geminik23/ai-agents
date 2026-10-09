@@ -342,7 +342,7 @@ impl AgentRegistry {
     }
 
     //
-    // Captures the caller's complete immutable gate ancestry before spawning and cheaply propagates it so recipients preserve cycle detection while the sender waits.
+    // Captures the caller's gate ancestry and task admission before spawning so recipients cannot escape ownership or shared limits.
     //
     async fn broadcast_inner(
         &self,
@@ -384,22 +384,26 @@ impl AgentRegistry {
             let context = actor_context.clone();
             let observation_context = observation_context.clone();
             let gate_identity_stack = Arc::clone(&gate_identity_stack);
+            let execution = crate::autonomy::current_execution();
             handles.push(tokio::spawn(async move {
-                scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
-                    let run = async move {
-                        if let Some(context) = context {
-                            agent.chat_with_actor_context(&msg, context).await
+                crate::autonomy::scope_inherited_execution(
+                    execution,
+                    scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
+                        let run = async move {
+                            if let Some(context) = context {
+                                agent.chat_with_actor_context(&msg, context).await
+                            } else {
+                                agent.chat(&msg).await
+                            }
+                        };
+                        let result = if let Some(context) = observation_context {
+                            with_observation_context(context, run).await
                         } else {
-                            agent.chat(&msg).await
-                        }
-                    };
-                    let result = if let Some(context) = observation_context {
-                        with_observation_context(context, run).await
-                    } else {
-                        run.await
-                    };
-                    (id, result)
-                })
+                            run.await
+                        };
+                        (id, result)
+                    }),
+                )
                 .await
             }));
         }

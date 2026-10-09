@@ -1073,12 +1073,37 @@ pub struct TodoRunBinding {
 struct TodoStoreState {
     items: Vec<TodoItem>,
     binding: Option<TodoRunBinding>,
+    max_open: Option<u32>,
 }
 
 /// Session-local storage shared by the tool and runtime, optionally bound to one task run.
 #[derive(Clone, Default)]
 pub struct TodoStore {
     inner: Arc<RwLock<TodoStoreState>>,
+}
+
+tokio::task_local! { static TASK_TODO_AUTHORITY: (TodoStore, TodoRunBinding); }
+
+/// Installs the coordinating canonical store without replacing a child's prepared tool handle.
+pub async fn scope_task_todos<F: std::future::Future>(
+    store: TodoStore,
+    binding: TodoRunBinding,
+    future: F,
+) -> F::Output {
+    TASK_TODO_AUTHORITY.scope((store, binding), future).await
+}
+
+/// A stale scoped binding fails closed instead of falling back to a participant's session-local list.
+pub fn current_task_todo_store() -> ai_agents_core::Result<Option<TodoStore>> {
+    TASK_TODO_AUTHORITY
+        .try_with(|(store, binding)| {
+            if store.list_for_run(binding).is_some() {
+                Ok(Some(store.clone()))
+            } else {
+                Err(ai_agents_core::autonomy::TaskRunStorageError::Conflict.into())
+            }
+        })
+        .unwrap_or(Ok(None))
 }
 
 impl TodoStore {
@@ -1089,7 +1114,33 @@ impl TodoStore {
 
     /// Replace the full todo list.
     pub fn set(&self, items: Vec<TodoItem>) {
-        self.inner.write().items = items;
+        let _ = self.try_set(items);
+    }
+
+    /// Applies the run's open-item bound atomically without replacing the sole canonical list on rejection.
+    pub fn try_set(&self, items: Vec<TodoItem>) -> bool {
+        let mut state = self.inner.write();
+        if state
+            .max_open
+            .is_some_and(|limit| open_todos(&items) > limit as usize)
+        {
+            return false;
+        }
+        state.items = items;
+        true
+    }
+
+    /// Installs a bound only for the current run owner; ordinary session todo behavior is unchanged.
+    pub fn set_run_open_limit(&self, binding: &TodoRunBinding, limit: Option<u32>) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(binding)
+            || limit == Some(0)
+            || limit.is_some_and(|limit| open_todos(&state.items) > limit as usize)
+        {
+            return false;
+        }
+        state.max_open = limit;
+        true
     }
 
     /// Update one item by ID and return whether it existed.
@@ -1101,9 +1152,25 @@ impl TodoStore {
         status: Option<TodoStatus>,
     ) -> bool {
         let mut state = self.inner.write();
-        let Some(item) = state.items.iter_mut().find(|item| item.id == id) else {
+        let Some(index) = state.items.iter().position(|item| item.id == id) else {
             return false;
         };
+        let was_open = matches!(
+            state.items[index].status,
+            TodoStatus::Pending | TodoStatus::InProgress
+        );
+        let becomes_open = status
+            .as_ref()
+            .is_some_and(|status| matches!(status, TodoStatus::Pending | TodoStatus::InProgress));
+        if !was_open
+            && becomes_open
+            && state
+                .max_open
+                .is_some_and(|limit| open_todos(&state.items) >= limit as usize)
+        {
+            return false;
+        }
+        let item = &mut state.items[index];
         if let Some(content) = content {
             item.content = content;
         }
@@ -1150,8 +1217,17 @@ impl TodoStore {
             return false;
         }
         state.binding = None;
+        state.max_open = None;
         true
     }
+}
+
+// Completed and cancelled items are visible history, not open work.
+fn open_todos(items: &[TodoItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress))
+        .count()
 }
 
 fn default_true() -> bool {

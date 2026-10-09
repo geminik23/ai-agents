@@ -367,6 +367,7 @@ fn task_native_history_exact_round_trip_and_corruption_rejection() {
             encode_native_tool_call_markers(std::slice::from_ref(&call), Some(&state)).unwrap(),
         ),
         ChatMessage {
+            provenance: None,
             role: Role::Tool,
             content: encode_native_tool_result_marker(&call, json!({"exact": "result"})).unwrap(),
             name: None,

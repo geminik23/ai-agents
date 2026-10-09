@@ -169,6 +169,7 @@ impl SqliteStorage {
         if affected != 1 {
             return Err(TaskRunStorageError::Conflict.into());
         }
+        mutation.validate_final_deadline(chrono::Utc::now())?;
         transaction.commit().await.map_err(persistence)?;
         Ok(next)
     }

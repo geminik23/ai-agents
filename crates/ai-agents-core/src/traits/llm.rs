@@ -58,6 +58,35 @@ pub trait LLMProvider: Send + Sync {
     /// Check if this provider supports a given feature.
     fn supports(&self, feature: LLMFeature) -> bool;
 
+    /// Reports an installed invocation layer so consumer preparation never double-wraps shared handles.
+    fn manages_invocation_admission(&self) -> bool {
+        false
+    }
+
+    /// Identifies a prepared priced capability; absent means hard priced execution is unsupported.
+    /// A stable identity is not an execution permit and every actual request must still be bounded.
+    fn priced_capability_identity(&self) -> Option<String> {
+        None
+    }
+
+    /// Bounds the complete request that this implementation will dispatch under its pinned schedule.
+    /// Implementations must preserve the quoted configuration through dispatch, including cached clients and internal retries.
+    fn request_cost_bound(
+        &self,
+        _request: &crate::autonomy::ProviderRequest<'_>,
+    ) -> Result<Option<crate::autonomy::ProviderCostBound>, LLMError> {
+        Ok(None)
+    }
+
+    /// Returns trustworthy matching billable usage; unknown usage keeps the full admitted bound.
+    fn settle_request_cost(
+        &self,
+        _bound: &crate::autonomy::ProviderCostBound,
+        _response: &LLMResponse,
+    ) -> Result<Option<crate::autonomy::ProviderCostSettlement>, LLMError> {
+        Ok(None)
+    }
+
     /// Reports whether a provider error is terminal for this exact attempt.
     ///
     /// Terminal errors represent local configuration, protocol, or history failures that retry,

@@ -1,10 +1,37 @@
-//! Strict autonomy configuration resolution; task execution is added separately.
+//! Development autonomy primitives and guarded standalone execution; full task integration remains unfinished.
 
+#[cfg(test)]
+mod admission_tests;
 mod authority;
+mod boundary;
+mod execution;
+mod memory;
+mod participants;
+pub(crate) use participants::{
+    child_required, current_child_operation, scope_child_operation, scope_child_requirement,
+};
+mod runner;
+#[cfg(test)]
+mod runner_additional_tests;
+#[cfg(test)]
+mod runner_tests;
+pub(crate) use boundary::{
+    AutonomyTurnInput, AutonomyTurnSource, OwnedTurnCleanup, RunOwner, RunOwnerSlot,
+    current_turn_input, scope_turn,
+};
+pub(crate) use execution::{
+    RunExecution, current_execution, scope_execution, scope_inherited_execution,
+};
+pub(crate) use memory::TaskMemory;
+pub use runner::AutonomyRunner;
 mod builtins;
 #[cfg(test)]
 mod checkpoint_tests;
+#[cfg(test)]
+mod child_tests;
 mod config;
+#[cfg(test)]
+mod continuation_tests;
 mod control;
 mod journal;
 mod lifecycle;

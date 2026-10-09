@@ -713,6 +713,37 @@ impl TaskCheckpointPayload {
         if charged > self.counters.charged_micro_usd {
             return Err(invalid());
         }
+        // Outstanding bounds remain committed across recovery; settled usage alone cannot hide in-flight overspend.
+        let commitment = self
+            .reservations
+            .iter()
+            .filter(|reservation| {
+                matches!(
+                    reservation.state,
+                    TaskEffectState::Reserved
+                        | TaskEffectState::Dispatched
+                        | TaskEffectState::Uncertain
+                )
+            })
+            .try_fold(self.counters.charged_micro_usd, |sum, reservation| {
+                sum.checked_add(
+                    reservation
+                        .reserved_micro_usd
+                        .saturating_sub(reservation.charged_micro_usd),
+                )
+            })
+            .ok_or_else(invalid)?;
+        if self
+            .limits
+            .max_micro_usd
+            .is_some_and(|limit| commitment > limit)
+            || self
+                .limits
+                .max_declared_write_paths
+                .is_some_and(|limit| declared.len() > limit as usize)
+        {
+            return Err(invalid());
+        }
         if envelope.status == TaskRunStatus::Completed
             && (self.counters.turns > u64::from(self.limits.max_turns)
                 || self.counters.llm_attempts > u64::from(self.limits.max_llm_calls)
@@ -743,10 +774,16 @@ impl TaskCheckpointPayload {
             count += reservation.write_targets.len();
             if reservation.id.is_empty()
                 || !ids.insert(&reservation.id)
-                || reservation
+                || (reservation
                     .write_targets
                     .iter()
                     .any(|target| !declared.contains(target))
+                    && !(reservation.state == TaskEffectState::Completed
+                        && reservation
+                            .result
+                            .as_ref()
+                            .and_then(|result| result.get("not_invoked"))
+                            == Some(&Value::Bool(true))))
                 || (reservation.state == TaskEffectState::Completed && reservation.result.is_none())
             {
                 return Err(invalid());
@@ -851,14 +888,61 @@ impl TaskCheckpointPayload {
         {
             return Err(invalid());
         }
-        for (new, old) in [
-            (self.counters.turns, previous.counters.turns),
-            (self.counters.llm_attempts, previous.counters.llm_attempts),
-            (self.counters.tool_attempts, previous.counters.tool_attempts),
+        // Only a newly acknowledged, proven non-invocation can refund its original typed slot.
+        let mut refunds = [0_u64; 3];
+        for prior in &previous.reservations {
+            if prior.state != TaskEffectState::Dispatched {
+                continue;
+            }
+            if let Some(next) = self.reservations.iter().find(|next| next.id == prior.id)
+                && next.state == TaskEffectState::Completed
+                && next
+                    .result
+                    .as_ref()
+                    .and_then(|result| result.get("not_invoked"))
+                    == Some(&Value::Bool(true))
+            {
+                let invocation = previous
+                    .adapters
+                    .iter()
+                    .find(|binding| binding.id == format!("invocation:{}", prior.id))
+                    .ok_or_else(invalid)?;
+                match invocation.config.get("tool").and_then(Value::as_str) {
+                    Some("command") => {
+                        refunds[1] += 1;
+                        refunds[2] += 1;
+                    }
+                    Some(_) => refunds[1] += 1,
+                    None => refunds[0] += 1,
+                }
+            }
+        }
+        for (new, old, refund) in [
+            (
+                self.counters.llm_attempts,
+                previous.counters.llm_attempts,
+                refunds[0],
+            ),
+            (
+                self.counters.tool_attempts,
+                previous.counters.tool_attempts,
+                refunds[1],
+            ),
             (
                 self.counters.command_attempts,
                 previous.counters.command_attempts,
+                refunds[2],
             ),
+        ] {
+            if new
+                .checked_add(refund)
+                .is_none_or(|accounted| accounted < old)
+            {
+                return Err(invalid());
+            }
+        }
+        for (new, old) in [
+            (self.counters.turns, previous.counters.turns),
             (self.counters.continuations, previous.counters.continuations),
             (
                 self.counters.charged_micro_usd,
@@ -873,10 +957,22 @@ impl TaskCheckpointPayload {
             .consumed_request_ids
             .iter()
             .any(|id| !self.consumed_request_ids.contains(id))
-            || previous
-                .declared_write_targets
-                .iter()
-                .any(|target| !self.declared_write_targets.contains(target))
+            || previous.declared_write_targets.iter().any(|target| {
+                !self.declared_write_targets.contains(target)
+                    && (previous
+                        .reservations
+                        .iter()
+                        .all(|reservation| !reservation.write_targets.contains(target))
+                        || self.reservations.iter().any(|reservation| {
+                            reservation.write_targets.contains(target)
+                                && !(reservation.state == TaskEffectState::Completed
+                                    && reservation
+                                        .result
+                                        .as_ref()
+                                        .and_then(|result| result.get("not_invoked"))
+                                        == Some(&Value::Bool(true)))
+                        }))
+            })
         {
             return Err(invalid());
         }
@@ -1054,7 +1150,7 @@ impl TaskRun {
     }
 }
 
-/// A task result is distinct from one turn response; no completion evaluator is installed yet.
+/// A task result describes the acknowledged run status rather than treating one turn response as completion.
 #[derive(Debug, Clone)]
 pub struct TaskRunResult {
     pub run: TaskRun,

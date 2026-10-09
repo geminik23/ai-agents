@@ -286,7 +286,7 @@ async fn select_next_speaker(
 
     let response = with_observation_purpose(
         ObservationPurpose::OrchestrationConversation,
-        llm.complete(&messages, None),
+        ai_agents_llm::managed_completion(llm, &messages, None),
     )
     .await
     .map_err(|e| AgentError::LLM(format!("Speaker selection failed: {}", e)))?;
@@ -414,7 +414,7 @@ async fn check_consensus(llm: &dyn LLMProvider, transcript: &[ChatTurn]) -> Resu
 
     let response = with_observation_purpose(
         ObservationPurpose::OrchestrationConversation,
-        llm.complete(&messages, None),
+        ai_agents_llm::managed_completion(llm, &messages, None),
     )
     .await
     .map_err(|e| AgentError::LLM(format!("Consensus check failed: {}", e)))?;

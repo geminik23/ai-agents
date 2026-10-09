@@ -31,7 +31,8 @@ pub use types::{
     TodoStore, ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel,
     UnavailableCommandRunner, UnavailableDiagnosticsProvider, UnavailableWebSearchProvider,
     WebSearchProvider, WebSearchProviderSlot, WebSearchRequest, WebSearchResponse,
-    WebSearchResultItem, WebSearchSafeSearch, file_version_evidence,
+    WebSearchResultItem, WebSearchSafeSearch, current_task_todo_store, file_version_evidence,
+    scope_task_todos,
 };
 
 pub use builtin::HttpTool;

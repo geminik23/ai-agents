@@ -13,6 +13,66 @@ use ai_agents::tools::{
 };
 use ai_agents::{NativeCallBinding, NativeProviderState, NativeProviderTarget};
 
+#[test]
+fn development_standalone_and_provenance_migration_surface_compiles() {
+    use ai_agents::autonomy::{AutonomyConfig, AutonomyHostCeilings, AutonomyRunner, TaskRunStore};
+    fn build(
+        agent: Arc<RuntimeAgent>,
+        config: AutonomyConfig,
+        store: Arc<dyn TaskRunStore>,
+    ) -> ai_agents::error::Result<()> {
+        let runner = AutonomyRunner::try_new(
+            agent.clone(),
+            config,
+            AutonomyHostCeilings::default(),
+            store,
+            "prepared-host-binding".into(),
+        )?;
+        let _run = runner.run("objective", None);
+        let _cancel = runner.request_cancel("retained-run");
+        agent.clear_actor_id()?;
+        let _removed = agent.remove_context("obsolete")?;
+        Ok(())
+    }
+    let _surface = build;
+    let message = ai_agents::ChatMessage {
+        provenance: None,
+        role: ai_agents::Role::User,
+        content: "legacy literal".into(),
+        name: None,
+        timestamp: None,
+    };
+    assert!(message.provenance.is_none());
+    let source = ai_agents::MessageProvenance {
+        run_id: "run".into(),
+    };
+    assert_eq!(source.run_id, "run");
+    let bound = ai_agents::autonomy::ProviderCostBound {
+        provider_identity: "host-provider/config-v1".into(),
+        pricing_identity: "declared-schedule-v1".into(),
+        request_id: "exact-request".into(),
+        max_micro_usd: 500_000,
+    };
+    let settlement = ai_agents::autonomy::ProviderCostSettlement {
+        bound: bound.clone(),
+        charged_micro_usd: 200_000,
+    };
+    ai_agents::autonomy::validate_cost_settlement(&bound, &settlement).unwrap();
+    let footprint = ai_agents::autonomy::ToolWriteFootprint::empty("host-read-only/v1");
+    assert!(footprint.targets.is_empty());
+    fn quote(provider: &dyn ai_agents::LLMProvider, messages: &[ai_agents::ChatMessage]) {
+        let request = ai_agents::autonomy::ProviderRequest {
+            request_id: "request",
+            messages,
+            config: None,
+            tools: None,
+            streaming: false,
+        };
+        let _bound = provider.request_cost_bound(&request);
+    }
+    let _surface = quote;
+}
+
 fn configure_host_integrations(
     agent: &RuntimeAgent,
     question_handler: Arc<dyn QuestionHandler>,

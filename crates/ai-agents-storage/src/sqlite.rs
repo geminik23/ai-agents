@@ -1326,12 +1326,14 @@ mod tests {
         let mut snapshot = AgentSnapshot::new("test-agent".into());
         snapshot.memory = MemorySnapshot::new(vec![
             ChatMessage {
+                provenance: None,
                 role: Role::User,
                 content: "Hello".to_string(),
                 name: None,
                 timestamp: None,
             },
             ChatMessage {
+                provenance: None,
                 role: Role::Assistant,
                 content: "Hi there!".to_string(),
                 name: None,

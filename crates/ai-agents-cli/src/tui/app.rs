@@ -1292,8 +1292,11 @@ impl App {
                     }
                 };
                 match self.agent.remove_context(key) {
-                    Some(_) => self.add_toast(&format!("Removed: {}", key)),
-                    None => self.add_system_message(&format!("Key not found: {}", key)),
+                    Ok(Some(_)) => self.add_toast(&format!("Removed: {}", key)),
+                    Ok(None) => self.add_system_message(&format!("Key not found: {}", key)),
+                    Err(error) => {
+                        self.add_system_message(&format!("Context removal failed: {}", error))
+                    }
                 }
             }
             Some(other) => {

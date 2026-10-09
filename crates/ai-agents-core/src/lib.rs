@@ -11,7 +11,7 @@ pub mod types;
 
 pub use dot_path::{get_dot_path, get_dot_path_from_map, set_dot_path};
 pub use error::{AgentError, Result};
-pub use message::{ChatMessage, Role};
+pub use message::{ChatMessage, MessageProvenance, Role};
 pub use native_history::{
     MAX_NATIVE_PROVIDER_STATE_BYTES, NATIVE_PROVIDER_STATE_METADATA_KEY,
     NATIVE_PROVIDER_STATE_VERSION, NATIVE_TOOL_CALL_MARKER_KEY, NATIVE_TOOL_RESULT_MARKER_KEY,

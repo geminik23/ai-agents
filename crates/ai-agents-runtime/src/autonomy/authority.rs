@@ -214,6 +214,17 @@ pub(crate) async fn invoke_bound(
         .await
 }
 
+// A live controller scope must match the permit's current run/revision; independent host SDK observations retain their existing contract.
+fn live_validation_authority(permit: &HostValidationPermit) -> bool {
+    super::current_execution().is_none_or(|execution| {
+        permit.run_id == execution.run_id
+            && permit.run_revision
+                == execution
+                    .revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
 /// Returns only the execution-specific ordinary-grant replacement, never a provider-visible tool list.
 pub(crate) fn validation_extra_grant(
     agent_id: &str,
@@ -223,7 +234,8 @@ pub(crate) fn validation_extra_grant(
 ) -> Option<String> {
     HOST_VALIDATION_PERMIT
         .try_with(|permit| {
-            (permit.agent_id == agent_id
+            (live_validation_authority(permit)
+                && permit.agent_id == agent_id
                 && permit.request.call_id == request.call_id
                 && matches!(request.source, ToolCallSource::Task)
                 && permit.binding.tool == canonical
@@ -245,7 +257,9 @@ pub(crate) fn validation_arguments_valid(
         .try_with(|permit| {
             permit.agent_id != agent_id
                 || permit.request.call_id != request.call_id
-                || (permit.binding.tool == canonical && permit.binding.arguments == *arguments)
+                || (live_validation_authority(permit)
+                    && permit.binding.tool == canonical
+                    && permit.binding.arguments == *arguments)
         })
         .unwrap_or(true)
 }

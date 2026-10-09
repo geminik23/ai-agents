@@ -18,7 +18,7 @@ Fixed framework-owned objects reject unknown fields. Misspelled top-level and ne
 
 ## Development-only autonomy configuration
 
-The development tree accepts typed `autonomy` profiles and named validation/progress adapters. These are not the published 1.1.1 YAML execution contract: **the autonomous runner is not installed, and enabled autonomy still fails agent construction**. See [development Rust integration](@/docs/rust-api.md#completion-validation-and-progress-development-only) for the evaluator/storage boundaries.
+The development tree accepts typed `autonomy` profiles and named validation/progress adapters. These are not the published 1.1.1 YAML execution contract: **the complete task controller integration is unfinished, and enabled autonomy still fails agent construction**. A restricted explicit Rust development runner does not activate YAML task execution. See [development Rust integration](@/docs/rust-api.md#completion-validation-and-progress-development-only) for the evaluator/storage boundaries.
 
 Within a development `validation.checks` entry, `max_evaluation_rounds` is an optional positive integer up to 32 (default 32), and `max_observations_per_round` is an optional positive integer up to 16 (default 16). They bound callback reentry and observation batches respectively and are intersected with host ceilings. A named binding's `contract_version` defaults to 1, not the newest registered version. Custom adapter configuration is schema-validated by its installed host implementation; YAML selects authority bindings but cannot create them.
 

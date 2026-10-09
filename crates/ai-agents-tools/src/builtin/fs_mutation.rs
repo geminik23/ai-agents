@@ -212,6 +212,23 @@ impl MutationPolicySnapshot {
 
 #[async_trait]
 impl Tool for FileWriteTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: FileWriteInput = serde_json::from_value(args.clone())?;
+        footprint_single(
+            self.id(),
+            Path::new(&input.path),
+            input.dry_run,
+            false,
+            input.create_parent_dirs,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "file_write"
     }
@@ -351,6 +368,23 @@ impl Tool for FileWriteTool {
 
 #[async_trait]
 impl Tool for FileEditTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: FileEditInput = serde_json::from_value(args.clone())?;
+        footprint_single(
+            self.id(),
+            Path::new(&input.path),
+            input.dry_run,
+            false,
+            false,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "file_edit"
     }
@@ -502,6 +536,33 @@ impl Tool for FileEditTool {
 
 #[async_trait]
 impl Tool for PatchTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: PatchInput = serde_json::from_value(args.clone())?;
+        if input.dry_run {
+            return Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                "builtin.patch.v1",
+            )));
+        }
+        let files = parse_unified_diff(&input.patch).map_err(ai_agents_core::AgentError::Tool)?;
+        let base = PathBuf::from(input.base_path.unwrap_or_else(|| ".".into()));
+        let mut targets = std::collections::BTreeSet::new();
+        for file in files {
+            let path = base.join(strip_patch_prefix(file.target_path()));
+            add_footprint_entry(&path, &mut targets, max_targets)?;
+            if MutationPolicySnapshot::from_context(&ctx.policy_snapshot).create_parent_dirs {
+                add_footprint_parents(&path, &mut targets, max_targets)?;
+            }
+        }
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint {
+            binding_identity: "builtin.patch.v1".into(),
+            targets: targets.into_iter().collect(),
+        }))
+    }
     fn id(&self) -> &str {
         "patch"
     }
@@ -1652,6 +1713,24 @@ struct PathMutationOutput {
 
 #[async_trait]
 impl Tool for CopyPathTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: CopyPathInput = serde_json::from_value(args.clone())?;
+        footprint_transfer(
+            self.id(),
+            Path::new(&input.source_path),
+            Path::new(&input.destination_path),
+            input.dry_run,
+            false,
+            input.create_parent_dirs,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "copy_path"
     }
@@ -1816,6 +1895,24 @@ impl Tool for CopyPathTool {
 
 #[async_trait]
 impl Tool for MovePathTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: MovePathInput = serde_json::from_value(args.clone())?;
+        footprint_transfer(
+            self.id(),
+            Path::new(&input.source_path),
+            Path::new(&input.destination_path),
+            input.dry_run,
+            true,
+            input.create_parent_dirs,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "move_path"
     }
@@ -1991,6 +2088,23 @@ impl Tool for MovePathTool {
 
 #[async_trait]
 impl Tool for DeletePathTool {
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        _ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        let input: DeletePathInput = serde_json::from_value(args.clone())?;
+        footprint_single(
+            self.id(),
+            Path::new(&input.path),
+            input.dry_run,
+            true,
+            false,
+            max_targets,
+        )
+        .map(Some)
+    }
     fn id(&self) -> &str {
         "delete_path"
     }
@@ -2344,6 +2458,165 @@ fn path_item_count(path: &Path) -> std::io::Result<usize> {
     } else {
         Ok(1)
     }
+}
+
+/// Entry mutations resolve the parent but never follow the leaf; two links to one referent remain distinct targets.
+pub(super) fn add_footprint_entry(
+    path: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    let resolved = footprint_entry_path(path)?;
+    add_footprint_identity(&resolved, targets, limit)
+}
+
+// Parent resolution is shared with policy, while the leaf remains an operation-owned entry.
+fn footprint_entry_path(path: &Path) -> ai_agents_core::Result<PathBuf> {
+    validate_safe_target(path).map_err(ai_agents_core::AgentError::Tool)?;
+    let name = path.file_name().ok_or_else(|| {
+        ai_agents_core::AgentError::Tool("footprint cannot mutate a filesystem root".into())
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let resolver = mutation_path_resolver().map_err(ai_agents_core::AgentError::Tool)?;
+    let resolved = resolver
+        .resolve_path(parent)
+        .map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?
+        .join(name);
+    Ok(resolved)
+}
+
+// Projected replacement descendants must not resolve through the old tree's symlinks.
+fn add_footprint_identity(
+    resolved: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    targets.insert(serde_json::to_string(resolved)?);
+    if targets.len() > limit {
+        return Err(ai_agents_core::AgentError::Tool(
+            "declared footprint exceeds target bound".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Missing parent creations are logical writes even when the leaf operation later fails.
+pub(super) fn add_footprint_parents(
+    path: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    let mut parent = path.parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(path) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                add_footprint_entry(path, targets, limit)?
+            }
+            Err(error) => return Err(ai_agents_core::AgentError::Tool(error.to_string())),
+        }
+        parent = path.parent();
+    }
+    Ok(())
+}
+
+/// Bounded traversal does not follow symbolic links and includes directory entries and overwritten descendants.
+fn add_footprint_tree(
+    path: &Path,
+    mapped: &Path,
+    targets: &mut std::collections::BTreeSet<String>,
+    limit: usize,
+) -> ai_agents_core::Result<()> {
+    let mut stack = vec![(path.to_path_buf(), footprint_entry_path(mapped)?)];
+    while let Some((path, mapped)) = stack.pop() {
+        add_footprint_identity(&mapped, targets, limit)?;
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(ai_agents_core::AgentError::Tool(error.to_string())),
+        };
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            for child in fs::read_dir(path)
+                .map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?
+            {
+                let child =
+                    child.map_err(|error| ai_agents_core::AgentError::Tool(error.to_string()))?;
+                // Bound queued enumeration as well as the final union so one directory cannot hide unbounded allocation.
+                if stack.len() >= limit {
+                    return Err(ai_agents_core::AgentError::Tool(
+                        "recursive footprint exceeds target bound".into(),
+                    ));
+                }
+                stack.push((child.path(), mapped.join(child.file_name())));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn footprint_single(
+    id: &str,
+    path: &Path,
+    preview: bool,
+    recursive: bool,
+    parents: bool,
+    limit: usize,
+) -> ai_agents_core::Result<ai_agents_core::autonomy::ToolWriteFootprint> {
+    let binding_identity = format!("builtin.{id}.v1");
+    if preview {
+        return Ok(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            binding_identity,
+        ));
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    if recursive {
+        add_footprint_tree(path, path, &mut targets, limit)?;
+    } else {
+        add_footprint_entry(path, &mut targets, limit)?;
+    }
+    if parents {
+        add_footprint_parents(path, &mut targets, limit)?;
+    }
+    Ok(ai_agents_core::autonomy::ToolWriteFootprint {
+        binding_identity,
+        targets: targets.into_iter().collect(),
+    })
+}
+
+fn footprint_transfer(
+    id: &str,
+    source: &Path,
+    destination: &Path,
+    preview: bool,
+    moving: bool,
+    parents: bool,
+    limit: usize,
+) -> ai_agents_core::Result<ai_agents_core::autonomy::ToolWriteFootprint> {
+    let binding_identity = format!("builtin.{id}.v1");
+    if preview {
+        return Ok(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            binding_identity,
+        ));
+    }
+    let mut targets = std::collections::BTreeSet::new();
+    add_footprint_tree(destination, destination, &mut targets, limit)?;
+    add_footprint_tree(source, destination, &mut targets, limit)?;
+    if moving {
+        add_footprint_tree(source, source, &mut targets, limit)?;
+    }
+    if parents {
+        add_footprint_parents(destination, &mut targets, limit)?;
+    }
+    Ok(ai_agents_core::autonomy::ToolWriteFootprint {
+        binding_identity,
+        targets: targets.into_iter().collect(),
+    })
 }
 
 #[cfg(test)]

@@ -11,6 +11,7 @@ use super::capability::DefaultLLMCapability;
 #[derive(Clone)]
 pub struct MultiLLMRouter {
     primary: Arc<dyn LLMProvider>,
+    primary_binding: Arc<dyn LLMProvider>,
     tool_selector: Option<Arc<dyn LLMProvider>>,
     guard_evaluator: Option<Arc<dyn LLMProvider>>,
     classifier: Option<Arc<dyn LLMProvider>>,
@@ -20,7 +21,8 @@ pub struct MultiLLMRouter {
 impl MultiLLMRouter {
     pub fn new(primary: Arc<dyn LLMProvider>) -> Self {
         Self {
-            primary,
+            primary_binding: primary.clone(),
+            primary: crate::managed_provider(primary),
             tool_selector: None,
             guard_evaluator: None,
             classifier: None,
@@ -29,23 +31,32 @@ impl MultiLLMRouter {
     }
 
     pub fn with_tool_selector(mut self, provider: Arc<dyn LLMProvider>) -> Self {
-        self.tool_selector = Some(provider);
+        self.tool_selector = Some(self.managed_override(provider));
         self
     }
 
     pub fn with_guard_evaluator(mut self, provider: Arc<dyn LLMProvider>) -> Self {
-        self.guard_evaluator = Some(provider);
+        self.guard_evaluator = Some(self.managed_override(provider));
         self
     }
 
     pub fn with_classifier(mut self, provider: Arc<dyn LLMProvider>) -> Self {
-        self.classifier = Some(provider);
+        self.classifier = Some(self.managed_override(provider));
         self
     }
 
     pub fn with_fallback(mut self, enable: bool) -> Self {
         self.enable_fallback = enable;
         self
+    }
+
+    // Preserve same-provider identity so wrapping does not introduce a retry through the primary itself.
+    fn managed_override(&self, provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> {
+        if Arc::ptr_eq(&provider, &self.primary_binding) {
+            self.primary.clone()
+        } else {
+            crate::managed_provider(provider)
+        }
     }
 
     fn get_tool_selector(&self) -> Arc<dyn LLMProvider> {
@@ -125,6 +136,22 @@ impl LLMProvider for MultiLLMRouter {
     ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
     {
         self.primary.complete_stream(messages, config).await
+    }
+
+    fn manages_invocation_admission(&self) -> bool {
+        true
+    }
+
+    /// Every reachable routed implementation must declare priced participation before a hard-priced run begins.
+    fn priced_capability_identity(&self) -> Option<String> {
+        let mut identities = vec![self.primary.priced_capability_identity()?];
+        for provider in [&self.tool_selector, &self.guard_evaluator, &self.classifier]
+            .into_iter()
+            .flatten()
+        {
+            identities.push(provider.priced_capability_identity()?);
+        }
+        Some(identities.join("|"))
     }
 
     fn provider_name(&self) -> &str {
@@ -455,6 +482,7 @@ mod tests {
         let router = MultiLLMRouter::new(Arc::new(primary));
 
         let messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::User,
             content: "Test".to_string(),
@@ -571,6 +599,7 @@ mod tests {
         let router = MultiLLMRouter::new(Arc::new(primary)).with_fallback(true);
 
         let messages = vec![ChatMessage {
+            provenance: None,
             timestamp: None,
             role: Role::User,
             content: "Test".to_string(),

@@ -13,8 +13,17 @@ pub enum Role {
     Function,
 }
 
+/// Controller-derived history remains available for provider replay, but is not actor-memory evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MessageProvenance {
+    pub run_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<MessageProvenance>,
     pub role: Role,
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -26,6 +35,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::System,
             content: content.into(),
             name: None,
@@ -35,6 +45,7 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::User,
             content: content.into(),
             name: None,
@@ -44,6 +55,7 @@ impl ChatMessage {
 
     pub fn assistant(content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Assistant,
             content: content.into(),
             name: None,
@@ -53,6 +65,7 @@ impl ChatMessage {
 
     pub fn tool(name: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Tool,
             content: content.into(),
             name: Some(name.into()),
@@ -62,6 +75,7 @@ impl ChatMessage {
 
     pub fn function(name: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
+            provenance: None,
             role: Role::Function,
             content: content.into(),
             name: Some(name.into()),

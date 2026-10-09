@@ -11,11 +11,12 @@ use std::sync::{
 
 /// One validation owner journals under the existing task claim and shares its latest revision with execution evidence.
 pub struct TaskValidationJournal {
-    store: Arc<ScopedTaskRunStore>,
+    store: Arc<dyn TaskRunStore>,
     run_id: String,
     owner_token: String,
     revision: Arc<AtomicU64>,
-    serial: tokio::sync::Mutex<()>,
+    serial: Arc<tokio::sync::Mutex<()>>,
+    invocation_accounting: bool,
 }
 
 impl TaskValidationJournal {
@@ -31,9 +32,22 @@ impl TaskValidationJournal {
             run_id,
             owner_token,
             revision: Arc::new(AtomicU64::new(revision)),
-            serial: tokio::sync::Mutex::new(()),
+            serial: Arc::new(tokio::sync::Mutex::new(())),
+            invocation_accounting: false,
         }
     }
+    /// The controller journal shares revision and serialization with actual provider/tool admission.
+    pub(crate) fn for_execution(execution: &Arc<RunExecution>) -> Self {
+        Self {
+            store: execution.store.clone(),
+            run_id: execution.run_id.clone(),
+            owner_token: execution.owner_token.clone(),
+            revision: execution.revision.clone(),
+            serial: execution.serial.clone(),
+            invocation_accounting: true,
+        }
+    }
+
     /// Invocation evidence uses the acknowledged revision, not a stale attempt-start revision.
     pub fn revision_handle(&self) -> Arc<AtomicU64> {
         self.revision.clone()
@@ -55,6 +69,11 @@ impl ValidationJournal for TaskValidationJournal {
     /// Checkpoint failure stops before dispatch, while a saved in-flight record remains crash-uncertain.
     async fn checkpoint(&self, state: &ValidationDriverState) -> Result<()> {
         let _serial = self.serial.lock().await;
+        let execution = super::current_execution()
+            .filter(|run| self.invocation_accounting && Arc::ptr_eq(&run.revision, &self.revision));
+        if let Some(execution) = &execution {
+            execution.load_owned().await?;
+        }
         let current = self
             .store
             .load(&self.run_id)
@@ -63,7 +82,8 @@ impl ValidationJournal for TaskValidationJournal {
         if current.revision != self.revision.load(Ordering::Acquire)
             || current.status != TaskRunStatus::Running
             || current.owner_token.as_deref() != Some(&self.owner_token)
-            || current.cancel_requested
+            || (current.cancel_requested
+                && (!self.invocation_accounting || state.in_flight.is_some()))
             || current.key != state.identity.key
         {
             return Err(AgentError::Persistence(
@@ -116,47 +136,54 @@ impl ValidationJournal for TaskValidationJournal {
                 let request = state.requests.get(id).ok_or_else(|| {
                     AgentError::Config("journal observation request missing".into())
                 })?;
-                match request {
-                    ValidationObservationRequest::Tool { tool, .. } => {
-                        payload.counters.tool_attempts = payload
-                            .counters
-                            .tool_attempts
-                            .checked_add(1)
-                            .ok_or_else(|| AgentError::Config("tool counter overflow".into()))?;
-                        if payload.counters.tool_attempts > u64::from(payload.limits.max_tool_calls)
-                        {
-                            return Err(AgentError::Config(
-                                "validation tool capacity exhausted".into(),
-                            ));
-                        }
-                        if tool == "command" {
-                            payload.counters.command_attempts = payload
+                if !self.invocation_accounting {
+                    match request {
+                        ValidationObservationRequest::Tool { tool, .. } => {
+                            payload.counters.tool_attempts = payload
                                 .counters
-                                .command_attempts
+                                .tool_attempts
                                 .checked_add(1)
                                 .ok_or_else(|| {
-                                    AgentError::Config("command counter overflow".into())
+                                    AgentError::Config("tool counter overflow".into())
                                 })?;
-                            if payload.counters.command_attempts
-                                > u64::from(payload.limits.max_command_calls)
+                            if payload.counters.tool_attempts
+                                > u64::from(payload.limits.max_tool_calls)
                             {
                                 return Err(AgentError::Config(
-                                    "validation command capacity exhausted".into(),
+                                    "validation tool capacity exhausted".into(),
                                 ));
                             }
+                            if tool == "command" {
+                                payload.counters.command_attempts = payload
+                                    .counters
+                                    .command_attempts
+                                    .checked_add(1)
+                                    .ok_or_else(|| {
+                                        AgentError::Config("command counter overflow".into())
+                                    })?;
+                                if payload.counters.command_attempts
+                                    > u64::from(payload.limits.max_command_calls)
+                                {
+                                    return Err(AgentError::Config(
+                                        "validation command capacity exhausted".into(),
+                                    ));
+                                }
+                            }
                         }
-                    }
-                    ValidationObservationRequest::Judge { .. }
-                    | ValidationObservationRequest::Plan { .. } => {
-                        payload.counters.llm_attempts = payload
-                            .counters
-                            .llm_attempts
-                            .checked_add(1)
-                            .ok_or_else(|| AgentError::Config("LLM counter overflow".into()))?;
-                        if payload.counters.llm_attempts > u64::from(payload.limits.max_llm_calls) {
-                            return Err(AgentError::Config(
-                                "validation judge capacity exhausted".into(),
-                            ));
+                        ValidationObservationRequest::Judge { .. }
+                        | ValidationObservationRequest::Plan { .. } => {
+                            payload.counters.llm_attempts = payload
+                                .counters
+                                .llm_attempts
+                                .checked_add(1)
+                                .ok_or_else(|| AgentError::Config("LLM counter overflow".into()))?;
+                            if payload.counters.llm_attempts
+                                > u64::from(payload.limits.max_llm_calls)
+                            {
+                                return Err(AgentError::Config(
+                                    "validation judge capacity exhausted".into(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -244,6 +271,9 @@ impl ValidationJournal for TaskValidationJournal {
             )
             .await?;
         self.revision.store(saved.revision, Ordering::Release);
+        if let Some(execution) = &execution {
+            execution.acknowledge_snapshot(&saved);
+        }
         Ok(())
     }
 }

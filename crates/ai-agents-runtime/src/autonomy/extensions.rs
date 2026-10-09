@@ -190,6 +190,38 @@ impl BoundAutonomyProfile {
         ))
     }
 
+    /// A stage requires only global and current-stage checks, never a future stage's unavailable proof.
+    pub fn required_stage_outcome(
+        &self,
+        scope: &EvaluationScope,
+        evidence: &EvaluationEvidence,
+    ) -> Result<super::GateOutcome> {
+        let evidence = evidence.normalized()?;
+        let required: Vec<_> = self
+            .checks
+            .iter()
+            .filter(|check| {
+                check.check.required.unwrap_or(true)
+                    && check
+                        .stage
+                        .as_ref()
+                        .is_none_or(|stage| scope.stage.as_ref() == Some(stage))
+            })
+            .collect();
+        if required.is_empty() {
+            return Ok(super::GateOutcome::Pass);
+        }
+        Ok(super::GateOutcome::all(
+            &required
+                .iter()
+                .map(|check| {
+                    super::latest_validation(&evidence.validations, &check.check.id, scope)
+                        .map_or(super::GateOutcome::Unknown, |result| result.outcome)
+                })
+                .collect::<Vec<_>>(),
+        ))
+    }
+
     /// Supplies frozen binding identities; the host explicitly selects validation attempt identities.
     pub fn prepare_scope(&self, scope: &mut EvaluationScope) {
         scope.validation_bindings = self

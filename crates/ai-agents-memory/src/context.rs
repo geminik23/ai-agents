@@ -86,6 +86,7 @@ impl ConversationContext {
 
         if let Some(ref summary) = self.summary {
             result.push(ChatMessage {
+                provenance: None,
                 role: Role::System,
                 content: format!("[Previous conversation summary]\n{}", summary),
                 name: None,
@@ -124,6 +125,7 @@ impl ConversationContext {
             };
 
             result.push(ChatMessage {
+                provenance: None,
                 role: Role::System,
                 content: final_content,
                 name: None,
@@ -151,6 +153,7 @@ impl ConversationContext {
 
         if let Some(ref summary) = self.summary {
             let summary_msg = ChatMessage {
+                provenance: None,
                 role: Role::System,
                 content: format!("[Previous conversation summary]\n{}", summary),
                 name: None,
@@ -252,6 +255,7 @@ mod tests {
 
     fn make_message(role: Role, content: &str) -> ChatMessage {
         ChatMessage {
+            provenance: None,
             role,
             content: content.to_string(),
             name: None,

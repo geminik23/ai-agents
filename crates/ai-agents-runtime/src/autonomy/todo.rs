@@ -84,6 +84,14 @@ impl RunTodoAdapter {
         })
     }
 
+    /// Installs the selected profile's growth bound on the same canonical store used by the tool.
+    pub(crate) fn set_open_limit(&self, limit: Option<u32>) -> Result<()> {
+        if !self.store.set_run_open_limit(&self.binding, limit) {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        Ok(())
+    }
+
     /// Empty, cleared and entirely cancelled lists cannot establish successful progress.
     pub fn all_done(&self) -> Result<bool> {
         let items = self.checkpoint()?.items;
