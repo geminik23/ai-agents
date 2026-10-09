@@ -989,44 +989,86 @@ mod tests {
     #[cfg(feature = "redis-storage")]
     #[tokio::test]
     #[ignore = "requires a Redis service"]
+    // Bound the service wait and preserve parent/sibling data while migrating legacy child keys.
     async fn redis_legacy_session_keys_are_read_migrated_preferred_and_deleted() {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".into());
+        let url = std::env::var("REDIS_URL").expect("service test requires explicit REDIS_URL");
         let prefix = format!("ai-agents-namespace-test:{}:", uuid::Uuid::new_v4());
         let inner = Arc::new(
             ai_agents_storage::RedisStorage::new(&url)
                 .unwrap()
                 .with_prefix(prefix),
         );
-        let storage = NamespacedStorage::new(inner.clone(), "child");
-        let legacy_key = "child/legacy";
-        inner
-            .save(legacy_key, &AgentSnapshot::new("legacy-agent".into()))
-            .await
-            .unwrap();
+        let task_inner = inner.clone();
+        let mut task = tokio::spawn(async move {
+            let inner = task_inner;
+            let storage = NamespacedStorage::new(inner.clone(), "child");
+            let legacy_key = "child/legacy";
+            inner
+                .save(legacy_key, &AgentSnapshot::new("legacy-agent".into()))
+                .await
+                .unwrap();
 
-        assert_eq!(
-            storage.load("legacy").await.unwrap().unwrap().agent_id,
-            "legacy-agent"
-        );
-        assert_eq!(storage.list_sessions().await.unwrap(), vec!["legacy"]);
+            assert_eq!(
+                storage.load("legacy").await.unwrap().unwrap().agent_id,
+                "legacy-agent"
+            );
+            assert_eq!(storage.list_sessions().await.unwrap(), vec!["legacy"]);
 
-        storage
-            .save("legacy", &AgentSnapshot::new("current-agent".into()))
-            .await
-            .unwrap();
-        assert!(inner.load(legacy_key).await.unwrap().is_none());
-        inner
-            .save(legacy_key, &AgentSnapshot::new("stale-agent".into()))
-            .await
-            .unwrap();
-        assert_eq!(
-            storage.load("legacy").await.unwrap().unwrap().agent_id,
-            "current-agent"
-        );
+            storage
+                .save("legacy", &AgentSnapshot::new("current-agent".into()))
+                .await
+                .unwrap();
+            assert!(inner.load(legacy_key).await.unwrap().is_none());
+            inner
+                .save(legacy_key, &AgentSnapshot::new("stale-agent".into()))
+                .await
+                .unwrap();
+            assert_eq!(
+                storage.load("legacy").await.unwrap().unwrap().agent_id,
+                "current-agent"
+            );
 
-        storage.delete("legacy").await.unwrap();
-        assert!(storage.load("legacy").await.unwrap().is_none());
-        assert!(inner.load(legacy_key).await.unwrap().is_none());
+            let sibling = NamespacedStorage::new(inner.clone(), "sibling");
+            sibling
+                .save("legacy", &AgentSnapshot::new("sibling-agent".into()))
+                .await
+                .unwrap();
+            inner
+                .save("parent-session", &AgentSnapshot::new("parent-agent".into()))
+                .await
+                .unwrap();
+            assert_eq!(storage.list_sessions().await.unwrap(), vec!["legacy"]);
+            assert_eq!(sibling.list_sessions().await.unwrap(), vec!["legacy"]);
+            assert_eq!(
+                sibling.load("legacy").await.unwrap().unwrap().agent_id,
+                "sibling-agent"
+            );
+            storage.delete("legacy").await.unwrap();
+            assert!(sibling.load("legacy").await.unwrap().is_some());
+            assert!(inner.load("parent-session").await.unwrap().is_some());
+            sibling.delete("legacy").await.unwrap();
+            inner.delete("parent-session").await.unwrap();
+            assert!(storage.load("legacy").await.unwrap().is_none());
+            assert!(inner.load(legacy_key).await.unwrap().is_none());
+        });
+        let result = tokio::time::timeout(std::time::Duration::from_secs(20), &mut task).await;
+        if result.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+        // Cleanup only our known keys even if a namespace assertion panics.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let child = NamespacedStorage::new(inner.clone(), "child");
+            let sibling = NamespacedStorage::new(inner.clone(), "sibling");
+            child.delete("legacy").await.unwrap();
+            sibling.delete("legacy").await.unwrap();
+            inner.delete("parent-session").await.unwrap();
+        })
+        .await
+        .expect("namespace cleanup timed out");
+        result
+            .expect("namespace service test timed out")
+            .expect("namespace service test failed");
     }
 
     #[tokio::test]

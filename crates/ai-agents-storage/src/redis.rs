@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::StorageCapability;
 use crate::{AgentError, AgentSnapshot, AgentStorage, Result};
 
+/// Backend-native snapshot bookkeeping, not generic session metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedisSessionMeta {
     pub agent_id: String,
@@ -18,6 +19,8 @@ pub struct RedisSessionMeta {
 }
 
 #[cfg(feature = "redis-storage")]
+/// Experimental snapshot storage for a single writable Redis server.
+/// Each operation opens a connection; callers own deadlines and uncertain-write recovery.
 pub struct RedisStorage {
     client: redis::Client,
     prefix: String,
@@ -39,7 +42,7 @@ local session_id = ARGV[2]
 local agent_index_prefix = ARGV[3]
 local permanent_score = tonumber(ARGV[4])
 
-if operation ~= 'save' and operation ~= 'delete' and operation ~= 'set_ttl' then
+if operation ~= 'save' and operation ~= 'delete' and operation ~= 'set_ttl' and operation ~= 'delete_if_unchanged' then
     return redis.error_reply('unsupported session mutation')
 end
 if operation == 'set_ttl' and redis.call('EXISTS', KEYS[1]) == 0 then
@@ -61,6 +64,13 @@ local function decode_meta(json)
         return nil
     end
     return meta
+end
+
+-- Check both raw values before any migration or write; a changed observation is a harmless skip.
+if operation == 'delete_if_unchanged' then
+    if redis.call('GET', KEYS[1]) ~= ARGV[8] or redis.call('GET', KEYS[2]) ~= ARGV[6] then
+        return 0
+    end
 end
 
 local previous_meta_json = redis.call('GET', KEYS[2])
@@ -149,7 +159,7 @@ if current_agent_index ~= previous_agent_index then
     migrate_index(current_agent_index)
 end
 
-if operation == 'delete' then
+if operation == 'delete' or operation == 'delete_if_unchanged' then
     redis.call('DEL', KEYS[1], KEYS[2])
     redis.call('ZREM', KEYS[3], session_id)
     if previous_agent_index then
@@ -196,6 +206,7 @@ return redis.error_reply('unreachable session mutation')
 
 #[cfg(feature = "redis-storage")]
 impl RedisStorage {
+    /// Parses the URL without contacting Redis; connectivity is checked by each operation.
     pub fn new(url: &str) -> Result<Self> {
         let client = redis::Client::open(url).map_err(map_redis_err)?;
         Ok(Self {
@@ -205,11 +216,14 @@ impl RedisStorage {
         })
     }
 
+    /// Selects a key namespace, which is not an access-control boundary.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
 
+    /// Sets the save-time TTL for snapshot and native metadata keys.
+    /// Zero and out-of-range deadlines fail at save time without replacing valid data.
     pub fn with_ttl(mut self, ttl_seconds: u64) -> Self {
         self.default_ttl = Some(ttl_seconds);
         self
@@ -261,6 +275,7 @@ impl RedisStorage {
         .map_err(map_redis_err)
     }
 
+    // The client default has no configured deadline; operation callers must bound their waits.
     async fn get_connection(&self) -> Result<redis::aio::MultiplexedConnection> {
         self.client
             .get_multiplexed_async_connection()
@@ -407,6 +422,7 @@ impl AgentStorage for RedisStorage {
 
 #[cfg(feature = "redis-storage")]
 impl RedisStorage {
+    /// Lists this agent's snapshots and lazily removes stale ownership entries.
     pub async fn list_sessions_by_agent(&self, agent_id: &str) -> Result<Vec<String>> {
         let mut conn = self.get_connection().await?;
         let agent_index = self.agent_index_key(agent_id);
@@ -452,6 +468,7 @@ impl RedisStorage {
         .map_err(map_redis_err)
     }
 
+    /// Checks key existence, not payload validity or index consistency.
     pub async fn exists(&self, session_id: &str) -> Result<bool> {
         let mut conn = self.get_connection().await?;
         let session_key = self.session_key(session_id);
@@ -465,6 +482,8 @@ impl RedisStorage {
         Ok(exists)
     }
 
+    /// Retimes both keys and indexes; zero deletes an existing, valid session.
+    /// A missing snapshot is a no-op, while missing or malformed metadata fails closed.
     pub async fn set_ttl(&self, session_id: &str, ttl_seconds: u64) -> Result<()> {
         let mut conn = self.get_connection().await?;
         let session_key = self.session_key(session_id);
@@ -488,6 +507,7 @@ impl RedisStorage {
             .map_err(map_redis_err)
     }
 
+    /// Reads Redis-native bookkeeping; missing and malformed values remain distinct.
     pub async fn get_meta(&self, session_id: &str) -> Result<Option<RedisSessionMeta>> {
         let mut conn = self.get_connection().await?;
         let meta_key = self.meta_key(session_id);
@@ -508,21 +528,69 @@ impl RedisStorage {
         }
     }
 
+    /// Deletes old snapshots only while their observed payload and metadata still match Redis.
+    /// This backend-native sweep does not implement the generic expiry-cleanup capability.
     pub async fn expire_sessions(&self, before: DateTime<Utc>) -> Result<usize> {
         let sessions = self.list_sessions().await?;
         let mut deleted = 0;
 
         for session_id in sessions {
-            if let Some(meta) = self.get_meta(&session_id).await?
-                && let Ok(updated_at) = DateTime::parse_from_rfc3339(&meta.updated_at)
+            let (snapshot, metadata) = self.load_raw_session(&session_id).await?;
+            let (Some(snapshot), Some(metadata)) = (snapshot, metadata) else {
+                continue;
+            };
+            let meta: RedisSessionMeta = serde_json::from_str(&metadata)
+                .map_err(|e| AgentError::Persistence(e.to_string()))?;
+            if let Ok(updated_at) = DateTime::parse_from_rfc3339(&meta.updated_at)
                 && updated_at.with_timezone(&Utc) < before
+                && self
+                    .delete_if_unchanged(&session_id, &snapshot, &metadata)
+                    .await?
             {
-                self.delete(&session_id).await?;
                 deleted += 1;
             }
         }
 
         Ok(deleted)
+    }
+
+    // Read both keys atomically, preserving wrong-type errors rather than treating corruption as missing.
+    async fn load_raw_session(&self, session_id: &str) -> Result<(Option<String>, Option<String>)> {
+        let mut connection = self.get_connection().await?;
+        redis::pipe()
+            .atomic()
+            .cmd("GET")
+            .arg(self.session_key(session_id))
+            .cmd("GET")
+            .arg(self.meta_key(session_id))
+            .query_async(&mut connection)
+            .await
+            .map_err(map_redis_err)
+    }
+
+    // The deletion boundary must reject a newer payload even when its timestamp is unchanged.
+    async fn delete_if_unchanged(
+        &self,
+        session_id: &str,
+        snapshot: &str,
+        metadata: &str,
+    ) -> Result<bool> {
+        let mut connection = self.get_connection().await?;
+        redis::Script::new(MUTATE_SESSION_SCRIPT)
+            .key(self.session_key(session_id))
+            .key(self.meta_key(session_id))
+            .key(self.sessions_index_key())
+            .arg("delete_if_unchanged")
+            .arg(session_id)
+            .arg(format!("{}agent_sessions:", self.prefix))
+            .arg(PERMANENT_EXPIRY_SCORE)
+            .arg("")
+            .arg(metadata)
+            .arg("")
+            .arg(snapshot)
+            .invoke_async::<bool>(&mut connection)
+            .await
+            .map_err(map_redis_err)
     }
 }
 
@@ -570,317 +638,335 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a Redis service"]
     async fn indexes_repair_ttl_delete_and_agent_reassignment() {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
-        let prefix = format!("ai-agents-test:{}:", uuid::Uuid::new_v4());
-        let storage = RedisStorage::new(&url).unwrap().with_prefix(&prefix);
-        storage
-            .save("session", &AgentSnapshot::new("agent-a".to_string()))
-            .await
-            .unwrap();
-        let mut connection = storage.get_connection().await.unwrap();
-        let global_type: String = redis::cmd("TYPE")
-            .arg(storage.sessions_index_key())
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        let agent_type: String = redis::cmd("TYPE")
-            .arg(storage.agent_index_key("agent-a"))
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert_eq!(global_type, "zset");
-        assert_eq!(agent_type, "zset");
-        assert_eq!(
-            storage.list_sessions_by_agent("agent-a").await.unwrap(),
-            vec!["session"]
-        );
-
-        storage
-            .save("session", &AgentSnapshot::new("agent-b".to_string()))
-            .await
-            .unwrap();
-        let old_owner_score: Option<f64> = redis::cmd("ZSCORE")
-            .arg(storage.agent_index_key("agent-a"))
-            .arg("session")
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        let new_owner_score: Option<f64> = redis::cmd("ZSCORE")
-            .arg(storage.agent_index_key("agent-b"))
-            .arg("session")
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert!(old_owner_score.is_none());
-        assert!(new_owner_score.is_some());
-        assert!(
+        super::service_tests::service_test(|storage| async move {
+            let url = std::env::var("REDIS_URL").unwrap();
+            let prefix = storage.prefix.clone();
             storage
-                .list_sessions_by_agent("agent-a")
+                .save("session", &AgentSnapshot::new("agent-a".to_string()))
                 .await
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            storage.list_sessions_by_agent("agent-b").await.unwrap(),
-            vec!["session"]
-        );
-
-        let concurrent_storage =
-            std::sync::Arc::new(RedisStorage::new(&url).unwrap().with_prefix(&prefix));
-        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(9));
-        let mut saves = Vec::new();
-        for index in 0..8 {
-            let storage = concurrent_storage.clone();
-            let barrier = barrier.clone();
-            saves.push(tokio::spawn(async move {
-                barrier.wait().await;
-                let agent_id = format!("concurrent-agent-{index}");
-                storage
-                    .save("concurrent", &AgentSnapshot::new(agent_id))
-                    .await
-                    .unwrap();
-            }));
-        }
-        barrier.wait().await;
-        for save in saves {
-            save.await.unwrap();
-        }
-        let owner = concurrent_storage
-            .get_meta("concurrent")
-            .await
-            .unwrap()
-            .unwrap()
-            .agent_id;
-        let mut raw_owner_count = 0;
-        for index in 0..8 {
-            let agent_id = format!("concurrent-agent-{index}");
-            let score: Option<f64> = redis::cmd("ZSCORE")
-                .arg(concurrent_storage.agent_index_key(&agent_id))
-                .arg("concurrent")
+                .unwrap();
+            let mut connection = storage.get_connection().await.unwrap();
+            let global_type: String = redis::cmd("TYPE")
+                .arg(storage.sessions_index_key())
                 .query_async(&mut connection)
                 .await
                 .unwrap();
-            if score.is_some() {
-                raw_owner_count += 1;
-                assert_eq!(agent_id, owner);
-            }
-        }
-        assert_eq!(raw_owner_count, 1);
-
-        for index in 0..8 {
-            let agent_id = format!("concurrent-agent-{index}");
-            let sessions = concurrent_storage
-                .list_sessions_by_agent(&agent_id)
+            let agent_type: String = redis::cmd("TYPE")
+                .arg(storage.agent_index_key("agent-a"))
+                .query_async(&mut connection)
                 .await
                 .unwrap();
-            if agent_id == owner {
-                assert_eq!(sessions, vec!["concurrent"]);
-            } else {
-                assert!(sessions.is_empty());
+            assert_eq!(global_type, "zset");
+            assert_eq!(agent_type, "zset");
+            assert_eq!(
+                storage.list_sessions_by_agent("agent-a").await.unwrap(),
+                vec!["session"]
+            );
+
+            storage
+                .save("session", &AgentSnapshot::new("agent-b".to_string()))
+                .await
+                .unwrap();
+            let old_owner_score: Option<f64> = redis::cmd("ZSCORE")
+                .arg(storage.agent_index_key("agent-a"))
+                .arg("session")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let new_owner_score: Option<f64> = redis::cmd("ZSCORE")
+                .arg(storage.agent_index_key("agent-b"))
+                .arg("session")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert!(old_owner_score.is_none());
+            assert!(new_owner_score.is_some());
+            assert!(
+                storage
+                    .list_sessions_by_agent("agent-a")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                storage.list_sessions_by_agent("agent-b").await.unwrap(),
+                vec!["session"]
+            );
+
+            let concurrent_storage =
+                std::sync::Arc::new(RedisStorage::new(&url).unwrap().with_prefix(&prefix));
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(9));
+            let mut saves = tokio::task::JoinSet::new();
+            for index in 0..8 {
+                let storage = concurrent_storage.clone();
+                let barrier = barrier.clone();
+                saves.spawn(async move {
+                    barrier.wait().await;
+                    let agent_id = format!("concurrent-agent-{index}");
+                    storage
+                        .save("concurrent", &AgentSnapshot::new(agent_id))
+                        .await
+                        .unwrap();
+                });
             }
-        }
-
-        storage.delete("session").await.unwrap();
-        concurrent_storage.delete("concurrent").await.unwrap();
-        assert!(storage.list_sessions().await.unwrap().is_empty());
-        assert!(
-            storage
-                .list_sessions_by_agent("agent-b")
+            barrier.wait().await;
+            while let Some(save) = saves.join_next().await {
+                save.unwrap();
+            }
+            let owner = concurrent_storage
+                .get_meta("concurrent")
                 .await
                 .unwrap()
-                .is_empty()
-        );
-
-        storage
-            .save("missing-meta", &AgentSnapshot::new("agent-e".to_string()))
-            .await
-            .unwrap();
-        redis::cmd("DEL")
-            .arg(storage.meta_key("missing-meta"))
-            .query_async::<()>(&mut connection)
-            .await
-            .unwrap();
-        assert!(storage.set_ttl("missing-meta", 60).await.is_err());
-        let missing_meta_ttl: i64 = redis::cmd("TTL")
-            .arg(storage.session_key("missing-meta"))
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert_eq!(missing_meta_ttl, -1);
-        storage.delete("missing-meta").await.unwrap();
-        assert!(
-            storage
-                .list_sessions_by_agent("agent-e")
-                .await
                 .unwrap()
-                .is_empty()
-        );
+                .agent_id;
+            let mut raw_owner_count = 0;
+            for index in 0..8 {
+                let agent_id = format!("concurrent-agent-{index}");
+                let score: Option<f64> = redis::cmd("ZSCORE")
+                    .arg(concurrent_storage.agent_index_key(&agent_id))
+                    .arg("concurrent")
+                    .query_async(&mut connection)
+                    .await
+                    .unwrap();
+                if score.is_some() {
+                    raw_owner_count += 1;
+                    assert_eq!(agent_id, owner);
+                }
+            }
+            assert_eq!(raw_owner_count, 1);
 
-        storage
-            .save("scalar-meta", &AgentSnapshot::new("agent-f".to_string()))
-            .await
-            .unwrap();
-        redis::cmd("SET")
-            .arg(storage.meta_key("scalar-meta"))
-            .arg("1")
-            .query_async::<()>(&mut connection)
-            .await
-            .unwrap();
-        assert!(
+            for index in 0..8 {
+                let agent_id = format!("concurrent-agent-{index}");
+                let sessions = concurrent_storage
+                    .list_sessions_by_agent(&agent_id)
+                    .await
+                    .unwrap();
+                if agent_id == owner {
+                    assert_eq!(sessions, vec!["concurrent"]);
+                } else {
+                    assert!(sessions.is_empty());
+                }
+            }
+
+            storage.delete("session").await.unwrap();
+            concurrent_storage.delete("concurrent").await.unwrap();
+            assert!(storage.list_sessions().await.unwrap().is_empty());
+            assert!(
+                storage
+                    .list_sessions_by_agent("agent-b")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
             storage
-                .list_sessions_by_agent("agent-f")
+                .save("missing-meta", &AgentSnapshot::new("agent-e".to_string()))
                 .await
+                .unwrap();
+            redis::cmd("DEL")
+                .arg(storage.meta_key("missing-meta"))
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+            assert!(storage.set_ttl("missing-meta", 60).await.is_err());
+            let missing_meta_ttl: i64 = redis::cmd("TTL")
+                .arg(storage.session_key("missing-meta"))
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert_eq!(missing_meta_ttl, -1);
+            storage.delete("missing-meta").await.unwrap();
+            assert!(
+                storage
+                    .list_sessions_by_agent("agent-e")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+
+            storage
+                .save("scalar-meta", &AgentSnapshot::new("agent-f".to_string()))
+                .await
+                .unwrap();
+            redis::cmd("SET")
+                .arg(storage.meta_key("scalar-meta"))
+                .arg("1")
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+            assert!(
+                storage
+                    .list_sessions_by_agent("agent-f")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            redis::cmd("DEL")
+                .arg(storage.meta_key("scalar-meta"))
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+            storage.delete("scalar-meta").await.unwrap();
+
+            let excessive_ttl = RedisStorage::new(&url)
                 .unwrap()
-                .is_empty()
-        );
-        redis::cmd("DEL")
-            .arg(storage.meta_key("scalar-meta"))
-            .query_async::<()>(&mut connection)
-            .await
-            .unwrap();
-        storage.delete("scalar-meta").await.unwrap();
-
-        let excessive_ttl = RedisStorage::new(&url)
-            .unwrap()
-            .with_prefix(&prefix)
-            .with_ttl(u64::MAX);
-        assert!(
-            excessive_ttl
-                .save("excessive-ttl", &AgentSnapshot::new("agent-g".to_string()))
+                .with_prefix(&prefix)
+                .with_ttl(u64::MAX);
+            assert!(
+                excessive_ttl
+                    .save("excessive-ttl", &AgentSnapshot::new("agent-g".to_string()))
+                    .await
+                    .is_err()
+            );
+            assert!(!excessive_ttl.exists("excessive-ttl").await.unwrap());
+            let excessive_score: Option<f64> = redis::cmd("ZSCORE")
+                .arg(excessive_ttl.sessions_index_key())
+                .arg("excessive-ttl")
+                .query_async(&mut connection)
                 .await
-                .is_err()
-        );
-        assert!(!excessive_ttl.exists("excessive-ttl").await.unwrap());
-        let excessive_score: Option<f64> = redis::cmd("ZSCORE")
-            .arg(excessive_ttl.sessions_index_key())
-            .arg("excessive-ttl")
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert!(excessive_score.is_none());
+                .unwrap();
+            assert!(excessive_score.is_none());
 
-        let expiring = RedisStorage::new(&url)
-            .unwrap()
-            .with_prefix(&prefix)
-            .with_ttl(1);
-        expiring
-            .save("expiring", &AgentSnapshot::new("agent-c".to_string()))
-            .await
-            .unwrap();
-        redis::pipe()
-            .atomic()
-            .cmd("ZADD")
-            .arg(expiring.sessions_index_key())
-            .arg(0)
-            .arg("expiring")
-            .ignore()
-            .cmd("ZADD")
-            .arg(expiring.agent_index_key("agent-c"))
-            .arg(0)
-            .arg("expiring")
-            .ignore()
-            .query_async::<()>(&mut connection)
-            .await
-            .unwrap();
-        assert!(
+            let expiring = RedisStorage::new(&url)
+                .unwrap()
+                .with_prefix(&prefix)
+                .with_ttl(1);
             expiring
-                .list_sessions()
+                .save("expiring", &AgentSnapshot::new("agent-c".to_string()))
                 .await
-                .unwrap()
-                .contains(&"expiring".to_string())
-        );
-        assert_eq!(
-            expiring.list_sessions_by_agent("agent-c").await.unwrap(),
-            vec!["expiring"]
-        );
-        let repaired_score: f64 = redis::cmd("ZSCORE")
-            .arg(expiring.sessions_index_key())
-            .arg("expiring")
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert!(repaired_score > Utc::now().timestamp() as f64);
+                .unwrap();
+            redis::pipe()
+                .atomic()
+                .cmd("ZADD")
+                .arg(expiring.sessions_index_key())
+                .arg(0)
+                .arg("expiring")
+                .ignore()
+                .cmd("ZADD")
+                .arg(expiring.agent_index_key("agent-c"))
+                .arg(0)
+                .arg("expiring")
+                .ignore()
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+            assert!(
+                expiring
+                    .list_sessions()
+                    .await
+                    .unwrap()
+                    .contains(&"expiring".to_string())
+            );
+            assert_eq!(
+                expiring.list_sessions_by_agent("agent-c").await.unwrap(),
+                vec!["expiring"]
+            );
+            let repaired_score: f64 = redis::cmd("ZSCORE")
+                .arg(expiring.sessions_index_key())
+                .arg("expiring")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let (server_seconds, _): (i64, i64) = redis::cmd("TIME")
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert!(repaired_score >= server_seconds as f64);
 
-        storage
-            .save("retimed", &AgentSnapshot::new("agent-d".to_string()))
+            storage
+                .save("retimed", &AgentSnapshot::new("agent-d".to_string()))
+                .await
+                .unwrap();
+            storage.set_ttl("retimed", 1).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while expiring.exists("expiring").await.unwrap()
+                    || storage.exists("retimed").await.unwrap()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            })
             .await
             .unwrap();
-        storage.set_ttl("retimed", 1).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
-        assert!(expiring.list_sessions().await.unwrap().is_empty());
-        assert!(
-            expiring
-                .list_sessions_by_agent("agent-c")
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            storage
-                .list_sessions_by_agent("agent-d")
-                .await
-                .unwrap()
-                .is_empty()
-        );
+            assert!(expiring.list_sessions().await.unwrap().is_empty());
+            assert!(
+                expiring
+                    .list_sessions_by_agent("agent-c")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                storage
+                    .list_sessions_by_agent("agent-d")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     #[ignore = "requires a Redis service"]
     async fn legacy_set_indexes_migrate_to_expiry_zsets() {
-        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
-        let prefix = format!("ai-agents-legacy-index-test:{}:", uuid::Uuid::new_v4());
-        let storage = RedisStorage::new(&url).unwrap().with_prefix(&prefix);
-        let session_id = "legacy";
-        let snapshot = AgentSnapshot::new("agent".to_string());
-        let now = Utc::now().to_rfc3339();
-        let metadata = RedisSessionMeta {
-            agent_id: "agent".to_string(),
-            message_count: 0,
-            current_state: None,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        let mut connection = storage.get_connection().await.unwrap();
-        redis::pipe()
-            .atomic()
-            .cmd("SET")
-            .arg(storage.session_key(session_id))
-            .arg(serde_json::to_string(&snapshot).unwrap())
-            .ignore()
-            .cmd("SET")
-            .arg(storage.meta_key(session_id))
-            .arg(serde_json::to_string(&metadata).unwrap())
-            .ignore()
-            .cmd("SADD")
-            .arg(storage.sessions_index_key())
-            .arg(session_id)
-            .ignore()
-            .cmd("SADD")
-            .arg(storage.agent_index_key("agent"))
-            .arg(session_id)
-            .ignore()
-            .query_async::<()>(&mut connection)
-            .await
-            .unwrap();
+        super::service_tests::service_test(|storage| async move {
+            let session_id = "legacy";
+            let snapshot = AgentSnapshot::new("agent".to_string());
+            let now = Utc::now().to_rfc3339();
+            let metadata = RedisSessionMeta {
+                agent_id: "agent".to_string(),
+                message_count: 0,
+                current_state: None,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            let mut connection = storage.get_connection().await.unwrap();
+            redis::pipe()
+                .atomic()
+                .cmd("SET")
+                .arg(storage.session_key(session_id))
+                .arg(serde_json::to_string(&snapshot).unwrap())
+                .ignore()
+                .cmd("SET")
+                .arg(storage.meta_key(session_id))
+                .arg(serde_json::to_string(&metadata).unwrap())
+                .ignore()
+                .cmd("SADD")
+                .arg(storage.sessions_index_key())
+                .arg(session_id)
+                .ignore()
+                .cmd("SADD")
+                .arg(storage.agent_index_key("agent"))
+                .arg(session_id)
+                .ignore()
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
 
-        assert_eq!(storage.list_sessions().await.unwrap(), vec![session_id]);
-        assert_eq!(
-            storage.list_sessions_by_agent("agent").await.unwrap(),
-            vec![session_id]
-        );
-        let global_type: String = redis::cmd("TYPE")
-            .arg(storage.sessions_index_key())
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        let agent_type: String = redis::cmd("TYPE")
-            .arg(storage.agent_index_key("agent"))
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        assert_eq!(global_type, "zset");
-        assert_eq!(agent_type, "zset");
+            assert_eq!(storage.list_sessions().await.unwrap(), vec![session_id]);
+            assert_eq!(
+                storage.list_sessions_by_agent("agent").await.unwrap(),
+                vec![session_id]
+            );
+            let global_type: String = redis::cmd("TYPE")
+                .arg(storage.sessions_index_key())
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            let agent_type: String = redis::cmd("TYPE")
+                .arg(storage.agent_index_key("agent"))
+                .query_async(&mut connection)
+                .await
+                .unwrap();
+            assert_eq!(global_type, "zset");
+            assert_eq!(agent_type, "zset");
 
-        storage.delete(session_id).await.unwrap();
+            storage.delete(session_id).await.unwrap();
+        })
+        .await;
     }
 }
+
+#[cfg(all(test, feature = "redis-storage"))]
+#[path = "redis_tests.rs"]
+mod service_tests;
