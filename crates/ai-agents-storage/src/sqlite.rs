@@ -74,7 +74,7 @@ pub enum SessionOrderBy {
 
 #[cfg(feature = "sqlite")]
 pub struct SqliteStorage {
-    pool: sqlx::SqlitePool,
+    pub(super) pool: sqlx::SqlitePool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -121,6 +121,7 @@ impl SqliteStorage {
     }
 
     async fn run_migrations(&self) -> Result<()> {
+        super::sqlite_tasks::migrate(&self.pool).await?;
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS sessions (
@@ -586,6 +587,39 @@ impl SqliteStorage {
 #[cfg(feature = "sqlite")]
 #[async_trait]
 impl AgentStorage for SqliteStorage {
+    async fn create_task_run(
+        &self,
+        snapshot: &ai_agents_core::autonomy::TaskRunSnapshot,
+    ) -> Result<()> {
+        self.task_create(snapshot).await
+    }
+    async fn load_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+    ) -> Result<Option<ai_agents_core::autonomy::TaskRunSnapshot>> {
+        self.task_load(key).await
+    }
+    async fn list_task_runs(
+        &self,
+        filter: &ai_agents_core::autonomy::TaskRunFilter,
+    ) -> Result<Vec<ai_agents_core::autonomy::TaskRunSummary>> {
+        self.task_list(filter).await
+    }
+    async fn mutate_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+        mutation: &ai_agents_core::autonomy::TaskRunMutation,
+    ) -> Result<ai_agents_core::autonomy::TaskRunSnapshot> {
+        self.task_mutate(key, mutation).await
+    }
+    async fn delete_task_run(
+        &self,
+        key: &ai_agents_core::autonomy::TaskRunKey,
+        revision: u64,
+    ) -> Result<()> {
+        self.task_delete(key, revision).await
+    }
+
     fn supports(&self, capability: StorageCapability) -> bool {
         matches!(
             capability,
@@ -596,6 +630,7 @@ impl AgentStorage for SqliteStorage {
                 | StorageCapability::ActorFacts
                 | StorageCapability::ActorRelationships
                 | StorageCapability::ActorDataDeletion
+                | StorageCapability::TaskRuns
         )
     }
 
@@ -1053,12 +1088,15 @@ impl AgentStorage for SqliteStorage {
         Ok(())
     }
 
+    /// Deletes actor data only after excluding active task writers within the same write transaction.
     async fn delete_actor_data(&self, agent_id: &str, actor_id: &str) -> Result<()> {
         let mut transaction = self
             .pool
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))?;
+
+        super::sqlite_tasks::delete_actor_tasks(&mut transaction, agent_id, actor_id).await?;
 
         sqlx::query("DELETE FROM actor_facts WHERE agent_id = ? AND actor_id = ?")
             .bind(agent_id)

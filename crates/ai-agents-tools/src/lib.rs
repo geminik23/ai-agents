@@ -27,11 +27,11 @@ pub use types::{
     DiagnosticSeverity, DiagnosticsProvider, DiagnosticsProviderSlot, DiagnosticsRequest,
     DiagnosticsResponse, FileVersionEvidence, FileVersionStore, ProcessCommandRunner,
     QuestionHandler, QuestionHandlerSlot, QuestionRequest, QuestionResponse, StaticCommandRunner,
-    StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem, TodoStatus, TodoStore,
-    ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel, UnavailableCommandRunner,
-    UnavailableDiagnosticsProvider, UnavailableWebSearchProvider, WebSearchProvider,
-    WebSearchProviderSlot, WebSearchRequest, WebSearchResponse, WebSearchResultItem,
-    WebSearchSafeSearch, file_version_evidence,
+    StaticDiagnosticsProvider, StaticWebSearchProvider, TodoItem, TodoRunBinding, TodoStatus,
+    TodoStore, ToolAliases, ToolContext, ToolMetadata, ToolProviderType, TrustLevel,
+    UnavailableCommandRunner, UnavailableDiagnosticsProvider, UnavailableWebSearchProvider,
+    WebSearchProvider, WebSearchProviderSlot, WebSearchRequest, WebSearchResponse,
+    WebSearchResultItem, WebSearchSafeSearch, file_version_evidence,
 };
 
 pub use builtin::HttpTool;

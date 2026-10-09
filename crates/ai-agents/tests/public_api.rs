@@ -66,6 +66,66 @@ fn autonomy_config_migration_exposes_typed_fields_without_enabling_chat() {
 }
 
 #[test]
+fn autonomy_storage_api_is_additive_and_separates_results_from_envelopes() {
+    use ai_agents::autonomy::*;
+    use ai_agents::persistence::{AgentSnapshot, InMemoryTaskStorage};
+    use ai_agents::{TaskRun, TaskRunStore};
+
+    let snapshot = AgentSnapshot::new("host-agent".into());
+    let now = snapshot.timestamp;
+    let profile = resolve_profile(
+        &AutonomyConfig::default(),
+        AutonomyScope::Task,
+        None,
+        None,
+        None,
+        None,
+        &AutonomyHostCeilings::default(),
+    )
+    .unwrap();
+    let payload = TaskCheckpointPayload::new(
+        "objective".into(),
+        "prepared-config-v1".into(),
+        &profile,
+        TaskRuntimeCheckpoint::between_turns(snapshot).unwrap(),
+    );
+    let envelope = payload
+        .bind(TaskRunSnapshot {
+            schema_version: TASK_RUN_SCHEMA_VERSION,
+            key: TaskRunKey {
+                agent_id: "host-agent".into(),
+                run_id: "run".into(),
+            },
+            actor_id: None,
+            revision: 0,
+            status: TaskRunStatus::Paused,
+            owner_token: None,
+            cancel_requested: false,
+            created_at: now,
+            updated_at: now,
+            payload: Default::default(),
+        })
+        .unwrap();
+    let store = ScopedTaskRunStore::new(
+        Arc::new(InMemoryTaskStorage::default()),
+        "host-agent".into(),
+        None,
+        "prepared-config-v1".into(),
+    )
+    .unwrap();
+    drop(store.create(&envelope));
+    drop(store.load("run"));
+    assert_eq!(
+        TaskRun::from_checkpoint(&envelope, "prepared-config-v1")
+            .unwrap()
+            .objective,
+        "objective"
+    );
+    assert!(!NoopStorage.supports(StorageCapability::TaskRuns));
+    drop(NoopStorage.load_task_run(&envelope.key));
+}
+
+#[test]
 fn facade_exposes_reviewed_v1_type_closure() {
     let mut templates = HashMap::new();
     templates.insert(

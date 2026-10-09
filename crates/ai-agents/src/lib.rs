@@ -79,7 +79,7 @@
 //! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
 //! | `full` | All optional features enabled |
 
-/// Autonomy configuration types; task execution is not available until the runner is installed.
+/// Autonomy configuration and checkpoint types; task execution is not available until the runner is installed.
 pub mod autonomy {
     pub use ai_agents_runtime::autonomy::*;
 }
@@ -223,7 +223,8 @@ pub mod persistence {
     #[cfg(feature = "sqlite")]
     pub use ai_agents_storage::SqliteStorage;
     pub use ai_agents_storage::{
-        FileStorage, SessionInfo, SessionMetadata, SessionOrderBy, SessionQuery,
+        FileStorage, InMemoryTaskStorage, SessionInfo, SessionMetadata, SessionOrderBy,
+        SessionQuery,
     };
     #[cfg(feature = "redis-storage")]
     pub use ai_agents_storage::{RedisSessionMeta, RedisStorage};
@@ -543,7 +544,9 @@ pub use agent::{
 };
 pub use autonomy::{
     AutonomyConfig, AutonomyHostCeilings, AutonomyMode, AutonomyOverride, AutonomyProfile,
-    AutonomyScope, CompletionGate, EffectiveAutonomyProfile,
+    AutonomyScope, CompletionGate, EffectiveAutonomyProfile, RunTodoAdapter, ScopedTaskRunStore,
+    TaskCheckpointPayload, TaskRun, TaskRunKey, TaskRunMutation, TaskRunResult, TaskRunSnapshot,
+    TaskRunStatus, TaskRunStorageError, TaskRunStore, TaskRuntimeCheckpoint,
 };
 pub use error::{AgentError, Result};
 pub use memory::{

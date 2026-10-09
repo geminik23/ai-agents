@@ -1058,21 +1058,36 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
-/// Session-local todo storage shared by the registry and runtime accessor.
+/// Identifies the sole run owner of a canonical todo list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TodoRunBinding {
+    pub agent_id: String,
+    pub run_id: String,
+    pub token: String,
+}
+
+#[derive(Default)]
+struct TodoStoreState {
+    items: Vec<TodoItem>,
+    binding: Option<TodoRunBinding>,
+}
+
+/// Session-local storage shared by the tool and runtime, optionally bound to one task run.
 #[derive(Clone, Default)]
 pub struct TodoStore {
-    inner: Arc<RwLock<Vec<TodoItem>>>,
+    inner: Arc<RwLock<TodoStoreState>>,
 }
 
 impl TodoStore {
     /// Return a snapshot of all todo items.
     pub fn list(&self) -> Vec<TodoItem> {
-        self.inner.read().clone()
+        self.inner.read().items.clone()
     }
 
     /// Replace the full todo list.
     pub fn set(&self, items: Vec<TodoItem>) {
-        *self.inner.write() = items;
+        self.inner.write().items = items;
     }
 
     /// Update one item by ID and return whether it existed.
@@ -1083,8 +1098,8 @@ impl TodoStore {
         active_form: Option<String>,
         status: Option<TodoStatus>,
     ) -> bool {
-        let mut items = self.inner.write();
-        let Some(item) = items.iter_mut().find(|item| item.id == id) else {
+        let mut state = self.inner.write();
+        let Some(item) = state.items.iter_mut().find(|item| item.id == id) else {
             return false;
         };
         if let Some(content) = content {
@@ -1101,7 +1116,34 @@ impl TodoStore {
 
     /// Remove every todo item.
     pub fn clear(&self) {
-        self.inner.write().clear();
+        self.inner.write().items.clear();
+    }
+
+    /// Binds a new run atomically and discards only the prior unbound session list.
+    pub fn bind_run(&self, binding: TodoRunBinding, items: Vec<TodoItem>) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.is_some() {
+            return false;
+        }
+        state.binding = Some(binding);
+        state.items = items;
+        true
+    }
+
+    /// Returns one authoritative list only when the run binding still matches.
+    pub fn list_for_run(&self, binding: &TodoRunBinding) -> Option<Vec<TodoItem>> {
+        let state = self.inner.read();
+        (state.binding.as_ref() == Some(binding)).then(|| state.items.clone())
+    }
+
+    /// Releases a matching run; a stale adapter cannot detach a newer owner.
+    pub fn release_run(&self, binding: &TodoRunBinding) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(binding) {
+            return false;
+        }
+        state.binding = None;
+        true
     }
 }
 

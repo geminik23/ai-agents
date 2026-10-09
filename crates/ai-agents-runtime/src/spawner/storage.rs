@@ -11,6 +11,8 @@ use ai_agents_core::{
     SessionMetadata, SessionSummary,
 };
 
+// Task checkpoints contain nested runtime identities that this adapter does not yet round-trip.
+// Keep task operations explicitly unsupported instead of forwarding an unscoped payload.
 const FORWARDED_CAPABILITIES: [StorageCapability; 6] = [
     StorageCapability::Snapshot,
     StorageCapability::SessionMetadata,

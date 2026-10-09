@@ -93,6 +93,18 @@ let state = StateDefinition {
 
 For a `SkillDefinition` literal, add `autonomy: None` alongside its existing required ID, description, trigger, steps, and other optional fields. The raw profile and completion-gate types are available through `ai_agents::autonomy`, but **the autonomous task runner is not implemented yet**. Enabling autonomy currently fails at agent construction rather than silently executing an ordinary chat turn. The configuration-only additions are not a shipped task-execution guarantee; do not use this development-tree note as the published 1.1.1 API reference.
 
+### Task checkpoint storage (development only)
+
+The development tree also provides runtime task/result and checkpoint types through `ai_agents::autonomy`. `TaskRunSnapshot` is a separately versioned core storage envelope; `TaskRun` and `TaskRunResult` are runtime-facing views, not the persistence ABI. These additions still do not install a runner, completion evaluator, task commands, or executable HITL resume.
+
+`AgentStorage` adds `StorageCapability::TaskRuns` and five defaulted methods: `create_task_run`, `load_task_run`, `list_task_runs`, `mutate_task_run`, and `delete_task_run`. Existing custom backends need no new methods to compile: defaults return `UnsupportedStorageCapability(TaskRuns)`. SQLite supports these conditional operations; `InMemoryTaskStorage` supports the same transitions only for its retained process-local lifetime. File, Redis, Noop and `NamespacedStorage` do not support task operations. Ordinary snapshot support is not proof of task transaction support.
+
+`TaskRunMutation` covers claim, checkpoint/release, cancellation request and acknowledgement, explicit abandoned-owner recovery, and reconciliation. Writes compare revision and owner before changing data. A cancellation request does not acknowledge cleanup; paused unowned runs use explicit acknowledgement, and uncertain effects require explicit reconciliation. Terminal states do not resume. Deleted run identities remain tombstoned and cannot be reused; SQLite actor-data deletion includes associated tasks and rejects active task owners atomically. No automatic owner takeover or exactly-once external-effect guarantee is provided.
+
+`ScopedTaskRunStore` fixes agent/actor scope and a host-supplied configuration compatibility identity, then validates runtime payloads before writes. The identity must describe the actual prepared configuration and host bindings, not merely a mutable profile name; storage scoping is not authentication. Core backend methods validate the envelope but do not interpret the runtime payload. SQLite and in-memory tests cover competing claims, cancellation/completion races, stale writers and deletion safety.
+
+Checkpoints retain exact native history, completed skill/batch results, pending identities, cumulative counters, resolved ceilings, independent clock data, effect reservations, adapter state, progress and child data. The envelope limit is 4 MiB and the runtime typed-record limit is 4,096, including nested continuations and state history. Required recovery data is rejected when excessive, never silently truncated. Listings contain metadata only, without objective or tool output. Raw snapshots and runtime-facing results may contain sensitive data; hosts must protect backend access, retention, logs and display. The run-bound todo adapter uses the existing canonical store, rejects stale handles, and does not count empty or entirely cancelled lists as completion.
+
 ## AgentBuilder
 
 `AgentBuilder` is the main entry point. There are three ways to create an agent.

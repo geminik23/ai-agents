@@ -59,6 +59,9 @@ pub enum AgentError {
     #[error("Storage capability is not supported: {0}")]
     UnsupportedStorageCapability(StorageCapability),
 
+    #[error("Task run storage error: {0}")]
+    TaskRunStorage(crate::autonomy::TaskRunStorageError),
+
     #[error("Memory budget exceeded: used {used} tokens, budget {budget} tokens")]
     MemoryBudgetExceeded { used: u32, budget: u32 },
 

@@ -2,6 +2,8 @@
 
 mod config;
 mod gate;
+mod storage;
 
 pub use config::*;
 pub use gate::*;
+pub use storage::*;

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; autonomous execution remains unavailable
+
 ### Changed
 - Rust configuration compatibility: typed autonomy fields on agent, state, and skill definitions require existing struct literals to be updated; enabled task execution remains unavailable until the runner is installed
 
