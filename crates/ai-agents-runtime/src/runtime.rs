@@ -489,6 +489,32 @@ impl Drop for RootTurnCleanup<'_> {
     }
 }
 
+// Keeps both redispatch counters balanced when a nested future is cancelled before its await returns.
+struct RedispatchScope<'a> {
+    agent: &'a RuntimeAgent,
+}
+
+impl<'a> RedispatchScope<'a> {
+    // Enter before polling nested work so root bookkeeping stays owned by the original turn.
+    fn new(agent: &'a RuntimeAgent) -> Self {
+        *agent.redispatch_depth.write() += 1;
+        if let Some(context) = agent.active_turn_context.write().as_mut() {
+            context.enter_redispatch();
+        }
+        Self { agent }
+    }
+}
+
+impl Drop for RedispatchScope<'_> {
+    // Unwind before root cleanup, including when the owning future or stream is dropped.
+    fn drop(&mut self) {
+        *self.agent.redispatch_depth.write() -= 1;
+        if let Some(context) = self.agent.active_turn_context.write().as_mut() {
+            context.exit_redispatch();
+        }
+    }
+}
+
 /// Host-owned runtime control state shared with active agents.
 #[derive(Debug)]
 struct RuntimeControlState {
@@ -8324,7 +8350,7 @@ OVERALL: PASS/FAIL"#,
         ))
     }
 
-    /// Re-enters the runtime loop after an optimized transition commits.
+    /// Re-enters after an optimized transition without duplicating root effects; the nested scope must unwind before root finalization or cancellation cleanup.
     async fn redispatch_current_state(&self, processed_input: &str) -> Result<AgentResponse> {
         const MAX_REDISPATCH_DEPTH: u32 = 3;
         let current_depth = *self.redispatch_depth.read();
@@ -8334,15 +8360,10 @@ OVERALL: PASS/FAIL"#,
             self.finish_turn_if_root(&response).await?;
             return Ok(response);
         }
-        *self.redispatch_depth.write() += 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.enter_redispatch();
-        }
-        let result = Box::pin(self.run_loop_internal(processed_input)).await;
-        *self.redispatch_depth.write() -= 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.exit_redispatch();
-        }
+        let result = {
+            let _redispatch = RedispatchScope::new(self);
+            Box::pin(self.run_loop_internal(processed_input)).await
+        };
         let response = result?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
@@ -10246,20 +10267,16 @@ Respond in JSON format:
     //
     // Tool drafts need a committed continuation after function results are written.
     // Redispatch depth suppresses duplicate root lifecycle work during that continuation.
+    // The scope must unwind on cancellation before the root can clean up or a later turn can start.
     //
     async fn continue_after_committed_tool_draft(
         &self,
         processed_input: &str,
     ) -> Result<AgentResponse> {
-        *self.redispatch_depth.write() += 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.enter_redispatch();
-        }
-        let result = Box::pin(self.run_loop_internal(processed_input)).await;
-        *self.redispatch_depth.write() -= 1;
-        if let Some(context) = self.active_turn_context.write().as_mut() {
-            context.exit_redispatch();
-        }
+        let result = {
+            let _redispatch = RedispatchScope::new(self);
+            Box::pin(self.run_loop_internal(processed_input)).await
+        };
         let response = result?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
@@ -10822,8 +10839,8 @@ Respond in JSON format:
     /// Consume a PostLoopResult. NeedsRedispatch re-enters run_loop_internal.
     /// The user message is already in memory - redispatch_depth suppresses re-adding it.
     ///
-    /// Shared by the blocking and streaming loops. The streaming loop emits `content` only when `regenerated` is true,
-    /// because otherwise the consumer already received the same text as deltas.
+    /// Shared by blocking and streaming; a redispatch scope must unwind if either owning path is dropped.
+    /// The streaming loop emits `content` only when `regenerated` is true, since otherwise the consumer already received the same text as deltas.
     async fn apply_post_loop_result(
         &self,
         processed_input: &str,
@@ -10862,19 +10879,14 @@ Respond in JSON format:
                         regenerated: false,
                     });
                 }
-                *self.redispatch_depth.write() += 1;
-                if let Some(context) = self.active_turn_context.write().as_mut() {
-                    context.enter_redispatch();
-                }
                 info!(
                     depth = current_depth + 1,
                     "Re-dispatching for new state after transition"
                 );
-                let resp = Box::pin(self.run_loop_internal(processed_input)).await;
-                *self.redispatch_depth.write() -= 1;
-                if let Some(context) = self.active_turn_context.write().as_mut() {
-                    context.exit_redispatch();
-                }
+                let resp = {
+                    let _redispatch = RedispatchScope::new(self);
+                    Box::pin(self.run_loop_internal(processed_input)).await
+                };
                 resp.map(|r| AppliedPostLoop {
                     content: r.content,
                     transitioned: true,
@@ -13936,6 +13948,7 @@ mod tests {
     /// Defines a prompt skill whose provider call proves committed execution.
     fn confirmation_skill() -> SkillDefinition {
         SkillDefinition {
+            autonomy: None,
             id: "send_report".to_string(),
             description: "Send a report after clarification".to_string(),
             trigger: "When the user asks to send a report".to_string(),
@@ -21081,6 +21094,156 @@ states:
         assert_eq!(response.content, "Billing state response");
         assert_eq!(call_counter.call_count(), 1);
         assert_eq!(agent.actor_facts().len(), 0);
+    }
+
+    // Exercises cancellation after committed pre-response routing has entered the nested provider.
+    async fn assert_redispatch_drop_restores_next_turn(streaming: bool) {
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let first_dropped = Arc::new(AtomicBool::new(false));
+        let responses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let provider = FirstCallLockingProvider {
+            lock: Arc::new(tokio::sync::Mutex::new(())),
+            first_started: Arc::clone(&first_started),
+            first_dropped: Arc::clone(&first_dropped),
+            committed_after_drop: Arc::new(AtomicBool::new(false)),
+            calls: AtomicU64::new(0),
+        };
+        let yaml = r#"
+name: CancelledRedispatch
+system_prompt: "Route before answering."
+runtime:
+  optimization:
+    enabled: true
+    pre_response_deterministic_transitions: true
+states:
+  initial: greeting
+  states:
+    greeting:
+      prompt: "Route billing requests."
+      transitions:
+        - to: billing
+          guard:
+            context:
+              topic:
+                eq: billing
+          timing: pre_response
+    billing:
+      prompt: "Answer billing requests."
+"#;
+        let agent = Arc::new(
+            AgentBuilder::from_yaml(yaml)
+                .unwrap()
+                .llm(Arc::new(provider))
+                .hooks(Arc::new(ResponseCountingHooks {
+                    responses: Arc::clone(&responses),
+                }))
+                .build()
+                .unwrap(),
+        );
+        agent
+            .set_context("topic", serde_json::json!("billing"))
+            .unwrap();
+
+        if streaming {
+            let mut stream = agent.chat_stream_events("first").await.unwrap();
+            assert!(futures::poll!(stream.next()).is_pending());
+            first_started.notified().await;
+            drop(stream);
+        } else {
+            let active = Arc::clone(&agent);
+            let turn = tokio::spawn(async move { active.chat("first").await });
+            tokio::time::timeout(Duration::from_secs(5), first_started.notified())
+                .await
+                .expect("nested provider was not reached");
+            turn.abort();
+            assert!(turn.await.unwrap_err().is_cancelled());
+        }
+
+        assert!(first_dropped.load(Ordering::SeqCst));
+        assert!(agent.root_turn_gate.try_lock().is_ok());
+        assert_eq!(*agent.redispatch_depth.read(), 0);
+        assert!(agent.active_turn_context.read().is_none());
+        assert!(!agent.root_user_message_committed.load(Ordering::SeqCst));
+        let response = tokio::time::timeout(Duration::from_secs(5), agent.chat("second"))
+            .await
+            .expect("next turn was blocked")
+            .unwrap();
+        assert_eq!(response.content, "Committed technical response.");
+        assert_eq!(responses.load(Ordering::SeqCst), 1);
+        let messages = agent.memory.get_messages(None).await.unwrap();
+        let users: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == ai_agents_core::Role::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(users, ["first", "second"]);
+    }
+
+    // Aborting a nested blocking turn must restore the next independent root turn.
+    #[tokio::test]
+    async fn redispatch_drop_restores_next_blocking_turn() {
+        assert_redispatch_drop_restores_next_turn(false).await;
+    }
+
+    // Dropping the owning event stream must release nested and root bookkeeping.
+    #[tokio::test]
+    async fn redispatch_drop_restores_next_turn_after_stream_drop() {
+        assert_redispatch_drop_restores_next_turn(true).await;
+    }
+
+    // Both remaining redispatch helpers must unwind the runtime and mirrored context depth.
+    #[tokio::test]
+    async fn nested_redispatch_helpers_release_depth_when_dropped() {
+        for tool_draft in [false, true] {
+            let first_started = Arc::new(tokio::sync::Notify::new());
+            let first_dropped = Arc::new(AtomicBool::new(false));
+            let provider = FirstCallLockingProvider {
+                lock: Arc::new(tokio::sync::Mutex::new(())),
+                first_started: Arc::clone(&first_started),
+                first_dropped: Arc::clone(&first_dropped),
+                committed_after_drop: Arc::new(AtomicBool::new(false)),
+                calls: AtomicU64::new(0),
+            };
+            let agent = AgentBuilder::new()
+                .system_prompt("Test nested redispatch cleanup.")
+                .llm(Arc::new(provider))
+                .build()
+                .unwrap();
+            agent.begin_root_turn();
+            {
+                let future = async {
+                    if tool_draft {
+                        agent.continue_after_committed_tool_draft("first").await?;
+                    } else {
+                        agent
+                            .apply_post_loop_result("first", PostLoopResult::NeedsRedispatch)
+                            .await?;
+                    }
+                    Ok::<(), AgentError>(())
+                };
+                let mut future = Box::pin(future);
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                first_started.notified().await;
+            }
+            assert!(first_dropped.load(Ordering::SeqCst));
+            assert_eq!(*agent.redispatch_depth.read(), 0);
+            assert_eq!(
+                agent
+                    .active_turn_context
+                    .read()
+                    .as_ref()
+                    .unwrap()
+                    .redispatch_depth,
+                0
+            );
+            agent.end_root_turn();
+            assert!(agent.active_turn_context.read().is_none());
+            agent.chat("second").await.unwrap();
+            let messages = agent.memory.get_messages(None).await.unwrap();
+            assert!(messages.iter().any(|message| {
+                message.role == ai_agents_core::Role::User && message.content == "second"
+            }));
+        }
     }
 
     #[tokio::test]

@@ -31,6 +31,41 @@ fn supports_snapshots(storage: &dyn AgentStorage) -> bool {
 }
 
 #[test]
+fn autonomy_config_migration_exposes_typed_fields_without_enabling_chat() {
+    use ai_agents::{
+        AutonomyConfig, AutonomyOverride, AutonomyProfile, SkillDefinition, StateDefinition,
+    };
+
+    let spec = AgentSpec {
+        autonomy: AutonomyConfig {
+            defaults: AutonomyProfile {
+                enabled: Some(false),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        ..AgentSpec::default()
+    };
+    let state = StateDefinition {
+        autonomy: Some(AutonomyOverride::default()),
+        ..Default::default()
+    };
+    let skill = SkillDefinition {
+        autonomy: Some(AutonomyOverride::default()),
+        id: "review".into(),
+        description: "Review the result".into(),
+        trigger: "When requested".into(),
+        steps: vec![],
+        reasoning: None,
+        reflection: None,
+        disambiguation: None,
+    };
+    spec.validate().unwrap();
+    assert!(!spec.autonomy.defaults.enabled.unwrap());
+    assert!(state.autonomy.is_some() && skill.autonomy.is_some());
+}
+
+#[test]
 fn facade_exposes_reviewed_v1_type_closure() {
     let mut templates = HashMap::new();
     templates.insert(

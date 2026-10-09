@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Rust configuration compatibility: typed autonomy fields on agent, state, and skill definitions require existing struct literals to be updated; enabled task execution remains unavailable until the runner is installed
+
+### Fixed
+- Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn
+- Shared model providers: concurrent requests retain their own prompt and model settings through dispatch and stream opening
+
 ## 1.1.1 - 2026-10-05
 
 ### Fixed

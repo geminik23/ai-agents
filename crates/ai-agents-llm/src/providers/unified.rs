@@ -1004,31 +1004,29 @@ impl UnifiedLLMProvider {
         self.build_llm_with_system(cfg, None, None, None)
     }
 
-    /// Ensure the cached client is built (or rebuilt) for the given config + system prompt.
-    /// Returns after the cache is populated; callers should then lock and use `self.client`.
-    async fn ensure_client(
+    /// Holds the request-specific client lock through use so concurrent requests cannot replace its prompt or config after validation.
+    async fn client_for_request(
         &self,
         config: Option<&LLMConfig>,
         system_prompt: Option<&str>,
         tool_choice: Option<&ToolChoice>,
         tools: Option<&[LLMToolDefinition]>,
-    ) -> Result<(), LLMError> {
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<CachedClient>>, LLMError> {
         let cfg = config.unwrap_or(&self.default_config);
         let hash = compute_config_hash(cfg, system_prompt, tool_choice, tools);
 
         let mut lock = self.client.lock().await;
-        if let Some(ref cached) = *lock
-            && cached.config_hash == hash
+        if lock
+            .as_ref()
+            .is_none_or(|cached| cached.config_hash != hash)
         {
-            return Ok(());
+            let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
+            *lock = Some(CachedClient {
+                llm,
+                config_hash: hash,
+            });
         }
-        // Build a new client
-        let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
-        *lock = Some(CachedClient {
-            llm,
-            config_hash: hash,
-        });
-        Ok(())
+        Ok(lock)
     }
 }
 
@@ -1051,15 +1049,10 @@ impl LLMProvider for UnifiedLLMProvider {
             .map(|m| self.convert_message(m))
             .collect();
 
-        // Ensure client is built for this config + system prompt
-        self.ensure_client(config, system_prompt.as_deref(), None, None)
+        let lock = self
+            .client_for_request(config, system_prompt.as_deref(), None, None)
             .await?;
-
-        // Use the cached client
-        let lock = self.client.lock().await;
-        let cached = lock
-            .as_ref()
-            .expect("client must be built after ensure_client");
+        let cached = lock.as_ref().expect("client must be built under this lock");
 
         let response = cached
             .llm
@@ -1125,17 +1118,15 @@ impl LLMProvider for UnifiedLLMProvider {
             .map(map_tool_definition)
             .collect::<Vec<_>>();
 
-        self.ensure_client(
-            config,
-            system_prompt.as_deref(),
-            Some(choice),
-            Some(&request.tools),
-        )
-        .await?;
-        let lock = self.client.lock().await;
-        let cached = lock
-            .as_ref()
-            .expect("client must be built after ensure_client");
+        let lock = self
+            .client_for_request(
+                config,
+                system_prompt.as_deref(),
+                Some(choice),
+                Some(&request.tools),
+            )
+            .await?;
+        let cached = lock.as_ref().expect("client must be built under this lock");
         let response = cached
             .llm
             .chat_with_tools(&llm_messages, Some(&tools))
@@ -1183,22 +1174,17 @@ impl LLMProvider for UnifiedLLMProvider {
             .map(|m| self.convert_message(m))
             .collect();
 
-        // Ensure client is built for this config + system prompt
-        self.ensure_client(config, system_prompt.as_deref(), None, None)
-            .await?;
-
-        // Acquire lock, call chat_stream, get owned stream, then release lock
+        // Keep the selected client stable until stream creation returns its owned stream.
         let stream = {
-            let lock = self.client.lock().await;
-            let cached = lock
-                .as_ref()
-                .expect("client must be built after ensure_client");
+            let lock = self
+                .client_for_request(config, system_prompt.as_deref(), None, None)
+                .await?;
+            let cached = lock.as_ref().expect("client must be built under this lock");
             cached
                 .llm
                 .chat_stream(&llm_messages)
                 .await
                 .map_err(|e| self.map_llm_crate_error(e))?
-            // lock is dropped here at end of block
         };
 
         let provider_type = self.provider_type;
@@ -1378,6 +1364,8 @@ impl Default for ProviderBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_builder() {
@@ -1491,6 +1479,196 @@ mod tests {
         let (system_prompt, non_system) = extract_system_and_messages(&messages);
         assert!(system_prompt.is_none());
         assert_eq!(non_system.len(), 2);
+    }
+
+    // Serves two bounded, local OpenAI responses and captures the requests actually dispatched.
+    async fn local_chat_fixture() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let header_end = loop {
+                    let mut buffer = [0; 4096];
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0, "request ended before HTTP headers");
+                    request.extend_from_slice(&buffer[..size]);
+                    if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break index + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                while request.len() - header_end < content_length {
+                    let mut buffer = [0; 4096];
+                    let size = socket.read(&mut buffer).await.unwrap();
+                    assert!(size > 0, "request ended before HTTP body");
+                    request.extend_from_slice(&buffer[..size]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&request[header_end..header_end + content_length])
+                        .unwrap();
+                let streaming = body["stream"] == true;
+                sender.send(body).unwrap();
+                let content_type = if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                };
+                let response_body = if streaming {
+                    "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+                } else {
+                    "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+        (format!("http://{address}/v1/"), receiver)
+    }
+
+    // Makes the lock requests contend in a known order before checking the actual provider payloads.
+    #[tokio::test]
+    async fn concurrent_requests_dispatch_with_their_own_client_config() {
+        async fn dispatch(provider: &UnifiedLLMProvider, kind: &str, name: &str, max_tokens: u32) {
+            let messages = [
+                ChatMessage::system(format!("system {name}")),
+                ChatMessage::user("hi"),
+            ];
+            let config = LLMConfig {
+                max_tokens: Some(max_tokens),
+                ..LLMConfig::default()
+            };
+            match kind {
+                "complete" => {
+                    provider.complete(&messages, Some(&config)).await.unwrap();
+                }
+                "native" => {
+                    let request = LLMToolRequest {
+                        choice: ToolChoice::Auto,
+                        tools: vec![LLMToolDefinition {
+                            name: name.to_string(),
+                            description: "Test tool".to_string(),
+                            input_schema: serde_json::json!({"type": "object"}),
+                        }],
+                    };
+                    provider
+                        .complete_with_tools(&messages, Some(&config), &request)
+                        .await
+                        .unwrap();
+                }
+                "stream" => {
+                    let mut stream = provider
+                        .complete_stream(&messages, Some(&config))
+                        .await
+                        .unwrap();
+                    while let Some(chunk) = stream.next().await {
+                        chunk.unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        for kind in ["complete", "native", "stream"] {
+            let (base_url, mut received) = local_chat_fixture().await;
+            let provider = ProviderBuilder::new()
+                .provider(ProviderType::OpenAI)
+                .model("test-model")
+                .api_key("test-key")
+                .base_url(base_url)
+                .build()
+                .unwrap();
+            let guard = provider.client.lock().await;
+            let mut first = Box::pin(dispatch(&provider, kind, "first", 20));
+            let mut second = Box::pin(dispatch(&provider, kind, "second", 200));
+            assert!(futures::poll!(first.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            drop(guard);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(first, second);
+                for (name, max_tokens) in [("first", 20), ("second", 200)] {
+                    let body = received.recv().await.unwrap();
+                    assert!(body.to_string().contains(&format!("system {name}")));
+                    assert_eq!(body["max_completion_tokens"], max_tokens);
+                    if kind == "native" {
+                        assert_eq!(body["tools"][0]["function"]["name"], name);
+                        assert_eq!(body["tool_choice"], "auto");
+                    }
+                }
+            })
+            .await
+            .expect("local provider fixture did not complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_client_stays_bound_to_its_request_until_use() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("test-model")
+            .api_key("test-key")
+            .build()
+            .unwrap();
+        let first = LLMConfig {
+            max_tokens: Some(20),
+            ..LLMConfig::default()
+        };
+        let second = LLMConfig {
+            max_tokens: Some(200),
+            ..LLMConfig::default()
+        };
+        let tools = [LLMToolDefinition {
+            name: "lookup".to_string(),
+            description: "Look up data".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+        }];
+        let expected = compute_config_hash(
+            &first,
+            Some("first system prompt"),
+            Some(&ToolChoice::Auto),
+            Some(&tools),
+        );
+        let first_client = provider
+            .client_for_request(
+                Some(&first),
+                Some("first system prompt"),
+                Some(&ToolChoice::Auto),
+                Some(&tools),
+            )
+            .await
+            .unwrap();
+        let mut replacement = Box::pin(provider.client_for_request(
+            Some(&second),
+            Some("second system prompt"),
+            None,
+            None,
+        ));
+        assert!(futures::poll!(replacement.as_mut()).is_pending());
+        assert_eq!(first_client.as_ref().unwrap().config_hash, expected);
+        drop(first_client);
+
+        let second_client = replacement.await.unwrap();
+        let expected_second =
+            compute_config_hash(&second, Some("second system prompt"), None, None);
+        assert_eq!(second_client.as_ref().unwrap().config_hash, expected_second);
     }
 
     #[test]

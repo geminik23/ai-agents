@@ -92,6 +92,20 @@ impl SkillLoader {
             AgentError::Skill(format!("Failed to read skill file {:?}: {}", resolved, e))
         })?;
 
+        let source: serde_yaml::Value = serde_yaml::from_str(&content).map_err(|error| {
+            AgentError::Skill(format!(
+                "Failed to parse skill file {:?}: {}",
+                resolved, error
+            ))
+        })?;
+        let unsupported = ai_agents_core::strict_yaml::unsupported_yaml_keys(&source);
+        if !unsupported.is_empty() {
+            return Err(AgentError::Skill(format!(
+                "Unsupported skill YAML key(s) in {:?}: {}",
+                resolved,
+                unsupported.join(", ")
+            )));
+        }
         let skill: SkillDefinition = serde_yaml::from_str(&content).map_err(|e| {
             AgentError::Skill(format!("Failed to parse skill file {:?}: {}", resolved, e))
         })?;
@@ -146,6 +160,7 @@ steps:
         let mut loader = SkillLoader::new();
 
         let inline_skill = SkillDefinition {
+            autonomy: None,
             id: "test_skill".to_string(),
             description: "Test".to_string(),
             trigger: "When testing".to_string(),
@@ -177,6 +192,7 @@ steps:
         let mut loader = SkillLoader::new();
 
         let inline_skill = SkillDefinition {
+            autonomy: None,
             id: "cached_skill".to_string(),
             description: "Cached".to_string(),
             trigger: "When cached".to_string(),

@@ -1192,7 +1192,7 @@ impl AgentBuilder {
         Ok(self)
     }
 
-    /// Finalizes one consistent hierarchy before runtime components capture selected handles.
+    /// Finalizes one consistent hierarchy, validates loaded autonomy overrides, and refuses enabled tasks until the controller exists.
     pub fn build(mut self) -> Result<RuntimeAgent> {
         self.prepare_routing(false)?;
         let resource_locks = self.shared_resource_locks();
@@ -1245,6 +1245,21 @@ impl AgentBuilder {
             }
             let loaded_skills = loader.load_refs(&spec.skills)?;
             self.skills.extend(loaded_skills);
+        }
+        // Validate the machine actually installed by the builder; it can replace spec.states.
+        let disabled = ai_agents_core::autonomy::AutonomyConfig::default();
+        let config = self.spec.as_ref().map_or(&disabled, |spec| &spec.autonomy);
+        let states = self
+            .state_machine
+            .as_ref()
+            .map(|machine| machine.config())
+            .or_else(|| self.spec.as_ref().and_then(|spec| spec.states.as_ref()));
+        crate::autonomy::validate_agent_config(config, states, &[])?;
+        crate::autonomy::validate_loaded_skills(config, &self.skills)?;
+        if crate::autonomy::has_enabled_declaration(config, states, &self.skills) {
+            return Err(AgentError::Config(
+                "autonomy task execution is not available until the runner is installed".into(),
+            ));
         }
 
         let mut llm_registry = self.llm_registry.unwrap_or_default();
@@ -2140,6 +2155,7 @@ spawner:
         use ai_agents_skills::{SkillDefinition, SkillStep};
 
         let skill = SkillDefinition {
+            autonomy: None,
             id: "test".to_string(),
             description: "Test skill".to_string(),
             trigger: "When testing".to_string(),

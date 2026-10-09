@@ -74,6 +74,25 @@ Low-level orchestration retains the one-provider `concurrent()` and `group_chat(
 
 Use `RuntimeAgent::try_new()` for fallible low-level hierarchy construction; `new()` remains a compatibility convenience and panics on invalid hierarchy construction. The recommended `AgentBuilder` path returns configuration errors. Child snapshot serialization uses prepared skill declarations without modifying `SpawnedAgent.spec`; retained restore compares routing configuration and does not hot-swap live models or prompts.
 
+## Autonomy configuration migration (development only)
+
+The development tree adds typed `autonomy` fields to `AgentSpec`, `StateDefinition`, and `SkillDefinition`. Existing exhaustive Rust struct literals must add `autonomy: AutonomyConfig::default()` for `AgentSpec`, or `autonomy: None` for states and skills. Existing `..Default::default()` literals remain usable where the type supports them. Omitted YAML keeps normal chat unchanged.
+
+```rust
+use ai_agents::{AutonomyConfig, AgentSpec, StateDefinition};
+
+let agent = AgentSpec {
+    autonomy: AutonomyConfig::default(),
+    ..AgentSpec::default()
+};
+let state = StateDefinition {
+    autonomy: None,
+    ..StateDefinition::default()
+};
+```
+
+For a `SkillDefinition` literal, add `autonomy: None` alongside its existing required ID, description, trigger, steps, and other optional fields. The raw profile and completion-gate types are available through `ai_agents::autonomy`, but **the autonomous task runner is not implemented yet**. Enabling autonomy currently fails at agent construction rather than silently executing an ordinary chat turn. The configuration-only additions are not a shipped task-execution guarantee; do not use this development-tree note as the published 1.1.1 API reference.
+
 ## AgentBuilder
 
 `AgentBuilder` is the main entry point. There are three ways to create an agent.

@@ -1,9 +1,11 @@
 //! Core types and traits for AI Agents framework
 
+pub mod autonomy;
 pub mod dot_path;
 pub mod error;
 pub mod message;
 pub mod native_history;
+pub mod strict_yaml;
 pub mod traits;
 pub mod types;
 

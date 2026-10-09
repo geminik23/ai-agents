@@ -79,6 +79,11 @@
 //! | `full-storage` | All storage backends (`sqlite` + `redis-storage`) |
 //! | `full` | All optional features enabled |
 
+/// Autonomy configuration types; task execution is not available until the runner is installed.
+pub mod autonomy {
+    pub use ai_agents_runtime::autonomy::*;
+}
+
 pub mod agent {
     pub use ai_agents_runtime::{
         Agent, AgentBuilder, AgentInfo, AgentResponse, AgentStreamEvent, AwaitBeforeNextTurn,
@@ -535,6 +540,10 @@ pub use agent::{
     RuntimeTaskPurpose, ScheduledBranchSet, SkillCandidate, StreamBranchBuffer, StreamChunk,
     StreamingConfig, StreamingDraftResult, StreamingOptimizationPolicy, TurnActorContext,
     TurnBranchScheduler, TurnOptimizationContext,
+};
+pub use autonomy::{
+    AutonomyConfig, AutonomyHostCeilings, AutonomyMode, AutonomyOverride, AutonomyProfile,
+    AutonomyScope, CompletionGate, EffectiveAutonomyProfile,
 };
 pub use error::{AgentError, Result};
 pub use memory::{
