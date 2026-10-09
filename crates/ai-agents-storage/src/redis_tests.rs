@@ -580,10 +580,12 @@ async fn cleanup_checks_payload_even_when_metadata_is_identical() {
 
 #[tokio::test]
 async fn refused_and_closed_connections_return_errors() {
-    let reserved = tokio::net::TcpSocket::new_v4().unwrap();
-    reserved.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let storage =
-        RedisStorage::new(&format!("redis://{}/", reserved.local_addr().unwrap())).unwrap();
+        RedisStorage::new(&format!("redis://{}/", listener.local_addr().unwrap())).unwrap();
+    // A bound non-listening socket can drop SYN packets on macOS instead of refusing them.
+    // Release an allocated listener immediately before connecting, without yielding in between.
+    drop(listener);
     assert_persistence(
         tokio::time::timeout(Duration::from_secs(3), storage.load("missing"))
             .await
