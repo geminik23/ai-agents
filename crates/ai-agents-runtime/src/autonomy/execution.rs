@@ -35,6 +35,10 @@ pub(crate) struct RunExecution {
     pub(crate) approval_deadlines: parking_lot::Mutex<std::collections::BTreeMap<String, Instant>>,
     pub(crate) parked_batches:
         parking_lot::Mutex<std::collections::BTreeMap<String, TaskBatchState>>,
+    pub(crate) parked_executor_cursors: parking_lot::Mutex<
+        std::collections::BTreeMap<(String, String), super::suspension::TaskExecutorCursor>,
+    >,
+    // Declared dispatch and batch coordinators use runtime keys; message invocations use their private frame IDs.
     pub(crate) delegate_frames:
         parking_lot::Mutex<std::collections::BTreeMap<String, super::composition::DelegateFrame>>,
     stop: parking_lot::RwLock<Option<String>>,
@@ -87,6 +91,7 @@ impl RunExecution {
             parked_approvals: Default::default(),
             approval_deadlines: Default::default(),
             parked_batches: Default::default(),
+            parked_executor_cursors: Default::default(),
             delegate_frames: Default::default(),
             stop: parking_lot::RwLock::new(None),
             lifecycle: parking_lot::RwLock::new((payload.settings, lifecycle)),

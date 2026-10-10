@@ -1,9 +1,9 @@
 //! Exact parent message reentry reauthorizes the saved invocation without repeating delivery or admission.
 
 use super::*;
+use crate::autonomy::TaskRuntimeCheckpoint;
 use crate::autonomy::composition::{CompositionDispatch, DelegateFrame};
 use crate::autonomy::message::{MessageInvocation, MessageState};
-use crate::autonomy::{TaskBatchState, TaskRuntimeCheckpoint};
 use serde_json::json;
 
 impl RuntimeAgent {
@@ -66,6 +66,7 @@ impl RuntimeAgent {
             batch: None,
             response: Default::default(),
             child_actor: None,
+            waiting_for: None,
         };
         let frame = DelegateFrame {
             version: 1,
@@ -120,11 +121,14 @@ impl RuntimeAgent {
                 "message tool implementation binding changed".into(),
             ));
         }
-        state
+        let batch = state
             .batch
             .as_ref()
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
-            .validate()?;
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        batch.validate()?;
+        if let Some(location) = &batch.location {
+            self.validate_task_location(location)?;
+        }
         Ok(state)
     }
 
@@ -219,6 +223,24 @@ impl RuntimeAgent {
         Ok(guards)
     }
 
+    /// Only the invocation owning the selected leaf response resumes; other calls retain their attempts and results.
+    pub(super) async fn resume_message_batch(
+        &self,
+        coordinator: DelegateFrame,
+    ) -> Result<AgentResponse> {
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        let frames = execution.delegate_frames.lock().clone();
+        let ids: Vec<String> = serde_json::from_value(coordinator.definition["messages"].clone())?;
+        let frame = ids
+            .iter()
+            .filter_map(|id| frames.get(id))
+            .find(|frame| crate::autonomy::composition::response_targets_frame(frame, &frames))
+            .cloned()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        Box::pin(self.resume_message_frame(frame)).await
+    }
+
     /// Completes the original parent result after its child settles; delivery hooks and the tool body are never replayed.
     pub(super) async fn resume_message_frame(&self, frame: DelegateFrame) -> Result<AgentResponse> {
         let execution = crate::autonomy::current_execution()
@@ -294,8 +316,9 @@ impl RuntimeAgent {
             return Err(AgentError::Tool("message final admission changed".into()));
         }
         guards.effect_custody.store(true, Ordering::SeqCst);
-        let work = crate::autonomy::composition::scope_composition(
+        let work = crate::autonomy::composition::scope_message_composition(
             frame.runtime_id.clone(),
+            frame.id.clone(),
             crate::autonomy::scope_child_invocation(
                 frame.child_operation.clone(),
                 child.info.id.clone(),
@@ -346,6 +369,7 @@ impl RuntimeAgent {
                 .batch
                 .take()
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            Box::pin(execution.retain_message_batch(&self.info.id, batch.clone())).await?;
             execution.retain_batch(&self.info.id, batch);
             return Err(AgentError::TaskSuspended(frame.id));
         }
@@ -390,6 +414,13 @@ impl RuntimeAgent {
             .batch
             .take()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        if let Some(location) = batch.location.take() {
+            execution.retire_completed_message(&self.info.id, &state.attempt);
+            self.acknowledge_completed_task_batch().await?;
+            execution.parked_batches.lock().remove(&self.info.id);
+            execution.delegate_frames.lock().remove(&self.info.id);
+            return Box::pin(self.finish_task_location_record(location, state.record)).await;
+        }
         let mut loop_state = batch
             .loop_state
             .take()
@@ -399,6 +430,9 @@ impl RuntimeAgent {
             .iter()
             .position(|call| call.id == state.record.call_id)
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        batch
+            .executor_cursors
+            .retain(|cursor| cursor.request.call_id != state.record.call_id);
         batch.results[index] = Some(if state.record.success {
             Ok(state.record.model_output_string())
         } else {
@@ -409,11 +443,50 @@ impl RuntimeAgent {
             .retain(|approval| approval.request_id != frame.id);
         self.append_task_batch_prefix(&mut batch, &mut loop_state.all_tool_calls)
             .await?;
-        execution.delegate_frames.lock().remove(&self.info.id);
+        execution.retire_completed_message(&self.info.id, &state.attempt);
         if let Some(next) = batch.approvals.first() {
             let id = next.request_id.clone();
             batch.loop_state = Some(loop_state);
+            Box::pin(execution.retain_message_batch(&self.info.id, batch.clone())).await?;
+            let order: Vec<_> = batch.calls.iter().map(|call| call.id.clone()).collect();
             execution.retain_batch(&self.info.id, batch);
+            // A repeated-target call already owns its parent attempt but has not started another child history.
+            let frames = execution.delegate_frames.lock().clone();
+            let snapshot = execution.acknowledged_snapshot();
+            let deferred =
+                frames
+                    .values()
+                    .filter(|frame| {
+                        frame.runtime_id == self.info.id
+                            && frame.dispatch == CompositionDispatch::ToolMessage
+                            && frame.cursor["waiting_for"]
+                                .as_str()
+                                .is_some_and(|dependency| {
+                                    snapshot.payload["children"].as_array().is_some_and(
+                                        |children| {
+                                            !children.iter().any(|child| {
+                                                child["child_id"] == frame.child_operation
+                                            }) && children.iter().all(|child| {
+                                                child["runtime"]["snapshot"]["agent_id"]
+                                                    != frame.delegate_runtime_id
+                                                    || !child["result"].is_null()
+                                            }) && children.iter().any(|child| {
+                                                child["child_id"] == dependency
+                                                    && !child["result"].is_null()
+                                            })
+                                        },
+                                    )
+                                })
+                    })
+                    .min_by_key(|frame| {
+                        order
+                            .iter()
+                            .position(|id| frame.cursor["record"]["call_id"] == *id)
+                    })
+                    .cloned();
+            if let Some(deferred) = deferred {
+                return Box::pin(self.resume_message_frame(deferred)).await;
+            }
             return Err(AgentError::TaskSuspended(id));
         }
         self.acknowledge_completed_task_batch().await?;
@@ -429,35 +502,79 @@ impl RuntimeAgent {
         self.run_committed_task_loop(loop_state).await
     }
 
-    /// Known-safe cancellation closes the parent's native batch without delivering another message.
-    pub(super) async fn close_message_frame(
+    /// Cancellation closes each runtime's native batch once while publishing every suspended invocation's own record.
+    /// Completed out-of-order results stay intact; no sender, selector, child tool or provider is polled.
+    pub(super) async fn close_message_batch(
         &self,
         owner: &Arc<crate::autonomy::RunOwner>,
-        frame: &DelegateFrame,
+        coordinator: &DelegateFrame,
+        frames: &std::collections::BTreeMap<String, DelegateFrame>,
     ) -> Result<TaskRuntimeCheckpoint> {
-        let mut state: MessageState = serde_json::from_value(frame.cursor.clone())?;
-        let mut batch: TaskBatchState = state
-            .batch
-            .take()
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        for result in &mut batch.results {
-            if result.is_none() {
-                *result = Some(Err("message stopped after child suspension".into()));
+        let execution = crate::autonomy::current_execution();
+        let mut batch: crate::autonomy::TaskBatchState = execution
+            .as_ref()
+            .and_then(|execution| execution.parked_batches.lock().get(&self.info.id).cloned())
+            .map(Ok)
+            .unwrap_or_else(|| serde_json::from_value(coordinator.cursor.clone()))?;
+        let mut records = Vec::new();
+        let ids: Vec<String> = serde_json::from_value(coordinator.definition["messages"].clone())?;
+        for id in ids {
+            let frame = frames
+                .get(&id)
+                .cloned()
+                .or_else(|| {
+                    execution.as_ref().and_then(|execution| {
+                        execution.acknowledged_snapshot().payload["adapters"]
+                            .as_array()
+                            .and_then(|adapters| {
+                                adapters.iter().find(|adapter| {
+                                    adapter["id"] == format!("runtime.delegate:{id}")
+                                })
+                            })
+                            .and_then(|adapter| {
+                                serde_json::from_value(adapter["state"].clone()).ok()
+                            })
+                    })
+                })
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let mut state: MessageState = serde_json::from_value(frame.cursor.clone())?;
+            if execution.as_ref().is_some_and(|execution| {
+                execution.acknowledged_snapshot().payload["reservations"]
+                    .as_array()
+                    .is_some_and(|reservations| {
+                        reservations.iter().any(|reservation| {
+                            reservation["id"] == state.attempt
+                                && reservation["state"] == "completed"
+                        })
+                    })
+            }) {
+                continue;
             }
+            let index = batch
+                .calls
+                .iter()
+                .position(|call| call.id == state.record.call_id)
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            if batch.results[index].is_none() {
+                batch.results[index] = Some(Err("message stopped after child suspension".into()));
+            }
+            state.record.output = "message stopped after child suspension".into();
+            state.record.success = false;
+            state.record.cancelled = true;
+            state.record.cancellation_reason = Some("task stopped".into());
+            state.record.duration_ms = u64::try_from(
+                (chrono::Utc::now() - state.record.started_at)
+                    .num_milliseconds()
+                    .max(0),
+            )
+            .unwrap_or(u64::MAX);
+            records.push(state.record);
         }
         let runtime = self.cancel_task_batch(owner, batch).await?;
-        state.record.output = "message stopped after child suspension".into();
-        state.record.success = false;
-        state.record.cancelled = true;
-        state.record.cancellation_reason = Some("task stopped".into());
-        state.record.duration_ms = u64::try_from(
-            (chrono::Utc::now() - state.record.started_at)
-                .num_milliseconds()
-                .max(0),
-        )
-        .unwrap_or(u64::MAX);
-        // The cancellation payload publishes exact attribution atomically; hooks must not publish a second root-attributed copy.
-        self.publish_tool_record(&state.record).await;
+        for record in records {
+            // The cancellation checkpoint owns attribution; hooks do not append a second root-attributed record.
+            self.publish_tool_record(&record).await;
+        }
         Ok(runtime)
     }
 }

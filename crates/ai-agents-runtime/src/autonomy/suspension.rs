@@ -44,6 +44,8 @@ pub(crate) struct TaskLoopState {
     pub thinking_content: Option<String>,
     #[serde(default)]
     pub native_exchanges: Vec<TaskNativeExchange>,
+    #[serde(default)]
+    pub deferred_final: Option<Box<super::location::TaskModelFinal>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +76,18 @@ pub(crate) struct TaskBatchState {
     pub authorized: Vec<BatchAuthorization>,
     #[serde(default)]
     pub rejected: bool,
+    #[serde(default)]
+    pub executor_cursors: Vec<TaskExecutorCursor>,
+    #[serde(default)]
+    pub location: Option<super::location::TaskLocation>,
+}
+
+/// A parked fallback keeps its actual request and canonical ancestry rather than replaying a failed ancestor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskExecutorCursor {
+    pub request: ToolExecutionRequest,
+    pub ancestry: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +100,19 @@ pub(crate) struct BatchAuthorization {
 }
 
 impl TaskBatchState {
+    /// The committed model call stays immutable while a resumed fallback uses its exact pending request.
+    pub(crate) fn pending_call(&self, call: &ToolCall) -> ToolCall {
+        self.executor_cursors
+            .iter()
+            .find(|cursor| cursor.request.call_id == call.id)
+            .map(|cursor| ToolCall {
+                id: call.id.clone(),
+                name: cursor.request.requested_name.clone(),
+                arguments: cursor.request.arguments.clone(),
+            })
+            .unwrap_or_else(|| call.clone())
+    }
+
     /// Parent and child snapshots use the same exact ordered native cursor and preserved batch results.
     pub(crate) fn bind_runtime(
         &self,
@@ -97,9 +124,25 @@ impl TaskBatchState {
         runtime.continuation = TaskContinuation::Suspended {
             request_id: self.approvals[0].request_id.clone(),
             turn_id: format!("{run_id}:{cycle}"),
-            user_message_committed: true,
+            user_message_committed: self
+                .location
+                .as_ref()
+                .is_none_or(|location| location.root_state().0),
             finalized: false,
-            skill: None,
+            skill: self.location.as_ref().and_then(|location| match location {
+                super::location::TaskLocation::Skill(state) => Some(TaskSkillCursor {
+                    skill_id: state.cursor.definition.id.clone(),
+                    next_step: state.cursor.next_step,
+                    results: state
+                        .cursor
+                        .context
+                        .step_results
+                        .iter()
+                        .map(|result| result.result.clone())
+                        .collect(),
+                }),
+                super::location::TaskLocation::Actions(_) => None,
+            }),
             batch: Some(TaskToolBatchCursor {
                 messages: runtime.snapshot.memory.messages.clone(),
                 call_ids: self.calls.iter().map(|call| call.id.clone()).collect(),
@@ -143,17 +186,22 @@ impl TaskBatchState {
                     .map(|call| call.id.clone())
                     .collect::<Vec<_>>()
             || cursor.completed_results != self.prefix_outputs()
-            || payload
-                .runtime
-                .snapshot
-                .memory
-                .messages
-                .iter()
-                .rev()
-                .find(|message| message.role == ai_agents_core::Role::Assistant)
-                .is_none_or(|message| message.content != self.content)
+            || (self.location.is_none()
+                && payload
+                    .runtime
+                    .snapshot
+                    .memory
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == ai_agents_core::Role::Assistant)
+                    .is_none_or(|message| message.content != self.content))
         {
             return Err(invalid());
+        }
+        if self.location.is_some() {
+            self.validate_model_history(&payload.runtime)?;
+            return Ok(());
         }
         if self
             .loop_state
@@ -184,6 +232,23 @@ impl TaskBatchState {
     pub(crate) fn validate_model_history(&self, runtime: &TaskRuntimeCheckpoint) -> Result<()> {
         self.validate()?;
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
+        if let Some(location) = &self.location {
+            let request = location.request()?;
+            if !self.content.is_empty()
+                || self.calls.len() != 1
+                || self.calls[0].id != request.call_id
+                || self.calls[0].name != request.requested_name
+                || self.calls[0].arguments != request.arguments
+                || location
+                    .root_state()
+                    .1
+                    .iter()
+                    .any(|expected| !runtime.native_exchanges.contains(expected))
+            {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
         if runtime
             .snapshot
             .memory
@@ -244,9 +309,15 @@ impl TaskBatchState {
             || self
                 .loop_state
                 .as_ref()
-                .is_none_or(|state| state.version != 1)
+                .is_some_and(|state| state.version != 1)
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        if self.loop_state.is_none() && self.location.is_none() {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        if let Some(location) = &self.location {
+            location.validate()?;
         }
         let mut calls = std::collections::HashSet::new();
         let mut requests = std::collections::HashSet::new();
@@ -281,6 +352,42 @@ impl TaskBatchState {
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
+        let mut executor_calls = std::collections::HashSet::new();
+        for cursor in &self.executor_cursors {
+            if !executor_calls.insert(&cursor.request.call_id)
+                || cursor.ancestry.len() > 16
+                || !self.calls.iter().enumerate().any(|(index, call)| {
+                    call.id == cursor.request.call_id && self.results[index].is_none()
+                })
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            match &cursor.request.source {
+                ai_agents_core::ToolCallSource::Model => {
+                    if !cursor.ancestry.is_empty()
+                        || !self.calls.iter().any(|call| {
+                            call.id == cursor.request.call_id
+                                && call.name == cursor.request.requested_name
+                                && call.arguments == cursor.request.arguments
+                        })
+                    {
+                        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                    }
+                }
+                ai_agents_core::ToolCallSource::Fallback { original_tool } => {
+                    if cursor.ancestry.last() != Some(original_tool) {
+                        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                    }
+                }
+                _ if self.location.as_ref().is_some_and(|location| {
+                    location.request().is_ok_and(|request| {
+                        serde_json::to_value(request).ok()
+                            == serde_json::to_value(&cursor.request).ok()
+                    })
+                }) && cursor.ancestry.is_empty() => {}
+                _ => return Err(TaskRunStorageError::InvalidCheckpoint.into()),
+            }
+        }
         bounded_value(&serde_json::to_value(self)?, MAX_TASK_CHECKPOINT_BYTES)
     }
 }
@@ -290,6 +397,7 @@ tokio::task_local! {
     static TASK_BATCH: bool;
     static RESUMED_APPROVAL: std::cell::RefCell<Vec<BatchAuthorization>>;
     static RESUMED_QUESTION: std::cell::RefCell<Option<(String, Value, Value)>>;
+    static RESUMED_EXECUTOR: std::cell::RefCell<Vec<TaskExecutorCursor>>;
 }
 
 /// Message dispatch may park only inside a reconstructible model batch with a live task request.
@@ -297,10 +405,16 @@ pub(crate) fn message_request() -> Option<ToolExecutionRequest> {
     if !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false) {
         return None;
     }
-    TASK_REQUEST
-        .try_with(Clone::clone)
-        .ok()
-        .filter(|request| matches!(request.source, ai_agents_core::ToolCallSource::Model))
+    TASK_REQUEST.try_with(Clone::clone).ok().filter(|request| {
+        matches!(
+            request.source,
+            ai_agents_core::ToolCallSource::Model
+                | ai_agents_core::ToolCallSource::Fallback { .. }
+                | ai_agents_core::ToolCallSource::Skill { .. }
+                | ai_agents_core::ToolCallSource::StateAction { .. }
+                | ai_agents_core::ToolCallSource::Task
+        )
+    })
 }
 
 /// A private request scope ties an approval to its original call ID, not a model-selected label.
@@ -347,6 +461,30 @@ pub(crate) fn take_resumed_approval(request: &ApprovalRequest) -> Result<Option<
         })
         .ok()
         .flatten())
+}
+
+/// Live resume custody supplies the actual pending executor request once; stored source labels cannot install it.
+pub(crate) async fn scope_resumed_executor<F: Future>(
+    cursors: Vec<TaskExecutorCursor>,
+    future: F,
+) -> F::Output {
+    RESUMED_EXECUTOR
+        .scope(std::cell::RefCell::new(cursors), future)
+        .await
+}
+
+/// Only the exact original call can consume its saved fallback location.
+pub(crate) fn take_resumed_executor(call_id: &str) -> Option<TaskExecutorCursor> {
+    RESUMED_EXECUTOR
+        .try_with(|slot| {
+            let mut cursors = slot.borrow_mut();
+            cursors
+                .iter()
+                .position(|cursor| cursor.request.call_id == call_id)
+                .map(|index| cursors.remove(index))
+        })
+        .ok()
+        .flatten()
 }
 
 /// Retains a validated response only while the exact resumed invocation is polled.
@@ -406,7 +544,16 @@ impl RunExecution {
                 || current_child_operation()
                     .is_some_and(|operation| self.has_composition_child(&operation)))
             && TASK_REQUEST
-                .try_with(|request| matches!(request.source, ai_agents_core::ToolCallSource::Model))
+                .try_with(|request| {
+                    matches!(
+                        request.source,
+                        ai_agents_core::ToolCallSource::Model
+                            | ai_agents_core::ToolCallSource::Fallback { .. }
+                            | ai_agents_core::ToolCallSource::Skill { .. }
+                            | ai_agents_core::ToolCallSource::StateAction { .. }
+                            | ai_agents_core::ToolCallSource::Task
+                    )
+                })
                 .unwrap_or(false)
     }
 
@@ -479,7 +626,14 @@ impl RunExecution {
         let Ok(request) = TASK_REQUEST.try_with(Clone::clone) else {
             return false;
         };
-        if !matches!(request.source, ai_agents_core::ToolCallSource::Model) {
+        if !matches!(
+            request.source,
+            ai_agents_core::ToolCallSource::Model
+                | ai_agents_core::ToolCallSource::Fallback { .. }
+                | ai_agents_core::ToolCallSource::Skill { .. }
+                | ai_agents_core::ToolCallSource::StateAction { .. }
+                | ai_agents_core::ToolCallSource::Task
+        ) {
             return false;
         }
         // Child suspension requires an exact live parent frame, not merely an inherited task label.
@@ -584,30 +738,7 @@ impl RunExecution {
             .approvals
             .first()
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-        let messages = runtime.snapshot.memory.messages.clone();
-        runtime.continuation = TaskContinuation::Suspended {
-            request_id: pending.request_id.clone(),
-            turn_id: format!("{}:{}", self.run_id, self.current_cycle()),
-            user_message_committed: true,
-            finalized: false,
-            skill: None,
-            batch: Some(TaskToolBatchCursor {
-                messages,
-                call_ids: state.calls.iter().map(|call| call.id.clone()).collect(),
-                next_call: state.appended,
-                completed_results: state.results[..state.appended]
-                    .iter()
-                    .map(|result| {
-                        let output = match result.as_ref().unwrap() {
-                            Ok(output) => output.clone(),
-                            Err(error) => format!("Error: {error}"),
-                        };
-                        serde_json::from_str(&output).unwrap_or(Value::String(output))
-                    })
-                    .collect(),
-            }),
-        };
-        runtime.validate()?;
+        state.bind_runtime(&mut runtime, &self.run_id, self.current_cycle())?;
         payload.runtime = runtime;
         payload.todos = todos;
         if let Some(previous) = &payload.pending

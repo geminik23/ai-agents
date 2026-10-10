@@ -40,6 +40,28 @@ impl RuntimeAgent {
         }
         ancestry.push(self.info.id.clone());
         use crate::autonomy::composition::CompositionDispatch;
+        if frame.dispatch == CompositionDispatch::ToolBatch {
+            let ids: Vec<String> = serde_json::from_value(frame.definition["messages"].clone())?;
+            let mut selected = None;
+            for id in ids {
+                let invocation = frames
+                    .get(&id)
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                self.check_message_frame(invocation, targets)?;
+                if invocation.contains_operation(operation, frames, &mut Vec::new()) {
+                    selected = Some(self.task_composition_target(
+                        invocation,
+                        frames,
+                        targets,
+                        operation,
+                        &mut Vec::new(),
+                    )?);
+                }
+            }
+            ancestry.pop();
+            return selected
+                .ok_or_else(|| crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+        }
         if frame.dispatch == CompositionDispatch::ToolMessage {
             self.check_message_frame(frame, targets)?;
             let slot = &frame.children[0];
@@ -81,7 +103,7 @@ impl RuntimeAgent {
             CompositionDispatch::GroupChat => {
                 serde_json::to_value(&definition.group_chat)? == frame.definition
             }
-            CompositionDispatch::ToolMessage => {
+            CompositionDispatch::ToolMessage | CompositionDispatch::ToolBatch => {
                 unreachable!("message frames are checked separately")
             }
         };
@@ -203,13 +225,14 @@ impl RuntimeAgent {
                         self.info.id.clone(),
                         Box::pin(async {
                             use crate::autonomy::composition::CompositionDispatch;
-                            if frame.dispatch == CompositionDispatch::ToolMessage {
-                                return Box::pin(self.resume_message_frame(frame.clone())).await;
+                            if frame.dispatch == CompositionDispatch::ToolBatch {
+                                return Box::pin(self.resume_message_batch(frame.clone())).await;
                             }
                             let definition = definition
                                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
                             match frame.dispatch {
-                                CompositionDispatch::ToolMessage => {
+                                CompositionDispatch::ToolMessage
+                                | CompositionDispatch::ToolBatch => {
                                     unreachable!("message frames resume separately")
                                 }
                                 CompositionDispatch::GroupChat => {
@@ -302,6 +325,17 @@ impl RuntimeAgent {
         };
         let mut retired = Vec::new();
         for leaf in &leaves {
+            if crate::autonomy::current_execution().is_some_and(|execution| {
+                execution.acknowledged_snapshot().payload["children"]
+                    .as_array()
+                    .is_some_and(|children| {
+                        children.iter().any(|child| {
+                            child["child_id"] == leaf.operation && child["pending"].is_null()
+                        })
+                    })
+            }) {
+                continue;
+            }
             let child = targets.resolve(&leaf.operation)?;
             if child.info.id != leaf.runtime_id {
                 return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
@@ -313,11 +347,10 @@ impl RuntimeAgent {
                 Box::pin(child.cancel_task_batch(&child_owner, leaf.batch.clone())).await?;
             retired.push((leaf.operation.clone(), runtime));
         }
-        for frame in group
-            .frames
-            .values()
-            .filter(|frame| frame.runtime_id != self.info.id)
-        {
+        for frame in group.frames.values().filter(|frame| {
+            frame.runtime_id != self.info.id
+                && frame.dispatch != crate::autonomy::composition::CompositionDispatch::ToolMessage
+        }) {
             if !leaves.iter().any(|leaf| {
                 frame.contains_operation(&leaf.operation, &group.frames, &mut Vec::new())
             }) {
@@ -351,17 +384,16 @@ impl RuntimeAgent {
                 ));
             }
             drop(_gate);
-            let runtime = if frame.dispatch
-                == crate::autonomy::composition::CompositionDispatch::ToolMessage
-            {
-                Box::pin(parent.close_message_frame(&owner, frame)).await?
-            } else {
-                TaskRuntimeCheckpoint::between_turns(parent.save_state_full().await?)?
-            };
+            let runtime =
+                if frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolBatch {
+                    Box::pin(parent.close_message_batch(&owner, frame, &group.frames)).await?
+                } else {
+                    TaskRuntimeCheckpoint::between_turns(parent.save_state_full().await?)?
+                };
             retired.push((edge.0, runtime));
         }
-        if group.frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolMessage {
-            Box::pin(self.close_message_frame(owner, &group.frame)).await?;
+        if group.frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolBatch {
+            Box::pin(self.close_message_batch(owner, &group.frame, &group.frames)).await?;
         }
         Ok(retired)
     }
@@ -442,7 +474,7 @@ impl RuntimeAgent {
                 .lock()
                 .get(&self.info.id)
                 .is_some_and(|frame| {
-                    frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolMessage
+                    frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolBatch
                 });
             if message_parent {
                 Box::pin(execution.checkpoint_child_composition_park(
@@ -512,6 +544,12 @@ impl RuntimeAgent {
         state: &mut TaskBatchState,
         all_calls: &mut Vec<ToolCall>,
     ) -> Result<()> {
+        if state.location.is_some() {
+            while state.appended < state.calls.len() && state.results[state.appended].is_some() {
+                state.appended += 1;
+            }
+            return Ok(());
+        }
         let native = Self::is_native_tool_call_content(&state.content)?;
         while state.appended < state.calls.len() {
             let Some(result) = &state.results[state.appended] else {
@@ -534,6 +572,9 @@ impl RuntimeAgent {
     /// Captures turn-local values before the caller unwinds its ordinary root bookkeeping.
     pub(super) async fn retain_task_loop(&self, mut state: TaskLoopState) -> Result<()> {
         state.native_exchanges = self.task_native_expectations();
+        if let Some(finalization) = &mut state.deferred_final {
+            finalization.finalize_on_resume = true;
+        }
         let execution = crate::autonomy::current_execution()
             .ok_or_else(|| AgentError::Config("task loop has no owner".into()))?;
         let batch = {
@@ -641,6 +682,10 @@ impl RuntimeAgent {
         result: crate::autonomy::suspension::BatchResponse,
     ) -> Result<AgentResponse> {
         batch.validate()?;
+        if batch.location.is_some() {
+            return Box::pin(self.resume_task_location_batch(input, batch, request_id, result))
+                .await;
+        }
         let approval = batch
             .approvals
             .iter()
@@ -713,15 +758,23 @@ impl RuntimeAgent {
                                 result: result.clone(),
                             });
                     }
-                    let invocation = crate::autonomy::suspension::scope_resumed_approval(
+                    let invocation = crate::autonomy::suspension::scope_resumed_executor(
                         batch
-                            .authorized
+                            .executor_cursors
                             .iter()
-                            .filter(|receipt| receipt.call_id == approval.call_id)
+                            .filter(|cursor| cursor.request.call_id == approval.call_id)
                             .cloned()
                             .collect(),
-                        crate::autonomy::scope_task_batch(
-                            self.execute_tool_smart(&batch.calls[index]),
+                        crate::autonomy::suspension::scope_resumed_approval(
+                            batch
+                                .authorized
+                                .iter()
+                                .filter(|receipt| receipt.call_id == approval.call_id)
+                                .cloned()
+                                .collect(),
+                            crate::autonomy::scope_task_batch(
+                                self.execute_tool_smart(&batch.calls[index]),
+                            ),
                         ),
                     );
                     let output = match result {
@@ -750,6 +803,17 @@ impl RuntimeAgent {
                                 .take_parked_approvals(&self.info.id);
                             replacements.append(&mut batch.approvals);
                             batch.approvals = replacements;
+                            let execution = crate::autonomy::current_execution().unwrap();
+                            if let Some(cursor) = execution
+                                .parked_executor_cursors
+                                .lock()
+                                .remove(&(self.info.id.clone(), approval.call_id.clone()))
+                            {
+                                batch
+                                    .executor_cursors
+                                    .retain(|old| old.request.call_id != cursor.request.call_id);
+                                batch.executor_cursors.push(cursor);
+                            }
                             batch.loop_state = Some(state);
                             let execution = crate::autonomy::current_execution().unwrap();
                             Box::pin(execution.retain_message_batch(&self.info.id, batch.clone()))
@@ -761,6 +825,9 @@ impl RuntimeAgent {
                             if matches!(&output, Err(AgentError::HITLRejected(_))) {
                                 batch.rejected = true;
                             }
+                            batch
+                                .executor_cursors
+                                .retain(|cursor| cursor.request.call_id != approval.call_id);
                             batch.results[index] = Some(output.map_err(|error| error.to_string()))
                         }
                     }
@@ -773,6 +840,7 @@ impl RuntimeAgent {
                                 *result = Some(Err("cancelled after approval rejection".into()));
                             }
                         }
+                        batch.executor_cursors.clear();
                         let retired: Vec<_> = batch
                             .approvals
                             .drain(..)
@@ -795,9 +863,10 @@ impl RuntimeAgent {
                     if let Some(next) = batch.approvals.first() {
                         let id = next.request_id.clone();
                         batch.loop_state = Some(state);
-                        crate::autonomy::current_execution()
-                            .unwrap()
-                            .retain_batch(&self.info.id, batch);
+                        let execution = crate::autonomy::current_execution().unwrap();
+                        Box::pin(execution.retain_message_batch(&self.info.id, batch.clone()))
+                            .await?;
+                        execution.retain_batch(&self.info.id, batch);
                         return Err(AgentError::TaskSuspended(id));
                     }
                     if batch.appended != batch.calls.len() {
@@ -910,13 +979,19 @@ impl RuntimeAgent {
                 .await;
             let content = response.content.trim();
             if let Some(calls) = self.parse_main_tool_calls(content, &protocol)? {
-                match Box::pin(self.handle_tool_calls(
-                    &state.processed_input,
-                    content,
-                    calls,
-                    &mut state.all_tool_calls,
-                    None,
-                ))
+                let position = crate::autonomy::location::TaskStateReturn::ModelContinue {
+                    state: Box::new(state.clone()),
+                };
+                match crate::autonomy::location::scope_state_return(
+                    position,
+                    Box::pin(self.handle_tool_calls(
+                        &state.processed_input,
+                        content,
+                        calls,
+                        &mut state.all_tool_calls,
+                        None,
+                    )),
+                )
                 .await
                 {
                     Err(AgentError::TaskSuspended(id)) => {
@@ -926,10 +1001,35 @@ impl RuntimeAgent {
                     Err(error) => return Err(error),
                     Ok(ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired) => continue,
                     Ok(ToolCallOutcome::Rejected(response)) => {
-                        self.finish_turn_if_root(&response).await?;
+                        if state
+                            .deferred_final
+                            .as_ref()
+                            .is_none_or(|finalization| finalization.finalize_on_resume)
+                        {
+                            self.finish_turn_if_root(&response).await?;
+                        }
                         return Ok(response);
                     }
                 }
+            }
+            if let Some(finalization) = state.deferred_final.take() {
+                self.memory
+                    .add_message(ChatMessage::assistant(content))
+                    .await?;
+                self.check_memory_compression().await?;
+                let response = self.build_agent_response(AgentResponseParts {
+                    content: content.into(),
+                    all_tool_calls: state.all_tool_calls,
+                    reasoning_mode: finalization.reasoning_mode,
+                    auto_detected: finalization.auto_detected,
+                    iterations: finalization.iterations,
+                    thinking: finalization.thinking,
+                    reflection_metadata: finalization.reflection_metadata,
+                });
+                if finalization.finalize_on_resume {
+                    self.finish_turn_if_root(&response).await?;
+                }
+                return Ok(response);
             }
             let (thinking, answer) = self.extract_thinking(content);
             if thinking.is_some() {

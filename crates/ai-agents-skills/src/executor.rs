@@ -5,7 +5,21 @@ use ai_agents_llm::{ChatMessage, LLMRegistry};
 use ai_agents_tools::ToolRegistry;
 use minijinja::Environment;
 
-use crate::definition::{SkillContext, SkillDefinition, SkillStep};
+use crate::definition::{SkillContext, SkillDefinition, SkillExecutionCursor, SkillStep};
+
+/// Hosts acknowledge exact skill progress before a new effect and after a completed result.
+#[async_trait::async_trait]
+pub trait SkillExecutionObserver: Send + Sync {
+    async fn checkpoint(&self, cursor: &SkillExecutionCursor) -> Result<()>;
+}
+
+struct UnjournaledSkill;
+#[async_trait::async_trait]
+impl SkillExecutionObserver for UnjournaledSkill {
+    async fn checkpoint(&self, _: &SkillExecutionCursor) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// Executes skill steps with either prompt-only mode or a runtime tool invoker.
 pub struct SkillExecutor {
@@ -86,67 +100,72 @@ impl SkillExecutor {
     where
         I: ToolInvoker + ?Sized,
     {
-        let mut ctx = SkillContext::new(user_input).with_extra(extra_context);
+        let mut cursor = SkillExecutionCursor::new(skill, user_input, extra_context);
+        self.execute_resumable_with_invoker(skill, &mut cursor, invoker, &UnjournaledSkill)
+            .await
+    }
 
-        for (index, step) in skill.steps.iter().enumerate() {
-            match step {
-                SkillStep::Tool {
-                    tool,
-                    args,
-                    output_as: _,
-                } => {
-                    let rendered_args = self.render_args(args.clone(), &ctx)?;
-                    let record = invoker
-                        .invoke_tool(ToolExecutionRequest::new(
+    /// Runs only unfinished script steps; pending tool identity and completed prompt/template results survive suspension.
+    pub async fn execute_resumable_with_invoker<I, O>(
+        &self,
+        skill: &SkillDefinition,
+        cursor: &mut SkillExecutionCursor,
+        invoker: &I,
+        observer: &O,
+    ) -> Result<String>
+    where
+        I: ToolInvoker + ?Sized,
+        O: SkillExecutionObserver + ?Sized,
+    {
+        cursor.validate(skill)?;
+        while cursor.next_step < skill.steps.len() {
+            let index = cursor.next_step;
+            match &skill.steps[index] {
+                SkillStep::Tool { tool, args, .. } => {
+                    if cursor.pending.is_none() {
+                        cursor.pending = Some(ToolExecutionRequest::new(
                             uuid::Uuid::new_v4().to_string(),
-                            tool.clone(),
-                            rendered_args.clone(),
+                            tool,
+                            self.render_args(args.clone(), &cursor.context)?,
                             ToolCallSource::Skill {
                                 skill_id: skill.id.clone(),
                                 step_index: index,
                             },
-                        ))
-                        .await?;
-                    let result_value = record.model_output_value();
-                    let metadata = serde_json::to_value(&record).ok();
-                    ctx.add_result_with_metadata(
-                        index,
-                        Some(rendered_args),
-                        result_value,
-                        metadata,
-                    );
-
-                    if !record.success {
-                        return Err(AgentError::Skill(format!(
-                            "Tool '{}' failed: {}",
-                            tool,
-                            record.model_output_string()
-                        )));
+                        ));
                     }
+                    observer.checkpoint(cursor).await?;
+                    let record = invoker
+                        .invoke_tool(cursor.pending.as_ref().unwrap().clone())
+                        .await?;
+                    cursor.accept_tool_result(record)?;
                 }
                 SkillStep::Prompt { prompt, llm } => {
-                    let rendered_prompt = self.render_prompt(prompt, &ctx)?;
-                    let llm_provider = match llm {
+                    observer.checkpoint(cursor).await?;
+                    let rendered = self.render_prompt(prompt, &cursor.context)?;
+                    let provider = match llm {
                         Some(alias) => self.llm_registry.get(alias)?,
                         None => self.llm_registry.default()?,
                     };
-                    let response = llm_provider
-                        .complete(&[ChatMessage::user(&rendered_prompt)], None)
+                    let response = provider
+                        .complete(&[ChatMessage::user(&rendered)], None)
                         .await
-                        .map_err(|e| AgentError::LLM(e.to_string()))?;
-                    let result_value =
-                        serde_json::Value::String(response.content.trim().to_string());
-                    ctx.add_result(index, None, result_value);
-                    if index == skill.steps.len() - 1 {
-                        return Ok(response.content);
+                        .map_err(|error| AgentError::LLM(error.to_string()))?;
+                    cursor.context.add_result(
+                        index,
+                        None,
+                        serde_json::Value::String(response.content.trim().to_string()),
+                    );
+                    cursor.next_step += 1;
+                    if cursor.next_step == skill.steps.len() {
+                        cursor.response = Some(response.content);
                     }
                 }
             }
+            observer.checkpoint(cursor).await?;
         }
-
-        Err(AgentError::Skill(
-            "Skill has no prompt step to generate response".to_string(),
-        ))
+        cursor.response.clone().ok_or_else(|| {
+            AgentError::Skill("Skill has no prompt step to generate response".into())
+        })
     }
 
     fn render_args(

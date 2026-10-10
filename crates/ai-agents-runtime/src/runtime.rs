@@ -21,8 +21,12 @@ tokio::task_local! {
 mod task_composition;
 #[path = "autonomy/continuation_runtime.rs"]
 mod task_continuation;
+#[path = "autonomy/location_runtime.rs"]
+mod task_location;
 #[path = "autonomy/message_runtime.rs"]
 mod task_message;
+#[path = "autonomy/state_runtime.rs"]
+mod task_state;
 
 #[cfg(test)]
 #[path = "autonomy/boundary_tests.rs"]
@@ -483,6 +487,8 @@ enum PostLoopResult {
     /// Transition fired.
     /// `regenerated == false` means content is byte-identical to the input: the caller must not emit it again.
     Transitioned { content: String, regenerated: bool },
+    /// Task regeneration keeps its full call accumulation while the enclosing root retains finalization ownership.
+    TaskRegenerated(AgentResponse),
     /// Transition fired into a state that requires full dispatch.
     /// Caller re-enters run_loop_internal to apply the correct handler.
     NeedsRedispatch,
@@ -491,6 +497,7 @@ enum PostLoopResult {
 /// Outcome of applying a `PostLoopResult`, shared by the blocking and streaming loops.
 struct AppliedPostLoop {
     content: String,
+    tool_calls: Option<Vec<ToolCall>>,
     transitioned: bool,
     /// True when `content` replaces what the consumer already saw; false when it is byte-identical to the pre-transition content.
     regenerated: bool,
@@ -1620,7 +1627,7 @@ impl RuntimeAgent {
                             let batch = execution.parked_batches.lock().get(&self.info.id).cloned();
                             let runtime = Box::pin(self.task_suspension_snapshot()).await?;
                             let message_parent = execution.delegate_frames.lock().get(&self.info.id)
-                                .is_some_and(|frame| frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolMessage);
+                                .is_some_and(|frame| frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolBatch);
                             if let Some(batch) = batch.filter(|_| !message_parent) {
                                 Box::pin(
                                     execution.checkpoint_child_park(&operation, runtime, batch),
@@ -6145,11 +6152,21 @@ impl RuntimeAgent {
 
     /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
     /// Each fallback hop installs its own private request scope in the inner driver, without duplicating a large outer record-return frame.
+    /// A retained resume cursor selects only the actual pending hop so completed failed ancestors and their admission are not replayed.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        self.execute_tool_record_inner(request, ToolFallbackState::default())
+        if let Some(cursor) = crate::autonomy::suspension::take_resumed_executor(&request.call_id) {
+            self.execute_tool_record_inner(
+                cursor.request,
+                ToolFallbackState {
+                    visited_canonical_ids: cursor.ancestry,
+                },
+            )
+        } else {
+            self.execute_tool_record_inner(request, ToolFallbackState::default())
+        }
     }
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
@@ -6167,7 +6184,11 @@ impl RuntimeAgent {
             let mut next = (request, fallback_state);
             loop {
                 let (request, fallback_state) = next;
-                let (record, successor) = TOOL_FALLBACK_REQUEST
+                let parked = crate::autonomy::suspension::TaskExecutorCursor {
+                    request: request.clone(),
+                    ancestry: fallback_state.visited_canonical_ids.clone(),
+                };
+                let result = TOOL_FALLBACK_REQUEST
                     .scope(std::cell::RefCell::new(None), async {
                         let work = Box::pin(
                             self.execute_tool_record_scoped(request.clone(), fallback_state),
@@ -6177,7 +6198,19 @@ impl RuntimeAgent {
                         let successor = TOOL_FALLBACK_REQUEST.with(|slot| slot.borrow_mut().take());
                         Ok::<_, AgentError>((record, successor))
                     })
-                    .await?;
+                    .await;
+                let (record, successor) = match result {
+                    Err(error @ AgentError::TaskSuspended(_)) => {
+                        if let Some(execution) = crate::autonomy::current_execution() {
+                            execution.parked_executor_cursors.lock().insert(
+                                (self.info.id.clone(), parked.request.call_id.clone()),
+                                parked,
+                            );
+                        }
+                        return Err(error);
+                    }
+                    result => result?,
+                };
                 if let Some(successor) = successor {
                     next = successor;
                 } else {
@@ -7840,7 +7873,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Execute a skill with reasoning and reflection, returning the response string.
+    /// Executes ordinary scripts directly and task scripts from an acknowledged cursor without rerouting or replaying completed steps.
     async fn execute_skill(&self, skill: &SkillDefinition, input: &str) -> Result<String> {
         if let Some(ref executor) = self.skill_executor {
             let skill_reasoning = self.get_skill_reasoning_config(skill);
@@ -7853,12 +7886,15 @@ impl RuntimeAgent {
                 "Skill reasoning/reflection config"
             );
 
-            let response = self
-                .observe_purpose(
+            let response = if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+                Box::pin(self.execute_task_skill(skill, input)).await?
+            } else {
+                self.observe_purpose(
                     ObservationPurpose::SkillPrompt,
                     executor.execute_with_invoker(skill, input, serde_json::json!({}), self),
                 )
-                .await?;
+                .await?
+            };
 
             if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
                 let should_reflect = self
@@ -8169,6 +8205,18 @@ OVERALL: PASS/FAIL"#,
         let Some(timeout_state) = sm.check_timeout() else {
             return Ok(());
         };
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && crate::autonomy::location::current_state_return().is_some()
+        {
+            return Box::pin(self.apply_task_transition_target(
+                &sm.current(),
+                &timeout_state,
+                "max_turns exceeded",
+                None,
+            ))
+            .await
+            .map(|_| ());
+        }
         let claim_admission = self.disambiguation_admission.write().await;
         if sm.check_timeout().as_deref() != Some(timeout_state.as_str()) {
             return Ok(());
@@ -8353,6 +8401,12 @@ OVERALL: PASS/FAIL"#,
         let Some(ref sm) = self.state_machine else {
             return Ok(false);
         };
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && crate::autonomy::location::current_state_return().is_some()
+        {
+            return Box::pin(self.apply_task_transition_target(from_state, target, reason, staged))
+                .await;
+        }
         let claim_admission = self.disambiguation_admission.write().await;
         if sm.current() != from_state {
             return Ok(false);
@@ -10625,12 +10679,22 @@ Respond in JSON format:
             self.hooks.on_message_received(input).await;
         }
 
-        self.prepare_turn_context().await?;
+        crate::autonomy::location::scope_state_return(
+            crate::autonomy::location::TaskStateReturn::ReadyContext {
+                input: input.into(),
+            },
+            self.prepare_turn_context(),
+        )
+        .await?;
 
         // Clear stale disambiguation context from previous turns.
         // This prevents resolved_intent from leaking across turns and causing incorrect deterministic routing on subsequent inputs.
         self.clear_disambiguation_context();
+        Box::pin(self.run_after_ready_context(input)).await
+    }
 
+    /// Readiness and receive hooks are already complete when a saved timeout or clarification returns here.
+    async fn run_after_ready_context(&self, input: &str) -> Result<AgentResponse> {
         // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
         // responses itself; this loop only dispatches on the outcome.
         let dispatch = if crate::autonomy::current_turn_input(&self.root_turn_gate)
@@ -11005,11 +11069,15 @@ Respond in JSON format:
         self.check_memory_compression().await?;
 
         self.increment_turn();
-        self.evaluate_transitions(processed_input, &final_response)
-            .await?;
-
-        let response = AgentResponse::new(final_response)
+        let response = AgentResponse::new(final_response.clone())
             .with_metadata("skill_id", serde_json::json!(skill_id));
+        crate::autonomy::location::scope_state_return(
+            crate::autonomy::location::TaskStateReturn::SkillFinish {
+                response: response.clone(),
+            },
+            self.evaluate_transitions(processed_input, &final_response),
+        )
+        .await?;
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
@@ -11269,7 +11337,7 @@ Respond in JSON format:
             auto_detected,
             iterations,
             thinking_content,
-            all_tool_calls,
+            mut all_tool_calls,
         } = response;
         let output_data = self.process_output(&answer, input_context).await?;
         let mut final_content = if output_data.metadata.rejected {
@@ -11287,12 +11355,30 @@ Respond in JSON format:
         final_content =
             self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
         let final_content = {
-            let result = self
-                .post_loop_processing(processed_input, final_content)
-                .await?;
-            self.apply_post_loop_result(processed_input, result)
-                .await?
-                .content
+            let position = crate::autonomy::location::TaskStateReturn::ModelFinish {
+                state: Box::new(crate::autonomy::location::TaskModelFinal {
+                    processed_input: processed_input.into(),
+                    input_context: input_context.clone(),
+                    content: final_content.clone(),
+                    all_tool_calls: all_tool_calls.clone(),
+                    reasoning_mode: reasoning_mode.clone(),
+                    auto_detected,
+                    iterations,
+                    thinking: thinking_content.clone(),
+                    reflection_metadata: reflection_metadata.clone(),
+                    finalize_on_resume: false,
+                }),
+            };
+            let result = crate::autonomy::location::scope_state_return(
+                position,
+                Box::pin(self.post_loop_processing(processed_input, final_content)),
+            )
+            .await?;
+            let applied = self.apply_post_loop_result(processed_input, result).await?;
+            if let Some(calls) = applied.tool_calls {
+                all_tool_calls = calls;
+            }
+            applied.content
         };
         let response = self.build_agent_response(AgentResponseParts {
             content: final_content,
@@ -11327,6 +11413,7 @@ Respond in JSON format:
                 all_tool_calls: Vec::new(),
                 thinking_content: None,
                 native_exchanges: Vec::new(),
+                deferred_final: None,
             }),
         )
         .await
@@ -11353,9 +11440,14 @@ Respond in JSON format:
         // (with proper URLs from YAML), so skip the LLM's tool call.
         let transition_content = native_readable_projection(content)
             .map_err(|error| AgentError::LLM(error.to_string()))?;
-        let transition_fired = self
-            .evaluate_transitions(processed_input, &transition_content)
-            .await?;
+        let transition_fired = if matches!(crate::autonomy::location::current_state_return(),
+            Some(crate::autonomy::location::TaskStateReturn::ModelContinue {state}) if state.deferred_final.is_some())
+        {
+            false
+        } else {
+            self.evaluate_transitions(processed_input, &transition_content)
+                .await?
+        };
         if transition_fired {
             self.memory
                 .add_message(ChatMessage::assistant(
@@ -11406,6 +11498,18 @@ Respond in JSON format:
                     loop_state: None,
                     authorized: Vec::new(),
                     rejected: false,
+                    location: None,
+                    executor_cursors: {
+                        let mut cursors = execution.parked_executor_cursors.lock();
+                        let keys: Vec<_> = cursors
+                            .keys()
+                            .filter(|(runtime, _)| runtime == &self.info.id)
+                            .cloned()
+                            .collect();
+                        keys.into_iter()
+                            .filter_map(|key| cursors.remove(&key))
+                            .collect()
+                    },
                 };
                 self.append_task_batch_prefix(&mut state, all_tool_calls)
                     .await?;
@@ -11592,7 +11696,16 @@ Respond in JSON format:
         self.run_context_extractors(processed_input).await?;
 
         let transitioned = self.evaluate_transitions(processed_input, &content).await?;
+        Box::pin(self.post_transition_processing(processed_input, content, transitioned)).await
+    }
 
+    /// Post-transition regeneration starts after the selected transition and actions, never by repeating extractors or incrementing the root twice.
+    async fn post_transition_processing(
+        &self,
+        processed_input: &str,
+        content: String,
+        transitioned: bool,
+    ) -> Result<PostLoopResult> {
         if !transitioned {
             self.memory
                 .add_message(ChatMessage::assistant(&content))
@@ -11635,6 +11748,27 @@ Respond in JSON format:
         // Re-generate in the new state context so the LLM can reference on_enter results.
         // If the LLM responds with a tool call, execute it in a mini-loop so the
         // result is not returned as raw JSON text.
+        if crate::autonomy::current_execution().is_some()
+            && let Some(crate::autonomy::location::TaskStateReturn::ModelFinish { state }) =
+                crate::autonomy::location::current_state_return()
+        {
+            let response = Box::pin(
+                self.run_committed_task_loop(crate::autonomy::TaskLoopState {
+                    version: 1,
+                    processed_input: processed_input.into(),
+                    input_context: state.input_context.clone(),
+                    reasoning_mode: ReasoningMode::None,
+                    auto_detected: false,
+                    iterations: 0,
+                    all_tool_calls: state.all_tool_calls.clone(),
+                    thinking_content: None,
+                    native_exchanges: self.task_native_expectations(),
+                    deferred_final: Some(state),
+                }),
+            )
+            .await?;
+            return Ok(PostLoopResult::TaskRegenerated(response));
+        }
         let new_llm = self.get_state_llm()?;
         let mut final_content;
 
@@ -11791,8 +11925,15 @@ Respond in JSON format:
         result: PostLoopResult,
     ) -> Result<AppliedPostLoop> {
         match result {
+            PostLoopResult::TaskRegenerated(response) => Ok(AppliedPostLoop {
+                content: response.content,
+                tool_calls: response.tool_calls,
+                transitioned: true,
+                regenerated: true,
+            }),
             PostLoopResult::NoTransition(content) => Ok(AppliedPostLoop {
                 content,
+                tool_calls: None,
                 transitioned: false,
                 regenerated: false,
             }),
@@ -11801,6 +11942,7 @@ Respond in JSON format:
                 regenerated,
             } => Ok(AppliedPostLoop {
                 content,
+                tool_calls: None,
                 transitioned: true,
                 regenerated,
             }),
@@ -11819,6 +11961,7 @@ Respond in JSON format:
                     // Nothing new for the consumer to see, so the streaming loop must not emit an empty chunk.
                     return Ok(AppliedPostLoop {
                         content,
+                        tool_calls: None,
                         transitioned: true,
                         regenerated: false,
                     });
@@ -11833,6 +11976,7 @@ Respond in JSON format:
                 };
                 resp.map(|r| AppliedPostLoop {
                     content: r.content,
+                    tool_calls: None,
                     transitioned: true,
                     regenerated: true,
                 })
@@ -12803,10 +12947,22 @@ Respond in JSON format:
 
         let processed_input = &input_data.content;
 
-        if let Some(response) = self.try_pre_response_transition(processed_input).await? {
+        if let Some(response) = crate::autonomy::location::scope_state_return(
+            crate::autonomy::location::TaskStateReturn::Prepared {
+                data: input_data.clone(),
+            },
+            Box::pin(self.try_pre_response_transition(processed_input)),
+        )
+        .await?
+        {
             return Ok(response);
         }
+        Box::pin(self.run_accepted_input(input_data)).await
+    }
 
+    /// Continues an accepted input after a saved transition without repeating processing or semantic transition selection.
+    async fn run_accepted_input(&self, input_data: ProcessData) -> Result<AgentResponse> {
+        let processed_input = &input_data.content;
         // Controller continuation works from committed aggregate history, not by rerunning completed initial child flows.
         if !crate::autonomy::current_turn_input(&self.root_turn_gate)
             .is_some_and(|turn| !turn.initial_work())

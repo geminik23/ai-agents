@@ -79,11 +79,106 @@ impl SkillRef {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkillContext {
     pub user_input: String,
     pub step_results: Vec<StepResult>,
     pub extra: Value,
+}
+
+/// Exact script progress retains rendered pending arguments and completed template inputs without rerouting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillExecutionCursor {
+    pub execution_id: String,
+    pub definition: SkillDefinition,
+    pub context: SkillContext,
+    pub next_step: usize,
+    pub pending: Option<ai_agents_core::ToolExecutionRequest>,
+    pub response: Option<String>,
+}
+
+impl SkillExecutionCursor {
+    /// A cursor starts before any prompt or tool effect; only its bound definition may advance it.
+    pub fn new(skill: &SkillDefinition, input: &str, extra: Value) -> Self {
+        Self {
+            execution_id: uuid::Uuid::new_v4().to_string(),
+            definition: skill.clone(),
+            context: SkillContext::new(input).with_extra(extra),
+            next_step: 0,
+            pending: None,
+            response: None,
+        }
+    }
+
+    /// Completed results form an exact prefix and a pending request belongs to the next declared tool step.
+    pub fn validate(&self, skill: &SkillDefinition) -> ai_agents_core::Result<()> {
+        if self.execution_id.is_empty()
+            || self.execution_id.len() > 128
+            || serde_json::to_value(&self.definition)? != serde_json::to_value(skill)?
+            || self.next_step > skill.steps.len()
+            || self.context.step_results.len() != self.next_step
+            || self
+                .context
+                .step_results
+                .iter()
+                .enumerate()
+                .any(|(index, result)| result.step_index != index)
+        {
+            return Err(ai_agents_core::AgentError::Skill(
+                "invalid or changed skill continuation".into(),
+            ));
+        }
+        if let Some(request) = &self.pending
+            && (request.call_id.is_empty()
+                || !matches!(&request.source, ai_agents_core::ToolCallSource::Skill {skill_id,step_index} if skill_id == &skill.id && *step_index == self.next_step)
+                || !matches!(skill.steps.get(self.next_step), Some(SkillStep::Tool {tool,..}) if tool == &request.requested_name))
+        {
+            return Err(ai_agents_core::AgentError::Skill(
+                "pending skill operation is not bound to its step".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A resumed result advances once and preserves original rendered arguments separately from approved execution arguments.
+    pub fn accept_tool_result(
+        &mut self,
+        record: ai_agents_core::ToolExecutionRecord,
+    ) -> ai_agents_core::Result<()> {
+        let request = self
+            .pending
+            .as_ref()
+            .ok_or_else(|| ai_agents_core::AgentError::Skill("skill has no pending tool".into()))?;
+        if request.call_id != record.call_id
+            || (!matches!(
+                record.source,
+                ai_agents_core::ToolCallSource::Fallback { .. }
+            ) && (request.requested_name != record.requested_name
+                || request.arguments != record.arguments))
+        {
+            return Err(ai_agents_core::AgentError::Skill(
+                "skill result binding changed".into(),
+            ));
+        }
+        if !record.success {
+            return Err(ai_agents_core::AgentError::Skill(format!(
+                "Tool '{}' failed: {}",
+                request.requested_name,
+                record.model_output_string()
+            )));
+        }
+        self.context.add_result_with_metadata(
+            self.next_step,
+            Some(request.arguments.clone()),
+            record.model_output_value(),
+            Some(serde_json::to_value(&record)?),
+        );
+        self.next_step += 1;
+        self.pending = None;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -50,6 +50,11 @@ mod continuation_tests;
 mod control;
 mod journal;
 mod lifecycle;
+pub(crate) mod location;
+#[cfg(test)]
+mod location_tests;
+#[cfg(test)]
+mod message_batch_tests;
 pub use authority::{HostValidationContext, RuntimeObservationExecutor, validation_judge_provider};
 pub(crate) use authority::{
     invoke_bound, validation_arguments_valid, validation_extra_grant, validation_metadata,

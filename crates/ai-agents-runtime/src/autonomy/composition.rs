@@ -61,6 +61,7 @@ pub(crate) enum CompositionDispatch {
     Handoff,
     GroupChat,
     ToolMessage,
+    ToolBatch,
 }
 
 /// Stable slot identities distinguish repeated calls to the same runtime without allocating new operations on resume.
@@ -268,19 +269,10 @@ impl TaskGroupState {
         else {
             return Err(invalid());
         };
-        if self.frame.dispatch == CompositionDispatch::ToolMessage {
-            let state: super::message::MessageState =
-                serde_json::from_value(self.frame.cursor.clone())?;
-            let batch = state.batch.as_ref().ok_or_else(invalid)?;
+        if self.frame.dispatch == CompositionDispatch::ToolBatch {
+            let batch: TaskBatchState = serde_json::from_value(self.frame.cursor.clone())?;
             batch.validate_model_history(&payload.runtime)?;
-            if !batch.calls.iter().enumerate().any(|(index, call)| {
-                call.id == state.record.call_id
-                    && call.name == state.record.requested_name
-                    && call.arguments == state.record.arguments
-                    && batch.results[index].is_none()
-            }) {
-                return Err(invalid());
-            }
+            super::message::validate_message_batch(&self.frame, &self.frames, &batch, payload)?;
             let mut projection = payload.runtime.clone();
             batch.bind_runtime(&mut projection, "message", 0)?;
             let TaskContinuation::Suspended {
@@ -296,8 +288,7 @@ impl TaskGroupState {
             return Err(invalid());
         }
         if *request_id != self.request_id
-            || (self.frame.dispatch != CompositionDispatch::ToolMessage
-                && *turn_id != self.frame.id)
+            || (self.frame.dispatch != CompositionDispatch::ToolBatch && *turn_id != self.frame.id)
         {
             return Err(invalid());
         }
@@ -444,6 +435,7 @@ fn collect_parked_leaves(
 #[derive(Clone)]
 pub(crate) struct CompositionScope {
     pub runtime_id: String,
+    frame_key: String,
     closed: Arc<parking_lot::Mutex<bool>>,
     deadline: Option<std::time::Instant>,
 }
@@ -481,9 +473,27 @@ pub(crate) fn current_composition() -> Option<CompositionScope> {
 
 /// Creates a fresh admission interval for a retained parent; original timeouts stay in its saved cursor.
 pub(crate) async fn scope_composition<F: Future>(runtime_id: String, future: F) -> F::Output {
+    scope_composition_frame(runtime_id.clone(), runtime_id, future).await
+}
+
+/// Message calls select their own frame and deadline, never a sibling's runtime-wide coordinator.
+pub(crate) async fn scope_message_composition<F: Future>(
+    runtime_id: String,
+    frame_id: String,
+    future: F,
+) -> F::Output {
+    scope_composition_frame(runtime_id, frame_id, future).await
+}
+
+/// Private frame selection carries a distinct admission interval while inherited deadlines only narrow it.
+async fn scope_composition_frame<F: Future>(
+    runtime_id: String,
+    frame_key: String,
+    future: F,
+) -> F::Output {
     let inherited = current_composition_deadline();
     let own = current_execution().and_then(|execution| {
-        let frame = execution.delegate_frames.lock().get(&runtime_id).cloned()?;
+        let frame = execution.delegate_frames.lock().get(&frame_key).cloned()?;
         execution
             .approval_deadlines
             .lock()
@@ -502,6 +512,7 @@ pub(crate) async fn scope_composition<F: Future>(runtime_id: String, future: F) 
                 COMPOSITION_SCOPE.scope(
                     CompositionScope {
                         runtime_id,
+                        frame_key,
                         closed: Arc::new(parking_lot::Mutex::new(false)),
                         deadline,
                     },
@@ -579,7 +590,7 @@ impl RunExecution {
         };
         self.delegate_frames
             .lock()
-            .get(&scope.runtime_id)
+            .get(&scope.frame_key)
             .cloned()
             .map(Some)
             .ok_or_else(|| TaskRunStorageError::InvalidCheckpoint.into())
@@ -746,10 +757,8 @@ impl RunExecution {
             kind: group.child_request.kind,
             reviewed_action: json!({"group_id":group.frame.id,"child_operation":group.child_operation,"request":group.child_request}),
         });
-        let parent_batch = if group.frame.dispatch == CompositionDispatch::ToolMessage {
-            let state: super::message::MessageState =
-                serde_json::from_value(group.frame.cursor.clone())?;
-            let batch = state.batch.ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let parent_batch = if group.frame.dispatch == CompositionDispatch::ToolBatch {
+            let batch: TaskBatchState = serde_json::from_value(group.frame.cursor.clone())?;
             batch.bind_runtime(&mut runtime, &self.run_id, self.current_cycle())?;
             match runtime.continuation {
                 TaskContinuation::Suspended { batch, .. } => batch,
@@ -760,7 +769,7 @@ impl RunExecution {
         };
         runtime.continuation = TaskContinuation::Suspended {
             request_id: request_id.clone(),
-            turn_id: if group.frame.dispatch == CompositionDispatch::ToolMessage {
+            turn_id: if group.frame.dispatch == CompositionDispatch::ToolBatch {
                 format!("{}:{}", self.run_id, self.current_cycle())
             } else {
                 group.frame.id.clone()
@@ -884,9 +893,12 @@ impl RunExecution {
         })
         .await?;
         self.targets.install(captured)?;
-        self.delegate_frames
-            .lock()
-            .insert(frame.runtime_id.clone(), frame);
+        let key = if frame.dispatch == CompositionDispatch::ToolMessage {
+            frame.id.clone()
+        } else {
+            frame.runtime_id.clone()
+        };
+        self.delegate_frames.lock().insert(key, frame);
         Ok(())
     }
 
@@ -963,13 +975,9 @@ impl RunExecution {
             let leaf = leaves
                 .first()
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            let parent_batch = if frame.dispatch == CompositionDispatch::ToolMessage {
-                let state: super::message::MessageState =
-                    serde_json::from_value(frame.cursor.clone())?;
-                state
-                    .batch
-                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?
-                    .bind_runtime(&mut runtime, &self.run_id, self.current_cycle())?;
+            let parent_batch = if frame.dispatch == CompositionDispatch::ToolBatch {
+                let batch: TaskBatchState = serde_json::from_value(frame.cursor.clone())?;
+                batch.bind_runtime(&mut runtime, &self.run_id, self.current_cycle())?;
                 match runtime.continuation {
                     TaskContinuation::Suspended { batch, .. } => batch,
                     _ => return Err(TaskRunStorageError::InvalidCheckpoint.into()),
@@ -979,7 +987,7 @@ impl RunExecution {
             };
             runtime.continuation = TaskContinuation::Suspended {
                 request_id: request_id.clone(),
-                turn_id: if frame.dispatch == CompositionDispatch::ToolMessage {
+                turn_id: if frame.dispatch == CompositionDispatch::ToolBatch {
                     format!("{}:{}", self.run_id, self.current_cycle())
                 } else {
                     frame.id.clone()

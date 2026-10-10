@@ -201,6 +201,7 @@ impl AutonomyRunner {
                 .find(|call| call.id == pending.call_id)
                 .cloned()
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            call = group.batch.pending_call(&call);
             call.arguments = pending.context.clone();
             child.validate_task_question_answer(&call, &pending.question, answer)?;
         }
@@ -415,39 +416,44 @@ impl AutonomyRunner {
         }
         let saved = execution.load_owned().await?;
         let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload)?;
-        let leaves = if group.parked.is_empty() {
-            vec![super::composition::ParkedCompositionChild {
-                operation: group.child_operation.clone(),
-                runtime_id: group.child_runtime_id.clone(),
-                request: group.child_request.clone(),
-                batch: group.batch.clone(),
-            }]
-        } else {
-            group.parked.clone()
-        };
+        // A resumed intermediate parent can replace its old descendant leaf with a local approval.
+        // Discover current acknowledged leaf batches rather than trusting the original group's leaf list.
         let mut pending = Vec::new();
-        for mut leaf in leaves {
-            if let Some(child) = payload
-                .children
-                .iter()
-                .find(|child| child.child_id == leaf.operation)
-                && let Some(request) = &child.pending
-            {
-                let adapter = payload
-                    .adapters
-                    .iter()
-                    .find(|adapter| adapter.id == format!("runtime.child_batch:{}", leaf.operation))
-                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                leaf.batch = serde_json::from_value(adapter.state.clone())?;
-                leaf.request = request.clone();
-                pending.push(leaf);
+        for child in &payload.children {
+            let Some(request) = &child.pending else {
+                continue;
+            };
+            if request.reviewed_action.get("frame_id").is_some() {
+                continue;
             }
+            let adapter = payload
+                .adapters
+                .iter()
+                .find(|adapter| adapter.id == format!("runtime.child_batch:{}", child.child_id))
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            pending.push(super::composition::ParkedCompositionChild {
+                operation: child.child_id.clone(),
+                runtime_id: child.runtime.snapshot.agent_id.clone(),
+                request: request.clone(),
+                batch: serde_json::from_value(adapter.state.clone())?,
+            });
         }
-        let retired = if pending.is_empty() {
+        let retired = if pending.is_empty()
+            && !execution
+                .parked_batches
+                .lock()
+                .contains_key(&self.agent.info().id)
+        {
             Vec::new()
         } else {
             let mut cancellation = group.clone();
+            // An empty parked list must not fall back to a completed original leaf during cancellation.
             cancellation.parked = pending;
+            // Resume may have settled siblings or advanced a child request; cleanup uses the newest acknowledged batch prefix.
+            cancellation.frames = execution.delegate_frames.lock().clone();
+            if let Some(frame) = cancellation.frames.get(&cancellation.frame.runtime_id) {
+                cancellation.frame = frame.clone();
+            }
             Box::pin(self.agent.cancel_task_group(
                 owner,
                 &cancellation,
@@ -882,14 +888,7 @@ impl AutonomyRunner {
             .lock()
             .get(&self.agent.info().id)
             .is_some_and(|frame| {
-                frame.dispatch == super::composition::CompositionDispatch::ToolMessage
-                    && execution
-                        .parked_batches
-                        .lock()
-                        .get(&self.agent.info().id)
-                        .is_some_and(|batch| {
-                            batch.approvals.iter().any(|a| a.request_id == frame.id)
-                        })
+                frame.dispatch == super::composition::CompositionDispatch::ToolBatch
             });
         let snapshot = if execution
             .parked_batches
@@ -984,6 +983,9 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let batch: TaskBatchState = serde_json::from_value(adapter.state.clone())?;
         batch.validate_checkpoint(&payload)?;
+        if let Some(location) = &batch.location {
+            self.agent.validate_task_location(location)?;
+        }
         if let super::suspension::BatchResponse::UserAnswer(answer) = &result {
             let pending = &batch.approvals[0];
             let call = batch
@@ -992,6 +994,7 @@ impl AutonomyRunner {
                 .find(|call| call.id == pending.call_id)
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
             let mut final_call = call.clone();
+            final_call = batch.pending_call(&final_call);
             final_call.arguments = pending.context.clone();
             self.agent
                 .validate_task_question_answer(&final_call, &pending.question, answer)?;

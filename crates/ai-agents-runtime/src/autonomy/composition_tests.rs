@@ -660,11 +660,9 @@ async fn model_message_checkpoint_rejects_resume_refund_and_unbound_suspension()
             .clone(),
     )
     .unwrap();
-    let mut state: super::message::MessageState =
-        serde_json::from_value(group.frame.cursor.clone()).unwrap();
-    state.batch.as_mut().unwrap().calls[0].arguments =
-        json!({"to":"worker","message":"changed native call"});
-    group.frame.cursor = serde_json::to_value(state).unwrap();
+    let mut batch: TaskBatchState = serde_json::from_value(group.frame.cursor.clone()).unwrap();
+    batch.calls[0].arguments = json!({"to":"worker","message":"changed native call"});
+    group.frame.cursor = serde_json::to_value(batch).unwrap();
     group
         .frames
         .insert(group.frame.runtime_id.clone(), group.frame.clone());

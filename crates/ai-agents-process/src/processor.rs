@@ -11,7 +11,8 @@ use ai_agents_llm::LLMRegistry;
 
 use super::config::*;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessData {
     pub content: String,
     pub original: String,
@@ -19,7 +20,8 @@ pub struct ProcessData {
     pub metadata: ProcessMetadata,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProcessMetadata {
     pub stages_executed: Vec<String>,
     pub timing: HashMap<String, u64>,

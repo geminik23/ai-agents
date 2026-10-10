@@ -395,7 +395,7 @@ impl AgentRegistry {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let message_admission = execution.message_admission.lock().await;
-        execution.check_message_slot(&invocation.frame.runtime_id)?;
+        execution.check_message_slot(&invocation.frame)?;
         let target = self
             .get(to)
             .ok_or_else(|| AgentError::Other(format!("Target agent not found: {to}")))?;
@@ -412,8 +412,10 @@ impl AgentRegistry {
         frame.delegate_input = input.clone();
         frame.actor = actor.clone();
         let mut state: crate::autonomy::message::MessageState =
-            serde_json::from_value(frame.cursor)?;
+            serde_json::from_value(frame.cursor.clone())?;
         state.child_actor = Some(actor.clone());
+        state.waiting_for = execution.message_dependency(&frame)?;
+        let deferred = state.waiting_for.is_some();
         frame.cursor = serde_json::to_value(state)?;
         frame.children = vec![crate::autonomy::composition::CompositionChild {
             registry_id: to.into(),
@@ -432,8 +434,13 @@ impl AgentRegistry {
         if let Some(hooks) = &self.hooks {
             hooks.on_message_sent(from, to, message).await;
         }
-        crate::autonomy::composition::scope_composition(
+        // The parent implementation ran once; another incoming operation waits without touching the parked target history.
+        if deferred {
+            return Err(AgentError::TaskSuspended(frame.id));
+        }
+        crate::autonomy::composition::scope_message_composition(
             frame.runtime_id.clone(),
+            frame.id.clone(),
             Box::pin(crate::autonomy::scope_child_invocation(
                 frame.child_operation,
                 target.info().id,
@@ -464,7 +471,7 @@ impl AgentRegistry {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let message_admission = execution.message_admission.lock().await;
-        execution.check_message_slot(&invocation.frame.runtime_id)?;
+        execution.check_message_slot(&invocation.frame)?;
         let child = self
             .get(to)
             .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
@@ -479,11 +486,13 @@ impl AgentRegistry {
             operation: frame.child_operation.clone(),
         }];
         let mut state: crate::autonomy::message::MessageState =
-            serde_json::from_value(frame.cursor)?;
+            serde_json::from_value(frame.cursor.clone())?;
         state.response = crate::autonomy::message::MessageResponse::Route {
             reason: reason.into(),
         };
         state.child_actor = actor.clone();
+        state.waiting_for = execution.message_dependency(&frame)?;
+        let deferred = state.waiting_for.is_some();
         frame.cursor = serde_json::to_value(state)?;
         Box::pin(execution.retain_delegate_frame((*frame).clone(), self.clone())).await?;
         execution.targets.bind_tool(&frame.id, invocation.tool)?;
@@ -492,8 +501,13 @@ impl AgentRegistry {
             return Err(AgentError::Config("route target binding changed".into()));
         }
         drop(message_admission);
-        crate::autonomy::composition::scope_composition(
+        // Completed route selection remains bound while a prior incoming operation owns the target history.
+        if deferred {
+            return Err(AgentError::TaskSuspended(frame.id));
+        }
+        crate::autonomy::composition::scope_message_composition(
             frame.runtime_id,
+            frame.id,
             Box::pin(crate::autonomy::scope_child_invocation(
                 frame.child_operation,
                 child.info().id,
