@@ -13,6 +13,13 @@ use tracing::{debug, error, info, instrument, warn};
 const DISAMBIGUATION_STATE_GENERATION_KEY: &str = "_runtime.disambiguation_state_generation";
 const MAX_TOOL_FALLBACK_HOPS: usize = 16;
 
+tokio::task_local! {
+    static TOOL_FALLBACK_REQUEST: std::cell::RefCell<Option<(ToolExecutionRequest, ToolFallbackState)>>;
+}
+
+#[path = "autonomy/continuation_runtime.rs"]
+mod task_continuation;
+
 #[cfg(test)]
 #[path = "autonomy/boundary_tests.rs"]
 mod autonomy_boundary_tests;
@@ -1278,7 +1285,10 @@ impl RuntimeAgent {
                 let result = self
                     .run_task_participant(input, Some(actor_context), execution.clone())
                     .await;
-                if result.is_err() && crate::autonomy::child_required() {
+                if result.is_err()
+                    && !matches!(&result, Err(AgentError::TaskSuspended(_)))
+                    && crate::autonomy::child_required()
+                {
                     execution.stop("required_child_failure");
                 }
                 return result;
@@ -1459,6 +1469,20 @@ impl RuntimeAgent {
             {
                 return Err(AgentError::Other("reentrant task participant".into()));
             }
+            if let Some(operation) = crate::autonomy::current_child_invocation(&self.info.id)
+                && let Some((pending, batch)) =
+                    Box::pin(execution.parked_child_batch(&operation, input, &self.info.id)).await?
+            {
+                if let Some(response) =
+                    crate::autonomy::composition::take_group_response(&operation, &pending.id)
+                {
+                    return Box::pin(self.resume_parked_task_child(
+                        input, actor, execution, operation, pending, batch, response,
+                    ))
+                    .await;
+                }
+                return Err(AgentError::TaskSuspended(pending.id));
+            }
             let lock = self.root_turn_gate.clone().lock_owned();
             let guard = tokio::time::timeout(execution.remaining_duration(), async {
                 tokio::pin!(lock);
@@ -1509,7 +1533,8 @@ impl RuntimeAgent {
                     .await?;
             drop(_mutations);
             let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(owner.clone());
-            let operation = execution.next_child_operation(&self.info.id);
+            let operation = crate::autonomy::current_child_invocation(&self.info.id)
+                .unwrap_or_else(|| execution.next_child_operation(&self.info.id));
             let mut identities = ancestry.to_vec();
             identities.push(self.root_turn_gate.clone());
             let identities: RootTurnGateIdentityStack = identities.into();
@@ -1555,6 +1580,18 @@ impl RuntimeAgent {
                         )
                         .await;
                         self.export_observability_if_configured().await;
+                        if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
+                            let batch = execution
+                                .parked_batches
+                                .lock()
+                                .get(&self.info.id)
+                                .cloned()
+                                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                            let runtime = self.task_suspension_snapshot().await?;
+                            Box::pin(execution.checkpoint_child_park(&operation, runtime, batch))
+                                .await?;
+                            return Ok::<_, AgentError>(outcome);
+                        }
                         let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
                             self.save_state_full().await?,
                         )?;
@@ -1572,7 +1609,11 @@ impl RuntimeAgent {
             .await;
             match result {
                 Ok(outcome) => {
-                    lease.acknowledge();
+                    if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
+                        lease.acknowledge_park();
+                    } else {
+                        lease.acknowledge();
+                    }
                     cleanup.finish();
                     drop(guard);
                     outcome
@@ -5767,6 +5808,23 @@ impl RuntimeAgent {
                 Some("task cancellation".into()),
             );
         }
+        // Suspend before reserving an attempt; a resumed answer still passes the final invocation checks below.
+        let mut question_result = None;
+        if let Some(execution) = &execution
+            && execution.pauses_question(&self.info.id)
+            && tool.task_question(&args)?.is_some()
+        {
+            if let Some(answer) =
+                crate::autonomy::suspension::take_resumed_question(&ctx.call_id, &args)
+            {
+                tool.task_question_result(&args, &answer)?;
+                question_result = Some(answer);
+            } else {
+                return Err(AgentError::Config(
+                    "task question response lost before final invocation".into(),
+                ));
+            }
+        }
         let mut admitted_footprint = None;
         let attempt = if let Some(execution) = &execution {
             let (id, footprint) =
@@ -5835,6 +5893,9 @@ impl RuntimeAgent {
                 custody.store(true, Ordering::SeqCst);
             }
             invoked_by_future.store(true, Ordering::SeqCst);
+            if let Some(answer) = question_result {
+                return tool.execute_task_question(args, answer, ctx).await;
+            }
             if let Some(actor_context) = actor_context {
                 scope_actor_context(actor_context, tool.execute(args, ctx)).await
             } else {
@@ -6003,19 +6064,54 @@ impl RuntimeAgent {
     }
 
     /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
+    /// The private request scope binds deferred approvals to the original call without changing ordinary host interaction.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        Box::pin(self.execute_tool_record_inner(request, ToolFallbackState::default()))
+        Box::pin(crate::autonomy::scope_task_request(
+            request.clone(),
+            self.execute_tool_record_inner(request, ToolFallbackState::default()),
+        ))
     }
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
     ///
     /// Host validation replaces only the ordinary grant predicate for a matched private invocation scope, never provider-visible exposure, state/runtime narrowing, policy, approval or final generation admission.
+    /// Sequential fallback polling keeps bounded ancestry without retaining one large executor frame per hop.
     /// Its exact arguments are rechecked after HITL so a modified call cannot reuse the original fixed-operation authority.
     /// A failed request selected for fallback releases its guards and finalizes its own record before the fallback starts as a separate shared-executor request. Canonical ancestry crosses that boundary so alias-mediated cycles and overlong acyclic chains stop before the start hook, approval, locks, or invocation while retaining terminal completion evidence.
-    async fn execute_tool_record_inner(
+    fn execute_tool_record_inner(
+        &self,
+        request: ToolExecutionRequest,
+        fallback_state: ToolFallbackState,
+    ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
+        Box::pin(async move {
+            let mut next = (request, fallback_state);
+            loop {
+                let (request, fallback_state) = next;
+                let (record, successor) = TOOL_FALLBACK_REQUEST
+                    .scope(std::cell::RefCell::new(None), async {
+                        let work = Box::pin(
+                            self.execute_tool_record_scoped(request.clone(), fallback_state),
+                        );
+                        let record =
+                            Box::pin(crate::autonomy::scope_task_request(request, work)).await?;
+                        let successor = TOOL_FALLBACK_REQUEST.with(|slot| slot.borrow_mut().take());
+                        Ok::<_, AgentError>((record, successor))
+                    })
+                    .await?;
+                if let Some(successor) = successor {
+                    next = successor;
+                } else {
+                    return Ok(record);
+                }
+            }
+        })
+    }
+
+    // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
+    async fn execute_tool_record_scoped(
         &self,
         request: ToolExecutionRequest,
         fallback_state: ToolFallbackState,
@@ -7153,6 +7249,25 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
+        // Park validated questions before locks and atomic rate admission, which belong only to an actual invocation.
+        // The answer is bound to final approved arguments and is consumed only after resumed authorization succeeds.
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.pauses_question(&self.info.id)
+            && let Some(question) = resolved.tool.task_question(&final_arguments)?
+            && !crate::autonomy::suspension::has_resumed_question(
+                &request.call_id,
+                &final_arguments,
+            )
+        {
+            let id = execution.park_question(
+                &self.info.id,
+                &request.call_id,
+                &final_arguments,
+                question,
+            )?;
+            return Err(AgentError::TaskSuspended(id));
+        }
+
         //
         // Hold conflict locks across final generation admission and invocation.
         // Completion hooks and fallback execution run only after these guards are released.
@@ -7342,8 +7457,11 @@ impl RuntimeAgent {
                 fallback_arguments,
                 ToolCallSource::Fallback { original_tool },
             );
-            return Box::pin(self.execute_tool_record_inner(fallback_request, fallback_state))
-                .await;
+            // The driver starts this separately authorized request only after this frame has returned and released its locks.
+            TOOL_FALLBACK_REQUEST
+                .try_with(|slot| *slot.borrow_mut() = Some((fallback_request, fallback_state)))
+                .map_err(|_| AgentError::Other("fallback has no shared executor driver".into()))?;
+            return Ok(record);
         }
         self.finish_tool_record_after_resource_guards(resource_guards, &record)
             .await;
@@ -11088,10 +11206,7 @@ Respond in JSON format:
         Ok(response)
     }
 
-    //
-    // Auto reasoning uses this path after the judge wins with a deeper mode.
-    // It intentionally uses committed message building instead of the draft overlay.
-    //
+    // Starts the winning reasoning loop on committed history; the stateful driver also owns exact task suspension.
     async fn run_committed_response_loop_with_reasoning(
         &self,
         processed_input: &str,
@@ -11100,76 +11215,22 @@ Respond in JSON format:
         auto_detected: bool,
     ) -> Result<AgentResponse> {
         self.commit_root_user_message(processed_input).await?;
-        let llm = self.get_state_llm()?;
-        let mut iterations = 0u32;
-        let mut all_tool_calls = Vec::new();
-        let mut thinking_content = None;
-        loop {
-            let effective_max = if reasoning_mode != ReasoningMode::None {
-                let rc = self.get_effective_reasoning_config();
-                self.max_iterations.min(rc.max_iterations)
-            } else {
-                self.max_iterations
-            };
-            if iterations >= effective_max {
-                return Err(AgentError::Other(format!(
-                    "Max iterations ({}) exceeded",
-                    effective_max
-                )));
-            }
-            iterations += 1;
-            *self.iteration_count.write() = iterations;
-            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
-            let mut messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none())
-                .await?;
-            self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
-            self.hooks.on_llm_start(&messages).await;
-            let llm_start = Instant::now();
-            let response = self
-                .complete_main_llm_with_recovery(Arc::clone(&llm), &messages, &protocol)
-                .await?;
-            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
-            let content = response.content.trim();
-            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
-                match self
-                    .handle_tool_calls(
-                        processed_input,
-                        content,
-                        tool_calls,
-                        &mut all_tool_calls,
-                        None,
-                    )
-                    .await?
-                {
-                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
-                    ToolCallOutcome::Rejected(resp) => {
-                        self.finish_turn_if_root(&resp).await?;
-                        return Ok(resp);
-                    }
-                }
-            }
-            let (extracted_thinking, answer) = self.extract_thinking(content);
-            if extracted_thinking.is_some() {
-                thinking_content = extracted_thinking;
-            }
-            return self
-                .finish_text_response_from_model(CommittedTextResponse {
-                    processed_input,
-                    input_context,
-                    answer,
-                    reasoning_mode,
-                    auto_detected,
-                    iterations,
-                    thinking_content,
-                    all_tool_calls,
-                })
-                .await;
-        }
+        self.run_committed_task_loop(crate::autonomy::TaskLoopState {
+            version: 1,
+            processed_input: processed_input.into(),
+            input_context: input_context.clone(),
+            reasoning_mode,
+            auto_detected,
+            iterations: 0,
+            all_tool_calls: Vec::new(),
+            thinking_content: None,
+            native_exchanges: Vec::new(),
+        })
+        .await
     }
 
-    /// Handle tool calls: check transitions, execute tools in parallel, handle HITL rejection.
+    /// Commits a batch once and drains admitted calls before ordered result publication or exact task suspension.
+    /// Out-of-order completed task results remain in the checkpoint instead of being replayed to fill a native history gap.
     ///
     /// Shared by the blocking and streaming loops. `events` collects streaming chunks in emission order when the caller
     /// is a stream; the blocking loop passes `None`. Tool start events are pushed before execution so the collected order
@@ -11220,7 +11281,35 @@ Respond in JSON format:
                 events.push(StreamChunk::tool_start(&tool_call.id, &tool_call.name));
             }
         }
-        let results = self.execute_tools_parallel(&tool_calls).await;
+        let results =
+            crate::autonomy::scope_task_batch(self.execute_tools_parallel(&tool_calls)).await;
+        if let Some(execution) = crate::autonomy::current_execution() {
+            let approvals = execution.take_parked_approvals(&self.info.id);
+            if !approvals.is_empty() {
+                let mut state = crate::autonomy::TaskBatchState {
+                    version: 1,
+                    content: content.into(),
+                    calls: tool_calls,
+                    results: results
+                        .into_iter()
+                        .map(|(_, result)| match result {
+                            Err(AgentError::TaskSuspended(_)) => None,
+                            result => Some(result.map_err(|error| error.to_string())),
+                        })
+                        .collect(),
+                    appended: 0,
+                    approvals,
+                    loop_state: None,
+                    authorized: Vec::new(),
+                    rejected: false,
+                };
+                self.append_task_batch_prefix(&mut state, all_tool_calls)
+                    .await?;
+                let id = state.approvals[0].request_id.clone();
+                execution.retain_batch(&self.info.id, state);
+                return Err(AgentError::TaskSuspended(id));
+            }
+        }
         let mut rejection = None;
 
         for ((_id, result), tool_call) in results.into_iter().zip(tool_calls.iter()) {
@@ -11687,8 +11776,8 @@ Respond in JSON format:
         response
     }
 
-    // Handle delegation: forward user input to a registry agent.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // A delegated task captures prepared input and stable child identity before any child effect can suspend.
+    // Resume enters this saved dispatch location and skips input processing, context summary and start-hook replay.
     async fn handle_delegated_state(
         &self,
         input: &str,
@@ -11711,7 +11800,33 @@ Respond in JSON format:
             .map(|sm| sm.current())
             .unwrap_or_else(|| "unknown".to_string());
 
-        self.hooks.on_delegate_start(delegate_id, &state_name).await;
+        let execution = crate::autonomy::current_execution();
+        let retained = if crate::autonomy::composition::resuming_delegate(&self.info.id) {
+            Some(
+                execution
+                    .as_ref()
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
+                    .delegate_frames
+                    .lock()
+                    .get(&self.info.id)
+                    .cloned()
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
+            )
+        } else {
+            None
+        };
+        if let Some(frame) = &retained {
+            if frame.input != input
+                || frame.delegate_id != delegate_id
+                || frame.definition != serde_json::to_value(state_def)?
+            {
+                return Err(AgentError::Config(
+                    "delegated composition binding changed".into(),
+                ));
+            }
+        } else {
+            self.hooks.on_delegate_start(delegate_id, &state_name).await;
+        }
         let start = Instant::now();
 
         let delegate = registry.get(delegate_id).ok_or_else(|| {
@@ -11723,8 +11838,10 @@ Respond in JSON format:
 
         // Prepare input based on delegate_context mode.
         let context_mode = state_def.delegate_context.clone().unwrap_or_default();
-        let effective_input = self
-            .observe_purpose(
+        let effective_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -11738,11 +11855,85 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        let response = delegate
-            .chat_with_actor_context(&effective_input, self.outbound_actor_context())
+        let frame = if let Some(frame) = retained {
+            Some(frame)
+        } else if let Some(execution) = &execution {
+            let turn = crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let id = uuid::Uuid::new_v4().to_string();
+            self.commit_root_user_message(input).await?;
+            let frame = crate::autonomy::DelegateFrame {
+                version: 1,
+                id: id.clone(),
+                runtime_id: self.info.id.clone(),
+                input: input.into(),
+                input_context: self.context_manager.get_all(),
+                delegate_id: delegate_id.into(),
+                delegate_runtime_id: delegate.info().id,
+                delegate_input: effective_input.clone(),
+                definition: serde_json::to_value(state_def)?,
+                actor: self.outbound_actor_context(),
+                parent_actor: current_turn_actor_context(),
+                source: turn.source,
+                child_operation: format!("delegate:{id}"),
+                user_message_committed: self.root_user_message_committed.load(Ordering::SeqCst),
+                native_exchanges: self.task_native_expectations(),
+            };
+            Box::pin(execution.retain_delegate_frame(frame.clone())).await?;
+            Some(frame)
+        } else {
+            None
+        };
+        let child_turn = delegate.chat_with_actor_context(
+            &effective_input,
+            frame.as_ref().map_or_else(
+                || self.outbound_actor_context(),
+                |frame| frame.actor.clone(),
+            ),
+        );
+        let response = if let Some(frame) = &frame {
+            crate::autonomy::scope_child_invocation(
+                frame.child_operation.clone(),
+                frame.delegate_runtime_id.clone(),
+                child_turn,
+            )
+            .await?
+        } else {
+            child_turn.await?
+        };
+        if let Some(execution) = &execution {
+            if let Some(reason) = execution.stop_reason() {
+                return Err(AgentError::Other(reason));
+            }
+            let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
+                self.save_state_full().await?,
+            )?;
+            let operation = crate::autonomy::current_child_operation();
+            Box::pin(execution.update(|payload| {
+                if let Some(operation) = &operation {
+                    let child = payload
+                        .children
+                        .iter_mut()
+                        .find(|child| child.child_id == *operation)
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                    if let Some(pending) = child.pending.take() {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    child.runtime = runtime;
+                } else {
+                    if let Some(pending) = payload.pending.take() {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    payload.runtime = runtime;
+                    payload.pause_reason = None;
+                }
+                Ok(())
+            }))
             .await?;
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
         self.hooks
@@ -12359,7 +12550,7 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Shares the blocking turn pipeline across ordinary roots and owned task participants.
+    // Shares the blocking turn pipeline across ordinary roots and owned task participants, capturing local loop state before a suspended batch unwinds.
     // Boxed composition dispatch keeps nested participants from multiplying large future stack frames.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         self.begin_root_turn();
@@ -12527,7 +12718,7 @@ Respond in JSON format:
             let content = response.content.trim();
 
             if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
-                match self
+                let outcome = self
                     .handle_tool_calls(
                         processed_input,
                         content,
@@ -12535,8 +12726,22 @@ Respond in JSON format:
                         &mut all_tool_calls,
                         None,
                     )
-                    .await?
-                {
+                    .await;
+                if let Err(AgentError::TaskSuspended(id)) = &outcome {
+                    self.retain_task_loop(crate::autonomy::TaskLoopState {
+                        version: 1,
+                        processed_input: processed_input.into(),
+                        input_context: input_data.context.clone(),
+                        reasoning_mode,
+                        auto_detected,
+                        iterations,
+                        all_tool_calls,
+                        thinking_content,
+                        native_exchanges: self.task_native_expectations(),
+                    })?;
+                    return Err(AgentError::TaskSuspended(id.clone()));
+                }
+                match outcome? {
                     ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
                     ToolCallOutcome::Rejected(resp) => {
                         self.finish_turn_if_root(&resp).await?;
@@ -13654,13 +13859,22 @@ Respond in JSON format:
         ctx
     }
 
-    /// Preserves the ordinary approval contract while bounding task waits by shared cancellation and remaining time.
-    /// A cancelled or expired wait is a failed admission, not a resumable pause or proof of effect rollback.
+    /// Preserves ordinary approval waits; opted-in executable batches transfer control before hooks or host interaction.
+    /// Live waits remain bounded by cancellation/time, while only an acknowledged exact checkpoint establishes a safe pause.
     async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
             return Ok(ApprovalResult::Approved);
         };
 
+        if let Some(result) = crate::autonomy::suspension::take_resumed_approval(&request)? {
+            return Ok(result);
+        }
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.pauses_approval(&self.info.id)
+        {
+            let id = execution.park_approval(&self.info.id, &request)?;
+            return Err(AgentError::TaskSuspended(id));
+        }
         self.hooks.on_approval_requested(&request).await;
 
         let timeout = request.timeout;
@@ -14132,7 +14346,10 @@ impl Agent for RuntimeAgent {
             let result = self
                 .run_task_participant(input, None, execution.clone())
                 .await;
-            if result.is_err() && crate::autonomy::child_required() {
+            if result.is_err()
+                && !matches!(&result, Err(AgentError::TaskSuspended(_)))
+                && crate::autonomy::child_required()
+            {
                 execution.stop("required_child_failure");
             }
             return result;

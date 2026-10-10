@@ -11,6 +11,189 @@ use std::{
     },
 };
 
+// A tool-producing domain validator executes through the production invoker under the enclosing allowance.
+#[tokio::test]
+async fn standalone_tool_validator_uses_real_shared_admission() {
+    let provider = super::runner_tests::RecordingProvider::new(&["done"]);
+    let mut extensions = AutonomyExtensions::builtins();
+    extensions
+        .register_validator(Arc::new(Batch {
+            descriptor: AdapterDescriptor {
+                id: "host.batch".into(),
+                contract_version: 1,
+                tools: vec!["probe".into()],
+                ..Default::default()
+            },
+        }))
+        .unwrap();
+    let agent = Arc::new(
+        crate::AgentBuilder::new()
+            .system_prompt("validate task")
+            .llm(provider.clone())
+            .tool(Arc::new(ValidationProbe))
+            .autonomy_extensions(extensions)
+            .build()
+            .unwrap(),
+    );
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "validator-runtime.v1".into())
+            .unwrap(),
+    );
+    let mut config = super::runner_tests::config(1);
+    config.defaults.validation = Some(
+        serde_yaml::from_str(
+            "checks: [{id: proof, adapter: host.batch, required: true, config: {}}]",
+        )
+        .unwrap(),
+    );
+    config.defaults.completion = Some(CompletionGate::ValidatorPassed("proof".into()));
+    let runner = AutonomyRunner::try_new(
+        agent,
+        config,
+        Default::default(),
+        store,
+        "validator-runtime.v1".into(),
+    )
+    .unwrap();
+    let result = runner.run("objective", None).await.unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::Completed);
+    assert_eq!(result.run.counters.llm_attempts, 1);
+    assert_eq!(result.run.counters.tool_attempts, 2);
+    assert_eq!(result.run.evidence.tool_calls.len(), 2);
+}
+
+struct ValidationProbe;
+#[async_trait]
+impl ai_agents_core::Tool for ValidationProbe {
+    fn id(&self) -> &str {
+        "probe"
+    }
+    fn name(&self) -> &str {
+        "probe"
+    }
+    fn description(&self) -> &str {
+        "Validation observation"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object"})
+    }
+    fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+        ai_agents_core::ToolSafetyMetadata {
+            read_only: true,
+            concurrency_safe: true,
+            ..Default::default()
+        }
+    }
+    async fn execute(
+        &self,
+        _: Value,
+        _: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::ToolResult {
+        ai_agents_core::ToolResult::ok("observed")
+    }
+}
+
+struct MutationExecutor {
+    generation: AtomicUsize,
+    mutation_first: bool,
+}
+#[async_trait]
+impl ValidationObservationExecutor for MutationExecutor {
+    /// The fake executor, not the callback, owns this generation just as the shared runtime owns managed effects.
+    fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
+        let mut scope = scope.clone();
+        scope.mutation_generation = self.generation.load(Ordering::SeqCst) as u64;
+        Ok(scope)
+    }
+    /// A deterministic ordered mutation exposes stale earlier read evidence without depending on elapsed time.
+    async fn execute(
+        &self,
+        request: &ValidationObservationRequest,
+        _: &EvidenceIdentity,
+    ) -> Result<ObservationResult> {
+        let ValidationObservationRequest::Tool {
+            tool, arguments, ..
+        } = request
+        else {
+            unreachable!()
+        };
+        let mutation = arguments["value"] == json!(if self.mutation_first { 0 } else { 1 });
+        if mutation {
+            self.generation.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut capture = record(tool, arguments.clone(), json!({"ok":true}));
+        capture.call_id = request.id().into();
+        capture
+            .metadata
+            .insert("classification".into(), json!({"read_only":!mutation}));
+        Ok(ObservationResult::Tool {
+            record: Box::new(capture),
+        })
+    }
+}
+
+// A validator cannot turn read-before-mutation proof into a fresh pass; post-mutation reads can pass.
+#[tokio::test]
+async fn validator_publication_uses_post_mutation_scope_without_relabelling_old_reads() {
+    for mutation_first in [false, true] {
+        let (bound, s) = batch_binding(2);
+        let check = &bound.checks[0];
+        let mut i = identity(&s);
+        i.config_identity = check.config_identity.clone();
+        let mut state = ValidationDriverState::new(check, i).unwrap();
+        let executor = MutationExecutor {
+            generation: AtomicUsize::new(0),
+            mutation_first,
+        };
+        let journal = super::evaluation_tests::MemoryJournal::default();
+        let evidence = current(&s);
+        let cancellation = ToolCancellationToken::new(Arc::new(AtomicBool::new(false)), None);
+        let outcome = state
+            .drive(
+                check,
+                &ValidationDriveContext {
+                    scope: &s,
+                    evidence: &evidence,
+                    extensions: &bound.extensions,
+                    executor: &executor,
+                    journal: &journal,
+                    limits: Default::default(),
+                    cancellation: &cancellation,
+                    deadline: chrono::Utc::now() + chrono::Duration::seconds(2),
+                },
+            )
+            .await
+            .unwrap();
+        let ValidationDriverOutcome::Complete(result) = outcome else {
+            panic!("missing terminal validation")
+        };
+        assert_eq!(
+            result.outcome,
+            if mutation_first {
+                GateOutcome::Pass
+            } else {
+                GateOutcome::Unknown
+            }
+        );
+        assert_eq!(result.identity.mutation_generation, 1);
+        assert!(state.publication_acknowledged());
+        assert_eq!(
+            state.completed["observation-0"]
+                .identity
+                .as_ref()
+                .unwrap()
+                .mutation_generation,
+            if mutation_first { 1 } else { 0 }
+        );
+        let mut captures = EvaluationEvidence::default();
+        captures.collect_validation(&state).unwrap();
+        assert_eq!(
+            captures.tools[0].identity.mutation_generation,
+            if mutation_first { 1 } else { 0 }
+        );
+    }
+}
+
 #[derive(Default)]
 struct Executor {
     calls: AtomicUsize,

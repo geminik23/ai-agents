@@ -4,13 +4,23 @@
 mod admission_tests;
 mod authority;
 mod boundary;
+pub(crate) mod composition;
 mod execution;
 mod memory;
 mod participants;
+pub(crate) use composition::{
+    DelegateFrame, TaskGroupState, current_child_invocation, scope_child_invocation,
+};
 pub(crate) use participants::{
-    child_required, current_child_operation, scope_child_operation, scope_child_requirement,
+    Participants, child_required, current_child_operation, scope_child_operation,
+    scope_child_requirement,
 };
 mod runner;
+pub(crate) mod suspension;
+#[cfg(test)]
+mod suspension_tests;
+pub use suspension::TaskResumeInput;
+pub(crate) use suspension::{TaskBatchState, TaskLoopState, scope_task_batch, scope_task_request};
 #[cfg(test)]
 mod runner_additional_tests;
 #[cfg(test)]
@@ -29,6 +39,8 @@ mod builtins;
 mod checkpoint_tests;
 #[cfg(test)]
 mod child_tests;
+#[cfg(test)]
+mod composition_tests;
 mod config;
 #[cfg(test)]
 mod continuation_tests;

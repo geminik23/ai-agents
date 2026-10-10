@@ -98,6 +98,32 @@ pub trait Tool: Send + Sync {
         ToolCallClassification::from_metadata(&self.safety_metadata())
     }
 
+    /// Describes a validated host question that can be parked before invoking this implementation.
+    /// None keeps ordinary execution; a tool ID or interaction metadata alone does not confer this capability.
+    fn task_question(&self, _args: &Value) -> Result<Option<Value>> {
+        Ok(None)
+    }
+
+    /// Validates a task answer against the exact arguments and prepares the implementation's normal result.
+    /// The executor must still reauthorize and admit the invocation before publishing this result.
+    fn task_question_result(&self, _args: &Value, _answer: &Value) -> Result<ToolResult> {
+        Err(crate::AgentError::Tool(
+            "task question answers are unsupported".into(),
+        ))
+    }
+
+    /// Executes a previously validated answer at the shared final invocation boundary without polling a host handler.
+    /// Wrappers should forward this method and retain their normal execution instrumentation.
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        _ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        self.task_question_result(&args, &answer)
+            .unwrap_or_else(|error| ToolResult::error(error.to_string()))
+    }
+
     /// Declares use of the coordinating task's canonical todo authority instead of a captured participant-local list.
     fn manages_task_todos(&self) -> bool {
         false

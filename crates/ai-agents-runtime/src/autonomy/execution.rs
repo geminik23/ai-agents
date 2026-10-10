@@ -14,10 +14,10 @@ use std::time::Instant;
 pub(crate) struct RunExecution {
     pub(crate) store: Arc<dyn TaskRunStore>,
     pub(crate) owner: Arc<RunOwner>,
-    pub(crate) participants: super::participants::Participants,
+    pub(crate) participants: Arc<super::participants::Participants>,
     acknowledged: parking_lot::RwLock<TaskRunSnapshot>,
     limits: TaskRunLimits,
-    expiry_projection: Option<Instant>,
+    pub(crate) expiry_projection: Option<Instant>,
     pub(crate) run_id: String,
     pub(crate) owner_token: String,
     pub(crate) revision: Arc<AtomicU64>,
@@ -25,6 +25,15 @@ pub(crate) struct RunExecution {
     pub(crate) cancellation: Arc<AtomicBool>,
     started: Instant,
     initial_active_millis: u64,
+    interrupted_millis: u64,
+    pub(crate) parked_approvals: parking_lot::Mutex<
+        std::collections::BTreeMap<String, Vec<super::suspension::BatchApproval>>,
+    >,
+    pub(crate) approval_deadlines: parking_lot::Mutex<std::collections::BTreeMap<String, Instant>>,
+    pub(crate) parked_batches:
+        parking_lot::Mutex<std::collections::BTreeMap<String, TaskBatchState>>,
+    pub(crate) delegate_frames:
+        parking_lot::Mutex<std::collections::BTreeMap<String, super::composition::DelegateFrame>>,
     stop: parking_lot::RwLock<Option<String>>,
     lifecycle: parking_lot::RwLock<(AutonomyProfile, LifecycleState)>,
     scope: parking_lot::RwLock<Option<EvaluationScope>>,
@@ -46,7 +55,7 @@ impl RunExecution {
         Ok(Arc::new(Self {
             store,
             owner,
-            participants: super::participants::Participants::default(),
+            participants: Arc::new(super::participants::Participants::default()),
             acknowledged: parking_lot::RwLock::new(snapshot.clone()),
             limits: payload.limits.clone(),
             expiry_projection: payload
@@ -69,12 +78,70 @@ impl RunExecution {
             cancellation: Arc::new(AtomicBool::new(false)),
             started,
             initial_active_millis: payload.clocks.active_millis,
+            interrupted_millis: payload.clocks.interrupted_interval_millis,
+            parked_approvals: Default::default(),
+            approval_deadlines: Default::default(),
+            parked_batches: Default::default(),
+            delegate_frames: Default::default(),
             stop: parking_lot::RwLock::new(None),
             lifecycle: parking_lot::RwLock::new((payload.settings, lifecycle)),
             scope: parking_lot::RwLock::new(None),
-            mutation_generation: AtomicU64::new(0),
+            mutation_generation: AtomicU64::new(
+                payload
+                    .evidence
+                    .tool_calls
+                    .iter()
+                    .filter_map(|capture| {
+                        capture
+                            .record
+                            .metadata
+                            .get("_task_identity")
+                            .and_then(|identity| identity.get("mutation_generation"))
+                            .and_then(Value::as_u64)
+                    })
+                    .max()
+                    .unwrap_or(0),
+            ),
             todos: parking_lot::RwLock::new(None),
         }))
+    }
+
+    /// Explicit recovery retires the original canonical binding; it cannot replace another run's list.
+    pub(crate) fn release_reconciled_todos(&self) -> Result<()> {
+        let mut todos = self.todos.write();
+        if let Some((store, binding)) = todos.as_ref()
+            && store.list_for_run(binding).is_some()
+            && !store.release_run(binding)
+        {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        *todos = None;
+        Ok(())
+    }
+
+    /// Returns the immutable expiry; pause/resume must never derive it from a later admission.
+    pub(crate) fn expiry(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.acknowledged
+            .read()
+            .payload
+            .get("clocks")
+            .and_then(|clocks| clocks.get("expires_at"))
+            .and_then(|expiry| serde_json::from_value(expiry.clone()).ok())
+    }
+
+    /// Captures immutable profile policy for interaction bridges without exposing mutable controller authority.
+    pub(crate) fn lifecycle_profile(&self) -> AutonomyProfile {
+        self.lifecycle.read().0.clone()
+    }
+
+    /// Reads the selected interaction policy without permitting controller instructions to grant approval.
+    pub(crate) fn task_interaction_policy(&self) -> Option<InteractionAction> {
+        self.lifecycle
+            .read()
+            .0
+            .hitl
+            .as_ref()
+            .and_then(|policy| policy.on_approval_required)
     }
 
     /// Recomputes cumulative elapsed time; overlapping child/provider durations are not summed.
@@ -85,6 +152,18 @@ impl RunExecution {
                     .map_err(|_| AgentError::Config("active clock overflow".into()))?,
             )
             .ok_or_else(|| AgentError::Config("active clock overflow".into()))
+    }
+
+    /// Identifies the coordinating runtime within an already-admitted private execution scope.
+    pub(crate) fn is_coordinator(&self, runtime_id: &str) -> bool {
+        self.acknowledged.read().key.agent_id == runtime_id
+    }
+
+    /// Interrupted intervals consume admission allowance but are not folded into the persisted active counter twice.
+    pub(crate) fn consumed_active_millis(&self) -> Result<u64> {
+        self.active_millis()?
+            .checked_add(self.interrupted_millis)
+            .ok_or_else(|| AgentError::Config("recovered active clock overflow".into()))
     }
 
     /// Stops admission even if a legacy optional-feature error handler swallows the original error.
@@ -124,6 +203,11 @@ impl RunExecution {
         self.acknowledge_snapshot(&saved);
         self.cancellation.store(true, Ordering::Release);
         Ok(saved.summary())
+    }
+
+    /// Returns the last acknowledged state for retaining pause authority without reading an unowned claim again.
+    pub(crate) fn acknowledged_snapshot(&self) -> TaskRunSnapshot {
+        self.acknowledged.read().clone()
     }
 
     /// Copies a lifecycle decision before later executor admission; it can only narrow grants.
@@ -238,7 +322,11 @@ impl RunExecution {
                 .and_then(Value::as_bool)
                 != Some(true)
         {
-            self.mutation_generation.fetch_add(1, Ordering::AcqRel);
+            self.mutation_generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    generation.checked_add(1)
+                })
+                .map_err(|_| AgentError::Config("mutation generation overflow".into()))?;
         }
         scope.mutation_generation = self.mutation_generation();
         let operation = super::current_child_operation();
@@ -659,7 +747,7 @@ impl RunExecution {
             self.limits.max_active_time_seconds.saturating_mul(1000),
         )
         .saturating_sub(std::time::Duration::from_millis(
-            self.active_millis().unwrap_or(u64::MAX),
+            self.consumed_active_millis().unwrap_or(u64::MAX),
         ));
         self.expiry_projection.map_or(active, |expiry| {
             active.min(expiry.saturating_duration_since(Instant::now()))
@@ -682,7 +770,8 @@ impl RunExecution {
             return Err(AgentError::Other(format!("autonomy stopped: {reason}")));
         }
         if self.remaining_duration().is_zero()
-            || self.active_millis()? >= payload.limits.max_active_time_seconds.saturating_mul(1000)
+            || self.consumed_active_millis()?
+                >= payload.limits.max_active_time_seconds.saturating_mul(1000)
             || payload
                 .clocks
                 .expires_at
@@ -695,6 +784,7 @@ impl RunExecution {
     }
 
     /// Final cancellation/time checks and CAS share owner admission; failed persistence never publishes success.
+    /// A conservative final millisecond closes an active interval even when its last acknowledged write occurred in the same tick.
     pub(crate) async fn terminal(
         &self,
         mut status: TaskRunStatus,
@@ -703,7 +793,13 @@ impl RunExecution {
         let _serial = self.serial.lock().await;
         let snapshot = self.load_owned().await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
-        payload.clocks.active_millis = self.active_millis()?;
+        payload.clocks.active_millis = self.active_millis()?.max(
+            payload
+                .clocks
+                .active_millis
+                .checked_add(1)
+                .ok_or_else(|| AgentError::Config("terminal active clock overflow".into()))?,
+        );
         let uncertain = self.participants.unsettled()
             || payload.children.iter().any(|child| child.result.is_none())
             || payload.reservations.iter().any(|r| {
@@ -716,7 +812,11 @@ impl RunExecution {
             status = TaskRunStatus::RecoveryRequired;
         } else if snapshot.cancel_requested || self.cancellation.load(Ordering::Acquire) {
             status = TaskRunStatus::Cancelled;
-        } else if payload.clocks.active_millis
+        } else if payload
+            .clocks
+            .active_millis
+            .checked_add(payload.clocks.interrupted_interval_millis)
+            .ok_or_else(|| AgentError::Config("terminal active clock overflow".into()))?
             > payload.limits.max_active_time_seconds.saturating_mul(1000)
             || payload
                 .clocks

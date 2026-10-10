@@ -66,6 +66,14 @@ pub fn validation_judge_provider(
 
 #[async_trait]
 impl ValidationObservationExecutor for RuntimeObservationExecutor {
+    /// Reads the shared mutation generation after managed observations without permitting callbacks to relabel old proof.
+    fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
+        let mut scope = scope.clone();
+        if let Some(execution) = super::current_execution() {
+            scope.mutation_generation = execution.mutation_generation();
+        }
+        Ok(scope)
+    }
     /// Unknown selected judge aliases fail before effect admission, not as an uncertain provider operation.
     fn preflight(
         &self,

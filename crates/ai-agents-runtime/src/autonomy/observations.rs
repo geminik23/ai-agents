@@ -29,7 +29,11 @@ impl EvaluationEvidence {
             ) = (&completed.request, &completed.result)
             {
                 self.tools.push(ScopedObservation {
-                    identity: state.identity.clone(),
+                    identity: completed
+                        .identity
+                        .as_ref()
+                        .unwrap_or(&state.identity)
+                        .clone(),
                     complete: true,
                     value: record.as_ref().clone(),
                 });
@@ -37,7 +41,11 @@ impl EvaluationEvidence {
                     let output: Value = serde_json::from_str(&record.output).unwrap_or(Value::Null);
                     if let Some(command) = arguments.get("command").and_then(Value::as_str) {
                         self.commands.push(ScopedObservation {
-                            identity: state.identity.clone(),
+                            identity: completed
+                                .identity
+                                .as_ref()
+                                .unwrap_or(&state.identity)
+                                .clone(),
                             complete: super::evidence::executed(record) && !record.output_truncated,
                             value: CommandObservation {
                                 check_id: state.check_id.clone(),
@@ -88,7 +96,11 @@ impl EvaluationEvidence {
                         && output.get("message").is_none_or(Value::is_null)
                         && !record.output_truncated;
                     self.diagnostics.push(ScopedObservation {
-                        identity: state.identity.clone(),
+                        identity: completed
+                            .identity
+                            .as_ref()
+                            .unwrap_or(&state.identity)
+                            .clone(),
                         complete,
                         value: DiagnosticsObservation {
                             check_id: state.check_id.clone(),

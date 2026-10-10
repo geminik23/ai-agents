@@ -296,6 +296,47 @@ impl Tool for ObservedTool {
         self.inner.classify_call(args)
     }
 
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        self.inner.task_question(args)
+    }
+
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        self.inner.task_question_result(args, answer)
+    }
+
+    /// Resumed answers retain execution timing without creating observations during pure answer preflight.
+    async fn execute_task_question(
+        &self,
+        args: Value,
+        answer: Value,
+        ctx: ToolExecutionContext,
+    ) -> ToolResult {
+        if !self.manager.config().latency.track_tools {
+            return self.inner.execute_task_question(args, answer, ctx).await;
+        }
+        let mut span = self.manager.start_span(
+            EventType::ToolCall {
+                tool_id: self.inner.id().to_string(),
+            },
+            current_purpose(),
+        );
+        if self.manager.config().privacy.include_tool_args {
+            span.set_payload(serde_json::json!({"args":args.clone()}));
+        }
+        let result = self.inner.execute_task_question(args, answer, ctx).await;
+        if !result.success {
+            span.set_error(ObservationError::new("tool_error", result.output.clone()));
+        }
+        if self.manager.config().privacy.include_tool_outputs {
+            span.set_payload(serde_json::json!({"output":result.output.clone()}));
+        }
+        result
+    }
+
     fn manages_task_todos(&self) -> bool {
         self.inner.manages_task_todos()
     }

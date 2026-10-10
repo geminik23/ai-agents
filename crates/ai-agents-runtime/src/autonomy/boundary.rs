@@ -38,6 +38,11 @@ impl RunOwner {
         self.abandoned.store(true, Ordering::Release);
     }
 
+    /// Recovery release is restricted to abandoned owners, never a cancellation receipt for live work.
+    pub(crate) fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+    }
+
     /// Unknown host effects retain their framework locks until explicit recovery, not merely future drop.
     pub(crate) fn retain_effect_guard(&self, guard: impl Send + 'static) {
         self.retained_effect_guards.lock().push(Box::new(guard));
@@ -55,13 +60,14 @@ impl RunOwner {
 pub(crate) type RunOwnerSlot = Arc<parking_lot::RwLock<Option<Arc<RunOwner>>>>;
 
 /// Controller instructions are not conversational input and must never be committed as user facts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) enum AutonomyTurnSource {
     InitialObjective,
     Continuation,
     StageInstruction,
     ValidationFix,
     ChildObjective,
+    ResumeAfterApproval,
 }
 
 /// Carries a private admitted owner rather than accepting a run ID as a permit.

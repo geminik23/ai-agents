@@ -266,6 +266,70 @@ impl Tool for DiagnosticsTool {
 
 #[async_trait]
 impl Tool for AskUserTool {
+    /// Only validated questions without a declared default need a suspended host response.
+    fn task_question(&self, args: &Value) -> ai_agents_core::Result<Option<Value>> {
+        let input: AskUserInput = serde_json::from_value(args.clone())
+            .map_err(|error| ai_agents_core::AgentError::Tool(format!("Invalid input: {error}")))?;
+        if input.question.trim().is_empty() {
+            return Err(ai_agents_core::AgentError::Tool("empty question".into()));
+        }
+        if input.default.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::to_value(QuestionRequest {
+            question: input.question,
+            options: input.options,
+            multi_select: input.multi_select,
+            allow_other: input.allow_other,
+            default: None,
+            timeout_seconds: input.timeout_seconds,
+        })?))
+    }
+
+    /// A resume answer cannot invent options, bypass selection cardinality or claim an unavailable host.
+    fn task_question_result(
+        &self,
+        args: &Value,
+        answer: &Value,
+    ) -> ai_agents_core::Result<ToolResult> {
+        let input: AskUserInput = serde_json::from_value(args.clone())?;
+        let response: QuestionResponse = serde_json::from_value(answer.clone())?;
+        let invalid = || {
+            ai_agents_core::AgentError::Tool("answer does not match the pending question".into())
+        };
+        if answer.as_object().is_none_or(|fields| {
+            fields.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "answered" | "selected" | "other_text" | "timed_out" | "unavailable"
+                )
+            })
+        }) || !response.answered
+            || response.unavailable
+            || response.timed_out
+            || (!input.multi_select && response.selected.len() > 1)
+            || response
+                .selected
+                .iter()
+                .any(|option| !input.options.contains(option))
+            || response
+                .selected
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                != response.selected.len()
+            || response
+                .other_text
+                .as_ref()
+                .is_some_and(|text| !input.allow_other || text.trim().is_empty())
+            || (response.selected.is_empty() && response.other_text.is_none())
+            || (!response.selected.is_empty() && response.other_text.is_some())
+        {
+            return Err(invalid());
+        }
+        Ok(json_result(&response, None))
+    }
+
     fn id(&self) -> &str {
         "ask_user"
     }

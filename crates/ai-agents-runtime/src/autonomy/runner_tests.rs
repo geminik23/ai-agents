@@ -433,6 +433,188 @@ async fn failed_terminal_checkpoint_returns_storage_error_and_keeps_runtime_rese
     assert!(agent.chat("unrelated").await.is_err());
 }
 
+struct TerminalAckStore {
+    inner: Arc<ScopedTaskRunStore>,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+#[async_trait]
+impl TaskRunStore for TerminalAckStore {
+    async fn create(&self, snapshot: &TaskRunSnapshot) -> Result<()> {
+        self.inner.create(snapshot).await
+    }
+    async fn load(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>> {
+        self.inner.load(run_id).await
+    }
+    async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot> {
+        let saved = self.inner.mutate(run_id, mutation).await?;
+        if saved.status == TaskRunStatus::Completed {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+        Ok(saved)
+    }
+    async fn list(&self) -> Result<Vec<TaskRunSummary>> {
+        self.inner.list().await
+    }
+    async fn delete(&self, run_id: &str, revision: u64) -> Result<()> {
+        self.inner.delete(run_id, revision).await
+    }
+}
+
+// A completed durable status cannot be replayed or downgraded merely because live cleanup was interrupted.
+#[tokio::test]
+async fn dropped_terminal_acknowledgement_can_release_completed_live_protection() {
+    let provider = RecordingProvider::new(&["done"]);
+    let (agent, _, store) = fixture(provider.clone(), 1);
+    let gated = Arc::new(TerminalAckStore {
+        inner: store.clone(),
+        entered: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let runner = Arc::new(
+        AutonomyRunner::try_new(
+            agent.clone(),
+            config(1),
+            Default::default(),
+            gated.clone(),
+            "prepared-v1".into(),
+        )
+        .unwrap(),
+    );
+    let task = tokio::spawn({
+        let runner = runner.clone();
+        async move { runner.run("objective", None).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), gated.entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let snapshot = store
+        .load(&store.list().await.unwrap()[0].key.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(snapshot.status, TaskRunStatus::Completed);
+    assert!(agent.chat("unrelated").await.is_err());
+    let released = runner
+        .acknowledge_recovery_release(&snapshot.key.run_id, snapshot.revision)
+        .await
+        .unwrap();
+    assert_eq!(released.status, TaskRunStatus::Completed);
+    assert_eq!(released.revision, snapshot.revision);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert!(agent.chat("ordinary").await.is_ok());
+}
+
+// Durable reconciliation and live release are separate acknowledgements; neither can replay an unknown request.
+#[tokio::test]
+async fn abandoned_owner_releases_only_after_reconciled_storage_acknowledgement() {
+    let provider = RecordingProvider::gated();
+    let (agent, runner, store) = fixture(provider.clone(), 2);
+    let runner = Arc::new(runner);
+    let task = tokio::spawn({
+        let runner = runner.clone();
+        async move { runner.run("objective", None).await }
+    });
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        provider.entered.as_ref().unwrap().acquire(),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .forget();
+    let running = store
+        .load(&store.list().await.unwrap()[0].key.run_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        runner
+            .acknowledge_recovery_release(&running.key.run_id, running.revision)
+            .await
+            .is_err()
+    );
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert!(
+        runner
+            .acknowledge_recovery_release(&running.key.run_id, running.revision)
+            .await
+            .is_err()
+    );
+    let recovery = store
+        .mutate(
+            &running.key.run_id,
+            &TaskRunMutation::Recover {
+                expected_revision: running.revision,
+                owner_token: running.owner_token.unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        runner
+            .acknowledge_recovery_release(&running.key.run_id, recovery.revision)
+            .await
+            .is_err()
+    );
+    let mut payload: TaskCheckpointPayload =
+        serde_json::from_value(recovery.payload.clone()).unwrap();
+    let used = payload.counters.llm_attempts;
+    for reservation in &mut payload.reservations {
+        reservation.state = TaskEffectState::Completed;
+        reservation.result = Some(serde_json::json!({"host_reconciled":true}));
+    }
+    payload.clocks.interrupted_interval_millis += 1;
+    payload.clocks.active_interval_started_at = None;
+    let safe = store
+        .mutate(
+            &running.key.run_id,
+            &TaskRunMutation::ResolveRecovery {
+                expected_revision: recovery.revision,
+                payload: serde_json::to_value(&payload).unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(agent.chat("unrelated").await.is_err());
+    assert!(
+        runner
+            .acknowledge_recovery_release(&running.key.run_id, recovery.revision)
+            .await
+            .is_err()
+    );
+    let released = runner
+        .acknowledge_recovery_release(&running.key.run_id, safe.revision)
+        .await
+        .unwrap();
+    assert_eq!(released.status, TaskRunStatus::Paused);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    let after: TaskCheckpointPayload = serde_json::from_value(
+        store
+            .load(&running.key.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(after.counters.llm_attempts, used);
+    provider.release.as_ref().unwrap().add_permits(1);
+    assert!(agent.chat("ordinary").await.is_ok());
+    assert!(
+        runner
+            .acknowledge_recovery_release(&running.key.run_id, safe.revision)
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn dropping_foreground_work_keeps_dispatched_marker_and_busy_runtime() {
     let provider = RecordingProvider::gated();

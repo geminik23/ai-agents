@@ -126,6 +126,7 @@ impl FromStr for ProviderType {
 struct CachedClient {
     llm: Box<dyn llm::LLMProvider>,
     config_hash: u64,
+    config_key: serde_json::Value,
 }
 
 pub struct UnifiedLLMProvider {
@@ -154,6 +155,32 @@ impl std::fmt::Debug for UnifiedLLMProvider {
             .field("google", &self.google)
             .finish()
     }
+}
+
+/// Keeps typed settings and extra fallbacks distinct so flattening or hash collisions cannot select a foreign client.
+fn request_config_key(
+    config: &LLMConfig,
+    system_prompt: Option<&str>,
+    tool_choice: Option<&ToolChoice>,
+    tools: Option<&[LLMToolDefinition]>,
+) -> Result<serde_json::Value, LLMError> {
+    let mut typed = config.clone();
+    typed.extra.clear();
+    let float_bits = [
+        config.temperature.map(f32::to_bits),
+        config.top_p.map(f32::to_bits),
+        config.frequency_penalty.map(f32::to_bits),
+        config.presence_penalty.map(f32::to_bits),
+    ];
+    serde_json::to_value((
+        typed,
+        &config.extra,
+        float_bits,
+        system_prompt,
+        tool_choice,
+        tools,
+    ))
+    .map_err(|error| LLMError::Config(format!("cannot bind request configuration: {error}")))
 }
 
 /// Compute a hash over the config fields that affect the LLM builder, plus the system prompt.
@@ -192,6 +219,10 @@ fn compute_config_hash(
     }
     // Extra keys forwarded to the builder
     const FORWARDED_EXTRA_KEYS: &[&str] = &[
+        "timeout_seconds",
+        "reasoning",
+        "reasoning_effort",
+        "reasoning_budget_tokens",
         "normalize_response",
         "api_version",
         "deployment_id",
@@ -1014,16 +1045,18 @@ impl UnifiedLLMProvider {
     ) -> Result<tokio::sync::MutexGuard<'_, Option<CachedClient>>, LLMError> {
         let cfg = config.unwrap_or(&self.default_config);
         let hash = compute_config_hash(cfg, system_prompt, tool_choice, tools);
+        let config_key = request_config_key(cfg, system_prompt, tool_choice, tools)?;
 
         let mut lock = self.client.lock().await;
         if lock
             .as_ref()
-            .is_none_or(|cached| cached.config_hash != hash)
+            .is_none_or(|cached| cached.config_hash != hash || cached.config_key != config_key)
         {
             let llm = self.build_llm_with_system(cfg, system_prompt, tool_choice, tools)?;
             *lock = Some(CachedClient {
                 llm,
                 config_hash: hash,
+                config_key,
             });
         }
         Ok(lock)
@@ -1797,6 +1830,56 @@ mod tests {
         let hash_a = compute_config_hash(&config_a, None, None, None);
         let hash_b = compute_config_hash(&config_b, None, None, None);
         assert_ne!(hash_a, hash_b);
+    }
+
+    // Legacy extra settings are actual builder inputs and must participate in exact client selection.
+    #[tokio::test]
+    async fn extra_fallback_settings_remain_bound_to_the_actual_cached_client() {
+        let provider = ProviderBuilder::new()
+            .provider(ProviderType::OpenAI)
+            .model("o3")
+            .api_key("fixture")
+            .build()
+            .unwrap();
+        let initial = LLMConfig::default();
+        let expected_initial = request_config_key(&initial, None, None, None).unwrap();
+        for (key, value) in [
+            ("timeout_seconds", serde_json::json!(120)),
+            ("reasoning", serde_json::json!(true)),
+            ("reasoning_effort", serde_json::json!("high")),
+            ("reasoning_budget_tokens", serde_json::json!(4096)),
+        ] {
+            let config = initial.clone().with_extra(key, value);
+            let client = provider
+                .client_for_request(Some(&config), None, None, None)
+                .await
+                .unwrap();
+            let expected = request_config_key(&config, None, None, None).unwrap();
+            assert_ne!(expected, expected_initial);
+            assert_eq!(client.as_ref().unwrap().config_key, expected);
+            assert_ne!(
+                compute_config_hash(&initial, None, None, None),
+                compute_config_hash(&config, None, None, None)
+            );
+        }
+    }
+
+    // Flattened extras cannot hide a differing authoritative typed field in an exact cache key.
+    #[test]
+    fn request_key_distinguishes_typed_fields_from_shadowing_extras() {
+        let first = LLMConfig {
+            reasoning: Some(false),
+            ..LLMConfig::default()
+        }
+        .with_extra("reasoning", serde_json::json!(true));
+        let second = LLMConfig {
+            reasoning: Some(true),
+            ..first.clone()
+        };
+        assert_ne!(
+            request_config_key(&first, None, None, None).unwrap(),
+            request_config_key(&second, None, None, None).unwrap()
+        );
     }
 
     #[test]

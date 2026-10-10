@@ -1,5 +1,4 @@
-//! Live child reservations and durable child outcomes share the coordinating run's admission and cleanup boundary.
-
+/// Live child reservations and durable child outcomes share the coordinating run's admission and cleanup boundary.
 use super::*;
 use ai_agents_core::{AgentError, AgentResponse, Result};
 use serde_json::{Value, json};
@@ -110,7 +109,17 @@ impl Participants {
         id
     }
 
-    /// Release follows terminal acknowledgement and quiescence; uncertain owners remain reserved for recovery.
+    /// An acknowledged host reconciliation cannot release still-polled child leases.
+    pub(crate) fn acknowledge_reconciliation(&self) -> Result<()> {
+        if self.active.load(Ordering::Acquire) != 0 {
+            return Err(AgentError::Other("child work has not stopped".into()));
+        }
+        self.uncertain.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    /// Release follows acknowledgement and quiescence; already retired slots are idempotent, but foreign owners remain protected.
+    /// Uncertain owners remain reserved until an explicit host reconciliation.
     pub(crate) async fn release(&self) -> Result<()> {
         if self.unsettled() {
             return Err(AgentError::Other(
@@ -128,7 +137,7 @@ impl Participants {
             let mut current = slot.write();
             if current
                 .as_ref()
-                .is_none_or(|active| !Arc::ptr_eq(active, &owner))
+                .is_some_and(|active| !Arc::ptr_eq(active, &owner))
             {
                 return Err(AgentError::Other("child release owner mismatch".into()));
             }
@@ -151,6 +160,11 @@ impl ChildLease {
             execution: execution.clone(),
             acknowledged: false,
         }
+    }
+
+    /// A parked child retains its owner while only an acknowledged exact safe checkpoint retires the active lease.
+    pub(crate) fn acknowledge_park(&mut self) {
+        self.acknowledged = true;
     }
 
     /// A durable child outcome must be acknowledged before the child ceases to be owned in-flight work.
@@ -260,6 +274,11 @@ impl RunExecution {
             {
                 if child.result.is_some() {
                     return Err(TaskRunStorageError::Conflict.into());
+                }
+                if let Some(pending) = child.pending.take()
+                    && !payload.consumed_request_ids.contains(&pending.id)
+                {
+                    payload.consumed_request_ids.push(pending.id);
                 }
                 child.runtime = runtime;
                 child.result = result;

@@ -53,6 +53,10 @@ pub enum AgentError {
     #[error("HITL rejected: {0}")]
     HITLRejected(String),
 
+    /// Internal task control transfer; it must not be published as a failed tool result.
+    #[error("Task suspended: {0}")]
+    TaskSuspended(String),
+
     #[error("Persistence error: {0}")]
     Persistence(String),
 

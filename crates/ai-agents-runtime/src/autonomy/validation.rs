@@ -48,6 +48,8 @@ pub enum ObservationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompletedObservation {
+    #[serde(default)]
+    pub identity: Option<EvidenceIdentity>,
     pub request: ValidationObservationRequest,
     pub request_identity: String,
     pub effective_identity: String,
@@ -123,6 +125,8 @@ pub struct ValidationDriverState {
     pub external_events: BTreeMap<String, String>,
     pub result: Option<ValidationResult>,
     pub result_identity: Option<String>,
+    #[serde(default)]
+    pub publication_scope: Option<EvaluationScope>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -150,6 +154,10 @@ pub trait ValidationJournal: Send + Sync {
 /// The production implementation uses RuntimeAgent's shared executor and frozen judge routing.
 #[async_trait]
 pub trait ValidationObservationExecutor: Send + Sync {
+    /// Captures authoritative freshness without changing the immutable check/request binding.
+    fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
+        Ok(scope.clone())
+    }
     /// Performs deterministic binding/alias preflight before a journal can mark an operation dispatched.
     fn preflight(
         &self,
@@ -242,6 +250,7 @@ impl ValidationDriverState {
             external_events: BTreeMap::new(),
             result: None,
             result_identity: None,
+            publication_scope: None,
         })
     }
     /// Restore rejects changed requests, adapters, outcomes and uncertain dispatched work before callback reentry.
@@ -413,8 +422,22 @@ impl ValidationDriverState {
         {
             return Err(AgentError::Config("changed external wait binding".into()));
         }
+        let mut publication_identity = self.identity.clone();
+        if let Some(publication) = &self.publication_scope {
+            if publication.key != scope.key
+                || publication.objective_revision != scope.objective_revision
+                || publication.cycle != scope.cycle
+                || publication.stage != scope.stage
+                || publication.mutation_generation < self.identity.mutation_generation
+            {
+                return Err(AgentError::Config(
+                    "validation publication scope changed binding".into(),
+                ));
+            }
+            publication_identity.mutation_generation = publication.mutation_generation;
+        }
         if let Some(result) = &self.result
-            && (result.identity != self.identity
+            && (result.identity != publication_identity
                 || result.check_id != self.check_id
                 || self.result_identity.as_ref()
                     != Some(&canonical_identity(&serde_json::to_value(result)?)?))
@@ -467,6 +490,7 @@ impl ValidationDriverState {
                 ));
             }
             let request = self.requests[&id].clone();
+            let before = context.executor.capture_scope(context.scope)?;
             let mut future = Box::pin(context.executor.execute(&request, &self.identity));
             let result = loop {
                 tokio::select! { result = &mut future => break result?, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
@@ -475,7 +499,32 @@ impl ValidationDriverState {
             };
             drop(future);
             validate_observation_result(&request, &result)?;
+            let after = context.executor.capture_scope(context.scope)?;
+            if after.key != before.key
+                || after.objective_revision != before.objective_revision
+                || after.cycle != before.cycle
+                || after.stage != before.stage
+                || after.mutation_generation < before.mutation_generation
+            {
+                return Err(AgentError::Config(
+                    "observation freshness changed execution scope".into(),
+                ));
+            }
+            self.publication_scope = Some(after.clone());
+            let mut observed = self.identity.clone();
+            observed.sequence = self
+                .identity
+                .sequence
+                .checked_add(self.completed.len() as u64)
+                .ok_or_else(|| AgentError::Config("observation sequence overflow".into()))?;
+            observed.mutation_generation = before.mutation_generation;
+            if matches!(&result, ObservationResult::Tool { record } if record.executed
+                && record.metadata.get("classification").and_then(|value| value.get("read_only")).and_then(Value::as_bool) == Some(false))
+            {
+                observed.mutation_generation = after.mutation_generation;
+            }
             let completed = CompletedObservation {
+                identity: Some(observed),
                 request_identity: request_identity(&request, &self.identity)?,
                 effective_identity: effective_identity(&result)?,
                 request,
@@ -627,6 +676,8 @@ impl ValidationDriverState {
             }
             self.rounds += 1;
             journal.checkpoint(self).await?;
+            let publication = context.executor.capture_scope(scope)?;
+            self.publication_scope = Some(publication.clone());
             let config = binding.check.config.clone().unwrap_or_else(|| json!({}));
             let decision = if !binding.available {
                 ValidationDecision::Complete {
@@ -637,7 +688,7 @@ impl ValidationDriverState {
                 }
             } else {
                 binding.adapter.evaluate(&ValidationInput {
-                    scope,
+                    scope: &publication,
                     identity: &self.identity,
                     config: &config,
                     evidence,
@@ -656,11 +707,22 @@ impl ValidationDriverState {
                         return Err(AgentError::Config("empty validation reason".into()));
                     }
                     bounded_value(&metrics, 65_536)?;
+                    let stale = self.completed.values().any(|observation| {
+                        let mutates = matches!(&observation.result, ObservationResult::Tool { record }
+                            if record.executed && record.metadata.get("classification").and_then(|value| value.get("read_only")).and_then(Value::as_bool) == Some(false));
+                        !mutates && !observation.identity.as_ref().unwrap_or(&self.identity).eligible(&publication, false, true)
+                    });
+                    let mut identity = self.identity.clone();
+                    identity.mutation_generation = publication.mutation_generation;
                     let result = ValidationResult {
                         check_id: self.check_id.clone(),
-                        identity: self.identity.clone(),
-                        outcome,
-                        reason,
+                        identity,
+                        outcome: if stale { GateOutcome::Unknown } else { outcome },
+                        reason: if stale {
+                            "observation_stale_after_mutation".into()
+                        } else {
+                            reason
+                        },
                         metrics,
                         evidence_refs,
                     };

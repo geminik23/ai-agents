@@ -30,6 +30,31 @@ fn development_standalone_and_provenance_migration_surface_compiles() {
         )?;
         let _run = runner.run("objective", None);
         let _cancel = runner.request_cancel("retained-run");
+        let _resume = runner.resume(
+            "retained-run",
+            1,
+            ai_agents::autonomy::TaskResumeInput::Approval {
+                request_id: "acknowledged-request".into(),
+                result: ai_agents::hitl::ApprovalResult::Approved,
+            },
+        );
+        let _answer = runner.resume(
+            "retained-run",
+            1,
+            ai_agents::autonomy::TaskResumeInput::UserAnswer {
+                request_id: "acknowledged-question".into(),
+                answer: r#"{"answered":true,"selected":["yes"]}"#.parse().unwrap(),
+            },
+        );
+        let _timeout = runner.resume(
+            "retained-run",
+            1,
+            ai_agents::autonomy::TaskResumeInput::QuestionTimeout {
+                request_id: "expired-question".into(),
+            },
+        );
+        let _recovery = runner.acknowledge_recovery_release("retained-run", 1);
+        let _close = runner.cancel_paused("retained-run", 1);
         agent.clear_actor_id()?;
         let _removed = agent.remove_context("obsolete")?;
         Ok(())

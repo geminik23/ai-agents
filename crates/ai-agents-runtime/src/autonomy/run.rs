@@ -673,6 +673,30 @@ impl TaskCheckpointPayload {
         ) {
             return Err(invalid());
         }
+        if matches!(
+            self.runtime.continuation,
+            TaskContinuation::Suspended { .. }
+        ) && let Some(adapter) = self
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == "runtime.tool_batch")
+        {
+            let batch: super::TaskBatchState = serde_json::from_value(adapter.state.clone())?;
+            batch.validate_checkpoint(self)?;
+        }
+        if envelope.status == TaskRunStatus::Paused
+            && matches!(
+                self.runtime.continuation,
+                TaskContinuation::Suspended { batch: None, .. }
+            )
+            && let Some(adapter) = self
+                .adapters
+                .iter()
+                .find(|adapter| adapter.id == "runtime.group")
+        {
+            let group: super::TaskGroupState = serde_json::from_value(adapter.state.clone())?;
+            group.validate_checkpoint(self)?;
+        }
         if envelope.status.is_terminal() && self.pending.is_some() {
             return Err(invalid());
         }
@@ -1110,6 +1134,8 @@ pub struct TaskRun {
     pub profile: Option<String>,
     pub current_stage: Option<String>,
     pub pause_reason: Option<String>,
+    /// Acknowledged interaction data is host-visible and may contain sensitive review context.
+    pub pending: Option<TaskPendingRequest>,
     pub stop_reason: Option<String>,
     pub todos: Vec<TodoItem>,
     pub progress: TaskProgressCheckpoint,
@@ -1137,6 +1163,7 @@ impl TaskRun {
             profile: payload.profile,
             current_stage: payload.stage,
             pause_reason: payload.pause_reason,
+            pending: payload.pending,
             stop_reason: payload.stop_reason,
             todos: payload.todos.map_or_else(Vec::new, |todos| todos.items),
             progress: payload.progress,
