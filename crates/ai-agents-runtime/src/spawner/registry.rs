@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
@@ -31,6 +31,46 @@ pub struct AgentRegistry {
     hooks: Option<Arc<dyn RegistryHooks>>,
     /// When true, `send()` prefixes messages with `[From {sender}]: `.
     send_with_context: bool,
+    task_pins: Mutex<HashMap<String, usize>>,
+}
+
+/// A live catalogue reservation pins one actual registered instance, including before its first turn is admitted.
+pub(crate) struct PinnedTaskAgent {
+    pub(crate) agent: Arc<RuntimeAgent>,
+    registry: Arc<AgentRegistry>,
+    id: String,
+}
+
+impl PinnedTaskAgent {
+    /// The registry read guard spans final participant enrollment, preventing removal between validation and owner installation.
+    pub(crate) fn with_binding<T>(
+        &self,
+        action: impl FnOnce(&Arc<RuntimeAgent>) -> Result<T>,
+    ) -> Result<T> {
+        let agents = self.registry.agents.read();
+        let actual = agents
+            .get(&self.id)
+            .ok_or_else(|| AgentError::Config("task registry target disappeared".into()))?;
+        if !Arc::ptr_eq(&actual.agent, &self.agent) {
+            return Err(AgentError::Config(
+                "task registry implementation changed".into(),
+            ));
+        }
+        action(&actual.agent)
+    }
+}
+
+impl Drop for PinnedTaskAgent {
+    /// Each guard retires only its own reservation; another run's pin cannot be released by stale cleanup.
+    fn drop(&mut self) {
+        let mut pins = self.registry.task_pins.lock();
+        if let Some(count) = pins.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                pins.remove(&self.id);
+            }
+        }
+    }
 }
 
 impl AgentRegistry {
@@ -39,6 +79,7 @@ impl AgentRegistry {
             agents: RwLock::new(HashMap::new()),
             hooks: None,
             send_with_context: true,
+            task_pins: Mutex::new(HashMap::new()),
         }
     }
 
@@ -99,6 +140,7 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Validates replacement topology before mutation; retained task pins and owners cannot be removed by session restoration.
     pub(crate) async fn reconcile(
         &self,
         target_ids: &HashSet<String>,
@@ -130,9 +172,27 @@ impl AgentRegistry {
                 }
             }
 
-            //
+            let retirement_candidates = agents
+                .iter()
+                .filter(|(id, _)| !target_ids.contains(*id))
+                .map(|(_, agent)| agent.clone())
+                .collect::<Vec<_>>();
+            let _retirements = retirement_candidates
+                .iter()
+                .map(|agent| agent.agent.try_registry_retirement())
+                .collect::<Result<Vec<_>>>()?;
+            let pins = self.task_pins.lock();
+            if agents.iter().any(|(id, agent)| {
+                !target_ids.contains(id)
+                    && (pins.get(id).is_some_and(|count| *count != 0)
+                        || agent.agent.has_task_owner())
+            }) {
+                return Err(AgentError::Config(
+                    "task-reserved topology cannot be removed".into(),
+                ));
+            }
+            drop(pins);
             // Build the complete replacement map before swapping it so validation failures preserve the prior topology.
-            //
             let mut next = agents.clone();
             let removed_ids = next
                 .keys()
@@ -168,6 +228,31 @@ impl AgentRegistry {
             }
         }
         Ok(())
+    }
+
+    /// Capture the actual implementation under the registry lock; labels alone cannot establish a task catalogue binding.
+    pub(crate) fn pin_task_target(
+        self: &Arc<Self>,
+        id: &str,
+        runtime_id: &str,
+    ) -> Result<Arc<PinnedTaskAgent>> {
+        let agents = self.agents.read();
+        let actual = agents
+            .get(id)
+            .ok_or_else(|| AgentError::Config(format!("task target not registered: {id}")))?;
+        if actual.agent.info().id != runtime_id {
+            return Err(AgentError::Config("task target identity changed".into()));
+        }
+        let mut pins = self.task_pins.lock();
+        let count = pins.entry(id.into()).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| AgentError::Config("task catalogue reservation overflow".into()))?;
+        Ok(Arc::new(PinnedTaskAgent {
+            agent: actual.agent.clone(),
+            registry: self.clone(),
+            id: id.into(),
+        }))
     }
 
     /// Clone an Arc handle to a registered agent's RuntimeAgent.
@@ -250,10 +335,20 @@ impl AgentRegistry {
             .collect()
     }
 
-    /// Remove an agent from the registry and return it.
+    /// Removes an unreserved agent; task catalogue pins and live runtime owners preserve entries until acknowledged cleanup.
     pub async fn remove(&self, id: &str) -> Option<Arc<SpawnedAgent>> {
         let removed = {
             let mut agents = self.agents.write();
+            let target = agents.get(id)?.clone();
+            let _retirement = target.agent.try_registry_retirement().ok()?;
+            if self
+                .task_pins
+                .lock()
+                .get(id)
+                .is_some_and(|count| *count != 0)
+            {
+                return None;
+            }
             agents.remove(id)
         };
         if let Some(agent) = removed.as_ref() {
@@ -341,16 +436,15 @@ impl AgentRegistry {
             .await
     }
 
-    //
-    // Captures the caller's gate ancestry and task admission before spawning so recipients cannot escape ownership or shared limits.
-    //
+    /// Captures ancestry, shared admission and required/optional failure policy before spawning recipients.
+    /// Losing task-locals at a broadcast boundary must not turn an optional nested dependency into a global required-child stop.
     async fn broadcast_inner(
         &self,
         from: &str,
         message: &str,
         actor_context: Option<TurnActorContext>,
     ) -> Vec<(String, Result<AgentResponse>)> {
-        let targets: Vec<(String, Arc<RuntimeAgent>)> = {
+        let mut targets: Vec<(String, Arc<RuntimeAgent>)> = {
             let agents = self.agents.read();
             agents
                 .iter()
@@ -362,6 +456,7 @@ impl AgentRegistry {
         if targets.is_empty() {
             return Vec::new();
         }
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
 
         let formatted = if self.send_with_context {
             format!("[From {}]: {}", from, message)
@@ -379,33 +474,40 @@ impl AgentRegistry {
         let mut handles = Vec::with_capacity(targets.len());
         let observation_context = current_observation_context();
         let gate_identity_stack = current_runtime_gate_identity_stack();
+        let required = crate::autonomy::child_required();
         for (id, agent) in targets {
             let msg = formatted.clone();
             let context = actor_context.clone();
             let observation_context = observation_context.clone();
             let gate_identity_stack = Arc::clone(&gate_identity_stack);
             let execution = crate::autonomy::current_execution();
-            handles.push(tokio::spawn(async move {
-                crate::autonomy::scope_inherited_execution(
-                    execution,
-                    scope_runtime_gate_identity_stack(&gate_identity_stack, async move {
-                        let run = async move {
-                            if let Some(context) = context {
-                                agent.chat_with_actor_context(&msg, context).await
-                            } else {
-                                agent.chat(&msg).await
-                            }
-                        };
-                        let result = if let Some(context) = observation_context {
-                            with_observation_context(context, run).await
-                        } else {
-                            run.await
-                        };
-                        (id, result)
-                    }),
+            handles.push(tokio::spawn(Box::pin(async move {
+                crate::autonomy::scope_child_requirement(
+                    required,
+                    crate::autonomy::scope_inherited_execution(
+                        execution,
+                        Box::pin(scope_runtime_gate_identity_stack(
+                            &gate_identity_stack,
+                            async move {
+                                let run = async move {
+                                    if let Some(context) = context {
+                                        agent.chat_with_actor_context(&msg, context).await
+                                    } else {
+                                        agent.chat(&msg).await
+                                    }
+                                };
+                                let result = if let Some(context) = observation_context {
+                                    with_observation_context(context, run).await
+                                } else {
+                                    run.await
+                                };
+                                (id, result)
+                            },
+                        )),
+                    ),
                 )
                 .await
-            }));
+            })));
         }
 
         let mut results = Vec::new();

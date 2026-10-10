@@ -4,6 +4,27 @@ use super::*;
 use crate::autonomy::composition::{CompositionChild, CompositionDispatch, DelegateFrame};
 
 impl RuntimeAgent {
+    /// Registry removal cannot retire an independently retained runtime owner after catalogue protection ends.
+    pub(crate) fn has_task_owner(&self) -> bool {
+        self.autonomy_owner.read().is_some()
+    }
+
+    /// Registry retirement excludes owner installation through the existing non-awaiting mutation barrier.
+    pub(crate) fn try_registry_retirement(&self) -> Result<tokio::sync::RwLockWriteGuard<'_, ()>> {
+        let guard = self.autonomy_mutations.try_write().map_err(|_| {
+            AgentError::Other("runtime admission or host mutation is active".into())
+        })?;
+        if self.has_task_owner() {
+            return Err(AgentError::Other("runtime is reserved by a task".into()));
+        }
+        Ok(guard)
+    }
+
+    /// Final child enrollment compares the captured implementation's gate, not its human-readable runtime identity.
+    pub(crate) fn matches_task_gate(&self, gate: &RootTurnGate) -> bool {
+        Arc::ptr_eq(&self.root_turn_gate, gate)
+    }
+
     /// A resumed dispatch uses the private retained frame rather than preparing input or allocating child operations again.
     pub(super) fn retained_composition_frame(&self) -> Result<Option<DelegateFrame>> {
         if !crate::autonomy::composition::resuming_delegate(&self.info.id) {
@@ -123,7 +144,7 @@ impl RuntimeAgent {
             parent_operation: crate::autonomy::current_child_operation(),
             required: crate::autonomy::child_required(),
         };
-        Box::pin(execution.retain_delegate_frame(frame.clone())).await?;
+        Box::pin(execution.retain_delegate_frame(frame.clone(), registry.clone())).await?;
 
         Ok(Some(frame))
     }
@@ -164,8 +185,12 @@ impl RuntimeAgent {
         )
         .await
         .map_err(|_| AgentError::Other("nested resume gate deadline exceeded".into()))?;
-        let mut lease =
-            Box::pin(execution.enroll_child(owner.clone(), self.autonomy_owner.clone())).await?;
+        let mut lease = Box::pin(execution.enroll_child(
+            owner.clone(),
+            self.autonomy_owner.clone(),
+            Some(&operation),
+        ))
+        .await?;
         drop(guard);
         let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(owner.clone());
         let turn = crate::autonomy::AutonomyTurnInput {

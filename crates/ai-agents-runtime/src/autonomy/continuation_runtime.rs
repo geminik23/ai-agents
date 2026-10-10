@@ -9,10 +9,12 @@ impl RuntimeAgent {
     pub(crate) fn task_group_child(
         &self,
         group: &crate::autonomy::TaskGroupState,
+        targets: &crate::autonomy::CompositionTargets,
     ) -> Result<Arc<RuntimeAgent>> {
         let child = self.task_composition_target(
             &group.frame,
             &group.frames,
+            targets,
             &group.child_operation,
             &mut Vec::new(),
         )?;
@@ -29,6 +31,7 @@ impl RuntimeAgent {
         &self,
         frame: &crate::autonomy::DelegateFrame,
         frames: &std::collections::BTreeMap<String, crate::autonomy::DelegateFrame>,
+        targets: &crate::autonomy::CompositionTargets,
         operation: &str,
         ancestry: &mut Vec<String>,
     ) -> Result<Arc<RuntimeAgent>> {
@@ -83,7 +86,8 @@ impl RuntimeAgent {
             let target = registry
                 .get(&slot.registry_id)
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-            if target.info.id != slot.runtime_id {
+            let captured = targets.resolve(&slot.operation)?;
+            if target.info.id != slot.runtime_id || !Arc::ptr_eq(&target, &captured) {
                 return Err(AgentError::Config("group topology binding changed".into()));
             }
             target.preflight_standalone_autonomy()?;
@@ -93,8 +97,9 @@ impl RuntimeAgent {
                 && nested.parent_operation.as_deref() == Some(slot.operation.as_str())
                 && nested.contains_operation(operation, frames, &mut Vec::new())
             {
-                selected =
-                    Some(target.task_composition_target(nested, frames, operation, ancestry)?);
+                selected = Some(
+                    target.task_composition_target(nested, frames, targets, operation, ancestry)?,
+                );
             }
         }
         ancestry.pop();
@@ -108,7 +113,9 @@ impl RuntimeAgent {
         group: crate::autonomy::TaskGroupState,
         response: crate::autonomy::suspension::BatchResponse,
     ) -> Result<AgentResponse> {
-        self.task_group_child(&group)?;
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        self.task_group_child(&group, &execution.targets)?;
         crate::autonomy::composition::scope_group_response(
             group.child_operation,
             group.child_request.id,
@@ -241,6 +248,7 @@ impl RuntimeAgent {
         owner: &Arc<crate::autonomy::RunOwner>,
         group: &crate::autonomy::TaskGroupState,
         participants: &crate::autonomy::Participants,
+        targets: &crate::autonomy::CompositionTargets,
     ) -> Result<Vec<(String, TaskRuntimeCheckpoint)>> {
         owner.check()?;
         if self
@@ -268,7 +276,7 @@ impl RuntimeAgent {
             let mut projection = group.clone();
             projection.child_operation = leaf.operation.clone();
             projection.child_runtime_id = leaf.runtime_id.clone();
-            let child = self.task_group_child(&projection)?;
+            let child = self.task_group_child(&projection, targets)?;
             let child_owner = participants
                 .owner_for(&child.root_turn_gate)
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -296,7 +304,7 @@ impl RuntimeAgent {
             let mut projection = group.clone();
             projection.child_operation = edge.0.clone();
             projection.child_runtime_id = edge.1;
-            let parent = self.task_group_child(&projection)?;
+            let parent = self.task_group_child(&projection, targets)?;
             let owner = participants
                 .owner_for(&parent.root_turn_gate)
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -364,7 +372,7 @@ impl RuntimeAgent {
         .await
         .map_err(|_| AgentError::Other("child resume gate deadline exceeded".into()))?;
         let mut lease = execution
-            .enroll_child(owner.clone(), self.autonomy_owner.clone())
+            .enroll_child(owner.clone(), self.autonomy_owner.clone(), Some(&operation))
             .await?;
         drop(guard);
         let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(owner.clone());

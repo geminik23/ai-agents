@@ -1555,9 +1555,12 @@ impl RuntimeAgent {
             };
 
             // Box ledger futures before nesting runtime polling; checkpoints contain large exact continuation DTOs.
-            let mut lease =
-                Box::pin(execution.enroll_child(owner.clone(), self.autonomy_owner.clone()))
-                    .await?;
+            let mut lease = Box::pin(execution.enroll_child(
+                owner.clone(),
+                self.autonomy_owner.clone(),
+                crate::autonomy::current_child_invocation(&self.info.id).as_deref(),
+            ))
+            .await?;
             drop(_mutations);
             let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(owner.clone());
             let operation = crate::autonomy::current_child_invocation(&self.info.id)
@@ -11925,7 +11928,7 @@ Respond in JSON format:
                 parent_operation: crate::autonomy::current_child_operation(),
                 required: crate::autonomy::child_required(),
             };
-            Box::pin(execution.retain_delegate_frame(frame.clone())).await?;
+            Box::pin(execution.retain_delegate_frame(frame.clone(), registry.clone())).await?;
             Some(frame)
         } else {
             None

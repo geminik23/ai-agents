@@ -263,6 +263,58 @@ async fn fixture_pattern_gated(question: bool, pattern: &str, gated: bool) -> Gr
     (parent, child, runner, store, first, second, provider)
 }
 
+// Catalogue protection includes unstarted slots and survives acknowledged pause until terminal cancellation cleanup.
+#[tokio::test]
+async fn paused_pipeline_protects_unstarted_registered_instance() {
+    let (parent, child, runner, _, _, _, _) =
+        fixture_pattern(false, "pipeline:\n        stages: [worker, peer]").await;
+    let registry = parent.spawner_registry().unwrap().clone();
+    let peer = registry.get("peer").unwrap();
+    let paused = runner.run("objective", None).await.unwrap();
+    assert_eq!(paused.run.status, TaskRunStatus::Paused);
+    assert!(child.has_task_owner());
+    assert!(!peer.has_task_owner());
+    assert!(registry.remove("worker").await.is_none());
+    assert!(registry.remove("peer").await.is_none());
+    let cancelled = runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.run.status, TaskRunStatus::Cancelled);
+    assert!(registry.remove("worker").await.is_some());
+    assert!(registry.remove("peer").await.is_some());
+}
+
+// A foreign run on an unstarted runtime cannot be released by the coordinating task's failed admission or cleanup.
+#[tokio::test]
+async fn coordinating_cleanup_preserves_independently_reserved_unstarted_child() {
+    let (parent, _, runner, _, _, _, _) =
+        fixture_pattern(false, "pipeline:\n        stages: [worker, peer]").await;
+    let registry = parent.spawner_registry().unwrap().clone();
+    let peer = registry.get("peer").unwrap();
+    let paused = runner.run("objective", None).await.unwrap();
+    let foreign = peer
+        .reserve_autonomy_run("independent".into())
+        .await
+        .unwrap();
+    let stopped = runner
+        .resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            TaskResumeInput::Approval {
+                request_id: paused.run.pending.unwrap().id,
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stopped.run.status, TaskRunStatus::Failed);
+    assert!(peer.has_task_owner());
+    assert!(registry.remove("peer").await.is_none());
+    peer.release_autonomy_run(&foreign).await.unwrap();
+    assert!(registry.remove("peer").await.is_some());
+}
+
 // An already expired parent dispatch denies provider admission rather than executing a first call before its timeout is observed.
 #[tokio::test]
 async fn zero_composition_timeout_does_not_admit_child_provider() {
@@ -535,6 +587,12 @@ async fn sqlite_concurrent_continuation_rejects_stale_receipts() {
         AutonomyRunner::try_new(parent, config, Default::default(), store, "group.v1".into())
             .unwrap();
     let first = runner.run("objective", None).await.unwrap();
+    assert_eq!(
+        first.run.status,
+        TaskRunStatus::Paused,
+        "stop reason: {:?}",
+        first.run.stop_reason
+    );
     let run_id = first.run.key.run_id.clone();
     let old_revision = first.run.revision;
     let old_id = first.run.pending.as_ref().unwrap().id.clone();

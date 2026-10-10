@@ -461,6 +461,7 @@ impl Tool for RemoveAgentTool {
         generate_schema::<RemoveAgentInput>()
     }
 
+    /// Reports protected existing targets separately from missing IDs; refusal never publishes a successful removal effect.
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let id = match args.get("id").and_then(|v| v.as_str()) {
             Some(i) => i,
@@ -469,6 +470,9 @@ impl Tool for RemoveAgentTool {
 
         match self.registry.remove(id).await {
             Some(removed) => ToolResult::ok(json!({"removed": true, "id": removed.id}).to_string()),
+            None if self.registry.contains(id) => ToolResult::error(format!(
+                "agent is reserved or admission/mutation is active: {id}"
+            )),
             None => ToolResult::error(format!("agent not found: {}", id)),
         }
     }

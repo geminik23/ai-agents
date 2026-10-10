@@ -15,6 +15,7 @@ pub(crate) struct RunExecution {
     pub(crate) store: Arc<dyn TaskRunStore>,
     pub(crate) owner: Arc<RunOwner>,
     pub(crate) participants: Arc<super::participants::Participants>,
+    pub(crate) targets: Arc<super::CompositionTargets>,
     acknowledged: parking_lot::RwLock<TaskRunSnapshot>,
     limits: TaskRunLimits,
     pub(crate) expiry_projection: Option<Instant>,
@@ -54,8 +55,9 @@ impl RunExecution {
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         Ok(Arc::new(Self {
             store,
-            owner,
+            owner: owner.clone(),
             participants: Arc::new(super::participants::Participants::default()),
+            targets: owner.targets.clone(),
             acknowledged: parking_lot::RwLock::new(snapshot.clone()),
             limits: payload.limits.clone(),
             expiry_projection: payload

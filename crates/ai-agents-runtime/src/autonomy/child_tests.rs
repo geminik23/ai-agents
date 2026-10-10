@@ -10,6 +10,199 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Arc;
 
+// Optional fan-out policy survives task spawning; failed recipients remain typed outcomes instead of globally stopping admission.
+#[tokio::test]
+async fn optional_broadcast_failure_preserves_coordinating_run_policy() {
+    let registry = Arc::new(AgentRegistry::new());
+    register(&registry, "good", &["done"]).await;
+    let bad = crate::AgentBuilder::new()
+        .system_prompt("bad")
+        .llm(Arc::new(FailingProvider))
+        .build()
+        .unwrap();
+    registry
+        .register(SpawnedAgent::from_runtime(
+            "bad".into(),
+            bad,
+            crate::spec::AgentSpec::default(),
+        ))
+        .await
+        .unwrap();
+    let (parent, execution) = execution(3).await;
+    let results = scope_child_requirement(
+        false,
+        scope_execution(
+            execution.clone(),
+            Box::pin(registry.broadcast("sender", "objective")),
+        ),
+    )
+    .await;
+    assert_eq!(
+        results
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bad", "good"]
+    );
+    assert!(
+        results
+            .iter()
+            .find(|(id, _)| id == "bad")
+            .unwrap()
+            .1
+            .is_err()
+    );
+    assert!(
+        results
+            .iter()
+            .find(|(id, _)| id == "good")
+            .unwrap()
+            .1
+            .is_ok()
+    );
+    assert!(execution.stop_reason().is_none());
+    let payload: TaskCheckpointPayload =
+        serde_json::from_value(execution.load_owned().await.unwrap().payload).unwrap();
+    assert_eq!(payload.counters.llm_attempts, 2);
+    assert_eq!(payload.children.len(), 2);
+    assert!(payload.children.iter().all(|child| child.result.is_some()));
+    finish(&parent, &execution).await;
+}
+
+// Model tool generation and later messaging reuse the builder-frozen provider handles and the real spawner registry.
+async fn generated_fixture(
+    max_llm: u32,
+) -> (
+    Arc<RuntimeAgent>,
+    AutonomyRunner,
+    Arc<ScopedTaskRunStore>,
+    Arc<super::runner_tests::RecordingProvider>,
+) {
+    let spawn = ai_agents_core::encode_native_tool_call_markers(
+        &[ai_agents_core::ToolCall {
+            id: "spawn".into(),
+            name: "spawn_agent".into(),
+            arguments: serde_json::json!({"name":"SpawnedWorker","description":"helper"}),
+        }],
+        None,
+    )
+    .unwrap();
+    let send = ai_agents_core::encode_native_tool_call_markers(
+        &[ai_agents_core::ToolCall {
+            id: "send".into(),
+            name: "send_agent_message".into(),
+            arguments: serde_json::json!({"to":"spawnedworker","message":"work"}),
+        }],
+        None,
+    )
+    .unwrap();
+    let provider = super::runner_tests::RecordingProvider::new(&[
+        &spawn,
+        "name: SpawnedWorker\nsystem_prompt: child\n",
+        &send,
+        "child result",
+        "done",
+    ]);
+    let parent = Arc::new(Box::pin(crate::AgentBuilder::from_yaml(
+        "name: SpawnParent\nsystem_prompt: parent\ntools: [spawn_agent, send_agent_message]\nspawner:\n  shared_llms: true\n  max_agents: 3\n")
+        .unwrap().llm(provider.clone()).auto_configure_features().unwrap().auto_configure_spawner()).await.unwrap().build().unwrap());
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(parent.info().id, None, "generated-v1".into()).unwrap(),
+    );
+    let runner = AutonomyRunner::try_new(
+        parent.clone(),
+        super::runner_tests::config(max_llm),
+        Default::default(),
+        store.clone(),
+        "generated-v1".into(),
+    )
+    .unwrap();
+    (parent, runner, store, provider)
+}
+
+// Generated provider work, parent model calls and the child's first turn consume one shared allowance without double wrapping.
+#[tokio::test]
+async fn generated_spawn_and_message_share_actual_provider_and_tool_accounting() {
+    let (parent, runner, store, provider) = Box::pin(generated_fixture(5)).await;
+    let finished = runner.run("objective", None).await.unwrap();
+    assert_eq!(
+        finished.run.status,
+        TaskRunStatus::Completed,
+        "reason: {:?}",
+        finished.run.stop_reason
+    );
+    assert_eq!(finished.run.counters.llm_attempts, 5);
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 5);
+    assert_eq!(finished.run.counters.tool_attempts, 2);
+    let payload: TaskCheckpointPayload = serde_json::from_value(
+        store
+            .load(&finished.run.key.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(
+        payload.children.len(),
+        1,
+        "tool outputs: {:?}",
+        payload
+            .evidence
+            .tool_calls
+            .iter()
+            .map(|call| &call.record.output)
+            .collect::<Vec<_>>()
+    );
+    assert!(payload.children[0].result.is_some());
+    assert!(
+        payload
+            .evidence
+            .tool_calls
+            .iter()
+            .all(|call| call.record.executed && call.record.success)
+    );
+    assert!(
+        parent
+            .spawner_registry()
+            .unwrap()
+            .remove("spawnedworker")
+            .await
+            .is_some()
+    );
+}
+
+// Exhaustion immediately after generation prevents another model request or messaging effect while retaining the settled creation.
+#[tokio::test]
+async fn generated_creation_respects_exact_shared_cap_without_extra_dispatch() {
+    let (parent, runner, store, provider) = Box::pin(generated_fixture(2)).await;
+    let finished = runner.run("objective", None).await.unwrap();
+    assert_eq!(finished.run.status, TaskRunStatus::LimitReached);
+    assert_eq!(finished.run.counters.llm_attempts, 2);
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(finished.run.counters.tool_attempts, 1);
+    let payload: TaskCheckpointPayload = serde_json::from_value(
+        store
+            .load(&finished.run.key.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(payload.children.is_empty());
+    assert!(
+        parent.spawner_registry().unwrap().contains("spawnedworker"),
+        "tool outputs: {:?}",
+        payload
+            .evidence
+            .tool_calls
+            .iter()
+            .map(|call| &call.record.output)
+            .collect::<Vec<_>>()
+    );
+}
+
 // Each child uses the production builder so provider wrapping and its own root gate remain authoritative.
 async fn register(
     registry: &AgentRegistry,

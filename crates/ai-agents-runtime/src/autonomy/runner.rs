@@ -20,6 +20,7 @@ pub struct AutonomyRunner {
 struct PausedTask {
     owner: Arc<RunOwner>,
     participants: Arc<super::participants::Participants>,
+    targets: Arc<CompositionTargets>,
     todo: Option<RunTodoAdapter>,
     batch: Option<TaskBatchState>,
     group: Option<TaskGroupState>,
@@ -147,7 +148,7 @@ impl AutonomyRunner {
                 .clone(),
         )?;
         group.validate_checkpoint(&payload)?;
-        let (owner, whole_expiry, request_deadline, composition_expired) = {
+        let (owner, whole_expiry, request_deadline, composition_expired, targets) = {
             let retained = self.paused.lock();
             let retained = retained
                 .get(&snapshot.key.run_id)
@@ -184,10 +185,11 @@ impl AutonomyRunner {
                                 .get(&format!("composition:{}", frame.id))
                                 .is_some_and(|expiry| std::time::Instant::now() >= *expiry)
                     }),
+                retained.targets.clone(),
             )
         };
         owner.check()?;
-        let child = self.agent.task_group_child(&group)?;
+        let child = self.agent.task_group_child(&group, &targets)?;
         child.preflight_priced_autonomy(payload.limits.max_micro_usd.is_some())?;
         if let super::suspension::BatchResponse::UserAnswer(answer) = &response {
             let pending = &group.batch.approvals[0];
@@ -277,6 +279,7 @@ impl AutonomyRunner {
         {
             let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
             live.participants = paused.participants.clone();
+            live.targets = paused.targets.clone();
             *live.delegate_frames.lock() = group.frames.clone();
             for leaf in &group.parked {
                 live.parked_batches
@@ -444,10 +447,12 @@ impl AutonomyRunner {
         } else {
             let mut cancellation = group.clone();
             cancellation.parked = pending;
-            Box::pin(
-                self.agent
-                    .cancel_task_group(owner, &cancellation, &execution.participants),
-            )
+            Box::pin(self.agent.cancel_task_group(
+                owner,
+                &cancellation,
+                &execution.participants,
+                &execution.targets,
+            ))
             .await?
         };
         let runtime = TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
@@ -496,7 +501,7 @@ impl AutonomyRunner {
                 .clone(),
         )?;
         group.validate_checkpoint(&payload)?;
-        let (owner, participants) = {
+        let (owner, participants, targets) = {
             let retained = self.paused.lock();
             let retained = retained
                 .get(&run_id)
@@ -510,7 +515,11 @@ impl AutonomyRunner {
             {
                 return Err(TaskRunStorageError::InvalidCheckpoint.into());
             }
-            (retained.owner.clone(), retained.participants.clone())
+            (
+                retained.owner.clone(),
+                retained.participants.clone(),
+                retained.targets.clone(),
+            )
         };
         owner.check()?;
         if participants.unsettled() {
@@ -531,7 +540,7 @@ impl AutonomyRunner {
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let retired = self
             .agent
-            .cancel_task_group(&owner, &group, &participants)
+            .cancel_task_group(&owner, &group, &participants, &targets)
             .await?;
         for (operation, child_runtime) in retired {
             let child = payload
@@ -621,8 +630,9 @@ impl AutonomyRunner {
         })
     }
 
-    /// Old-owner cleanup cannot erase a newer run published after the runtime reservation was released.
+    /// Acknowledged cleanup always retires this owner's catalogue, while active-slot clearing still requires exact pointer identity.
     fn retire_owner(&self, owner: &Arc<RunOwner>) {
+        owner.targets.release();
         let mut active = self.active.lock();
         if active
             .as_ref()
@@ -1081,9 +1091,11 @@ impl AutonomyRunner {
             owner.clone(),
             std::time::Instant::now(),
         )?;
-        Arc::get_mut(&mut execution)
-            .ok_or(TaskRunStorageError::Conflict)?
-            .participants = paused.participants.clone();
+        {
+            let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
+            live.participants = paused.participants.clone();
+            live.targets = paused.targets.clone();
+        }
         if let Some(expiry) = whole_expiry {
             let execution = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
             execution.expiry_projection = Some(
@@ -1401,6 +1413,7 @@ impl AutonomyRunner {
                 run_id.clone(),
                 PausedTask {
                     participants: execution.participants.clone(),
+                    targets: execution.targets.clone(),
                     owner,
                     todo,
                     whole_expiry: execution.expiry_projection,
@@ -2063,5 +2076,69 @@ impl AutonomyRunner {
             run,
             final_response,
         })
+    }
+}
+
+#[cfg(test)]
+mod catalogue_race_tests {
+    use super::*;
+    use crate::spawner::{AgentRegistry, SpawnedAgent};
+
+    // Delayed old cleanup must release its own pins even after a newer execution has claimed the controller's active slot.
+    #[tokio::test]
+    async fn old_cleanup_retires_catalogue_without_erasing_new_execution() {
+        let provider = super::super::runner_tests::RecordingProvider::gated();
+        let (_, runner, _) = super::super::runner_tests::fixture(provider.clone(), 2);
+        let yaml = "name: CatalogueChild\nsystem_prompt: test\n";
+        let child = crate::AgentBuilder::from_yaml(yaml)
+            .unwrap()
+            .llm(super::super::runner_tests::RecordingProvider::new(&[
+                "done",
+            ]))
+            .build()
+            .unwrap();
+        let registry = Arc::new(AgentRegistry::new());
+        Box::pin(registry.register(SpawnedAgent::from_runtime(
+            "child".into(),
+            child,
+            crate::spec::AgentSpec::from_yaml_strict(yaml).unwrap(),
+        )))
+        .await
+        .unwrap();
+        let old_owner =
+            RunOwner::new("old".into(), Arc::new(tokio::sync::Mutex::new(())), None).unwrap();
+        old_owner
+            .targets
+            .install(vec![(
+                "old-operation".into(),
+                registry.pin_task_target("child", "CatalogueChild").unwrap(),
+            )])
+            .unwrap();
+        let work = runner.run("objective", None);
+        tokio::pin!(work);
+        tokio::select! {
+            _ = provider.entered.as_ref().unwrap().acquire() => {},
+            result = &mut work => panic!("provider did not park: {result:?}"),
+        }
+        let new_execution = runner.active.lock().as_ref().unwrap().clone();
+        new_execution
+            .targets
+            .install(vec![(
+                "new-operation".into(),
+                registry.pin_task_target("child", "CatalogueChild").unwrap(),
+            )])
+            .unwrap();
+        runner.retire_owner(&old_owner);
+        assert!(old_owner.targets.resolve("old-operation").is_err());
+        assert!(Arc::ptr_eq(
+            &runner.active.lock().as_ref().unwrap().owner,
+            &new_execution.owner
+        ));
+        assert!(registry.remove("child").await.is_none());
+        provider.release.as_ref().unwrap().add_permits(1);
+        let finished = work.await.unwrap();
+        assert_eq!(finished.run.status, TaskRunStatus::Completed);
+        assert!(new_execution.targets.resolve("new-operation").is_err());
+        assert!(registry.remove("child").await.is_some());
     }
 }

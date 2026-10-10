@@ -571,6 +571,7 @@ impl RunExecution {
             if slot.runtime_id != child_runtime_id {
                 return Err(TaskRunStorageError::InvalidCheckpoint.into());
             }
+            self.targets.resolve(&slot.operation)?;
             return Ok(slot.clone());
         }
         if frame.calls.len() >= MAX_TASK_CHECKPOINT_RECORDS {
@@ -581,6 +582,7 @@ impl RunExecution {
             .iter()
             .find(|slot| slot.runtime_id == child_runtime_id)
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let catalog_operation = catalog.operation.clone();
         let slot = CompositionChild {
             registry_id: catalog.registry_id.clone(),
             runtime_id: child_runtime_id.into(),
@@ -597,6 +599,8 @@ impl RunExecution {
             Ok(())
         })
         .await?;
+        self.targets
+            .bind_call(&catalog_operation, &slot.operation)?;
         self.delegate_frames.lock().insert(runtime_id.into(), frame);
         Ok(slot)
     }
@@ -799,11 +803,16 @@ impl RunExecution {
         Ok(saved)
     }
 
-    /// Captures an exact parent frame before child work, with immutable dispatch/configuration binding.
-    pub(crate) async fn retain_delegate_frame(&self, frame: DelegateFrame) -> Result<()> {
+    /// Captures exact parent configuration and actual registry objects before child work; stored labels never create execution authority.
+    pub(crate) async fn retain_delegate_frame(
+        &self,
+        frame: DelegateFrame,
+        registry: Arc<crate::spawner::AgentRegistry>,
+    ) -> Result<()> {
         if frame.version != 1 || frame.id.is_empty() || frame.child_operation.is_empty() {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
+        let captured = self.targets.capture(&frame, &registry)?;
         self.update(|payload| {
             let adapter = TaskAdapterCheckpoint {
                 id: format!("runtime.delegate:{}", frame.id),
@@ -826,6 +835,7 @@ impl RunExecution {
             Ok(())
         })
         .await?;
+        self.targets.install(captured)?;
         self.delegate_frames
             .lock()
             .insert(frame.runtime_id.clone(), frame);

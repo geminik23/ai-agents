@@ -8,6 +8,7 @@ pub(crate) mod composition;
 mod execution;
 mod memory;
 mod participants;
+mod targets;
 pub(crate) use composition::{
     DelegateFrame, TaskGroupState, current_child_invocation, scope_child_invocation,
 };
@@ -15,6 +16,7 @@ pub(crate) use participants::{
     Participants, child_required, current_child_operation, scope_child_operation,
     scope_child_requirement,
 };
+pub(crate) use targets::CompositionTargets;
 mod runner;
 pub(crate) mod suspension;
 #[cfg(test)]

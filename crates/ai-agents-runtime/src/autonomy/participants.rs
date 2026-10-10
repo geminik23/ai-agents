@@ -246,6 +246,7 @@ impl RunExecution {
         self: &Arc<Self>,
         owner: Arc<RunOwner>,
         slot: boundary::RunOwnerSlot,
+        operation: Option<&str>,
     ) -> Result<ChildLease> {
         let _serial = self.serial.lock().await;
         let snapshot = self.load_owned().await?;
@@ -254,7 +255,12 @@ impl RunExecution {
         if let Some(parent) = super::composition::composition_admission_denial() {
             return Err(AgentError::TaskSuspended(parent));
         }
-        self.participants.enroll(owner, slot)?;
+        if let Some(operation) = operation {
+            self.targets
+                .enroll(operation, owner, slot, &self.participants)?;
+        } else {
+            self.participants.enroll(owner, slot)?;
+        }
         Ok(ChildLease::new(self))
     }
 

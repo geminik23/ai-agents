@@ -10,6 +10,7 @@ pub(crate) struct RunOwner {
     pub(crate) run_id: String,
     pub(crate) actor_id: Option<String>,
     pub(crate) gate: crate::runtime::RootTurnGate,
+    pub(crate) targets: Arc<super::CompositionTargets>,
     abandoned: AtomicBool,
     retained_effect_guards: parking_lot::Mutex<Vec<Box<dyn Send>>>,
 }
@@ -28,6 +29,7 @@ impl RunOwner {
             run_id,
             actor_id,
             gate,
+            targets: Arc::new(super::CompositionTargets::default()),
             abandoned: AtomicBool::new(false),
             retained_effect_guards: parking_lot::Mutex::new(Vec::new()),
         }))

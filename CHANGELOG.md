@@ -16,6 +16,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task registry: retain actual registered instances through task cleanup, prevent removal and admission races, and protect newer catalogue reservations from stale cleanup
+- Task broadcasts: preserve optional dependency failure policy across spawned recipients and return results in stable registry-ID order
 - Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn
 - Shared model providers: concurrent requests retain their own prompt and model settings through dispatch and stream opening, including extra fallback settings and exact configuration cache matching
 
