@@ -206,7 +206,7 @@ impl RunExecution {
         runtime_id: &str,
     ) -> Result<Option<Result<AgentResponse>>> {
         let _serial = self.serial.lock().await;
-        let snapshot = self.load_owned().await?;
+        let snapshot = self.load_owned_locked(&_serial).await?;
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
         let Some(child) = payload
             .children
@@ -249,7 +249,7 @@ impl RunExecution {
         operation: Option<&str>,
     ) -> Result<ChildLease> {
         let _serial = self.serial.lock().await;
-        let snapshot = self.load_owned().await?;
+        let snapshot = self.load_owned_locked(&_serial).await?;
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
         self.check(&payload)?;
         if let Some(parent) = super::composition::composition_admission_denial() {

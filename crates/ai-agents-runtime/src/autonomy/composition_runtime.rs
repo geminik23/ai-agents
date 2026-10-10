@@ -32,13 +32,8 @@ impl RuntimeAgent {
         }
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let frame = execution
-            .delegate_frames
-            .lock()
-            .get(&self.info.id)
-            .cloned()
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        Ok(Some(frame))
+        // After acknowledged dispatch retirement, redispatch may prepare a new state rather than reuse the old cursor.
+        Ok(execution.delegate_frames.lock().get(&self.info.id).cloned())
     }
 
     /// Captures state dispatch after input preparation and before any child can act; saved slots bind registry targets by identity.
@@ -206,11 +201,22 @@ impl RuntimeAgent {
         )
         .await;
         if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
-            Box::pin(execution.checkpoint_child_composition_park(
-                &operation,
-                self.task_suspension_snapshot().await?,
-            ))
-            .await?;
+            let local_batch = execution.parked_batches.lock().get(&self.info.id).cloned();
+            let has_frame = execution.delegate_frames.lock().contains_key(&self.info.id);
+            if let Some(batch) = local_batch.filter(|_| !has_frame) {
+                Box::pin(execution.checkpoint_child_park(
+                    &operation,
+                    self.task_suspension_snapshot().await?,
+                    batch,
+                ))
+                .await?;
+            } else {
+                Box::pin(execution.checkpoint_child_composition_park(
+                    &operation,
+                    self.task_suspension_snapshot().await?,
+                ))
+                .await?;
+            }
             lease.acknowledge_park();
         } else {
             let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
@@ -224,7 +230,8 @@ impl RuntimeAgent {
         outcome
     }
 
-    /// Retires the parent interaction only after the composition returns a settled result, never while children are parked.
+    /// Retires the parent interaction and frame only after the composition returns a settled result, never while children are parked.
+    /// Later local interactions must own a batch cursor rather than inherit the completed dispatch's authority.
     pub(super) async fn retire_composition_pending(&self) -> Result<()> {
         let Some(execution) = crate::autonomy::current_execution() else {
             return Ok(());
@@ -253,6 +260,7 @@ impl RuntimeAgent {
             Ok(())
         }))
         .await?;
+        execution.delegate_frames.lock().remove(&self.info.id);
         Ok(())
     }
 }

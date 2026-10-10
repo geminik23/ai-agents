@@ -49,7 +49,8 @@ impl AutonomyRunner {
         if matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: Some(_), .. }
-        ) {
+        ) && payload.pause_reason.as_deref() != Some("child_interaction")
+        {
             let batch = execution
                 .parked_batches
                 .lock()
@@ -472,6 +473,7 @@ impl AutonomyRunner {
                     }
                     child.result = Some(json!({"error":"task stopped before child continuation"}));
                 }
+                super::message::settle_cancelled_messages(payload)?;
                 if let Some(pending) = payload.pending.take() {
                     payload.consumed_request_ids.push(pending.id);
                 }
@@ -571,6 +573,7 @@ impl AutonomyRunner {
                     .push(approval.request_id.clone());
             }
         }
+        super::message::settle_cancelled_messages(&mut payload)?;
         payload.runtime =
             TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
         payload.pause_reason = None;
@@ -720,6 +723,7 @@ impl AutonomyRunner {
                     reservation.state,
                     TaskEffectState::Reserved
                         | TaskEffectState::Dispatched
+                        | TaskEffectState::Suspended
                         | TaskEffectState::Uncertain
                 )
             })
@@ -794,7 +798,8 @@ impl AutonomyRunner {
         if matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: None, .. }
-        ) {
+        ) || payload.pause_reason.as_deref() == Some("child_interaction")
+        {
             return Box::pin(self.cancel_group(snapshot, payload)).await;
         }
         let batch: TaskBatchState = serde_json::from_value(
@@ -872,10 +877,25 @@ impl AutonomyRunner {
     ) -> Result<TaskRunResult> {
         let runtime = self.agent.task_suspension_snapshot().await?;
         let todos = todo.map(RunTodoAdapter::checkpoint).transpose()?;
+        let message_group = execution
+            .delegate_frames
+            .lock()
+            .get(&self.agent.info().id)
+            .is_some_and(|frame| {
+                frame.dispatch == super::composition::CompositionDispatch::ToolMessage
+                    && execution
+                        .parked_batches
+                        .lock()
+                        .get(&self.agent.info().id)
+                        .is_some_and(|batch| {
+                            batch.approvals.iter().any(|a| a.request_id == frame.id)
+                        })
+            });
         let snapshot = if execution
             .parked_batches
             .lock()
             .contains_key(&self.agent.info().id)
+            && !message_group
         {
             Box::pin(execution.pause_batch(runtime, &self.agent.info().id, todos)).await?
         } else {
@@ -953,7 +973,8 @@ impl AutonomyRunner {
         if matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: None, .. }
-        ) {
+        ) || payload.pause_reason.as_deref() == Some("child_interaction")
+        {
             return Box::pin(self.resume_group(snapshot, payload, request_id, result)).await;
         }
         let adapter = payload
@@ -1550,7 +1571,7 @@ impl AutonomyRunner {
                 "remaining_command_calls":(profile.max_command_calls as u64).saturating_sub(payload.counters.command_attempts),
                 "remaining_active_seconds":profile.max_active_time_seconds.saturating_mul(1000).saturating_sub(execution.consumed_active_millis()?)/1000,
                 "remaining_wall_seconds":payload.clocks.expires_at.map(|expiry|(expiry-chrono::Utc::now()).num_seconds().max(0)),
-                "remaining_micro_usd":payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Uncertain)).map(|reservation| reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)).sum::<u64>())),
+                "remaining_micro_usd":payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain)).map(|reservation| reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)).sum::<u64>())),
                 "remaining_declared_write_paths":payload.limits.max_declared_write_paths.map(|limit| (limit as usize).saturating_sub(payload.declared_write_targets.len())),
                                 "failed_gates":payload.evidence.records.last().and_then(|record| record.data.get("completion")).cloned(),
                 "progress_instruction":profile.settings.progress.as_ref().and_then(|progress| progress.auto_create_todo_prompt.clone()).unwrap_or_else(|| "Before progress-gated work, maintain the run todo list and select exactly one active item when required.".into()),
@@ -1612,7 +1633,7 @@ impl AutonomyRunner {
                     .await;
             }
             execution.await_children().await?;
-            self.agent.flush_background_tasks().await?;
+            Box::pin(self.agent.flush_background_tasks()).await?;
             let runtime =
                 TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
             let todos = todo.map(RunTodoAdapter::checkpoint).transpose()?;
@@ -1657,7 +1678,7 @@ impl AutonomyRunner {
                     {
                         continue;
                     }
-                    self.validate(
+                    Box::pin(self.validate(
                         check,
                         &mut scope,
                         &mut evidence,
@@ -1665,7 +1686,7 @@ impl AutonomyRunner {
                         bound,
                         &executor,
                         &journal,
-                    )
+                    ))
                     .await?;
                 }
             }

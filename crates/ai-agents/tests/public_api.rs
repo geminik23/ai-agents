@@ -116,6 +116,29 @@ fn supports_snapshots(storage: &dyn AgentStorage) -> bool {
 }
 
 #[test]
+fn task_tool_control_transfer_and_effect_state_surface_compiles() {
+    fn invoke(tool: &dyn ai_agents::Tool, context: ai_agents::tools::ToolExecutionContext) {
+        let _supported = tool.supports_task_messages();
+        drop(tool.execute_task(Default::default(), context));
+    }
+    fn effect(state: ai_agents::autonomy::TaskEffectState) -> &'static str {
+        use ai_agents::autonomy::TaskEffectState;
+        match state {
+            TaskEffectState::Reserved => "reserved",
+            TaskEffectState::Dispatched => "dispatched",
+            TaskEffectState::Suspended => "suspended",
+            TaskEffectState::Completed => "completed",
+            TaskEffectState::Uncertain => "uncertain",
+        }
+    }
+    let _surface = invoke;
+    assert_eq!(
+        effect(ai_agents::autonomy::TaskEffectState::Suspended),
+        "suspended"
+    );
+}
+
+#[test]
 fn autonomy_config_migration_exposes_typed_fields_without_enabling_chat() {
     use ai_agents::{
         AutonomyConfig, AutonomyOverride, AutonomyProfile, SkillDefinition, StateDefinition,

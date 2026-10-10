@@ -345,6 +345,40 @@ impl Tool for SendMessageTool {
         generate_schema::<SendMessageInput>()
     }
 
+    /// Managed dispatch preserves typed child suspension; ordinary execution keeps its existing model-facing error format.
+    async fn execute_task(
+        &self,
+        args: Value,
+        _ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        let to = args
+            .get("to")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ai_agents_core::AgentError::Tool("missing required field: to".into()))?;
+        let message = args.get("message").and_then(Value::as_str).ok_or_else(|| {
+            ai_agents_core::AgentError::Tool("missing required field: message".into())
+        })?;
+        let actor = current_turn_actor_context()
+            .unwrap_or_default()
+            .for_sender(self.sender_id.clone());
+        match self
+            .registry
+            .send_task_message(&self.sender_id, to, message, actor)
+            .await
+        {
+            Ok(response) => Ok(ToolResult::ok(
+                json!({"from":to,"response":response.content}).to_string(),
+            )),
+            Err(error @ ai_agents_core::AgentError::TaskSuspended(_)) => Err(error),
+            Err(error) => Ok(ToolResult::error(format!("send failed: {error}"))),
+        }
+    }
+
+    /// Typed dispatch uses framework-owned child cursors; ordinary invocation remains unchanged.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
+
     async fn execute(&self, args: Value, _ctx: ai_agents_core::ToolExecutionContext) -> ToolResult {
         let to = match args.get("to").and_then(|v| v.as_str()) {
             Some(t) => t,

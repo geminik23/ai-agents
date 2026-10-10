@@ -354,6 +354,44 @@ impl Tool for ObservedTool {
         self.inner.policy_bindings()
     }
 
+    fn supports_task_messages(&self) -> bool {
+        self.inner.supports_task_messages()
+    }
+
+    /// Task transfer retains instrumentation without turning a safe suspension into a tool error.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if !self.manager.config().latency.track_tools {
+            return self.inner.execute_task(args, ctx).await;
+        }
+        let mut span = self.manager.start_span(
+            EventType::ToolCall {
+                tool_id: self.inner.id().to_string(),
+            },
+            current_purpose(),
+        );
+        if self.manager.config().privacy.include_tool_args {
+            span.set_payload(serde_json::json!({"args":args.clone()}));
+        }
+        let result = self.inner.execute_task(args, ctx).await;
+        match &result {
+            Ok(output) => {
+                if !output.success {
+                    span.set_error(ObservationError::new("tool_error", output.output.clone()));
+                }
+                if self.manager.config().privacy.include_tool_outputs {
+                    span.set_payload(serde_json::json!({"output":output.output.clone()}));
+                }
+            }
+            Err(ai_agents_core::AgentError::TaskSuspended(_)) => {}
+            Err(error) => span.set_error(ObservationError::new("tool_error", error.to_string())),
+        }
+        result
+    }
+
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
         if !self.manager.config().latency.track_tools {
             return self.inner.execute(args, ctx).await;

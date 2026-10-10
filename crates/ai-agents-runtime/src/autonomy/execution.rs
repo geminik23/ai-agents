@@ -23,6 +23,8 @@ pub(crate) struct RunExecution {
     pub(crate) owner_token: String,
     pub(crate) revision: Arc<AtomicU64>,
     pub(crate) serial: Arc<tokio::sync::Mutex<()>>,
+    // Slot validation and frame publication are atomic with respect to other message installers, not child execution.
+    pub(crate) message_admission: tokio::sync::Mutex<()>,
     pub(crate) cancellation: Arc<AtomicBool>,
     started: Instant,
     initial_active_millis: u64,
@@ -77,6 +79,7 @@ impl RunExecution {
                 .ok_or(TaskRunStorageError::Owned)?,
             revision: Arc::new(AtomicU64::new(snapshot.revision)),
             serial: Arc::new(tokio::sync::Mutex::new(())),
+            message_admission: tokio::sync::Mutex::new(()),
             cancellation: Arc::new(AtomicBool::new(false)),
             started,
             initial_active_millis: payload.clocks.active_millis,
@@ -188,7 +191,7 @@ impl RunExecution {
     /// Serializes a retained-owner cancellation request with admission and signals only after the CAS is acknowledged.
     pub(crate) async fn request_cancel(&self) -> Result<TaskRunSummary> {
         let _serial = self.serial.lock().await;
-        let snapshot = self.load_owned().await?;
+        let snapshot = self.load_owned_locked(&_serial).await?;
         if snapshot.cancel_requested {
             return Ok(snapshot.summary());
         }
@@ -395,15 +398,29 @@ impl RunExecution {
         change: impl FnOnce(&mut TaskCheckpointPayload) -> Result<()>,
     ) -> Result<TaskRunSnapshot> {
         let _serial = self.serial.lock().await;
-        let snapshot = self.load_owned().await?;
+        let snapshot = self.load_owned_locked(&_serial).await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         change(&mut payload)?;
         payload.clocks.active_millis = self.active_millis()?;
         self.save(snapshot, payload, TaskRunStatus::Running).await
     }
 
-    /// Refreshes ownership before every counted attempt; stale revisions and committed cancellation fail closed.
+    /// Owned reads share the writer boundary so a sibling acknowledgement cannot invalidate a snapshot while storage is returning it.
     pub(crate) async fn load_owned(&self) -> Result<TaskRunSnapshot> {
+        let serial = self.serial.lock().await;
+        Box::pin(self.load_owned_locked(&serial)).await
+    }
+
+    /// Callers already holding the exact journal mutex avoid recursive acquisition without weakening ownership or cancellation checks.
+    pub(crate) async fn load_owned_locked(
+        &self,
+        serial: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Result<TaskRunSnapshot> {
+        if !std::ptr::eq(tokio::sync::MutexGuard::mutex(serial), self.serial.as_ref()) {
+            return Err(AgentError::Config(
+                "owned task read requires its own journal guard".into(),
+            ));
+        }
         let snapshot = self
             .store
             .load(&self.run_id)
@@ -443,10 +460,11 @@ impl RunExecution {
 
     /// Persisted marker and final checks precede dispatch; an exact-cap result is allowed to complete.
     pub(crate) async fn admit(&self, tool: Option<&str>) -> Result<String> {
-        self.admit_resources(tool, None, None).await
+        Box::pin(self.admit_resources(tool, None, None)).await
     }
 
     /// Footprints are computed from the actual implementation and approved arguments while existing executor locks are held.
+    /// Box the conditional resource journal before nesting child-tool polling so exact checkpoint temporaries do not multiply on the host stack.
     pub(crate) async fn admit_tool(
         &self,
         tool: &dyn ai_agents_core::Tool,
@@ -474,8 +492,7 @@ impl RunExecution {
         } else {
             None
         };
-        let id = self
-            .admit_resources(Some(&ctx.canonical_id), None, footprint.as_ref())
+        let id = Box::pin(self.admit_resources(Some(&ctx.canonical_id), None, footprint.as_ref()))
             .await?;
         Ok((id, footprint))
     }
@@ -488,7 +505,7 @@ impl RunExecution {
         footprint: Option<&ToolWriteFootprint>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        self.update(|payload| {
+        Box::pin(self.update(|payload| {
             self.check(payload)?;
             if tool.is_none()
                 && let Some(limit) = payload.limits.max_micro_usd
@@ -524,6 +541,7 @@ impl RunExecution {
                             reservation.state,
                             TaskEffectState::Reserved
                                 | TaskEffectState::Dispatched
+                                | TaskEffectState::Suspended
                                 | TaskEffectState::Uncertain
                         )
                     })
@@ -617,12 +635,12 @@ impl RunExecution {
                 result: None,
             });
             Ok(())
-        })
+        }))
         .await?;
         // Reload under serialization so a sibling settlement cannot turn an owned revision into a spurious conflict.
         let admission_check = {
             let _serial = self.serial.lock().await;
-            let snapshot = self.load_owned().await?;
+            let snapshot = self.load_owned_locked(&_serial).await?;
             if snapshot.cancel_requested {
                 self.cancellation.store(true, Ordering::Release);
             }
@@ -670,7 +688,10 @@ impl RunExecution {
                 .iter_mut()
                 .find(|r| r.id == id)
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            if reservation.state != TaskEffectState::Dispatched {
+            if !matches!(
+                reservation.state,
+                TaskEffectState::Dispatched | TaskEffectState::Suspended
+            ) {
                 return Err(TaskRunStorageError::Conflict.into());
             }
             reservation.state = if uncertain {
@@ -803,7 +824,7 @@ impl RunExecution {
         reason: String,
     ) -> Result<TaskRunSnapshot> {
         let _serial = self.serial.lock().await;
-        let snapshot = self.load_owned().await?;
+        let snapshot = self.load_owned_locked(&_serial).await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.clocks.active_millis = self.active_millis()?.max(
             payload
@@ -817,7 +838,9 @@ impl RunExecution {
             || payload.reservations.iter().any(|r| {
                 matches!(
                     r.state,
-                    TaskEffectState::Dispatched | TaskEffectState::Uncertain
+                    TaskEffectState::Dispatched
+                        | TaskEffectState::Suspended
+                        | TaskEffectState::Uncertain
                 )
             });
         if uncertain {
@@ -992,5 +1015,137 @@ pub(crate) async fn scope_execution<F: std::future::Future>(
         ai_agents_tools::scope_task_todos(store, binding, scoped).await
     } else {
         scoped.await
+    }
+}
+
+#[cfg(test)]
+mod owned_read_tests {
+    use super::*;
+
+    struct ReadBarrierStore {
+        inner: Arc<ScopedTaskRunStore>,
+        block: AtomicBool,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+        writes: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl TaskRunStore for ReadBarrierStore {
+        async fn create(&self, snapshot: &TaskRunSnapshot) -> Result<()> {
+            self.inner.create(snapshot).await
+        }
+        async fn load(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>> {
+            let snapshot = self.inner.load(run_id).await?;
+            if self.block.swap(false, Ordering::AcqRel) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            Ok(snapshot)
+        }
+        async fn mutate(
+            &self,
+            run_id: &str,
+            mutation: &TaskRunMutation,
+        ) -> Result<TaskRunSnapshot> {
+            self.writes.add_permits(1);
+            self.inner.mutate(run_id, mutation).await
+        }
+        async fn list(&self) -> Result<Vec<TaskRunSummary>> {
+            self.inner.list().await
+        }
+        async fn delete(&self, run_id: &str, revision: u64) -> Result<()> {
+            self.inner.delete(run_id, revision).await
+        }
+    }
+
+    // A real conditional store pauses delivery of a snapshot after its read, not by replacing ownership enforcement.
+    async fn fixture() -> (Arc<RunExecution>, Arc<ReadBarrierStore>) {
+        let snapshot = super::super::tests::checkpoint("owned-read");
+        let inner = Arc::new(
+            ScopedTaskRunStore::in_memory("agent".into(), None, "config-v1".into()).unwrap(),
+        );
+        inner.create(&snapshot).await.unwrap();
+        let running = inner
+            .mutate(
+                "owned-read",
+                &TaskRunMutation::Claim {
+                    expected_revision: 0,
+                    owner_token: "owner".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let payload: TaskCheckpointPayload =
+            serde_json::from_value(running.payload.clone()).unwrap();
+        let lifecycle = LifecycleState::new(&payload.settings, false).unwrap();
+        let owner = RunOwner::new(
+            "owned-read".into(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            None,
+        )
+        .unwrap();
+        let store = Arc::new(ReadBarrierStore {
+            inner,
+            block: AtomicBool::new(false),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            writes: tokio::sync::Semaphore::new(0),
+        });
+        let execution =
+            RunExecution::new(store.clone(), &running, lifecycle, owner, Instant::now()).unwrap();
+        (execution, store)
+    }
+
+    // An acknowledged sibling write cannot overtake an owned read and turn the old delivered revision into a false owner conflict.
+    #[tokio::test]
+    async fn owned_read_serializes_snapshot_delivery_with_sibling_acknowledgement() {
+        let (execution, store) = fixture().await;
+        store.block.store(true, Ordering::Release);
+        let reading = execution.clone();
+        let reader = tokio::spawn(async move { reading.load_owned().await });
+        tokio::time::timeout(std::time::Duration::from_secs(10), store.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let writing = execution.clone();
+        let signalled = started.clone();
+        let writer = tokio::spawn(async move {
+            signalled.add_permits(1);
+            writing
+                .update(|payload| {
+                    payload.controller_state = json!({"acknowledged":true});
+                    Ok(())
+                })
+                .await
+        });
+        started.acquire().await.unwrap().forget();
+        assert!(store.writes.try_acquire().is_err());
+        store.release.add_permits(1);
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(10), reader)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.revision, 1);
+        let written = tokio::time::timeout(std::time::Duration::from_secs(10), writer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(written.revision, 2);
+        assert_eq!(execution.load_owned().await.unwrap().revision, 2);
+        assert!(execution.stop_reason().is_none());
+    }
+
+    // A guard for another run's mutex cannot opt out of this execution's owned-read serialization.
+    #[tokio::test]
+    async fn owned_read_rejects_foreign_serialization_guard() {
+        let (execution, _) = fixture().await;
+        let foreign = tokio::sync::Mutex::new(());
+        let guard = foreign.lock().await;
+        assert!(execution.load_owned_locked(&guard).await.is_err());
     }
 }

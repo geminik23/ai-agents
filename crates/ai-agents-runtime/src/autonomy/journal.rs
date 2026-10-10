@@ -67,12 +67,13 @@ fn observation_reservation_id(state: &ValidationDriverState, id: &str) -> Result
 #[async_trait]
 impl ValidationJournal for TaskValidationJournal {
     /// Checkpoint failure stops before dispatch, while a saved in-flight record remains crash-uncertain.
+    /// Journal writes and owned snapshot reads use the same exact serialization guard without recursive acquisition.
     async fn checkpoint(&self, state: &ValidationDriverState) -> Result<()> {
         let _serial = self.serial.lock().await;
         let execution = super::current_execution()
             .filter(|run| self.invocation_accounting && Arc::ptr_eq(&run.revision, &self.revision));
         if let Some(execution) = &execution {
-            execution.load_owned().await?;
+            execution.load_owned_locked(&_serial).await?;
         }
         let current = self
             .store

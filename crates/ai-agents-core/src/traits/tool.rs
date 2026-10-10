@@ -83,6 +83,18 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with arguments and executor context.
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult;
 
+    /// Executes a managed task call without converting internal control transfer into model-visible failure text.
+    /// Implementations opting into suspension still need a framework-owned exact continuation before returning TaskSuspended.
+    async fn execute_task(&self, args: Value, ctx: ToolExecutionContext) -> Result<ToolResult> {
+        Ok(self.execute(args, ctx).await)
+    }
+
+    /// Declares the exact framework message/routing result protocol, without extra post-dispatch implementation work or result transformation.
+    /// This capability is not a tool grant, an arbitrary workflow continuation, or an execution permit.
+    fn supports_task_messages(&self) -> bool {
+        false
+    }
+
     /// Policy bindings used by the shared executor to apply configured policy.
     fn policy_bindings(&self) -> ToolPolicyBindings {
         ToolPolicyBindings::default()

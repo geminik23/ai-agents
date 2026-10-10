@@ -5,17 +5,19 @@
 ### Added
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
 - Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, skill and restart integration remains unfinished
-- Task interaction continuation: development-only same-process foreground and declared delegated, concurrent, pipeline, handoff and group-chat approval/question pause-resume preserve completed work and nested parent dispatch; original deadlines and acknowledged cancellation are retained, while router, full participant, skill and restart integration remain unfinished
+- Task interaction continuation: development-only same-process foreground, declared composition and single model-message/routing approval-question continuation preserve completed work, native history and selected routes without redelivery; general model-tool composition, full participant, skill and restart integration remain unfinished
 - Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and restart reconstruction remain unavailable
 - Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; full autonomous execution remains unavailable
 - Task validation: development-only tri-state completion, versioned host adapters, resumable observations, progress and bounded replanning on existing execution boundaries; full runner integration remains unavailable
 
 ### Changed
+- Rust task execution compatibility: tools gain an additive typed task-execution bridge, and exhaustive development effect-state matches must handle acknowledged suspended message invocations without refunding consumed attempts
 - Rust task continuation compatibility: runtime task views expose pending requests and typed answers, observation literals add optional identity, validation driver data includes publication scope, and tools gain unsupported-default question capability methods; request bindings and old serialized defaults remain preserved
 - Rust task compatibility: message literals include optional provenance, actor/context mutation APIs report ownership errors, and additive provider billing, tool footprint and task-todo methods declare capabilities; existing serialized messages remain readable
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task checkpoint reads: serialize snapshot delivery with shared updates so parallel participants do not spuriously stop with ownership conflicts
 - Task registry: retain actual registered instances through task cleanup, prevent removal and admission races, and protect newer catalogue reservations from stale cleanup
 - Task broadcasts: preserve optional dependency failure policy across spawned recipients and return results in stable registry-ID order
 - Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn

@@ -39,12 +39,31 @@ impl RuntimeAgent {
             return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
         }
         ancestry.push(self.info.id.clone());
+        use crate::autonomy::composition::CompositionDispatch;
+        if frame.dispatch == CompositionDispatch::ToolMessage {
+            self.check_message_frame(frame, targets)?;
+            let slot = &frame.children[0];
+            let target = targets.resolve(&slot.operation)?;
+            if slot.operation == operation {
+                ancestry.pop();
+                return Ok(target);
+            }
+            let nested = frames
+                .get(&slot.runtime_id)
+                .filter(|nested| {
+                    nested.parent_operation.as_deref() == Some(slot.operation.as_str())
+                })
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let selected =
+                target.task_composition_target(nested, frames, targets, operation, ancestry)?;
+            ancestry.pop();
+            return Ok(selected);
+        }
         let definition = self
             .state_machine
             .as_ref()
             .and_then(|machine| machine.current_definition())
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        use crate::autonomy::composition::CompositionDispatch;
         let binding_matches = match frame.dispatch {
             CompositionDispatch::Delegate => {
                 serde_json::to_value(&definition)? == frame.definition
@@ -61,6 +80,9 @@ impl RuntimeAgent {
             }
             CompositionDispatch::GroupChat => {
                 serde_json::to_value(&definition.group_chat)? == frame.definition
+            }
+            CompositionDispatch::ToolMessage => {
+                unreachable!("message frames are checked separately")
             }
         };
         if frame.runtime_id != self.info.id || !binding_matches {
@@ -154,8 +176,7 @@ impl RuntimeAgent {
         let definition = self
             .state_machine
             .as_ref()
-            .and_then(|machine| machine.current_definition())
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            .and_then(|machine| machine.current_definition());
         let run = scope_runtime_gate_identity_stack(
             &ancestry,
             crate::autonomy::scope_turn(
@@ -182,7 +203,15 @@ impl RuntimeAgent {
                         self.info.id.clone(),
                         Box::pin(async {
                             use crate::autonomy::composition::CompositionDispatch;
+                            if frame.dispatch == CompositionDispatch::ToolMessage {
+                                return Box::pin(self.resume_message_frame(frame.clone())).await;
+                            }
+                            let definition = definition
+                                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
                             match frame.dispatch {
+                                CompositionDispatch::ToolMessage => {
+                                    unreachable!("message frames resume separately")
+                                }
                                 CompositionDispatch::GroupChat => {
                                     Box::pin(self.handle_group_chat_state(
                                         &frame.input,
@@ -273,10 +302,10 @@ impl RuntimeAgent {
         };
         let mut retired = Vec::new();
         for leaf in &leaves {
-            let mut projection = group.clone();
-            projection.child_operation = leaf.operation.clone();
-            projection.child_runtime_id = leaf.runtime_id.clone();
-            let child = self.task_group_child(&projection, targets)?;
+            let child = targets.resolve(&leaf.operation)?;
+            if child.info.id != leaf.runtime_id {
+                return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+            }
             let child_owner = participants
                 .owner_for(&child.root_turn_gate)
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -301,10 +330,11 @@ impl RuntimeAgent {
                     .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
                 frame.runtime_id.clone(),
             );
-            let mut projection = group.clone();
-            projection.child_operation = edge.0.clone();
-            projection.child_runtime_id = edge.1;
-            let parent = self.task_group_child(&projection, targets)?;
+
+            let parent = targets.resolve(&edge.0)?;
+            if parent.info.id != edge.1 {
+                return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+            }
             let owner = participants
                 .owner_for(&parent.root_turn_gate)
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -320,10 +350,18 @@ impl RuntimeAgent {
                     "nested cancellation owner changed".into(),
                 ));
             }
-            retired.push((
-                edge.0,
-                TaskRuntimeCheckpoint::between_turns(parent.save_state_full().await?)?,
-            ));
+            drop(_gate);
+            let runtime = if frame.dispatch
+                == crate::autonomy::composition::CompositionDispatch::ToolMessage
+            {
+                Box::pin(parent.close_message_frame(&owner, frame)).await?
+            } else {
+                TaskRuntimeCheckpoint::between_turns(parent.save_state_full().await?)?
+            };
+            retired.push((edge.0, runtime));
+        }
+        if group.frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolMessage {
+            Box::pin(self.close_message_frame(owner, &group.frame)).await?;
         }
         Ok(retired)
     }
@@ -399,9 +437,28 @@ impl RuntimeAgent {
                 .get(&self.info.id)
                 .cloned()
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-            execution
-                .checkpoint_child_park(&operation, self.task_suspension_snapshot().await?, batch)
+            let message_parent = execution
+                .delegate_frames
+                .lock()
+                .get(&self.info.id)
+                .is_some_and(|frame| {
+                    frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolMessage
+                });
+            if message_parent {
+                Box::pin(execution.checkpoint_child_composition_park(
+                    &operation,
+                    self.task_suspension_snapshot().await?,
+                ))
                 .await?;
+            } else {
+                execution
+                    .checkpoint_child_park(
+                        &operation,
+                        self.task_suspension_snapshot().await?,
+                        batch,
+                    )
+                    .await?;
+            }
             lease.acknowledge_park();
         } else {
             let runtime = TaskRuntimeCheckpoint::between_turns(self.save_state_full().await?)?;
@@ -475,16 +532,20 @@ impl RuntimeAgent {
     }
 
     /// Captures turn-local values before the caller unwinds its ordinary root bookkeeping.
-    pub(super) fn retain_task_loop(&self, mut state: TaskLoopState) -> Result<()> {
+    pub(super) async fn retain_task_loop(&self, mut state: TaskLoopState) -> Result<()> {
         state.native_exchanges = self.task_native_expectations();
         let execution = crate::autonomy::current_execution()
             .ok_or_else(|| AgentError::Config("task loop has no owner".into()))?;
-        let mut batches = execution.parked_batches.lock();
-        let batch = batches
-            .get_mut(&self.info.id)
-            .ok_or_else(|| AgentError::Config("task batch continuation missing".into()))?;
-        batch.loop_state = Some(state);
-        batch.validate()
+        let batch = {
+            let mut batches = execution.parked_batches.lock();
+            let batch = batches
+                .get_mut(&self.info.id)
+                .ok_or_else(|| AgentError::Config("task batch continuation missing".into()))?;
+            batch.loop_state = Some(state);
+            batch.validate()?;
+            batch.clone()
+        };
+        Box::pin(execution.retain_message_batch(&self.info.id, batch)).await
     }
 
     /// Captures all current-root signed exchange expectations, including earlier completed batches in this turn.
@@ -690,9 +751,10 @@ impl RuntimeAgent {
                             replacements.append(&mut batch.approvals);
                             batch.approvals = replacements;
                             batch.loop_state = Some(state);
-                            crate::autonomy::current_execution()
-                                .unwrap()
-                                .retain_batch(&self.info.id, batch);
+                            let execution = crate::autonomy::current_execution().unwrap();
+                            Box::pin(execution.retain_message_batch(&self.info.id, batch.clone()))
+                                .await?;
+                            execution.retain_batch(&self.info.id, batch);
                             return Err(AgentError::TaskSuspended(id));
                         }
                         output => {
@@ -777,7 +839,7 @@ impl RuntimeAgent {
     }
 
     /// A completed batch is acknowledged before model continuation so a later pause cannot replace an active cursor.
-    async fn acknowledge_completed_task_batch(&self) -> Result<()> {
+    pub(super) async fn acknowledge_completed_task_batch(&self) -> Result<()> {
         let execution = crate::autonomy::current_execution()
             .ok_or_else(|| AgentError::Config("completed batch has no owner".into()))?;
         let runtime = TaskRuntimeCheckpoint::between_turns(self.save_state_full().await?)?;
@@ -807,7 +869,8 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Continues an existing turn without resetting iterations, reasoning, accumulated calls or user commit.
+    /// Runs initial or resumed committed model work from exact iteration, reasoning and native history state.
+    /// The caller owns user commit; reflection retains this loop's provider and suspension never resets accumulated calls.
     pub(super) async fn run_committed_task_loop(
         &self,
         mut state: TaskLoopState,
@@ -821,9 +884,10 @@ impl RuntimeAgent {
                 self.max_iterations
             };
             if state.iterations >= max {
-                return Err(AgentError::Other(format!(
-                    "Max iterations ({max}) exceeded"
-                )));
+                let error = AgentError::Other(format!("Max iterations ({max}) exceeded"));
+                self.hooks.on_error(&error).await;
+                error!(iterations = state.iterations, "Max iterations exceeded");
+                return Err(error);
             }
             state.iterations += 1;
             *self.iteration_count.write() = state.iterations;
@@ -846,18 +910,17 @@ impl RuntimeAgent {
                 .await;
             let content = response.content.trim();
             if let Some(calls) = self.parse_main_tool_calls(content, &protocol)? {
-                match self
-                    .handle_tool_calls(
-                        &state.processed_input,
-                        content,
-                        calls,
-                        &mut state.all_tool_calls,
-                        None,
-                    )
-                    .await
+                match Box::pin(self.handle_tool_calls(
+                    &state.processed_input,
+                    content,
+                    calls,
+                    &mut state.all_tool_calls,
+                    None,
+                ))
+                .await
                 {
                     Err(AgentError::TaskSuspended(id)) => {
-                        self.retain_task_loop(state)?;
+                        Box::pin(self.retain_task_loop(state)).await?;
                         return Err(AgentError::TaskSuspended(id));
                     }
                     Err(error) => return Err(error),
@@ -872,8 +935,8 @@ impl RuntimeAgent {
             if thinking.is_some() {
                 state.thinking_content = thinking;
             }
-            return self
-                .finish_text_response_from_model(CommittedTextResponse {
+            return Box::pin(self.finish_text_response_from_model(
+                CommittedTextResponse {
                     processed_input: &state.processed_input,
                     input_context: &state.input_context,
                     answer,
@@ -882,8 +945,10 @@ impl RuntimeAgent {
                     iterations: state.iterations,
                     thinking_content: state.thinking_content,
                     all_tool_calls: state.all_tool_calls,
-                })
-                .await;
+                },
+                llm.clone(),
+            ))
+            .await;
         }
     }
 }

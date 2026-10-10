@@ -11,6 +11,7 @@ use std::{collections::BTreeMap, sync::Arc};
 pub(crate) struct CompositionTargets {
     bindings: Mutex<BTreeMap<String, Arc<PinnedTaskAgent>>>,
     retired: std::sync::atomic::AtomicBool,
+    tools: Mutex<BTreeMap<String, Arc<dyn ai_agents_core::Tool>>>,
 }
 
 impl CompositionTargets {
@@ -128,12 +129,51 @@ impl CompositionTargets {
         })
     }
 
+    /// Message resume is tied to the actual reviewed tool implementation, not its reusable canonical name.
+    pub(crate) fn bind_tool(
+        &self,
+        frame_id: &str,
+        tool: Arc<dyn ai_agents_core::Tool>,
+    ) -> Result<()> {
+        let _bindings = self.bindings.lock();
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        let mut tools = self.tools.lock();
+        if tools.len() >= MAX_TASK_CHECKPOINT_RECORDS {
+            return Err(TaskRunStorageError::CheckpointTooLarge.into());
+        }
+        if tools
+            .get(frame_id)
+            .is_some_and(|old| !Arc::ptr_eq(old, &tool))
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        tools.insert(frame_id.into(), tool);
+        Ok(())
+    }
+
+    /// Retained live capability must still agree with current resolution before a resume claim can execute.
+    pub(crate) fn matches_tool(
+        &self,
+        frame_id: &str,
+        tool: &Arc<dyn ai_agents_core::Tool>,
+    ) -> bool {
+        !self.retired.load(std::sync::atomic::Ordering::Acquire)
+            && self
+                .tools
+                .lock()
+                .get(frame_id)
+                .is_some_and(|old| Arc::ptr_eq(old, tool))
+    }
+
     /// Only acknowledged terminal or explicit reconciled cleanup retires catalogue protection; stale scopes cannot recreate it.
     pub(crate) fn release(&self) {
         let mut bindings = self.bindings.lock();
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
         bindings.clear();
+        self.tools.lock().clear();
     }
 }
 

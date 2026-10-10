@@ -263,6 +263,840 @@ async fn fixture_pattern_gated(question: bool, pattern: &str, gated: bool) -> Gr
     (parent, child, runner, store, first, second, provider)
 }
 
+struct UnboundCounterTool(CounterTool);
+#[async_trait]
+impl Tool for UnboundCounterTool {
+    fn id(&self) -> &str {
+        self.0.id()
+    }
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+    fn description(&self) -> &str {
+        self.0.description()
+    }
+    fn input_schema(&self) -> Value {
+        self.0.input_schema()
+    }
+    async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
+        self.0.execute(args, ctx).await
+    }
+}
+
+struct MessageHooks(Arc<AtomicUsize>);
+#[async_trait]
+impl crate::spawner::RegistryHooks for MessageHooks {
+    async fn on_message_sent(&self, _: &str, _: &str, _: &str) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+// Real model-tool delivery exercises the shared executor rather than declared-state dispatch.
+async fn message_fixture(
+    question: bool,
+) -> (
+    GroupFixture,
+    Arc<super::runner_tests::RecordingProvider>,
+    Arc<AtomicUsize>,
+) {
+    message_fixture_approved(question, false).await
+}
+
+// Parent approval and child interaction are distinct checkpoints sharing the same exact model call.
+async fn message_fixture_approved(
+    question: bool,
+    parent_approval: bool,
+) -> (
+    GroupFixture,
+    Arc<super::runner_tests::RecordingProvider>,
+    Arc<AtomicUsize>,
+) {
+    message_fixture_with_hooks(question, parent_approval, None).await
+}
+
+// Blocking response hooks expose cancellation after child polling but before immutable child-result acknowledgement.
+async fn message_fixture_with_hooks(
+    question: bool,
+    parent_approval: bool,
+    hooks: Option<Arc<dyn ai_agents_hooks::AgentHooks>>,
+) -> (
+    GroupFixture,
+    Arc<super::runner_tests::RecordingProvider>,
+    Arc<AtomicUsize>,
+) {
+    let (_, _, _, _, first, second, child_provider) = fixture(question).await;
+    let sent = Arc::new(AtomicUsize::new(0));
+    let shared_locks = Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
+    let registry = Arc::new(AgentRegistry::new().with_hooks(Arc::new(MessageHooks(sent.clone()))));
+    let child_yaml = if question {
+        "name: Worker\nsystem_prompt: child\ntools: [ask_user, second]\n"
+    } else {
+        "name: Worker\nsystem_prompt: child\ntools: [first, second]\nhitl:\n  tools:\n    first:\n      require_approval: true\n"
+    };
+    // Build each participant once around its recording provider before managed handles are frozen.
+    let calls = vec![ToolCall {
+        id: "parent-send".into(),
+        name: "send_agent_message".into(),
+        arguments: json!({"to":"worker","message":"child work"}),
+    }];
+    let native = ai_agents_core::NativeProviderState::new(
+        "parent-message-exchange",
+        "fixture",
+        "native-tools",
+        ai_agents_core::NativeProviderTarget::new("https://fixture.invalid", "fixture-model")
+            .unwrap(),
+        json!({"signature":"exact-parent-state"}),
+        vec![ai_agents_core::NativeCallBinding::new("parent-send", 0).unwrap()],
+    )
+    .unwrap();
+    let marker = ai_agents_core::encode_native_tool_call_markers(&calls, Some(&native)).unwrap();
+    let parent_provider = super::runner_tests::RecordingProvider::new(&[&marker, "parent done"]);
+    let registered = crate::AgentBuilder::from_yaml(child_yaml)
+        .unwrap()
+        .llm(child_provider.clone())
+        .tool(Arc::new(CounterTool {
+            id: "second",
+            calls: second.clone(),
+        }))
+        .auto_configure_features()
+        .unwrap()
+        .approval_handler(Arc::new(NoApproval));
+    let registered = if let Some(hooks) = hooks {
+        registered.hooks(hooks)
+    } else {
+        registered
+    };
+    let registered = if question {
+        registered.tool(Arc::new(ai_agents_tools::builtin::AskUserTool::new(
+            Arc::new(parking_lot::RwLock::new(None)),
+        )))
+    } else {
+        registered.tool(Arc::new(UnboundCounterTool(CounterTool {
+            id: "first",
+            calls: first.clone(),
+        })))
+    };
+    registry
+        .register(SpawnedAgent::from_runtime(
+            "worker".into(),
+            registered
+                .build()
+                .unwrap()
+                .with_shared_resource_locks(shared_locks.clone()),
+            crate::spec::AgentSpec::from_yaml_strict(child_yaml).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let child = registry.get("worker").unwrap();
+    let parent_yaml = if parent_approval {
+        "name: MessageParent\nsystem_prompt: parent\ntools: [send_agent_message]\nhitl:\n  tools:\n    send_agent_message:\n      require_approval: true\n"
+    } else {
+        "name: MessageParent\nsystem_prompt: parent\ntools: [send_agent_message]\n"
+    };
+    let parent = Arc::new(
+        crate::AgentBuilder::from_yaml(parent_yaml)
+            .unwrap()
+            .llm(parent_provider.clone())
+            .auto_configure_features()
+            .unwrap()
+            .approval_handler(Arc::new(NoApproval))
+            .tool(Arc::new(crate::spawner::SendMessageTool::new(
+                registry.clone(),
+                "parent",
+            )))
+            .build()
+            .unwrap()
+            .with_spawner_handles(Arc::new(AgentSpawner::new()), registry)
+            .with_shared_resource_locks(shared_locks),
+    );
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(parent.info().id, None, "message.v1".into()).unwrap(),
+    );
+    let mut config = super::runner_tests::config(8);
+    config.defaults.hitl = Some(AutonomyHitlConfig {
+        on_approval_required: Some(InteractionAction::PauseRun),
+        on_user_question: Some(InteractionAction::PauseRun),
+    });
+    let runner = AutonomyRunner::try_new(
+        parent.clone(),
+        config,
+        Default::default(),
+        store.clone(),
+        "message.v1".into(),
+    )
+    .unwrap();
+    (
+        (parent, child, runner, store, first, second, child_provider),
+        parent_provider,
+        sent,
+    )
+}
+
+// Fixture construction is isolated from recursive polling; large builder and runtime moves are not part of execution depth.
+async fn nested_message_fixture() -> (
+    AutonomyRunner,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<super::runner_tests::RecordingProvider>,
+    Arc<super::runner_tests::RecordingProvider>,
+) {
+    let ((middle, _, _, _, first, second, child_provider), middle_provider, sent) =
+        Box::pin(message_fixture(false)).await;
+    let registry = Arc::new(AgentRegistry::new());
+    let middle = match Arc::try_unwrap(middle) {
+        Ok(middle) => middle,
+        Err(_) => panic!("fixture unexpectedly retained middle"),
+    };
+
+    let middle_spec = crate::spec::AgentSpec::from_yaml_strict(
+        "name: MessageParent\nsystem_prompt: parent\ntools: [send_agent_message]\n",
+    )
+    .unwrap();
+    registry
+        .register(SpawnedAgent::from_runtime(
+            "middle".into(),
+            middle,
+            middle_spec,
+        ))
+        .await
+        .unwrap();
+    let outer = Arc::new(crate::AgentBuilder::from_yaml("name: Outer\nsystem_prompt: outer\nstates:\n  initial: active\n  states:\n    active:\n      delegate: middle\n").unwrap()
+        .llm(super::runner_tests::RecordingProvider::new(&["unused outer"]))
+        .auto_configure_features().unwrap().build().unwrap().with_spawner_handles(Arc::new(AgentSpawner::new()), registry));
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(outer.info().id, None, "nested-message.v1".into()).unwrap(),
+    );
+    let mut config = super::runner_tests::config(8);
+    config.defaults.hitl = Some(AutonomyHitlConfig {
+        on_approval_required: Some(InteractionAction::PauseRun),
+        on_user_question: Some(InteractionAction::PauseRun),
+    });
+
+    let runner = AutonomyRunner::try_new(
+        outer,
+        config,
+        Default::default(),
+        store,
+        "nested-message.v1".into(),
+    )
+    .unwrap();
+    (runner, first, second, sent, middle_provider, child_provider)
+}
+
+// A retained message may be reached through an existing declared-state parent without flattening its incoming operation.
+#[tokio::test]
+async fn model_message_nested_under_delegate_resumes_exact_native_parent() {
+    let (runner, first, second, sent, middle_provider, child_provider) =
+        Box::pin(nested_message_fixture()).await;
+    let paused = runner.run("objective", None).await.unwrap();
+
+    assert_eq!(
+        paused.run.status,
+        TaskRunStatus::Paused,
+        "{:?}",
+        paused.run.stop_reason
+    );
+    let done = runner
+        .resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            TaskResumeInput::Approval {
+                request_id: paused.run.pending.unwrap().id,
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        done.run.status,
+        TaskRunStatus::Completed,
+        "{:?}",
+        done.run.stop_reason
+    );
+    assert_eq!(first.load(Ordering::SeqCst), 1);
+    assert_eq!(second.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(middle_provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 2);
+}
+
+// Current authorization may narrow during a pause; the already consumed message attempt is not refunded.
+#[tokio::test]
+async fn model_message_changed_scope_closes_histories_without_child_invocation() {
+    let ((parent, child, runner, store, first, _, child_provider), parent_provider, sent) =
+        message_fixture(false).await;
+    let paused = runner.run("objective", None).await.unwrap();
+    parent.runtime_control().set_tool_scope(Vec::new());
+    let stopped = runner
+        .resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            TaskResumeInput::Approval {
+                request_id: paused.run.pending.unwrap().id,
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(stopped.run.status, TaskRunStatus::Failed);
+    assert_eq!(
+        stopped.run.stop_reason.as_deref(),
+        Some("message_authorization_changed")
+    );
+    assert_eq!(first.load(Ordering::SeqCst), 0);
+    assert_eq!(stopped.run.counters.tool_attempts, 2);
+    assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    let saved = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+    assert!(
+        payload
+            .children
+            .iter()
+            .all(|child| child.result.is_some() && child.pending.is_none())
+    );
+    assert!(
+        payload
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|capture| capture.record.call_id == "parent-send"
+                && capture.record.executed
+                && capture.record.cancelled)
+    );
+    assert!(child.chat("ordinary reuse").await.is_ok());
+}
+
+// Leaf IDs and malformed answers never claim the parent's pending coordinating request.
+#[tokio::test]
+async fn model_message_rejects_leaf_ids_and_invalid_answers_before_claim() {
+    let ((_, _, runner, store, _, _, _), _, _) = message_fixture(true).await;
+    let paused = runner.run("objective", None).await.unwrap();
+    let snapshot = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone()).unwrap();
+    let group: TaskGroupState = serde_json::from_value(
+        payload
+            .adapters
+            .iter()
+            .find(|a| a.id == "runtime.group")
+            .unwrap()
+            .state
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        runner
+            .resume(
+                &paused.run.key.run_id,
+                paused.run.revision,
+                TaskResumeInput::UserAnswer {
+                    request_id: group.child_request.id,
+                    answer: json!({"answered":true,"selected":["yes"]})
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        runner
+            .resume(
+                &paused.run.key.run_id,
+                paused.run.revision,
+                TaskResumeInput::UserAnswer {
+                    request_id: paused.run.pending.as_ref().unwrap().id.clone(),
+                    answer: json!({"answered":true,"selected":["missing"]})
+                }
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load(&paused.run.key.run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        snapshot.revision
+    );
+    runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+}
+
+// A suspended parent cannot gain a refund by passing through Dispatched again during resume.
+#[tokio::test]
+async fn model_message_checkpoint_rejects_resume_refund_and_unbound_suspension() {
+    let ((_, _, runner, store, _, _, _), _, _) = message_fixture(false).await;
+    let paused = runner.run("objective", None).await.unwrap();
+    let snapshot = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone()).unwrap();
+    let mut dispatched = payload.clone();
+    let index = dispatched
+        .reservations
+        .iter()
+        .position(|r| r.state == TaskEffectState::Suspended)
+        .unwrap();
+    dispatched.reservations[index].state = TaskEffectState::Dispatched;
+    let mut refunded = dispatched.clone();
+    refunded.reservations[index].state = TaskEffectState::Completed;
+    refunded.reservations[index].result = Some(json!({"not_invoked":true}));
+    refunded.counters.tool_attempts -= 1;
+    assert!(
+        refunded
+            .validate_successor(&dispatched, snapshot.revision + 1, false)
+            .is_err()
+    );
+    let mut group: TaskGroupState = serde_json::from_value(
+        payload
+            .adapters
+            .iter()
+            .find(|a| a.id == "runtime.group")
+            .unwrap()
+            .state
+            .clone(),
+    )
+    .unwrap();
+    let mut state: super::message::MessageState =
+        serde_json::from_value(group.frame.cursor.clone()).unwrap();
+    state.batch.as_mut().unwrap().calls[0].arguments =
+        json!({"to":"worker","message":"changed native call"});
+    group.frame.cursor = serde_json::to_value(state).unwrap();
+    group
+        .frames
+        .insert(group.frame.runtime_id.clone(), group.frame.clone());
+    assert!(group.validate_checkpoint(&payload).is_err());
+    let mut unbound = payload;
+    unbound.adapters.retain(|a| a.adapter != "runtime.delegate");
+    assert!(unbound.validate(&snapshot, "message.v1").is_err());
+    runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+}
+
+struct MessageResponseWait(Arc<tokio::sync::Semaphore>);
+#[async_trait]
+impl ai_agents_hooks::AgentHooks for MessageResponseWait {
+    async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
+        self.0.add_permits(1);
+        std::future::pending::<()>().await;
+    }
+}
+
+// Cancellation interrupts a resumed child callback and retains uncertainty rather than claiming safe paused cleanup.
+#[tokio::test]
+async fn model_message_resumed_callback_cancellation_retains_recovery() {
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let ((parent, child, runner, store, first, _, child_provider), parent_provider, sent) =
+        Box::pin(message_fixture_with_hooks(
+            false,
+            false,
+            Some(Arc::new(MessageResponseWait(entered.clone()))),
+        ))
+        .await;
+    let runner = Arc::new(runner);
+    let paused = runner.run("objective", None).await.unwrap();
+    let run_id = paused.run.key.run_id.clone();
+    let resumed = runner.clone();
+    let resumed_id = run_id.clone();
+    let work = tokio::spawn(Box::pin(async move {
+        resumed
+            .resume(
+                &resumed_id,
+                paused.run.revision,
+                TaskResumeInput::Approval {
+                    request_id: paused.run.pending.unwrap().id,
+                    result: ai_agents_hitl::ApprovalResult::Approved,
+                },
+            )
+            .await
+    }));
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    runner.request_cancel(&run_id).await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(10), work)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::RecoveryRequired);
+    assert_eq!(first.load(Ordering::SeqCst), 1);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    let payload: TaskCheckpointPayload =
+        serde_json::from_value(store.load(&run_id).await.unwrap().unwrap().payload).unwrap();
+    assert!(
+        payload
+            .reservations
+            .iter()
+            .any(|r| r.state == TaskEffectState::Uncertain)
+    );
+    assert!(parent.chat("cannot steal owner").await.is_err());
+    assert!(child.chat("cannot steal owner").await.is_err());
+}
+
+struct MessageCheckpointFailure {
+    inner: Arc<ScopedTaskRunStore>,
+    fired: std::sync::atomic::AtomicBool,
+}
+#[async_trait]
+impl TaskRunStore for MessageCheckpointFailure {
+    async fn create(&self, snapshot: &TaskRunSnapshot) -> ai_agents_core::Result<()> {
+        self.inner.create(snapshot).await
+    }
+    async fn load(&self, run_id: &str) -> ai_agents_core::Result<Option<TaskRunSnapshot>> {
+        self.inner.load(run_id).await
+    }
+    async fn list(&self) -> ai_agents_core::Result<Vec<TaskRunSummary>> {
+        self.inner.list().await
+    }
+    async fn delete(&self, run_id: &str, revision: u64) -> ai_agents_core::Result<()> {
+        self.inner.delete(run_id, revision).await
+    }
+    async fn mutate(
+        &self,
+        run_id: &str,
+        mutation: &TaskRunMutation,
+    ) -> ai_agents_core::Result<TaskRunSnapshot> {
+        if let TaskRunMutation::Checkpoint { payload, .. } = mutation
+            && payload["reservations"]
+                .as_array()
+                .is_some_and(|reservations| reservations.iter().any(|r| r["state"] == "suspended"))
+            && !self.fired.swap(true, Ordering::SeqCst)
+        {
+            return Err(ai_agents_core::AgentError::Persistence(
+                "injected message suspension acknowledgement failure".into(),
+            ));
+        }
+        self.inner.mutate(run_id, mutation).await
+    }
+}
+
+// Failed safe-park acknowledgement cannot release the parent invocation or its actual registered child.
+#[tokio::test]
+async fn model_message_failed_park_acknowledgement_retains_protection() {
+    let ((parent, child, _, store, first, second, child_provider), parent_provider, sent) =
+        message_fixture(false).await;
+    let faulty = Arc::new(MessageCheckpointFailure {
+        inner: store,
+        fired: std::sync::atomic::AtomicBool::new(false),
+    });
+    let mut config = super::runner_tests::config(8);
+    config.defaults.hitl = Some(AutonomyHitlConfig {
+        on_approval_required: Some(InteractionAction::PauseRun),
+        on_user_question: Some(InteractionAction::PauseRun),
+    });
+    let runner = AutonomyRunner::try_new(
+        parent.clone(),
+        config,
+        Default::default(),
+        faulty.clone(),
+        "message.v1".into(),
+    )
+    .unwrap();
+    let result = runner.run("objective", None).await.unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::RecoveryRequired);
+    assert!(faulty.fired.load(Ordering::SeqCst));
+    assert_eq!(first.load(Ordering::SeqCst), 0);
+    assert_eq!(second.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 1);
+    assert!(parent.chat("cannot steal owner").await.is_err());
+    assert!(child.chat("cannot steal owner").await.is_err());
+    assert!(
+        parent
+            .spawner_registry()
+            .unwrap()
+            .remove("worker")
+            .await
+            .is_none()
+    );
+}
+
+// Parent tool approval may lead to a second pause in the child without losing the original batch.
+#[tokio::test]
+async fn model_message_parent_approval_then_child_question_preserves_batch() {
+    let ((_, _, runner, _, _, second, child_provider), parent_provider, sent) =
+        message_fixture_approved(true, true).await;
+    let first = runner.run("objective", None).await.unwrap();
+    assert_eq!(first.run.status, TaskRunStatus::Paused);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(sent.load(Ordering::SeqCst), 0);
+    let second_pause = runner
+        .resume(
+            &first.run.key.run_id,
+            first.run.revision,
+            TaskResumeInput::Approval {
+                request_id: first.run.pending.unwrap().id,
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_pause.run.status, TaskRunStatus::Paused);
+    let finished = runner
+        .resume(
+            &first.run.key.run_id,
+            second_pause.run.revision,
+            TaskResumeInput::UserAnswer {
+                request_id: second_pause.run.pending.unwrap().id,
+                answer: json!({"answered":true,"selected":["yes"]}),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(finished.run.status, TaskRunStatus::Completed);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(second.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(finished.run.counters.tool_attempts, 3);
+}
+
+// Both routing methods preserve completed selection and do not replay the selector at resume.
+#[tokio::test]
+async fn model_route_resumes_selected_child_without_reselection() {
+    for method in ["llm", "round_robin"] {
+        let ((base, _, _, _, first, second, child_provider), _, sent) =
+            Box::pin(message_fixture(false)).await;
+
+        let registry = base.spawner_registry().unwrap().clone();
+        let call = ToolCall {
+            id: "parent-route".into(),
+            name: "route_to_agent".into(),
+            arguments: json!({"input":"child work","candidates":["worker","missing"],"method":method}),
+        };
+        let marker = ai_agents_core::encode_native_tool_call_markers(&[call], None).unwrap();
+        let main = super::runner_tests::RecordingProvider::new(&[&marker, "parent done"]);
+        let selector = super::runner_tests::RecordingProvider::new(&["worker"]);
+        let mut llms = ai_agents_llm::LLMRegistry::new();
+        llms.register("default", main.clone());
+        llms.register("router", selector.clone());
+        let tool = Arc::new(crate::orchestration::tools::RouteToAgentTool::new(
+            registry.clone(),
+            Arc::new(llms.clone()),
+        ));
+        let parent = Arc::new(
+            crate::AgentBuilder::from_yaml(
+                "name: RouteParent\nsystem_prompt: parent\ntools: [route_to_agent]\n",
+            )
+            .unwrap()
+            .llm_registry(llms)
+            .tool(tool)
+            .build()
+            .unwrap()
+            .with_spawner_handles(Arc::new(AgentSpawner::new()), registry),
+        );
+        let store = Arc::new(
+            ScopedTaskRunStore::in_memory(parent.info().id, None, "route.v1".into()).unwrap(),
+        );
+        let mut config = super::runner_tests::config(8);
+        config.defaults.hitl = Some(AutonomyHitlConfig {
+            on_approval_required: Some(InteractionAction::PauseRun),
+            on_user_question: Some(InteractionAction::PauseRun),
+        });
+        let runner =
+            AutonomyRunner::try_new(parent, config, Default::default(), store, "route.v1".into())
+                .unwrap();
+
+        let paused = runner.run("objective", None).await.unwrap();
+
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        let result = runner
+            .resume(
+                &paused.run.key.run_id,
+                paused.run.revision,
+                TaskResumeInput::Approval {
+                    request_id: paused.run.pending.unwrap().id,
+                    result: ai_agents_hitl::ApprovalResult::Approved,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.run.status,
+            TaskRunStatus::Completed,
+            "{:?}",
+            result.run.stop_reason
+        );
+        assert_eq!(main.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            selector.calls.load(Ordering::SeqCst),
+            usize::from(method == "llm")
+        );
+        assert_eq!(child_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        assert_eq!(sent.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            result.run.counters.llm_attempts,
+            if method == "llm" { 5 } else { 4 }
+        );
+        let parent_record = result
+            .run
+            .evidence
+            .tool_calls
+            .iter()
+            .find(|capture| capture.record.call_id == "parent-route")
+            .unwrap();
+        let output: Value = serde_json::from_str(&parent_record.record.output).unwrap();
+        assert_eq!(output["selected_agent"], "worker");
+        assert_eq!(
+            output["reason"],
+            if method == "llm" {
+                "LLM selected based on input analysis"
+            } else {
+                "round_robin"
+            }
+        );
+    }
+}
+
+// Both child interaction kinds preserve the parent native cursor and one consumed message invocation.
+#[tokio::test]
+async fn model_message_resumes_child_without_redelivery_or_counter_reset() {
+    for question in [false, true] {
+        let ((parent, child, runner, store, first, second, child_provider), parent_provider, sent) =
+            message_fixture(question).await;
+        let paused = runner.run("objective", None).await.unwrap();
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(child_provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        let saved = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+        let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+        assert_eq!(
+            payload
+                .reservations
+                .iter()
+                .filter(|r| r.state == TaskEffectState::Suspended)
+                .count(),
+            1
+        );
+        assert_eq!(paused.run.counters.tool_attempts, 2);
+        assert!(
+            parent
+                .spawner_registry()
+                .unwrap()
+                .remove("worker")
+                .await
+                .is_none()
+        );
+        let request_id = paused.run.pending.unwrap().id;
+        let input = if question {
+            TaskResumeInput::UserAnswer {
+                request_id,
+                answer: json!({"answered":true,"selected":["yes"]}),
+            }
+        } else {
+            TaskResumeInput::Approval {
+                request_id,
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            }
+        };
+        let finished = runner
+            .resume(&paused.run.key.run_id, paused.run.revision, input)
+            .await
+            .unwrap();
+        assert_eq!(
+            finished.run.status,
+            TaskRunStatus::Completed,
+            "{finished:?}"
+        );
+        assert_eq!(finished.final_response.unwrap().content, "parent done");
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(child_provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(first.load(Ordering::SeqCst), usize::from(!question));
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.run.counters.tool_attempts, 3);
+        assert_eq!(finished.run.counters.llm_attempts, 4);
+        assert!(child.chat("ordinary reuse").await.is_ok());
+    }
+}
+
+// Paused cancellation closes both native batches and retains the consumed parent attempt.
+#[tokio::test]
+async fn model_message_paused_cancellation_closes_parent_and_child() {
+    let ((parent, child, runner, store, first, _, child_provider), parent_provider, sent) =
+        message_fixture(false).await;
+    let paused = runner.run("objective", None).await.unwrap();
+    let cancelled = runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.run.status, TaskRunStatus::Cancelled);
+    assert_eq!(cancelled.run.counters.tool_attempts, 2);
+    assert_eq!(first.load(Ordering::SeqCst), 0);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 1);
+    let saved = store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+    let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+    assert!(
+        payload
+            .reservations
+            .iter()
+            .all(|r| r.state == TaskEffectState::Completed)
+    );
+    assert!(
+        payload
+            .evidence
+            .tool_calls
+            .iter()
+            .any(|capture| capture.record.call_id == "parent-send"
+                && capture.record.executed
+                && capture.record.cancelled)
+    );
+    let history =
+        ai_agents_core::inspect_native_history(&payload.runtime.snapshot.memory.messages).unwrap();
+    assert!(
+        history
+            .exchanges()
+            .iter()
+            .all(|exchange| exchange.is_complete())
+    );
+    assert!(parent.chat("ordinary reuse").await.is_ok());
+    assert!(child.chat("ordinary reuse").await.is_ok());
+}
+
+// Rejection settles the original parent result without continuing the parent model or invoking the child action.
+#[tokio::test]
+async fn model_message_child_rejection_stops_without_parent_replay() {
+    let ((_, _, runner, _, first, _, child_provider), parent_provider, sent) =
+        message_fixture(false).await;
+    let paused = runner.run("objective", None).await.unwrap();
+    let result = runner
+        .resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            TaskResumeInput::Approval {
+                request_id: paused.run.pending.unwrap().id,
+                result: ai_agents_hitl::ApprovalResult::Rejected {
+                    reason: Some("no".into()),
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::Failed, "{result:?}");
+    assert_eq!(result.run.stop_reason.as_deref(), Some("approval_rejected"));
+    assert_eq!(first.load(Ordering::SeqCst), 0);
+    assert_eq!(child_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(parent_provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sent.load(Ordering::SeqCst), 1);
+}
+
 // Catalogue protection includes unstarted slots and survives acknowledged pause until terminal cancellation cleanup.
 #[tokio::test]
 async fn paused_pipeline_protects_unstarted_registered_instance() {
@@ -636,7 +1470,13 @@ async fn sqlite_concurrent_continuation_rejects_stale_receipts() {
             .await
             .unwrap();
     }
-    assert_eq!(result.run.status, TaskRunStatus::Completed);
+    assert_eq!(
+        result.run.status,
+        TaskRunStatus::Completed,
+        "stop reason: {:?}; revision: {}",
+        result.run.stop_reason,
+        result.run.revision
+    );
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(completed.load(Ordering::SeqCst), 1);
 }

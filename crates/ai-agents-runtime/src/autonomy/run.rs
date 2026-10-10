@@ -391,6 +391,8 @@ pub enum TaskPendingKind {
 pub enum TaskEffectState {
     Reserved,
     Dispatched,
+    /// A framework-owned message cursor has acknowledged quiescence without completing or refunding this invocation.
+    Suspended,
     Completed,
     Uncertain,
 }
@@ -676,19 +678,20 @@ impl TaskCheckpointPayload {
         if matches!(
             self.runtime.continuation,
             TaskContinuation::Suspended { .. }
-        ) && let Some(adapter) = self
-            .adapters
-            .iter()
-            .find(|adapter| adapter.id == "runtime.tool_batch")
+        ) && self.pause_reason.as_deref() != Some("child_interaction")
+            && let Some(adapter) = self
+                .adapters
+                .iter()
+                .find(|adapter| adapter.id == "runtime.tool_batch")
         {
             let batch: super::TaskBatchState = serde_json::from_value(adapter.state.clone())?;
             batch.validate_checkpoint(self)?;
         }
         if envelope.status == TaskRunStatus::Paused
-            && matches!(
+            && (matches!(
                 self.runtime.continuation,
                 TaskContinuation::Suspended { batch: None, .. }
-            )
+            ) || self.pause_reason.as_deref() == Some("child_interaction"))
             && let Some(adapter) = self
                 .adapters
                 .iter()
@@ -700,6 +703,7 @@ impl TaskCheckpointPayload {
         if envelope.status.is_terminal() && self.pending.is_some() {
             return Err(invalid());
         }
+        super::message::validate_suspended_attempts(self, envelope.status)?;
         let uncertain = self.reservations.iter().any(|r| {
             matches!(
                 r.state,
@@ -746,6 +750,7 @@ impl TaskCheckpointPayload {
                     reservation.state,
                     TaskEffectState::Reserved
                         | TaskEffectState::Dispatched
+                        | TaskEffectState::Suspended
                         | TaskEffectState::Uncertain
                 )
             })
@@ -926,6 +931,20 @@ impl TaskCheckpointPayload {
                     .and_then(|result| result.get("not_invoked"))
                     == Some(&Value::Bool(true))
             {
+                // Message frames prove the parent implementation already dispatched; a later resume cannot relabel that attempt as unused.
+                if previous.adapters.iter().any(|adapter| {
+                    adapter.adapter == "runtime.delegate"
+                        && adapter.state.get("dispatch").and_then(Value::as_str)
+                            == Some("tool_message")
+                        && adapter
+                            .state
+                            .get("cursor")
+                            .and_then(|cursor| cursor.get("attempt"))
+                            .and_then(Value::as_str)
+                            == Some(prior.id.as_str())
+                }) {
+                    return Err(invalid());
+                }
                 let invocation = previous
                     .adapters
                     .iter()
@@ -1103,8 +1122,16 @@ impl TaskCheckpointPayload {
                 || next.charged_micro_usd < prior.charged_micro_usd
                 || (prior.state == TaskEffectState::Completed
                     && serde_json::to_value(next)? != serde_json::to_value(prior)?)
-                || (prior.state == TaskEffectState::Dispatched
-                    && next.state == TaskEffectState::Reserved)
+                || (matches!(
+                    prior.state,
+                    TaskEffectState::Dispatched | TaskEffectState::Suspended
+                ) && next.state == TaskEffectState::Reserved)
+                || (prior.state == TaskEffectState::Suspended
+                    && next
+                        .result
+                        .as_ref()
+                        .and_then(|result| result.get("not_invoked"))
+                        == Some(&Value::Bool(true)))
                 || (prior.state == TaskEffectState::Uncertain
                     && next.state != TaskEffectState::Uncertain
                     && (!reconciled || next.state != TaskEffectState::Completed))

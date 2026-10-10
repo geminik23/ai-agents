@@ -60,6 +60,7 @@ pub(crate) enum CompositionDispatch {
     Pipeline,
     Handoff,
     GroupChat,
+    ToolMessage,
 }
 
 /// Stable slot identities distinguish repeated calls to the same runtime without allocating new operations on resume.
@@ -261,13 +262,43 @@ impl TaskGroupState {
         let TaskContinuation::Suspended {
             request_id,
             turn_id,
-            batch: None,
+            batch: parent_cursor,
             ..
         } = &payload.runtime.continuation
         else {
             return Err(invalid());
         };
-        if *request_id != self.request_id || *turn_id != self.frame.id {
+        if self.frame.dispatch == CompositionDispatch::ToolMessage {
+            let state: super::message::MessageState =
+                serde_json::from_value(self.frame.cursor.clone())?;
+            let batch = state.batch.as_ref().ok_or_else(invalid)?;
+            batch.validate_model_history(&payload.runtime)?;
+            if !batch.calls.iter().enumerate().any(|(index, call)| {
+                call.id == state.record.call_id
+                    && call.name == state.record.requested_name
+                    && call.arguments == state.record.arguments
+                    && batch.results[index].is_none()
+            }) {
+                return Err(invalid());
+            }
+            let mut projection = payload.runtime.clone();
+            batch.bind_runtime(&mut projection, "message", 0)?;
+            let TaskContinuation::Suspended {
+                batch: expected, ..
+            } = projection.continuation
+            else {
+                return Err(invalid());
+            };
+            if serde_json::to_value(parent_cursor)? != serde_json::to_value(expected)? {
+                return Err(invalid());
+            }
+        } else if parent_cursor.is_some() {
+            return Err(invalid());
+        }
+        if *request_id != self.request_id
+            || (self.frame.dispatch != CompositionDispatch::ToolMessage
+                && *turn_id != self.frame.id)
+        {
             return Err(invalid());
         }
         let child = payload
@@ -382,7 +413,8 @@ fn collect_parked_leaves(
         if matches!(
             child.runtime.continuation,
             TaskContinuation::Suspended { batch: Some(_), .. }
-        ) {
+        ) && request.reviewed_action.get("frame_id").is_none()
+        {
             let adapter = payload
                 .adapters
                 .iter()
@@ -645,7 +677,7 @@ impl RunExecution {
         todos: Option<TaskTodoCheckpoint>,
     ) -> Result<TaskRunSnapshot> {
         let _serial = self.serial.lock().await;
-        let previous = self.load_owned().await?;
+        let previous = self.load_owned_locked(&_serial).await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(previous.payload.clone())?;
         self.check(&payload)?;
         if self.participants.unsettled()
@@ -714,13 +746,29 @@ impl RunExecution {
             kind: group.child_request.kind,
             reviewed_action: json!({"group_id":group.frame.id,"child_operation":group.child_operation,"request":group.child_request}),
         });
+        let parent_batch = if group.frame.dispatch == CompositionDispatch::ToolMessage {
+            let state: super::message::MessageState =
+                serde_json::from_value(group.frame.cursor.clone())?;
+            let batch = state.batch.ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            batch.bind_runtime(&mut runtime, &self.run_id, self.current_cycle())?;
+            match runtime.continuation {
+                TaskContinuation::Suspended { batch, .. } => batch,
+                _ => return Err(TaskRunStorageError::InvalidCheckpoint.into()),
+            }
+        } else {
+            None
+        };
         runtime.continuation = TaskContinuation::Suspended {
             request_id: request_id.clone(),
-            turn_id: group.frame.id.clone(),
+            turn_id: if group.frame.dispatch == CompositionDispatch::ToolMessage {
+                format!("{}:{}", self.run_id, self.current_cycle())
+            } else {
+                group.frame.id.clone()
+            },
             user_message_committed: group.frame.user_message_committed,
             finalized: false,
             skill: None,
-            batch: None,
+            batch: parent_batch,
         };
         runtime.validate()?;
         payload.runtime = runtime;
@@ -871,10 +919,13 @@ impl RunExecution {
             return Ok(None);
         };
         if child.pending.is_none()
-            || !matches!(
+            || !(matches!(
                 child.runtime.continuation,
                 TaskContinuation::Suspended { batch: None, .. }
-            )
+            ) || child
+                .pending
+                .as_ref()
+                .is_some_and(|p| p.reviewed_action.get("frame_id").is_some()))
         {
             return Ok(None);
         }
@@ -912,13 +963,31 @@ impl RunExecution {
             let leaf = leaves
                 .first()
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            let parent_batch = if frame.dispatch == CompositionDispatch::ToolMessage {
+                let state: super::message::MessageState =
+                    serde_json::from_value(frame.cursor.clone())?;
+                state
+                    .batch
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+                    .bind_runtime(&mut runtime, &self.run_id, self.current_cycle())?;
+                match runtime.continuation {
+                    TaskContinuation::Suspended { batch, .. } => batch,
+                    _ => return Err(TaskRunStorageError::InvalidCheckpoint.into()),
+                }
+            } else {
+                None
+            };
             runtime.continuation = TaskContinuation::Suspended {
                 request_id: request_id.clone(),
-                turn_id: frame.id.clone(),
+                turn_id: if frame.dispatch == CompositionDispatch::ToolMessage {
+                    format!("{}:{}", self.run_id, self.current_cycle())
+                } else {
+                    frame.id.clone()
+                },
                 user_message_committed: frame.user_message_committed,
                 finalized: false,
                 skill: None,
-                batch: None,
+                batch: parent_batch,
             };
             runtime.validate()?;
             let child = payload

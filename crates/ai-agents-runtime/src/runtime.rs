@@ -21,6 +21,8 @@ tokio::task_local! {
 mod task_composition;
 #[path = "autonomy/continuation_runtime.rs"]
 mod task_continuation;
+#[path = "autonomy/message_runtime.rs"]
+mod task_message;
 
 #[cfg(test)]
 #[path = "autonomy/boundary_tests.rs"]
@@ -1617,7 +1619,9 @@ impl RuntimeAgent {
                         if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
                             let batch = execution.parked_batches.lock().get(&self.info.id).cloned();
                             let runtime = Box::pin(self.task_suspension_snapshot()).await?;
-                            if let Some(batch) = batch {
+                            let message_parent = execution.delegate_frames.lock().get(&self.info.id)
+                                .is_some_and(|frame| frame.dispatch == crate::autonomy::composition::CompositionDispatch::ToolMessage);
+                            if let Some(batch) = batch.filter(|_| !message_parent) {
                                 Box::pin(
                                     execution.checkpoint_child_park(&operation, runtime, batch),
                                 )
@@ -5730,6 +5734,11 @@ impl RuntimeAgent {
             execution.stop("evidence_storage_failure");
             warn!(error = %error, "task execution evidence was not acknowledged");
         }
+        self.publish_tool_record(record).await;
+    }
+
+    /// Emits the logical request lifecycle after its evidence owner has selected the appropriate publication boundary.
+    async fn publish_tool_record(&self, record: &ToolExecutionRecord) {
         let result = ToolResult {
             success: record.success,
             output: record.model_output_string(),
@@ -5927,20 +5936,41 @@ impl RuntimeAgent {
                 false,
             ));
         }
-        let mut future = Box::pin(async move {
-            if let Some(custody) = &custody_for_future {
-                custody.store(true, Ordering::SeqCst);
-            }
-            invoked_by_future.store(true, Ordering::SeqCst);
-            if let Some(answer) = question_result {
-                return tool.execute_task_question(args, answer, ctx).await;
-            }
-            if let Some(actor_context) = actor_context {
-                scope_actor_context(actor_context, tool.execute(args, ctx)).await
-            } else {
-                tool.execute(args, ctx).await
-            }
-        });
+        let message_invocation =
+            self.prepare_message_invocation(tool.clone(), &args, &ctx, attempt.as_ref())?;
+        if let (Some(execution), Some(invocation)) = (&execution, &message_invocation) {
+            execution.approval_deadlines.lock().insert(
+                format!("composition:{}", invocation.frame.id),
+                std::time::Instant::now()
+                    .checked_add(timer_duration)
+                    .ok_or_else(|| AgentError::Config("message deadline overflow".into()))?,
+            );
+        }
+        let managed = execution.is_some();
+        let mut future = Box::pin(crate::autonomy::message::scope_message(
+            message_invocation,
+            async move {
+                if let Some(custody) = &custody_for_future {
+                    custody.store(true, Ordering::SeqCst);
+                }
+                invoked_by_future.store(true, Ordering::SeqCst);
+                if let Some(answer) = question_result {
+                    return Ok(tool.execute_task_question(args, answer, ctx).await);
+                }
+                let work = async {
+                    if managed {
+                        tool.execute_task(args, ctx).await
+                    } else {
+                        Ok(tool.execute(args, ctx).await)
+                    }
+                };
+                if let Some(actor_context) = actor_context {
+                    scope_actor_context(actor_context, work).await
+                } else {
+                    work.await
+                }
+            },
+        ));
         let timer = tokio::time::sleep(timer_duration);
         tokio::pin!(timer);
         let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
@@ -5949,8 +5979,19 @@ impl RuntimeAgent {
             tokio::select! {
                 result = &mut future => {
                     drop(future);
+                    // Typed transfer is safe only after the framework message frame acknowledges its child's cursor.
+                    // A failed acknowledgement leaves custody armed and the dispatched marker intact for recovery.
+                    if matches!(&result, Err(AgentError::TaskSuspended(_))) {
+                        let execution = execution.as_ref().ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                        let attempt = attempt.as_ref().ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                        let id = Box::pin(execution.suspend_message(&self.info.id, attempt)).await?;
+                        if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
+                        return Err(AgentError::TaskSuspended(id));
+                    }
+                    let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
                     if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
                         Box::pin(execution.settle(attempt, serde_json::to_value(&result)?, false)).await?;
+                        execution.retire_completed_message(&self.info.id, attempt);
                     }
                     if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
                     return Ok((result, false, false, true));
@@ -6103,15 +6144,12 @@ impl RuntimeAgent {
     }
 
     /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
-    /// The private request scope binds deferred approvals to the original call without changing ordinary host interaction.
+    /// Each fallback hop installs its own private request scope in the inner driver, without duplicating a large outer record-return frame.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        Box::pin(crate::autonomy::scope_task_request(
-            request.clone(),
-            self.execute_tool_record_inner(request, ToolFallbackState::default()),
-        ))
+        self.execute_tool_record_inner(request, ToolFallbackState::default())
     }
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
@@ -7097,8 +7135,16 @@ impl RuntimeAgent {
             }
         };
         let policy_snapshot = security_engine.policy_snapshot(&canonical_id);
-        let resource_lock_keys =
-            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification);
+        // Framework message coordination must not hold a mutation lock needed by its own child.
+        // Descendant tools still acquire their ordinary resource locks under the shared run authority.
+        let resource_lock_keys = if resolved.tool.supports_task_messages()
+            && crate::autonomy::current_execution().is_some()
+            && crate::autonomy::suspension::message_request().is_some()
+        {
+            Vec::new()
+        } else {
+            tool_resource_lock_keys(&canonical_id, &final_arguments, &bindings, &classification)
+        };
         metadata.insert(
             "effective_limits".to_string(),
             serde_json::to_value(&limits).unwrap_or(Value::Null),
@@ -7423,14 +7469,14 @@ impl RuntimeAgent {
         let (mut result, timed_out, cancelled, invoked) = TOOL_EFFECT_CUSTODY
             .scope(
                 resource_guards.effect_custody.clone(),
-                self.run_tool_with_retries(
+                Box::pin(self.run_tool_with_retries(
                     &canonical_id,
                     resolved.tool.clone(),
                     executed_arguments.clone(),
                     tool_context,
                     timeout,
                     tool_config.max_retries,
-                ),
+                )),
             )
             .await?;
 
@@ -8498,7 +8544,20 @@ OVERALL: PASS/FAIL"#,
     // Speculative branches overlap independent decisions but still commit exactly one path.
     // Losing branches must remain data only and must not write memory, run tools, or emit output.
     //
-    async fn try_speculative_branches(
+    fn try_speculative_branches<'a>(
+        &'a self,
+        processed_input: &'a str,
+        input_context: &'a HashMap<String, Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<AgentResponse>>> + Send + 'a>> {
+        if !self.runtime_config.optimization.enabled {
+            return Box::pin(async { Ok(None) });
+        }
+        Box::pin(self.try_speculative_branches_inner(processed_input, input_context))
+    }
+
+    // Construction stays outside the recursive turn's polling frame even when speculation is disabled.
+    // Branch execution remains same-task and preserves the existing commit, discard and cancellation boundaries.
+    async fn try_speculative_branches_inner(
         &self,
         processed_input: &str,
         input_context: &HashMap<String, Value>,
@@ -11131,16 +11190,19 @@ Respond in JSON format:
                 raw_content,
                 thinking,
             } => {
-                self.finish_text_response_from_model(CommittedTextResponse {
-                    processed_input,
-                    input_context,
-                    answer: raw_content,
-                    reasoning_mode,
-                    auto_detected,
-                    iterations: 1,
-                    thinking_content: thinking,
-                    all_tool_calls: Vec::new(),
-                })
+                self.finish_text_response_from_model(
+                    CommittedTextResponse {
+                        processed_input,
+                        input_context,
+                        answer: raw_content,
+                        reasoning_mode,
+                        auto_detected,
+                        iterations: 1,
+                        thinking_content: thinking,
+                        all_tool_calls: Vec::new(),
+                    },
+                    self.get_state_llm()?,
+                )
                 .await
             }
             MainResponseDraft::ToolCalls {
@@ -11191,12 +11253,13 @@ Respond in JSON format:
     }
 
     //
-    // Shared committed text finalization for normal responses and winning text drafts.
-    // Keep output processing, reflection, transitions, hooks, and maintenance behind this commit boundary.
+    // Shared committed text finalization owns output processing, reflection, transitions, hooks and maintenance.
+    // Reflection uses the main loop's retained provider rather than rebinding it after a tool-driven state transition.
     //
     async fn finish_text_response_from_model(
         &self,
         response: CommittedTextResponse<'_>,
+        llm: Arc<dyn LLMProvider>,
     ) -> Result<AgentResponse> {
         let CommittedTextResponse {
             processed_input,
@@ -11217,7 +11280,6 @@ Respond in JSON format:
         } else {
             output_data.content
         };
-        let llm = self.get_state_llm()?;
         let reflection_metadata;
         (final_content, reflection_metadata) = self
             .run_reflection(&*llm, processed_input, final_content)
@@ -11254,17 +11316,19 @@ Respond in JSON format:
         auto_detected: bool,
     ) -> Result<AgentResponse> {
         self.commit_root_user_message(processed_input).await?;
-        self.run_committed_task_loop(crate::autonomy::TaskLoopState {
-            version: 1,
-            processed_input: processed_input.into(),
-            input_context: input_context.clone(),
-            reasoning_mode,
-            auto_detected,
-            iterations: 0,
-            all_tool_calls: Vec::new(),
-            thinking_content: None,
-            native_exchanges: Vec::new(),
-        })
+        Box::pin(
+            self.run_committed_task_loop(crate::autonomy::TaskLoopState {
+                version: 1,
+                processed_input: processed_input.into(),
+                input_context: input_context.clone(),
+                reasoning_mode,
+                auto_detected,
+                iterations: 0,
+                all_tool_calls: Vec::new(),
+                thinking_content: None,
+                native_exchanges: Vec::new(),
+            }),
+        )
         .await
     }
 
@@ -11283,6 +11347,7 @@ Respond in JSON format:
         mut events: Option<&mut Vec<StreamChunk>>,
     ) -> Result<ToolCallOutcome> {
         let include_tool_events = self.streaming.include_tool_events;
+
         // Check if a transition should fire before executing the LLM's tool call.
         // If a transition fires, on_enter actions handle the tool call correctly
         // (with proper URLs from YAML), so skip the LLM's tool call.
@@ -11840,20 +11905,7 @@ Respond in JSON format:
             .unwrap_or_else(|| "unknown".to_string());
 
         let execution = crate::autonomy::current_execution();
-        let retained = if crate::autonomy::composition::resuming_delegate(&self.info.id) {
-            Some(
-                execution
-                    .as_ref()
-                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
-                    .delegate_frames
-                    .lock()
-                    .get(&self.info.id)
-                    .cloned()
-                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
-            )
-        } else {
-            None
-        };
+        let retained = self.retained_composition_frame()?;
         if let Some(frame) = &retained {
             if frame.input != input
                 || frame.delegate_id != delegate_id
@@ -11979,6 +12031,7 @@ Respond in JSON format:
                 Ok(())
             }))
             .await?;
+            execution.delegate_frames.lock().remove(&self.info.id);
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -12781,6 +12834,13 @@ Respond in JSON format:
             }
         }
 
+        Box::pin(self.run_prepared_input(input_data)).await
+    }
+
+    // Keeps the model, skill and planning driver out of declared-state parents' recursive polling frames.
+    // Input preparation and root ownership stay in the caller; the prepared data is consumed without rerouting the user input.
+    async fn run_prepared_input(&self, input_data: ProcessData) -> Result<AgentResponse> {
+        let processed_input = &input_data.content;
         //
         // The speculative future is boxed to keep the runtime future size manageable.
         // Removing the box can overflow small test stacks because this function is recursive through redispatch.
@@ -12791,12 +12851,16 @@ Respond in JSON format:
             return Ok(response);
         }
 
-        match self.try_skill_route(processed_input).await? {
+        match Box::pin(self.try_skill_route(processed_input)).await? {
             SkillRouteResult::Response { skill_id, content } => {
                 self.commit_root_user_message(processed_input).await?;
-                return self
-                    .handle_skill_response(processed_input, &skill_id, content, &input_data.context)
-                    .await;
+                return Box::pin(self.handle_skill_response(
+                    processed_input,
+                    &skill_id,
+                    content,
+                    &input_data.context,
+                ))
+                .await;
             }
             SkillRouteResult::NeedsClarification {
                 response,
@@ -12835,151 +12899,21 @@ Respond in JSON format:
 
         if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
             self.commit_root_user_message(processed_input).await?;
-            return self
-                .handle_plan_and_execute(processed_input, &input_data.context, auto_detected)
-                .await;
-        }
-
-        self.commit_root_user_message(processed_input).await?;
-
-        let mut iterations = 0u32;
-        let mut all_tool_calls: Vec<ToolCall> = Vec::new();
-        let mut thinking_content: Option<String> = None;
-
-        let llm = self.get_state_llm()?;
-
-        loop {
-            // When reasoning is active, cap iterations at the reasoning-specific limit.
-            let effective_max = if reasoning_mode != ReasoningMode::None {
-                let rc = self.get_effective_reasoning_config();
-                self.max_iterations.min(rc.max_iterations)
-            } else {
-                self.max_iterations
-            };
-
-            if iterations >= effective_max {
-                let err = AgentError::Other(format!("Max iterations ({}) exceeded", effective_max));
-                self.hooks.on_error(&err).await;
-                error!(iterations = iterations, "Max iterations exceeded");
-                return Err(err);
-            }
-            iterations += 1;
-            *self.iteration_count.write() = iterations;
-
-            debug!(iteration = iterations, max = effective_max, "LLM call");
-
-            let protocol = self.main_tool_protocol(llm.as_ref(), false).await?;
-            let mut messages = self
-                .build_messages_internal(true, None, protocol.choice.is_none())
-                .await?;
-            self.inject_reasoning_prompt(&mut messages, &reasoning_mode, iterations == 1);
-
-            self.hooks.on_llm_start(&messages).await;
-            let llm_start = Instant::now();
-            let response = self
-                .complete_main_llm_with_recovery(Arc::clone(&llm), &messages, &protocol)
-                .await?;
-
-            let llm_duration_ms = llm_start.elapsed().as_millis() as u64;
-            self.hooks.on_llm_complete(&response, llm_duration_ms).await;
-
-            let content = response.content.trim();
-
-            if let Some(tool_calls) = self.parse_main_tool_calls(content, &protocol)? {
-                let outcome = self
-                    .handle_tool_calls(
-                        processed_input,
-                        content,
-                        tool_calls,
-                        &mut all_tool_calls,
-                        None,
-                    )
-                    .await;
-                if let Err(AgentError::TaskSuspended(id)) = &outcome {
-                    self.retain_task_loop(crate::autonomy::TaskLoopState {
-                        version: 1,
-                        processed_input: processed_input.into(),
-                        input_context: input_data.context.clone(),
-                        reasoning_mode,
-                        auto_detected,
-                        iterations,
-                        all_tool_calls,
-                        thinking_content,
-                        native_exchanges: self.task_native_expectations(),
-                    })?;
-                    return Err(AgentError::TaskSuspended(id.clone()));
-                }
-                match outcome? {
-                    ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired => continue,
-                    ToolCallOutcome::Rejected(resp) => {
-                        self.finish_turn_if_root(&resp).await?;
-                        return Ok(resp);
-                    }
-                }
-            }
-
-            let (extracted_thinking, answer) = self.extract_thinking(content);
-            if extracted_thinking.is_some() {
-                thinking_content = extracted_thinking;
-            }
-
-            let output_data = self.process_output(&answer, &input_data.context).await?;
-
-            let mut final_content = if output_data.metadata.rejected {
-                output_data
-                    .metadata
-                    .rejection_reason
-                    .unwrap_or_else(|| answer.to_string())
-            } else {
-                output_data.content
-            };
-
-            // Run reflection (blocking LLM calls for retries)
-            let reflection_metadata;
-            (final_content, reflection_metadata) = self
-                .run_reflection(&*llm, processed_input, final_content)
-                .await?;
-
-            final_content =
-                self.format_response_with_thinking(thinking_content.as_deref(), &final_content);
-
-            // Post-loop: memory, transitions, post-transition re-generation.
-            // apply_post_loop_result handles NeedsRedispatch by re-entering
-            // run_loop_internal so the new state's full dispatch activates.
-            let final_content = {
-                let result = self
-                    .post_loop_processing(processed_input, final_content)
-                    .await?;
-                self.apply_post_loop_result(processed_input, result)
-                    .await?
-                    .content
-            };
-
-            let reflected = reflection_metadata.is_some();
-            let reasoning_mode_debug = format!("{:?}", reasoning_mode);
-
-            let response = self.build_agent_response(AgentResponseParts {
-                content: final_content,
-                all_tool_calls,
-                reasoning_mode,
+            return Box::pin(self.handle_plan_and_execute(
+                processed_input,
+                &input_data.context,
                 auto_detected,
-                iterations,
-                thinking: thinking_content,
-                reflection_metadata,
-            });
-
-            self.finish_turn_if_root(&response).await?;
-
-            let tool_call_count = response.tool_calls.as_ref().map(|tc| tc.len()).unwrap_or(0);
-            info!(
-                tool_calls = tool_call_count,
-                response_len = response.content.len(),
-                reasoning_mode = %reasoning_mode_debug,
-                reflected = reflected,
-                "Chat completed"
-            );
-            return Ok(response);
+            ))
+            .await;
         }
+
+        Box::pin(self.run_committed_response_loop_with_reasoning(
+            processed_input,
+            &input_data.context,
+            reasoning_mode,
+            auto_detected,
+        ))
+        .await
     }
 
     async fn generate_buffered_streaming_draft(
@@ -14505,6 +14439,7 @@ impl ToolInvoker for RuntimeAgent {
 #[async_trait]
 impl Agent for RuntimeAgent {
     /// Runs one blocking external root turn with task-local ownership visible through finalization, hooks, orchestration, and export.
+    /// Boxing the ordinary driver keeps its unused polling frame out of recursive participant entry without moving work to another task.
     async fn chat(&self, input: &str) -> Result<AgentResponse> {
         if let Some(execution) = crate::autonomy::current_execution()
             && !current_runtime_gate_identity_stack()
@@ -14528,9 +14463,9 @@ impl Agent for RuntimeAgent {
         } = self.acquire_root_turn().await?;
         let result = scope_runtime_gate_identity_stack(&identity_stack, async {
             let result = if let Some(context) = self.build_observation_context(None) {
-                with_observation_context(context, self.run_loop(input)).await
+                with_observation_context(context, Box::pin(self.run_loop(input))).await
             } else {
-                self.run_loop(input).await
+                Box::pin(self.run_loop(input)).await
             };
             self.export_observability_if_configured().await;
             result

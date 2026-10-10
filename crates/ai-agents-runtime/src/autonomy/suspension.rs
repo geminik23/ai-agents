@@ -180,6 +180,45 @@ impl TaskBatchState {
         Ok(())
     }
 
+    /// Group parents retain the same normalized calls and signed expectations as foreground batches.
+    pub(crate) fn validate_model_history(&self, runtime: &TaskRuntimeCheckpoint) -> Result<()> {
+        self.validate()?;
+        let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
+        if runtime
+            .snapshot
+            .memory
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == ai_agents_core::Role::Assistant)
+            .is_none_or(|message| message.content != self.content)
+        {
+            return Err(invalid());
+        }
+        if let Some(native) =
+            ai_agents_core::decode_native_tool_call_markers(&self.content).map_err(|_| invalid())?
+            && serde_json::to_value(native.calls())? != serde_json::to_value(&self.calls)?
+        {
+            return Err(invalid());
+        }
+        if self
+            .loop_state
+            .as_ref()
+            .ok_or_else(invalid)?
+            .native_exchanges
+            .iter()
+            .any(|expected| {
+                !runtime
+                    .native_exchanges
+                    .iter()
+                    .any(|actual| actual == expected)
+            })
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     /// Native results use the same JSON-or-string projection as the shared history encoder.
     fn prefix_outputs(&self) -> Vec<Value> {
         self.results[..self.appended]
@@ -251,6 +290,17 @@ tokio::task_local! {
     static TASK_BATCH: bool;
     static RESUMED_APPROVAL: std::cell::RefCell<Vec<BatchAuthorization>>;
     static RESUMED_QUESTION: std::cell::RefCell<Option<(String, Value, Value)>>;
+}
+
+/// Message dispatch may park only inside a reconstructible model batch with a live task request.
+pub(crate) fn message_request() -> Option<ToolExecutionRequest> {
+    if !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false) {
+        return None;
+    }
+    TASK_REQUEST
+        .try_with(Clone::clone)
+        .ok()
+        .filter(|request| matches!(request.source, ai_agents_core::ToolCallSource::Model))
 }
 
 /// A private request scope ties an approval to its original call ID, not a model-selected label.
@@ -510,7 +560,7 @@ impl RunExecution {
         todos: Option<TaskTodoCheckpoint>,
     ) -> Result<TaskRunSnapshot> {
         let _serial = self.serial.lock().await;
-        let previous = self.load_owned().await?;
+        let previous = self.load_owned_locked(&_serial).await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(previous.payload.clone())?;
         self.check(&payload)?;
         if self.participants.unsettled()

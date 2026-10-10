@@ -7,6 +7,7 @@ mod boundary;
 pub(crate) mod composition;
 mod execution;
 mod memory;
+pub(crate) mod message;
 mod participants;
 mod targets;
 pub(crate) use composition::{
