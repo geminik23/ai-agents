@@ -741,7 +741,7 @@ impl RunExecution {
         Ok(())
     }
 
-    /// A monotonic projection cannot extend live allowance when the wall clock moves backwards.
+    /// Live run and inherited composition deadlines intersect; a pause or nested callback cannot refill either allowance.
     pub(crate) fn remaining_duration(&self) -> std::time::Duration {
         let active = std::time::Duration::from_millis(
             self.limits.max_active_time_seconds.saturating_mul(1000),
@@ -749,8 +749,11 @@ impl RunExecution {
         .saturating_sub(std::time::Duration::from_millis(
             self.consumed_active_millis().unwrap_or(u64::MAX),
         ));
-        self.expiry_projection.map_or(active, |expiry| {
+        let remaining = self.expiry_projection.map_or(active, |expiry| {
             active.min(expiry.saturating_duration_since(Instant::now()))
+        });
+        super::composition::current_composition_deadline().map_or(remaining, |deadline| {
+            remaining.min(deadline.saturating_duration_since(Instant::now()))
         })
     }
 
@@ -759,7 +762,8 @@ impl RunExecution {
         *self.acknowledged.write() = snapshot.clone();
     }
 
-    /// Limits are cooperative admission checks; synchronous host work may overrun and is still charged.
+    /// Run and composition windows are cooperative admission checks; synchronous host work may overrun and remains charged.
+    /// An expired parent dispatch cannot admit a fresh provider/tool request while already dispatched work still settles.
     pub(crate) fn check(&self, payload: &TaskCheckpointPayload) -> Result<()> {
         // Captured task scopes must not admit new work after their foreground owner is dropped.
         if let Err(error) = self.owner.check() {
@@ -768,6 +772,12 @@ impl RunExecution {
         }
         if let Some(reason) = self.stop_reason() {
             return Err(AgentError::Other(format!("autonomy stopped: {reason}")));
+        }
+        if super::composition::current_composition_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.stop("composition_timeout");
+            return Err(AgentError::Other("composition deadline exceeded".into()));
         }
         if self.remaining_duration().is_zero()
             || self.consumed_active_millis()?

@@ -4,8 +4,8 @@
 
 ### Added
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
-- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; group, skill and restart continuation remain unfinished
-- Task interaction continuation: development-only same-process foreground and direct delegated-child approval/question pause-resume preserve completed calls, native history and parent dispatch; acknowledged cancellation is supported, while general multi-child, skill and restart continuation remain unfinished
+- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, skill and restart integration remains unfinished
+- Task interaction continuation: development-only same-process foreground and declared delegated, concurrent, pipeline, handoff and group-chat approval/question pause-resume preserve completed work and nested parent dispatch; original deadlines and acknowledged cancellation are retained, while router, full participant, skill and restart integration remain unfinished
 - Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and restart reconstruction remain unavailable
 - Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; full autonomous execution remains unavailable
 - Task validation: development-only tri-state completion, versioned host adapters, resumable observations, progress and bounded replanning on existing execution boundaries; full runner integration remains unavailable

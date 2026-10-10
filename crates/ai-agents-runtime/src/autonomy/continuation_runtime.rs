@@ -10,31 +10,95 @@ impl RuntimeAgent {
         &self,
         group: &crate::autonomy::TaskGroupState,
     ) -> Result<Arc<RuntimeAgent>> {
-        let definition = self
-            .state_machine
-            .as_ref()
-            .and_then(|machine| machine.current_definition())
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        if group.frame.runtime_id != self.info.id
-            || serde_json::to_value(&definition)? != group.frame.definition
-            || definition.delegate.as_deref() != Some(group.frame.delegate_id.as_str())
-        {
-            return Err(AgentError::Config(
-                "parent composition configuration changed".into(),
-            ));
-        }
-        let child = self
-            .spawner_registry
-            .as_ref()
-            .and_then(|registry| registry.get(&group.frame.delegate_id))
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        let child = self.task_composition_target(
+            &group.frame,
+            &group.frames,
+            &group.child_operation,
+            &mut Vec::new(),
+        )?;
         if child.info.id != group.child_runtime_id {
             return Err(AgentError::Config(
                 "group child implementation binding changed".into(),
             ));
         }
-        child.preflight_standalone_autonomy()?;
         Ok(child)
+    }
+
+    /// Resolves only the selected leaf along checked live registry edges; IDs cannot substitute for parent configuration binding.
+    fn task_composition_target(
+        &self,
+        frame: &crate::autonomy::DelegateFrame,
+        frames: &std::collections::BTreeMap<String, crate::autonomy::DelegateFrame>,
+        operation: &str,
+        ancestry: &mut Vec<String>,
+    ) -> Result<Arc<RuntimeAgent>> {
+        if ancestry.len() >= 32 || ancestry.contains(&self.info.id) {
+            return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        ancestry.push(self.info.id.clone());
+        let definition = self
+            .state_machine
+            .as_ref()
+            .and_then(|machine| machine.current_definition())
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        use crate::autonomy::composition::CompositionDispatch;
+        let binding_matches = match frame.dispatch {
+            CompositionDispatch::Delegate => {
+                serde_json::to_value(&definition)? == frame.definition
+                    && definition.delegate.as_deref() == Some(frame.delegate_id.as_str())
+            }
+            CompositionDispatch::Concurrent => {
+                serde_json::to_value(&definition.concurrent)? == frame.definition
+            }
+            CompositionDispatch::Pipeline => {
+                serde_json::to_value(&definition.pipeline)? == frame.definition
+            }
+            CompositionDispatch::Handoff => {
+                serde_json::to_value(&definition.handoff)? == frame.definition
+            }
+            CompositionDispatch::GroupChat => {
+                serde_json::to_value(&definition.group_chat)? == frame.definition
+            }
+        };
+        if frame.runtime_id != self.info.id || !binding_matches {
+            return Err(AgentError::Config(
+                "parent composition configuration changed".into(),
+            ));
+        }
+        let slots = if frame.dispatch == CompositionDispatch::Delegate {
+            vec![crate::autonomy::composition::CompositionChild {
+                registry_id: frame.delegate_id.clone(),
+                runtime_id: frame.delegate_runtime_id.clone(),
+                operation: frame.child_operation.clone(),
+            }]
+        } else {
+            frame.children.iter().chain(&frame.calls).cloned().collect()
+        };
+        let registry = self
+            .spawner_registry
+            .as_ref()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        let mut selected = None;
+        for slot in &slots {
+            let target = registry
+                .get(&slot.registry_id)
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            if target.info.id != slot.runtime_id {
+                return Err(AgentError::Config("group topology binding changed".into()));
+            }
+            target.preflight_standalone_autonomy()?;
+            if slot.operation == operation {
+                selected = Some(target);
+            } else if let Some(nested) = frames.get(&slot.runtime_id)
+                && nested.parent_operation.as_deref() == Some(slot.operation.as_str())
+                && nested.contains_operation(operation, frames, &mut Vec::new())
+            {
+                selected =
+                    Some(target.task_composition_target(nested, frames, operation, ancestry)?);
+            }
+        }
+        ancestry.pop();
+        selected.ok_or_else(|| crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into())
     }
 
     /// Resumes only the saved parent dispatch frame; the child consumes its exact request through inherited live authority.
@@ -45,6 +109,21 @@ impl RuntimeAgent {
         response: crate::autonomy::suspension::BatchResponse,
     ) -> Result<AgentResponse> {
         self.task_group_child(&group)?;
+        crate::autonomy::composition::scope_group_response(
+            group.child_operation,
+            group.child_request.id,
+            response,
+            Box::pin(self.resume_task_parent_frame(input, group.frame)),
+        )
+        .await
+    }
+
+    /// Restores only a parent's saved dispatch location under its retained owner; nested parents inherit existing response custody.
+    pub(super) async fn resume_task_parent_frame(
+        &self,
+        input: crate::autonomy::AutonomyTurnInput,
+        frame: crate::autonomy::DelegateFrame,
+    ) -> Result<AgentResponse> {
         if self
             .autonomy_owner
             .read()
@@ -70,7 +149,6 @@ impl RuntimeAgent {
             .as_ref()
             .and_then(|machine| machine.current_definition())
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let frame = group.frame.clone();
         let run = scope_runtime_gate_identity_stack(
             &ancestry,
             crate::autonomy::scope_turn(
@@ -93,23 +171,63 @@ impl RuntimeAgent {
                         &self.memory.get_messages(None).await?,
                         false,
                     )?;
-                    crate::autonomy::composition::scope_group_response(
-                        group.child_operation,
-                        group.child_request.id,
-                        response,
-                        crate::autonomy::composition::scope_resuming_delegate(
-                            self.info.id.clone(),
-                            Box::pin(self.handle_delegated_state(
-                                &frame.input,
-                                &frame.delegate_id,
-                                &definition,
-                            )),
-                        ),
+                    crate::autonomy::composition::scope_resuming_delegate(
+                        self.info.id.clone(),
+                        Box::pin(async {
+                            use crate::autonomy::composition::CompositionDispatch;
+                            match frame.dispatch {
+                                CompositionDispatch::GroupChat => {
+                                    Box::pin(self.handle_group_chat_state(
+                                        &frame.input,
+                                        definition.group_chat.as_ref().ok_or(
+                                            crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                        )?,
+                                    ))
+                                    .await
+                                }
+                                CompositionDispatch::Delegate => {
+                                    Box::pin(self.handle_delegated_state(
+                                        &frame.input,
+                                        &frame.delegate_id,
+                                        &definition,
+                                    ))
+                                    .await
+                                }
+                                CompositionDispatch::Concurrent => {
+                                    Box::pin(self.handle_concurrent_state(
+                                        &frame.input,
+                                        definition.concurrent.as_ref().ok_or(
+                                            crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                        )?,
+                                    ))
+                                    .await
+                                }
+                                CompositionDispatch::Handoff => {
+                                    Box::pin(self.handle_handoff_state(
+                                        &frame.input,
+                                        definition.handoff.as_ref().ok_or(
+                                            crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                        )?,
+                                    ))
+                                    .await
+                                }
+                                CompositionDispatch::Pipeline => {
+                                    Box::pin(self.handle_pipeline_state(
+                                        &frame.input,
+                                        definition.pipeline.as_ref().ok_or(
+                                            crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                        )?,
+                                    ))
+                                    .await
+                                }
+                            }
+                        }),
                     )
                     .await
                 }),
             ),
         );
+        let run = crate::autonomy::scope_child_requirement(frame.required, run);
         if let Some(actor) = frame.parent_actor.clone() {
             scope_actor_context(actor, run).await
         } else {
@@ -123,7 +241,7 @@ impl RuntimeAgent {
         owner: &Arc<crate::autonomy::RunOwner>,
         group: &crate::autonomy::TaskGroupState,
         participants: &crate::autonomy::Participants,
-    ) -> Result<TaskRuntimeCheckpoint> {
+    ) -> Result<Vec<(String, TaskRuntimeCheckpoint)>> {
         owner.check()?;
         if self
             .autonomy_owner
@@ -135,13 +253,71 @@ impl RuntimeAgent {
                 "group cancellation owner mismatch".into(),
             ));
         }
-        let child = self.task_group_child(group)?;
-        let child_owner = participants
-            .owner_for(&child.root_turn_gate)
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        child
-            .cancel_task_batch(&child_owner, group.batch.clone())
-            .await
+        let leaves = if group.parked.is_empty() {
+            vec![crate::autonomy::composition::ParkedCompositionChild {
+                operation: group.child_operation.clone(),
+                runtime_id: group.child_runtime_id.clone(),
+                request: group.child_request.clone(),
+                batch: group.batch.clone(),
+            }]
+        } else {
+            group.parked.clone()
+        };
+        let mut retired = Vec::new();
+        for leaf in &leaves {
+            let mut projection = group.clone();
+            projection.child_operation = leaf.operation.clone();
+            projection.child_runtime_id = leaf.runtime_id.clone();
+            let child = self.task_group_child(&projection)?;
+            let child_owner = participants
+                .owner_for(&child.root_turn_gate)
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let runtime =
+                Box::pin(child.cancel_task_batch(&child_owner, leaf.batch.clone())).await?;
+            retired.push((leaf.operation.clone(), runtime));
+        }
+        for frame in group
+            .frames
+            .values()
+            .filter(|frame| frame.runtime_id != self.info.id)
+        {
+            if !leaves.iter().any(|leaf| {
+                frame.contains_operation(&leaf.operation, &group.frames, &mut Vec::new())
+            }) {
+                continue;
+            }
+            let edge = (
+                frame
+                    .parent_operation
+                    .clone()
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
+                frame.runtime_id.clone(),
+            );
+            let mut projection = group.clone();
+            projection.child_operation = edge.0.clone();
+            projection.child_runtime_id = edge.1;
+            let parent = self.task_group_child(&projection)?;
+            let owner = participants
+                .owner_for(&parent.root_turn_gate)
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            owner.check()?;
+            let _gate = parent.root_turn_gate.lock().await;
+            if parent
+                .autonomy_owner
+                .read()
+                .as_ref()
+                .is_none_or(|active| !Arc::ptr_eq(active, &owner))
+            {
+                return Err(AgentError::Other(
+                    "nested cancellation owner changed".into(),
+                ));
+            }
+            retired.push((
+                edge.0,
+                TaskRuntimeCheckpoint::between_turns(parent.save_state_full().await?)?,
+            ));
+        }
+        Ok(retired)
     }
 
     /// Resumes a parked participant's committed batch rather than running its original input pipeline again.
@@ -162,10 +338,12 @@ impl RuntimeAgent {
             .owner_for(&self.root_turn_gate)
             .ok_or_else(|| AgentError::Config("parked child has no retained owner".into()))?;
         owner.check()?;
+        let actor_bound = Box::pin(execution.verify_child_actor(&operation, &actor)).await?;
         if actor
             .as_ref()
             .and_then(|actor| actor.effective_actor_id())
             .is_some_and(|actor| owner.actor_id.as_deref() != Some(actor))
+            && !actor_bound
         {
             return Err(AgentError::Other(
                 "parked child actor binding changed".into(),

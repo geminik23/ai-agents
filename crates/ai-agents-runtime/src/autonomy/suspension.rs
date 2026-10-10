@@ -368,6 +368,7 @@ impl RunExecution {
         args: &Value,
         question: Value,
     ) -> Result<String> {
+        super::composition::close_composition_admission();
         let request_id = uuid::Uuid::new_v4().to_string();
         let timeout_millis = question
             .get("timeout_seconds")
@@ -443,6 +444,7 @@ impl RunExecution {
         runtime_id: &str,
         request: &ApprovalRequest,
     ) -> Result<String> {
+        super::composition::close_composition_admission();
         let call_id = TASK_REQUEST
             .try_with(|request| request.call_id.clone())
             .map_err(|_| AgentError::Config("approval has no executable task request".into()))?;

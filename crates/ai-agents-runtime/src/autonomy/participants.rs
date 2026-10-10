@@ -240,7 +240,8 @@ impl RunExecution {
         ))))
     }
 
-    /// Child setup cannot race the terminal transition or replace a foreign runtime owner.
+    /// Child setup cannot race terminal transition or barrier closure, including after waiting for a shared runtime gate.
+    /// A denied not-started child has no lease or dispatched effect; already admitted children retain their settlement path.
     pub(crate) async fn enroll_child(
         self: &Arc<Self>,
         owner: Arc<RunOwner>,
@@ -250,8 +251,66 @@ impl RunExecution {
         let snapshot = self.load_owned().await?;
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
         self.check(&payload)?;
+        if let Some(parent) = super::composition::composition_admission_denial() {
+            return Err(AgentError::TaskSuspended(parent));
+        }
         self.participants.enroll(owner, slot)?;
         Ok(ChildLease::new(self))
+    }
+
+    /// Binds actor attribution to one invocation rather than conflating a pipeline sender with the long-lived runtime owner.
+    pub(crate) async fn bind_child_actor(
+        &self,
+        operation: &str,
+        actor: &Option<crate::TurnActorContext>,
+    ) -> Result<()> {
+        let state = serde_json::to_value(actor)?;
+        self.update(|payload| {
+            let id = format!("child-actor:{operation}");
+            if let Some(adapter) = payload.adapters.iter().find(|adapter| adapter.id == id) {
+                if adapter.state != state {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                }
+            } else {
+                payload.adapters.push(TaskAdapterCheckpoint {
+                    id,
+                    adapter: "runtime.child_actor".into(),
+                    contract_version: 1,
+                    config: json!({"operation":operation}),
+                    state,
+                });
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Resume requires the exact invocation actor; older checkpoints retain their owner-level equality check.
+    pub(crate) async fn verify_child_actor(
+        &self,
+        operation: &str,
+        actor: &Option<crate::TurnActorContext>,
+    ) -> Result<bool> {
+        let snapshot = self.load_owned().await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        let Some(adapter) = payload
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == format!("child-actor:{operation}"))
+        else {
+            return Ok(false);
+        };
+        if adapter.adapter != "runtime.child_actor"
+            || adapter.contract_version != 1
+            || adapter.config != json!({"operation":operation})
+            || adapter.state != serde_json::to_value(actor)?
+        {
+            return Err(AgentError::Config(
+                "child invocation actor binding changed".into(),
+            ));
+        }
+        Ok(true)
     }
 
     /// Stores the exact child runtime before its first effect, then an immutable result after its local turn settles.

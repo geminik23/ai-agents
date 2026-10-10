@@ -11,14 +11,15 @@ use crate::spawner::AgentRegistry;
 use crate::turn_context::current_turn_actor_context;
 
 /// Structured decision from the handoff evaluator LLM.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct HandoffDecision {
     action: String,
     confidence: f32,
     reason: String,
 }
 
-/// Run a handoff chain starting from an initial agent.
-/// An LLM decides after each agent turn whether to hand off to another agent.
+/// Runs a handoff chain with an acknowledged task cursor for the exact child input, response and routing decision.
+/// A parked child resumes its saved operation without repeating earlier turns, decisions or acknowledged hooks.
 pub async fn handoff(
     registry: &AgentRegistry,
     input: &str,
@@ -28,31 +29,132 @@ pub async fn handoff(
     llm: &dyn LLMProvider,
     hooks: Option<&dyn AgentHooks>,
 ) -> Result<HandoffResult> {
-    let mut current_agent = initial_agent.to_string();
-    let mut current_input = input.to_string();
-    let mut chain: Vec<HandoffEvent> = Vec::new();
-    let mut final_response = AgentResponse::new("");
-    let mut actor_context = current_turn_actor_context();
+    let authorized = crate::autonomy::composition::enter_composition_dispatch();
+    crate::autonomy::composition::scope_dispatch_authority(
+        authorized,
+        Box::pin(handoff_dispatch(
+            registry,
+            input,
+            initial_agent,
+            available_agents,
+            max_handoffs,
+            llm,
+            hooks,
+        )),
+    )
+    .await
+}
 
-    if let Some(h) = hooks {
-        h.on_handoff_start(initial_agent).await;
+/// A nested public handoff cannot consume its caller's already selected cursor or routing decision.
+async fn handoff_dispatch(
+    registry: &AgentRegistry,
+    input: &str,
+    initial_agent: &str,
+    available_agents: &[String],
+    max_handoffs: u32,
+    llm: &dyn LLMProvider,
+    hooks: Option<&dyn AgentHooks>,
+) -> Result<HandoffResult> {
+    use crate::autonomy::composition;
+    let execution = crate::autonomy::current_execution();
+    let frame = execution
+        .as_ref()
+        .map(|execution| execution.composition_frame())
+        .transpose()?
+        .flatten();
+    let saved = frame.as_ref().and_then(|frame| frame.cursor.get("handoff"));
+    let mut cursor = saved
+        .map(|value| serde_json::from_value::<TaskHandoffCursor>(value.clone()))
+        .transpose()?
+        .unwrap_or_else(|| TaskHandoffCursor {
+            step: 0,
+            current_agent: initial_agent.into(),
+            current_input: input.into(),
+            chain: Vec::new(),
+            final_response: AgentResponse::new(""),
+            actor: current_turn_actor_context(),
+            response: None,
+            decision: None,
+            finished: false,
+        });
+    if cursor.step > max_handoffs.saturating_add(1) {
+        return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    let mut current_agent = cursor.current_agent.clone();
+    let mut current_input = cursor.current_input.clone();
+    let mut chain = cursor.chain.clone();
+    let mut final_response = cursor.final_response.clone();
+    let mut actor_context = cursor.actor.clone();
+    if saved.is_none() {
+        if let Some(h) = hooks {
+            h.on_handoff_start(initial_agent).await;
+        }
+        checkpoint_handoff_cursor(execution.as_deref(), frame.as_ref(), &cursor).await?;
     }
 
-    for _step in 0..=max_handoffs {
+    for step in cursor.step..=max_handoffs {
+        if cursor.finished {
+            break;
+        }
+        if frame.as_ref().is_some_and(|frame| {
+            frame
+                .expires_at
+                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+        }) {
+            if let Some(execution) = &execution {
+                execution.stop("composition_timeout");
+            }
+            return Err(AgentError::HITLTimeout);
+        }
         let agent = registry.get(&current_agent).ok_or_else(|| {
             AgentError::Other(format!("Handoff agent not found: {}", current_agent))
         })?;
 
         debug!(agent = %current_agent, "Handoff chain executing agent");
 
-        let response = if let Some(context) = actor_context.clone() {
-            agent
-                .chat_with_actor_context(&current_input, context)
-                .await?
+        let response = if let Some(response) = &cursor.response {
+            response.clone()
         } else {
-            agent.chat(&current_input).await?
+            let slot = if let Some(frame) = &frame {
+                let targets: Vec<String> = serde_json::from_value(frame.cursor["targets"].clone())?;
+                let target = targets
+                    .iter()
+                    .position(|id| id == &current_agent)
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                Some(
+                    frame
+                        .children
+                        .get(step as usize * targets.len() + target)
+                        .cloned()
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
+                )
+            } else {
+                None
+            };
+            let response = composition::run_composition_child(
+                composition::current_composition(),
+                slot,
+                composition::group_response_custody(),
+                async {
+                    if let Some(context) = actor_context.clone() {
+                        agent.chat_with_actor_context(&current_input, context).await
+                    } else {
+                        agent.chat(&current_input).await
+                    }
+                },
+            )
+            .await?;
+            cursor.response = Some(response.clone());
+            cursor.final_response = response.clone();
+            checkpoint_handoff_cursor(execution.as_deref(), frame.as_ref(), &cursor).await?;
+            response
         };
         final_response = response.clone();
+        if let Some(execution) = &execution
+            && let Some(reason) = execution.stop_reason()
+        {
+            return Err(AgentError::Other(reason));
+        }
 
         // Build the list of agents we could hand off to (excluding current).
         let candidates: Vec<&str> = available_agents
@@ -66,14 +168,21 @@ pub async fn handoff(
             break;
         }
 
-        let decision = evaluate_handoff(
-            llm,
-            &current_agent,
-            &candidates,
-            &current_input,
-            &response.content,
-        )
-        .await?;
+        let decision = if let Some(decision) = &cursor.decision {
+            decision.clone()
+        } else {
+            let decision = evaluate_handoff(
+                llm,
+                &current_agent,
+                &candidates,
+                &current_input,
+                &response.content,
+            )
+            .await?;
+            cursor.decision = Some(decision.clone());
+            checkpoint_handoff_cursor(execution.as_deref(), frame.as_ref(), &cursor).await?;
+            decision
+        };
 
         if decision.action != "stay" {
             let next_agent = decision.action.clone();
@@ -107,6 +216,14 @@ pub async fn handoff(
                     *context = context.for_sender(current_agent.clone());
                 }
                 current_agent = next_agent;
+                cursor.step = step + 1;
+                cursor.current_agent = current_agent.clone();
+                cursor.current_input = current_input.clone();
+                cursor.chain = chain.clone();
+                cursor.actor = actor_context.clone();
+                cursor.response = None;
+                cursor.decision = None;
+                checkpoint_handoff_cursor(execution.as_deref(), frame.as_ref(), &cursor).await?;
                 continue;
             }
 
@@ -120,6 +237,11 @@ pub async fn handoff(
         break;
     }
 
+    cursor.finished = true;
+    cursor.final_response = final_response.clone();
+    cursor.current_agent = current_agent.clone();
+    cursor.chain = chain.clone();
+    checkpoint_handoff_cursor(execution.as_deref(), frame.as_ref(), &cursor).await?;
     info!(
         initial = %initial_agent,
         final_agent = %current_agent,
@@ -132,6 +254,35 @@ pub async fn handoff(
         handoff_chain: chain,
         final_agent: current_agent,
     })
+}
+
+/// Exact handoff coordinates preserve settled child responses and model decisions separately.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskHandoffCursor {
+    step: u32,
+    current_agent: String,
+    current_input: String,
+    chain: Vec<HandoffEvent>,
+    final_response: AgentResponse,
+    actor: Option<crate::TurnActorContext>,
+    response: Option<AgentResponse>,
+    decision: Option<HandoffDecision>,
+    finished: bool,
+}
+
+/// Cursor acknowledgement shares the run ledger; failure cannot publish a new routing location or release its owner.
+async fn checkpoint_handoff_cursor(
+    execution: Option<&crate::autonomy::RunExecution>,
+    frame: Option<&crate::autonomy::DelegateFrame>,
+    cursor: &TaskHandoffCursor,
+) -> Result<()> {
+    if let (Some(execution), Some(frame)) = (execution, frame) {
+        let mut saved = frame.cursor.clone();
+        saved["handoff"] = serde_json::to_value(cursor)?;
+        Box::pin(execution.checkpoint_composition_cursor(&frame.runtime_id, saved)).await?;
+    }
+    Ok(())
 }
 
 /// Ask the LLM for a structured JSON handoff decision.

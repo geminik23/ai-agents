@@ -29,6 +29,56 @@ pub(crate) struct DelegateFrame {
     pub child_operation: String,
     pub user_message_committed: bool,
     pub native_exchanges: Vec<TaskNativeExchange>,
+    #[serde(default)]
+    pub dispatch: CompositionDispatch,
+    #[serde(default)]
+    pub children: Vec<CompositionChild>,
+    #[serde(default)]
+    pub calls: Vec<CompositionChild>,
+    #[serde(default)]
+    pub cursor: Value,
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub parent_operation: Option<String>,
+    #[serde(default = "required_by_default")]
+    pub required: bool,
+}
+
+/// Older direct-delegation frames used the default mandatory-child policy.
+fn required_by_default() -> bool {
+    true
+}
+
+/// Dispatch coordinates are framework-owned; a serialized variant does not grant runtime access.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompositionDispatch {
+    #[default]
+    Delegate,
+    Concurrent,
+    Pipeline,
+    Handoff,
+    GroupChat,
+}
+
+/// Stable slot identities distinguish repeated calls to the same runtime without allocating new operations on resume.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CompositionChild {
+    pub registry_id: String,
+    pub runtime_id: String,
+    pub operation: String,
+}
+
+/// Every safely parked leaf remains bound to its own exact history and single-use request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ParkedCompositionChild {
+    pub operation: String,
+    pub runtime_id: String,
+    pub request: TaskPendingRequest,
+    pub batch: TaskBatchState,
 }
 
 /// A coordinating request has its own identity and refers to one exact parked child request.
@@ -43,10 +93,12 @@ pub(crate) struct TaskGroupState {
     pub child_request: TaskPendingRequest,
     pub batch: TaskBatchState,
     pub frames: BTreeMap<String, DelegateFrame>,
+    #[serde(default)]
+    pub parked: Vec<ParkedCompositionChild>,
 }
 
 /// The private response is propagated by the composition call site, not deserialized as execution authority.
-struct GroupResponse {
+pub(crate) struct GroupResponse {
     operation: String,
     request_id: String,
     response: super::suspension::BatchResponse,
@@ -56,6 +108,9 @@ tokio::task_local! {
     static CHILD_INVOCATION: (String, String);
     static RESUMING_DELEGATE: String;
     static GROUP_RESPONSE: Arc<parking_lot::Mutex<Option<GroupResponse>>>;
+    static COMPOSITION_SCOPE: CompositionScope;
+    static COMPOSITION_DISPATCH: bool;
+    static COMPOSITION_ENTRY: std::cell::Cell<bool>;
 }
 
 /// Marks only the parent's saved dispatch frame as a resumed composition, without rerunning input processing.
@@ -129,6 +184,58 @@ pub(crate) fn take_group_response(
         .flatten()
 }
 
+impl DelegateFrame {
+    /// Reachability follows stable frame edges rather than granting authority to a free-form child operation.
+    pub(crate) fn contains_operation(
+        &self,
+        operation: &str,
+        frames: &BTreeMap<String, DelegateFrame>,
+        ancestry: &mut Vec<String>,
+    ) -> bool {
+        if ancestry.len() >= 32 || ancestry.contains(&self.runtime_id) {
+            return false;
+        }
+        ancestry.push(self.runtime_id.clone());
+        let found = self.child_operation == operation
+            || self
+                .children
+                .iter()
+                .chain(&self.calls)
+                .any(|slot| slot.operation == operation)
+            || self
+                .children
+                .iter()
+                .chain(&self.calls)
+                .map(|slot| (&slot.operation, &slot.runtime_id))
+                .chain(
+                    (self.dispatch == CompositionDispatch::Delegate)
+                        .then_some((&self.child_operation, &self.delegate_runtime_id)),
+                )
+                .filter_map(|(incoming, runtime)| {
+                    frames
+                        .get(runtime)
+                        .filter(|frame| frame.parent_operation.as_ref() == Some(incoming))
+                })
+                .any(|frame| frame.contains_operation(operation, frames, ancestry));
+        ancestry.pop();
+        found
+    }
+}
+
+/// An intermediate parent may resume only when the live single-use response targets one of its saved descendants.
+pub(crate) fn response_targets_frame(
+    frame: &DelegateFrame,
+    frames: &BTreeMap<String, DelegateFrame>,
+) -> bool {
+    GROUP_RESPONSE
+        .try_with(|custody| {
+            custody.lock().as_ref().is_some_and(|response| {
+                frame.contains_operation(&response.operation, frames, &mut Vec::new())
+            })
+        })
+        .unwrap_or(false)
+}
+
 impl TaskGroupState {
     /// Exact parent/child references are validated before a safe pause can be exposed or a response can claim it.
     pub(crate) fn validate_checkpoint(&self, payload: &TaskCheckpointPayload) -> Result<()> {
@@ -137,8 +244,6 @@ impl TaskGroupState {
             || self.request_id.is_empty()
             || self.frame.version != 1
             || self.frame.runtime_id != payload.runtime.snapshot.agent_id
-            || self.frame.child_operation != self.child_operation
-            || self.frame.delegate_runtime_id != self.child_runtime_id
             || self.frames.get(&self.frame.runtime_id).is_none_or(|frame| {
                 serde_json::to_value(frame).ok() != serde_json::to_value(&self.frame).ok()
             })
@@ -181,11 +286,353 @@ impl TaskGroupState {
         let mut projection = payload.clone();
         projection.runtime = child.runtime.clone();
         projection.pending = Some(self.child_request.clone());
-        self.batch.validate_checkpoint(&projection)
+        self.batch.validate_checkpoint(&projection)?;
+        if !self.parked.is_empty() {
+            let mut operations = std::collections::HashSet::new();
+            let mut requests = std::collections::HashSet::new();
+            if self.parked.is_empty()
+                || !self.parked.iter().any(|leaf| {
+                    leaf.operation == self.child_operation
+                        && leaf.runtime_id == self.child_runtime_id
+                        && serde_json::to_value(&leaf.request).ok()
+                            == serde_json::to_value(&self.child_request).ok()
+                        && serde_json::to_value(&leaf.batch).ok()
+                            == serde_json::to_value(&self.batch).ok()
+                })
+            {
+                return Err(invalid());
+            }
+            for leaf in &self.parked {
+                if !operations.insert(&leaf.operation)
+                    || !requests.insert(&leaf.request.id)
+                    || !self.frames.values().any(|frame| {
+                        (frame.dispatch == CompositionDispatch::Delegate
+                            && frame.child_operation == leaf.operation
+                            && frame.delegate_runtime_id == leaf.runtime_id)
+                            || frame.children.iter().chain(&frame.calls).any(|slot| {
+                                slot.operation == leaf.operation
+                                    && slot.runtime_id == leaf.runtime_id
+                            })
+                    })
+                {
+                    return Err(invalid());
+                }
+                let child = payload
+                    .children
+                    .iter()
+                    .find(|child| child.child_id == leaf.operation)
+                    .ok_or_else(invalid)?;
+                if child.runtime.snapshot.agent_id != leaf.runtime_id
+                    || child.result.is_some()
+                    || serde_json::to_value(&child.pending)?
+                        != serde_json::to_value(Some(&leaf.request))?
+                {
+                    return Err(invalid());
+                }
+                let mut projection = payload.clone();
+                projection.runtime = child.runtime.clone();
+                projection.pending = Some(leaf.request.clone());
+                leaf.batch.validate_checkpoint(&projection)?;
+            }
+            let reachable =
+                collect_parked_leaves(&self.frame, &self.frames, payload, &mut Vec::new())?;
+            if serde_json::to_value(reachable)? != serde_json::to_value(&self.parked)? {
+                return Err(invalid());
+            }
+        }
+        Ok(())
     }
 }
 
+/// Walks only active pending frame edges, preserving declaration order and rejecting cycles or missing leaf continuation.
+fn collect_parked_leaves(
+    frame: &DelegateFrame,
+    frames: &BTreeMap<String, DelegateFrame>,
+    payload: &TaskCheckpointPayload,
+    ancestry: &mut Vec<String>,
+) -> Result<Vec<ParkedCompositionChild>> {
+    if ancestry.len() >= 32 || ancestry.contains(&frame.runtime_id) {
+        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    ancestry.push(frame.runtime_id.clone());
+    let slots = if frame.dispatch == CompositionDispatch::Delegate {
+        vec![CompositionChild {
+            registry_id: frame.delegate_id.clone(),
+            runtime_id: frame.delegate_runtime_id.clone(),
+            operation: frame.child_operation.clone(),
+        }]
+    } else {
+        frame.children.iter().chain(&frame.calls).cloned().collect()
+    };
+    let mut leaves = Vec::new();
+    for slot in slots {
+        let Some(child) = payload
+            .children
+            .iter()
+            .find(|child| child.child_id == slot.operation)
+        else {
+            continue;
+        };
+        let Some(request) = &child.pending else {
+            continue;
+        };
+        if child.runtime.snapshot.agent_id != slot.runtime_id || child.result.is_some() {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        if matches!(
+            child.runtime.continuation,
+            TaskContinuation::Suspended { batch: Some(_), .. }
+        ) {
+            let adapter = payload
+                .adapters
+                .iter()
+                .find(|adapter| adapter.id == format!("runtime.child_batch:{}", slot.operation))
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            leaves.push(ParkedCompositionChild {
+                operation: slot.operation,
+                runtime_id: slot.runtime_id,
+                request: request.clone(),
+                batch: serde_json::from_value(adapter.state.clone())?,
+            });
+        } else {
+            let nested = frames
+                .get(&slot.runtime_id)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            if nested.parent_operation.as_deref() != Some(slot.operation.as_str()) {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            leaves.extend(collect_parked_leaves(nested, frames, payload, ancestry)?);
+        }
+    }
+    ancestry.pop();
+    Ok(leaves)
+}
+
+/// Admission closure is local to one parent dispatch and never changes permanent cancellation state.
+#[derive(Clone)]
+pub(crate) struct CompositionScope {
+    pub runtime_id: String,
+    closed: Arc<parking_lot::Mutex<bool>>,
+    deadline: Option<std::time::Instant>,
+}
+
+/// Captures the same private response custody before a JoinSet boundary; it remains single-use across all siblings.
+pub(crate) fn group_response_custody() -> Option<Arc<parking_lot::Mutex<Option<GroupResponse>>>> {
+    GROUP_RESPONSE.try_with(Clone::clone).ok()
+}
+
+/// Closes new child admission at the first safe interaction point while admitted child turns drain normally.
+pub(crate) fn close_composition_admission() {
+    if let Ok(scope) = COMPOSITION_SCOPE.try_with(Clone::clone) {
+        *scope.closed.lock() = true;
+    }
+}
+
+/// Final child enrollment observes the same barrier as parking; waiting for a runtime gate does not authorize a later start.
+pub(crate) fn composition_admission_denial() -> Option<String> {
+    COMPOSITION_SCOPE
+        .try_with(|scope| (*scope.closed.lock()).then(|| scope.runtime_id.clone()))
+        .ok()
+        .flatten()
+}
+
+/// Only a live parent scope can select a saved slot or cursor; persisted metadata does not establish authority.
+pub(crate) fn current_composition() -> Option<CompositionScope> {
+    if !COMPOSITION_DISPATCH
+        .try_with(|active| *active)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    COMPOSITION_SCOPE.try_with(Clone::clone).ok()
+}
+
+/// Creates a fresh admission interval for a retained parent; original timeouts stay in its saved cursor.
+pub(crate) async fn scope_composition<F: Future>(runtime_id: String, future: F) -> F::Output {
+    let inherited = current_composition_deadline();
+    let own = current_execution().and_then(|execution| {
+        let frame = execution.delegate_frames.lock().get(&runtime_id).cloned()?;
+        execution
+            .approval_deadlines
+            .lock()
+            .get(&format!("composition:{}", frame.id))
+            .copied()
+    });
+    let deadline = match (inherited, own) {
+        (Some(parent), Some(own)) => Some(parent.min(own)),
+        (parent, own) => parent.or(own),
+    };
+    COMPOSITION_ENTRY
+        .scope(
+            std::cell::Cell::new(true),
+            COMPOSITION_DISPATCH.scope(
+                true,
+                COMPOSITION_SCOPE.scope(
+                    CompositionScope {
+                        runtime_id,
+                        closed: Arc::new(parking_lot::Mutex::new(false)),
+                        deadline,
+                    },
+                    future,
+                ),
+            ),
+        )
+        .await
+}
+
+/// Captured parent deadlines can only narrow provider/tool admission, even inside callbacks without cursor authority.
+pub(crate) fn current_composition_deadline() -> Option<std::time::Instant> {
+    COMPOSITION_SCOPE
+        .try_with(|scope| scope.deadline)
+        .ok()
+        .flatten()
+}
+
+/// A public orchestration entry consumes the parent's dispatch permission once, so provider callbacks cannot select its cursor again.
+pub(crate) fn enter_composition_dispatch() -> bool {
+    current_composition().is_some()
+        && COMPOSITION_ENTRY
+            .try_with(|entry| entry.replace(false))
+            .unwrap_or(false)
+}
+
+/// Cursor authority is disabled for nested public orchestration without dropping inherited accounting or barrier custody.
+pub(crate) async fn scope_dispatch_authority<F: Future>(authorized: bool, future: F) -> F::Output {
+    COMPOSITION_DISPATCH.scope(authorized, future).await
+}
+
+/// Child admission and barrier closure share one lock; closure never aborts already admitted turns or their settlement.
+pub(crate) async fn run_composition_child<
+    F: Future<Output = Result<ai_agents_core::AgentResponse>>,
+>(
+    scope: Option<CompositionScope>,
+    slot: Option<CompositionChild>,
+    response: Option<Arc<parking_lot::Mutex<Option<GroupResponse>>>>,
+    future: F,
+) -> Result<ai_agents_core::AgentResponse> {
+    let (Some(scope), Some(slot)) = (scope, slot) else {
+        return future.await;
+    };
+    {
+        let closed = scope.closed.lock();
+        if *closed {
+            return Err(AgentError::TaskSuspended(scope.runtime_id.clone()));
+        }
+    }
+    let work = COMPOSITION_DISPATCH.scope(
+        false,
+        COMPOSITION_SCOPE.scope(
+            scope,
+            scope_child_invocation(slot.operation, slot.runtime_id, future),
+        ),
+    );
+    let outcome = if let Some(response) = response {
+        GROUP_RESPONSE.scope(response, work).await
+    } else {
+        work.await
+    };
+    if outcome.is_ok()
+        && let Some(reason) = current_execution().and_then(|execution| execution.stop_reason())
+    {
+        return Err(AgentError::Other(reason));
+    }
+    outcome
+}
+
 impl RunExecution {
+    /// Returns an acknowledged parent frame only inside that parent's live scope.
+    pub(crate) fn composition_frame(&self) -> Result<Option<DelegateFrame>> {
+        let Some(scope) = current_composition() else {
+            return Ok(None);
+        };
+        self.delegate_frames
+            .lock()
+            .get(&scope.runtime_id)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| TaskRunStorageError::InvalidCheckpoint.into())
+    }
+
+    /// A serial orchestration call binds a deterministic coordinate to a catalogued live child before its first effect.
+    pub(crate) async fn bind_composition_call(
+        &self,
+        runtime_id: &str,
+        coordinate: &str,
+        child_runtime_id: &str,
+    ) -> Result<CompositionChild> {
+        let mut frame = self
+            .delegate_frames
+            .lock()
+            .get(runtime_id)
+            .cloned()
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let operation = format!("composition:{}:call:{coordinate}", frame.id);
+        if let Some(slot) = frame.calls.iter().find(|slot| slot.operation == operation) {
+            if slot.runtime_id != child_runtime_id {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            return Ok(slot.clone());
+        }
+        if frame.calls.len() >= MAX_TASK_CHECKPOINT_RECORDS {
+            return Err(TaskRunStorageError::CheckpointTooLarge.into());
+        }
+        let catalog = frame
+            .children
+            .iter()
+            .find(|slot| slot.runtime_id == child_runtime_id)
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let slot = CompositionChild {
+            registry_id: catalog.registry_id.clone(),
+            runtime_id: child_runtime_id.into(),
+            operation,
+        };
+        frame.calls.push(slot.clone());
+        self.update(|payload| {
+            let adapter = payload
+                .adapters
+                .iter_mut()
+                .find(|adapter| adapter.id == format!("runtime.delegate:{}", frame.id))
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            adapter.state = serde_json::to_value(&frame)?;
+            Ok(())
+        })
+        .await?;
+        self.delegate_frames.lock().insert(runtime_id.into(), frame);
+        Ok(slot)
+    }
+
+    /// Cursor replacement preserves immutable dispatch binding and follows the same conditional ledger as child outcomes.
+    pub(crate) async fn checkpoint_composition_cursor(
+        &self,
+        runtime_id: &str,
+        cursor: Value,
+    ) -> Result<()> {
+        let mut frame = self
+            .delegate_frames
+            .lock()
+            .get(runtime_id)
+            .cloned()
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        frame.cursor = cursor;
+        self.update(|payload| {
+            let adapter = payload
+                .adapters
+                .iter_mut()
+                .find(|adapter| adapter.id == format!("runtime.delegate:{}", frame.id))
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            if adapter.config
+                != json!({"runtime_id":frame.runtime_id,"definition":frame.definition})
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            adapter.state = serde_json::to_value(&frame)?;
+            Ok(())
+        })
+        .await?;
+        self.delegate_frames.lock().insert(runtime_id.into(), frame);
+        Ok(())
+    }
+
     /// Captures a quiescent group together with its exact parent frame; unknown or still-polled work cannot be parked.
     pub(crate) async fn pause_group(
         &self,
@@ -218,10 +665,16 @@ impl RunExecution {
             .get(runtime_id)
             .cloned()
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let parked = collect_parked_leaves(&frame, &frames, &payload, &mut Vec::new())?;
+        let selected_operation = parked
+            .first()
+            .map_or(frame.child_operation.as_str(), |leaf| {
+                leaf.operation.as_str()
+            });
         let child = payload
             .children
             .iter()
-            .find(|child| child.child_id == frame.child_operation)
+            .find(|child| child.child_id == selected_operation)
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let child_request = child
             .pending
@@ -231,9 +684,7 @@ impl RunExecution {
             payload
                 .adapters
                 .iter()
-                .find(|adapter| {
-                    adapter.id == format!("runtime.child_batch:{}", frame.child_operation)
-                })
+                .find(|adapter| adapter.id == format!("runtime.child_batch:{}", selected_operation))
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?
                 .state
                 .clone(),
@@ -242,12 +693,13 @@ impl RunExecution {
         let group = TaskGroupState {
             version: 1,
             request_id: request_id.clone(),
-            child_operation: frame.child_operation.clone(),
+            child_operation: selected_operation.into(),
             child_runtime_id: child.runtime.snapshot.agent_id.clone(),
             child_request,
             batch,
             frame,
             frames,
+            parked,
         };
         if let Some(old) = payload.pending.take() {
             payload.consumed_request_ids.push(old.id);
@@ -382,10 +834,105 @@ impl RunExecution {
 
     /// Admission uses a live framework-owned frame; a stored child ID alone cannot authorize suspension.
     pub(crate) fn has_composition_child(&self, operation: &str) -> bool {
+        self.delegate_frames.lock().values().any(|frame| {
+            frame.child_operation == operation
+                || frame
+                    .children
+                    .iter()
+                    .chain(&frame.calls)
+                    .any(|child| child.operation == operation)
+        })
+    }
+
+    /// An intermediate parked parent is distinguished from a leaf batch and never restored from an unbound runtime label.
+    pub(crate) async fn parked_child_composition(
+        &self,
+        operation: &str,
+        input: &str,
+        runtime_id: &str,
+    ) -> Result<Option<DelegateFrame>> {
+        let snapshot = self.load_owned().await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        let Some(child) = payload
+            .children
+            .iter()
+            .find(|child| child.child_id == operation)
+        else {
+            return Ok(None);
+        };
+        if child.pending.is_none()
+            || !matches!(
+                child.runtime.continuation,
+                TaskContinuation::Suspended { batch: None, .. }
+            )
+        {
+            return Ok(None);
+        }
+        let binding = payload
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == format!("child-operation:{operation}"))
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if binding.config != json!({"input":input,"runtime_id":runtime_id})
+            || child.runtime.snapshot.agent_id != runtime_id
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
         self.delegate_frames
             .lock()
-            .values()
-            .any(|frame| frame.child_operation == operation)
+            .get(runtime_id)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| TaskRunStorageError::InvalidCheckpoint.into())
+    }
+
+    /// Saves a nested parent's exact dispatch after its children have reached acknowledged safe points.
+    pub(crate) async fn checkpoint_child_composition_park(
+        &self,
+        operation: &str,
+        mut runtime: TaskRuntimeCheckpoint,
+    ) -> Result<()> {
+        let frames = self.delegate_frames.lock().clone();
+        let frame = frames
+            .get(&runtime.snapshot.agent_id)
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let request_id = uuid::Uuid::new_v4().to_string();
+        self.update(|payload| {
+            let leaves = collect_parked_leaves(frame, &frames, payload, &mut Vec::new())?;
+            let leaf = leaves
+                .first()
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            runtime.continuation = TaskContinuation::Suspended {
+                request_id: request_id.clone(),
+                turn_id: frame.id.clone(),
+                user_message_committed: frame.user_message_committed,
+                finalized: false,
+                skill: None,
+                batch: None,
+            };
+            runtime.validate()?;
+            let child = payload
+                .children
+                .iter_mut()
+                .find(|child| child.child_id == operation)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            if child.result.is_some() {
+                return Err(TaskRunStorageError::Conflict.into());
+            }
+            if let Some(pending) = child.pending.take() {
+                payload.consumed_request_ids.push(pending.id);
+            }
+            child.runtime = runtime;
+            child.pending = Some(TaskPendingRequest {
+                id: request_id.clone(),
+                issued_revision: self.revision.load(std::sync::atomic::Ordering::Acquire) + 1,
+                kind: leaf.request.kind,
+                reviewed_action: json!({"frame_id":frame.id}),
+            });
+            Ok(())
+        })
+        .await?;
+        Ok(())
     }
 
     /// A parked child batch is usable only for the same operation, runtime and prepared input binding.

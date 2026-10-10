@@ -68,7 +68,15 @@ impl AutonomyRunner {
                     .clone(),
             )?;
             group.validate_checkpoint(&payload)?;
-            if execution
+            if group.parked.iter().any(|leaf| {
+                execution
+                    .parked_batches
+                    .lock()
+                    .get(&leaf.runtime_id)
+                    .is_none_or(|batch| {
+                        serde_json::to_value(batch).ok() != serde_json::to_value(&leaf.batch).ok()
+                    })
+            }) || execution
                 .parked_batches
                 .lock()
                 .get(&group.child_runtime_id)
@@ -102,6 +110,16 @@ impl AutonomyRunner {
             }) || paused.group.as_ref().is_some_and(|group| {
                 &group.request_id == id
                     || group
+                        .frames
+                        .values()
+                        .any(|frame| format!("composition:{}", frame.id) == *id)
+                    || group.parked.iter().any(|leaf| {
+                        leaf.batch
+                            .approvals
+                            .iter()
+                            .any(|approval| &approval.request_id == id)
+                    })
+                    || group
                         .batch
                         .approvals
                         .iter()
@@ -129,7 +147,7 @@ impl AutonomyRunner {
                 .clone(),
         )?;
         group.validate_checkpoint(&payload)?;
-        let (owner, whole_expiry, request_deadline) = {
+        let (owner, whole_expiry, request_deadline, composition_expired) = {
             let retained = self.paused.lock();
             let retained = retained
                 .get(&snapshot.key.run_id)
@@ -147,6 +165,25 @@ impl AutonomyRunner {
                 retained.owner.clone(),
                 retained.whole_expiry,
                 retained.approval_deadlines.get(&request_id).copied(),
+                group
+                    .frames
+                    .values()
+                    .filter(|frame| {
+                        frame.contains_operation(
+                            &group.child_operation,
+                            &group.frames,
+                            &mut Vec::new(),
+                        )
+                    })
+                    .any(|frame| {
+                        frame
+                            .expires_at
+                            .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+                            || retained
+                                .approval_deadlines
+                                .get(&format!("composition:{}", frame.id))
+                                .is_some_and(|expiry| std::time::Instant::now() >= *expiry)
+                    }),
             )
         };
         owner.check()?;
@@ -241,6 +278,12 @@ impl AutonomyRunner {
             let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
             live.participants = paused.participants.clone();
             *live.delegate_frames.lock() = group.frames.clone();
+            for leaf in &group.parked {
+                live.parked_batches
+                    .lock()
+                    .insert(leaf.runtime_id.clone(), leaf.batch.clone());
+            }
+            *live.approval_deadlines.lock() = paused.approval_deadlines.clone();
             if let Some(expiry) = whole_expiry {
                 live.expiry_projection = Some(
                     live.expiry_projection
@@ -262,6 +305,16 @@ impl AutonomyRunner {
         let outcome = scope_execution(
             execution.clone(),
             Box::pin(async {
+                if composition_expired {
+                    execution.stop("composition_timeout");
+                    return Box::pin(self.finish_stopped_group(
+                        &execution,
+                        &owner,
+                        &group,
+                        "composition_timeout".into(),
+                    ))
+                    .await;
+                }
                 let response = self
                     .agent
                     .resume_task_group(
@@ -271,10 +324,14 @@ impl AutonomyRunner {
                             controller_message: payload.controller_state.to_string(),
                             source: group.frame.source,
                         },
-                        group,
+                        group.clone(),
                         response,
                     )
                     .await;
+                if let Some(reason) = execution.stop_reason() {
+                    return Box::pin(self.finish_stopped_group(&execution, &owner, &group, reason))
+                        .await;
+                }
                 if matches!(&response, Err(AgentError::TaskSuspended(_))) {
                     return self.pause(&execution, paused.todo.as_ref()).await;
                 }
@@ -339,6 +396,89 @@ impl AutonomyRunner {
         outcome
     }
 
+    /// A stop wins over re-pause; acknowledged parked leaves are closed without replay while genuinely uncertain work retains custody.
+    async fn finish_stopped_group(
+        &self,
+        execution: &RunExecution,
+        owner: &Arc<RunOwner>,
+        group: &TaskGroupState,
+        reason: String,
+    ) -> Result<TaskRunResult> {
+        if execution.participants.unsettled() {
+            return self
+                .finish(execution, TaskRunStatus::RecoveryRequired, reason, None)
+                .await;
+        }
+        let saved = execution.load_owned().await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload)?;
+        let leaves = if group.parked.is_empty() {
+            vec![super::composition::ParkedCompositionChild {
+                operation: group.child_operation.clone(),
+                runtime_id: group.child_runtime_id.clone(),
+                request: group.child_request.clone(),
+                batch: group.batch.clone(),
+            }]
+        } else {
+            group.parked.clone()
+        };
+        let mut pending = Vec::new();
+        for mut leaf in leaves {
+            if let Some(child) = payload
+                .children
+                .iter()
+                .find(|child| child.child_id == leaf.operation)
+                && let Some(request) = &child.pending
+            {
+                let adapter = payload
+                    .adapters
+                    .iter()
+                    .find(|adapter| adapter.id == format!("runtime.child_batch:{}", leaf.operation))
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                leaf.batch = serde_json::from_value(adapter.state.clone())?;
+                leaf.request = request.clone();
+                pending.push(leaf);
+            }
+        }
+        let retired = if pending.is_empty() {
+            Vec::new()
+        } else {
+            let mut cancellation = group.clone();
+            cancellation.parked = pending;
+            Box::pin(
+                self.agent
+                    .cancel_task_group(owner, &cancellation, &execution.participants),
+            )
+            .await?
+        };
+        let runtime = TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
+        execution
+            .update(|payload| {
+                for (operation, runtime) in retired {
+                    let child = payload
+                        .children
+                        .iter_mut()
+                        .find(|child| child.child_id == operation)
+                        .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                    child.runtime = runtime;
+                    if let Some(pending) = child.pending.take()
+                        && !payload.consumed_request_ids.contains(&pending.id)
+                    {
+                        payload.consumed_request_ids.push(pending.id);
+                    }
+                    child.result = Some(json!({"error":"task stopped before child continuation"}));
+                }
+                if let Some(pending) = payload.pending.take() {
+                    payload.consumed_request_ids.push(pending.id);
+                }
+                payload.runtime = runtime;
+                payload.pause_reason = None;
+                Ok(())
+            })
+            .await?;
+        self.finish(execution, Self::stopped_status(execution), reason, None)
+            .await
+    }
+
     /// Cancels a known-safe group without polling any pending child or aggregation work.
     async fn cancel_group(
         &self,
@@ -389,22 +529,33 @@ impl AutonomyRunner {
                 .await?
         };
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
-        let child_runtime = self
+        let retired = self
             .agent
             .cancel_task_group(&owner, &group, &participants)
             .await?;
-        let child = payload
-            .children
-            .iter_mut()
-            .find(|child| child.child_id == group.child_operation)
-            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-        child.runtime = child_runtime;
-        child.pending = None;
-        child.result = Some(json!({"error":"task cancelled before child continuation"}));
+        for (operation, child_runtime) in retired {
+            let child = payload
+                .children
+                .iter_mut()
+                .find(|child| child.child_id == operation)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            child.runtime = child_runtime;
+            if let Some(pending) = child.pending.take()
+                && !payload.consumed_request_ids.contains(&pending.id)
+            {
+                payload.consumed_request_ids.push(pending.id);
+            }
+            child.result = Some(json!({"error":"task cancelled before child continuation"}));
+        }
         if let Some(pending) = payload.pending.take() {
             payload.consumed_request_ids.push(pending.id);
         }
-        for approval in &group.batch.approvals {
+        for approval in group.batch.approvals.iter().chain(
+            group
+                .parked
+                .iter()
+                .flat_map(|leaf| leaf.batch.approvals.iter()),
+        ) {
             if !payload.consumed_request_ids.contains(&approval.request_id) {
                 payload
                     .consumed_request_ids
@@ -1858,7 +2009,9 @@ impl AutonomyRunner {
                 | "time_violation",
             ) => TaskRunStatus::LimitReached,
             Some("cancel_requested") => TaskRunStatus::Cancelled,
-            Some("question_timeout") => TaskRunStatus::Incomplete,
+            Some("question_timeout" | "pipeline_timeout" | "composition_timeout") => {
+                TaskRunStatus::Incomplete
+            }
             _ => TaskRunStatus::Failed,
         }
     }

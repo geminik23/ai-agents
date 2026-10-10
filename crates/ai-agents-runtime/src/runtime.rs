@@ -17,6 +17,8 @@ tokio::task_local! {
     static TOOL_FALLBACK_REQUEST: std::cell::RefCell<Option<(ToolExecutionRequest, ToolFallbackState)>>;
 }
 
+#[path = "autonomy/composition_runtime.rs"]
+mod task_composition;
 #[path = "autonomy/continuation_runtime.rs"]
 mod task_continuation;
 
@@ -1297,23 +1299,26 @@ impl RuntimeAgent {
                 guard,
                 identity_stack,
             } = self.acquire_root_turn().await?;
-            let result = scope_runtime_gate_identity_stack(&identity_stack, async move {
-                let actor_id = actor_context.effective_actor_id().map(str::to_string);
-                let run = async move {
-                    scope_actor_context(
-                        actor_context,
-                        Box::pin(async move { self.run_loop(input).await }),
-                    )
-                    .await
-                };
-                let result = if let Some(context) = self.build_observation_context(actor_id) {
-                    with_observation_context(context, run).await
-                } else {
-                    run.await
-                };
-                self.export_observability_if_configured().await;
-                result
-            })
+            let result = Box::pin(scope_runtime_gate_identity_stack(
+                &identity_stack,
+                async move {
+                    let actor_id = actor_context.effective_actor_id().map(str::to_string);
+                    let run = async move {
+                        scope_actor_context(
+                            actor_context,
+                            Box::pin(async move { self.run_loop(input).await }),
+                        )
+                        .await
+                    };
+                    let result = if let Some(context) = self.build_observation_context(actor_id) {
+                        with_observation_context(context, run).await
+                    } else {
+                        run.await
+                    };
+                    self.export_observability_if_configured().await;
+                    result
+                },
+            ))
             .await;
             drop(guard);
             result
@@ -1462,12 +1467,30 @@ impl RuntimeAgent {
                     "child todo implementation does not share the canonical task authority".into(),
                 ));
             }
+
             let ancestry = current_runtime_gate_identity_stack();
             if ancestry
                 .iter()
                 .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
             {
                 return Err(AgentError::Other("reentrant task participant".into()));
+            }
+            if let Some(operation) = crate::autonomy::current_child_invocation(&self.info.id)
+                && let Some(frame) =
+                    Box::pin(execution.parked_child_composition(&operation, input, &self.info.id))
+                        .await?
+            {
+                let targets = {
+                    let frames = execution.delegate_frames.lock();
+                    crate::autonomy::composition::response_targets_frame(&frame, &frames)
+                };
+                if targets {
+                    return Box::pin(self.resume_parked_task_composition(
+                        input, actor, execution, operation, frame,
+                    ))
+                    .await;
+                }
+                return Err(AgentError::TaskSuspended(frame.id));
             }
             if let Some(operation) = crate::autonomy::current_child_invocation(&self.info.id)
                 && let Some((pending, batch)) =
@@ -1483,6 +1506,7 @@ impl RuntimeAgent {
                 }
                 return Err(AgentError::TaskSuspended(pending.id));
             }
+
             let lock = self.root_turn_gate.clone().lock_owned();
             let guard = tokio::time::timeout(execution.remaining_duration(), async {
                 tokio::pin!(lock);
@@ -1510,6 +1534,8 @@ impl RuntimeAgent {
                     .as_ref()
                     .and_then(|context| context.effective_actor_id())
                     .is_some_and(|actor| owner.actor_id.as_deref() != Some(actor))
+                    && !crate::autonomy::current_child_invocation(&self.info.id)
+                        .is_some_and(|operation| execution.has_composition_child(&operation))
                 {
                     return Err(AgentError::Other(
                         "child actor scope differs from its admitted binding".into(),
@@ -1527,6 +1553,7 @@ impl RuntimeAgent {
                         .or_else(|| self.effective_actor_id()),
                 )?
             };
+
             // Box ledger futures before nesting runtime polling; checkpoints contain large exact continuation DTOs.
             let mut lease =
                 Box::pin(execution.enroll_child(owner.clone(), self.autonomy_owner.clone()))
@@ -1551,18 +1578,21 @@ impl RuntimeAgent {
                 crate::autonomy::scope_turn(
                     turn,
                     Box::pin(async {
-                        self.init_storage().await?;
-                        if let Some(cached) = execution
-                            .cached_child(&operation, input, &self.info.id)
-                            .await?
+                        Box::pin(self.init_storage()).await?;
+                        if let Some(cached) =
+                            Box::pin(execution.cached_child(&operation, input, &self.info.id))
+                                .await?
                         {
+                            Box::pin(execution.verify_child_actor(&operation, &actor)).await?;
                             return Ok(cached);
                         }
+
                         let initial = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
-                            self.save_state_full().await?,
+                            Box::pin(self.save_state_full()).await?,
                         )?;
                         Box::pin(execution.checkpoint_child(&operation, initial, input, None))
                             .await?;
+                        Box::pin(execution.bind_child_actor(&operation, &actor)).await?;
 
                         let outcome = crate::autonomy::scope_child_operation(
                             operation.clone(),
@@ -1579,21 +1609,27 @@ impl RuntimeAgent {
                             ),
                         )
                         .await;
+
                         self.export_observability_if_configured().await;
                         if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
-                            let batch = execution
-                                .parked_batches
-                                .lock()
-                                .get(&self.info.id)
-                                .cloned()
-                                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-                            let runtime = self.task_suspension_snapshot().await?;
-                            Box::pin(execution.checkpoint_child_park(&operation, runtime, batch))
+                            let batch = execution.parked_batches.lock().get(&self.info.id).cloned();
+                            let runtime = Box::pin(self.task_suspension_snapshot()).await?;
+                            if let Some(batch) = batch {
+                                Box::pin(
+                                    execution.checkpoint_child_park(&operation, runtime, batch),
+                                )
                                 .await?;
+                            } else {
+                                Box::pin(
+                                    execution
+                                        .checkpoint_child_composition_park(&operation, runtime),
+                                )
+                                .await?;
+                            }
                             return Ok::<_, AgentError>(outcome);
                         }
                         let runtime = crate::autonomy::TaskRuntimeCheckpoint::between_turns(
-                            self.save_state_full().await?,
+                            Box::pin(self.save_state_full()).await?,
                         )?;
                         Box::pin(execution.checkpoint_child(
                             &operation,
@@ -11881,19 +11917,26 @@ Respond in JSON format:
                 child_operation: format!("delegate:{id}"),
                 user_message_committed: self.root_user_message_committed.load(Ordering::SeqCst),
                 native_exchanges: self.task_native_expectations(),
+                dispatch: crate::autonomy::composition::CompositionDispatch::Delegate,
+                children: Vec::new(),
+                calls: Vec::new(),
+                cursor: Value::Null,
+                expires_at: None,
+                parent_operation: crate::autonomy::current_child_operation(),
+                required: crate::autonomy::child_required(),
             };
             Box::pin(execution.retain_delegate_frame(frame.clone())).await?;
             Some(frame)
         } else {
             None
         };
-        let child_turn = delegate.chat_with_actor_context(
+        let child_turn = Box::pin(delegate.chat_with_actor_context(
             &effective_input,
             frame.as_ref().map_or_else(
                 || self.outbound_actor_context(),
                 |frame| frame.actor.clone(),
             ),
-        );
+        ));
         let response = if let Some(frame) = &frame {
             crate::autonomy::scope_child_invocation(
                 frame.child_operation.clone(),
@@ -11996,8 +12039,8 @@ Respond in JSON format:
         Ok(result)
     }
 
-    // Handle concurrent execution: run multiple registry agents in parallel and aggregate.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // Captures prepared concurrent input and stable slots before child admission; safe resume skips preparation and completed work.
+    // Aggregation and parent finalization run only after the saved child cursor is fully settled.
     async fn handle_concurrent_state(
         &self,
         input: &str,
@@ -12011,13 +12054,12 @@ Respond in JSON format:
             )
         })?;
 
-        // Render input template if provided, otherwise use the raw input.
-        // Uses direct minijinja rendering (same approach as pipeline) so variables
-        // are top-level: {{ user_input }}, not {{ context.user_input }}.
-        // Enrich input with parent conversation history when context_mode is set.
+        let retained = self.retained_composition_frame()?;
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -12031,14 +12073,32 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        let effective_input = if let Some(ref tmpl) = config.input {
+        let effective_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
+        let frame = Box::pin(
+            self.prepare_composition_frame(
+                input,
+                &effective_input,
+                crate::autonomy::composition::CompositionDispatch::Concurrent,
+                serde_json::to_value(config)?,
+                &config
+                    .agents
+                    .iter()
+                    .map(|agent| agent.id().to_string())
+                    .collect::<Vec<_>>(),
+                serde_json::json!({}),
+            ),
+        )
+        .await?;
 
         let start = Instant::now();
 
@@ -12058,25 +12118,30 @@ Respond in JSON format:
             None
         };
 
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationAggregation,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::concurrent_with_llms(
-                        registry,
-                        &effective_input,
-                        &config.agents,
-                        &config.aggregation,
-                        providers.as_refs(),
-                        config.min_required,
-                        config.timeout_ms,
-                        config.on_partial_failure.clone(),
-                        vote_parallelism,
-                    ),
+        let work = Box::pin(self.observe_purpose(
+            ObservationPurpose::OrchestrationAggregation,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::concurrent_with_llms(
+                    registry,
+                    &effective_input,
+                    &config.agents,
+                    &config.aggregation,
+                    providers.as_refs(),
+                    config.min_required,
+                    config.timeout_ms,
+                    config.on_partial_failure.clone(),
+                    vote_parallelism,
                 ),
-            )
-            .await?;
+            ),
+        ));
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), Box::pin(work))
+                .await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let agent_ids: Vec<String> = config.agents.iter().map(|a| a.id().to_string()).collect();
@@ -12149,8 +12214,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Handle group chat: run a multi-turn multi-agent conversation.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // Saves prepared group input and its participant catalog before conversation work can park.
+    // Speaker, transcript and termination cursors preserve completed turns without repeating parent preparation.
     async fn handle_group_chat_state(
         &self,
         input: &str,
@@ -12166,6 +12231,7 @@ Respond in JSON format:
 
         let start = Instant::now();
 
+        let retained = self.retained_composition_frame()?;
         let speaker = crate::orchestration::role_provider(
             &self.llm_registry,
             ai_agents_llm::LLMRole::OrchestrationSpeaker,
@@ -12177,10 +12243,11 @@ Respond in JSON format:
             None,
         )?;
 
-        // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -12194,34 +12261,66 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
         // Render input template if provided, otherwise use the raw user message as topic.
-        let effective_topic = if let Some(ref tmpl) = config.input {
+        let effective_topic = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
 
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationConversation,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::group_chat_with_llms(
-                        registry,
-                        &effective_topic,
-                        config,
-                        crate::orchestration::GroupLLMs {
-                            speaker: speaker.as_deref(),
-                            consensus: consensus.as_deref(),
-                        },
-                        Some(&*self.hooks),
-                    ),
+        let mut registry_ids = config
+            .participants
+            .iter()
+            .map(|participant| participant.id.clone())
+            .collect::<Vec<_>>();
+        for id in config
+            .manager
+            .as_ref()
+            .and_then(|manager| manager.agent.as_ref())
+            .into_iter()
+            .chain(config.debate.as_ref().map(|debate| &debate.synthesizer))
+        {
+            if registry.contains(id) && !registry_ids.contains(id) {
+                registry_ids.push(id.clone());
+            }
+        }
+        let frame = Box::pin(self.prepare_composition_frame(
+            input,
+            &effective_topic,
+            crate::autonomy::composition::CompositionDispatch::GroupChat,
+            serde_json::to_value(config)?,
+            &registry_ids,
+            serde_json::json!({}),
+        ))
+        .await?;
+        let work = Box::pin(self.observe_purpose(
+            ObservationPurpose::OrchestrationConversation,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::group_chat_with_llms(
+                    registry,
+                    &effective_topic,
+                    config,
+                    crate::orchestration::GroupLLMs {
+                        speaker: speaker.as_deref(),
+                        consensus: consensus.as_deref(),
+                    },
+                    Some(&*self.hooks),
                 ),
-            )
-            .await?;
+            ),
+        ));
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), work).await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -12289,8 +12388,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Handle pipeline: run agents sequentially with per-stage input templates.
-    // Captures agent-local auxiliary roles without changing root ownership or child turn providers.
+    // Captures prepared pipeline input and stable stage slots before execution; resume uses its acknowledged stage cursor.
+    // Completed stage hooks and template preparation are not repeated when a later child is parked.
     async fn handle_pipeline_state(
         &self,
         input: &str,
@@ -12306,6 +12405,7 @@ Respond in JSON format:
 
         let start = Instant::now();
 
+        let retained = self.retained_composition_frame()?;
         let stages: Vec<crate::orchestration::PipelineStage> = config
             .stages
             .iter()
@@ -12318,10 +12418,11 @@ Respond in JSON format:
             })
             .collect();
 
-        // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -12335,25 +12436,49 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        let context_values = self.build_context_with_overlays();
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationRouting,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::pipeline(
-                        registry,
-                        &context_input,
-                        &stages,
-                        config.timeout_ms,
-                        Some(&*self.hooks),
-                        Some(&context_values),
-                    ),
+        let context_values = if let Some(frame) = &retained {
+            serde_json::from_value(frame.cursor["context"].clone())?
+        } else {
+            self.build_context_with_overlays()
+        };
+        let frame = Box::pin(
+            self.prepare_composition_frame(
+                input,
+                &context_input,
+                crate::autonomy::composition::CompositionDispatch::Pipeline,
+                serde_json::to_value(config)?,
+                &stages
+                    .iter()
+                    .map(|stage| stage.agent_id.clone())
+                    .collect::<Vec<_>>(),
+                serde_json::json!({"context":context_values}),
+            ),
+        )
+        .await?;
+        let work = self.observe_purpose(
+            ObservationPurpose::OrchestrationRouting,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::pipeline(
+                    registry,
+                    &context_input,
+                    &stages,
+                    config.timeout_ms,
+                    Some(&*self.hooks),
+                    Some(&context_values),
                 ),
-            )
-            .await?;
+            ),
+        );
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), Box::pin(work))
+                .await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -12418,8 +12543,8 @@ Respond in JSON format:
         Ok(response)
     }
 
-    // Handle handoff: LLM-directed agent-to-agent control transfer.
-    // Keeps handoff decisions and delegate summary on separate auxiliary roles.
+    // Captures prepared handoff input and per-turn target slots before dispatch; saved decisions and child results are not repeated on resume.
+    // The handoff evaluator and context summary retain separate captured auxiliary roles.
     async fn handle_handoff_state(
         &self,
         input: &str,
@@ -12433,6 +12558,7 @@ Respond in JSON format:
             )
         })?;
 
+        let retained = self.retained_composition_frame()?;
         let llm = self.role_llm(ai_agents_llm::LLMRole::OrchestrationHandoff, None, || {
             self.llm_registry
                 .get("router")
@@ -12441,10 +12567,11 @@ Respond in JSON format:
 
         let start = Instant::now();
 
-        // Enrich input with parent conversation history when context_mode is set.
         let context_mode = config.context_mode.clone().unwrap_or_default();
-        let context_input = self
-            .observe_purpose(
+        let context_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else {
+            self.observe_purpose(
                 ObservationPurpose::OrchestrationRouting,
                 crate::orchestration::context::prepare_delegate_input(
                     input,
@@ -12458,33 +12585,71 @@ Respond in JSON format:
                     .as_deref(),
                 ),
             )
-            .await?;
+            .await?
+        };
 
-        // Render input template if provided, otherwise forward the raw user message.
-        let effective_input = if let Some(ref tmpl) = config.input {
+        // Saved input is already rendered and cannot be interpreted as a fresh template on resume.
+        let effective_input = if let Some(frame) = &retained {
+            frame.delegate_input.clone()
+        } else if let Some(ref tmpl) = config.input {
             render_concurrent_template(tmpl, &context_input, &self.build_context_with_overlays())
                 .unwrap_or_else(|_| context_input.clone())
         } else {
             context_input
         };
 
-        let result = self
-            .observe_purpose(
-                ObservationPurpose::OrchestrationRouting,
-                scope_actor_context(
-                    self.outbound_actor_context(),
-                    crate::orchestration::handoff(
-                        registry,
-                        &effective_input,
-                        &config.initial_agent,
-                        &config.available_agents,
-                        config.max_handoffs,
-                        llm.as_ref(),
-                        Some(&*self.hooks),
-                    ),
+        let mut targets = vec![config.initial_agent.clone()];
+        for id in &config.available_agents {
+            if !targets.contains(id) {
+                targets.push(id.clone());
+            }
+        }
+        let count = (config.max_handoffs as usize)
+            .checked_add(1)
+            .and_then(|turns| turns.checked_mul(targets.len()))
+            .ok_or(crate::autonomy::TaskRunStorageError::CheckpointTooLarge)?;
+        if crate::autonomy::current_execution().is_some()
+            && count > crate::autonomy::MAX_TASK_CHECKPOINT_RECORDS
+        {
+            return Err(crate::autonomy::TaskRunStorageError::CheckpointTooLarge.into());
+        }
+        let registry_ids = if crate::autonomy::current_execution().is_some() {
+            (0..=config.max_handoffs)
+                .flat_map(|_| targets.iter().cloned())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let frame = Box::pin(self.prepare_composition_frame(
+            input,
+            &effective_input,
+            crate::autonomy::composition::CompositionDispatch::Handoff,
+            serde_json::to_value(config)?,
+            &registry_ids,
+            serde_json::json!({"targets":targets}),
+        ))
+        .await?;
+        let work = Box::pin(self.observe_purpose(
+            ObservationPurpose::OrchestrationRouting,
+            scope_actor_context(
+                self.outbound_actor_context(),
+                crate::orchestration::handoff(
+                    registry,
+                    &effective_input,
+                    &config.initial_agent,
+                    &config.available_agents,
+                    config.max_handoffs,
+                    llm.as_ref(),
+                    Some(&*self.hooks),
                 ),
-            )
-            .await?;
+            ),
+        ));
+        let result = if frame.is_some() {
+            crate::autonomy::composition::scope_composition(self.info.id.clone(), work).await?
+        } else {
+            work.await?
+        };
+        Box::pin(self.retire_composition_pending()).await?;
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
