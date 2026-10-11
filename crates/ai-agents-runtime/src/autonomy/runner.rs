@@ -5,6 +5,12 @@ use ai_agents_core::{AgentError, AgentResponse, Result, ToolCancellationToken};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
+#[path = "controller_runtime.rs"]
+mod controller_runtime;
+
+type ControllerFuture<'a, T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
+
 /// Development API for explicit host invocation; it does not enable automatic state/skill task entry.
 pub struct AutonomyRunner {
     agent: Arc<crate::RuntimeAgent>,
@@ -24,6 +30,7 @@ struct PausedTask {
     todo: Option<RunTodoAdapter>,
     batch: Option<TaskBatchState>,
     group: Option<TaskGroupState>,
+    controller: Option<Box<ControllerContinuation>>,
     whole_expiry: Option<std::time::Instant>,
     approval_deadlines: BTreeMap<String, std::time::Instant>,
 }
@@ -36,7 +43,7 @@ impl Drop for PausedTask {
 }
 
 impl AutonomyRunner {
-    /// Retains only the exact acknowledged cursor that agrees with private live batch and composition authority.
+    /// Retains only the exact acknowledged cursor that agrees with private live controller, batch or composition authority.
     fn capture_pause(
         &self,
         execution: &RunExecution,
@@ -46,6 +53,13 @@ impl AutonomyRunner {
             return Err(TaskRunStorageError::NotResumable.into());
         }
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        if let Some(state) = controller_checkpoint(&payload)? {
+            if serde_json::to_value(&state)? != serde_json::to_value(&*execution.controller.lock())?
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            return Ok((None, None));
+        }
         if matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: Some(_), .. }
@@ -97,6 +111,7 @@ impl AutonomyRunner {
     /// Refreshes trusted parked state and non-extending request deadlines after another acknowledged safe pause.
     fn refresh_pause(&self, paused: &mut PausedTask, execution: &RunExecution) -> Result<()> {
         (paused.batch, paused.group) = self.capture_pause(execution)?;
+        paused.controller = execution.controller.lock().clone();
         for (id, deadline) in execution.approval_deadlines.lock().iter() {
             paused
                 .approval_deadlines
@@ -104,7 +119,13 @@ impl AutonomyRunner {
                 .or_insert(*deadline);
         }
         paused.approval_deadlines.retain(|id, _| {
-            paused.batch.as_ref().is_some_and(|batch| {
+            paused.controller.as_ref().is_some_and(|state| {
+                state
+                    .driver
+                    .as_ref()
+                    .and_then(|driver| driver.parked.as_ref())
+                    .is_some_and(|parked| &parked.pending.id == id)
+            }) || paused.batch.as_ref().is_some_and(|batch| {
                 batch
                     .approvals
                     .iter()
@@ -801,6 +822,9 @@ impl AutonomyRunner {
             return Err(TaskRunStorageError::NotResumable.into());
         }
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        if controller_checkpoint(&payload)?.is_some() {
+            return self.cancel_controller(snapshot, payload).await;
+        }
         if matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: None, .. }
@@ -906,7 +930,7 @@ impl AutonomyRunner {
         })
     }
 
-    /// Validates one bound approval or question answer before claiming its same-process exact continuation.
+    /// Validates one bound approval, question answer or external signal before claiming its same-process exact continuation.
     /// The implementation-owned question contract is checked before claim and final authorization still runs on resume.
     /// A losing or invalid response cannot mutate the runtime, and failed execution retains the owner for recovery.
     pub async fn resume(
@@ -941,6 +965,9 @@ impl AutonomyRunner {
         {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
+        if controller_checkpoint(&payload)?.is_some() {
+            return Box::pin(self.resume_controller(snapshot, payload, input)).await;
+        }
         let (request_id, mut result, question_response) = match input {
             TaskResumeInput::Approval { request_id, result } => (
                 request_id,
@@ -957,6 +984,9 @@ impl AutonomyRunner {
                 super::suspension::BatchResponse::QuestionTimeout,
                 true,
             ),
+            TaskResumeInput::ExternalSignal(_) => {
+                return Err(TaskRunStorageError::NotResumable.into());
+            }
         };
         if payload.pending.as_ref().is_none_or(|pending| {
             pending.id != request_id
@@ -1282,18 +1312,13 @@ impl AutonomyRunner {
                     .into(),
             ));
         }
-        if bound
-            .checks
-            .iter()
-            .any(|check| !check.adapter.descriptor().conditions.is_empty())
-            || profile.settings.hitl.as_ref().is_some_and(|hitl| {
-                hitl.on_user_question
+        if profile.settings.hitl.as_ref().is_some_and(|hitl| {
+            hitl.on_user_question
+                .is_some_and(|action| action != InteractionAction::PauseRun)
+                || hitl
+                    .on_approval_required
                     .is_some_and(|action| action != InteractionAction::PauseRun)
-                    || hitl
-                        .on_approval_required
-                        .is_some_and(|action| action != InteractionAction::PauseRun)
-            })
-            || profile.settings.supervision.is_some()
+        }) || profile.settings.supervision.is_some()
             || profile.settings.on_limit.as_ref().is_some_and(|limit| {
                 !matches!(
                     limit.action,
@@ -1444,6 +1469,7 @@ impl AutonomyRunner {
                     approval_deadlines: execution.approval_deadlines.lock().clone(),
                     batch,
                     group,
+                    controller: execution.controller.lock().clone(),
                 },
             );
             cleanup.finish();
@@ -1466,107 +1492,125 @@ impl AutonomyRunner {
     }
 
     /// The controller invokes internal turns, not public chat, and shares one ledger with validation observations.
+    /// Future erasure isolates retained validation data from nested model-message polling stacks.
     #[allow(clippy::too_many_arguments)]
-    async fn execute(
-        &self,
-        owner: &Arc<RunOwner>,
-        execution: &Arc<RunExecution>,
-        bound: &BoundAutonomyProfile,
-        profile: &EffectiveAutonomyProfile,
-        key: &TaskRunKey,
-        objective: &str,
+    fn execute<'a>(
+        &'a self,
+        owner: &'a Arc<RunOwner>,
+        execution: &'a Arc<RunExecution>,
+        bound: &'a BoundAutonomyProfile,
+        profile: &'a EffectiveAutonomyProfile,
+        key: &'a TaskRunKey,
+        objective: &'a str,
         mut lifecycle: LifecycleState,
-        todo: Option<&RunTodoAdapter>,
+        todo: Option<&'a RunTodoAdapter>,
         mut resumed_response: Option<AgentResponse>,
-    ) -> Result<TaskRunResult> {
-        let restored = execution.load_owned().await?;
-        let restored: TaskCheckpointPayload = serde_json::from_value(restored.payload)?;
-        let controller = restored
-            .adapters
-            .iter()
-            .find(|adapter| adapter.id == "runtime.controller");
-        let mut scope = EvaluationScope {
-            key: key.clone(),
-            objective_revision: 0,
-            cycle: 0,
-            stage: None,
-            mutation_generation: 0,
-            target_revisions: BTreeMap::new(),
-            target_generations: BTreeMap::new(),
-            validation_bindings: BTreeMap::new(),
-            validation_attempts: BTreeMap::new(),
-        };
-        if let Some(controller) = controller {
-            scope = serde_json::from_value(controller.state["scope"].clone())?;
-            lifecycle = serde_json::from_value(controller.state["lifecycle"].clone())?;
-        }
-        bound.prepare_scope(&mut scope);
-        let mut progress = if let Some(controller) = controller {
-            serde_json::from_value(controller.state["progress"].clone())?
-        } else {
-            ProgressState::new(scope.clone())
-        };
-        let mut evidence = EvaluationEvidence {
-            required_checks: bound
-                .checks
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskRunResult>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let restored = execution.load_owned().await?;
+            let restored: TaskCheckpointPayload = serde_json::from_value(restored.payload)?;
+            let controller = restored
+                .adapters
                 .iter()
-                .filter(|check| check.check.required.unwrap_or(true))
-                .map(|check| check.check.id.clone())
-                .collect(),
-            ..Default::default()
-        };
-        let journal = TaskValidationJournal::for_execution(execution);
-        let executor = RuntimeObservationExecutor {
-            agent: self.agent.clone(),
-            profile: profile.profile.clone(),
-            scope_mode: "task".into(),
-            run_revision: execution.revision.clone(),
-            validator: String::new(),
-            contract_version: 1,
-        };
-        if let Some(controller) = controller {
-            evidence = serde_json::from_value(controller.state["evidence"].clone())?;
-        }
-        let mut last_response = None;
-        let mut instruction = String::new();
-        let mut source = AutonomyTurnSource::InitialObjective;
-        let mut forced_continuation = false;
-        loop {
-            let snapshot = execution.load_owned().await?;
-            let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
-            if execution.check(&payload).is_err()
-                || (resumed_response.is_none()
-                    && payload.counters.turns >= u64::from(profile.max_turns))
-            {
-                return self
-                    .finish(
-                        execution,
-                        if execution.stop_reason().is_some() {
-                            Self::stopped_status(execution)
-                        } else {
-                            TaskRunStatus::LimitReached
-                        },
-                        execution
-                            .stop_reason()
-                            .unwrap_or_else(|| "turn_capacity".into()),
-                        last_response,
-                    )
-                    .await;
+                .find(|adapter| adapter.id == "runtime.controller");
+            let mut scope = EvaluationScope {
+                key: key.clone(),
+                objective_revision: 0,
+                cycle: 0,
+                stage: None,
+                mutation_generation: 0,
+                target_revisions: BTreeMap::new(),
+                target_generations: BTreeMap::new(),
+                validation_bindings: BTreeMap::new(),
+                validation_attempts: BTreeMap::new(),
+            };
+            if let Some(controller) = controller {
+                scope = serde_json::from_value(controller.state["scope"].clone())?;
+                lifecycle = serde_json::from_value(controller.state["lifecycle"].clone())?;
             }
-            if resumed_response.is_none() {
-                scope.cycle += 1;
+            bound.prepare_scope(&mut scope);
+            let mut progress = if let Some(controller) = controller {
+                serde_json::from_value(controller.state["progress"].clone())?
+            } else {
+                ProgressState::new(scope.clone())
+            };
+            let mut evidence = EvaluationEvidence {
+                required_checks: bound
+                    .checks
+                    .iter()
+                    .filter(|check| check.check.required.unwrap_or(true))
+                    .map(|check| check.check.id.clone())
+                    .collect(),
+                ..Default::default()
+            };
+            let journal = TaskValidationJournal::for_execution(execution);
+            let executor = RuntimeObservationExecutor {
+                agent: self.agent.clone(),
+                profile: profile.profile.clone(),
+                scope_mode: "task".into(),
+                run_revision: execution.revision.clone(),
+                validator: String::new(),
+                contract_version: 1,
+            };
+            if let Some(controller) = controller {
+                evidence = serde_json::from_value(controller.state["evidence"].clone())?;
             }
-            scope.mutation_generation = execution.mutation_generation();
-            scope.stage = profile
-                .settings
-                .lifecycle
-                .as_ref()
-                .and_then(|stages| stages.get(lifecycle.current_stage))
-                .map(|stage| stage.id.clone());
+            let mut continuation = execution.controller.lock().take();
+            let mut last_response = None;
+            let mut instruction = String::new();
+            let mut source = AutonomyTurnSource::InitialObjective;
+            let mut forced_continuation = false;
+            if let Some(saved) = &continuation {
+                scope = saved.scope.clone();
+                lifecycle = saved.lifecycle.clone();
+                progress = saved.progress.clone();
+                evidence = saved.evidence.clone();
+                last_response = Some(saved.response.clone());
+                instruction = saved.instruction.clone();
+                source = saved.source;
+                forced_continuation = saved.forced_continuation;
+                execution.set_scope(&scope);
+            }
+            loop {
+                // Validation resumes after the committed turn and must not repeat its counters, observation or hooks.
+                if continuation.is_none() {
+                    let snapshot = execution.load_owned().await?;
+                    let payload: TaskCheckpointPayload =
+                        serde_json::from_value(snapshot.payload.clone())?;
+                    if execution.check(&payload).is_err()
+                        || (resumed_response.is_none()
+                            && payload.counters.turns >= u64::from(profile.max_turns))
+                    {
+                        return self
+                            .finish(
+                                execution,
+                                if execution.stop_reason().is_some() {
+                                    Self::stopped_status(execution)
+                                } else {
+                                    TaskRunStatus::LimitReached
+                                },
+                                execution
+                                    .stop_reason()
+                                    .unwrap_or_else(|| "turn_capacity".into()),
+                                last_response,
+                            )
+                            .await;
+                    }
+                    if resumed_response.is_none() {
+                        scope.cycle += 1;
+                    }
+                    scope.mutation_generation = execution.mutation_generation();
+                    scope.stage = profile
+                        .settings
+                        .lifecycle
+                        .as_ref()
+                        .and_then(|stages| stages.get(lifecycle.current_stage))
+                        .map(|stage| stage.id.clone());
 
-            execution.set_scope(&scope);
-            // This is an advisory view; live admission remains authoritative if time passes before dispatch.
-            let controller = json!({"objective":objective,"stage":scope.stage,"instruction":instruction,
+                    execution.set_scope(&scope);
+                    // This is an advisory view; live admission remains authoritative if time passes before dispatch.
+                    let controller = json!({"objective":objective,"stage":scope.stage,"instruction":instruction,
                 "todos":todo.map(RunTodoAdapter::checkpoint).transpose()?,
                 "remaining_turns":profile.max_turns as u64-payload.counters.turns,
                 "remaining_llm_calls":(profile.max_llm_calls as u64).saturating_sub(payload.counters.llm_attempts),
@@ -1579,7 +1623,7 @@ impl AutonomyRunner {
                                 "failed_gates":payload.evidence.records.last().and_then(|record| record.data.get("completion")).cloned(),
                 "progress_instruction":profile.settings.progress.as_ref().and_then(|progress| progress.auto_create_todo_prompt.clone()).unwrap_or_else(|| "Before progress-gated work, maintain the run todo list and select exactly one active item when required.".into()),
                 "stage_instruction":profile.settings.lifecycle.as_ref().and_then(|stages| stages.get(lifecycle.current_stage)).and_then(|stage| stage.instruction.clone())});
-            execution
+                    execution
                 .update(|payload| {
                     if resumed_response.is_none() { payload.counters.turns += 1; }
                     if forced_continuation && resumed_response.is_none() {
@@ -1595,81 +1639,102 @@ impl AutonomyRunner {
                     Ok(())
                 })
                 .await?;
-            let response = if let Some(response) = resumed_response.take() {
-                Ok(response)
-            } else {
-                self.agent
-                    .run_autonomy_turn(AutonomyTurnInput {
-                        owner: owner.clone(),
-                        objective: objective.into(),
-                        controller_message: controller.to_string(),
-                        source,
+                    let response = if let Some(response) = resumed_response.take() {
+                        Ok(response)
+                    } else {
+                        self.agent
+                            .run_autonomy_turn(AutonomyTurnInput {
+                                owner: owner.clone(),
+                                objective: objective.into(),
+                                controller_message: controller.to_string(),
+                                source,
+                            })
+                            .await
+                    };
+                    match response {
+                        Ok(response) => last_response = Some(response),
+                        Err(AgentError::TaskSuspended(_)) => {
+                            return self.pause(execution, todo).await;
+                        }
+                        Err(_error) => {
+                            return self
+                                .finish(
+                                    execution,
+                                    Self::stopped_status(execution),
+                                    execution
+                                        .stop_reason()
+                                        .unwrap_or_else(|| "execution_error".into()),
+                                    last_response,
+                                )
+                                .await;
+                        }
+                    }
+                    if let Some(reason) = execution.stop_reason() {
+                        return self
+                            .finish(
+                                execution,
+                                Self::stopped_status(execution),
+                                reason,
+                                last_response,
+                            )
+                            .await;
+                    }
+                    execution.await_children().await?;
+                    Box::pin(self.agent.flush_background_tasks()).await?;
+                    let runtime =
+                        TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
+                    let todos = todo.map(RunTodoAdapter::checkpoint).transpose()?;
+                    execution
+                        .update(|payload| {
+                            payload.runtime = runtime;
+                            payload.todos = todos.clone();
+                            payload.last_response =
+                                last_response.as_ref().map(|r| r.content.clone());
+                            Ok(())
+                        })
+                        .await?;
+                    scope.mutation_generation = execution.mutation_generation();
+                    let identity = Self::identity(&scope, scope.cycle, None, String::new());
+                    evidence.current = Some(ScopedObservation {
+                        identity: identity.clone(),
+                        complete: true,
+                        value: CurrentTaskObservation {
+                            state: self.agent.current_state(),
+                            context: serde_json::to_value(self.agent.context_manager().get_all())?,
+                            response: last_response.as_ref().unwrap().content.clone(),
+                            todos,
+                        },
+                    });
+                    // Shared executor records remain authoritative; capturing a logical request does not charge another attempt.
+                    scope.mutation_generation = execution.mutation_generation();
+                    Self::collect_tools(execution, &mut evidence).await?;
+                }
+                let schedules = [
+                    ValidationSchedule::EachCycle,
+                    ValidationSchedule::StageEnd,
+                    ValidationSchedule::Completion,
+                ];
+                let checks: Vec<_> = schedules
+                    .into_iter()
+                    .flat_map(|schedule| {
+                        bound
+                            .scheduled_checks(&scope, schedule)
+                            .into_iter()
+                            .map(move |check| (schedule, check))
                     })
-                    .await
-            };
-            match response {
-                Ok(response) => last_response = Some(response),
-                Err(AgentError::TaskSuspended(_)) => {
-                    return self.pause(execution, todo).await;
+                    .collect();
+                let ids: Vec<_> = checks
+                    .iter()
+                    .map(|(_, check)| check.check.id.clone())
+                    .collect();
+                if continuation
+                    .as_ref()
+                    .is_some_and(|saved| saved.checks != ids)
+                {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
                 }
-                Err(_error) => {
-                    return self
-                        .finish(
-                            execution,
-                            Self::stopped_status(execution),
-                            execution
-                                .stop_reason()
-                                .unwrap_or_else(|| "execution_error".into()),
-                            last_response,
-                        )
-                        .await;
-                }
-            }
-            if let Some(reason) = execution.stop_reason() {
-                return self
-                    .finish(
-                        execution,
-                        Self::stopped_status(execution),
-                        reason,
-                        last_response,
-                    )
-                    .await;
-            }
-            execution.await_children().await?;
-            Box::pin(self.agent.flush_background_tasks()).await?;
-            let runtime =
-                TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
-            let todos = todo.map(RunTodoAdapter::checkpoint).transpose()?;
-            execution
-                .update(|payload| {
-                    payload.runtime = runtime;
-                    payload.todos = todos.clone();
-                    payload.last_response = last_response.as_ref().map(|r| r.content.clone());
-                    Ok(())
-                })
-                .await?;
-            scope.mutation_generation = execution.mutation_generation();
-            let identity = Self::identity(&scope, scope.cycle, None, String::new());
-            evidence.current = Some(ScopedObservation {
-                identity: identity.clone(),
-                complete: true,
-                value: CurrentTaskObservation {
-                    state: self.agent.current_state(),
-                    context: serde_json::to_value(self.agent.context_manager().get_all())?,
-                    response: last_response.as_ref().unwrap().content.clone(),
-                    todos,
-                },
-            });
-            // Shared executor records remain authoritative; capturing a logical request does not charge another attempt.
-            scope.mutation_generation = execution.mutation_generation();
-            Self::collect_tools(execution, &mut evidence).await?;
-            let schedules = [
-                ValidationSchedule::EachCycle,
-                ValidationSchedule::StageEnd,
-                ValidationSchedule::Completion,
-            ];
-            for schedule in schedules {
-                for check in bound.scheduled_checks(&scope, schedule) {
+                let next = continuation.as_ref().map_or(0, |saved| saved.next_check);
+                for (index, (schedule, check)) in checks.into_iter().enumerate().skip(next) {
                     let evaluator = CompletionGateEvaluator::default();
                     if schedule == ValidationSchedule::Completion
                         && !check.check.required.unwrap_or(true)
@@ -1681,7 +1746,8 @@ impl AutonomyRunner {
                     {
                         continue;
                     }
-                    Box::pin(self.validate(
+                    let driver = continuation.as_mut().and_then(|saved| saved.driver.take());
+                    if let Some(driver) = Box::pin(self.validate(
                         check,
                         &mut scope,
                         &mut evidence,
@@ -1689,106 +1755,136 @@ impl AutonomyRunner {
                         bound,
                         &executor,
                         &journal,
+                        driver,
                     ))
-                    .await?;
+                    .await?
+                    {
+                        *execution.controller.lock() = Some(Box::new(ControllerContinuation {
+                            scope: scope.clone(),
+                            lifecycle: lifecycle.clone(),
+                            progress: progress.clone(),
+                            evidence: evidence.clone(),
+                            response: last_response
+                                .clone()
+                                .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
+                            instruction: instruction.clone(),
+                            source,
+                            forced_continuation,
+                            checks: ids.clone(),
+                            next_check: index,
+                            driver: Some(driver),
+                        }));
+                        return Box::pin(self.pause_controller(execution, todo)).await;
+                    }
                 }
-            }
-            scope.mutation_generation = execution.mutation_generation();
-            Self::collect_tools(execution, &mut evidence).await?;
-            let observation = bound.observe_progress(&scope, &evidence)?;
-            progress.observe(&scope, &observation)?;
-            evidence.progress =
-                Some(observation.scoped(Self::identity(&scope, scope.cycle, None, String::new())));
-            let evaluator = CompletionGateEvaluator::default();
-            let previous_stage = lifecycle.current_stage;
-            if let Some(stage) = profile
-                .settings
-                .lifecycle
-                .as_ref()
-                .and_then(|stages| stages.get(lifecycle.current_stage))
-            {
-                let gate = stage
+                continuation = None;
+                execution
+                    .update(|payload| {
+                        retire_controller(payload)?;
+                        payload.pause_reason = None;
+                        Ok(())
+                    })
+                    .await?;
+                scope.mutation_generation = execution.mutation_generation();
+                Self::collect_tools(execution, &mut evidence).await?;
+                let observation = bound.observe_progress(&scope, &evidence)?;
+                progress.observe(&scope, &observation)?;
+                evidence.progress = Some(observation.scoped(Self::identity(
+                    &scope,
+                    scope.cycle,
+                    None,
+                    String::new(),
+                )));
+                let evaluator = CompletionGateEvaluator::default();
+                let previous_stage = lifecycle.current_stage;
+                if let Some(stage) = profile
+                    .settings
+                    .lifecycle
+                    .as_ref()
+                    .and_then(|stages| stages.get(lifecycle.current_stage))
+                {
+                    let gate = stage
+                        .completion
+                        .as_ref()
+                        .map(|gate| evaluator.evaluate(gate, &scope, &evidence))
+                        .transpose()?
+                        .map_or(GateOutcome::Pass, |r| r.outcome);
+                    if lifecycle.complete_stage(
+                        &profile.settings,
+                        &stage.id,
+                        gate,
+                        bound.required_stage_outcome(&scope, &evidence)?,
+                    )? {
+                        execution.set_lifecycle(&profile.settings, &lifecycle);
+                    } else if (gate == GateOutcome::Fail
+                        || bound.required_stage_outcome(&scope, &evidence)? == GateOutcome::Fail)
+                        && lifecycle.validation_failure(&profile.settings)?
+                    {
+                        source = AutonomyTurnSource::ValidationFix;
+                        execution.set_lifecycle(&profile.settings, &lifecycle);
+                    }
+                }
+                let completion = profile
+                    .settings
                     .completion
                     .as_ref()
                     .map(|gate| evaluator.evaluate(gate, &scope, &evidence))
-                    .transpose()?
-                    .map_or(GateOutcome::Pass, |r| r.outcome);
-                if lifecycle.complete_stage(
-                    &profile.settings,
-                    &stage.id,
-                    gate,
-                    bound.required_stage_outcome(&scope, &evidence)?,
-                )? {
-                    execution.set_lifecycle(&profile.settings, &lifecycle);
-                } else if (gate == GateOutcome::Fail
-                    || bound.required_stage_outcome(&scope, &evidence)? == GateOutcome::Fail)
-                    && lifecycle.validation_failure(&profile.settings)?
-                {
-                    source = AutonomyTurnSource::ValidationFix;
-                    execution.set_lifecycle(&profile.settings, &lifecycle);
-                }
-            }
-            let completion = profile
-                .settings
-                .completion
-                .as_ref()
-                .map(|gate| evaluator.evaluate(gate, &scope, &evidence))
-                .transpose()?;
-            let mut gate = completion
-                .as_ref()
-                .map_or(GateOutcome::Unknown, |result| result.outcome);
-            // A nonempty-list requirement is distinct from the explicitly configured todos_done completion gate.
-            if gate == GateOutcome::Pass
-                && profile
-                    .settings
-                    .progress
+                    .transpose()?;
+                let mut gate = completion
                     .as_ref()
-                    .is_some_and(|progress| progress.require_todos == Some(true))
-                && todo
-                    .map(RunTodoAdapter::checkpoint)
-                    .transpose()?
-                    .is_none_or(|checkpoint| checkpoint.items.is_empty())
-            {
-                gate = GateOutcome::Fail;
-            }
-            let current = execution.load_owned().await?;
-            let payload: TaskCheckpointPayload = serde_json::from_value(current.payload)?;
-            let decision = checkpoint_decision(
-                &profile.settings,
-                &lifecycle,
-                &mut progress,
-                &DecisionInputs {
-                    uncertain_effect: payload.reservations.iter().any(|r| {
-                        matches!(
-                            r.state,
-                            TaskEffectState::Dispatched | TaskEffectState::Uncertain
-                        )
-                    }),
-                    cancel_requested: execution
-                        .cancellation
-                        .load(std::sync::atomic::Ordering::Acquire),
-                    unrecoverable_error: execution.stop_reason().is_some_and(|reason| {
-                        !matches!(reason.as_str(), "time_violation" | "cancel_requested")
-                    }),
-                    actual_time_violation: execution.stop_reason().as_deref()
-                        == Some("time_violation"),
-                    mandatory_wait: payload.pending.is_some(),
-                    gates: gate,
-                    required_validation: {
-                        let mut task_scope = scope.clone();
-                        task_scope.stage = None;
-                        bound.required_outcome(&task_scope, &evidence)?
+                    .map_or(GateOutcome::Unknown, |result| result.outcome);
+                // A nonempty-list requirement is distinct from the explicitly configured todos_done completion gate.
+                if gate == GateOutcome::Pass
+                    && profile
+                        .settings
+                        .progress
+                        .as_ref()
+                        .is_some_and(|progress| progress.require_todos == Some(true))
+                    && todo
+                        .map(RunTodoAdapter::checkpoint)
+                        .transpose()?
+                        .is_none_or(|checkpoint| checkpoint.items.is_empty())
+                {
+                    gate = GateOutcome::Fail;
+                }
+                let current = execution.load_owned().await?;
+                let payload: TaskCheckpointPayload = serde_json::from_value(current.payload)?;
+                let decision = checkpoint_decision(
+                    &profile.settings,
+                    &lifecycle,
+                    &mut progress,
+                    &DecisionInputs {
+                        uncertain_effect: payload.reservations.iter().any(|r| {
+                            matches!(
+                                r.state,
+                                TaskEffectState::Dispatched | TaskEffectState::Uncertain
+                            )
+                        }),
+                        cancel_requested: execution
+                            .cancellation
+                            .load(std::sync::atomic::Ordering::Acquire),
+                        unrecoverable_error: execution.stop_reason().is_some_and(|reason| {
+                            !matches!(reason.as_str(), "time_violation" | "cancel_requested")
+                        }),
+                        actual_time_violation: execution.stop_reason().as_deref()
+                            == Some("time_violation"),
+                        mandatory_wait: payload.pending.is_some(),
+                        gates: gate,
+                        required_validation: {
+                            let mut task_scope = scope.clone();
+                            task_scope.stage = None;
+                            bound.required_outcome(&task_scope, &evidence)?
+                        },
+                        children_settled: !execution.participants.unsettled()
+                            && payload.children.iter().all(|child| child.result.is_some()),
+                        scope_ended: false,
+                        additional_work_capacity: execution.stop_reason().is_none()
+                            && payload.counters.turns < u64::from(profile.max_turns)
+                            && payload.counters.llm_attempts < u64::from(profile.max_llm_calls),
+                        interaction_available: false,
                     },
-                    children_settled: !execution.participants.unsettled()
-                        && payload.children.iter().all(|child| child.result.is_some()),
-                    scope_ended: false,
-                    additional_work_capacity: execution.stop_reason().is_none()
-                        && payload.counters.turns < u64::from(profile.max_turns)
-                        && payload.counters.llm_attempts < u64::from(profile.max_llm_calls),
-                    interaction_available: false,
-                },
-            )?;
-            execution.update(|payload| {
+                )?;
+                execution.update(|payload| {
                 payload.progress.observation_sequence = progress.sequence;
                 payload.progress.cycles_without_progress = progress.cycles_without_progress;
                 payload.progress.replans = progress.replans;
@@ -1798,214 +1894,235 @@ impl AutonomyRunner {
                     data: json!({"scope":scope,"gate":gate,"completion":completion,"validations":evidence.validations.iter().filter(|result| result.identity.cycle == scope.cycle).collect::<Vec<_>>(),"progress":progress.last_delta,"decision":decision}) });
                 Ok(())
             }).await?;
-            match decision {
-                CheckpointDecision::Terminal { status, reason } => {
-                    return self.finish(execution, status, reason, last_response).await;
-                }
-                CheckpointDecision::Limit => {
-                    return self
-                        .finish(
-                            execution,
-                            TaskRunStatus::LimitReached,
-                            "invocation_capacity".into(),
-                            last_response,
-                        )
-                        .await;
-                }
-                CheckpointDecision::Replan => {
-                    forced_continuation = false;
-                    let check = bound.replan_check(&progress, objective)?;
-                    scope
-                        .validation_bindings
-                        .insert(check.check.id.clone(), check.config_identity.clone());
-                    self.validate(
-                        &check,
-                        &mut scope,
-                        &mut evidence,
-                        execution,
-                        bound,
-                        &executor,
-                        &journal,
-                    )
-                    .await?;
-                    instruction = evidence
-                        .validations
-                        .last()
-                        .map(|result| result.metrics.to_string())
-                        .unwrap_or_default();
-                }
-                CheckpointDecision::Wait | CheckpointDecision::AskUser => {
-                    return Err(AgentError::Config(
-                        "task suspension is not installed".into(),
-                    ));
-                }
-                CheckpointDecision::Continue => {
-                    if lifecycle.current_stage != previous_stage
-                        && lifecycle.current_stage
-                            < profile.settings.lifecycle.as_ref().map_or(0, Vec::len)
-                    {
-                        forced_continuation = false;
-                        source = AutonomyTurnSource::StageInstruction;
-                        instruction = String::new();
-                        continue;
+                match decision {
+                    CheckpointDecision::Terminal { status, reason } => {
+                        return self.finish(execution, status, reason, last_response).await;
                     }
-                    if source == AutonomyTurnSource::ValidationFix {
-                        forced_continuation = false;
-                        instruction = "Required validation failed. Repair the reopened stage without resetting completed effects or resource usage.".into();
-                        continue;
-                    }
-                    forced_continuation = progress.handled_sequence != Some(progress.sequence);
-                    let policy = profile.settings.premature_finish.as_ref();
-                    let action = policy
-                        .and_then(|p| p.action)
-                        .unwrap_or(PrematureFinishAction::Continue);
-                    if progress.handled_sequence != Some(progress.sequence) {
-                        match action {
-                            PrematureFinishAction::SummarizeAndStop => {
-                                return self
-                                    .finish(
-                                        execution,
-                                        TaskRunStatus::Incomplete,
-                                        "premature_finish".into(),
-                                        last_response,
-                                    )
-                                    .await;
-                            }
-                            PrematureFinishAction::Fail => {
-                                return self
-                                    .finish(
-                                        execution,
-                                        TaskRunStatus::Failed,
-                                        "premature_finish".into(),
-                                        last_response,
-                                    )
-                                    .await;
-                            }
-                            PrematureFinishAction::AskUser => {
-                                return self
-                                    .finish(
-                                        execution,
-                                        TaskRunStatus::Incomplete,
-                                        "interaction_unavailable".into(),
-                                        last_response,
-                                    )
-                                    .await;
-                            }
-                            PrematureFinishAction::Continue => {}
-                        }
-                        if payload.counters.continuations
-                            >= u64::from(
-                                policy
-                                    .and_then(|p| p.max_continuations)
-                                    .unwrap_or(profile.max_turns),
+                    CheckpointDecision::Limit => {
+                        return self
+                            .finish(
+                                execution,
+                                TaskRunStatus::LimitReached,
+                                "invocation_capacity".into(),
+                                last_response,
                             )
-                        {
-                            return self
-                                .finish(
-                                    execution,
-                                    TaskRunStatus::LimitReached,
-                                    "continuation_capacity".into(),
-                                    last_response,
-                                )
-                                .await;
-                        }
+                            .await;
                     }
-                    instruction = policy.and_then(|p| p.prompt.clone()).unwrap_or_else(|| "Completion is not proven. Continue the objective using the failed gates and remaining allowance.".into());
+                    CheckpointDecision::Replan => {
+                        forced_continuation = false;
+                        let check = bound.replan_check(&progress, objective)?;
+                        scope
+                            .validation_bindings
+                            .insert(check.check.id.clone(), check.config_identity.clone());
+                        self.validate(
+                            &check,
+                            &mut scope,
+                            &mut evidence,
+                            execution,
+                            bound,
+                            &executor,
+                            &journal,
+                            None,
+                        )
+                        .await?;
+                        instruction = evidence
+                            .validations
+                            .last()
+                            .map(|result| result.metrics.to_string())
+                            .unwrap_or_default();
+                    }
+                    CheckpointDecision::Wait | CheckpointDecision::AskUser => {
+                        return Err(AgentError::Config(
+                            "task suspension is not installed".into(),
+                        ));
+                    }
+                    CheckpointDecision::Continue => {
+                        if lifecycle.current_stage != previous_stage
+                            && lifecycle.current_stage
+                                < profile.settings.lifecycle.as_ref().map_or(0, Vec::len)
+                        {
+                            forced_continuation = false;
+                            source = AutonomyTurnSource::StageInstruction;
+                            instruction = String::new();
+                            continue;
+                        }
+                        if source == AutonomyTurnSource::ValidationFix {
+                            forced_continuation = false;
+                            instruction = "Required validation failed. Repair the reopened stage without resetting completed effects or resource usage.".into();
+                            continue;
+                        }
+                        forced_continuation = progress.handled_sequence != Some(progress.sequence);
+                        let policy = profile.settings.premature_finish.as_ref();
+                        let action = policy
+                            .and_then(|p| p.action)
+                            .unwrap_or(PrematureFinishAction::Continue);
+                        if progress.handled_sequence != Some(progress.sequence) {
+                            match action {
+                                PrematureFinishAction::SummarizeAndStop => {
+                                    return self
+                                        .finish(
+                                            execution,
+                                            TaskRunStatus::Incomplete,
+                                            "premature_finish".into(),
+                                            last_response,
+                                        )
+                                        .await;
+                                }
+                                PrematureFinishAction::Fail => {
+                                    return self
+                                        .finish(
+                                            execution,
+                                            TaskRunStatus::Failed,
+                                            "premature_finish".into(),
+                                            last_response,
+                                        )
+                                        .await;
+                                }
+                                PrematureFinishAction::AskUser => {
+                                    return self
+                                        .finish(
+                                            execution,
+                                            TaskRunStatus::Incomplete,
+                                            "interaction_unavailable".into(),
+                                            last_response,
+                                        )
+                                        .await;
+                                }
+                                PrematureFinishAction::Continue => {}
+                            }
+                            if payload.counters.continuations
+                                >= u64::from(
+                                    policy
+                                        .and_then(|p| p.max_continuations)
+                                        .unwrap_or(profile.max_turns),
+                                )
+                            {
+                                return self
+                                    .finish(
+                                        execution,
+                                        TaskRunStatus::LimitReached,
+                                        "continuation_capacity".into(),
+                                        last_response,
+                                    )
+                                    .await;
+                            }
+                        }
+                        instruction = policy.and_then(|p| p.prompt.clone()).unwrap_or_else(|| "Completion is not proven. Continue the objective using the failed gates and remaining allowance.".into());
+                    }
+                }
+                if source != AutonomyTurnSource::ValidationFix {
+                    source = AutonomyTurnSource::Continuation;
                 }
             }
-            if source != AutonomyTurnSource::ValidationFix {
-                source = AutonomyTurnSource::Continuation;
-            }
-        }
+        })
     }
 
     /// Binds one selected check attempt to the same acknowledged revision and invocation ledger as runtime turns.
+    /// Erasure keeps optional observation future construction out of nested runtime turn polling frames.
     #[allow(clippy::too_many_arguments)]
-    async fn validate(
-        &self,
-        check: &BoundValidationCheck,
-        scope: &mut EvaluationScope,
-        evidence: &mut EvaluationEvidence,
-        execution: &Arc<RunExecution>,
-        bound: &BoundAutonomyProfile,
-        executor: &RuntimeObservationExecutor,
-        journal: &TaskValidationJournal,
-    ) -> Result<()> {
-        let attempt = format!("{}:{}", scope.cycle, check.check.id);
-        scope
-            .validation_attempts
-            .insert(check.check.id.clone(), attempt.clone());
-        let capacity = execution.load_owned().await?;
-        let capacity: TaskCheckpointPayload = serde_json::from_value(capacity.payload)?;
-        if (check.adapter.descriptor().needs_judge || check.adapter.descriptor().needs_planner)
-            && capacity.counters.llm_attempts >= u64::from(capacity.limits.max_llm_calls)
-        {
-            execution.stop("llm_capacity");
-            return Err(AgentError::Other(
-                "validation has no remaining provider allowance".into(),
-            ));
-        }
-        scope.mutation_generation = execution.mutation_generation();
-        let identity = Self::identity(
-            scope,
-            scope.cycle,
-            Some(attempt),
-            check.config_identity.clone(),
-        );
-        let mut driver = ValidationDriverState::new(check, identity)?;
-        let snapshot = execution.load_owned().await?;
-        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
-        let millis = payload
-            .limits
-            .max_active_time_seconds
-            .saturating_mul(1000)
-            .saturating_sub(execution.consumed_active_millis()?);
-        let deadline = chrono::Utc::now()
-            .checked_add_signed(chrono::Duration::milliseconds(
-                i64::try_from(millis)
-                    .map_err(|_| AgentError::Config("deadline overflow".into()))?,
-            ))
-            .ok_or_else(|| AgentError::Config("deadline overflow".into()))?;
-        let deadline = payload
-            .clocks
-            .expires_at
-            .map_or(deadline, |expiry| deadline.min(expiry));
-        let cancellation = ToolCancellationToken::new(
-            execution.cancellation.clone(),
-            Some("task cancellation".into()),
-        );
-        let executor = RuntimeObservationExecutor {
-            agent: executor.agent.clone(),
-            profile: executor.profile.clone(),
-            scope_mode: executor.scope_mode.clone(),
-            run_revision: executor.run_revision.clone(),
-            validator: check.check.adapter.clone(),
-            contract_version: check.adapter.descriptor().contract_version,
-        };
-        match driver
-            .drive(
-                check,
-                &ValidationDriveContext {
-                    scope,
-                    evidence,
-                    extensions: &bound.extensions,
-                    executor: &executor,
-                    journal,
-                    limits: ValidationDriverLimits::default(),
-                    cancellation: &cancellation,
-                    deadline,
-                },
-            )
-            .await?
-        {
-            ValidationDriverOutcome::Complete(_) => {
-                scope.mutation_generation = execution.mutation_generation();
-                evidence.collect_validation(&driver)
+    fn validate<'a>(
+        &'a self,
+        check: &'a BoundValidationCheck,
+        scope: &'a mut EvaluationScope,
+        evidence: &'a mut EvaluationEvidence,
+        execution: &'a Arc<RunExecution>,
+        bound: &'a BoundAutonomyProfile,
+        executor: &'a RuntimeObservationExecutor,
+        journal: &'a TaskValidationJournal,
+        resumed: Option<Box<ValidationDriverState>>,
+    ) -> ControllerFuture<'a, Option<Box<ValidationDriverState>>> {
+        Box::pin(async move {
+            let attempt = format!("{}:{}", scope.cycle, check.check.id);
+            scope
+                .validation_attempts
+                .insert(check.check.id.clone(), attempt.clone());
+            let capacity = execution.load_owned().await?;
+            let capacity: TaskCheckpointPayload = serde_json::from_value(capacity.payload)?;
+            if resumed.is_none()
+                && (check.adapter.descriptor().needs_judge
+                    || check.adapter.descriptor().needs_planner)
+                && capacity.counters.llm_attempts >= u64::from(capacity.limits.max_llm_calls)
+            {
+                execution.stop("llm_capacity");
+                return Err(AgentError::Other(
+                    "validation has no remaining provider allowance".into(),
+                ));
             }
-            ValidationDriverOutcome::AwaitExternal(_) => Err(AgentError::Config(
-                "external task suspension is not installed".into(),
-            )),
-        }
+            // A resumed attempt retains its original identity; capture_scope records current invocation/publication freshness separately.
+            if resumed.is_none() {
+                scope.mutation_generation = execution.mutation_generation();
+            }
+            let identity = Self::identity(
+                scope,
+                scope.cycle,
+                Some(attempt),
+                check.config_identity.clone(),
+            );
+            let mut driver = Box::new(if let Some(driver) = resumed {
+                ValidationDriverState::restore(
+                    serde_json::to_value(driver)?,
+                    check,
+                    scope,
+                    &bound.extensions,
+                )?
+            } else {
+                ValidationDriverState::new(check, identity)?
+            });
+            let snapshot = execution.load_owned().await?;
+            let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+            let millis = payload
+                .limits
+                .max_active_time_seconds
+                .saturating_mul(1000)
+                .saturating_sub(execution.consumed_active_millis()?);
+            let deadline = chrono::Utc::now()
+                .checked_add_signed(chrono::Duration::milliseconds(
+                    i64::try_from(millis)
+                        .map_err(|_| AgentError::Config("deadline overflow".into()))?,
+                ))
+                .ok_or_else(|| AgentError::Config("deadline overflow".into()))?;
+            let deadline = payload
+                .clocks
+                .expires_at
+                .map_or(deadline, |expiry| deadline.min(expiry));
+            let cancellation = ToolCancellationToken::new(
+                execution.cancellation.clone(),
+                Some("task cancellation".into()),
+            );
+            let executor = RuntimeObservationExecutor {
+                agent: executor.agent.clone(),
+                profile: executor.profile.clone(),
+                scope_mode: executor.scope_mode.clone(),
+                run_revision: executor.run_revision.clone(),
+                validator: check.check.adapter.clone(),
+                contract_version: check.adapter.descriptor().contract_version,
+            };
+            match driver
+                .drive(
+                    check,
+                    &ValidationDriveContext {
+                        scope,
+                        evidence,
+                        extensions: &bound.extensions,
+                        executor: &executor,
+                        journal,
+                        limits: ValidationDriverLimits::default(),
+                        cancellation: &cancellation,
+                        deadline,
+                    },
+                )
+                .await?
+            {
+                ValidationDriverOutcome::Complete(_) => {
+                    scope.mutation_generation = execution.mutation_generation();
+                    evidence.collect_validation(&driver)?;
+                    Ok(None)
+                }
+                ValidationDriverOutcome::AwaitExternal(_) | ValidationDriverOutcome::Suspended => {
+                    Ok(Some(driver))
+                }
+            }
+        })
     }
 
     /// Replaces duplicate driver captures with the acknowledged shared-executor records.

@@ -123,11 +123,16 @@ impl ValidationJournal for TaskValidationJournal {
         }
         if let Some(id) = &state.in_flight {
             let reservation_id = observation_reservation_id(state, id)?;
-            if payload.reservations.iter().any(|r| r.id == reservation_id)
-                || payload
-                    .reservations
-                    .iter()
-                    .any(|r| r.state == TaskEffectState::Uncertain)
+            let resumed = payload
+                .reservations
+                .iter()
+                .position(|r| r.id == reservation_id);
+            if resumed.is_some_and(|index| {
+                payload.reservations[index].state != TaskEffectState::Suspended
+            }) || payload
+                .reservations
+                .iter()
+                .any(|r| r.state == TaskEffectState::Uncertain)
             {
                 return Err(AgentError::Config(
                     "validation reservation already admitted or requires recovery".into(),
@@ -137,7 +142,7 @@ impl ValidationJournal for TaskValidationJournal {
                 let request = state.requests.get(id).ok_or_else(|| {
                     AgentError::Config("journal observation request missing".into())
                 })?;
-                if !self.invocation_accounting {
+                if !self.invocation_accounting && resumed.is_none() {
                     match request {
                         ValidationObservationRequest::Tool { tool, .. } => {
                             payload.counters.tool_attempts = payload
@@ -188,14 +193,45 @@ impl ValidationJournal for TaskValidationJournal {
                         }
                     }
                 }
-                payload.reservations.push(TaskReservation {
-                    id: reservation_id,
-                    state: TaskEffectState::Dispatched,
-                    reserved_micro_usd: 0,
-                    charged_micro_usd: 0,
-                    write_targets: vec![],
-                    result: None,
-                });
+                if let Some(index) = resumed {
+                    payload.reservations[index].state = TaskEffectState::Dispatched;
+                } else {
+                    payload.reservations.push(TaskReservation {
+                        id: reservation_id,
+                        state: TaskEffectState::Dispatched,
+                        reserved_micro_usd: 0,
+                        charged_micro_usd: 0,
+                        write_targets: vec![],
+                        result: None,
+                    });
+                }
+            }
+        }
+        if let Some(parked) = &state.parked {
+            let reservation_id = observation_reservation_id(state, &parked.observation)?;
+            let reservation = payload
+                .reservations
+                .iter_mut()
+                .find(|r| r.id == reservation_id)
+                .ok_or_else(|| {
+                    AgentError::Config("parked observation has no reservation".into())
+                })?;
+            if !matches!(
+                reservation.state,
+                TaskEffectState::Dispatched | TaskEffectState::Suspended
+            ) || reservation.result.is_some()
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            reservation.state = TaskEffectState::Suspended;
+            if let Some(pending) = &payload.pending {
+                if pending.id != parked.pending.id {
+                    return Err(AgentError::Config(
+                        "another response owns validation".into(),
+                    ));
+                }
+            } else {
+                payload.pending = Some(parked.pending.clone());
             }
         }
         for (id, completed) in &state.completed {

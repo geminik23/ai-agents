@@ -48,6 +48,12 @@ mod config;
 #[cfg(test)]
 mod continuation_tests;
 mod control;
+mod controller;
+#[cfg(test)]
+mod controller_failure_tests;
+#[cfg(test)]
+mod controller_tests;
+pub(crate) use controller::{ControllerContinuation, controller_checkpoint, retire_controller};
 mod journal;
 mod lifecycle;
 pub(crate) mod location;

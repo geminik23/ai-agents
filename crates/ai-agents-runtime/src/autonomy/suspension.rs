@@ -21,6 +21,7 @@ pub enum TaskResumeInput {
     QuestionTimeout {
         request_id: String,
     },
+    ExternalSignal(ExternalSignal),
 }
 
 /// Keeps question data separate from approval authority while using the same exact batch cursor.

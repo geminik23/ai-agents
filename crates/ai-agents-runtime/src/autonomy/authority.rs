@@ -31,6 +31,59 @@ pub(crate) struct HostValidationPermit {
 
 tokio::task_local! { static HOST_VALIDATION_PERMIT: HostValidationPermit; }
 
+/// A tool observation has one stable call identity across pauses without changing its immutable attempt binding.
+pub(crate) fn observation_tool_request(
+    request: &ValidationObservationRequest,
+    identity: &EvidenceIdentity,
+) -> Result<ToolExecutionRequest> {
+    let ValidationObservationRequest::Tool {
+        tool, arguments, ..
+    } = request
+    else {
+        return Err(AgentError::Config(
+            "observation is not a tool request".into(),
+        ));
+    };
+    let call_id = format!(
+        "validation:{}",
+        canonical_identity(&json!([
+            identity.key.run_id,
+            identity.attempt,
+            request.id()
+        ]))?
+    );
+    Ok(ToolExecutionRequest::new(
+        call_id,
+        tool,
+        arguments.clone(),
+        ToolCallSource::Task,
+    ))
+}
+
+/// Serialized park data must bind one exact pending operation; it cannot mint live resume authority.
+pub(crate) fn validate_observation_pause(parked: &ValidationObservationPause) -> Result<()> {
+    let pending: super::suspension::BatchApproval =
+        serde_json::from_value(parked.pending.reviewed_action.clone())?;
+    if pending.call_id != parked.request.call_id
+        || pending.request_id != parked.pending.id
+        || matches!(parked.pending.kind, TaskPendingKind::UserQuestion)
+            != pending.question.is_some()
+        || !matches!(
+            parked.pending.kind,
+            TaskPendingKind::UserQuestion | TaskPendingKind::Approval
+        )
+    {
+        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    if let Some(cursor) = &parked.executor {
+        let cursor: super::suspension::TaskExecutorCursor = serde_json::from_value(cursor.clone())?;
+        if cursor.request.call_id != parked.request.call_id || cursor.ancestry.len() > 32 {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+    }
+    Ok(())
+}
+
 /// Default production observation bridge keeps all tool work inside RuntimeAgent: ToolInvoker.
 pub struct RuntimeObservationExecutor {
     pub agent: Arc<crate::RuntimeAgent>,
@@ -91,6 +144,52 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
         Ok(())
     }
 
+    /// A suspension is resumable only when this executor owns exactly one matching pending operation.
+    fn take_suspension(
+        &self,
+        request: &ValidationObservationRequest,
+        identity: &EvidenceIdentity,
+        before: &EvaluationScope,
+    ) -> Result<Option<ValidationObservationPause>> {
+        let execution = current_execution().ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let call = observation_tool_request(request, identity)?;
+        let mut approvals = execution.take_parked_approvals(&self.agent.info().id);
+        if approvals.len() != 1 || approvals[0].call_id != call.call_id {
+            return Err(AgentError::Config(
+                "observation park requires exact operation custody".into(),
+            ));
+        }
+        let approval = approvals.remove(0);
+        let executor = execution
+            .parked_executor_cursors
+            .lock()
+            .remove(&(self.agent.info().id.clone(), call.call_id.clone()))
+            .map(serde_json::to_value)
+            .transpose()?;
+        let parked = ValidationObservationPause {
+            observation: request.id().to_owned(),
+            request: call,
+            pending: TaskPendingRequest {
+                id: approval.request_id.clone(),
+                issued_revision: execution
+                    .revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    + 1,
+                kind: if approval.question.is_some() {
+                    TaskPendingKind::UserQuestion
+                } else {
+                    TaskPendingKind::Approval
+                },
+                reviewed_action: serde_json::to_value(approval)?,
+            },
+            executor,
+            before: before.clone(),
+            authorized: Vec::new(),
+        };
+        validate_observation_pause(&parked)?;
+        Ok(Some(parked))
+    }
+
     /// Managed calls preserve identity, policy, approval, locks and exact execution records; run-wide admission is owned by the enclosing controller.
     async fn execute(
         &self,
@@ -109,37 +208,34 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                     plan: serde_json::to_value(plan)?,
                 })
             }
-            ValidationObservationRequest::Tool {
-                tool,
-                arguments,
-                host_binding,
-                ..
-            } => {
-                let request = ToolExecutionRequest::new(
-                    uuid::Uuid::new_v4().to_string(),
-                    tool,
-                    arguments.clone(),
-                    ToolCallSource::Task,
-                );
-                let record = if let Some(binding) = host_binding {
-                    self.agent
-                        .invoke_host_validation(
-                            binding,
-                            request,
-                            &HostValidationContext {
-                                identity,
-                                validator: &self.validator,
-                                contract_version: self.contract_version,
-                                profile: &self.profile,
-                                scope_mode: &self.scope_mode,
-                                run_revision: self
-                                    .run_revision
-                                    .load(std::sync::atomic::Ordering::Acquire),
-                            },
-                        )
-                        .await?
+            ValidationObservationRequest::Tool { host_binding, .. } => {
+                let request = observation_tool_request(request, identity)?;
+                let invocation = async {
+                    Ok::<_, AgentError>(if let Some(binding) = host_binding {
+                        self.agent
+                            .invoke_host_validation(
+                                binding,
+                                request,
+                                &HostValidationContext {
+                                    identity,
+                                    validator: &self.validator,
+                                    contract_version: self.contract_version,
+                                    profile: &self.profile,
+                                    scope_mode: &self.scope_mode,
+                                    run_revision: self
+                                        .run_revision
+                                        .load(std::sync::atomic::Ordering::Acquire),
+                                },
+                            )
+                            .await?
+                    } else {
+                        self.agent.invoke_tool(request).await?
+                    })
+                };
+                let record = if current_execution().is_some() {
+                    scope_task_batch(invocation).await?
                 } else {
-                    self.agent.invoke_tool(request).await?
+                    invocation.await?
                 };
                 Ok(ObservationResult::Tool {
                     record: Box::new(record),

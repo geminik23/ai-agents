@@ -33,6 +33,7 @@ pub(crate) struct RunExecution {
         std::collections::BTreeMap<String, Vec<super::suspension::BatchApproval>>,
     >,
     pub(crate) approval_deadlines: parking_lot::Mutex<std::collections::BTreeMap<String, Instant>>,
+    pub(crate) controller: parking_lot::Mutex<Option<Box<ControllerContinuation>>>,
     pub(crate) parked_batches:
         parking_lot::Mutex<std::collections::BTreeMap<String, TaskBatchState>>,
     pub(crate) parked_executor_cursors: parking_lot::Mutex<
@@ -91,6 +92,7 @@ impl RunExecution {
             parked_approvals: Default::default(),
             approval_deadlines: Default::default(),
             parked_batches: Default::default(),
+            controller: Default::default(),
             parked_executor_cursors: Default::default(),
             delegate_frames: Default::default(),
             stop: parking_lot::RwLock::new(None),

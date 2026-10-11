@@ -65,7 +65,36 @@ pub(crate) fn take_message() -> Option<MessageInvocation> {
         .flatten()
 }
 
-/// Serialized suspended markers require an exact recorded message frame and never authorize execution by themselves.
+// Separate decoding keeps optional validation data off nested message-checkpoint stacks.
+fn validate_suspended_observation(payload: &TaskCheckpointPayload, id: &str) -> Result<()> {
+    let mut matches = 0;
+    for value in payload
+        .adapters
+        .iter()
+        .filter_map(|adapter| adapter.state.get("_task_validation_driver"))
+    {
+        let state: Box<ValidationDriverState> = serde_json::from_value(value.clone())?;
+        if let Some(parked) = &state.parked {
+            super::authority::validate_observation_pause(parked)?;
+            if state.in_flight.is_some() || state.pending_batch.first() != Some(&parked.observation)
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            if canonical_identity(
+                &serde_json::json!({"check":state.check_id,"attempt":state.identity.attempt,"observation":parked.observation}),
+            )? == id
+            {
+                matches += 1;
+            }
+        }
+    }
+    if matches != 1 {
+        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    Ok(())
+}
+
+/// Serialized suspended markers require an exact recorded message or observation frame and never authorize execution by themselves.
 pub(crate) fn validate_suspended_attempts(
     payload: &TaskCheckpointPayload,
     status: TaskRunStatus,
@@ -77,6 +106,11 @@ pub(crate) fn validate_suspended_attempts(
     {
         if status.is_terminal() || reservation.result.is_some() {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        // Logical observation reservations need their own exact acknowledged cursor, not a fabricated message frame.
+        if let Some(id) = reservation.id.strip_prefix("validation:") {
+            validate_suspended_observation(payload, id)?;
+            continue;
         }
         let mut bindings = 0;
         for adapter in payload

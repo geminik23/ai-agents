@@ -101,6 +101,19 @@ pub struct ExternalSignal {
     pub payload: Value,
 }
 
+/// A safe observation pause retains the actual executor request and exact response binding, not executable authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationObservationPause {
+    pub observation: String,
+    pub request: ai_agents_core::ToolExecutionRequest,
+    pub pending: TaskPendingRequest,
+    pub executor: Option<Value>,
+    pub before: EvaluationScope,
+    #[serde(default)]
+    pub authorized: Vec<Value>,
+}
+
 /// In-flight records are recovery-required after a crash, never automatically reexecuted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,6 +131,8 @@ pub struct ValidationDriverState {
     pub requests: BTreeMap<String, ValidationObservationRequest>,
     pub completed: BTreeMap<String, CompletedObservation>,
     pub in_flight: Option<String>,
+    #[serde(default)]
+    pub parked: Option<Box<ValidationObservationPause>>,
     pub pending_batch: Vec<String>,
     #[serde(skip)]
     publication_identity: Option<String>,
@@ -166,6 +181,15 @@ pub trait ValidationObservationExecutor: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    /// Only an executor owning an exact acknowledged park may convert suspension into resumable progress.
+    fn take_suspension(
+        &self,
+        _request: &ValidationObservationRequest,
+        _identity: &EvidenceIdentity,
+        _before: &EvaluationScope,
+    ) -> Result<Option<ValidationObservationPause>> {
+        Ok(None)
+    }
     /// Must preserve shared policy/HITL/admission and return only authoritative managed observations.
     async fn execute(
         &self,
@@ -189,6 +213,7 @@ pub struct ValidationDriveContext<'a> {
 pub enum ValidationDriverOutcome {
     Complete(ValidationResult),
     AwaitExternal(ExternalWait),
+    Suspended,
 }
 
 impl ValidationDriverState {
@@ -244,6 +269,7 @@ impl ValidationDriverState {
             requests: BTreeMap::new(),
             completed: BTreeMap::new(),
             in_flight: None,
+            parked: None,
             pending_batch: vec![],
             publication_identity: None,
             wait: None,
@@ -270,6 +296,40 @@ impl ValidationDriverState {
         }
         Ok(state)
     }
+    /// Validates signal data without consuming it or requiring a storage claim.
+    pub fn validate_external(
+        &self,
+        signal: &ExternalSignal,
+        extensions: &FrozenAutonomyExtensions,
+    ) -> Result<()> {
+        bounded_value(&serde_json::to_value(signal)?, 65_536)?;
+        let mut projected = self.clone();
+        projected.external_events.insert(
+            signal.event_id.clone(),
+            canonical_identity(&serde_json::to_value(signal)?)?,
+        );
+        projected.checkpoint = json!({"adapter_state":self.checkpoint,"external_signal":signal.payload,"condition_request":signal.request_id});
+        projected.wait = None;
+        bounded_value(&serde_json::to_value(projected)?, 262_144)?;
+        let wait = self
+            .wait
+            .as_ref()
+            .ok_or_else(|| AgentError::Config("no pending external condition".into()))?;
+        if signal.request_id != wait.request_id
+            || signal.event_id.is_empty()
+            || signal.target_revision != wait.identity.target_revision
+            || extensions.condition(&wait.binding.id) != Some(&wait.binding)
+            || !wait.binding.shape.accepts(&signal.payload)
+            || self.external_events.contains_key(&signal.event_id)
+            || self.external_events.len() >= 64
+        {
+            return Err(AgentError::Config(
+                "invalid, duplicate or incompatible external signal".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// A signal is schema-validated, deduplicated and consumed once against the frozen wait binding.
     pub fn accept_external(
         &mut self,
@@ -281,6 +341,7 @@ impl ValidationDriverState {
                 "external wait issuance must be acknowledged before signal consumption".into(),
             ));
         }
+        self.validate_external(&signal, extensions)?;
         let wait = self
             .wait
             .as_ref()
@@ -446,6 +507,33 @@ impl ValidationDriverState {
                 "changed validation result identity".into(),
             ));
         }
+        if let Some(parked) = &self.parked {
+            let Some(ValidationObservationRequest::Tool {
+                tool, arguments, ..
+            }) = self.requests.get(&parked.observation)
+            else {
+                return Err(AgentError::Config(
+                    "parked observation has no tool request".into(),
+                ));
+            };
+            if self.in_flight.is_some()
+                || self.pending_batch.first() != Some(&parked.observation)
+                || serde_json::to_value(&parked.request)?
+                    != serde_json::to_value(super::authority::observation_tool_request(
+                        &self.requests[&parked.observation],
+                        &self.identity,
+                    )?)?
+                || parked.request.requested_name != *tool
+                || parked.request.arguments != *arguments
+                || self.wait.is_some()
+                || self.result.is_some()
+            {
+                return Err(AgentError::Config(
+                    "invalid parked observation binding".into(),
+                ));
+            }
+            super::authority::validate_observation_pause(parked)?;
+        }
         Ok(())
     }
 
@@ -456,8 +544,8 @@ impl ValidationDriverState {
             .is_some_and(|digest| serde_json::to_string(self).ok().as_ref() == Some(digest))
     }
 
-    // A failed acknowledgement clears publication authority, including cached terminal/wait reentry.
-    async fn acknowledge(&mut self, journal: &dyn ValidationJournal) -> Result<()> {
+    /// A failed acknowledgement clears publication authority, including cached terminal/wait reentry.
+    pub(crate) async fn acknowledge(&mut self, journal: &dyn ValidationJournal) -> Result<()> {
         self.publication_identity = None;
         journal.checkpoint(self).await?;
         self.publication_identity = Some(serde_json::to_string(self)?);
@@ -470,7 +558,7 @@ impl ValidationDriverState {
         binding: &BoundValidationCheck,
         context: &ValidationDriveContext<'_>,
         deadline: chrono::DateTime<chrono::Utc>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         while let Some(id) = self.pending_batch.first().cloned() {
             if context.cancellation.is_cancelled() || chrono::Utc::now() >= deadline {
                 return Err(AgentError::Other(
@@ -481,6 +569,7 @@ impl ValidationDriverState {
                 .executor
                 .preflight(&self.requests[&id], &self.identity)?;
             self.publication_identity = None;
+            let resumed = self.parked.take();
             self.in_flight = Some(id.clone());
             self.validate(binding, context.scope, context.extensions)?;
             context.journal.checkpoint(self).await?;
@@ -490,14 +579,36 @@ impl ValidationDriverState {
                 ));
             }
             let request = self.requests[&id].clone();
-            let before = context.executor.capture_scope(context.scope)?;
+            let before = match &resumed {
+                Some(parked) => parked.before.clone(),
+                None => context.executor.capture_scope(context.scope)?,
+            };
             let mut future = Box::pin(context.executor.execute(&request, &self.identity));
             let result = loop {
-                tokio::select! { result = &mut future => break result?, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
+                tokio::select! { result = &mut future => break result, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
                     if context.cancellation.is_cancelled() || chrono::Utc::now() >= deadline { return Err(AgentError::Other("validation interrupted with uncertain effect".into())); }
                 } }
             };
             drop(future);
+            let result = match result {
+                Err(AgentError::TaskSuspended(_)) => {
+                    let mut parked = context
+                        .executor
+                        .take_suspension(&request, &self.identity, &before)?
+                        .ok_or_else(|| {
+                            AgentError::Config("observation suspension has no live custody".into())
+                        })?;
+                    if let Some(previous) = &resumed {
+                        parked.authorized = previous.authorized.clone();
+                    }
+                    self.in_flight = None;
+                    self.parked = Some(Box::new(parked));
+                    self.validate(binding, context.scope, context.extensions)?;
+                    self.acknowledge(context.journal).await?;
+                    return Ok(true);
+                }
+                result => result?,
+            };
             validate_observation_result(&request, &result)?;
             let after = context.executor.capture_scope(context.scope)?;
             if after.key != before.key
@@ -535,7 +646,7 @@ impl ValidationDriverState {
             self.pending_batch.remove(0);
             context.journal.checkpoint(self).await?;
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Refuses stale attempt rewinds and preserves every acknowledged request/result before a journal can admit another effect.
@@ -543,6 +654,7 @@ impl ValidationDriverState {
         if self.identity.attempt != old.identity.attempt {
             if old.in_flight.is_some()
                 || old.wait.is_some()
+                || old.parked.is_some()
                 || old.result.is_none()
                 || !self.completed.is_empty()
                 || self.in_flight.is_some()
@@ -572,14 +684,37 @@ impl ValidationDriverState {
                 .any(|(id, event)| self.external_events.get(id) != Some(event))
             || (old.result.is_some()
                 && serde_json::to_value(&self.result)? != serde_json::to_value(&old.result)?)
-            || old
-                .in_flight
-                .as_ref()
-                .is_some_and(|id| !self.completed.contains_key(id))
+            || old.in_flight.as_ref().is_some_and(|id| {
+                !self.completed.contains_key(id)
+                    && self
+                        .parked
+                        .as_ref()
+                        .is_none_or(|parked| &parked.observation != id)
+            })
         {
             return Err(AgentError::Config(
                 "stale or uncertain validation journal continuation".into(),
             ));
+        }
+        if let Some(previous) = &old.parked {
+            if let Some(next) = &self.parked {
+                if next.observation != previous.observation
+                    || serde_json::to_value(&next.request)?
+                        != serde_json::to_value(&previous.request)?
+                    || serde_json::to_value(&next.before)?
+                        != serde_json::to_value(&previous.before)?
+                    || next.authorized.len() < previous.authorized.len()
+                    || next.authorized[..previous.authorized.len()] != previous.authorized
+                {
+                    return Err(AgentError::Config(
+                        "parked observation custody was replaced".into(),
+                    ));
+                }
+            } else if !self.completed.contains_key(&previous.observation)
+                && self.in_flight.as_ref() != Some(&previous.observation)
+            {
+                return Err(AgentError::Config("parked observation was skipped".into()));
+            }
         }
         if !old.pending_batch.is_empty()
             && self.pending_batch
@@ -668,7 +803,9 @@ impl ValidationDriverState {
                 ));
             }
             if !self.pending_batch.is_empty() {
-                self.execute_pending(binding, context, deadline).await?;
+                if self.execute_pending(binding, context, deadline).await? {
+                    return Ok(ValidationDriverOutcome::Suspended);
+                }
                 continue;
             }
             if self.rounds >= limits.max_evaluation_rounds {

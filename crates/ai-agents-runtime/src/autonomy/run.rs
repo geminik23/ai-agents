@@ -391,7 +391,7 @@ pub enum TaskPendingKind {
 pub enum TaskEffectState {
     Reserved,
     Dispatched,
-    /// A framework-owned message cursor has acknowledged quiescence without completing or refunding this invocation.
+    /// A framework-owned message or validation cursor has acknowledged quiescence without completing or refunding its reservation.
     Suspended,
     Completed,
     Uncertain,
@@ -702,6 +702,9 @@ impl TaskCheckpointPayload {
         }
         if envelope.status.is_terminal() && self.pending.is_some() {
             return Err(invalid());
+        }
+        if self.pause_reason.as_deref() == Some("validation") {
+            super::controller_checkpoint(self)?.ok_or_else(invalid)?;
         }
         super::message::validate_suspended_attempts(self, envelope.status)?;
         let uncertain = self.reservations.iter().any(|r| {
