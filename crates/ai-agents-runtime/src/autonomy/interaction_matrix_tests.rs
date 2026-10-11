@@ -70,6 +70,225 @@ async fn interaction_confirmation_repause_preserves_parsed_resolution() {
     assert_eq!(done.run.counters.turns, 1);
 }
 
+// Exhaustion review must preserve the objective rather than reinterpret the final unclear answer as new work.
+#[tokio::test]
+async fn interaction_escalation_preserves_original_input_and_rejection_stops() {
+    for approved in [false, true] {
+        let yaml = format!("{}hitl:\n  message_language:\n    strategy: explicit\n    explicit: en\n", CLARIFICATION.replace("  clarification:\n    llm: router\n", "  clarification:\n    llm: router\n    max_attempts: 2\n    on_max_attempts: escalate\n"));
+        let f = fixture(
+            &yaml,
+            &["done"],
+            &[AMBIGUOUS, QUESTION, r#"{"status":"unclear"}"#],
+        );
+        let first = f.runner.run("original objective", None).await.unwrap();
+        let review = f
+            .runner
+            .resume(
+                &first.run.key.run_id,
+                first.run.revision,
+                TaskResumeInput::UserAnswer {
+                    request_id: first.run.pending.as_ref().unwrap().id.clone(),
+                    answer: json!("maybe"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(review.run.status, TaskRunStatus::Paused);
+        assert!(matches!(
+            review.run.pending.as_ref().unwrap().kind,
+            TaskPendingKind::Approval
+        ));
+        let payload: TaskCheckpointPayload = serde_json::from_value(
+            f.store
+                .load(&review.run.key.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        let batch: TaskBatchState = serde_json::from_value(
+            payload
+                .adapters
+                .iter()
+                .find(|a| a.id == "runtime.tool_batch")
+                .unwrap()
+                .state
+                .clone(),
+        )
+        .unwrap();
+        let super::super::interaction::TaskInteractionKind::Escalation { input, .. } =
+            &batch.interaction.as_ref().unwrap().kind
+        else {
+            panic!("missing escalation cursor")
+        };
+        assert_eq!(input, "original objective");
+        assert_eq!(f.router.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 0);
+        let done = respond(
+            &f,
+            &review.run,
+            if approved {
+                ApprovalResult::Approved
+            } else {
+                ApprovalResult::Rejected { reason: None }
+            },
+        )
+        .await;
+        assert_eq!(
+            done.run.status,
+            if approved {
+                TaskRunStatus::Completed
+            } else {
+                TaskRunStatus::Failed
+            }
+        );
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), usize::from(approved));
+        assert_eq!(f.finalized.load(Ordering::SeqCst), 1);
+        assert_eq!(f.router.calls.load(Ordering::SeqCst), 3);
+    }
+}
+
+// Apologize-and-stop exhausts the task even when its localized text happens to satisfy a completion predicate.
+#[tokio::test]
+async fn interaction_exhaustion_stops_task_before_completion_gate() {
+    let yaml = CLARIFICATION.replace("  clarification:\n    llm: router\n", "  clarification:\n    llm: router\n    max_attempts: 2\n    on_max_attempts: apologize_and_stop\n");
+    let f = fixture(
+        &yaml,
+        &["done apology"],
+        &[
+            AMBIGUOUS,
+            QUESTION,
+            r#"{"status":"unclear"}"#,
+            "done apology",
+        ],
+    );
+    let first = f.runner.run("original objective", None).await.unwrap();
+    let done = f
+        .runner
+        .resume(
+            &first.run.key.run_id,
+            first.run.revision,
+            TaskResumeInput::UserAnswer {
+                request_id: first.run.pending.as_ref().unwrap().id.clone(),
+                answer: json!("maybe"),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.run.status, TaskRunStatus::Incomplete);
+    assert_eq!(
+        done.run.stop_reason.as_deref(),
+        Some("disambiguation_exhausted")
+    );
+    assert_eq!(f.router.calls.load(Ordering::SeqCst), 4);
+    assert_eq!(f.main.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.finalized.load(Ordering::SeqCst), 1);
+    assert_eq!(done.run.counters.turns, 1);
+}
+
+// Missing human escalation cannot turn a transfer message into evidence that the task objective completed.
+#[tokio::test]
+async fn interaction_unavailable_escalation_cannot_pass_completion_gate() {
+    let yaml = CLARIFICATION.replace(
+        "  clarification:\n    llm: router\n",
+        "  clarification:\n    llm: router\n    max_attempts: 2\n    on_max_attempts: escalate\n",
+    );
+    let f = fixture(
+        &yaml,
+        &["done transfer"],
+        &[
+            AMBIGUOUS,
+            QUESTION,
+            r#"{"status":"unclear"}"#,
+            "done transfer",
+        ],
+    );
+    let first = f.runner.run("objective", None).await.unwrap();
+    let done = f
+        .runner
+        .resume(
+            &first.run.key.run_id,
+            first.run.revision,
+            TaskResumeInput::UserAnswer {
+                request_id: first.run.pending.as_ref().unwrap().id.clone(),
+                answer: json!("maybe"),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.run.status, TaskRunStatus::Incomplete);
+    assert_eq!(
+        done.run.stop_reason.as_deref(),
+        Some("interaction_unavailable")
+    );
+    assert_eq!(done.run.counters.turns, 1);
+    assert_eq!(f.main.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(f.finalized.load(Ordering::SeqCst), 1);
+}
+
+// Host-approved escalation returns to the selected skill with its original processed context and no new routing.
+#[tokio::test]
+async fn interaction_skill_escalation_keeps_processed_context_and_selected_skill() {
+    for repause in [false, true] {
+        let yaml = format!("{}hitl:\n  message_language:\n    strategy: explicit\n    explicit: en\nprocess:\n  input:\n    - type: extract\n      config:\n        llm: router\n        schema:\n          tag:\n            type: string\n            required: true\n        store_in_context: extracted\n  output:\n    - type: format\n      config:\n        template: '{{{{ response }}}} : {{{{ context.extracted }}}}'\nskills:\n  - id: script\n    description: Finish task\n    trigger: Work requested\n    disambiguation:\n      enabled: true\n      required_clarity: [target]\n    steps:\n      - prompt: 'Finish {{{{ input }}}}'\n", CLARIFICATION.replace("  clarification:\n    llm: router\n", "  clarification:\n    llm: router\n    max_attempts: 2\n    on_max_attempts: escalate\n"));
+        let yaml = if repause {
+            yaml.replace(
+                "hitl:\n",
+                "hitl:\n  tools:\n    probe:\n      require_approval: true\n",
+            )
+            .replace(
+                "    steps:\n      - prompt:",
+                "    steps:\n      - tool: probe\n        args: {}\n      - prompt:",
+            )
+            .replace(
+                "system_prompt: test\n",
+                "system_prompt: test\ntools: [probe]\n",
+            )
+        } else {
+            yaml
+        };
+        let f = fixture(
+            &yaml,
+            &["done"],
+            &[
+                r#"{"is_ambiguous":false,"confidence":1.0}"#,
+                r#"{"tag":"original"}"#,
+                "script",
+                AMBIGUOUS,
+                QUESTION,
+                r#"{"status":"unclear"}"#,
+            ],
+        );
+        let first = f.runner.run("original objective", None).await.unwrap();
+        let review = f
+            .runner
+            .resume(
+                &first.run.key.run_id,
+                first.run.revision,
+                TaskResumeInput::UserAnswer {
+                    request_id: first.run.pending.as_ref().unwrap().id.clone(),
+                    answer: json!("maybe"),
+                },
+            )
+            .await
+            .unwrap();
+        let mut done = respond(&f, &review.run, ApprovalResult::Approved).await;
+        if repause {
+            assert_eq!(done.run.status, TaskRunStatus::Paused);
+            assert_eq!(f.router.calls.load(Ordering::SeqCst), 6);
+            assert_eq!(f.main.calls.load(Ordering::SeqCst), 0);
+            done = respond(&f, &done.run, ApprovalResult::Approved).await;
+        }
+        assert_eq!(done.run.status, TaskRunStatus::Completed);
+        assert!(done.final_response.unwrap().content.contains("original"));
+        assert_eq!(f.effects.load(Ordering::SeqCst), usize::from(repause));
+        assert_eq!(f.router.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.finalized.load(Ordering::SeqCst), 1);
+    }
+}
+
 #[tokio::test]
 async fn interaction_task_entry_cannot_consume_ordinary_clarification() {
     let f = fixture(CLARIFICATION, &["done"], &[AMBIGUOUS, QUESTION, ANSWER]);

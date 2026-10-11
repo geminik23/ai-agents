@@ -92,6 +92,8 @@ mod integration_tests;
 #[cfg(test)]
 mod observation_message_tests;
 mod observations;
+#[cfg(test)]
+mod paused_limit_tests;
 mod progress;
 #[cfg(test)]
 mod registry_tests;

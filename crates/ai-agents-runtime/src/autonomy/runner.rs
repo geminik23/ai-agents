@@ -1451,7 +1451,7 @@ impl AutonomyRunner {
         result
     }
 
-    /// The controller invokes internal turns, not public chat, and shares one ledger with validation observations.
+    /// The controller invokes internal turns and shares one ledger with validation; remaining capacity uses acknowledged limits rather than the original profile after host revision.
     /// Future erasure isolates retained validation data from nested model-message polling stacks.
     #[allow(clippy::too_many_arguments)]
     fn execute<'a>(
@@ -1540,7 +1540,7 @@ impl AutonomyRunner {
                         serde_json::from_value(snapshot.payload.clone())?;
                     if execution.check(&payload).is_err()
                         || (resumed_response.is_none()
-                            && payload.counters.turns >= u64::from(profile.max_turns))
+                            && payload.counters.turns >= u64::from(payload.limits.max_turns))
                     {
                         return self
                             .finish(
@@ -1572,11 +1572,11 @@ impl AutonomyRunner {
                     // This is an advisory view; live admission remains authoritative if time passes before dispatch.
                     let controller = json!({"objective":objective,"stage":scope.stage,"instruction":instruction,
                 "todos":todo.map(RunTodoAdapter::checkpoint).transpose()?,
-                "remaining_turns":profile.max_turns as u64-payload.counters.turns,
-                "remaining_llm_calls":(profile.max_llm_calls as u64).saturating_sub(payload.counters.llm_attempts),
-                "remaining_tool_calls":(profile.max_tool_calls as u64).saturating_sub(payload.counters.tool_attempts),
-                "remaining_command_calls":(profile.max_command_calls as u64).saturating_sub(payload.counters.command_attempts),
-                "remaining_active_seconds":profile.max_active_time_seconds.saturating_mul(1000).saturating_sub(execution.consumed_active_millis()?)/1000,
+                "remaining_turns":(payload.limits.max_turns as u64).saturating_sub(payload.counters.turns),
+                "remaining_llm_calls":(payload.limits.max_llm_calls as u64).saturating_sub(payload.counters.llm_attempts),
+                "remaining_tool_calls":(payload.limits.max_tool_calls as u64).saturating_sub(payload.counters.tool_attempts),
+                "remaining_command_calls":(payload.limits.max_command_calls as u64).saturating_sub(payload.counters.command_attempts),
+                "remaining_active_seconds":payload.limits.max_active_time_seconds.saturating_mul(1000).saturating_sub(execution.consumed_active_millis()?)/1000,
                 "remaining_wall_seconds":payload.clocks.expires_at.map(|expiry|(expiry-chrono::Utc::now()).num_seconds().max(0)),
                 "remaining_micro_usd":payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain)).map(|reservation| reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)).sum::<u64>())),
                 "remaining_declared_write_paths":payload.limits.max_declared_write_paths.map(|limit| (limit as usize).saturating_sub(payload.declared_write_targets.len())),
@@ -1839,8 +1839,9 @@ impl AutonomyRunner {
                             && payload.children.iter().all(|child| child.result.is_some()),
                         scope_ended: false,
                         additional_work_capacity: execution.stop_reason().is_none()
-                            && payload.counters.turns < u64::from(profile.max_turns)
-                            && payload.counters.llm_attempts < u64::from(profile.max_llm_calls),
+                            && payload.counters.turns < u64::from(payload.limits.max_turns)
+                            && payload.counters.llm_attempts
+                                < u64::from(payload.limits.max_llm_calls),
                         interaction_available: false,
                     },
                 )?;
@@ -1954,7 +1955,7 @@ impl AutonomyRunner {
                                 >= u64::from(
                                     policy
                                         .and_then(|p| p.max_continuations)
-                                        .unwrap_or(profile.max_turns),
+                                        .unwrap_or(payload.limits.max_turns),
                                 )
                             {
                                 return self
@@ -2115,7 +2116,7 @@ impl AutonomyRunner {
         Ok(())
     }
 
-    /// Invocation exhaustion and unanswered question timeout remain distinct from execution or ownership failure.
+    /// Capacity exhaustion and unanswered or exhausted clarification remain distinct from execution or ownership failure.
     fn stopped_status(execution: &RunExecution) -> TaskRunStatus {
         match execution.stop_reason().as_deref() {
             Some(
@@ -2128,7 +2129,8 @@ impl AutonomyRunner {
                 | "pipeline_timeout"
                 | "composition_timeout"
                 | "scope_ended"
-                | "interaction_unavailable",
+                | "interaction_unavailable"
+                | "disambiguation_exhausted",
             ) => TaskRunStatus::Incomplete,
             _ => TaskRunStatus::Failed,
         }

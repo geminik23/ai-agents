@@ -194,7 +194,13 @@ impl RuntimeAgent {
                     ));
                 }
             }
-            TaskInteractionKind::Escalation { .. } => {}
+            TaskInteractionKind::Escalation { skill_id, .. } => {
+                if let Some(skill) = skill_id
+                    && !self.get_available_skills().iter().any(|s| &s.id == skill)
+                {
+                    return Err(AgentError::Config("escalation skill scope changed".into()));
+                }
+            }
         }
         Ok(())
     }
@@ -269,7 +275,8 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Retained interaction futures are erased so optional semantic/transition drivers do not enlarge nested model polling frames.
+    /// Resumes the admitted non-tool location, retaining selected skill/input context through escalation without repeating routing or processing.
+    /// Future erasure keeps optional semantic/transition drivers out of nested model polling frames.
     pub(super) fn resume_task_interaction_batch(
         &self,
         mut input: crate::autonomy::AutonomyTurnInput,
@@ -314,6 +321,10 @@ impl RuntimeAgent {
                         self.root_user_message_committed
                             .store(state.user_message_committed, Ordering::SeqCst);
                         if let TaskInteractionKind::Clarification {
+                            prepared: Some(data),
+                            ..
+                        }
+                        | TaskInteractionKind::Escalation {
                             prepared: Some(data),
                             ..
                         } = &state.kind
@@ -377,6 +388,10 @@ impl RuntimeAgent {
                                         }
                                     }
                                 });
+                                let run = interaction::scope_clarification_return(
+                                    state.kind.clone(),
+                                    run,
+                                );
                                 if let Some(data) = prepared {
                                     interaction::scope_prepared_input(data.clone(), run).await
                                 } else {
@@ -423,14 +438,39 @@ impl RuntimeAgent {
                                 .await
                             }
                             (
-                                TaskInteractionKind::Escalation { input, reason },
+                                TaskInteractionKind::Escalation {
+                                    input,
+                                    reason,
+                                    prepared,
+                                    skill_id,
+                                },
                                 BatchResponse::Approval(result),
                             ) => {
                                 if matches!(
                                     result,
                                     ApprovalResult::Approved | ApprovalResult::Modified { .. }
                                 ) {
-                                    Box::pin(self.run_loop_internal(input)).await
+                                    if let Some(skill) = skill_id {
+                                        // Human approval keeps the selected skill; restarting routing would repeat completed semantic work.
+                                        let content =
+                                            Box::pin(self.execute_skill_by_id(skill, input))
+                                                .await?;
+                                        self.commit_rechecked_skill_input(input).await?;
+                                        let context = prepared
+                                            .as_ref()
+                                            .map(|data| data.context.clone())
+                                            .unwrap_or_default();
+                                        Box::pin(
+                                            self.handle_skill_response(
+                                                input, skill, content, &context,
+                                            ),
+                                        )
+                                        .await
+                                    } else if let Some(data) = prepared {
+                                        Box::pin(self.run_accepted_input(data.clone())).await
+                                    } else {
+                                        Box::pin(self.run_loop_internal(input)).await
+                                    }
                                 } else {
                                     execution.stop("approval_rejected");
                                     let response = AgentResponse::new(format!(

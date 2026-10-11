@@ -37,6 +37,10 @@ pub(crate) enum TaskInteractionKind {
     Escalation {
         input: String,
         reason: String,
+        #[serde(default)]
+        prepared: Option<ai_agents_process::ProcessData>,
+        #[serde(default)]
+        skill_id: Option<String>,
     },
 }
 
@@ -111,6 +115,7 @@ impl TaskInteraction {
 
 tokio::task_local! {
     static PREPARED_INPUT: Box<ai_agents_process::ProcessData>;
+    static CLARIFICATION_RETURN: Box<TaskInteractionKind>;
     static SKIP_TOOL_TRANSITION: bool;
 }
 
@@ -120,6 +125,21 @@ pub(crate) fn scope_prepared_input<F: Future>(
     future: F,
 ) -> impl Future<Output = F::Output> {
     PREPARED_INPUT.scope(Box::new(data), future)
+}
+
+/// Semantic answer parsing may exhaust clarification; the original live return position remains available until dispatch settles.
+pub(crate) fn scope_clarification_return<F: Future>(
+    state: TaskInteractionKind,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    CLARIFICATION_RETURN.scope(Box::new(state), future)
+}
+
+/// Only the admitted clarification driver supplies escalation context, never a new answer or serialized control request.
+pub(crate) fn clarification_return() -> Option<TaskInteractionKind> {
+    CLARIFICATION_RETURN
+        .try_with(|state| (**state).clone())
+        .ok()
 }
 
 /// Only a framework-installed processed input can become a skill clarification return position.

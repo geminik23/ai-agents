@@ -27,6 +27,37 @@ pub(crate) fn prepare_host_control(
     action: HostControlAction,
     host: &AutonomyHostCeilings,
 ) -> Result<(TaskCheckpointPayload, TaskRunStatus)> {
+    prepare_host_control_at_boundary(snapshot, action, host, false)
+}
+
+/// Limit-only revision can retain safe pending work because it changes no objective, request, cursor or evidence binding.
+pub(crate) fn prepare_paused_limit_revision(
+    snapshot: &TaskRunSnapshot,
+    limits: TaskRunLimits,
+    reason: &str,
+    host: &AutonomyHostCeilings,
+) -> Result<(TaskCheckpointPayload, TaskRunStatus)> {
+    if snapshot.status != TaskRunStatus::Paused || snapshot.owner_token.is_some() {
+        return Err(TaskRunStorageError::NotResumable.into());
+    }
+    prepare_host_control_at_boundary(
+        snapshot,
+        HostControlAction::ReviseLimits {
+            limits,
+            reason: reason.into(),
+        },
+        host,
+        true,
+    )
+}
+
+// Pending-work relaxation is exclusive to limit revision; unknown effects and active intervals remain ineligible.
+fn prepare_host_control_at_boundary(
+    snapshot: &TaskRunSnapshot,
+    action: HostControlAction,
+    host: &AutonomyHostCeilings,
+    paused_limits: bool,
+) -> Result<(TaskCheckpointPayload, TaskRunStatus)> {
     let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
     if snapshot.status.is_terminal()
         || snapshot.cancel_requested
@@ -34,9 +65,10 @@ pub(crate) fn prepare_host_control(
             .clocks
             .expires_at
             .is_some_and(|expiry| chrono::Utc::now() >= expiry)
-        || payload.pending.is_some()
-        || payload.children.iter().any(|c| c.pending.is_some())
-        || !matches!(payload.runtime.continuation, TaskContinuation::BetweenTurns)
+        || (!paused_limits
+            && (payload.pending.is_some()
+                || payload.children.iter().any(|c| c.pending.is_some())
+                || !matches!(payload.runtime.continuation, TaskContinuation::BetweenTurns)))
         || payload.clocks.active_interval_started_at.is_some()
         || payload.reservations.iter().any(|r| {
             matches!(

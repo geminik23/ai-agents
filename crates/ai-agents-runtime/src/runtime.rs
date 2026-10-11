@@ -10531,7 +10531,7 @@ Respond in JSON format:
         Box::pin(self.resolve_disambiguation_inner(input))
     }
 
-    /// Installed-manager work retains semantic phases under the current root owner.
+    /// Installed-manager work retains original task input and skill positions through escalation; exhausted tasks stop before completion gates.
     /// Its optional future is constructed outside unrelated nested model polling frames.
     async fn resolve_disambiguation_inner(&self, input: &str) -> Result<DisambiguationDispatch> {
         let Some(ref disambiguator) = self.disambiguation_manager else {
@@ -10702,17 +10702,47 @@ Respond in JSON format:
                         format!("I'm sorry, I couldn't understand your request: {}", reason)
                     });
                 let response = AgentResponse::new(&apology);
+                if let Some(execution) = crate::autonomy::current_execution() {
+                    execution.stop("disambiguation_exhausted");
+                }
                 self.finish_turn_if_root(&response).await?;
                 Ok(DisambiguationDispatch::Terminal(response))
             }
             DisambiguationResult::Escalate { reason } => {
+                let (original_input, prepared, skill_id) =
+                    match crate::autonomy::interaction::clarification_return() {
+                        Some(
+                            crate::autonomy::interaction::TaskInteractionKind::Clarification {
+                                manager,
+                                input: original,
+                                prepared,
+                                skill_id,
+                            },
+                        ) => (
+                            manager
+                                .get("original_input")
+                                .and_then(Value::as_str)
+                                .unwrap_or(&original)
+                                .to_string(),
+                            prepared,
+                            skill_id,
+                        ),
+                        _ => (
+                            input.to_string(),
+                            crate::autonomy::interaction::prepared_input(),
+                            self.pending_skill_id.read().clone(),
+                        ),
+                    };
                 *self.pending_skill_id.write() = None;
                 info!(reason = %reason, "Escalating to human");
                 if let Some(ref hitl) = self.hitl_engine {
                     let trigger =
                         ApprovalTrigger::condition("disambiguation_escalation", reason.clone());
                     let mut context_map = HashMap::new();
-                    context_map.insert("original_input".to_string(), serde_json::json!(input));
+                    context_map.insert(
+                        "original_input".to_string(),
+                        serde_json::json!(&original_input),
+                    );
                     context_map.insert("reason".to_string(), serde_json::json!(&reason));
                     let check_result = HITLCheckResult::required(
                         trigger,
@@ -10723,8 +10753,10 @@ Respond in JSON format:
                     if let Some(request) = check_result.clone().into_request() {
                         self.park_task_interaction(
                             crate::autonomy::interaction::TaskInteractionKind::Escalation {
-                                input: input.into(),
+                                input: original_input.clone(),
                                 reason: reason.clone(),
+                                prepared,
+                                skill_id,
                             },
                             Some(request),
                             None,
@@ -10750,6 +10782,9 @@ Respond in JSON format:
                         format!("I need human assistance to help with your request: {}", reason)
                     });
                 let response = AgentResponse::new(&apology);
+                if let Some(execution) = crate::autonomy::current_execution() {
+                    execution.stop("interaction_unavailable");
+                }
                 self.finish_turn_if_root(&response).await?;
                 Ok(DisambiguationDispatch::Terminal(response))
             }

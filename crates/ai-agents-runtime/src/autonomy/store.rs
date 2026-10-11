@@ -15,6 +15,25 @@ pub trait TaskRunStore: Send + Sync {
     async fn load(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>>;
     /// Applies a conditional operation without executing external work.
     async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot>;
+    /// Declares validated paused-limit support before the runner starts a potentially ambiguous control write.
+    fn supports_paused_limit_revision(&self) -> bool {
+        false
+    }
+    /// Applies a limit-only CAS with the original admission deadline; None certifies no write, while Err may be ambiguous.
+    /// Custom stores fail closed unless they implement the same preflight and acknowledgement contract.
+    async fn revise_paused_limits(
+        &self,
+        _run_id: &str,
+        _expected_revision: u64,
+        _limits: super::TaskRunLimits,
+        _reason: &str,
+        _host: &super::AutonomyHostCeilings,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        Err(AgentError::Config(
+            "paused limit revision is unsupported by this task store".into(),
+        ))
+    }
     /// Lists safe metadata, never raw recovery data.
     async fn list(&self) -> Result<Vec<TaskRunSummary>>;
     /// Deletes unowned data at the expected revision.
@@ -92,6 +111,8 @@ impl ScopedTaskRunStore {
             owner_token: previous.owner_token.clone(),
             status,
             payload: serde_json::to_value(&payload)?,
+            deadline: None,
+            expires_at: old.clocks.expires_at,
         };
         let proposed = previous.transition(&mutation, chrono::Utc::now())?;
         self.validate(&proposed)?;
@@ -169,6 +190,76 @@ impl TaskRunStore for ScopedTaskRunStore {
             .await?;
         self.validate(&saved)?;
         Ok(saved)
+    }
+
+    /// Both supported scoped backends use the same preflight and conditional host-control transition.
+    fn supports_paused_limit_revision(&self) -> bool {
+        true
+    }
+
+    /// Preserves pending requests and every execution/evidence field while validating numeric ceilings before the backend CAS.
+    async fn revise_paused_limits(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        limits: super::TaskRunLimits,
+        reason: &str,
+        host: &super::AutonomyHostCeilings,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        let previous = self
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if previous.revision != expected_revision {
+            return Ok(None);
+        }
+        let old: TaskCheckpointPayload = serde_json::from_value(previous.payload.clone())?;
+        let (payload, status) =
+            match super::control::prepare_paused_limit_revision(&previous, limits, reason, host) {
+                Ok(prepared) => prepared,
+                Err(_) => return Ok(None),
+            };
+        let mutation = TaskRunMutation::HostControl {
+            expected_revision,
+            owner_token: None,
+            status,
+            payload: serde_json::to_value(&payload)?,
+            deadline,
+            expires_at: old.clocks.expires_at,
+        };
+        let proposed = match previous.transition(&mutation, chrono::Utc::now()) {
+            Ok(proposed) => proposed,
+            Err(AgentError::TaskRunStorage(
+                TaskRunStorageError::AdmissionExpired
+                | TaskRunStorageError::Conflict
+                | TaskRunStorageError::NotResumable,
+            )) => return Ok(None),
+            Err(_) => return Ok(None),
+        };
+        if self.validate(&proposed).is_err()
+            || payload
+                .validate_successor_with_control(&old, proposed.revision, false, true)
+                .is_err()
+        {
+            return Ok(None);
+        }
+        // These protocol rejections occur before commit; transport/commit errors remain ambiguous and retain owner protection.
+        let saved = match self
+            .storage
+            .mutate_task_run(&self.key(run_id), &mutation)
+            .await
+        {
+            Ok(saved) => saved,
+            Err(AgentError::TaskRunStorage(
+                TaskRunStorageError::AdmissionExpired
+                | TaskRunStorageError::Conflict
+                | TaskRunStorageError::NotResumable,
+            )) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        self.validate(&saved)?;
+        Ok(Some(saved))
     }
 
     /// Actorless scope excludes actor-owned runs even though the raw backend supports broad listing.

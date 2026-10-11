@@ -55,8 +55,10 @@ struct Fixture {
     root: Arc<crate::RuntimeAgent>,
     main: Arc<super::runner_tests::RecordingProvider>,
     child: Arc<super::runner_tests::RecordingProvider>,
+    worker: Arc<crate::RuntimeAgent>,
     calls: Arc<AtomicUsize>,
     store: Arc<ScopedTaskRunStore>,
+    config: AutonomyConfig,
 }
 // This observation is an actual Task-origin message, not a model call manufactured to obtain child cursor authority.
 async fn fixture() -> Fixture {
@@ -69,6 +71,7 @@ async fn fixture_repause(repause: bool) -> Fixture {
 }
 
 // Private fixed host validation authority survives child parking without exposing the operation to the model.
+// The actual child and configuration remain available for acknowledgement fault injection without replacing runtime execution.
 async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
     let registry = Arc::new(AgentRegistry::new());
     let question = ai_agents_core::encode_native_tool_call_markers(
@@ -113,6 +116,7 @@ async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
         ))
         .await
         .unwrap();
+    let worker = registry.get("worker").unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let mut extensions = AutonomyExtensions::builtins();
     extensions
@@ -181,7 +185,7 @@ async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
     });
     let runner = AutonomyRunner::try_new(
         root.clone(),
-        config,
+        config.clone(),
         Default::default(),
         store.clone(),
         "observation-message.v1".into(),
@@ -192,8 +196,10 @@ async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
         root,
         main,
         child,
+        worker,
         calls,
         store,
+        config,
     }
 }
 
@@ -380,4 +386,592 @@ async fn observation_message_child_resume_returns_to_exact_validation_position()
     assert_eq!(done.run.counters.tool_attempts, 2);
     assert_eq!(done.run.counters.llm_attempts, 3);
     assert!(f.root.set_context("released", json!(true)).is_ok());
+}
+
+mod acknowledgement {
+    use super::*;
+    use ai_agents_core::{AgentError, Result};
+    use async_trait::async_trait;
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        RejectWrite,
+        LoseAcknowledgement,
+        HoldAcknowledgement,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Boundary {
+        Admission,
+        Repark,
+    }
+
+    // Select an exact journal boundary, not a write ordinal or the earlier public request consumption.
+    struct AckStore {
+        inner: Arc<ScopedTaskRunStore>,
+        fault: Fault,
+        boundary: Boundary,
+        before_write: parking_lot::Mutex<Option<TaskRunSnapshot>>,
+        armed: parking_lot::Mutex<Option<(String, String)>>,
+        hits: AtomicUsize,
+        entered: tokio::sync::Semaphore,
+        release: tokio::sync::Semaphore,
+    }
+
+    impl AckStore {
+        // Arm only after the initial pause so the original observation admission is never intercepted.
+        fn arm(&self, run: &TaskRun) {
+            *self.armed.lock() = Some((
+                run.key.run_id.clone(),
+                run.pending.as_ref().unwrap().id.clone(),
+            ));
+        }
+
+        // Admission gates child execution; re-park acknowledgement gates publication of its new pending request.
+        fn intercept(&self, run_id: &str, mutation: &TaskRunMutation) -> bool {
+            let TaskRunMutation::Checkpoint {
+                status: TaskRunStatus::Running,
+                payload,
+                release: false,
+                ..
+            } = mutation
+            else {
+                return false;
+            };
+            let mut armed = self.armed.lock();
+            let Some((expected_run, request_id)) = armed.as_ref() else {
+                return false;
+            };
+            if run_id != expected_run {
+                return false;
+            }
+            let payload: TaskCheckpointPayload = serde_json::from_value(payload.clone()).unwrap();
+            let driver = driver(&payload);
+            if !payload.consumed_request_ids.contains(request_id)
+                || driver.identity.key.run_id != run_id
+                || driver.pending_batch != ["message"]
+                || !driver.completed.is_empty()
+            {
+                return false;
+            }
+            let selected = match self.boundary {
+                Boundary::Admission => {
+                    payload.pending.is_none()
+                        && driver.in_flight.as_deref() == Some("message")
+                        && driver.parked.is_none()
+                }
+                Boundary::Repark => {
+                    driver.in_flight.is_none()
+                        && driver.parked.as_ref().is_some_and(|parked| {
+                            parked.observation == "message"
+                                && parked.group.is_some()
+                                && parked.pending.id != *request_id
+                                && payload
+                                    .pending
+                                    .as_ref()
+                                    .is_some_and(|pending| pending.id == parked.pending.id)
+                        })
+                }
+            };
+            if !selected {
+                return false;
+            }
+            armed.take();
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[async_trait]
+    impl TaskRunStore for AckStore {
+        // The wrapper leaves creation and ordinary conditional storage semantics unchanged.
+        async fn create(&self, snapshot: &TaskRunSnapshot) -> Result<()> {
+            self.inner.create(snapshot).await
+        }
+
+        // Reads expose the real committed state even when the caller lost acknowledgement.
+        async fn load(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>> {
+            self.inner.load(run_id).await
+        }
+
+        // Listing never fabricates a safely published pause after an interrupted write.
+        async fn list(&self) -> Result<Vec<TaskRunSummary>> {
+            self.inner.list().await
+        }
+
+        // Deletion retains the scoped store's revision and ownership checks.
+        async fn delete(&self, run_id: &str, revision: u64) -> Result<()> {
+            self.inner.delete(run_id, revision).await
+        }
+
+        // Failure may precede commit or follow it; a held acknowledgement is released or dropped deterministically.
+        async fn mutate(
+            &self,
+            run_id: &str,
+            mutation: &TaskRunMutation,
+        ) -> Result<TaskRunSnapshot> {
+            if !self.intercept(run_id, mutation) {
+                return self.inner.mutate(run_id, mutation).await;
+            }
+            *self.before_write.lock() = self.inner.load(run_id).await?;
+            if matches!(self.fault, Fault::RejectWrite) {
+                return Err(AgentError::Persistence(
+                    "observation admission write rejected".into(),
+                ));
+            }
+            let saved = self.inner.mutate(run_id, mutation).await?;
+            if matches!(self.fault, Fault::LoseAcknowledgement) {
+                return Err(AgentError::Persistence(
+                    "observation admission acknowledgement lost".into(),
+                ));
+            }
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+            Ok(saved)
+        }
+    }
+
+    // Existing admission tests keep their original single-question child.
+    async fn fixture(fault: Fault) -> (Fixture, Arc<AckStore>) {
+        Box::pin(fixture_at(fault, Boundary::Admission)).await
+    }
+
+    // Re-park uses the existing two-question child; only the selected acknowledgement is intercepted.
+    async fn fixture_at(fault: Fault, boundary: Boundary) -> (Fixture, Arc<AckStore>) {
+        Box::pin(fixture_on(fault, boundary, false)).await
+    }
+
+    // Both scoped backends exercise the same real runtimes and exact journal acknowledgement selector.
+    async fn fixture_on(
+        fault: Fault,
+        boundary: Boundary,
+        sqlite: bool,
+    ) -> (Fixture, Arc<AckStore>) {
+        let mut f = Box::pin(super::fixture_repause(matches!(boundary, Boundary::Repark))).await;
+        if sqlite {
+            #[cfg(feature = "sqlite")]
+            {
+                f.store = Arc::new(
+                    ScopedTaskRunStore::new(
+                        Arc::new(ai_agents_storage::SqliteStorage::in_memory().await.unwrap()),
+                        f.root.info().id,
+                        None,
+                        "observation-message.v1".into(),
+                    )
+                    .unwrap(),
+                );
+            }
+            #[cfg(not(feature = "sqlite"))]
+            panic!("SQLite fixture requires its feature");
+        }
+        let store = Arc::new(AckStore {
+            inner: f.store.clone(),
+            fault,
+            boundary,
+            before_write: parking_lot::Mutex::new(None),
+            armed: parking_lot::Mutex::new(None),
+            hits: AtomicUsize::new(0),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        f.runner = AutonomyRunner::try_new(
+            f.root.clone(),
+            f.config.clone(),
+            Default::default(),
+            store.clone(),
+            "observation-message.v1".into(),
+        )
+        .unwrap();
+        (f, store)
+    }
+
+    // The selected fixture has one exact observation driver and one logical reservation for its message.
+    fn driver(payload: &TaskCheckpointPayload) -> ValidationDriverState {
+        serde_json::from_value(
+            payload
+                .adapters
+                .iter()
+                .find(|adapter| adapter.id == "check")
+                .unwrap()
+                .state["_task_validation_driver"]
+                .clone(),
+        )
+        .unwrap()
+    }
+
+    // Construct only the implementation-bound answer; a coordinating request ID is not a child authority token.
+    fn answer(run: &TaskRun) -> TaskResumeInput {
+        TaskResumeInput::UserAnswer {
+            request_id: run.pending.as_ref().unwrap().id.clone(),
+            answer: json!({"answered":true,"selected":["yes"]}),
+        }
+    }
+
+    // A semaphore observes the accepted write without timing the child; the timeout only bounds a broken test.
+    async fn await_acknowledgement<F>(resume: &mut std::pin::Pin<Box<F>>, store: &AckStore)
+    where
+        F: std::future::Future<Output = Result<TaskRunResult>>,
+    {
+        tokio::select! {
+            result = resume => panic!("resume returned before acknowledgement gate: {result:?}"),
+            permit = tokio::time::timeout(std::time::Duration::from_secs(5), store.entered.acquire()) => {
+                permit.unwrap().unwrap().forget();
+            }
+        }
+    }
+
+    // Durable admission does not prove child execution, and neither failed path may release root or child protection.
+    async fn assert_undelivered(f: &Fixture, original: &TaskRunSnapshot, committed: bool) {
+        let saved = f.store.load(&original.key.run_id).await.unwrap().unwrap();
+        let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+        let before: TaskCheckpointPayload =
+            serde_json::from_value(original.payload.clone()).unwrap();
+        let before_driver = driver(&before);
+        let current_driver = driver(&payload);
+        assert_eq!(saved.status, TaskRunStatus::Running);
+        assert!(saved.owner_token.is_some());
+        assert!(payload.pending.is_none());
+        assert!(
+            payload
+                .consumed_request_ids
+                .contains(&before.pending.unwrap().id)
+        );
+        assert_eq!(current_driver.identity, before_driver.identity);
+        assert_eq!(current_driver.requests, before_driver.requests);
+        assert_eq!(
+            serde_json::to_value(&payload.counters).unwrap(),
+            serde_json::to_value(&before.counters).unwrap()
+        );
+        assert_eq!(
+            current_driver.in_flight.as_deref(),
+            committed.then_some("message")
+        );
+        assert_eq!(current_driver.parked.is_some(), !committed);
+        assert!(current_driver.completed.is_empty());
+        let reservation_id = format!(
+            "validation:{}",
+            canonical_identity(&json!({"check":"check","attempt":current_driver.identity.attempt,"observation":"message"})).unwrap()
+        );
+        let reservation = payload
+            .reservations
+            .iter()
+            .find(|r| r.id == reservation_id)
+            .unwrap();
+        assert_eq!(
+            reservation.state,
+            if committed {
+                TaskEffectState::Dispatched
+            } else {
+                TaskEffectState::Suspended
+            }
+        );
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert!(f.root.set_context("unrelated", json!(true)).is_err());
+        assert!(f.worker.set_context("unrelated", json!(true)).is_err());
+        assert_eq!(
+            serde_json::to_value(f.root.save_state_full().await.unwrap().memory.messages).unwrap(),
+            serde_json::to_value(&before.runtime.snapshot.memory.messages).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(f.worker.save_state_full().await.unwrap().memory.messages)
+                .unwrap(),
+            serde_json::to_value(&before.children[0].runtime.snapshot.memory.messages).unwrap()
+        );
+    }
+
+    // Neither the stale public pause nor the newer stored admission can authorize automatic replay after abandonment.
+    async fn assert_replay_rejected(f: &Fixture, paused: &TaskRunResult) {
+        let run_id = &paused.run.key.run_id;
+        let saved = f.store.load(run_id).await.unwrap().unwrap();
+        for revision in [paused.run.revision, saved.revision] {
+            assert!(
+                f.runner
+                    .resume(run_id, revision, answer(&paused.run))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            f.store.load(run_id).await.unwrap().unwrap().revision,
+            saved.revision
+        );
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+    }
+
+    // Rejected writes and committed-but-unacknowledged writes both stop before child response execution.
+    #[tokio::test]
+    async fn observation_message_failed_resume_acknowledgement_preserves_child_custody() {
+        for fault in [Fault::RejectWrite, Fault::LoseAcknowledgement] {
+            let (f, store) = Box::pin(fixture(fault)).await;
+            let paused = f.runner.run("objective", None).await.unwrap();
+            let original = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+            store.arm(&paused.run);
+            let error = f
+                .runner
+                .resume(
+                    &paused.run.key.run_id,
+                    paused.run.revision,
+                    answer(&paused.run),
+                )
+                .await
+                .unwrap_err();
+            let expected = if matches!(fault, Fault::RejectWrite) {
+                "observation admission write rejected"
+            } else {
+                // The committed but unacknowledged revision fails the subsequent owned read, not just the injected write.
+                "task revision or owner conflicts"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+            assert_undelivered(&f, &original, matches!(fault, Fault::LoseAcknowledgement)).await;
+            assert_replay_rejected(&f, &paused).await;
+        }
+    }
+
+    // Dropping after commit retains the dispatched journal and both live owners without delivering the child answer.
+    #[tokio::test]
+    async fn observation_message_dropped_resume_acknowledgement_preserves_child_custody() {
+        let (f, store) = Box::pin(fixture(Fault::HoldAcknowledgement)).await;
+        let paused = f.runner.run("objective", None).await.unwrap();
+        let original = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+        store.arm(&paused.run);
+        let mut resume = Box::pin(f.runner.resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            answer(&paused.run),
+        ));
+        await_acknowledgement(&mut resume, &store).await;
+        drop(resume);
+        assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+        assert_undelivered(&f, &original, true).await;
+        assert_replay_rejected(&f, &paused).await;
+    }
+
+    // Re-park preserves completed child work but cannot publish a safe pause or accept its next answer without acknowledgement.
+    async fn assert_repark_protected(f: &Fixture, store: &AckStore, committed: bool) {
+        let before = store.before_write.lock().clone().unwrap();
+        let saved = f.store.load(&before.key.run_id).await.unwrap().unwrap();
+        let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload.clone()).unwrap();
+        let previous: TaskCheckpointPayload =
+            serde_json::from_value(before.payload.clone()).unwrap();
+        let current_driver = driver(&payload);
+        assert_eq!(saved.status, TaskRunStatus::Running);
+        assert!(saved.owner_token.is_some());
+        assert_eq!(current_driver.identity, driver(&previous).identity);
+        assert_eq!(current_driver.requests, driver(&previous).requests);
+        assert!(current_driver.completed.is_empty());
+        assert_eq!(current_driver.parked.is_some(), committed);
+        assert_eq!(
+            current_driver.in_flight.as_deref(),
+            (!committed).then_some("message")
+        );
+        if !committed {
+            assert_eq!(saved.revision, before.revision);
+            assert_eq!(saved.payload, before.payload);
+        } else {
+            assert_eq!(saved.revision, before.revision + 1);
+            assert_eq!(
+                payload.pending.as_ref().unwrap().id,
+                current_driver.parked.as_ref().unwrap().pending.id
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&payload.counters).unwrap(),
+            serde_json::to_value(&previous.counters).unwrap()
+        );
+        assert_eq!(payload.counters.turns, 1);
+        assert_eq!(payload.counters.llm_attempts, 3);
+        assert_eq!(payload.counters.tool_attempts, 2);
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert!(f.root.set_context("unrelated", json!(true)).is_err());
+        assert!(f.worker.set_context("unrelated", json!(true)).is_err());
+        assert_eq!(
+            serde_json::to_value(f.worker.save_state_full().await.unwrap().memory.messages)
+                .unwrap(),
+            serde_json::to_value(&payload.children[0].runtime.snapshot.memory.messages).unwrap()
+        );
+        if let Some(pending) = payload.pending {
+            assert!(
+                f.runner
+                    .resume(
+                        &saved.key.run_id,
+                        saved.revision,
+                        TaskResumeInput::UserAnswer {
+                            request_id: pending.id,
+                            answer: json!({"answered":true,"selected":["yes"]}),
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                f.store
+                    .load(&saved.key.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                saved.revision
+            );
+        }
+    }
+
+    // Both sides of commit retain completed first-question work instead of replaying it or exposing the second answer.
+    #[tokio::test]
+    async fn observation_message_failed_repark_acknowledgement_preserves_completed_child_work() {
+        for fault in [Fault::RejectWrite, Fault::LoseAcknowledgement] {
+            let (f, store) = Box::pin(fixture_at(fault, Boundary::Repark)).await;
+            let paused = f.runner.run("objective", None).await.unwrap();
+            store.arm(&paused.run);
+            assert!(
+                f.runner
+                    .resume(
+                        &paused.run.key.run_id,
+                        paused.run.revision,
+                        answer(&paused.run)
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+            assert_repark_protected(&f, &store, matches!(fault, Fault::LoseAcknowledgement)).await;
+        }
+    }
+
+    // A durable new pending ID remains non-resumable when its acknowledgement is dropped before pause publication.
+    #[tokio::test]
+    async fn observation_message_dropped_repark_acknowledgement_preserves_completed_child_work() {
+        let (f, store) = Box::pin(fixture_at(Fault::HoldAcknowledgement, Boundary::Repark)).await;
+        let paused = f.runner.run("objective", None).await.unwrap();
+        store.arm(&paused.run);
+        let mut resume = Box::pin(f.runner.resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            answer(&paused.run),
+        ));
+        await_acknowledgement(&mut resume, &store).await;
+        drop(resume);
+        assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+        assert_repark_protected(&f, &store, true).await;
+    }
+
+    // Successful re-park acknowledgement publishes the new coordinating request and resumes only the second child question.
+    #[tokio::test]
+    async fn observation_message_repark_waits_for_acknowledgement_before_publishing_pause() {
+        let (f, store) = Box::pin(fixture_at(Fault::HoldAcknowledgement, Boundary::Repark)).await;
+        let first = f.runner.run("objective", None).await.unwrap();
+        store.arm(&first.run);
+        let mut resume = Box::pin(f.runner.resume(
+            &first.run.key.run_id,
+            first.run.revision,
+            answer(&first.run),
+        ));
+        await_acknowledgement(&mut resume, &store).await;
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            f.store
+                .load(&first.run.key.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskRunStatus::Running
+        );
+        store.release.add_permits(1);
+        let second = resume.await.unwrap();
+        assert_eq!(second.run.status, TaskRunStatus::Paused);
+        assert_ne!(
+            second.run.pending.as_ref().unwrap().id,
+            first.run.pending.as_ref().unwrap().id
+        );
+        let done = f
+            .runner
+            .resume(
+                &second.run.key.run_id,
+                second.run.revision,
+                answer(&second.run),
+            )
+            .await
+            .unwrap();
+        assert_eq!(done.run.status, TaskRunStatus::Completed);
+        assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(done.run.counters.tool_attempts, 3);
+        assert!(f.root.set_context("released", json!(true)).is_ok());
+        assert!(f.worker.set_context("released", json!(true)).is_ok());
+    }
+
+    // SQLite must preserve the same non-execution or completed-child custody on both sides of each journal commit.
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn observation_message_sqlite_admission_and_repark_acknowledgement_protection() {
+        for boundary in [Boundary::Admission, Boundary::Repark] {
+            for fault in [
+                Fault::RejectWrite,
+                Fault::LoseAcknowledgement,
+                Fault::HoldAcknowledgement,
+            ] {
+                let (f, store) = Box::pin(fixture_on(fault, boundary, true)).await;
+                let paused = f.runner.run("objective", None).await.unwrap();
+                let original = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+                store.arm(&paused.run);
+                let mut resume = Box::pin(f.runner.resume(
+                    &paused.run.key.run_id,
+                    paused.run.revision,
+                    answer(&paused.run),
+                ));
+                if matches!(fault, Fault::HoldAcknowledgement) {
+                    await_acknowledgement(&mut resume, &store).await;
+                    drop(resume);
+                } else {
+                    assert!(resume.await.is_err());
+                }
+                assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+                let committed = !matches!(fault, Fault::RejectWrite);
+                if matches!(boundary, Boundary::Admission) {
+                    assert_undelivered(&f, &original, committed).await;
+                    assert_replay_rejected(&f, &paused).await;
+                } else {
+                    assert_repark_protected(&f, &store, committed).await;
+                }
+            }
+        }
+    }
+
+    // Releasing the exact acknowledgement proves the injection gate is reachable and permits one normal child continuation.
+    #[tokio::test]
+    async fn observation_message_child_answer_waits_for_resume_acknowledgement() {
+        let (f, store) = Box::pin(fixture(Fault::HoldAcknowledgement)).await;
+        let paused = f.runner.run("objective", None).await.unwrap();
+        let original = f.store.load(&paused.run.key.run_id).await.unwrap().unwrap();
+        store.arm(&paused.run);
+        let mut resume = Box::pin(f.runner.resume(
+            &paused.run.key.run_id,
+            paused.run.revision,
+            answer(&paused.run),
+        ));
+        await_acknowledgement(&mut resume, &store).await;
+        assert_undelivered(&f, &original, true).await;
+        store.release.add_permits(1);
+        let done = resume.await.unwrap();
+        assert_eq!(store.hits.load(Ordering::SeqCst), 1);
+        assert_eq!(done.run.status, TaskRunStatus::Completed);
+        assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(f.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(done.run.counters.turns, 1);
+        assert_eq!(done.run.counters.llm_attempts, 3);
+        assert_eq!(done.run.counters.tool_attempts, 2);
+        assert!(f.root.set_context("released", json!(true)).is_ok());
+        assert!(f.worker.set_context("released", json!(true)).is_ok());
+    }
 }

@@ -136,12 +136,14 @@ pub enum TaskRunMutation {
         deadline: std::time::Instant,
         expires_at: Option<DateTime<Utc>>,
     },
-    /// Host control-plane CAS; runtime adapters require an auditable authenticated host action.
+    /// Host control-plane CAS requires authenticated preflight and retains original expiry through backend write admission.
     HostControl {
         expected_revision: u64,
         owner_token: Option<String>,
         status: TaskRunStatus,
         payload: Value,
+        deadline: Option<std::time::Instant>,
+        expires_at: Option<DateTime<Utc>>,
     },
     RequestCancel {
         expected_revision: u64,
@@ -164,17 +166,26 @@ pub enum TaskRunMutation {
 }
 
 impl TaskRunMutation {
-    /// Completion cannot pass a live monotonic or original-expiry deadline after waiting for a write lock.
+    /// Completion and host control cannot pass their original UTC or monotonic admission bound after waiting for a write lock.
     pub fn validate_final_deadline(&self, now: DateTime<Utc>) -> Result<()> {
-        if let Self::FinalCheckpoint {
-            status: TaskRunStatus::Completed,
-            deadline,
-            expires_at,
-            ..
-        } = self
-            && (std::time::Instant::now() >= *deadline
-                || expires_at.is_some_and(|expiry| now >= expiry))
-        {
+        let bounds = match self {
+            Self::FinalCheckpoint {
+                status: TaskRunStatus::Completed,
+                deadline,
+                expires_at,
+                ..
+            } => Some((Some(*deadline), *expires_at)),
+            Self::HostControl {
+                deadline,
+                expires_at,
+                ..
+            } => Some((*deadline, *expires_at)),
+            _ => None,
+        };
+        if bounds.is_some_and(|(deadline, expiry)| {
+            deadline.is_some_and(|bound| std::time::Instant::now() >= bound)
+                || expiry.is_some_and(|bound| now >= bound)
+        }) {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
         Ok(())
