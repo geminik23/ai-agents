@@ -367,16 +367,17 @@ impl TaskGroupState {
 }
 
 /// Walks only active pending frame edges, preserving declaration order and rejecting cycles or missing leaf continuation.
-fn collect_parked_leaves(
+pub(crate) fn collect_parked_leaves(
     frame: &DelegateFrame,
     frames: &BTreeMap<String, DelegateFrame>,
     payload: &TaskCheckpointPayload,
     ancestry: &mut Vec<String>,
 ) -> Result<Vec<ParkedCompositionChild>> {
-    if ancestry.len() >= 32 || ancestry.contains(&frame.runtime_id) {
+    // Dependency edges can revisit a runtime through a distinct invocation; only repeated frames are graph cycles.
+    if ancestry.len() >= 32 || ancestry.contains(&frame.id) {
         return Err(TaskRunStorageError::InvalidCheckpoint.into());
     }
-    ancestry.push(frame.runtime_id.clone());
+    ancestry.push(frame.id.clone());
     let slots = if frame.dispatch == CompositionDispatch::Delegate {
         vec![CompositionChild {
             registry_id: frame.delegate_id.clone(),
@@ -387,6 +388,54 @@ fn collect_parked_leaves(
         frame.children.iter().chain(&frame.calls).cloned().collect()
     };
     let mut leaves = Vec::new();
+    if frame.dispatch == CompositionDispatch::ToolBatch {
+        let ids: Vec<String> = serde_json::from_value(frame.definition["messages"].clone())?;
+        for id in ids {
+            let invocation = frames
+                .get(&id)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            if let Some(dependency) = invocation.cursor.get("waiting_for").and_then(Value::as_str)
+                && payload
+                    .children
+                    .iter()
+                    .any(|child| child.child_id == dependency && child.pending.is_some())
+            {
+                let source = frames.values().find(|source| {
+                    source.dispatch == CompositionDispatch::ToolMessage
+                        && source.runtime_id != frame.runtime_id
+                        && source
+                            .children
+                            .iter()
+                            .chain(&source.calls)
+                            .any(|slot| slot.operation == dependency)
+                });
+                if let Some(source) = source {
+                    leaves.extend(collect_parked_leaves(source, frames, payload, ancestry)?);
+                }
+            }
+        }
+    }
+    if frame.dispatch == CompositionDispatch::ToolMessage
+        && let Some(dependency) = frame.cursor.get("waiting_for").and_then(Value::as_str)
+        && let Some(child) = payload
+            .children
+            .iter()
+            .find(|child| child.child_id == dependency && child.pending.is_some())
+    {
+        let source = frames
+            .values()
+            .find(|source| {
+                source.dispatch == CompositionDispatch::ToolMessage
+                    && source.id != frame.id
+                    && source
+                        .children
+                        .iter()
+                        .chain(&source.calls)
+                        .any(|slot| slot.operation == child.child_id)
+            })
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        leaves.extend(collect_parked_leaves(source, frames, payload, ancestry)?);
+    }
     for slot in slots {
         let Some(child) = payload
             .children
@@ -401,10 +450,18 @@ fn collect_parked_leaves(
         if child.runtime.snapshot.agent_id != slot.runtime_id || child.result.is_some() {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
-        if matches!(
+        let interaction_leaf = payload.adapters.iter().any(|adapter| {
+            adapter.id == format!("runtime.child_batch:{}", slot.operation)
+                && adapter
+                    .state
+                    .get("interaction")
+                    .is_some_and(Value::is_object)
+        });
+        if (matches!(
             child.runtime.continuation,
             TaskContinuation::Suspended { batch: Some(_), .. }
-        ) && request.reviewed_action.get("frame_id").is_none()
+        ) || interaction_leaf)
+            && request.reviewed_action.get("frame_id").is_none()
         {
             let adapter = payload
                 .adapters
@@ -428,14 +485,27 @@ fn collect_parked_leaves(
         }
     }
     ancestry.pop();
-    Ok(leaves)
+    let mut unique: Vec<ParkedCompositionChild> = Vec::new();
+    for leaf in leaves {
+        if let Some(previous) = unique
+            .iter()
+            .find(|previous| previous.operation == leaf.operation)
+        {
+            if serde_json::to_value(previous)? != serde_json::to_value(&leaf)? {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+        } else {
+            unique.push(leaf);
+        }
+    }
+    Ok(unique)
 }
 
 /// Admission closure is local to one parent dispatch and never changes permanent cancellation state.
 #[derive(Clone)]
 pub(crate) struct CompositionScope {
     pub runtime_id: String,
-    frame_key: String,
+    pub(crate) frame_key: String,
     closed: Arc<parking_lot::Mutex<bool>>,
     deadline: Option<std::time::Instant>,
 }
@@ -592,7 +662,14 @@ impl RunExecution {
             .lock()
             .get(&scope.frame_key)
             .cloned()
-            .map(Some)
+            .map(|mut frame| {
+                if frame.dispatch == CompositionDispatch::ToolMessage
+                    && let Some(work) = frame.cursor.get("work")
+                {
+                    frame.cursor = work.clone();
+                }
+                Some(frame)
+            })
             .ok_or_else(|| TaskRunStorageError::InvalidCheckpoint.into())
     }
 
@@ -603,10 +680,13 @@ impl RunExecution {
         coordinate: &str,
         child_runtime_id: &str,
     ) -> Result<CompositionChild> {
+        let key = current_composition()
+            .filter(|scope| scope.runtime_id == runtime_id)
+            .map_or_else(|| runtime_id.to_owned(), |scope| scope.frame_key);
         let mut frame = self
             .delegate_frames
             .lock()
-            .get(runtime_id)
+            .get(&key)
             .cloned()
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let operation = format!("composition:{}:call:{coordinate}", frame.id);
@@ -644,7 +724,7 @@ impl RunExecution {
         .await?;
         self.targets
             .bind_call(&catalog_operation, &slot.operation)?;
-        self.delegate_frames.lock().insert(runtime_id.into(), frame);
+        self.delegate_frames.lock().insert(key, frame);
         Ok(slot)
     }
 
@@ -654,13 +734,20 @@ impl RunExecution {
         runtime_id: &str,
         cursor: Value,
     ) -> Result<()> {
+        let key = current_composition()
+            .filter(|scope| scope.runtime_id == runtime_id)
+            .map_or_else(|| runtime_id.to_owned(), |scope| scope.frame_key);
         let mut frame = self
             .delegate_frames
             .lock()
-            .get(runtime_id)
+            .get(&key)
             .cloned()
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-        frame.cursor = cursor;
+        if frame.dispatch == CompositionDispatch::ToolMessage {
+            frame.cursor["work"] = cursor;
+        } else {
+            frame.cursor = cursor;
+        }
         self.update(|payload| {
             let adapter = payload
                 .adapters
@@ -676,7 +763,7 @@ impl RunExecution {
             Ok(())
         })
         .await?;
-        self.delegate_frames.lock().insert(runtime_id.into(), frame);
+        self.delegate_frames.lock().insert(key, frame);
         Ok(())
     }
 
@@ -930,6 +1017,22 @@ impl RunExecution {
         else {
             return Ok(None);
         };
+        if self
+            .parked_batches
+            .lock()
+            .get(runtime_id)
+            .is_some_and(|batch| {
+                batch.interaction.is_some()
+                    && batch.approvals.first().is_some_and(|approval| {
+                        child
+                            .pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.id == approval.request_id)
+                    })
+            })
+        {
+            return Ok(None);
+        }
         if child.pending.is_none()
             || !(matches!(
                 child.runtime.continuation,

@@ -352,8 +352,29 @@ impl RuntimeAgent {
     }
 
     /// Return-position dispatch never starts another root turn or repeats completed semantic/input processing.
-    async fn resume_state_return(&self, position: TaskStateReturn) -> Result<AgentResponse> {
+    pub(super) async fn resume_state_return(
+        &self,
+        position: TaskStateReturn,
+    ) -> Result<AgentResponse> {
+        Box::pin(self.resume_state_return_outcome(position, true)).await
+    }
+
+    /// Rejection returns to the saved non-transition branch; successful actions retain their single commit/finalization path.
+    pub(super) async fn resume_state_return_outcome(
+        &self,
+        position: TaskStateReturn,
+        transitioned: bool,
+    ) -> Result<AgentResponse> {
         match position {
+            TaskStateReturn::BeforeCalls { saved } => {
+                if !transitioned {
+                    return Box::pin(self.resume_rejected_tool_transition(*saved)).await;
+                }
+                Box::pin(
+                    self.resume_state_return(TaskStateReturn::ModelContinue { state: saved.state }),
+                )
+                .await
+            }
             TaskStateReturn::Prepared { data } => Box::pin(self.run_accepted_input(data)).await,
             TaskStateReturn::ReadyContext { input } => {
                 self.context_manager.refresh_per_turn().await?;
@@ -385,14 +406,14 @@ impl RuntimeAgent {
                     Box::pin(self.post_transition_processing(
                         &state.processed_input,
                         state.content.clone(),
-                        true,
+                        transitioned,
                     )),
                 )
                 .await?;
                 let applied = self
                     .apply_post_loop_result(&state.processed_input, result)
                     .await?;
-                let response = self.build_agent_response(AgentResponseParts {
+                let mut response = self.build_agent_response(AgentResponseParts {
                     content: applied.content,
                     all_tool_calls: applied.tool_calls.unwrap_or(state.all_tool_calls),
                     reasoning_mode: state.reasoning_mode,
@@ -401,6 +422,12 @@ impl RuntimeAgent {
                     thinking: state.thinking,
                     reflection_metadata: state.reflection_metadata,
                 });
+                if let Some(metadata) = state.response_metadata {
+                    response
+                        .metadata
+                        .get_or_insert_with(HashMap::new)
+                        .extend(metadata);
+                }
                 self.finish_turn_if_root(&response).await?;
                 Ok(response)
             }

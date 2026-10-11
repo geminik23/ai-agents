@@ -29,7 +29,60 @@ pub(crate) struct HostValidationPermit {
     pub(crate) run_revision: u64,
 }
 
-tokio::task_local! { static HOST_VALIDATION_PERMIT: HostValidationPermit; }
+tokio::task_local! {
+    static HOST_VALIDATION_PERMIT: HostValidationPermit;
+    static OBSERVATION_GROUP_RESPONSE: std::cell::RefCell<Option<(String, TaskGroupState, super::suspension::BatchResponse)>>;
+}
+
+/// Only the retained runner installs a child response for its exact observation call; callbacks cannot reconstruct this custody from labels.
+pub(crate) async fn scope_observation_group<F: std::future::Future>(
+    value: Option<(String, TaskGroupState, super::suspension::BatchResponse)>,
+    future: F,
+) -> F::Output {
+    OBSERVATION_GROUP_RESPONSE
+        .scope(std::cell::RefCell::new(value), future)
+        .await
+}
+
+// One actual observation call consumes its captured child response once.
+fn take_observation_group(
+    call_id: &str,
+) -> Option<(TaskGroupState, super::suspension::BatchResponse)> {
+    OBSERVATION_GROUP_RESPONSE
+        .try_with(|slot| {
+            let mut value = slot.borrow_mut();
+            if value.as_ref().is_some_and(|(id, _, _)| id == call_id) {
+                value.take().map(|(_, group, response)| (group, response))
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
+}
+
+/// Group validation projects the real invocation cursor while keeping the persisted controller at its completed-turn position.
+pub(crate) fn validate_observation_group(
+    group: &TaskGroupState,
+    payload: &TaskCheckpointPayload,
+    pending: &TaskPendingRequest,
+) -> Result<()> {
+    let batch: TaskBatchState = serde_json::from_value(group.frame.cursor.clone())?;
+    if !matches!(
+        batch.location,
+        Some(super::location::TaskLocation::Observation(_))
+    ) || group.frame.dispatch != super::composition::CompositionDispatch::ToolBatch
+    {
+        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    let mut projection = payload.clone();
+    batch.bind_runtime(&mut projection.runtime, &pending.id, 0)?;
+    if let TaskContinuation::Suspended { request_id, .. } = &mut projection.runtime.continuation {
+        *request_id = pending.id.clone();
+    }
+    projection.pending = Some(pending.clone());
+    group.validate_checkpoint(&projection)
+}
 
 /// A tool observation has one stable call identity across pauses without changing its immutable attempt binding.
 pub(crate) fn observation_tool_request(
@@ -62,6 +115,24 @@ pub(crate) fn observation_tool_request(
 
 /// Serialized park data must bind one exact pending operation; it cannot mint live resume authority.
 pub(crate) fn validate_observation_pause(parked: &ValidationObservationPause) -> Result<()> {
+    if let Some(group) = &parked.group {
+        let group: Box<TaskGroupState> = serde_json::from_value(group.clone())?;
+        let batch: TaskBatchState = serde_json::from_value(group.frame.cursor.clone())?;
+        if group.request_id != parked.pending.id
+            || serde_json::to_value(group.child_request.kind)?
+                != serde_json::to_value(parked.pending.kind)?
+            || parked.pending.reviewed_action
+                != json!({"group_id":group.frame.id,"child_operation":group.child_operation,"request":group.child_request})
+            || batch.location.as_ref().is_none_or(|location| {
+                !location
+                    .request()
+                    .is_ok_and(|request| request.call_id == parked.request.call_id)
+            })
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        return Ok(());
+    }
     let pending: super::suspension::BatchApproval =
         serde_json::from_value(parked.pending.reviewed_action.clone())?;
     if pending.call_id != parked.request.call_id
@@ -145,7 +216,7 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
     }
 
     /// A suspension is resumable only when this executor owns exactly one matching pending operation.
-    fn take_suspension(
+    async fn acknowledge_suspension(
         &self,
         request: &ValidationObservationRequest,
         identity: &EvidenceIdentity,
@@ -153,6 +224,38 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
     ) -> Result<Option<ValidationObservationPause>> {
         let execution = current_execution().ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let call = observation_tool_request(request, identity)?;
+        if execution.delegate_frames.lock().values().any(|frame| {
+            frame.runtime_id == self.agent.info().id
+                && frame.dispatch == super::composition::CompositionDispatch::ToolMessage
+                && frame.cursor["record"]["call_id"] == call.call_id
+        }) {
+            let group = Box::pin(
+                self.agent
+                    .retain_observation_message(call.clone(), identity.clone()),
+            )
+            .await?;
+            let pending = TaskPendingRequest {
+                id: group.request_id.clone(),
+                issued_revision: execution
+                    .revision
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    + 1,
+                kind: group.child_request.kind,
+                reviewed_action: json!({"group_id":group.frame.id,"child_operation":group.child_operation,"request":group.child_request}),
+            };
+            let payload: TaskCheckpointPayload =
+                serde_json::from_value(execution.acknowledged_snapshot().payload)?;
+            validate_observation_group(&group, &payload, &pending)?;
+            return Ok(Some(ValidationObservationPause {
+                observation: request.id().into(),
+                request: call,
+                pending,
+                executor: None,
+                before: before.clone(),
+                authorized: Vec::new(),
+                group: Some(serde_json::to_value(group)?),
+            }));
+        }
         let mut approvals = execution.take_parked_approvals(&self.agent.info().id);
         if approvals.len() != 1 || approvals[0].call_id != call.call_id {
             return Err(AgentError::Config(
@@ -185,6 +288,7 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
             executor,
             before: before.clone(),
             authorized: Vec::new(),
+            group: None,
         };
         validate_observation_pause(&parked)?;
         Ok(Some(parked))
@@ -210,6 +314,9 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
             }
             ValidationObservationRequest::Tool { host_binding, .. } => {
                 let request = observation_tool_request(request, identity)?;
+                let requested = serde_json::to_value(&request)?;
+                let resumed = take_observation_group(&request.call_id);
+                let resumed_request = request.clone();
                 let invocation = async {
                     Ok::<_, AgentError>(if let Some(binding) = host_binding {
                         self.agent
@@ -232,11 +339,40 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                         self.agent.invoke_tool(request).await?
                     })
                 };
-                let record = if current_execution().is_some() {
-                    scope_task_batch(invocation).await?
+                let mut record = if let Some((group, response)) = resumed {
+                    let future = self.agent.resume_observation_message(group, response);
+                    if let Some(binding) = host_binding {
+                        scope_bound(
+                            &self.agent,
+                            binding,
+                            &resumed_request,
+                            &HostValidationContext {
+                                identity,
+                                validator: &self.validator,
+                                contract_version: self.contract_version,
+                                profile: &self.profile,
+                                scope_mode: &self.scope_mode,
+                                run_revision: self
+                                    .run_revision
+                                    .load(std::sync::atomic::Ordering::Acquire),
+                            },
+                            future,
+                        )
+                        .await?
+                    } else {
+                        future.await?
+                    }
+                } else if current_execution().is_some() {
+                    self.agent
+                        .scope_observation_invocation(scope_task_batch(invocation))
+                        .await?
                 } else {
                     invocation.await?
                 };
+                // The returned hop retains its actual source and effective operation while the observation remains bound to its original request.
+                record
+                    .metadata
+                    .insert("_validation_request".into(), requested);
                 Ok(ObservationResult::Tool {
                     record: Box::new(record),
                 })
@@ -280,6 +416,27 @@ pub(crate) async fn invoke_bound(
     request: ToolExecutionRequest,
     context: &HostValidationContext<'_>,
 ) -> Result<ToolExecutionRecord> {
+    scope_bound(
+        agent,
+        binding_id,
+        &request,
+        context,
+        agent.invoke_tool(request.clone()),
+    )
+    .await
+}
+
+/// Resumed owned observations reconstruct the same fixed host permit without invoking the original tool body again.
+async fn scope_bound<F, T>(
+    agent: &crate::RuntimeAgent,
+    binding_id: &str,
+    request: &ToolExecutionRequest,
+    context: &HostValidationContext<'_>,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>> + Send,
+{
     let HostValidationContext {
         identity,
         profile,
@@ -313,9 +470,7 @@ pub(crate) async fn invoke_bound(
         run_id: identity.key.run_id.clone(),
         run_revision,
     };
-    HOST_VALIDATION_PERMIT
-        .scope(permit, agent.invoke_tool(request))
-        .await
+    HOST_VALIDATION_PERMIT.scope(permit, future).await
 }
 
 // A live controller scope must match the permit's current run/revision; independent host SDK observations retain their existing contract.

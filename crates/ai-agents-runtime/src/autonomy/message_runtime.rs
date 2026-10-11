@@ -67,6 +67,7 @@ impl RuntimeAgent {
             response: Default::default(),
             child_actor: None,
             waiting_for: None,
+            work: Value::Null,
         };
         let frame = DelegateFrame {
             version: 1,
@@ -110,7 +111,8 @@ impl RuntimeAgent {
             .resolve(&state.record.requested_name)
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         if frame.runtime_id != self.info.id
-            || frame.children.len() != 1
+            || frame.children.is_empty()
+            || (!state.response.composed() && frame.children.len() != 1)
             || frame.definition
                 != json!({"tool":state.record.canonical_id,"arguments":state.record.executed_arguments,"call_id":state.record.call_id})
             || resolved.identity.canonical_id != state.record.canonical_id
@@ -144,10 +146,32 @@ impl RuntimeAgent {
             .get(&state.record.canonical_id)
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let arguments = &state.record.executed_arguments;
+        let request = ai_agents_core::ToolExecutionRequest::new(
+            state.record.call_id.clone(),
+            state.record.requested_name.clone(),
+            state.record.arguments.clone(),
+            state.record.source.clone(),
+        );
+        let grant = crate::autonomy::validation_extra_grant(
+            &self.info.id,
+            &request,
+            &state.record.canonical_id,
+            arguments,
+        );
+        if !crate::autonomy::validation_arguments_valid(
+            &self.info.id,
+            &request,
+            &state.record.canonical_id,
+            arguments,
+        ) {
+            return Err(AgentError::Config(
+                "resumed message differs from fixed host validation operation".into(),
+            ));
+        }
         let scope = self
             .get_available_tool_ids_with_validation_grant(
                 safety.tool_scope_override.as_deref(),
-                None,
+                grant.as_deref(),
             )
             .await?;
         let security = safety
@@ -235,7 +259,11 @@ impl RuntimeAgent {
         let frame = ids
             .iter()
             .filter_map(|id| frames.get(id))
-            .find(|frame| crate::autonomy::composition::response_targets_frame(frame, &frames))
+            .find(|frame| {
+                crate::autonomy::composition::response_targets_frame(frame, &frames)
+                    || execution.deferred_message_ready(frame)
+                    || execution.composition_has_ready_dependency(frame)
+            })
             .cloned()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         Box::pin(self.resume_message_frame(frame)).await
@@ -272,7 +300,34 @@ impl RuntimeAgent {
                 return Err(error);
             }
         };
-        let child = execution.targets.resolve(&frame.child_operation)?;
+        let composed = state.response.composed();
+        let child = if composed {
+            None
+        } else {
+            Some(execution.targets.resolve(&frame.child_operation)?)
+        };
+        let binding = if composed {
+            Some(execution.targets.composition_binding(&frame.id)?)
+        } else {
+            None
+        };
+        let admission = execution.message_admission.lock().await;
+        if state.waiting_for.is_some()
+            && !execution.deferred_message_ready(&frame)
+            && execution.acknowledged_snapshot().payload["children"]
+                .as_array()
+                .is_none_or(|children| {
+                    !children.iter().any(|child| {
+                        frame
+                            .children
+                            .iter()
+                            .chain(&frame.calls)
+                            .any(|slot| child["child_id"] == slot.operation)
+                    })
+                })
+        {
+            return Err(AgentError::TaskSuspended(frame.id));
+        }
         // Resuming owned work restores the dispatched marker without reserving another slot.
         // Until the child acknowledges its next result or park, drop retains conservative effect custody.
         Box::pin(execution.update(|payload| {
@@ -288,6 +343,7 @@ impl RuntimeAgent {
             Ok(())
         }))
         .await?;
+        drop(admission);
         // Storage acknowledgement can await; recheck actual registry and control authority immediately before child polling.
         let resolved = self.tools.resolve(&state.record.requested_name);
         if self.tools.version() != state.record.registry_version
@@ -319,19 +375,34 @@ impl RuntimeAgent {
         let work = crate::autonomy::composition::scope_message_composition(
             frame.runtime_id.clone(),
             frame.id.clone(),
-            crate::autonomy::scope_child_invocation(
-                frame.child_operation.clone(),
-                child.info.id.clone(),
-                Box::pin(async {
-                    if let Some(actor) = &state.child_actor {
-                        child
-                            .chat_with_actor_context(&frame.delegate_input, actor.clone())
-                            .await
-                    } else {
-                        child.chat(&frame.delegate_input).await
-                    }
-                }),
-            ),
+            Box::pin(async {
+                if let Some((registry, llms)) = &binding {
+                    return crate::orchestration::task_tools::run(
+                        registry,
+                        llms.as_deref(),
+                        &state.record.executed_arguments,
+                        &state.response,
+                    )
+                    .await;
+                }
+                let child = child
+                    .as_ref()
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                crate::autonomy::scope_child_invocation(
+                    frame.child_operation.clone(),
+                    child.info.id.clone(),
+                    Box::pin(async {
+                        if let Some(actor) = &state.child_actor {
+                            child
+                                .chat_with_actor_context(&frame.delegate_input, actor.clone())
+                                .await
+                        } else {
+                            child.chat(&frame.delegate_input).await
+                        }
+                    }),
+                )
+                .await
+            }),
         );
         let timer = tokio::time::sleep(
             original_deadline
@@ -379,8 +450,13 @@ impl RuntimeAgent {
         if acknowledged
             .children
             .iter()
-            .find(|child| child.child_id == frame.child_operation)
-            .is_none_or(|child| child.result.is_none() || child.pending.is_some())
+            .filter(|child| {
+                frame
+                    .children
+                    .iter()
+                    .any(|slot| slot.operation == child.child_id)
+            })
+            .any(|child| child.result.is_none() || child.pending.is_some())
         {
             return Err(AgentError::Other("message child requires recovery".into()));
         }
@@ -388,10 +464,15 @@ impl RuntimeAgent {
             Ok(response) => ToolResult::ok(match &state.response {
                 crate::autonomy::message::MessageResponse::Message => json!({"from":frame.delegate_id,"response":response.content}),
                 crate::autonomy::message::MessageResponse::Route { reason } => json!({"selected_agent":frame.delegate_id,"response":response.content,"reason":reason}),
+                crate::autonomy::message::MessageResponse::Pipeline | crate::autonomy::message::MessageResponse::Concurrent | crate::autonomy::message::MessageResponse::Group | crate::autonomy::message::MessageResponse::Handoff => serde_json::from_str(&response.content)?,
             }.to_string()),
             Err(error) => ToolResult::error(match state.response {
                 crate::autonomy::message::MessageResponse::Message => format!("send failed: {error}"),
                 crate::autonomy::message::MessageResponse::Route { .. } => format!("routing failed: {error}"),
+                crate::autonomy::message::MessageResponse::Pipeline => format!("pipeline failed: {error}"),
+                crate::autonomy::message::MessageResponse::Concurrent => format!("concurrent ask failed: {error}"),
+                crate::autonomy::message::MessageResponse::Group => format!("group discussion failed: {error}"),
+                crate::autonomy::message::MessageResponse::Handoff => format!("handoff failed: {error}"),
             }),
         };
         Box::pin(execution.settle(&state.attempt, serde_json::to_value(&tool_result)?, false))
@@ -453,37 +534,43 @@ impl RuntimeAgent {
             // A repeated-target call already owns its parent attempt but has not started another child history.
             let frames = execution.delegate_frames.lock().clone();
             let snapshot = execution.acknowledged_snapshot();
-            let deferred =
-                frames
-                    .values()
-                    .filter(|frame| {
-                        frame.runtime_id == self.info.id
-                            && frame.dispatch == CompositionDispatch::ToolMessage
-                            && frame.cursor["waiting_for"]
+            let deferred = frames
+                .values()
+                .filter(|frame| {
+                    frame.runtime_id == self.info.id
+                        && frame.dispatch == CompositionDispatch::ToolMessage
+                        && (execution.composition_has_ready_dependency(frame)
+                            || frame.cursor["waiting_for"]
                                 .as_str()
                                 .is_some_and(|dependency| {
                                     snapshot.payload["children"].as_array().is_some_and(
                                         |children| {
                                             !children.iter().any(|child| {
-                                                child["child_id"] == frame.child_operation
+                                                frame
+                                                    .children
+                                                    .iter()
+                                                    .any(|slot| child["child_id"] == slot.operation)
                                             }) && children.iter().all(|child| {
-                                                child["runtime"]["snapshot"]["agent_id"]
-                                                    != frame.delegate_runtime_id
-                                                    || !child["result"].is_null()
+                                                !frame.children.iter().chain(&frame.calls).any(
+                                                    |slot| {
+                                                        child["runtime"]["snapshot"]["agent_id"]
+                                                            == slot.runtime_id
+                                                    },
+                                                ) || !child["result"].is_null()
                                             }) && children.iter().any(|child| {
                                                 child["child_id"] == dependency
                                                     && !child["result"].is_null()
                                             })
                                         },
                                     )
-                                })
-                    })
-                    .min_by_key(|frame| {
-                        order
-                            .iter()
-                            .position(|id| frame.cursor["record"]["call_id"] == *id)
-                    })
-                    .cloned();
+                                }))
+                })
+                .min_by_key(|frame| {
+                    order
+                        .iter()
+                        .position(|id| frame.cursor["record"]["call_id"] == *id)
+                })
+                .cloned();
             if let Some(deferred) = deferred {
                 return Box::pin(self.resume_message_frame(deferred)).await;
             }

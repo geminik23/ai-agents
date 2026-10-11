@@ -30,6 +30,8 @@ pub(crate) struct MessageState {
     /// A repeated target waits for this exact incoming operation to finish before starting another root history.
     #[serde(default)]
     pub waiting_for: Option<String>,
+    #[serde(default)]
+    pub work: Value,
 }
 
 /// Routing selection is a completed dispatch effect and is not repeated when formatting the eventual response.
@@ -41,6 +43,20 @@ pub(crate) enum MessageResponse {
     Route {
         reason: String,
     },
+    Pipeline,
+    Concurrent,
+    Group,
+    Handoff,
+}
+
+impl MessageResponse {
+    /// Structured compositions use their existing algorithm cursors rather than a single message recipient.
+    pub(crate) fn composed(&self) -> bool {
+        matches!(
+            self,
+            Self::Pipeline | Self::Concurrent | Self::Group | Self::Handoff
+        )
+    }
 }
 
 tokio::task_local! {
@@ -127,11 +143,39 @@ pub(crate) fn validate_suspended_attempts(
                 continue;
             }
             bindings += 1;
-            if frame.children.len() != 1
+            if frame.children.is_empty()
                 || state.record.call_id.is_empty()
                 || !state.record.executed
             {
                 return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            if state.response.composed() {
+                let mut parked = false;
+                for slot in frame.children.iter().chain(&frame.calls) {
+                    if let Some(child) = payload
+                        .children
+                        .iter()
+                        .find(|child| child.child_id == slot.operation)
+                    {
+                        if child.runtime.snapshot.agent_id != slot.runtime_id
+                            || (child.pending.is_none() && child.result.is_none())
+                        {
+                            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                        }
+                        parked |= child.pending.is_some();
+                    }
+                }
+                if !parked
+                    && state.waiting_for.as_ref().is_none_or(|dependency| {
+                        !payload
+                            .children
+                            .iter()
+                            .any(|child| &child.child_id == dependency)
+                    })
+                {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                }
+                continue;
             }
             let child = payload
                 .children
@@ -337,29 +381,40 @@ pub(crate) fn validate_message_batch(
                 .filter_map(|adapter| {
                     serde_json::from_value::<DelegateFrame>(adapter.state.clone()).ok()
                 })
-                .find(|source| source.child_operation == *dependency)
+                .find(|source| {
+                    source.child_operation == *dependency
+                        || source
+                            .children
+                            .iter()
+                            .any(|slot| &slot.operation == dependency)
+                })
                 .ok_or_else(invalid)?;
             let source_state: MessageState = serde_json::from_value(source.cursor.clone())?;
             let predecessor = batch
                 .calls
                 .iter()
-                .position(|call| call.id == source_state.record.call_id)
-                .ok_or_else(invalid)?;
+                .position(|call| call.id == source_state.record.call_id);
             let current = batch
                 .calls
                 .iter()
                 .position(|call| call.id == state.record.call_id)
                 .ok_or_else(invalid)?;
             if source.dispatch != composition::CompositionDispatch::ToolMessage
-                || source.runtime_id != frame.runtime_id
-                || source.parent_operation != frame.parent_operation
-                || source.delegate_runtime_id != frame.delegate_runtime_id
-                || predecessor >= current
+                || (source.delegate_runtime_id != frame.delegate_runtime_id
+                    && !source.children.iter().any(|previous| {
+                        frame
+                            .children
+                            .iter()
+                            .any(|next| next.runtime_id == previous.runtime_id)
+                    }))
+                || (source.runtime_id == frame.runtime_id
+                    && source.parent_operation == frame.parent_operation
+                    && predecessor.is_none_or(|predecessor| predecessor >= current))
             {
                 return Err(invalid());
             }
         }
-        children.extend(frame.children.clone());
+        children.extend(frame.children.iter().chain(&frame.calls).cloned());
     }
     if json!(children) != json!(coordinator.children) {
         return Err(invalid());
@@ -421,11 +476,28 @@ impl RunExecution {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
         let operation = &frame.children[0].operation;
+
         self.update(|payload| {
+            let selected_operation = if state.response.composed() {
+                frame
+                    .children
+                    .iter()
+                    .chain(&frame.calls)
+                    .find(|slot| {
+                        payload.children.iter().any(|child| {
+                            child.child_id == slot.operation && child.pending.is_some()
+                        })
+                    })
+                    .map(|slot| &slot.operation)
+                    .or(state.waiting_for.as_ref())
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+            } else {
+                operation
+            };
             let child = payload
                 .children
                 .iter()
-                .find(|child| &child.child_id == operation)
+                .find(|child| &child.child_id == selected_operation)
                 .or_else(|| {
                     state.waiting_for.as_ref().and_then(|dependency| {
                         payload
@@ -435,7 +507,7 @@ impl RunExecution {
                     })
                 })
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            if child.child_id == *operation && child.pending.is_none() {
+            if child.child_id == *selected_operation && child.pending.is_none() {
                 return Err(AgentError::Other(
                     "message child did not acknowledge safe suspension".into(),
                 ));
@@ -469,33 +541,297 @@ impl RunExecution {
         Ok(frame.id)
     }
 
-    /// Repeated calls retain distinct incoming operations but cannot start a second root while the target history is incomplete.
-    pub(crate) fn message_dependency(&self, incoming: &DelegateFrame) -> Result<Option<String>> {
-        let snapshot = self.acknowledged_snapshot();
+    /// A catalogue overlapping another parked operation defers the invocation before any new child root history.
+    pub(crate) fn composition_dependency(
+        &self,
+        incoming: &DelegateFrame,
+    ) -> Result<Option<String>> {
         let frames = self.delegate_frames.lock();
-        let predecessor = frames.values().find(|frame| {
+        if !frames.values().any(|frame| {
             frame.dispatch == composition::CompositionDispatch::ToolMessage
-                && frame.delegate_runtime_id == incoming.delegate_runtime_id
-                && snapshot.payload["children"]
-                    .as_array()
-                    .is_some_and(|children| {
-                        children.iter().any(|child| {
-                            child["child_id"] == frame.child_operation
-                                && !child["pending"].is_null()
-                        })
-                    })
-        });
-        if let Some(predecessor) = predecessor {
-            if predecessor.runtime_id != incoming.runtime_id
-                || predecessor.parent_operation != incoming.parent_operation
-            {
-                return Err(AgentError::Config(
-                    "cross-parent pending message target requires composition continuation".into(),
-                ));
+                && frame.children.iter().chain(&frame.calls).any(|previous| {
+                    incoming
+                        .children
+                        .iter()
+                        .any(|next| previous.runtime_id == next.runtime_id)
+                })
+        }) {
+            return Ok(None);
+        }
+        drop(frames);
+        self.composition_dependency_bound(incoming)
+    }
+
+    // Optional checkpoint decoding stays outside ordinary nested-message dispatch stack frames.
+    fn composition_dependency_bound(&self, incoming: &DelegateFrame) -> Result<Option<String>> {
+        let frames = self.delegate_frames.lock();
+        let snapshot = self.acknowledged_snapshot();
+        let payload: Box<TaskCheckpointPayload> = serde_json::from_value(snapshot.payload)?;
+        if let Some(child) = payload.children.iter().find(|child| {
+            child.pending.is_some()
+                && incoming
+                    .children
+                    .iter()
+                    .any(|slot| slot.runtime_id == child.runtime.snapshot.agent_id)
+        }) {
+            let source = frames
+                .values()
+                .find(|frame| {
+                    frame.dispatch == composition::CompositionDispatch::ToolMessage
+                        && frame
+                            .children
+                            .iter()
+                            .any(|slot| slot.operation == child.child_id)
+                })
+                .ok_or_else(|| {
+                    AgentError::Config("parked target needs exact parent dependency".into())
+                })?;
+            let destination = incoming
+                .children
+                .iter()
+                .find(|slot| slot.runtime_id == child.runtime.snapshot.agent_id)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            let registered = self.targets.resolve(&child.child_id)?;
+            if registered.info().id != destination.runtime_id || source.id == incoming.id {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
             }
-            return Ok(Some(predecessor.child_operation.clone()));
+            return Ok(Some(child.child_id.clone()));
+        }
+        for source in frames.values().filter(|source| {
+            source.dispatch == composition::CompositionDispatch::ToolMessage
+                && source.id != incoming.id
+        }) {
+            let state: MessageState = serde_json::from_value(source.cursor.clone())?;
+            if payload.reservations.iter().any(|reservation| {
+                reservation.id == state.attempt
+                    && matches!(
+                        reservation.state,
+                        TaskEffectState::Dispatched | TaskEffectState::Suspended
+                    )
+            }) && let Some(slot) = source
+                .children
+                .iter()
+                .chain(&source.calls)
+                .find(|previous| {
+                    incoming
+                        .children
+                        .iter()
+                        .any(|next| previous.runtime_id == next.runtime_id)
+                })
+            {
+                return Ok(Some(slot.operation.clone()));
+            }
         }
         Ok(None)
+    }
+
+    /// Queued work waits outside message publication locks until its predecessor acknowledges a result or safe park.
+    pub(crate) fn wait_message_dependency<'a>(
+        &'a self,
+        frame: &'a DelegateFrame,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(dependency) = frame.cursor.get("waiting_for").and_then(Value::as_str) else {
+                return Ok(false);
+            };
+            loop {
+                let snapshot = self.load_owned().await?;
+                let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+                self.check(&payload)?;
+                if let Some(child) = payload
+                    .children
+                    .iter()
+                    .find(|child| child.child_id == dependency)
+                {
+                    if child.pending.is_some() {
+                        return Ok(true);
+                    }
+                    if child.result.is_some() {
+                        return Ok(false);
+                    }
+                }
+                let source = payload
+                    .adapters
+                    .iter()
+                    .filter(|adapter| adapter.adapter == "runtime.delegate")
+                    .filter_map(|adapter| {
+                        serde_json::from_value::<DelegateFrame>(adapter.state.clone()).ok()
+                    })
+                    .find(|source| {
+                        source
+                            .children
+                            .iter()
+                            .chain(&source.calls)
+                            .any(|slot| slot.operation == dependency)
+                    })
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                let state: MessageState = serde_json::from_value(source.cursor.clone())?;
+                let selected_runtime = source
+                    .children
+                    .iter()
+                    .chain(&source.calls)
+                    .find(|slot| slot.operation == dependency)
+                    .map(|slot| slot.runtime_id.as_str())
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                if let Some(child) = payload.children.iter().find(|child| {
+                    child.pending.is_some()
+                        && child.runtime.snapshot.agent_id == selected_runtime
+                        && source
+                            .children
+                            .iter()
+                            .chain(&source.calls)
+                            .any(|slot| slot.operation == child.child_id)
+                }) {
+                    let actual = child.child_id.clone();
+                    let mut incoming = self
+                        .delegate_frames
+                        .lock()
+                        .get(&frame.id)
+                        .cloned()
+                        .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                    incoming.cursor["waiting_for"] = json!(actual);
+                    self.update(|payload| {
+                        let adapter = payload
+                            .adapters
+                            .iter_mut()
+                            .find(|adapter| adapter.id == format!("runtime.delegate:{}", frame.id))
+                            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                        adapter.state = serde_json::to_value(&incoming)?;
+                        Ok(())
+                    })
+                    .await?;
+                    self.delegate_frames
+                        .lock()
+                        .insert(frame.id.clone(), incoming);
+                    return Ok(true);
+                }
+                if payload.reservations.iter().any(|reservation| {
+                    reservation.id == state.attempt
+                        && reservation.state == TaskEffectState::Completed
+                }) {
+                    return Ok(false);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    /// A deferred invocation becomes runnable only after its exact predecessor settles and every selected actual target is free of parked work.
+    pub(crate) fn deferred_message_ready(&self, frame: &DelegateFrame) -> bool {
+        let Some(dependency) = frame.cursor.get("waiting_for").and_then(Value::as_str) else {
+            return false;
+        };
+        let snapshot = self.acknowledged_snapshot();
+        if self.delegate_frames.lock().values().any(|other| {
+            other.id != frame.id
+                && other.dispatch == composition::CompositionDispatch::ToolMessage
+                && other.children.iter().any(|slot| {
+                    frame
+                        .children
+                        .iter()
+                        .any(|incoming| slot.runtime_id == incoming.runtime_id)
+                })
+                && snapshot.payload["reservations"]
+                    .as_array()
+                    .is_some_and(|reservations| {
+                        reservations.iter().any(|reservation| {
+                            reservation["id"] == other.cursor["attempt"]
+                                && reservation["state"] == "dispatched"
+                        })
+                    })
+        }) {
+            return false;
+        }
+        snapshot.payload["children"]
+            .as_array()
+            .is_some_and(|children| {
+                children
+                    .iter()
+                    .any(|child| child["child_id"] == dependency && !child["result"].is_null())
+                    && !children.iter().any(|child| {
+                        frame
+                            .children
+                            .iter()
+                            .any(|slot| child["child_id"] == slot.operation)
+                    })
+                    && children.iter().all(|child| {
+                        !frame
+                            .children
+                            .iter()
+                            .any(|slot| child["runtime"]["snapshot"]["agent_id"] == slot.runtime_id)
+                            || child["pending"].is_null()
+                    })
+            })
+    }
+
+    /// A retained batch can advance a dependency-only invocation without inventing a response for its unstarted child.
+    pub(crate) fn deferred_batch_ready(&self, coordinator: &DelegateFrame) -> bool {
+        let Some(ids) = coordinator
+            .definition
+            .get("messages")
+            .and_then(Value::as_array)
+        else {
+            return false;
+        };
+        let frames = self.delegate_frames.lock().clone();
+        ids.iter()
+            .filter_map(Value::as_str)
+            .filter_map(|id| frames.get(id))
+            .any(|frame| self.deferred_message_ready(frame))
+    }
+
+    /// Drained composition siblings may release a dependency after its parent was polled; ready saved work must be driven before another pause is exposed.
+    pub(crate) fn composition_has_ready_dependency(&self, frame: &DelegateFrame) -> bool {
+        let frames = self.delegate_frames.lock().clone();
+        let mut queue = vec![frame.clone()];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(parent) = queue.pop() {
+            if !seen.insert(parent.id.clone()) || seen.len() > 32 {
+                continue;
+            }
+            if parent.dispatch == composition::CompositionDispatch::ToolBatch
+                && self.deferred_batch_ready(&parent)
+            {
+                return true;
+            }
+            for slot in parent.children.iter().chain(&parent.calls) {
+                if let Some(child) = frames.get(&slot.runtime_id).filter(|child| {
+                    child.parent_operation.as_deref() == Some(slot.operation.as_str())
+                }) {
+                    queue.push(child.clone());
+                }
+            }
+        }
+        false
+    }
+
+    /// Final participant admission cannot start another root on a runtime whose different operation is still parked.
+    pub(crate) fn target_has_pending_operation(
+        &self,
+        runtime: &str,
+        incoming: Option<&str>,
+    ) -> bool {
+        let snapshot = self.acknowledged_snapshot();
+        snapshot.payload["children"]
+            .as_array()
+            .is_some_and(|children| {
+                children.iter().any(|child| {
+                    child["runtime"]["snapshot"]["agent_id"] == runtime
+                        && !child["pending"].is_null()
+                        && child["child_id"].as_str() != incoming
+                })
+            })
+    }
+
+    /// Repeated calls retain distinct incoming operations but cannot start a second root while the target history is incomplete.
+    pub(crate) fn message_dependency(&self, incoming: &DelegateFrame) -> Result<Option<String>> {
+        let mut binding = incoming.clone();
+        binding.children = vec![composition::CompositionChild {
+            registry_id: incoming.delegate_id.clone(),
+            runtime_id: incoming.delegate_runtime_id.clone(),
+            operation: incoming.child_operation.clone(),
+        }];
+        self.composition_dependency(&binding)
     }
 
     /// Batch retention follows child parking and must be acknowledged before the root exposes a pause.
@@ -540,8 +876,9 @@ impl RunExecution {
         coordinator.dispatch = composition::CompositionDispatch::ToolBatch;
         coordinator.children = messages
             .iter()
-            .flat_map(|frame| frame.children.clone())
+            .flat_map(|frame| frame.children.iter().chain(&frame.calls).cloned())
             .collect();
+        coordinator.calls.clear();
         coordinator.cursor = json!(batch);
         coordinator.definition =
             json!({"messages":messages.iter().map(|frame| &frame.id).collect::<Vec<_>>()});

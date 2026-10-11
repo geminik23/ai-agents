@@ -7,14 +7,40 @@ use ai_agents_core::{AgentError, Result};
 use parking_lot::Mutex;
 use std::{collections::BTreeMap, sync::Arc};
 
+type CapturedComposition = (Arc<AgentRegistry>, Option<Arc<ai_agents_llm::LLMRegistry>>);
+
 #[derive(Default)]
 pub(crate) struct CompositionTargets {
     bindings: Mutex<BTreeMap<String, Arc<PinnedTaskAgent>>>,
     retired: std::sync::atomic::AtomicBool,
     tools: Mutex<BTreeMap<String, Arc<dyn ai_agents_core::Tool>>>,
+    compositions: Mutex<BTreeMap<String, CapturedComposition>>,
 }
 
 impl CompositionTargets {
+    /// Actual captured tool registries/providers survive suspension; serialized operation names cannot substitute them.
+    pub(crate) fn bind_composition(
+        &self,
+        id: &str,
+        registry: Arc<AgentRegistry>,
+        llms: Option<Arc<ai_agents_llm::LLMRegistry>>,
+    ) -> Result<()> {
+        let mut bindings = self.compositions.lock();
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) || bindings.contains_key(id) {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        bindings.insert(id.into(), (registry, llms));
+        Ok(())
+    }
+
+    /// Resolves only live captured composition implementations, never a current lookup under a copied label.
+    pub(crate) fn composition_binding(&self, id: &str) -> Result<CapturedComposition> {
+        self.compositions
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| TaskRunStorageError::InvalidCheckpoint.into())
+    }
     /// Captures the actual registered objects before any child effect; discarded preparation releases its own pins.
     pub(crate) fn capture(
         &self,
@@ -36,6 +62,19 @@ impl CompositionTargets {
         let mut captured = Vec::with_capacity(slots.len());
         for slot in slots {
             let pinned = registry.pin_task_target(&slot.registry_id, &slot.runtime_id)?;
+            if self.bindings.lock().values().any(|old| {
+                old.agent.info().id == slot.runtime_id && !Arc::ptr_eq(&old.agent, &pinned.agent)
+            }) || captured
+                .iter()
+                .any(|(_, old): &(String, Arc<PinnedTaskAgent>)| {
+                    old.agent.info().id == slot.runtime_id
+                        && !Arc::ptr_eq(&old.agent, &pinned.agent)
+                })
+            {
+                return Err(AgentError::Config(
+                    "different runtime gates cannot share a task runtime identity".into(),
+                ));
+            }
             if self
                 .bindings
                 .lock()
@@ -174,6 +213,7 @@ impl CompositionTargets {
             .store(true, std::sync::atomic::Ordering::Release);
         bindings.clear();
         self.tools.lock().clear();
+        self.compositions.lock().clear();
     }
 }
 

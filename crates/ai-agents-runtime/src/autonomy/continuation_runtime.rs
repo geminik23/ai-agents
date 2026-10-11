@@ -64,22 +64,23 @@ impl RuntimeAgent {
         }
         if frame.dispatch == CompositionDispatch::ToolMessage {
             self.check_message_frame(frame, targets)?;
-            let slot = &frame.children[0];
-            let target = targets.resolve(&slot.operation)?;
-            if slot.operation == operation {
-                ancestry.pop();
-                return Ok(target);
-            }
-            let nested = frames
-                .get(&slot.runtime_id)
-                .filter(|nested| {
+            for slot in frame.children.iter().chain(&frame.calls) {
+                let target = targets.resolve(&slot.operation)?;
+                if slot.operation == operation {
+                    ancestry.pop();
+                    return Ok(target);
+                }
+                if let Some(nested) = frames.get(&slot.runtime_id).filter(|nested| {
                     nested.parent_operation.as_deref() == Some(slot.operation.as_str())
-                })
-                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-            let selected =
-                target.task_composition_target(nested, frames, targets, operation, ancestry)?;
-            ancestry.pop();
-            return Ok(selected);
+                        && nested.contains_operation(operation, frames, &mut Vec::new())
+                }) {
+                    let selected = target
+                        .task_composition_target(nested, frames, targets, operation, ancestry)?;
+                    ancestry.pop();
+                    return Ok(selected);
+                }
+            }
+            return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
         }
         let definition = self
             .state_machine
@@ -351,9 +352,16 @@ impl RuntimeAgent {
             frame.runtime_id != self.info.id
                 && frame.dispatch != crate::autonomy::composition::CompositionDispatch::ToolMessage
         }) {
-            if !leaves.iter().any(|leaf| {
-                frame.contains_operation(&leaf.operation, &group.frames, &mut Vec::new())
-            }) {
+            let dependency_parent = frame.parent_operation.as_ref().is_some_and(|operation| {
+                group
+                    .frame
+                    .contains_operation(operation, &group.frames, &mut Vec::new())
+            });
+            if !dependency_parent
+                && !leaves.iter().any(|leaf| {
+                    frame.contains_operation(&leaf.operation, &group.frames, &mut Vec::new())
+                })
+            {
                 continue;
             }
             let edge = (
@@ -544,7 +552,7 @@ impl RuntimeAgent {
         state: &mut TaskBatchState,
         all_calls: &mut Vec<ToolCall>,
     ) -> Result<()> {
-        if state.location.is_some() {
+        if state.location.is_some() || state.interaction.is_some() {
             while state.appended < state.calls.len() && state.results[state.appended].is_some() {
                 state.appended += 1;
             }
@@ -582,7 +590,9 @@ impl RuntimeAgent {
             let batch = batches
                 .get_mut(&self.info.id)
                 .ok_or_else(|| AgentError::Config("task batch continuation missing".into()))?;
-            batch.loop_state = Some(state);
+            if batch.interaction.is_none() {
+                batch.loop_state = Some(state);
+            }
             batch.validate()?;
             batch.clone()
         };
@@ -658,6 +668,9 @@ impl RuntimeAgent {
             source: crate::autonomy::AutonomyTurnSource::ResumeAfterApproval,
         };
         crate::autonomy::scope_turn(input, async {
+            if let Some(interaction) = &batch.interaction {
+                self.clear_task_interaction(interaction).await?;
+            }
             for result in &mut batch.results {
                 if result.is_none() {
                     *result = Some(Err("task cancelled before invocation".into()));
@@ -682,6 +695,11 @@ impl RuntimeAgent {
         result: crate::autonomy::suspension::BatchResponse,
     ) -> Result<AgentResponse> {
         batch.validate()?;
+        if batch.interaction.is_some() {
+            return self
+                .resume_task_interaction_batch(input, batch, result)
+                .await;
+        }
         if batch.location.is_some() {
             return Box::pin(self.resume_task_location_batch(input, batch, request_id, result))
                 .await;
@@ -979,8 +997,12 @@ impl RuntimeAgent {
                 .await;
             let content = response.content.trim();
             if let Some(calls) = self.parse_main_tool_calls(content, &protocol)? {
-                let position = crate::autonomy::location::TaskStateReturn::ModelContinue {
-                    state: Box::new(state.clone()),
+                let position = crate::autonomy::location::TaskStateReturn::BeforeCalls {
+                    saved: Box::new(crate::autonomy::interaction::TaskModelCalls {
+                        state: Box::new(state.clone()),
+                        content: content.into(),
+                        calls: calls.clone(),
+                    }),
                 };
                 match crate::autonomy::location::scope_state_return(
                     position,
@@ -1017,7 +1039,7 @@ impl RuntimeAgent {
                     .add_message(ChatMessage::assistant(content))
                     .await?;
                 self.check_memory_compression().await?;
-                let response = self.build_agent_response(AgentResponseParts {
+                let mut response = self.build_agent_response(AgentResponseParts {
                     content: content.into(),
                     all_tool_calls: state.all_tool_calls,
                     reasoning_mode: finalization.reasoning_mode,
@@ -1026,6 +1048,12 @@ impl RuntimeAgent {
                     thinking: finalization.thinking,
                     reflection_metadata: finalization.reflection_metadata,
                 });
+                if let Some(metadata) = finalization.response_metadata {
+                    response
+                        .metadata
+                        .get_or_insert_with(HashMap::new)
+                        .extend(metadata);
+                }
                 if finalization.finalize_on_resume {
                     self.finish_turn_if_root(&response).await?;
                 }

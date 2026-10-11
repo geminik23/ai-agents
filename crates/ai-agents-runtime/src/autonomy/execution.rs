@@ -400,16 +400,21 @@ impl RunExecution {
     }
 
     /// All controller, journal and invocation writes share this short CAS boundary.
-    pub(crate) async fn update(
-        &self,
-        change: impl FnOnce(&mut TaskCheckpointPayload) -> Result<()>,
-    ) -> Result<TaskRunSnapshot> {
-        let _serial = self.serial.lock().await;
-        let snapshot = self.load_owned_locked(&_serial).await?;
-        let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
-        change(&mut payload)?;
-        payload.clocks.active_millis = self.active_millis()?;
-        self.save(snapshot, payload, TaskRunStatus::Running).await
+    /// Erasure and heap-owned checkpoint decoding keep ledger construction from multiplying nested participant polling stacks.
+    pub(crate) fn update<'a>(
+        &'a self,
+        change: impl FnOnce(&mut TaskCheckpointPayload) -> Result<()> + Send + 'a,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TaskRunSnapshot>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let _serial = self.serial.lock().await;
+            let snapshot = self.load_owned_locked(&_serial).await?;
+            let mut payload: Box<TaskCheckpointPayload> =
+                serde_json::from_value(snapshot.payload.clone())?;
+            change(&mut payload)?;
+            payload.clocks.active_millis = self.active_millis()?;
+            self.save(snapshot, payload, TaskRunStatus::Running).await
+        })
     }
 
     /// Owned reads share the writer boundary so a sibling acknowledgement cannot invalidate a snapshot while storage is returning it.
@@ -832,7 +837,8 @@ impl RunExecution {
     ) -> Result<TaskRunSnapshot> {
         let _serial = self.serial.lock().await;
         let snapshot = self.load_owned_locked(&_serial).await?;
-        let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        let mut payload: Box<TaskCheckpointPayload> =
+            serde_json::from_value(snapshot.payload.clone())?;
         payload.clocks.active_millis = self.active_millis()?.max(
             payload
                 .clocks
@@ -892,7 +898,7 @@ impl RunExecution {
     async fn save(
         &self,
         previous: TaskRunSnapshot,
-        payload: TaskCheckpointPayload,
+        payload: Box<TaskCheckpointPayload>,
         status: TaskRunStatus,
     ) -> Result<TaskRunSnapshot> {
         let mutation = if status == TaskRunStatus::Running {

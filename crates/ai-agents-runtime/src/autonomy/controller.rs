@@ -51,6 +51,10 @@ impl ControllerContinuation {
                 return Err(invalid());
             }
         } else if let Some(parked) = &driver.parked {
+            if let Some(group) = &parked.group {
+                let group: Box<TaskGroupState> = serde_json::from_value(group.clone())?;
+                super::authority::validate_observation_group(&group, payload, pending)?;
+            }
             if pending.id != parked.pending.id
                 || serde_json::to_value(pending)? != serde_json::to_value(&parked.pending)?
             {

@@ -33,7 +33,7 @@ pub struct DisambiguationManager {
 }
 
 /// Manager-owned request retained across clarification and confirmation turns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct PendingClarification {
     id: u64,
     original_input: String,
@@ -46,7 +46,7 @@ struct PendingClarification {
 }
 
 /// Pending phases keep unresolved and resolved payloads mutually exclusive.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 enum PendingPhase {
     Clarification {
         required_clarity: Vec<String>,
@@ -136,6 +136,59 @@ impl DisambiguationManager {
     /// Check if there is a pending clarification or confirmation.
     pub async fn has_pending_clarification(&self) -> bool {
         self.pending_clarification.read().await.is_some()
+    }
+
+    /// Captures exact manager-owned progress for a retained host continuation, not an executable restore grant.
+    pub async fn pending_checkpoint(&self) -> Result<Option<serde_json::Value>> {
+        self.pending_clarification
+            .read()
+            .await
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Preflight distinguishes an unrelated outstanding exchange without waiting for semantic callbacks.
+    pub fn has_pending_now(&self) -> Result<bool> {
+        Ok(self
+            .pending_clarification
+            .try_read()
+            .map_err(|_| {
+                ai_agents_core::AgentError::Other("clarification exchange is busy".into())
+            })?
+            .is_some())
+    }
+
+    /// Checks an existing exchange without semantic work; a busy or replaced exchange cannot consume a stale response.
+    pub fn matches_pending_checkpoint(&self, checkpoint: &serde_json::Value) -> Result<bool> {
+        let pending = self.pending_clarification.try_read().map_err(|_| {
+            ai_agents_core::AgentError::Other("clarification exchange is busy".into())
+        })?;
+        Ok(pending
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .as_ref()
+            == Some(checkpoint))
+    }
+
+    /// Retires only the captured exchange so cancellation cannot clear a newer clarification phase.
+    pub async fn clear_pending_checkpoint(&self, checkpoint: &serde_json::Value) -> Result<()> {
+        let mut pending = self.pending_clarification.write().await;
+        if pending
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()?
+            .as_ref()
+            != Some(checkpoint)
+        {
+            return Err(ai_agents_core::AgentError::Other(
+                "clarification exchange changed".into(),
+            ));
+        }
+        *pending = None;
+        Ok(())
     }
 
     /// Check whether the pending exchange is waiting for explicit confirmation.

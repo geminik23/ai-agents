@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[path = "controller_runtime.rs"]
 mod controller_runtime;
+#[path = "paused_control.rs"]
+mod paused_control;
 
 type ControllerFuture<'a, T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
@@ -60,10 +62,11 @@ impl AutonomyRunner {
             }
             return Ok((None, None));
         }
-        if matches!(
+        if (matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: Some(_), .. }
-        ) && payload.pause_reason.as_deref() != Some("child_interaction")
+        ) || super::interaction::has_root_interaction(&payload))
+            && payload.pause_reason.as_deref() != Some("child_interaction")
         {
             let batch = execution
                 .parked_batches
@@ -118,8 +121,28 @@ impl AutonomyRunner {
                 .entry(id.clone())
                 .or_insert(*deadline);
         }
+        let observation_group = paused
+            .controller
+            .as_ref()
+            .and_then(|state| state.driver.as_ref())
+            .and_then(|driver| driver.parked.as_ref())
+            .and_then(|parked| parked.group.as_ref())
+            .map(|value| serde_json::from_value::<Box<TaskGroupState>>(value.clone()))
+            .transpose()?;
         paused.approval_deadlines.retain(|id, _| {
-            paused.controller.as_ref().is_some_and(|state| {
+            observation_group.as_ref().is_some_and(|group| {
+                &group.request_id == id
+                    || group
+                        .frames
+                        .values()
+                        .any(|frame| format!("composition:{}", frame.id) == *id)
+                    || group.parked.iter().any(|leaf| {
+                        leaf.batch
+                            .approvals
+                            .iter()
+                            .any(|approval| &approval.request_id == id)
+                    })
+            }) || paused.controller.as_ref().is_some_and(|state| {
                 state
                     .driver
                     .as_ref()
@@ -213,19 +236,7 @@ impl AutonomyRunner {
         owner.check()?;
         let child = self.agent.task_group_child(&group, &targets)?;
         child.preflight_priced_autonomy(payload.limits.max_micro_usd.is_some())?;
-        if let super::suspension::BatchResponse::UserAnswer(answer) = &response {
-            let pending = &group.batch.approvals[0];
-            let mut call = group
-                .batch
-                .calls
-                .iter()
-                .find(|call| call.id == pending.call_id)
-                .cloned()
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            call = group.batch.pending_call(&call);
-            call.arguments = pending.context.clone();
-            child.validate_task_question_answer(&call, &pending.question, answer)?;
-        }
+        child.validate_task_batch_response(&group.batch, &response)?;
         if whole_expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
@@ -554,18 +565,7 @@ impl AutonomyRunner {
         if participants.unsettled() {
             return Err(TaskRunStorageError::NotResumable.into());
         }
-        let requested = if snapshot.cancel_requested {
-            snapshot
-        } else {
-            self.store
-                .mutate(
-                    &run_id,
-                    &TaskRunMutation::RequestCancel {
-                        expected_revision: snapshot.revision,
-                    },
-                )
-                .await?
-        };
+        let requested = self.admit_paused_cleanup(snapshot).await?;
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let retired = self
             .agent
@@ -605,16 +605,7 @@ impl AutonomyRunner {
             TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
         payload.pause_reason = None;
         payload.stop_reason = Some("cancel_requested".into());
-        let acknowledged = self
-            .store
-            .mutate(
-                &run_id,
-                &TaskRunMutation::AcknowledgeCancel {
-                    expected_revision: requested.revision,
-                    payload: serde_json::to_value(payload)?,
-                },
-            )
-            .await?;
+        let acknowledged = self.acknowledge_paused_cleanup(&requested, payload).await?;
         let paused = self
             .paused
             .lock()
@@ -825,10 +816,11 @@ impl AutonomyRunner {
         if controller_checkpoint(&payload)?.is_some() {
             return self.cancel_controller(snapshot, payload).await;
         }
-        if matches!(
+        if (matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: None, .. }
-        ) || payload.pause_reason.as_deref() == Some("child_interaction")
+        ) && !super::interaction::has_root_interaction(&payload))
+            || payload.pause_reason.as_deref() == Some("child_interaction")
         {
             return Box::pin(self.cancel_group(snapshot, payload)).await;
         }
@@ -848,16 +840,7 @@ impl AutonomyRunner {
             .get(run_id)
             .map(|paused| paused.owner.clone())
             .ok_or(TaskRunStorageError::NotResumable)?;
-        let requested = if snapshot.cancel_requested {
-            snapshot
-        } else {
-            self.store
-                .mutate(
-                    run_id,
-                    &TaskRunMutation::RequestCancel { expected_revision },
-                )
-                .await?
-        };
+        let requested = self.admit_paused_cleanup(snapshot).await?;
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         payload.runtime = self.agent.cancel_task_batch(&owner, batch.clone()).await?;
         payload.pending = None;
@@ -870,16 +853,7 @@ impl AutonomyRunner {
                     .push(approval.request_id.clone());
             }
         }
-        let acknowledged = self
-            .store
-            .mutate(
-                run_id,
-                &TaskRunMutation::AcknowledgeCancel {
-                    expected_revision: requested.revision,
-                    payload: serde_json::to_value(payload)?,
-                },
-            )
-            .await?;
+        let acknowledged = self.acknowledge_paused_cleanup(&requested, payload).await?;
         let paused = self
             .paused
             .lock()
@@ -999,10 +973,11 @@ impl AutonomyRunner {
         {
             return Err(TaskRunStorageError::NotResumable.into());
         }
-        if matches!(
+        if (matches!(
             payload.runtime.continuation,
             TaskContinuation::Suspended { batch: None, .. }
-        ) || payload.pause_reason.as_deref() == Some("child_interaction")
+        ) && !super::interaction::has_root_interaction(&payload))
+            || payload.pause_reason.as_deref() == Some("child_interaction")
         {
             return Box::pin(self.resume_group(snapshot, payload, request_id, result)).await;
         }
@@ -1013,22 +988,7 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let batch: TaskBatchState = serde_json::from_value(adapter.state.clone())?;
         batch.validate_checkpoint(&payload)?;
-        if let Some(location) = &batch.location {
-            self.agent.validate_task_location(location)?;
-        }
-        if let super::suspension::BatchResponse::UserAnswer(answer) = &result {
-            let pending = &batch.approvals[0];
-            let call = batch
-                .calls
-                .iter()
-                .find(|call| call.id == pending.call_id)
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            let mut final_call = call.clone();
-            final_call = batch.pending_call(&final_call);
-            final_call.arguments = pending.context.clone();
-            self.agent
-                .validate_task_question_answer(&final_call, &pending.question, answer)?;
-        }
+        self.agent.validate_task_batch_response(&batch, &result)?;
         {
             let retained = self.paused.lock();
             let retained = retained
@@ -2163,9 +2123,13 @@ impl AutonomyRunner {
                 | "time_violation",
             ) => TaskRunStatus::LimitReached,
             Some("cancel_requested") => TaskRunStatus::Cancelled,
-            Some("question_timeout" | "pipeline_timeout" | "composition_timeout") => {
-                TaskRunStatus::Incomplete
-            }
+            Some(
+                "question_timeout"
+                | "pipeline_timeout"
+                | "composition_timeout"
+                | "scope_ended"
+                | "interaction_unavailable",
+            ) => TaskRunStatus::Incomplete,
             _ => TaskRunStatus::Failed,
         }
     }

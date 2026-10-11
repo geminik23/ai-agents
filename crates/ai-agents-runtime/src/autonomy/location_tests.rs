@@ -1,4 +1,6 @@
 use super::*;
+#[path = "location_matrix_tests.rs"]
+mod matrix_tests;
 use crate::{Agent, AgentBuilder, RuntimeAgent};
 use ai_agents_core::{Tool, ToolCall, ToolExecutionContext, ToolResult, ToolSafetyMetadata};
 use async_trait::async_trait;

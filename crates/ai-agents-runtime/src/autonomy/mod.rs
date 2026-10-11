@@ -18,6 +18,7 @@ pub(crate) use participants::{
     scope_child_requirement,
 };
 pub(crate) use targets::CompositionTargets;
+
 mod runner;
 pub(crate) mod suspension;
 #[cfg(test)]
@@ -54,13 +55,22 @@ mod controller_failure_tests;
 #[cfg(test)]
 mod controller_tests;
 pub(crate) use controller::{ControllerContinuation, controller_checkpoint, retire_controller};
+pub(crate) mod interaction;
+#[cfg(test)]
+mod interaction_tests;
 mod journal;
+#[cfg(test)]
+mod journal_resume_tests;
 mod lifecycle;
 pub(crate) mod location;
 #[cfg(test)]
 mod location_tests;
 #[cfg(test)]
 mod message_batch_tests;
+#[cfg(test)]
+mod shared_target_tests;
+#[cfg(test)]
+mod tool_composition_tests;
 pub use authority::{HostValidationContext, RuntimeObservationExecutor, validation_judge_provider};
 pub(crate) use authority::{
     invoke_bound, validation_arguments_valid, validation_extra_grant, validation_metadata,
@@ -79,6 +89,8 @@ mod extensions;
 mod gate;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod observation_message_tests;
 mod observations;
 mod progress;
 #[cfg(test)]

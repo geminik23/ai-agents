@@ -382,145 +382,155 @@ impl AgentRegistry {
     }
 
     /// Captures framework-owned parent and child bindings before the sender callback; resume never reissues this delivery.
-    pub(crate) async fn send_task_message(
-        self: &Arc<Self>,
-        from: &str,
-        to: &str,
-        message: &str,
+    /// Erasure separates optional dependency-wait construction from nested model/tool polling stacks.
+    pub(crate) fn send_task_message<'a>(
+        self: &'a Arc<Self>,
+        from: &'a str,
+        to: &'a str,
+        message: &'a str,
         actor: TurnActorContext,
-    ) -> Result<AgentResponse> {
-        let Some(invocation) = crate::autonomy::message::take_message() else {
-            return self.send_with_actor_context(from, to, message, actor).await;
-        };
-        let execution = crate::autonomy::current_execution()
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let message_admission = execution.message_admission.lock().await;
-        execution.check_message_slot(&invocation.frame)?;
-        let target = self
-            .get(to)
-            .ok_or_else(|| AgentError::Other(format!("Target agent not found: {to}")))?;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentResponse>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(invocation) = crate::autonomy::message::take_message() else {
+                return self.send_with_actor_context(from, to, message, actor).await;
+            };
+            let execution = crate::autonomy::current_execution()
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let message_admission = execution.message_admission.lock().await;
+            execution.check_message_slot(&invocation.frame)?;
+            let target = self
+                .get(to)
+                .ok_or_else(|| AgentError::Other(format!("Target agent not found: {to}")))?;
 
-        target.preflight_standalone_autonomy()?;
-        let mut frame = *invocation.frame;
-        let input = if self.send_with_context {
-            format!("[From {from}]: {message}")
-        } else {
-            message.into()
-        };
-        frame.delegate_id = to.into();
-        frame.delegate_runtime_id = target.info().id;
-        frame.delegate_input = input.clone();
-        frame.actor = actor.clone();
-        let mut state: crate::autonomy::message::MessageState =
-            serde_json::from_value(frame.cursor.clone())?;
-        state.child_actor = Some(actor.clone());
-        state.waiting_for = execution.message_dependency(&frame)?;
-        let deferred = state.waiting_for.is_some();
-        frame.cursor = serde_json::to_value(state)?;
-        frame.children = vec![crate::autonomy::composition::CompositionChild {
-            registry_id: to.into(),
-            runtime_id: frame.delegate_runtime_id.clone(),
-            operation: frame.child_operation.clone(),
-        }];
-        Box::pin(execution.retain_delegate_frame(frame.clone(), self.clone())).await?;
-        execution.targets.bind_tool(&frame.id, invocation.tool)?;
-        let captured = execution.targets.resolve(&frame.child_operation)?;
-        if !Arc::ptr_eq(&target, &captured) {
-            return Err(AgentError::Config(
-                "message target implementation changed before dispatch".into(),
-            ));
-        }
-        drop(message_admission);
-        if let Some(hooks) = &self.hooks {
-            hooks.on_message_sent(from, to, message).await;
-        }
-        // The parent implementation ran once; another incoming operation waits without touching the parked target history.
-        if deferred {
-            return Err(AgentError::TaskSuspended(frame.id));
-        }
-        crate::autonomy::composition::scope_message_composition(
-            frame.runtime_id.clone(),
-            frame.id.clone(),
-            Box::pin(crate::autonomy::scope_child_invocation(
-                frame.child_operation,
-                target.info().id,
-                Box::pin(target.chat_with_actor_context(&input, actor)),
-            )),
-        )
-        .await
+            target.preflight_standalone_autonomy()?;
+            target.reject_task_ancestor()?;
+            let mut frame = *invocation.frame;
+            let input = if self.send_with_context {
+                format!("[From {from}]: {message}")
+            } else {
+                message.into()
+            };
+            frame.delegate_id = to.into();
+            frame.delegate_runtime_id = target.info().id;
+            frame.delegate_input = input.clone();
+            frame.actor = actor.clone();
+            let mut state: crate::autonomy::message::MessageState =
+                serde_json::from_value(frame.cursor.clone())?;
+            state.child_actor = Some(actor.clone());
+            state.waiting_for = execution.message_dependency(&frame)?;
+            let deferred = state.waiting_for.is_some();
+            frame.cursor = serde_json::to_value(state)?;
+            frame.children = vec![crate::autonomy::composition::CompositionChild {
+                registry_id: to.into(),
+                runtime_id: frame.delegate_runtime_id.clone(),
+                operation: frame.child_operation.clone(),
+            }];
+            Box::pin(execution.retain_delegate_frame(frame.clone(), self.clone())).await?;
+            execution.targets.bind_tool(&frame.id, invocation.tool)?;
+            let captured = execution.targets.resolve(&frame.child_operation)?;
+            if !Arc::ptr_eq(&target, &captured) {
+                return Err(AgentError::Config(
+                    "message target implementation changed before dispatch".into(),
+                ));
+            }
+            drop(message_admission);
+            if let Some(hooks) = &self.hooks {
+                hooks.on_message_sent(from, to, message).await;
+            }
+            // The parent implementation ran once; another incoming operation waits without touching the parked target history.
+            if deferred && execution.wait_message_dependency(&frame).await? {
+                return Err(AgentError::TaskSuspended(frame.id));
+            }
+            crate::autonomy::composition::scope_message_composition(
+                frame.runtime_id.clone(),
+                frame.id.clone(),
+                Box::pin(crate::autonomy::scope_child_invocation(
+                    frame.child_operation,
+                    target.info().id,
+                    Box::pin(target.chat_with_actor_context(&input, actor)),
+                )),
+            )
+            .await
+        })
     }
 
     /// Saves an already selected route before child dispatch; resuming does not advance selection or send messaging hooks.
-    pub(crate) async fn route_task_message(
-        self: &Arc<Self>,
-        to: &str,
-        input: &str,
+    /// Erasure keeps optional dependency waits out of nested selected-route polling frames.
+    pub(crate) fn route_task_message<'a>(
+        self: &'a Arc<Self>,
+        to: &'a str,
+        input: &'a str,
         actor: Option<TurnActorContext>,
-        reason: &str,
-    ) -> Result<AgentResponse> {
-        let Some(invocation) = crate::autonomy::message::take_message() else {
+        reason: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentResponse>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(invocation) = crate::autonomy::message::take_message() else {
+                let child = self
+                    .get(to)
+                    .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
+                return if let Some(actor) = actor {
+                    child.chat_with_actor_context(input, actor).await
+                } else {
+                    child.chat(input).await
+                };
+            };
+            let execution = crate::autonomy::current_execution()
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            let message_admission = execution.message_admission.lock().await;
+            execution.check_message_slot(&invocation.frame)?;
             let child = self
                 .get(to)
                 .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
-            return if let Some(actor) = actor {
-                child.chat_with_actor_context(input, actor).await
-            } else {
-                child.chat(input).await
+            child.preflight_standalone_autonomy()?;
+            child.reject_task_ancestor()?;
+            let mut frame = invocation.frame;
+            frame.delegate_id = to.into();
+            frame.delegate_runtime_id = child.info().id;
+            frame.delegate_input = input.into();
+            frame.children = vec![crate::autonomy::composition::CompositionChild {
+                registry_id: to.into(),
+                runtime_id: frame.delegate_runtime_id.clone(),
+                operation: frame.child_operation.clone(),
+            }];
+            let mut state: crate::autonomy::message::MessageState =
+                serde_json::from_value(frame.cursor.clone())?;
+            state.response = crate::autonomy::message::MessageResponse::Route {
+                reason: reason.into(),
             };
-        };
-        let execution = crate::autonomy::current_execution()
-            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let message_admission = execution.message_admission.lock().await;
-        execution.check_message_slot(&invocation.frame)?;
-        let child = self
-            .get(to)
-            .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
-        child.preflight_standalone_autonomy()?;
-        let mut frame = invocation.frame;
-        frame.delegate_id = to.into();
-        frame.delegate_runtime_id = child.info().id;
-        frame.delegate_input = input.into();
-        frame.children = vec![crate::autonomy::composition::CompositionChild {
-            registry_id: to.into(),
-            runtime_id: frame.delegate_runtime_id.clone(),
-            operation: frame.child_operation.clone(),
-        }];
-        let mut state: crate::autonomy::message::MessageState =
-            serde_json::from_value(frame.cursor.clone())?;
-        state.response = crate::autonomy::message::MessageResponse::Route {
-            reason: reason.into(),
-        };
-        state.child_actor = actor.clone();
-        state.waiting_for = execution.message_dependency(&frame)?;
-        let deferred = state.waiting_for.is_some();
-        frame.cursor = serde_json::to_value(state)?;
-        Box::pin(execution.retain_delegate_frame((*frame).clone(), self.clone())).await?;
-        execution.targets.bind_tool(&frame.id, invocation.tool)?;
-        let captured = execution.targets.resolve(&frame.child_operation)?;
-        if !Arc::ptr_eq(&captured, &child) {
-            return Err(AgentError::Config("route target binding changed".into()));
-        }
-        drop(message_admission);
-        // Completed route selection remains bound while a prior incoming operation owns the target history.
-        if deferred {
-            return Err(AgentError::TaskSuspended(frame.id));
-        }
-        crate::autonomy::composition::scope_message_composition(
-            frame.runtime_id,
-            frame.id,
-            Box::pin(crate::autonomy::scope_child_invocation(
-                frame.child_operation,
-                child.info().id,
-                Box::pin(async {
-                    if let Some(actor) = actor {
-                        child.chat_with_actor_context(input, actor).await
-                    } else {
-                        child.chat(input).await
-                    }
-                }),
-            )),
-        )
-        .await
+            state.child_actor = actor.clone();
+            state.waiting_for = execution.message_dependency(&frame)?;
+            let deferred = state.waiting_for.is_some();
+            frame.cursor = serde_json::to_value(state)?;
+            Box::pin(execution.retain_delegate_frame((*frame).clone(), self.clone())).await?;
+            execution.targets.bind_tool(&frame.id, invocation.tool)?;
+            let captured = execution.targets.resolve(&frame.child_operation)?;
+            if !Arc::ptr_eq(&captured, &child) {
+                return Err(AgentError::Config("route target binding changed".into()));
+            }
+            drop(message_admission);
+            // Completed route selection remains bound while a prior incoming operation owns the target history.
+            if deferred && execution.wait_message_dependency(&frame).await? {
+                return Err(AgentError::TaskSuspended(frame.id));
+            }
+            crate::autonomy::composition::scope_message_composition(
+                frame.runtime_id,
+                frame.id,
+                Box::pin(crate::autonomy::scope_child_invocation(
+                    frame.child_operation,
+                    child.info().id,
+                    Box::pin(async {
+                        if let Some(actor) = actor {
+                            child.chat_with_actor_context(input, actor).await
+                        } else {
+                            child.chat(input).await
+                        }
+                    }),
+                )),
+            )
+            .await
+        })
     }
 
     async fn send_inner(

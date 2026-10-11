@@ -34,12 +34,17 @@ pub(crate) struct TaskModelFinal {
     pub thinking: Option<String>,
     pub reflection_metadata: Option<ai_agents_reasoning::ReflectionMetadata>,
     pub finalize_on_resume: bool,
+    #[serde(default)]
+    pub response_metadata: Option<HashMap<String, Value>>,
 }
 
 /// Return positions select existing runtime drivers without repeating input processing, semantic selection or finalization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TaskStateReturn {
+    BeforeCalls {
+        saved: Box<super::interaction::TaskModelCalls>,
+    },
     Prepared {
         data: ai_agents_process::ProcessData,
     },
@@ -140,12 +145,22 @@ pub(crate) fn current_actions_parent() -> Option<TaskActionsLocation> {
         .ok()
 }
 
+/// An observation's actual tool invocation returns to its controller rather than to a model turn or response finalization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskObservationLocation {
+    pub request: ToolExecutionRequest,
+    pub identity: EvidenceIdentity,
+    pub native_exchanges: Vec<TaskNativeExchange>,
+}
+
 /// The discriminant selects the existing executable driver, never a serialized execution capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TaskLocation {
     Skill(Box<TaskSkillLocation>),
     Actions(Box<TaskActionsLocation>),
+    Observation(Box<TaskObservationLocation>),
 }
 
 impl TaskLocation {
@@ -160,6 +175,15 @@ impl TaskLocation {
                 bounded_value(&serde_json::to_value(state)?, MAX_TASK_CHECKPOINT_BYTES)
             }
             Self::Actions(state) => state.validate(),
+            Self::Observation(state) => {
+                if !matches!(state.request.source, ai_agents_core::ToolCallSource::Task)
+                    || state.request.call_id.is_empty()
+                    || state.identity.attempt.as_ref().is_none_or(String::is_empty)
+                {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                }
+                bounded_value(&serde_json::to_value(state)?, MAX_TASK_CHECKPOINT_BYTES)
+            }
         }
     }
 
@@ -171,6 +195,7 @@ impl TaskLocation {
                 .pending
                 .as_ref()
                 .ok_or_else(|| AgentError::from(TaskRunStorageError::InvalidCheckpoint)),
+            Self::Observation(state) => Ok(&state.request),
             Self::Actions(state) => state
                 .pending
                 .as_ref()
@@ -183,6 +208,7 @@ impl TaskLocation {
         match self {
             Self::Skill(state) => state.source,
             Self::Actions(state) => state.source,
+            Self::Observation(_) => AutonomyTurnSource::ValidationFix,
         }
     }
 
@@ -191,6 +217,7 @@ impl TaskLocation {
         match self {
             Self::Skill(state) => (state.user_message_committed, &state.native_exchanges),
             Self::Actions(state) => (state.user_message_committed, &state.native_exchanges),
+            Self::Observation(state) => (false, &state.native_exchanges),
         }
     }
 }

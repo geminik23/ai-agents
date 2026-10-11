@@ -159,6 +159,7 @@ impl AutonomyRunner {
             let mut cursor = Vec::new();
             let mut question = None;
             let mut external = None;
+            let mut observation_group = None;
             let mut timed_out = false;
             match input {
                 TaskResumeInput::ExternalSignal(signal) => {
@@ -178,8 +179,53 @@ impl AutonomyRunner {
                         .iter()
                         .map(|value| serde_json::from_value::<BatchAuthorization>(value.clone()))
                         .collect::<std::result::Result<Vec<_>, _>>()?;
-                    let approval: BatchApproval =
-                        serde_json::from_value(parked.pending.reviewed_action.clone())?;
+                    let group = parked
+                        .group
+                        .as_ref()
+                        .map(|value| serde_json::from_value::<TaskGroupState>(value.clone()))
+                        .transpose()?;
+                    if let Some(group) = &group {
+                        super::super::authority::validate_observation_group(
+                            group, &payload, pending,
+                        )?;
+                        let retained = self.paused.lock();
+                        let retained = retained
+                            .get(&snapshot.key.run_id)
+                            .ok_or(TaskRunStorageError::NotResumable)?;
+                        if group
+                            .frames
+                            .values()
+                            .filter(|frame| {
+                                frame.id == group.frame.id
+                                    || frame.contains_operation(
+                                        &group.child_operation,
+                                        &group.frames,
+                                        &mut Vec::new(),
+                                    )
+                            })
+                            .any(|frame| {
+                                frame
+                                    .expires_at
+                                    .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+                                    || retained
+                                        .approval_deadlines
+                                        .get(&format!("composition:{}", frame.id))
+                                        .is_some_and(|expiry| std::time::Instant::now() >= *expiry)
+                            })
+                        {
+                            return Err(TaskRunStorageError::AdmissionExpired.into());
+                        }
+                    }
+                    let approval: BatchApproval = if let Some(group) = &group {
+                        group
+                            .batch
+                            .approvals
+                            .first()
+                            .cloned()
+                            .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+                    } else {
+                        serde_json::from_value(parked.pending.reviewed_action.clone())?
+                    };
                     let (id, response) = match response {
                         TaskResumeInput::Approval { request_id, result } => {
                             (request_id, BatchResponse::Approval(result))
@@ -195,10 +241,31 @@ impl AutonomyRunner {
                     if id != pending.id || payload.consumed_request_ids.contains(&id) {
                         return Err(TaskRunStorageError::NotResumable.into());
                     }
+                    if let Some(group) = &group {
+                        let targets = self
+                            .paused
+                            .lock()
+                            .get(&snapshot.key.run_id)
+                            .map(|paused| paused.targets.clone())
+                            .ok_or(TaskRunStorageError::NotResumable)?;
+                        let child = self.agent.task_group_child(group, &targets)?;
+                        child.validate_task_batch_response(&group.batch, &response)?;
+                        observation_group = Some((
+                            parked.request.call_id.clone(),
+                            group.clone(),
+                            response.clone(),
+                        ));
+                    }
                     let retained = self.paused.lock();
                     let deadline = retained
                         .get(&snapshot.key.run_id)
-                        .and_then(|p| p.approval_deadlines.get(&id))
+                        .and_then(|p| {
+                            p.approval_deadlines.get(&id).or_else(|| {
+                                group.as_ref().and_then(|group| {
+                                    p.approval_deadlines.get(&group.child_request.id)
+                                })
+                            })
+                        })
                         .copied();
                     drop(retained);
                     let expired = deadline
@@ -221,6 +288,9 @@ impl AutonomyRunner {
                             } else if matches!(result, ApprovalResult::Timeout) {
                                 return Err(AgentError::HITLTimeout);
                             }
+                            if let Some((_, _, response)) = &mut observation_group {
+                                *response = BatchResponse::Approval(result.clone());
+                            }
                             receipts.push(BatchAuthorization {
                                 call_id: approval.call_id,
                                 trigger: approval.trigger,
@@ -238,15 +308,17 @@ impl AutonomyRunner {
                                 .first()
                                 .map(|c| c.request.clone())
                                 .unwrap_or_else(|| parked.request.clone());
-                            self.agent.validate_task_question_answer(
-                                &ToolCall {
-                                    id: request.call_id.clone(),
-                                    name: request.requested_name,
-                                    arguments: approval.context.clone(),
-                                },
-                                &approval.question,
-                                &answer,
-                            )?;
+                            if group.is_none() {
+                                self.agent.validate_task_question_answer(
+                                    &ToolCall {
+                                        id: request.call_id.clone(),
+                                        name: request.requested_name,
+                                        arguments: approval.context.clone(),
+                                    },
+                                    &approval.question,
+                                    &answer,
+                                )?;
+                            }
                             question = Some((request.call_id, approval.context, answer));
                         }
                         BatchResponse::QuestionTimeout
@@ -297,6 +369,9 @@ impl AutonomyRunner {
                 (a, b) => a.or(b),
             };
             *execution.approval_deadlines.lock() = paused.approval_deadlines.clone();
+            if let Some((_, group, _)) = &observation_group {
+                *execution.delegate_frames.lock() = group.frames.clone();
+            }
             execution.set_scope(&state.scope);
             if let Some(todo) = &paused.todo {
                 execution.install_todos(self.agent.todo_store(), todo.checkpoint()?.binding);
@@ -384,6 +459,8 @@ impl AutonomyRunner {
                             )),
                         ),
                     );
+                    let future =
+                        super::super::authority::scope_observation_group(observation_group, future);
                     let result = if let Some((call, args, answer)) = question {
                         super::super::suspension::scope_resumed_question(call, args, answer, future)
                             .await
@@ -475,28 +552,24 @@ impl AutonomyRunner {
             .map(|paused| paused.owner.clone())
             .ok_or(TaskRunStorageError::NotResumable)?;
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
-        let requested = if snapshot.cancel_requested {
-            snapshot.clone()
-        } else {
-            self.store
-                .mutate(
-                    &snapshot.key.run_id,
-                    &TaskRunMutation::RequestCancel {
-                        expected_revision: snapshot.revision,
-                    },
-                )
-                .await?
-        };
-        let acknowledged = self
-            .store
-            .mutate(
-                &snapshot.key.run_id,
-                &TaskRunMutation::AcknowledgeCancel {
-                    expected_revision: requested.revision,
-                    payload: serde_json::to_value(payload)?,
-                },
-            )
-            .await?;
+        let requested = self.admit_paused_cleanup(snapshot.clone()).await?;
+        if let Some(group) = state
+            .driver
+            .as_ref()
+            .and_then(|driver| driver.parked.as_ref())
+            .and_then(|parked| parked.group.as_ref())
+        {
+            let group: TaskGroupState = serde_json::from_value(group.clone())?;
+            let (participants, targets) = self
+                .paused
+                .lock()
+                .get(&snapshot.key.run_id)
+                .map(|paused| (paused.participants.clone(), paused.targets.clone()))
+                .ok_or(TaskRunStorageError::NotResumable)?;
+            self.cleanup_observation_group(&owner, &group, &participants, &targets, &mut payload)
+                .await?;
+        }
+        let acknowledged = self.acknowledge_paused_cleanup(&requested, payload).await?;
         let paused = self
             .paused
             .lock()
@@ -513,6 +586,44 @@ impl AutonomyRunner {
             run: TaskRun::from_checkpoint(&acknowledged, &self.config_identity)?,
             final_response: None,
         })
+    }
+
+    /// Known-safe observation groups close each exact child history and consumed parent attempt without invoking a pending implementation.
+    async fn cleanup_observation_group(
+        &self,
+        owner: &Arc<RunOwner>,
+        group: &TaskGroupState,
+        participants: &Arc<super::super::participants::Participants>,
+        targets: &Arc<CompositionTargets>,
+        payload: &mut TaskCheckpointPayload,
+    ) -> Result<()> {
+        if participants.unsettled() {
+            return Err(AgentError::Config(
+                "observation group cleanup requires actual quiescence".into(),
+            ));
+        }
+        let retired = self
+            .agent
+            .cancel_task_group(owner, group, participants, targets)
+            .await?;
+        for (operation, runtime) in retired {
+            let child = payload
+                .children
+                .iter_mut()
+                .find(|child| child.child_id == operation)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            child.runtime = runtime;
+            if let Some(pending) = child.pending.take()
+                && !payload.consumed_request_ids.contains(&pending.id)
+            {
+                payload.consumed_request_ids.push(pending.id);
+            }
+            child.result = Some(json!({"error":"observation child stopped before continuation"}));
+        }
+        super::super::message::settle_cancelled_messages(payload)?;
+        payload.runtime =
+            TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
+        Ok(())
     }
 
     /// Successful acknowledgement can race cancellation or expiry; settle only after proving no actual invocation remains uncertain.
@@ -562,6 +673,56 @@ impl AutonomyRunner {
         execution: &Arc<RunExecution>,
         driver: &mut ValidationDriverState,
     ) -> Result<()> {
+        if let Some(group) = driver
+            .parked
+            .as_ref()
+            .and_then(|parked| parked.group.as_ref())
+        {
+            let group: TaskGroupState = serde_json::from_value(group.clone())?;
+            let snapshot = execution.load_owned().await?;
+            let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+            let logical = driver.parked.as_ref().map(|parked| canonical_identity(&json!({"check":driver.check_id,"attempt":driver.identity.attempt,"observation":parked.observation})).map(|id| format!("validation:{id}"))).transpose()?;
+            if payload.reservations.iter().any(|reservation| {
+                Some(&reservation.id) != logical.as_ref()
+                    && matches!(
+                        reservation.state,
+                        TaskEffectState::Dispatched | TaskEffectState::Uncertain
+                    )
+            }) {
+                return Err(AgentError::Config(
+                    "observation group interruption has uncertain invocation work".into(),
+                ));
+            }
+            self.cleanup_observation_group(
+                &execution.owner,
+                &group,
+                &execution.participants,
+                &execution.targets,
+                &mut payload,
+            )
+            .await?;
+            if let Some(logical) = &logical {
+                let reservation = payload
+                    .reservations
+                    .iter_mut()
+                    .find(|reservation| &reservation.id == logical)
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                reservation.state = TaskEffectState::Completed;
+                reservation.result = Some(json!({"cancelled":true,"origin":"validation"}));
+            }
+            if let Some(pending) = payload.pending.take() {
+                payload.consumed_request_ids.push(pending.id);
+            }
+            payload.pause_reason = None;
+            retire_controller(&mut payload)?;
+            execution
+                .update(|current| {
+                    *current = payload;
+                    Ok(())
+                })
+                .await?;
+            return Ok(());
+        }
         execution.update(|payload| {
             let parked_id = driver.parked.as_ref().map(|parked| canonical_identity(&json!({"check":driver.check_id,"attempt":driver.identity.attempt,"observation":parked.observation})).map(|id| format!("validation:{id}"))).transpose()?;
             if execution.participants.unsettled() || payload.children.iter().any(|child| child.result.is_none())

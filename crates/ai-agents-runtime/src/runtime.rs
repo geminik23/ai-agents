@@ -21,10 +21,14 @@ tokio::task_local! {
 mod task_composition;
 #[path = "autonomy/continuation_runtime.rs"]
 mod task_continuation;
+#[path = "autonomy/interaction_runtime.rs"]
+mod task_interaction;
 #[path = "autonomy/location_runtime.rs"]
 mod task_location;
 #[path = "autonomy/message_runtime.rs"]
 mod task_message;
+#[path = "autonomy/observation_runtime.rs"]
+mod task_observation;
 #[path = "autonomy/state_runtime.rs"]
 mod task_state;
 
@@ -1408,9 +1412,16 @@ impl RuntimeAgent {
 
     /// Checks prepared consumer capabilities before standalone or inherited child work begins.
     pub(crate) fn preflight_standalone_autonomy(&self) -> Result<()> {
-        if self.disambiguation_manager.is_some() {
+        if self.autonomy_owner.read().is_none()
+            && self
+                .disambiguation_manager
+                .as_ref()
+                .map(|manager| manager.has_pending_now())
+                .transpose()?
+                .unwrap_or(false)
+        {
             return Err(AgentError::Config(
-                "task disambiguation continuation is not installed".into(),
+                "task entry cannot adopt an unrelated clarification exchange".into(),
             ));
         }
         if self.llm_registry.aliases().iter().any(|alias| {
@@ -1436,7 +1447,15 @@ impl RuntimeAgent {
             ));
         }
 
-        if self.runtime_config.optimization.enabled {
+        let optimization = &self.runtime_config.optimization;
+        if optimization.enabled
+            && (optimization.speculative_state_transitions
+                || optimization.speculative_skill_routing
+                || optimization.speculative_reasoning_auto
+                || optimization.parallel_post_turn_memory
+                || optimization.background_observability_export
+                || optimization.post_turn.any_background_tasks_enabled())
+        {
             return Err(AgentError::Config(
                 "autonomy speculative settlement is not installed".into(),
             ));
@@ -1493,7 +1512,7 @@ impl RuntimeAgent {
                     let frames = execution.delegate_frames.lock();
                     crate::autonomy::composition::response_targets_frame(&frame, &frames)
                 };
-                if targets {
+                if targets || execution.deferred_batch_ready(&frame) {
                     return Box::pin(self.resume_parked_task_composition(
                         input, actor, execution, operation, frame,
                     ))
@@ -1525,6 +1544,12 @@ impl RuntimeAgent {
                     } }
                 }
             }).await.map_err(|_| AgentError::Other("child root admission deadline exceeded".into()))??;
+            let incoming = crate::autonomy::current_child_invocation(&self.info.id);
+            if execution.target_has_pending_operation(&self.info.id, incoming.as_deref()) {
+                return Err(AgentError::Config(
+                    "another incoming operation still owns this parked runtime".into(),
+                ));
+            }
             let _mutations = self.autonomy_mutations.try_write().map_err(|_| {
                 AgentError::Other("child runtime has an active host operation".into())
             })?;
@@ -1705,6 +1730,17 @@ impl RuntimeAgent {
         let admission = self.acquire_root_turn().await?;
         scope_runtime_gate_identity_stack(&admission.identity_stack, self.init_storage()).await?;
         self.flush_background_tasks().await?;
+        if self
+            .disambiguation_manager
+            .as_ref()
+            .map(|manager| manager.has_pending_now())
+            .transpose()?
+            .unwrap_or(false)
+        {
+            return Err(AgentError::Config(
+                "task entry cannot adopt an unrelated clarification exchange".into(),
+            ));
+        }
         // Never wait for mutations while holding the root gate: their hooks may need that same gate.
         let _mutations = self
             .autonomy_mutations
@@ -7806,7 +7842,19 @@ impl RuntimeAgent {
     }
 
     /// Routes only the accepted task input to a script; controller continuations use native/model history without replaying that segment.
-    async fn try_skill_route(&self, input: &str) -> Result<SkillRouteResult> {
+    /// Optional semantic skill construction is erased so runtimes without routing do not retain it on nested model polling stacks.
+    fn try_skill_route<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<SkillRouteResult>> + Send + 'a>> {
+        if self.skill_router.is_none() {
+            return Box::pin(async { Ok(SkillRouteResult::NoMatch) });
+        }
+        Box::pin(self.try_skill_route_inner(input))
+    }
+
+    /// Installed skill routing selects once under the admitted turn; later controller work skips completed selection.
+    async fn try_skill_route_inner(&self, input: &str) -> Result<SkillRouteResult> {
         if crate::autonomy::current_turn_input(&self.root_turn_gate)
             .is_some_and(|turn| !turn.initial_work())
         {
@@ -8381,8 +8429,63 @@ OVERALL: PASS/FAIL"#,
             .await
     }
 
-    /// Runs state transition approval before any transition side effects.
-    async fn approve_transition_target(&self, from_state: &str, target: &str) -> Result<bool> {
+    /// Runs state transition approval before effects and retains the exact selected caller position for task suspension.
+    async fn approve_transition_target(
+        &self,
+        from_state: &str,
+        target: &str,
+        reason: &str,
+        staged: Option<&HashMap<String, Value>>,
+        processed_input: Option<&str>,
+    ) -> Result<bool> {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && let Some(position) = crate::autonomy::location::current_state_return()
+            && let Some(engine) = &self.hitl_engine
+        {
+            let generation = self.state_machine.as_ref().map(|m| m.generation());
+            let epoch = self.disambiguation_epoch.load(Ordering::SeqCst);
+            let kind = crate::autonomy::interaction::TaskInteractionKind::StateApproval {
+                from_state: from_state.into(),
+                target: target.into(),
+                reason: reason.into(),
+                staged: staged.cloned(),
+                processed_input: processed_input.map(str::to_owned),
+                definition: serde_json::to_value(
+                    self.state_machine
+                        .as_ref()
+                        .and_then(|m| m.current_definition()),
+                )?,
+                return_to: Box::new(position),
+            };
+            let check = self
+                .observe_purpose(
+                    ObservationPurpose::HitlLocalization,
+                    engine.check_state_transition_with_localization(
+                        Some(from_state),
+                        target,
+                        &self.build_hitl_language_context(),
+                        self.approval_handler.as_ref(),
+                        Some(&self.llm_registry),
+                    ),
+                )
+                .await?;
+            if generation != self.state_machine.as_ref().map(|m| m.generation())
+                || epoch != self.disambiguation_epoch.load(Ordering::SeqCst)
+            {
+                return Err(AgentError::Other(
+                    "transition review ownership changed".into(),
+                ));
+            }
+            if let Some(request) = check.clone().into_request() {
+                self.park_task_interaction(kind, Some(request), None)
+                    .await?;
+            }
+            let result = self.request_hitl_approval(check).await?;
+            return Ok(matches!(
+                result,
+                ApprovalResult::Approved | ApprovalResult::Modified { .. }
+            ));
+        }
         let approved = self.check_state_hitl(Some(from_state), target).await?;
         if !approved {
             info!(to = %target, "State transition rejected by HITL");
@@ -8455,7 +8558,10 @@ OVERALL: PASS/FAIL"#,
         target: &str,
         reason: &str,
     ) -> Result<bool> {
-        if !self.approve_transition_target(from_state, target).await? {
+        if !self
+            .approve_transition_target(from_state, target, reason, None, None)
+            .await?
+        {
             return Ok(false);
         }
         self.apply_transition_target(from_state, target, reason, None)
@@ -8487,7 +8593,13 @@ OVERALL: PASS/FAIL"#,
         processed_input: &str,
     ) -> Result<bool> {
         if !self
-            .approve_transition_target(&candidate.from_state, candidate.target())
+            .approve_transition_target(
+                &candidate.from_state,
+                candidate.target(),
+                &candidate.reason,
+                Some(staged),
+                Some(processed_input),
+            )
             .await?
         {
             return Ok(false);
@@ -8527,6 +8639,7 @@ OVERALL: PASS/FAIL"#,
     }
 
     /// Attempts deterministic pre-response routing before old-state response generation.
+    /// Task redispatch consumes retained processed data so approved transitions do not repeat input processing.
     async fn try_pre_response_transition(
         &self,
         processed_input: &str,
@@ -8588,6 +8701,12 @@ OVERALL: PASS/FAIL"#,
             .await?
         {
             return Ok(None);
+        }
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+            && let Some(crate::autonomy::location::TaskStateReturn::Prepared { data }) =
+                crate::autonomy::location::current_state_return()
+        {
+            return Box::pin(self.run_accepted_input(data)).await.map(Some);
         }
         self.redispatch_current_state(processed_input)
             .await
@@ -8847,7 +8966,13 @@ OVERALL: PASS/FAIL"#,
         loop {
             if let Some(candidate) = transition_candidate.take() {
                 if self
-                    .approve_transition_target(&candidate.from_state, candidate.target())
+                    .approve_transition_target(
+                        &candidate.from_state,
+                        candidate.target(),
+                        &candidate.reason,
+                        None,
+                        None,
+                    )
                     .await?
                 {
                     // Drop losing provider futures before transition side effects can reuse their shared resources.
@@ -10396,7 +10521,19 @@ Respond in JSON format:
     /// `Proceed` carries the input the internal loop must run on. Some branches (`Abandoned` with a replacement input)
     /// have already committed the original user message before returning it; the internal loop's own commit is then a no-op
     /// because `root_user_message_committed` is set. Callers must not reset root-turn state between this call and the loop.
-    async fn resolve_disambiguation(&self, input: &str) -> Result<DisambiguationDispatch> {
+    fn resolve_disambiguation<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<DisambiguationDispatch>> + Send + 'a>> {
+        if self.disambiguation_manager.is_none() {
+            return Box::pin(async move { Ok(DisambiguationDispatch::Proceed(input.to_owned())) });
+        }
+        Box::pin(self.resolve_disambiguation_inner(input))
+    }
+
+    /// Installed-manager work retains semantic phases under the current root owner.
+    /// Its optional future is constructed outside unrelated nested model polling frames.
+    async fn resolve_disambiguation_inner(&self, input: &str) -> Result<DisambiguationDispatch> {
         let Some(ref disambiguator) = self.disambiguation_manager else {
             return Ok(DisambiguationDispatch::Proceed(input.to_string()));
         };
@@ -10480,6 +10617,7 @@ Respond in JSON format:
                     awaiting_confirmation,
                 );
                 drop(admission);
+                self.park_task_clarification(input, &response).await?;
                 self.finish_turn_if_root(&response).await?;
                 Ok(DisambiguationDispatch::Terminal(response))
             }
@@ -10582,6 +10720,17 @@ Respond in JSON format:
                         format!("User request needs human assistance: {}", reason),
                         Some(hitl.config().default_timeout_seconds),
                     );
+                    if let Some(request) = check_result.clone().into_request() {
+                        self.park_task_interaction(
+                            crate::autonomy::interaction::TaskInteractionKind::Escalation {
+                                input: input.into(),
+                                reason: reason.clone(),
+                            },
+                            Some(request),
+                            None,
+                        )
+                        .await?;
+                    }
                     let result = self.request_hitl_approval(check_result).await?;
                     if matches!(
                         result,
@@ -10606,6 +10755,12 @@ Respond in JSON format:
             }
             DisambiguationResult::Abandoned { new_input } => {
                 *self.pending_skill_id.write() = None;
+                if let Some(execution) = crate::autonomy::current_execution() {
+                    execution.stop("scope_ended");
+                    let response = AgentResponse::new("Task clarification was abandoned");
+                    self.finish_turn_if_root(&response).await?;
+                    return Ok(DisambiguationDispatch::Terminal(response));
+                }
 
                 info!(
                     has_new_input = new_input.is_some(),
@@ -10694,38 +10849,44 @@ Respond in JSON format:
     }
 
     /// Readiness and receive hooks are already complete when a saved timeout or clarification returns here.
-    async fn run_after_ready_context(&self, input: &str) -> Result<AgentResponse> {
-        // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
-        // responses itself; this loop only dispatches on the outcome.
-        let dispatch = if crate::autonomy::current_turn_input(&self.root_turn_gate)
-            .is_some_and(|turn| !turn.initial_work())
-        {
-            DisambiguationDispatch::Proceed(input.to_string())
-        } else {
-            self.resolve_disambiguation(input).await?
-        };
-        let input_to_run = match dispatch {
-            DisambiguationDispatch::Terminal(response) => return Ok(response),
-            DisambiguationDispatch::RecheckSkill {
-                skill_id,
-                enriched_input,
-                disambiguation_epoch,
-                state_generation,
-            } => {
-                return self
-                    .recheck_skill_disambiguation(
-                        &skill_id,
-                        &enriched_input,
-                        disambiguation_epoch,
-                        state_generation,
-                    )
-                    .await;
-            }
-            DisambiguationDispatch::Proceed(input) => input,
-        };
+    /// Erasure prevents unused semantic-dispatch construction from multiplying nested participant polling stacks.
+    fn run_after_ready_context<'a>(
+        &'a self,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + 'a>> {
+        Box::pin(async move {
+            // Disambiguation check (before input processing). The shared gate finalizes terminal clarification
+            // responses itself; this loop only dispatches on the outcome.
+            let dispatch = if crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .is_some_and(|turn| !turn.initial_work())
+            {
+                DisambiguationDispatch::Proceed(input.to_string())
+            } else {
+                self.resolve_disambiguation(input).await?
+            };
+            let input_to_run = match dispatch {
+                DisambiguationDispatch::Terminal(response) => return Ok(response),
+                DisambiguationDispatch::RecheckSkill {
+                    skill_id,
+                    enriched_input,
+                    disambiguation_epoch,
+                    state_generation,
+                } => {
+                    return self
+                        .recheck_skill_disambiguation(
+                            &skill_id,
+                            &enriched_input,
+                            disambiguation_epoch,
+                            state_generation,
+                        )
+                        .await;
+                }
+                DisambiguationDispatch::Proceed(input) => input,
+            };
 
-        // Box the large turn pipeline before nesting child polling on the caller's test or host thread stack.
-        Box::pin(self.run_loop_internal(&input_to_run)).await
+            // Box the large turn pipeline before nesting child polling on the caller's test or host thread stack.
+            Box::pin(self.run_loop_internal(&input_to_run)).await
+        })
     }
 
     /// Generate a localized response using the router LLM
@@ -10898,9 +11059,7 @@ Respond in JSON format:
                     // Keep pending_skill_id set (do NOT clear it).
                     // The next turn will resolve this new clarification and
                     // re-enter this method until all fields are present.
-                    self.memory
-                        .add_message(ChatMessage::user(enriched_input))
-                        .await?;
+                    self.commit_rechecked_skill_input(enriched_input).await?;
                     self.memory
                         .add_message(ChatMessage::assistant(&question.question))
                         .await?;
@@ -10920,6 +11079,8 @@ Respond in JSON format:
                         }),
                     );
                     drop(admission);
+                    self.park_task_clarification(enriched_input, &response)
+                        .await?;
                     self.finish_turn_if_root(&response).await?;
                     return Ok(response);
                 }
@@ -10937,15 +11098,13 @@ Respond in JSON format:
                     *self.pending_skill_id.write() = None;
                     drop(admission);
                     let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
-                    self.memory
-                        .add_message(ChatMessage::user(&re_enriched))
-                        .await?;
+                    self.commit_rechecked_skill_input(&re_enriched).await?;
                     return self
                         .handle_skill_response(
                             &re_enriched,
                             skill_id,
                             skill_response,
-                            &HashMap::new(),
+                            &crate::autonomy::interaction::prepared_context(),
                         )
                         .await;
                 }
@@ -10962,15 +11121,13 @@ Respond in JSON format:
                     *self.pending_skill_id.write() = None;
                     drop(admission);
                     let skill_response = self.execute_skill_by_id(skill_id, &re_enriched).await?;
-                    self.memory
-                        .add_message(ChatMessage::user(&re_enriched))
-                        .await?;
+                    self.commit_rechecked_skill_input(&re_enriched).await?;
                     return self
                         .handle_skill_response(
                             &re_enriched,
                             skill_id,
                             skill_response,
-                            &HashMap::new(),
+                            &crate::autonomy::interaction::prepared_context(),
                         )
                         .await;
                 }
@@ -11043,11 +11200,14 @@ Respond in JSON format:
         *self.pending_skill_id.write() = None;
         drop(admission);
         let skill_response = self.execute_skill_by_id(skill_id, enriched_input).await?;
-        self.memory
-            .add_message(ChatMessage::user(enriched_input))
-            .await?;
-        self.handle_skill_response(enriched_input, skill_id, skill_response, &HashMap::new())
-            .await
+        self.commit_rechecked_skill_input(enriched_input).await?;
+        self.handle_skill_response(
+            enriched_input,
+            skill_id,
+            skill_response,
+            &crate::autonomy::interaction::prepared_context(),
+        )
+        .await
     }
 
     /// Handle skill routing result: output processing, memory, transitions.
@@ -11367,6 +11527,7 @@ Respond in JSON format:
                     thinking: thinking_content.clone(),
                     reflection_metadata: reflection_metadata.clone(),
                     finalize_on_resume: false,
+                    response_metadata: None,
                 }),
             };
             let result = crate::autonomy::location::scope_state_return(
@@ -11440,8 +11601,8 @@ Respond in JSON format:
         // (with proper URLs from YAML), so skip the LLM's tool call.
         let transition_content = native_readable_projection(content)
             .map_err(|error| AgentError::LLM(error.to_string()))?;
-        let transition_fired = if matches!(crate::autonomy::location::current_state_return(),
-            Some(crate::autonomy::location::TaskStateReturn::ModelContinue {state}) if state.deferred_final.is_some())
+        let transition_fired = if crate::autonomy::interaction::skip_tool_transition()
+            || crate::autonomy::interaction::regenerating_model()
         {
             false
         } else {
@@ -11499,6 +11660,7 @@ Respond in JSON format:
                     authorized: Vec::new(),
                     rejected: false,
                     location: None,
+                    interaction: None,
                     executor_cursors: {
                         let mut cursors = execution.parked_executor_cursors.lock();
                         let keys: Vec<_> = cursors
@@ -12207,7 +12369,7 @@ Respond in JSON format:
         // post_loop_processing records the assistant turn and evaluates transitions.
         // apply_post_loop_result handles NeedsRedispatch by re-entering run_loop_internal.
         let post_result = self
-            .post_loop_processing(
+            .post_composed_processing(
                 input,
                 format!("[Delegated to {}]: {}", delegate_id, response.content),
             )
@@ -12386,7 +12548,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -12559,7 +12721,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -12716,7 +12878,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -12887,7 +13049,7 @@ Respond in JSON format:
         self.commit_root_user_message(input).await?;
 
         let post_result = self
-            .post_loop_processing(input, result.response.content.clone())
+            .post_composed_processing(input, result.response.content.clone())
             .await?;
         let final_content = self
             .apply_post_loop_result(input, post_result)
@@ -12961,36 +13123,55 @@ Respond in JSON format:
     }
 
     /// Continues an accepted input after a saved transition without repeating processing or semantic transition selection.
-    async fn run_accepted_input(&self, input_data: ProcessData) -> Result<AgentResponse> {
-        let processed_input = &input_data.content;
-        // Controller continuation works from committed aggregate history, not by rerunning completed initial child flows.
-        if !crate::autonomy::current_turn_input(&self.root_turn_gate)
-            .is_some_and(|turn| !turn.initial_work())
-            && let Some(ref sm) = self.state_machine
-            && let Some(def) = sm.current_definition()
-        {
-            if let Some(ref delegate_id) = def.delegate {
-                return Box::pin(self.handle_delegated_state(processed_input, delegate_id, &def))
+    /// Erasure isolates optional orchestration construction from the enclosing input pipeline's nested polling frame.
+    fn run_accepted_input(
+        &self,
+        input_data: ProcessData,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> {
+        Box::pin(async move {
+            let processed_input = &input_data.content;
+            // Controller continuation works from committed aggregate history, not by rerunning completed initial child flows.
+            if !crate::autonomy::current_turn_input(&self.root_turn_gate)
+                .is_some_and(|turn| !turn.initial_work())
+                && let Some(ref sm) = self.state_machine
+                && let Some(def) = sm.current_definition()
+            {
+                if let Some(ref delegate_id) = def.delegate {
+                    return Box::pin(self.handle_delegated_state(
+                        processed_input,
+                        delegate_id,
+                        &def,
+                    ))
                     .await;
-            }
-            if let Some(ref concurrent_config) = def.concurrent {
-                return Box::pin(self.handle_concurrent_state(processed_input, concurrent_config))
+                }
+                if let Some(ref concurrent_config) = def.concurrent {
+                    return Box::pin(
+                        self.handle_concurrent_state(processed_input, concurrent_config),
+                    )
                     .await;
-            }
-            if let Some(ref group_chat_config) = def.group_chat {
-                return Box::pin(self.handle_group_chat_state(processed_input, group_chat_config))
+                }
+                if let Some(ref group_chat_config) = def.group_chat {
+                    return Box::pin(
+                        self.handle_group_chat_state(processed_input, group_chat_config),
+                    )
                     .await;
+                }
+                if let Some(ref pipeline_config) = def.pipeline {
+                    return Box::pin(self.handle_pipeline_state(processed_input, pipeline_config))
+                        .await;
+                }
+                if let Some(ref handoff_config) = def.handoff {
+                    return Box::pin(self.handle_handoff_state(processed_input, handoff_config))
+                        .await;
+                }
             }
-            if let Some(ref pipeline_config) = def.pipeline {
-                return Box::pin(self.handle_pipeline_state(processed_input, pipeline_config))
-                    .await;
-            }
-            if let Some(ref handoff_config) = def.handoff {
-                return Box::pin(self.handle_handoff_state(processed_input, handoff_config)).await;
-            }
-        }
 
-        Box::pin(self.run_prepared_input(input_data)).await
+            crate::autonomy::interaction::scope_prepared_input(
+                input_data.clone(),
+                Box::pin(self.run_prepared_input(input_data)),
+            )
+            .await
+        })
     }
 
     // Keeps the model, skill and planning driver out of declared-state parents' recursive polling frames.
@@ -13034,6 +13215,8 @@ Respond in JSON format:
                         .await?;
                 }
                 drop(admission);
+                self.park_task_clarification(processed_input, &response)
+                    .await?;
                 self.finish_turn_if_root(&response).await?;
                 return Ok(response);
             }
@@ -13213,7 +13396,13 @@ Respond in JSON format:
         loop {
             if let Some(candidate) = transition_candidate.take() {
                 if self
-                    .approve_transition_target(&candidate.from_state, candidate.target())
+                    .approve_transition_target(
+                        &candidate.from_state,
+                        candidate.target(),
+                        &candidate.reason,
+                        None,
+                        None,
+                    )
                     .await?
                 {
                     // Drop the stale stream future before transition side effects or redispatch reuse the provider.

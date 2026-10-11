@@ -4,6 +4,18 @@ use super::*;
 use crate::autonomy::composition::{CompositionChild, CompositionDispatch, DelegateFrame};
 
 impl RuntimeAgent {
+    /// Dependency queuing must reject a held ancestor gate before waiting, otherwise the ancestor cannot settle its predecessor operation.
+    pub(crate) fn reject_task_ancestor(&self) -> Result<()> {
+        if current_runtime_gate_identity_stack()
+            .iter()
+            .any(|gate| Arc::ptr_eq(gate, &self.root_turn_gate))
+        {
+            return Err(AgentError::Config(
+                "task dispatch cannot depend on a held ancestor runtime".into(),
+            ));
+        }
+        Ok(())
+    }
     /// Registry removal cannot retire an independently retained runtime owner after catalogue protection ends.
     pub(crate) fn has_task_owner(&self) -> bool {
         self.autonomy_owner.read().is_some()

@@ -295,6 +295,28 @@ async fn concurrent_dispatch(
         .await?;
     }
     if let Some(suspension) = suspension {
+        // A sibling can settle after a deferred parent was polled; reenter only acknowledged ready cursors, never completed children.
+        if let (Some(execution), Some(frame), Some(scope)) =
+            (&execution, &frame, composition::current_composition())
+            && execution.composition_has_ready_dependency(frame)
+        {
+            return composition::scope_message_composition(
+                scope.runtime_id,
+                scope.frame_key,
+                Box::pin(concurrent_dispatch(
+                    registry,
+                    input,
+                    agents,
+                    aggregation_config,
+                    llms,
+                    min_required,
+                    timeout_ms,
+                    on_partial_failure,
+                    vote_parallelism,
+                )),
+            )
+            .await;
+        }
         return Err(suspension);
     }
 

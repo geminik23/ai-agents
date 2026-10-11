@@ -174,6 +174,7 @@ impl RuntimeAgent {
             rejected: false,
             executor_cursors,
             location: Some(location),
+            interaction: None,
         };
         batch.validate()?;
         Box::pin(execution.retain_message_batch(&self.info.id, batch.clone())).await?;
@@ -186,6 +187,20 @@ impl RuntimeAgent {
         location.validate()?;
         match location {
             TaskLocation::Actions(state) => self.validate_task_actions(state),
+            TaskLocation::Observation(state) => {
+                if state.identity.key.agent_id != self.info.id
+                    || self
+                        .autonomy_owner
+                        .read()
+                        .as_ref()
+                        .is_none_or(|owner| owner.run_id != state.identity.key.run_id)
+                {
+                    return Err(AgentError::Config(
+                        "observation runtime owner changed".into(),
+                    ));
+                }
+                Ok(())
+            }
             TaskLocation::Skill(state) => {
                 if self
                     .state_machine
@@ -364,6 +379,9 @@ impl RuntimeAgent {
             let execution = crate::autonomy::current_execution()
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
             match &mut location {
+                TaskLocation::Observation(_) => {
+                    Ok(AgentResponse::new(serde_json::to_string(&record)?))
+                }
                 TaskLocation::Actions(state) => {
                     if record.success {
                         self.context_manager.set(

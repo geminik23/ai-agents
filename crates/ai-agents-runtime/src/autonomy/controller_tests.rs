@@ -61,13 +61,15 @@ impl AutonomyValidator for Validator {
             return Ok(ValidationDecision::NeedObservations {
                 requests: vec![ValidationObservationRequest::Tool {
                     id: "observe".into(),
-                    tool: if self.mode == "question" {
+                    tool: if self.mode.starts_with("fallback") {
+                        "fail_probe"
+                    } else if self.mode == "question" {
                         "ask_user"
                     } else {
                         "probe"
                     }
                     .into(),
-                    arguments: if self.mode == "question" {
+                    arguments: if self.mode == "question" || self.mode == "fallback_question" {
                         json!({"question":"Select","options":["yes"],"allow_other":false})
                     } else {
                         json!({"value":1})
@@ -121,6 +123,34 @@ impl Tool for Probe {
         ToolResult::ok(args.to_string())
     }
 }
+struct FailProbe(Arc<AtomicUsize>);
+#[async_trait]
+impl Tool for FailProbe {
+    fn id(&self) -> &str {
+        "fail_probe"
+    }
+    fn name(&self) -> &str {
+        "fail_probe"
+    }
+    fn description(&self) -> &str {
+        "Count the failed original observation"
+    }
+    fn input_schema(&self) -> Value {
+        json!({"type":"object"})
+    }
+    fn safety_metadata(&self) -> ToolSafetyMetadata {
+        ToolSafetyMetadata {
+            read_only: true,
+            concurrency_safe: true,
+            ..Default::default()
+        }
+    }
+    async fn execute(&self, _: Value, _: ToolExecutionContext) -> ToolResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ToolResult::error("original observation failed")
+    }
+}
+
 struct Mutation(Arc<AtomicUsize>);
 #[async_trait]
 impl Tool for Mutation {
@@ -182,7 +212,9 @@ pub(super) fn fixture(mode: &'static str) -> Fixture {
                     vec![]
                 } else {
                     vec![
-                        if mode == "question" {
+                        if mode.starts_with("fallback") {
+                            "fail_probe"
+                        } else if mode == "question" {
                             "ask_user"
                         } else {
                             "probe"
@@ -223,8 +255,13 @@ pub(super) fn fixture(mode: &'static str) -> Fixture {
             .unwrap();
     }
     let provider = super::runner_tests::RecordingProvider::new(&["done", "ordinary"]);
-    let yaml = "name: Observation\nsystem_prompt: test\ntools: [probe, ask_user, mutate]\nhitl:\n  tools:\n    probe:\n      require_approval: true\n";
-    let mut agent = AgentBuilder::from_yaml(yaml)
+    let yaml = "name: Observation\nsystem_prompt: test\ntools: [probe, ask_user, mutate, fail_probe]\nerror_recovery:\n  tools:\n    fail_probe:\n      max_retries: 0\n      on_failure:\n        action: fallback\n        fallback_tool: probe\nhitl:\n  tools:\n    probe:\n      require_approval: true\n";
+    let yaml = if mode == "fallback_question" {
+        yaml.replace("fallback_tool: probe", "fallback_tool: ask_user")
+    } else {
+        yaml.into()
+    };
+    let mut agent = AgentBuilder::from_yaml(&yaml)
         .unwrap()
         .llm(provider.clone())
         .auto_configure_features()
@@ -232,6 +269,7 @@ pub(super) fn fixture(mode: &'static str) -> Fixture {
         .approval_handler(Arc::new(NoApproval))
         .autonomy_extensions(extensions)
         .tool(Arc::new(Probe(calls.clone())))
+        .tool(Arc::new(FailProbe(calls.clone())))
         .tool(Arc::new(Mutation(calls.clone())))
         .tool(Arc::new(ai_agents_tools::builtin::AskUserTool::new(
             Arc::new(parking_lot::RwLock::new(None)),
@@ -246,7 +284,11 @@ pub(super) fn fixture(mode: &'static str) -> Fixture {
         ScopedTaskRunStore::in_memory(agent.info().id, None, "controller.v1".into()).unwrap(),
     );
     let mut config = super::runner_tests::config(1);
-    config.defaults.max_tool_calls = Some(if mode == "batch" { 2 } else { 1 });
+    config.defaults.max_tool_calls = Some(if mode == "batch" || mode.starts_with("fallback") {
+        2
+    } else {
+        1
+    });
     config.defaults.validation = Some(
         serde_yaml::from_str(
             if mode == "host" {
@@ -434,6 +476,54 @@ async fn controller_cancel_does_not_invoke_parked_work() {
         assert_eq!(f.calls.load(Ordering::SeqCst), 0);
         assert_eq!(f.callbacks.load(Ordering::SeqCst), 1);
         assert_eq!(f.agent.chat("follow-up").await.unwrap().content, "ordinary");
+    }
+}
+
+#[tokio::test]
+async fn controller_fallback_observation_resumes_actual_hop_without_original_replay() {
+    for mode in ["fallback", "fallback_question"] {
+        let f = fixture(mode);
+        let first = f.runner.run("objective", None).await.unwrap();
+        assert_eq!(
+            first.run.status,
+            TaskRunStatus::Paused,
+            "{:?}",
+            first.run.stop_reason
+        );
+        assert_eq!(f.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(first.run.counters.tool_attempts, 1);
+        assert_eq!(f.callbacks.load(Ordering::SeqCst), 1);
+        let id = first.run.pending.as_ref().unwrap().id.clone();
+        let input = if mode == "fallback" {
+            TaskResumeInput::Approval {
+                request_id: id,
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            }
+        } else {
+            TaskResumeInput::UserAnswer {
+                request_id: id,
+                answer: json!({"answered":true,"selected":["yes"]}),
+            }
+        };
+        let done = f
+            .runner
+            .resume(&first.run.key.run_id, first.run.revision, input)
+            .await
+            .unwrap();
+        assert_eq!(
+            done.run.status,
+            TaskRunStatus::Completed,
+            "{:?}",
+            done.run.stop_reason
+        );
+        assert_eq!(
+            f.calls.load(Ordering::SeqCst),
+            if mode == "fallback" { 2 } else { 1 }
+        );
+        assert_eq!(done.run.counters.tool_attempts, 2);
+        assert_eq!(done.run.counters.llm_attempts, 1);
+        assert_eq!(done.run.counters.turns, 1);
+        assert_eq!(f.callbacks.load(Ordering::SeqCst), 2);
     }
 }
 

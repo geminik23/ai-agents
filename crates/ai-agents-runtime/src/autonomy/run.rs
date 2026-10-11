@@ -688,6 +688,7 @@ impl TaskCheckpointPayload {
             batch.validate_checkpoint(self)?;
         }
         if envelope.status == TaskRunStatus::Paused
+            && !super::interaction::has_root_interaction(self)
             && (matches!(
                 self.runtime.continuation,
                 TaskContinuation::Suspended { batch: None, .. }
@@ -705,6 +706,15 @@ impl TaskCheckpointPayload {
         }
         if self.pause_reason.as_deref() == Some("validation") {
             super::controller_checkpoint(self)?.ok_or_else(invalid)?;
+        }
+        if super::interaction::has_root_interaction(self) {
+            let adapter = self
+                .adapters
+                .iter()
+                .find(|a| a.id == "runtime.tool_batch")
+                .ok_or_else(invalid)?;
+            let batch: super::TaskBatchState = serde_json::from_value(adapter.state.clone())?;
+            batch.validate_checkpoint(self)?;
         }
         super::message::validate_suspended_attempts(self, envelope.status)?;
         let uncertain = self.reservations.iter().any(|r| {

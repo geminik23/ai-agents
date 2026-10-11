@@ -112,6 +112,8 @@ pub struct ValidationObservationPause {
     pub before: EvaluationScope,
     #[serde(default)]
     pub authorized: Vec<Value>,
+    #[serde(default)]
+    pub group: Option<Value>,
 }
 
 /// In-flight records are recovery-required after a crash, never automatically reexecuted.
@@ -189,6 +191,15 @@ pub trait ValidationObservationExecutor: Send + Sync {
         _before: &EvaluationScope,
     ) -> Result<Option<ValidationObservationPause>> {
         Ok(None)
+    }
+    /// Framework composition bridges can acknowledge captured child progress before returning park data; existing synchronous executors retain their hook.
+    async fn acknowledge_suspension(
+        &self,
+        request: &ValidationObservationRequest,
+        identity: &EvidenceIdentity,
+        before: &EvaluationScope,
+    ) -> Result<Option<ValidationObservationPause>> {
+        self.take_suspension(request, identity, before)
     }
     /// Must preserve shared policy/HITL/admission and return only authoritative managed observations.
     async fn execute(
@@ -518,15 +529,16 @@ impl ValidationDriverState {
             };
             if self.in_flight.is_some()
                 || self.pending_batch.first() != Some(&parked.observation)
-                || serde_json::to_value(&parked.request)?
-                    != serde_json::to_value(super::authority::observation_tool_request(
-                        &self.requests[&parked.observation],
-                        &self.identity,
-                    )?)?
+                || parked.request.call_id.is_empty()
+                || !matches!(parked.request.source, ai_agents_core::ToolCallSource::Task)
                 || parked.request.requested_name != *tool
                 || parked.request.arguments != *arguments
                 || self.wait.is_some()
                 || self.result.is_some()
+                || parked.before.key != self.identity.key
+                || parked.before.objective_revision != self.identity.objective_revision
+                || parked.before.cycle != self.identity.cycle
+                || parked.before.stage != self.identity.stage
             {
                 return Err(AgentError::Config(
                     "invalid parked observation binding".into(),
@@ -594,7 +606,8 @@ impl ValidationDriverState {
                 Err(AgentError::TaskSuspended(_)) => {
                     let mut parked = context
                         .executor
-                        .take_suspension(&request, &self.identity, &before)?
+                        .acknowledge_suspension(&request, &self.identity, &before)
+                        .await?
                         .ok_or_else(|| {
                             AgentError::Config("observation suspension has no live custody".into())
                         })?;
@@ -1015,6 +1028,7 @@ fn validate_request(
     Ok(())
 }
 // Executor outputs remain bound to their original operation; malformed or excessive results are errors.
+// Effective fallback records retain their actual source; only an execution bridge binding can connect them to the immutable observation request.
 fn validate_observation_result(
     request: &ValidationObservationRequest,
     result: &ObservationResult,
@@ -1031,7 +1045,27 @@ fn validate_observation_result(
                 tool, arguments, ..
             },
             ObservationResult::Tool { record },
-        ) if record.requested_name == *tool && record.arguments == *arguments => Ok(()),
+        ) if (record.requested_name == *tool && record.arguments == *arguments)
+            || (matches!(
+                record.source,
+                ai_agents_core::ToolCallSource::Fallback { .. }
+            ) && record
+                .metadata
+                .get("_validation_request")
+                .is_some_and(|binding| {
+                    binding.get("requested_name").and_then(Value::as_str) == Some(tool.as_str())
+                        && binding.get("arguments") == Some(arguments)
+                        && binding.get("call_id").and_then(Value::as_str)
+                            == Some(record.call_id.as_str())
+                        && binding.get("source")
+                            == Some(
+                                &serde_json::to_value(ai_agents_core::ToolCallSource::Task)
+                                    .unwrap_or(Value::Null),
+                            )
+                })) =>
+        {
+            Ok(())
+        }
         (ValidationObservationRequest::Judge { .. }, ObservationResult::Judge { score })
             if score.is_finite() && (0.0..=1.0).contains(score) =>
         {

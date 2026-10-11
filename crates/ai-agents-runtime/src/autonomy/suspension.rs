@@ -81,6 +81,8 @@ pub(crate) struct TaskBatchState {
     pub executor_cursors: Vec<TaskExecutorCursor>,
     #[serde(default)]
     pub location: Option<super::location::TaskLocation>,
+    #[serde(default)]
+    pub interaction: Option<Box<super::interaction::TaskInteraction>>,
 }
 
 /// A parked fallback keeps its actual request and canonical ancestry rather than replaying a failed ancestor.
@@ -122,6 +124,17 @@ impl TaskBatchState {
         cycle: u64,
     ) -> Result<()> {
         self.validate()?;
+        if let Some(interaction) = &self.interaction {
+            runtime.continuation = TaskContinuation::Suspended {
+                request_id: self.approvals[0].request_id.clone(),
+                turn_id: format!("{run_id}:{cycle}"),
+                user_message_committed: interaction.user_message_committed,
+                finalized: false,
+                skill: None,
+                batch: None,
+            };
+            return runtime.validate();
+        }
         runtime.continuation = TaskContinuation::Suspended {
             request_id: self.approvals[0].request_id.clone(),
             turn_id: format!("{run_id}:{cycle}"),
@@ -142,7 +155,8 @@ impl TaskBatchState {
                         .map(|result| result.result.clone())
                         .collect(),
                 }),
-                super::location::TaskLocation::Actions(_) => None,
+                super::location::TaskLocation::Actions(_)
+                | super::location::TaskLocation::Observation(_) => None,
             }),
             batch: Some(TaskToolBatchCursor {
                 messages: runtime.snapshot.memory.messages.clone(),
@@ -169,6 +183,13 @@ impl TaskBatchState {
             || pending.id != self.approvals[0].request_id
         {
             return Err(invalid());
+        }
+        if self.interaction.is_some() {
+            if !matches!(&payload.runtime.continuation, TaskContinuation::Suspended {request_id, batch: None, ..} if request_id == &pending.id)
+            {
+                return Err(invalid());
+            }
+            return self.validate_model_history(&payload.runtime);
         }
         let TaskContinuation::Suspended {
             batch: Some(cursor),
@@ -233,6 +254,16 @@ impl TaskBatchState {
     pub(crate) fn validate_model_history(&self, runtime: &TaskRuntimeCheckpoint) -> Result<()> {
         self.validate()?;
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
+        if let Some(interaction) = &self.interaction {
+            if interaction
+                .native_exchanges
+                .iter()
+                .any(|expected| !runtime.native_exchanges.contains(expected))
+            {
+                return Err(invalid());
+            }
+            return Ok(());
+        }
         if let Some(location) = &self.location {
             let request = location.request()?;
             if !self.content.is_empty()
@@ -301,6 +332,12 @@ impl TaskBatchState {
 
     /// The executable state is bounded independently of the opaque adapter payload and agrees with its native cursor.
     pub(crate) fn validate(&self) -> Result<()> {
+        if let Some(interaction) = &self.interaction {
+            if self.version != 1 {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            return interaction.validate(self);
+        }
         if self.version != 1
             || self.calls.is_empty()
             || self.calls.len() > MAX_TASK_CHECKPOINT_RECORDS

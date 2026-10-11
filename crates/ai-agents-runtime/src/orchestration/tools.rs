@@ -180,6 +180,22 @@ impl PipelineProcessTool {
 
 #[async_trait]
 impl Tool for PipelineProcessTool {
+    /// Typed task dispatch retains the actual pipeline cursor rather than converting suspension into failure.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch(self.registry.clone(), None, args, false).await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// Capability enables capture only under the shared executor's live final-invocation permit.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "pipeline_process"
     }
@@ -284,6 +300,23 @@ impl ConcurrentAskTool {
 
 #[async_trait]
 impl Tool for ConcurrentAskTool {
+    /// Typed task dispatch retains admitted sibling results and propagates suspension after draining.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch(self.registry.clone(), Some(self.llm.clone()), args, true)
+                .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// Capability enables capture only under the shared executor's live final-invocation permit.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "concurrent_ask"
     }
@@ -412,6 +445,28 @@ impl GroupDiscussionTool {
 
 #[async_trait]
 impl Tool for GroupDiscussionTool {
+    /// Typed group discussion resumes acknowledged transcript and speaker positions without repeating completed rounds.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch_kind(
+                self.registry.clone(),
+                Some(self.llm.clone()),
+                args,
+                crate::autonomy::message::MessageResponse::Group,
+            )
+            .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// The final executor captures the actual group tool and selected catalogue.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "group_discussion"
     }
@@ -553,6 +608,28 @@ impl HandoffConversationTool {
 
 #[async_trait]
 impl Tool for HandoffConversationTool {
+    /// Typed handoff preserves the selected specialist and evaluator decisions at each acknowledged position.
+    async fn execute_task(
+        &self,
+        args: Value,
+        ctx: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::Result<ToolResult> {
+        if crate::autonomy::suspension::message_request().is_some() {
+            super::task_tools::dispatch_kind(
+                self.registry.clone(),
+                Some(self.llm.clone()),
+                args,
+                crate::autonomy::message::MessageResponse::Handoff,
+            )
+            .await
+        } else {
+            Ok(self.execute(args, ctx).await)
+        }
+    }
+    /// The final executor captures the actual handoff tool and selected catalogue.
+    fn supports_task_messages(&self) -> bool {
+        true
+    }
     fn id(&self) -> &str {
         "handoff_conversation"
     }
