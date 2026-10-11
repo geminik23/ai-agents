@@ -20,7 +20,7 @@ Pick whichever option fits your workflow.
 ### Option 1: CLI only (fastest)
 
 ```sh
-cargo install ai-agents-cli --version 1.1.1
+cargo install ai-agents-cli --version 1.1.2
 ```
 
 ### Option 2: As a library
@@ -29,7 +29,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.1.1"
+ai-agents = "1.1.2"
 ```
 
 ### Option 3: From source

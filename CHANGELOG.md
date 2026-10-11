@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.2 - 2026-10-11
 
 ### Fixed
 - Redis cleanup: preserve snapshots changed after expiry inspection and count only sessions actually deleted

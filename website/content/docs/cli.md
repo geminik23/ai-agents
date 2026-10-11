@@ -17,7 +17,7 @@ The `ai-agents-cli` crate runs YAML-defined agents on the ai-agents Rust runtime
 ### From crates.io (recommended)
 
 ```sh
-cargo install ai-agents-cli --version 1.1.1
+cargo install ai-agents-cli --version 1.1.2
 ```
 
 ### From source

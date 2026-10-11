@@ -18,7 +18,7 @@ Add `ai-agents` to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-ai-agents = "1.1.1"
+ai-agents = "1.1.2"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 ```
@@ -38,7 +38,7 @@ Enable features like this:
 
 ```toml
 [dependencies]
-ai-agents = { version = "1.1.1", features = ["full"] }
+ai-agents = { version = "1.1.2", features = ["full"] }
 ```
 
 ---
@@ -953,7 +953,7 @@ Automatic updates run after successful turns when `memory.relationships.auto_upd
 Persistent relationship memory requires `StorageCapability::ActorRelationships`, currently provided only by SQLite among the built-in backends. Enable it with the `sqlite` feature:
 
 ```toml
-ai-agents = { version = "1.1.1", features = ["sqlite"] }
+ai-agents = { version = "1.1.2", features = ["sqlite"] }
 ```
 
 Configure storage in your YAML:
