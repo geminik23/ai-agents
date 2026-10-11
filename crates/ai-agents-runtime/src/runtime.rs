@@ -7675,10 +7675,8 @@ impl RuntimeAgent {
         Ok(Some(SkillCandidate::new(skill_id, skill)))
     }
 
-    //
-    // This is the commit half of skill routing.
-    // It may mutate pending skill state, run clarification, and execute skill steps.
-    //
+    /// Commits selected skill routing, clarification and execution without replaying a completed selection.
+    /// Task generation invalidation preserves newer manager exchanges while ordinary chat retains its reset behavior.
     async fn commit_skill_candidate_route_result(
         &self,
         candidate: SkillCandidate,
@@ -7720,8 +7718,10 @@ impl RuntimeAgent {
             if current_state_generation != expected_state_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
+                if crate::autonomy::current_execution().is_none() {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                }
                 return Err(AgentError::Other(
                     "State or reset ownership changed during skill disambiguation".to_string(),
                 ));
@@ -10535,6 +10535,7 @@ Respond in JSON format:
     }
 
     /// Installed-manager work retains original task input and skill positions through escalation; exhausted tasks stop before completion gates.
+    /// In-flight task generation changes fail without clearing manager state because a trusted host may have installed a newer exchange.
     /// Its optional future is constructed outside unrelated nested model polling frames.
     async fn resolve_disambiguation_inner(&self, input: &str) -> Result<DisambiguationDispatch> {
         let Some(ref disambiguator) = self.disambiguation_manager else {
@@ -10572,6 +10573,11 @@ Respond in JSON format:
         if current_state_generation != state_generation
             || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
         {
+            if crate::autonomy::current_execution().is_some() {
+                return Err(AgentError::Other(
+                    "Task clarification ownership changed during semantic work".into(),
+                ));
+            }
             disambiguator.clear_pending().await;
             *self.pending_skill_id.write() = None;
             disambiguation_result = DisambiguationResult::Abandoned { new_input: None };
@@ -11023,6 +11029,7 @@ Respond in JSON format:
     /// This method re-runs the skill's disambiguation pass.
     /// If fields are still missing, it returns the new clarification question and keeps pending_skill_id set.
     /// If all fields are present (Clear), it executes the skill and returns the response.
+    /// Task invalidation keeps manager state protected rather than clearing a possibly replaced exchange.
     async fn recheck_skill_disambiguation(
         &self,
         skill_id: &str,
@@ -11066,8 +11073,10 @@ Respond in JSON format:
             if current_state_generation != expected_state_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
+                if crate::autonomy::current_execution().is_none() {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                }
                 return Err(AgentError::Other(
                     "State or reset ownership changed during skill disambiguation recheck"
                         .to_string(),

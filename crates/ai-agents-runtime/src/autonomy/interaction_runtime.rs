@@ -8,6 +8,7 @@ use ai_agents_hitl::ApprovalRequest;
 
 impl RuntimeAgent {
     /// A framework-selected interaction retains its return position before any host response or transition effect.
+    /// Clarification questions use the configured HITL deadline so timeout settlement can retire the exact exchange without semantic replay.
     pub(super) async fn park_task_interaction(
         &self,
         kind: TaskInteractionKind,
@@ -50,7 +51,9 @@ impl RuntimeAgent {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .into(),
-                None,
+                self.hitl_engine.as_ref().map(|hitl| {
+                    std::time::Duration::from_secs(hitl.config().default_timeout_seconds)
+                }),
             )
         };
         let expires_at = if let Some(timeout) = timeout {

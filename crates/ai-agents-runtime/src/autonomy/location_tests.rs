@@ -1,6 +1,8 @@
 use super::*;
 #[path = "location_matrix_tests.rs"]
 mod matrix_tests;
+#[path = "skill_acceptance_tests.rs"]
+mod skill_acceptance_tests;
 use crate::{Agent, AgentBuilder, RuntimeAgent};
 use ai_agents_core::{Tool, ToolCall, ToolExecutionContext, ToolResult, ToolSafetyMetadata};
 use async_trait::async_trait;
@@ -75,15 +77,24 @@ struct Fixture {
 
 // A real scripted skill preserves one completed prompt and tool before its pending approval/question.
 async fn skill_fixture(question: bool) -> Fixture {
+    Box::pin(skill_fixture_options(question, false, false)).await
+}
+
+// Repeated steps, an incomplete first response and an original approval deadline exercise the same script driver.
+async fn skill_fixture_options(question: bool, repeated: bool, expiry: bool) -> Fixture {
     let first = Arc::new(AtomicUsize::new(0));
     let second = Arc::new(AtomicUsize::new(0));
     let responses = Arc::new(AtomicUsize::new(0));
-    let main = super::runner_tests::RecordingProvider::new(&["prefix", "done"]);
+    let main = super::runner_tests::RecordingProvider::new(if repeated {
+        &["prefix", "working", "done"]
+    } else {
+        &["prefix", "done"]
+    });
     let router = super::runner_tests::RecordingProvider::new(&["script"]);
     let mut registry = ai_agents_llm::LLMRegistry::new();
     registry.register("default", main.clone());
     registry.register("router", router.clone());
-    let skill = ai_agents_skills::SkillDefinition {
+    let mut skill = ai_agents_skills::SkillDefinition {
         autonomy: None,
         id: "script".into(),
         description: "work".into(),
@@ -104,7 +115,11 @@ async fn skill_fixture(question: bool) -> Fixture {
             ai_agents_skills::SkillStep::Tool {
                 tool: if question { "ask_user" } else { "second" }.into(),
                 args: Some(if question {
-                    json!({"question":"Select","options":["yes"],"allow_other":false})
+                    if expiry {
+                        json!({"question":"Select","options":["yes"],"allow_other":false,"timeout_seconds":1})
+                    } else {
+                        json!({"question":"Select","options":["yes"],"allow_other":false})
+                    }
                 } else {
                     json!({"value":"{{ steps[0].result }}"})
                 }),
@@ -116,8 +131,23 @@ async fn skill_fixture(question: bool) -> Fixture {
             },
         ],
     };
+    if repeated {
+        skill.steps.insert(3, skill.steps[2].clone());
+        skill.steps[4] = ai_agents_skills::SkillStep::Prompt {
+            prompt: "{{ steps[0].result }} {{ steps[1].result }} {{ steps[2].result }} {{ steps[3].result }}".into(),
+            llm: None,
+        };
+    }
     let yaml = "name: Script\nsystem_prompt: test\nllm:\n  default: default\n  router: router\ntools: [first, second, ask_user]\nhitl:\n  tools:\n    second:\n      require_approval: true\n";
-    let mut spec: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+    let yaml = if expiry {
+        yaml.replace(
+            "hitl:\n",
+            "hitl:\n  default_timeout_seconds: 1\n  on_timeout: reject\n",
+        )
+    } else {
+        yaml.into()
+    };
+    let mut spec: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
     spec["skills"] = serde_yaml::to_value(vec![skill]).unwrap();
     let yaml = serde_yaml::to_string(&spec).unwrap();
     let builder = AgentBuilder::from_yaml(&yaml)

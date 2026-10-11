@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "disambig_acceptance_tests.rs"]
+mod disambig_acceptance_tests;
 #[path = "interaction_failure_tests.rs"]
 mod failure_tests;
 #[path = "interaction_matrix_tests.rs"]

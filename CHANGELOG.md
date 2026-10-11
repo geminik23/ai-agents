@@ -4,7 +4,7 @@
 
 ### Added
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
-- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, skill and restart integration remains unfinished
+- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, strategy and restart integration remains unfinished
 - Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full acceptance and restart remain unfinished
 - Task broadcast continuation: development-only `AgentRegistry::broadcast_task` retains recipient operations and ordered results under a live tool-message permit; ordinary broadcast and calls without a permit remain blocking
 - Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and restart reconstruction remain unavailable
@@ -19,6 +19,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task clarification: development-only retained questions honor configured human-review deadlines and settle expiry without semantic replay; in-flight state changes preserve newer exchanges instead of clearing them
 - Task validation continuation: preserve immutable attempt identity after mutations, reject oversized responses before claim, acknowledge signals before callback reentry and safely settle cancellation or expiry racing resume acknowledgement
 - Task action continuation: preserve approval and rejection positions, original escalation input, processed skill context through re-pause and single finalization; exhausted or unavailable clarification cannot pass completion gates, and heap-owned boundaries protect default nested stacks
 - Task message continuation: retain pipeline/concurrent/group/handoff/broadcast cursors and generated-child identity; capture all prior declared/model dispatches, validate dynamic group predecessors and reject ancestor-source waits without replay or premature reentry

@@ -81,6 +81,8 @@ pub(crate) use control::prepare_host_control;
 pub use journal::TaskValidationJournal;
 pub use lifecycle::*;
 #[cfg(test)]
+mod continuation_test_support;
+#[cfg(test)]
 mod driver_regression_tests;
 #[cfg(test)]
 mod evaluation_tests;
