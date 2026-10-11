@@ -90,6 +90,10 @@ mod gate;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
+mod model_consumer_tests;
+#[cfg(test)]
+mod model_dependency_tests;
+#[cfg(test)]
 mod observation_message_tests;
 mod observations;
 #[cfg(test)]

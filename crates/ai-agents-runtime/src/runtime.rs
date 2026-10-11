@@ -1464,8 +1464,8 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Runs a child under its own gate and reservation, while all providers/tools use the inherited run ledger.
-    /// The child outcome is checkpointed before aggregation can observe it; drop or failed acknowledgement retains recovery protection.
+    /// Runs a child under its own gate and reservation with inherited accounting and protection after drop or failed acknowledgement.
+    /// Dependency-only reentry needs acknowledged predecessor retirement, and child outcome acknowledgement precedes aggregation and release.
     fn run_task_participant<'a>(
         &'a self,
         input: &'a str,
@@ -1512,7 +1512,10 @@ impl RuntimeAgent {
                     let frames = execution.delegate_frames.lock();
                     crate::autonomy::composition::response_targets_frame(&frame, &frames)
                 };
-                if targets || execution.deferred_batch_ready(&frame) {
+                if targets
+                    || execution.deferred_batch_ready(&frame)
+                    || execution.deferred_declared_ready(&frame)
+                {
                     return Box::pin(self.resume_parked_task_composition(
                         input, actor, execution, operation, frame,
                     ))
@@ -12222,7 +12225,7 @@ Respond in JSON format:
     }
 
     // A delegated task captures prepared input and stable child identity before any child effect can suspend.
-    // Resume enters this saved dispatch location and skips input processing, context summary and start-hook replay.
+    // Resume skips preparation and start hooks; captured predecessor retirement must precede new child history, even after a dependency-only pause.
     async fn handle_delegated_state(
         &self,
         input: &str,
@@ -12297,7 +12300,9 @@ Respond in JSON format:
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
             let id = uuid::Uuid::new_v4().to_string();
             self.commit_root_user_message(input).await?;
-            let frame = crate::autonomy::DelegateFrame {
+            delegate.reject_task_ancestor()?;
+            let admission = execution.message_admission.lock().await;
+            let mut frame = crate::autonomy::DelegateFrame {
                 version: 1,
                 id: id.clone(),
                 runtime_id: self.info.id.clone(),
@@ -12320,12 +12325,21 @@ Respond in JSON format:
                 expires_at: None,
                 parent_operation: crate::autonomy::current_child_operation(),
                 required: crate::autonomy::child_required(),
+                waiting_for: None,
+                predecessors: Vec::new(),
             };
+            frame.waiting_for = execution.composition_dependency(&frame)?;
             Box::pin(execution.retain_delegate_frame(frame.clone(), registry.clone())).await?;
+            drop(admission);
             Some(frame)
         } else {
             None
         };
+        if let (Some(execution), Some(frame)) = (&execution, &frame)
+            && execution.wait_message_dependency(frame).await?
+        {
+            return Err(AgentError::TaskSuspended(frame.id.clone()));
+        }
         let child_turn = Box::pin(delegate.chat_with_actor_context(
             &effective_input,
             frame.as_ref().map_or_else(

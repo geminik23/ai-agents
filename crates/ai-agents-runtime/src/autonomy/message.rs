@@ -47,6 +47,7 @@ pub(crate) enum MessageResponse {
     Concurrent,
     Group,
     Handoff,
+    Broadcast,
 }
 
 impl MessageResponse {
@@ -54,7 +55,7 @@ impl MessageResponse {
     pub(crate) fn composed(&self) -> bool {
         matches!(
             self,
-            Self::Pipeline | Self::Concurrent | Self::Group | Self::Handoff
+            Self::Pipeline | Self::Concurrent | Self::Group | Self::Handoff | Self::Broadcast
         )
     }
 }
@@ -138,7 +139,7 @@ pub(crate) fn validate_suspended_attempts(
             if frame.dispatch != composition::CompositionDispatch::ToolMessage {
                 continue;
             }
-            let state: MessageState = serde_json::from_value(frame.cursor)?;
+            let state: MessageState = serde_json::from_value(frame.cursor.clone())?;
             if state.attempt != reservation.id {
                 continue;
             }
@@ -148,6 +149,51 @@ pub(crate) fn validate_suspended_attempts(
                 || !state.record.executed
             {
                 return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            if !frame.predecessors.is_empty()
+                && !payload.children.iter().any(|child| {
+                    frame
+                        .slots()
+                        .iter()
+                        .any(|slot| slot.operation == child.child_id)
+                })
+            {
+                let frames = checkpoint_frames(payload)?;
+                let mut unique = std::collections::HashSet::new();
+                for id in &frame.predecessors {
+                    let source = frames
+                        .get(id)
+                        .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                    if id == &frame.id
+                        || !unique.insert(id)
+                        || !source.slots().iter().any(|old| {
+                            frame
+                                .slots()
+                                .iter()
+                                .any(|new| new.runtime_id == old.runtime_id)
+                        })
+                    {
+                        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                    }
+                }
+                if status == TaskRunStatus::Paused {
+                    state
+                        .batch
+                        .as_ref()
+                        .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+                        .validate()?;
+                    if composition::collect_parked_leaves(
+                        &frame,
+                        &frames,
+                        payload,
+                        &mut Vec::new(),
+                    )?
+                    .is_empty()
+                    {
+                        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                    }
+                }
+                continue;
             }
             if state.response.composed() {
                 let mut parked = false;
@@ -307,6 +353,25 @@ pub(crate) fn settle_cancelled_messages(payload: &mut TaskCheckpointPayload) -> 
     Ok(())
 }
 
+/// Recovery-data traversal keeps immutable frame IDs alongside the latest per-runtime entry without granting live authority.
+fn checkpoint_frames(
+    payload: &TaskCheckpointPayload,
+) -> Result<std::collections::BTreeMap<String, DelegateFrame>> {
+    let mut frames = std::collections::BTreeMap::new();
+    for adapter in payload
+        .adapters
+        .iter()
+        .filter(|adapter| adapter.adapter == "runtime.delegate")
+    {
+        let frame: DelegateFrame = serde_json::from_value(adapter.state.clone())?;
+        frames.insert(frame.id.clone(), frame.clone());
+        if frame.dispatch != composition::CompositionDispatch::ToolMessage {
+            frames.insert(frame.runtime_id.clone(), frame);
+        }
+    }
+    Ok(frames)
+}
+
 /// A coordinator is only a projection of acknowledged invocation frames, never an independent execution grant.
 pub(crate) fn validate_message_batch(
     coordinator: &DelegateFrame,
@@ -382,31 +447,34 @@ pub(crate) fn validate_message_batch(
                     serde_json::from_value::<DelegateFrame>(adapter.state.clone()).ok()
                 })
                 .find(|source| {
-                    source.child_operation == *dependency
-                        || source
-                            .children
+                    source.dispatch != composition::CompositionDispatch::ToolBatch
+                        && source
+                            .slots()
                             .iter()
                             .any(|slot| &slot.operation == dependency)
                 })
                 .ok_or_else(invalid)?;
-            let source_state: MessageState = serde_json::from_value(source.cursor.clone())?;
-            let predecessor = batch
-                .calls
-                .iter()
-                .position(|call| call.id == source_state.record.call_id);
+            let predecessor = if source.dispatch == composition::CompositionDispatch::ToolMessage {
+                let source_state: MessageState = serde_json::from_value(source.cursor.clone())?;
+                batch
+                    .calls
+                    .iter()
+                    .position(|call| call.id == source_state.record.call_id)
+            } else {
+                None
+            };
             let current = batch
                 .calls
                 .iter()
                 .position(|call| call.id == state.record.call_id)
                 .ok_or_else(invalid)?;
-            if source.dispatch != composition::CompositionDispatch::ToolMessage
-                || (source.delegate_runtime_id != frame.delegate_runtime_id
-                    && !source.children.iter().any(|previous| {
-                        frame
-                            .children
-                            .iter()
-                            .any(|next| next.runtime_id == previous.runtime_id)
-                    }))
+            if source.id == frame.id
+                || !source.slots().iter().any(|previous| {
+                    frame
+                        .slots()
+                        .iter()
+                        .any(|next| next.runtime_id == previous.runtime_id)
+                })
                 || (source.runtime_id == frame.runtime_id
                     && source.parent_operation == frame.parent_operation
                     && predecessor.is_none_or(|predecessor| predecessor >= current))
@@ -475,39 +543,11 @@ impl RunExecution {
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
-        let operation = &frame.children[0].operation;
-
+        let frames = self.delegate_frames.lock().clone();
         self.update(|payload| {
-            let selected_operation = if state.response.composed() {
-                frame
-                    .children
-                    .iter()
-                    .chain(&frame.calls)
-                    .find(|slot| {
-                        payload.children.iter().any(|child| {
-                            child.child_id == slot.operation && child.pending.is_some()
-                        })
-                    })
-                    .map(|slot| &slot.operation)
-                    .or(state.waiting_for.as_ref())
-                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?
-            } else {
-                operation
-            };
-            let child = payload
-                .children
-                .iter()
-                .find(|child| &child.child_id == selected_operation)
-                .or_else(|| {
-                    state.waiting_for.as_ref().and_then(|dependency| {
-                        payload
-                            .children
-                            .iter()
-                            .find(|child| &child.child_id == dependency)
-                    })
-                })
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            if child.child_id == *selected_operation && child.pending.is_none() {
+            if composition::collect_parked_leaves(&frame, &frames, payload, &mut Vec::new())?
+                .is_empty()
+            {
                 return Err(AgentError::Other(
                     "message child did not acknowledge safe suspension".into(),
                 ));
@@ -546,221 +586,178 @@ impl RunExecution {
         &self,
         incoming: &DelegateFrame,
     ) -> Result<Option<String>> {
-        let frames = self.delegate_frames.lock();
-        if !frames.values().any(|frame| {
-            frame.dispatch == composition::CompositionDispatch::ToolMessage
-                && frame.children.iter().chain(&frame.calls).any(|previous| {
-                    incoming
-                        .children
+        let slots = incoming.slots();
+        if !self.delegate_frames.lock().values().any(|frame| {
+            frame.id != incoming.id
+                && frame.dispatch != composition::CompositionDispatch::ToolBatch
+                && frame.slots().iter().any(|previous| {
+                    slots
                         .iter()
                         .any(|next| previous.runtime_id == next.runtime_id)
                 })
         }) {
             return Ok(None);
         }
-        drop(frames);
         self.composition_dependency_bound(incoming)
     }
 
-    // Optional checkpoint decoding stays outside ordinary nested-message dispatch stack frames.
+    // Select a stable target coordinate from earlier live dispatches without converting their cursors into tool invocations.
     fn composition_dependency_bound(&self, incoming: &DelegateFrame) -> Result<Option<String>> {
-        let frames = self.delegate_frames.lock();
-        let snapshot = self.acknowledged_snapshot();
-        let payload: Box<TaskCheckpointPayload> = serde_json::from_value(snapshot.payload)?;
-        if let Some(child) = payload.children.iter().find(|child| {
-            child.pending.is_some()
-                && incoming
-                    .children
-                    .iter()
-                    .any(|slot| slot.runtime_id == child.runtime.snapshot.agent_id)
-        }) {
-            let source = frames
-                .values()
-                .find(|frame| {
-                    frame.dispatch == composition::CompositionDispatch::ToolMessage
-                        && frame
-                            .children
+        let slots = incoming.slots();
+        Ok(self
+            .prior_compositions(incoming)?
+            .iter()
+            .find_map(|source| {
+                source
+                    .slots()
+                    .into_iter()
+                    .find(|previous| {
+                        slots
                             .iter()
-                            .any(|slot| slot.operation == child.child_id)
-                })
-                .ok_or_else(|| {
-                    AgentError::Config("parked target needs exact parent dependency".into())
-                })?;
-            let destination = incoming
-                .children
-                .iter()
-                .find(|slot| slot.runtime_id == child.runtime.snapshot.agent_id)
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            let registered = self.targets.resolve(&child.child_id)?;
-            if registered.info().id != destination.runtime_id || source.id == incoming.id {
-                return Err(TaskRunStorageError::InvalidCheckpoint.into());
-            }
-            return Ok(Some(child.child_id.clone()));
-        }
+                            .any(|next| previous.runtime_id == next.runtime_id)
+                    })
+                    .map(|slot| slot.operation)
+            }))
+    }
+
+    /// Captures every earlier overlapping live dispatch and rejects source ancestry before queuing can create a circular wait.
+    pub(crate) fn prior_compositions(
+        &self,
+        incoming: &DelegateFrame,
+    ) -> Result<Vec<DelegateFrame>> {
+        let frames = self.delegate_frames.lock();
+        let slots = incoming.slots();
+        let snapshot = self.acknowledged_snapshot();
+        let mut sources = Vec::new();
         for source in frames.values().filter(|source| {
-            source.dispatch == composition::CompositionDispatch::ToolMessage
-                && source.id != incoming.id
-        }) {
-            let state: MessageState = serde_json::from_value(source.cursor.clone())?;
-            if payload.reservations.iter().any(|reservation| {
-                reservation.id == state.attempt
-                    && matches!(
-                        reservation.state,
-                        TaskEffectState::Dispatched | TaskEffectState::Suspended
-                    )
-            }) && let Some(slot) = source
-                .children
-                .iter()
-                .chain(&source.calls)
-                .find(|previous| {
-                    incoming
-                        .children
+            source.id != incoming.id
+                && source.dispatch != composition::CompositionDispatch::ToolBatch
+                && source.slots().iter().any(|previous| {
+                    slots
                         .iter()
                         .any(|next| previous.runtime_id == next.runtime_id)
                 })
+        }) {
+            if source.dispatch == composition::CompositionDispatch::ToolMessage
+                && !snapshot.payload["reservations"]
+                    .as_array()
+                    .is_some_and(|reservations| {
+                        reservations.iter().any(|reservation| {
+                            reservation["id"] == source.cursor["attempt"]
+                                && matches!(
+                                    reservation["state"].as_str(),
+                                    Some("dispatched" | "suspended")
+                                )
+                        })
+                    })
             {
-                return Ok(Some(slot.operation.clone()));
+                continue;
             }
+            let mut operation = incoming.parent_operation.as_deref();
+            let mut seen = std::collections::HashSet::new();
+            while let Some(parent) = operation {
+                let Some(owner) = frames.values().find(|frame| {
+                    frame.dispatch != composition::CompositionDispatch::ToolBatch
+                        && frame.slots().iter().any(|slot| slot.operation == parent)
+                }) else {
+                    break;
+                };
+                if owner.id == source.id {
+                    return Err(AgentError::Config(
+                        "task dispatch cannot depend on a held ancestor dispatch".into(),
+                    ));
+                }
+                if !seen.insert(owner.id.clone()) || seen.len() >= 32 {
+                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
+                }
+                operation = owner.parent_operation.as_deref();
+            }
+            sources.push(source.clone());
         }
-        Ok(None)
+        Ok(sources)
     }
 
-    /// Queued work waits outside message publication locks until its predecessor acknowledges a result or safe park.
+    /// Queued work waits outside publication locks until every captured predecessor retires or acknowledges a serviceable park.
+    /// A predecessor parked on another slot still blocks its whole catalogue, so its actual leaf is propagated without changing the queued target.
     pub(crate) fn wait_message_dependency<'a>(
         &'a self,
         frame: &'a DelegateFrame,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<bool>> + Send + 'a>> {
         Box::pin(async move {
-            let Some(dependency) = frame.cursor.get("waiting_for").and_then(Value::as_str) else {
+            if frame.dependency().is_none() {
                 return Ok(false);
-            };
+            }
             loop {
                 let snapshot = self.load_owned().await?;
-                let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+                let payload: Box<TaskCheckpointPayload> = serde_json::from_value(snapshot.payload)?;
                 self.check(&payload)?;
-                if let Some(child) = payload
-                    .children
-                    .iter()
-                    .find(|child| child.child_id == dependency)
-                {
-                    if child.pending.is_some() {
+                let sources = self.queued_sources(frame);
+                if sources.is_empty() {
+                    return Ok(false);
+                }
+                let frames = self.delegate_frames.lock().clone();
+                for source in sources {
+                    if !composition::collect_parked_leaves(
+                        &source,
+                        &frames,
+                        &payload,
+                        &mut Vec::new(),
+                    )?
+                    .is_empty()
+                    {
                         return Ok(true);
                     }
-                    if child.result.is_some() {
-                        return Ok(false);
-                    }
-                }
-                let source = payload
-                    .adapters
-                    .iter()
-                    .filter(|adapter| adapter.adapter == "runtime.delegate")
-                    .filter_map(|adapter| {
-                        serde_json::from_value::<DelegateFrame>(adapter.state.clone()).ok()
-                    })
-                    .find(|source| {
-                        source
-                            .children
-                            .iter()
-                            .chain(&source.calls)
-                            .any(|slot| slot.operation == dependency)
-                    })
-                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                let state: MessageState = serde_json::from_value(source.cursor.clone())?;
-                let selected_runtime = source
-                    .children
-                    .iter()
-                    .chain(&source.calls)
-                    .find(|slot| slot.operation == dependency)
-                    .map(|slot| slot.runtime_id.as_str())
-                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                if let Some(child) = payload.children.iter().find(|child| {
-                    child.pending.is_some()
-                        && child.runtime.snapshot.agent_id == selected_runtime
-                        && source
-                            .children
-                            .iter()
-                            .chain(&source.calls)
-                            .any(|slot| slot.operation == child.child_id)
-                }) {
-                    let actual = child.child_id.clone();
-                    let mut incoming = self
-                        .delegate_frames
-                        .lock()
-                        .get(&frame.id)
-                        .cloned()
-                        .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                    incoming.cursor["waiting_for"] = json!(actual);
-                    self.update(|payload| {
-                        let adapter = payload
-                            .adapters
-                            .iter_mut()
-                            .find(|adapter| adapter.id == format!("runtime.delegate:{}", frame.id))
-                            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                        adapter.state = serde_json::to_value(&incoming)?;
-                        Ok(())
-                    })
-                    .await?;
-                    self.delegate_frames
-                        .lock()
-                        .insert(frame.id.clone(), incoming);
-                    return Ok(true);
-                }
-                if payload.reservations.iter().any(|reservation| {
-                    reservation.id == state.attempt
-                        && reservation.state == TaskEffectState::Completed
-                }) {
-                    return Ok(false);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
     }
 
-    /// A deferred invocation becomes runnable only after its exact predecessor settles and every selected actual target is free of parked work.
-    pub(crate) fn deferred_message_ready(&self, frame: &DelegateFrame) -> bool {
-        let Some(dependency) = frame.cursor.get("waiting_for").and_then(Value::as_str) else {
-            return false;
-        };
+    /// Only captured older live frames block reentry; younger successors cannot reverse the admission order.
+    pub(crate) fn queued_sources(&self, frame: &DelegateFrame) -> Vec<DelegateFrame> {
+        let frames = self.delegate_frames.lock();
+        let current = frames
+            .values()
+            .find(|current| current.id == frame.id)
+            .unwrap_or(frame);
         let snapshot = self.acknowledged_snapshot();
-        if self.delegate_frames.lock().values().any(|other| {
-            other.id != frame.id
-                && other.dispatch == composition::CompositionDispatch::ToolMessage
-                && other.children.iter().any(|slot| {
-                    frame
-                        .children
-                        .iter()
-                        .any(|incoming| slot.runtime_id == incoming.runtime_id)
-                })
-                && snapshot.payload["reservations"]
-                    .as_array()
-                    .is_some_and(|reservations| {
-                        reservations.iter().any(|reservation| {
-                            reservation["id"] == other.cursor["attempt"]
-                                && reservation["state"] == "dispatched"
-                        })
-                    })
-        }) {
+        frames
+            .values()
+            .filter(|source| {
+                current.predecessors.contains(&source.id)
+                    && (source.dispatch != composition::CompositionDispatch::ToolMessage
+                        || snapshot.payload["reservations"].as_array().is_some_and(
+                            |reservations| {
+                                reservations.iter().any(|reservation| {
+                                    reservation["id"] == source.cursor["attempt"]
+                                        && matches!(
+                                            reservation["state"].as_str(),
+                                            Some("dispatched" | "suspended")
+                                        )
+                                })
+                            },
+                        ))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// A deferred invocation is runnable only after all captured predecessor dispatches retire, not one early child result.
+    pub(crate) fn deferred_message_ready(&self, frame: &DelegateFrame) -> bool {
+        if frame.dependency().is_none() || !self.queued_sources(frame).is_empty() {
             return false;
         }
+        let snapshot = self.acknowledged_snapshot();
         snapshot.payload["children"]
             .as_array()
             .is_some_and(|children| {
-                children
-                    .iter()
-                    .any(|child| child["child_id"] == dependency && !child["result"].is_null())
-                    && !children.iter().any(|child| {
-                        frame
-                            .children
-                            .iter()
-                            .any(|slot| child["child_id"] == slot.operation)
+                !frame.slots().iter().any(|slot| {
+                    children.iter().any(|child| {
+                        child["child_id"] == slot.operation
+                            || (child["runtime"]["snapshot"]["agent_id"] == slot.runtime_id
+                                && !child["pending"].is_null())
                     })
-                    && children.iter().all(|child| {
-                        !frame
-                            .children
-                            .iter()
-                            .any(|slot| child["runtime"]["snapshot"]["agent_id"] == slot.runtime_id)
-                            || child["pending"].is_null()
-                    })
+                })
             })
     }
 
@@ -780,6 +777,11 @@ impl RunExecution {
             .any(|frame| self.deferred_message_ready(frame))
     }
 
+    /// Declared reentry uses the same acknowledged predecessor ownership predicate as model-message reentry.
+    pub(crate) fn deferred_declared_ready(&self, frame: &DelegateFrame) -> bool {
+        frame.waiting_for.is_some() && self.deferred_message_ready(frame)
+    }
+
     /// Drained composition siblings may release a dependency after its parent was polled; ready saved work must be driven before another pause is exposed.
     pub(crate) fn composition_has_ready_dependency(&self, frame: &DelegateFrame) -> bool {
         let frames = self.delegate_frames.lock().clone();
@@ -789,12 +791,13 @@ impl RunExecution {
             if !seen.insert(parent.id.clone()) || seen.len() > 32 {
                 continue;
             }
-            if parent.dispatch == composition::CompositionDispatch::ToolBatch
-                && self.deferred_batch_ready(&parent)
+            if (parent.dispatch == composition::CompositionDispatch::ToolBatch
+                && self.deferred_batch_ready(&parent))
+                || self.deferred_declared_ready(&parent)
             {
                 return true;
             }
-            for slot in parent.children.iter().chain(&parent.calls) {
+            for slot in parent.slots() {
                 if let Some(child) = frames.get(&slot.runtime_id).filter(|child| {
                     child.parent_operation.as_deref() == Some(slot.operation.as_str())
                 }) {

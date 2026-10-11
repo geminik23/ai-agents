@@ -1397,6 +1397,7 @@ async fn handoff_questions_resume_saved_chain_without_repeating_decisions() {
 }
 
 // SQL-backed continuation executes the same multi-leaf CAS contract, including rejection of stale responses.
+#[cfg(feature = "sqlite")]
 #[tokio::test]
 async fn sqlite_concurrent_continuation_rejects_stale_receipts() {
     let pattern = "concurrent:\n        agents: [worker, peer]\n        aggregation:\n          strategy: all";

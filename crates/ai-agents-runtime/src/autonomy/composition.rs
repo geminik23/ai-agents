@@ -43,6 +43,12 @@ pub(crate) struct DelegateFrame {
     pub parent_operation: Option<String>,
     #[serde(default = "required_by_default")]
     pub required: bool,
+    /// Declared dispatches retain the same exact predecessor edge as model-message consumers.
+    #[serde(default)]
+    pub waiting_for: Option<String>,
+    /// Immutable prior dispatch identities prevent a multi-target successor from overtaking another active predecessor.
+    #[serde(default)]
+    pub predecessors: Vec<String>,
 }
 
 /// Older direct-delegation frames used the default mandatory-child policy.
@@ -187,6 +193,28 @@ pub(crate) fn take_group_response(
 }
 
 impl DelegateFrame {
+    /// Direct delegation and algorithm calls expose the same actual operation edges to dependency admission.
+    pub(crate) fn slots(&self) -> Vec<CompositionChild> {
+        if self.dispatch == CompositionDispatch::Delegate {
+            vec![CompositionChild {
+                registry_id: self.delegate_id.clone(),
+                runtime_id: self.delegate_runtime_id.clone(),
+                operation: self.child_operation.clone(),
+            }]
+        } else {
+            self.children.iter().chain(&self.calls).cloned().collect()
+        }
+    }
+
+    /// Older model cursors retain their dependency representation; declared cursors cannot overwrite the common edge.
+    pub(crate) fn dependency(&self) -> Option<&str> {
+        if self.dispatch == CompositionDispatch::ToolMessage {
+            self.cursor.get("waiting_for").and_then(Value::as_str)
+        } else {
+            self.waiting_for.as_deref()
+        }
+    }
+
     /// Reachability follows stable frame edges rather than granting authority to a free-form child operation.
     pub(crate) fn contains_operation(
         &self,
@@ -394,44 +422,32 @@ pub(crate) fn collect_parked_leaves(
             let invocation = frames
                 .get(&id)
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            if let Some(dependency) = invocation.cursor.get("waiting_for").and_then(Value::as_str)
-                && payload
-                    .children
-                    .iter()
-                    .any(|child| child.child_id == dependency && child.pending.is_some())
-            {
-                let source = frames.values().find(|source| {
-                    source.dispatch == CompositionDispatch::ToolMessage
-                        && source.runtime_id != frame.runtime_id
-                        && source
-                            .children
-                            .iter()
-                            .chain(&source.calls)
-                            .any(|slot| slot.operation == dependency)
-                });
-                if let Some(source) = source {
-                    leaves.extend(collect_parked_leaves(source, frames, payload, ancestry)?);
-                }
-            }
+            leaves.extend(collect_parked_leaves(
+                invocation, frames, payload, ancestry,
+            )?);
         }
     }
-    if frame.dispatch == CompositionDispatch::ToolMessage
-        && let Some(dependency) = frame.cursor.get("waiting_for").and_then(Value::as_str)
-        && let Some(child) = payload
+    for id in &frame.predecessors {
+        if let Some(source) = frames.values().find(|source| source.id == *id) {
+            leaves.extend(collect_parked_leaves(source, frames, payload, ancestry)?);
+        }
+    }
+    if frame.predecessors.is_empty()
+        && let Some(dependency) = frame.dependency()
+        && !payload
             .children
             .iter()
-            .find(|child| child.child_id == dependency && child.pending.is_some())
+            .any(|child| child.child_id == dependency && child.result.is_some())
     {
         let source = frames
             .values()
             .find(|source| {
-                source.dispatch == CompositionDispatch::ToolMessage
+                source.dispatch != CompositionDispatch::ToolBatch
                     && source.id != frame.id
                     && source
-                        .children
+                        .slots()
                         .iter()
-                        .chain(&source.calls)
-                        .any(|slot| slot.operation == child.child_id)
+                        .any(|slot| slot.operation == dependency)
             })
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         leaves.extend(collect_parked_leaves(source, frames, payload, ancestry)?);
@@ -615,6 +631,7 @@ pub(crate) async fn scope_dispatch_authority<F: Future>(authorized: bool, future
 }
 
 /// Child admission and barrier closure share one lock; closure never aborts already admitted turns or their settlement.
+/// Declared dependency-only parks propagate the predecessor's real leaf without polling an unstarted child future.
 pub(crate) async fn run_composition_child<
     F: Future<Output = Result<ai_agents_core::AgentResponse>>,
 >(
@@ -626,6 +643,17 @@ pub(crate) async fn run_composition_child<
     let (Some(scope), Some(slot)) = (scope, slot) else {
         return future.await;
     };
+    if let Some(execution) = current_execution() {
+        let frame = execution
+            .delegate_frames
+            .lock()
+            .get(&scope.frame_key)
+            .cloned()
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if frame.waiting_for.is_some() && execution.wait_message_dependency(&frame).await? {
+            return Err(AgentError::TaskSuspended(scope.runtime_id.clone()));
+        }
+    }
     {
         let closed = scope.closed.lock();
         if *closed {
@@ -947,12 +975,18 @@ impl RunExecution {
         Ok(saved)
     }
 
-    /// Captures exact parent configuration and actual registry objects before child work; stored labels never create execution authority.
+    /// Captures exact parent configuration, immutable predecessor dispatches and actual registry objects before child work.
+    /// Publication is serialized by message_admission so a later overlapping catalogue can never become an earlier frame's predecessor.
     pub(crate) async fn retain_delegate_frame(
         &self,
-        frame: DelegateFrame,
+        mut frame: DelegateFrame,
         registry: Arc<crate::spawner::AgentRegistry>,
     ) -> Result<()> {
+        frame.predecessors = self
+            .prior_compositions(&frame)?
+            .into_iter()
+            .map(|source| source.id)
+            .collect();
         if frame.version != 1 || frame.id.is_empty() || frame.child_operation.is_empty() {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }

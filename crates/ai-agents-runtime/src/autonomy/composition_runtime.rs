@@ -49,6 +49,7 @@ impl RuntimeAgent {
     }
 
     /// Captures state dispatch after input preparation and before any child can act; saved slots bind registry targets by identity.
+    /// Serialized publication with model dispatches freezes older overlapping predecessors before a later catalogue can overtake them.
     pub(super) async fn prepare_composition_frame(
         &self,
         input: &str,
@@ -113,6 +114,7 @@ impl RuntimeAgent {
                     AgentError::Config(format!("composition child not registered: {registry_id}"))
                 })?;
                 child.preflight_standalone_autonomy()?;
+                child.reject_task_ancestor()?;
                 child.preflight_priced_autonomy(
                     ai_agents_core::autonomy::InvocationAdmission::requires_priced_llm(
                         execution.as_ref(),
@@ -127,7 +129,8 @@ impl RuntimeAgent {
             .collect::<Result<Vec<_>>>()?;
         Box::pin(self.commit_root_user_message(input)).await?;
 
-        let frame = DelegateFrame {
+        let admission = execution.message_admission.lock().await;
+        let mut frame = DelegateFrame {
             version: 1,
             id: id.clone(),
             runtime_id: self.info.id.clone(),
@@ -150,9 +153,13 @@ impl RuntimeAgent {
             expires_at,
             parent_operation: crate::autonomy::current_child_operation(),
             required: crate::autonomy::child_required(),
+            waiting_for: None,
+            predecessors: Vec::new(),
         };
+        frame.waiting_for = execution.composition_dependency(&frame)?;
         Box::pin(execution.retain_delegate_frame(frame.clone(), registry.clone())).await?;
 
+        drop(admission);
         Ok(Some(frame))
     }
 

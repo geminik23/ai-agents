@@ -151,13 +151,32 @@ pub(crate) async fn dispatch_kind(
     .map(|response| ToolResult::ok(response.content))
 }
 
-/// Existing pipeline/concurrent algorithms own prepared input, actor progression, admission closure, draining and ordered results.
+/// Broadcast formatting is identical on first dispatch and reentry, including per-recipient errors and registry order.
+pub(crate) fn broadcast_output(results: Vec<(String, Result<AgentResponse>)>) -> Value {
+    json!(
+        results
+            .into_iter()
+            .map(|(id, result)| match result {
+                Ok(response) => json!({"agent_id":id,"response":response.content,"success":true}),
+                Err(error) => json!({"agent_id":id,"error":error.to_string(),"success":false}),
+            })
+            .collect::<Vec<_>>()
+    )
+}
+
+/// Existing pipeline/concurrent/broadcast algorithms own prepared input, actor progression, admission closure, draining and ordered results.
 pub(crate) async fn run(
     registry: &AgentRegistry,
     llms: Option<&LLMRegistry>,
     args: &Value,
     kind: &MessageResponse,
 ) -> Result<AgentResponse> {
+    if matches!(kind, MessageResponse::Broadcast) {
+        return registry
+            .resume_task_broadcast()
+            .await
+            .map(|results| AgentResponse::new(broadcast_output(results).to_string()));
+    }
     let (input, ids) = members(args, kind)?;
     if matches!(kind, MessageResponse::Pipeline) {
         let templates = args.get("stage_inputs").and_then(Value::as_array);

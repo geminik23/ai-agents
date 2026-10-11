@@ -92,6 +92,8 @@ impl RuntimeAgent {
             expires_at: ctx.deadline,
             parent_operation: crate::autonomy::current_child_operation(),
             required: crate::autonomy::child_required(),
+            waiting_for: None,
+            predecessors: Vec::new(),
         };
         Ok(Some(MessageInvocation {
             frame: Box::new(frame),
@@ -464,7 +466,7 @@ impl RuntimeAgent {
             Ok(response) => ToolResult::ok(match &state.response {
                 crate::autonomy::message::MessageResponse::Message => json!({"from":frame.delegate_id,"response":response.content}),
                 crate::autonomy::message::MessageResponse::Route { reason } => json!({"selected_agent":frame.delegate_id,"response":response.content,"reason":reason}),
-                crate::autonomy::message::MessageResponse::Pipeline | crate::autonomy::message::MessageResponse::Concurrent | crate::autonomy::message::MessageResponse::Group | crate::autonomy::message::MessageResponse::Handoff => serde_json::from_str(&response.content)?,
+                crate::autonomy::message::MessageResponse::Pipeline | crate::autonomy::message::MessageResponse::Concurrent | crate::autonomy::message::MessageResponse::Group | crate::autonomy::message::MessageResponse::Handoff | crate::autonomy::message::MessageResponse::Broadcast => serde_json::from_str(&response.content)?,
             }.to_string()),
             Err(error) => ToolResult::error(match state.response {
                 crate::autonomy::message::MessageResponse::Message => format!("send failed: {error}"),
@@ -473,6 +475,7 @@ impl RuntimeAgent {
                 crate::autonomy::message::MessageResponse::Concurrent => format!("concurrent ask failed: {error}"),
                 crate::autonomy::message::MessageResponse::Group => format!("group discussion failed: {error}"),
                 crate::autonomy::message::MessageResponse::Handoff => format!("handoff failed: {error}"),
+                                crate::autonomy::message::MessageResponse::Broadcast => format!("broadcast failed: {error}"),
             }),
         };
         Box::pin(execution.settle(&state.attempt, serde_json::to_value(&tool_result)?, false))
@@ -533,37 +536,13 @@ impl RuntimeAgent {
             execution.retain_batch(&self.info.id, batch);
             // A repeated-target call already owns its parent attempt but has not started another child history.
             let frames = execution.delegate_frames.lock().clone();
-            let snapshot = execution.acknowledged_snapshot();
             let deferred = frames
                 .values()
                 .filter(|frame| {
                     frame.runtime_id == self.info.id
                         && frame.dispatch == CompositionDispatch::ToolMessage
-                        && (execution.composition_has_ready_dependency(frame)
-                            || frame.cursor["waiting_for"]
-                                .as_str()
-                                .is_some_and(|dependency| {
-                                    snapshot.payload["children"].as_array().is_some_and(
-                                        |children| {
-                                            !children.iter().any(|child| {
-                                                frame
-                                                    .children
-                                                    .iter()
-                                                    .any(|slot| child["child_id"] == slot.operation)
-                                            }) && children.iter().all(|child| {
-                                                !frame.children.iter().chain(&frame.calls).any(
-                                                    |slot| {
-                                                        child["runtime"]["snapshot"]["agent_id"]
-                                                            == slot.runtime_id
-                                                    },
-                                                ) || !child["result"].is_null()
-                                            }) && children.iter().any(|child| {
-                                                child["child_id"] == dependency
-                                                    && !child["result"].is_null()
-                                            })
-                                        },
-                                    )
-                                }))
+                        && (execution.deferred_message_ready(frame)
+                            || execution.composition_has_ready_dependency(frame))
                 })
                 .min_by_key(|frame| {
                     order

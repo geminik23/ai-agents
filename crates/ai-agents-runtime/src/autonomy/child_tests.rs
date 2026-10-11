@@ -430,7 +430,7 @@ async fn concurrent_children_and_borrowed_aggregator_use_one_allowance() {
     finish(&parent, &execution).await;
 }
 
-struct FailingProvider;
+pub(super) struct FailingProvider;
 #[async_trait]
 impl LLMProvider for FailingProvider {
     async fn complete(

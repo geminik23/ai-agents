@@ -17,6 +17,9 @@ use ai_agents_observability::{current_observation_context, with_observation_cont
 
 use super::spawner::SpawnedAgent;
 
+#[path = "task_broadcast.rs"]
+mod task_broadcast;
+
 /// Summary information for a registered agent, returned by `list()`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedAgentInfo {
