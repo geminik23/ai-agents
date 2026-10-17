@@ -73,8 +73,8 @@ mod shared_target_tests;
 mod tool_composition_tests;
 pub use authority::{HostValidationContext, RuntimeObservationExecutor, validation_judge_provider};
 pub(crate) use authority::{
-    invoke_bound, validation_arguments_valid, validation_extra_grant, validation_metadata,
-    validation_requires_approval,
+    invoke_bound, scope_message_recovery_authority, validation_arguments_valid,
+    validation_extra_grant, validation_metadata, validation_requires_approval,
 };
 pub use control::HostControlAction;
 pub(crate) use control::prepare_host_control;
@@ -88,6 +88,8 @@ mod driver_regression_tests;
 mod evaluation_tests;
 mod evidence;
 mod extensions;
+#[cfg(test)]
+mod fallback_acceptance_tests;
 mod gate;
 #[cfg(test)]
 mod integration_tests;
@@ -105,6 +107,8 @@ mod progress;
 mod registry_tests;
 mod replanning;
 mod run;
+#[cfg(test)]
+mod state_acceptance_tests;
 mod validation;
 
 pub use evidence::*;

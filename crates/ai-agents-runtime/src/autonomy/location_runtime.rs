@@ -231,7 +231,7 @@ impl RuntimeAgent {
     }
 
     /// Resumes one exact non-model operation under its retained root owner, then advances the original driver.
-    /// Erasure keeps optional script/action future construction out of nested model polling frames.
+    /// Location binding is rechecked under the root gate before effects; erasure bounds nested polling stack construction.
     pub(super) fn resume_task_location_batch(
         &self,
         mut input: crate::autonomy::AutonomyTurnInput,
@@ -263,6 +263,7 @@ impl RuntimeAgent {
                 return Err(AgentError::Other("location resume owner changed".into()));
             }
             input.owner.check()?;
+            self.validate_task_location(&location)?;
             let mut identities = current_runtime_gate_identity_stack().to_vec();
             if identities
                 .iter()
@@ -369,6 +370,7 @@ impl RuntimeAgent {
     }
 
     /// Advances the bound caller only after its original tool or message has settled; root finalization remains single-owner.
+    /// A changed state-action binding cannot publish its settled result into a newer transition.
     /// The boxed driver prevents unused non-model branches from multiplying the model-message stack.
     pub(super) fn finish_task_location_record(
         &self,
@@ -383,6 +385,7 @@ impl RuntimeAgent {
                     Ok(AgentResponse::new(serde_json::to_string(&record)?))
                 }
                 TaskLocation::Actions(state) => {
+                    self.validate_task_actions(state)?;
                     if record.success {
                         self.context_manager.set(
                             "last_tool_result",

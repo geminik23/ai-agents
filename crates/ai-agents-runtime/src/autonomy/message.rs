@@ -19,6 +19,8 @@ pub(crate) struct MessageInvocation {
 pub(crate) struct MessageState {
     pub attempt: String,
     pub record: ToolExecutionRecord,
+    #[serde(default)]
+    pub executor: Option<Box<super::suspension::TaskExecutorCursor>>,
     pub state_generation: Option<u64>,
     pub resource_lock_keys: Vec<String>,
     pub max_output_chars: Option<usize>,
@@ -320,6 +322,8 @@ pub(crate) fn settle_cancelled_messages(payload: &mut TaskCheckpointPayload) -> 
                     == record.metadata.get("_task_runtime_id")
                 && capture.record.metadata.get("_task_child_operation")
                     == record.metadata.get("_task_child_operation")
+                && capture.record.metadata.get("_task_executor_hop")
+                    == record.metadata.get("_task_executor_hop")
         }) {
             payload.evidence.tool_calls.push(TaskToolEvidence {
                 run_id: scope.key.run_id.clone(),

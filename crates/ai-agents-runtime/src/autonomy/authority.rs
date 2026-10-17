@@ -21,6 +21,7 @@ pub struct HostValidationContext<'a> {
     pub run_revision: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct HostValidationPermit {
     agent_id: String,
     request: ToolExecutionRequest,
@@ -473,6 +474,39 @@ where
     HOST_VALIDATION_PERMIT.scope(permit, future).await
 }
 
+/// Owned message recovery refreshes only an already installed exact operation after acknowledged journal progress.
+/// It cannot grant a different fallback tool or reconstruct authority from checkpoint data.
+pub(crate) async fn scope_message_recovery_authority<F, T>(
+    agent_id: &str,
+    request: &ToolExecutionRequest,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let permit = HOST_VALIDATION_PERMIT.try_with(Clone::clone).ok();
+    if let Some(mut permit) = permit {
+        if permit.agent_id != agent_id || permit.request.call_id != request.call_id {
+            return future.await;
+        }
+        let execution = super::current_execution().ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if permit.agent_id != agent_id
+            || permit.run_id != execution.run_id
+            || serde_json::to_value(&permit.request)? != serde_json::to_value(request)?
+        {
+            return Err(AgentError::Config(
+                "message recovery differs from installed host operation".into(),
+            ));
+        }
+        permit.run_revision = execution
+            .revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        HOST_VALIDATION_PERMIT.scope(permit, future).await
+    } else {
+        future.await
+    }
+}
+
 // A live controller scope must match the permit's current run/revision; independent host SDK observations retain their existing contract.
 fn live_validation_authority(permit: &HostValidationPermit) -> bool {
     super::current_execution().is_none_or(|execution| {
@@ -540,4 +574,58 @@ pub(crate) fn validation_metadata(request: &ToolExecutionRequest) -> Option<Valu
         })
         .ok()
         .flatten()
+}
+
+#[cfg(test)]
+mod recovery_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fallback_acceptance_unrelated_inherited_permit_is_not_exported_or_refreshed() {
+        for agent_id in ["child", "parent"] {
+            let permit = HostValidationPermit {
+                agent_id: "parent".into(),
+                request: ToolExecutionRequest::new(
+                    "fixed-call",
+                    "fixed",
+                    json!({}),
+                    ToolCallSource::Task,
+                ),
+                binding: HostValidationBinding {
+                    id: "fixed".into(),
+                    validator: "validator".into(),
+                    version: 1,
+                    profile: None,
+                    scope: "task".into(),
+                    tool: "fixed".into(),
+                    arguments: json!({}),
+                    require_approval: false,
+                },
+                run_id: "run".into(),
+                run_revision: 0,
+            };
+            let request =
+                ToolExecutionRequest::new("child-call", "second", json!({}), ToolCallSource::Model);
+            let result = HOST_VALIDATION_PERMIT
+                .scope(
+                    permit,
+                    scope_message_recovery_authority(agent_id, &request, async {
+                        assert!(
+                            validation_extra_grant(agent_id, &request, "second", &json!({}))
+                                .is_none()
+                        );
+                        assert!(validation_arguments_valid(
+                            agent_id,
+                            &request,
+                            "second",
+                            &json!({})
+                        ));
+                        Ok(1usize)
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, 1);
+        }
+    }
 }

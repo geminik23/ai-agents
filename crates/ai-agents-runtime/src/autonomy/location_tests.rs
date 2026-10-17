@@ -399,6 +399,16 @@ async fn fallback_location_resumes_pending_hop_without_repeating_original() {
     assert_eq!(first.load(Ordering::SeqCst), 1);
     assert_eq!(second.load(Ordering::SeqCst), 1);
     assert_eq!(done.run.counters.tool_attempts, 2);
+    assert_eq!(
+        done.run
+            .evidence
+            .tool_calls
+            .iter()
+            .map(|capture| capture.record.canonical_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"],
+        "each fallback hop must retain its own ordered evidence",
+    );
 }
 
 // Exit actions precede one state commit and resumed entry work does not repeat completed exit effects.

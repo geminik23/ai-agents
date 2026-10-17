@@ -19,6 +19,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task fallback recovery: retain retry position, original lifecycle and distinct hop evidence across message pauses without duplicate rate admission or stale approval rebinding; uncertain task timeouts cannot start fresh fallback work
+- Task state actions: reject changed state bindings after awaited preparation before prompt dispatch, context publication or the next saved action
 - Task clarification: development-only retained questions honor configured human-review deadlines and settle expiry without semantic replay; in-flight state changes preserve newer exchanges instead of clearing them
 - Task validation continuation: preserve immutable attempt identity after mutations, reject oversized responses before claim, acknowledge signals before callback reentry and safely settle cancellation or expiry racing resume acknowledgement
 - Task action continuation: preserve approval and rejection positions, original escalation input, processed skill context through re-pause and single finalization; exhausted or unavailable clarification cannot pass completion gates, and heap-owned boundaries protect default nested stacks

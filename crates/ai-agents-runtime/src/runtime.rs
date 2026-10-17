@@ -5728,7 +5728,8 @@ impl RuntimeAgent {
         )
     }
 
-    /// Builds evidence with the exact generations used by the corresponding decision.
+    /// Builds evidence with the exact generations and logical executor-hop identity used by the corresponding decision.
+    /// Retained task timing starts at the original lifecycle, not the most recent host resume.
     #[allow(clippy::too_many_arguments)]
     fn record_from_parts_at(
         &self,
@@ -5740,13 +5741,21 @@ impl RuntimeAgent {
         executed: bool,
         success: bool,
         output: String,
-        metadata: HashMap<String, Value>,
+        mut metadata: HashMap<String, Value>,
         policy: ToolPolicyDecisionRecord,
         approval: Option<ToolApprovalRecord>,
         timed_out: bool,
         output_truncated: bool,
         versions: ToolDecisionVersions,
     ) -> ToolExecutionRecord {
+        if let Some(cursor) = crate::autonomy::suspension::executor_progress()
+            && crate::autonomy::current_execution().is_some()
+        {
+            metadata.insert(
+                "_task_executor_hop".into(),
+                serde_json::json!(cursor.ancestry.len()),
+            );
+        }
         ToolExecutionRecord {
             call_id: request.call_id.clone(),
             requested_name: request.requested_name.clone(),
@@ -5764,7 +5773,15 @@ impl RuntimeAgent {
             policy,
             approval,
             started_at,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms: if crate::autonomy::current_execution().is_some()
+                && crate::autonomy::suspension::executor_progress()
+                    .is_some_and(|cursor| cursor.started_at.is_some())
+            {
+                u64::try_from((chrono::Utc::now() - started_at).num_milliseconds().max(0))
+                    .unwrap_or(u64::MAX)
+            } else {
+                start.elapsed().as_millis() as u64
+            },
             timed_out,
             cancelled: false,
             cancellation_reason: None,
@@ -6137,7 +6154,8 @@ impl RuntimeAgent {
         Some(resource_guards)
     }
 
-    /// Executes retry sub-attempts inside one logical executor request while assigning every invocation a fresh deadline.
+    /// Executes retry sub-attempts inside one logical executor request while assigning every new invocation a fresh deadline.
+    /// A settled retained-message result consumes no new attempt and continues from its captured retry index.
     ///
     /// Hooks and `ToolExecutionRecord` finalization remain request-level and occur once after this retry loop returns.
     async fn run_tool_with_retries(
@@ -6154,13 +6172,27 @@ impl RuntimeAgent {
         } else {
             0
         };
-        let mut attempts = 0;
-        let mut invoked = false;
+        let progress = crate::autonomy::suspension::executor_progress();
+        let mut attempts = progress.as_ref().map_or(0, |cursor| cursor.retry_index);
+        let mut invoked = progress.as_ref().is_some_and(|cursor| cursor.invoked);
         loop {
-            let (result, timed_out, cancelled, attempt_invoked) = Box::pin(
-                self.execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout),
-            )
-            .await?;
+            crate::autonomy::suspension::update_executor_progress(|cursor| {
+                cursor.retry_index = attempts;
+                cursor.invoked = invoked;
+            });
+            let (result, timed_out, cancelled, attempt_invoked) = if let Some(result) =
+                crate::autonomy::suspension::take_settled_tool_result(&ctx.call_id)
+            {
+                (result, false, false, true)
+            } else {
+                Box::pin(self.execute_resolved_tool_once(
+                    tool.clone(),
+                    args.clone(),
+                    ctx.clone(),
+                    timeout,
+                ))
+                .await?
+            };
             invoked |= attempt_invoked;
             if result.success || timed_out || cancelled || attempts >= max_retries {
                 return Ok((result, timed_out, cancelled, invoked));
@@ -6192,20 +6224,28 @@ impl RuntimeAgent {
     /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
     /// Each fallback hop installs its own private request scope in the inner driver, without duplicating a large outer record-return frame.
     /// A retained resume cursor selects only the actual pending hop so completed failed ancestors and their admission are not replayed.
+    /// Cursor consumption happens when polled, after the caller's private response and executor scopes are installed.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        if let Some(cursor) = crate::autonomy::suspension::take_resumed_executor(&request.call_id) {
-            self.execute_tool_record_inner(
-                cursor.request,
-                ToolFallbackState {
-                    visited_canonical_ids: cursor.ancestry,
-                },
-            )
-        } else {
-            self.execute_tool_record_inner(request, ToolFallbackState::default())
-        }
+        Box::pin(async move {
+            if let Some(cursor) =
+                crate::autonomy::suspension::take_resumed_executor(&request.call_id)
+            {
+                self.execute_tool_record_inner(
+                    cursor.request.clone(),
+                    ToolFallbackState {
+                        visited_canonical_ids: cursor.ancestry.clone(),
+                    },
+                    Some(cursor),
+                )
+                .await
+            } else {
+                self.execute_tool_record_inner(request, ToolFallbackState::default(), None)
+                    .await
+            }
+        })
     }
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
@@ -6218,36 +6258,51 @@ impl RuntimeAgent {
         &self,
         request: ToolExecutionRequest,
         fallback_state: ToolFallbackState,
+        mut resumed: Option<crate::autonomy::suspension::TaskExecutorCursor>,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
         Box::pin(async move {
             let mut next = (request, fallback_state);
             loop {
                 let (request, fallback_state) = next;
-                let parked = crate::autonomy::suspension::TaskExecutorCursor {
-                    request: request.clone(),
-                    ancestry: fallback_state.visited_canonical_ids.clone(),
-                };
+                let parked = resumed.take().unwrap_or_else(|| {
+                    crate::autonomy::suspension::TaskExecutorCursor::new(
+                        request.clone(),
+                        fallback_state.visited_canonical_ids.clone(),
+                    )
+                });
                 let result = TOOL_FALLBACK_REQUEST
                     .scope(std::cell::RefCell::new(None), async {
                         let work = Box::pin(
                             self.execute_tool_record_scoped(request.clone(), fallback_state),
                         );
+                        let work = crate::autonomy::scope_task_request(request.clone(), work);
+                        let work = async {
+                            match work.await {
+                                Err(error @ AgentError::TaskSuspended(_)) => {
+                                    let cursor = crate::autonomy::suspension::executor_progress()
+                                        .ok_or(
+                                        crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                    )?;
+                                    if let Some(execution) = crate::autonomy::current_execution() {
+                                        execution.parked_executor_cursors.lock().insert(
+                                            (self.info.id.clone(), cursor.request.call_id.clone()),
+                                            cursor,
+                                        );
+                                    }
+                                    Err(error)
+                                }
+                                result => result,
+                            }
+                        };
                         let record =
-                            Box::pin(crate::autonomy::scope_task_request(request, work)).await?;
+                            crate::autonomy::suspension::scope_executor_progress(parked, work)
+                                .await?;
                         let successor = TOOL_FALLBACK_REQUEST.with(|slot| slot.borrow_mut().take());
                         Ok::<_, AgentError>((record, successor))
                     })
                     .await;
                 let (record, successor) = match result {
-                    Err(error @ AgentError::TaskSuspended(_)) => {
-                        if let Some(execution) = crate::autonomy::current_execution() {
-                            execution.parked_executor_cursors.lock().insert(
-                                (self.info.id.clone(), parked.request.call_id.clone()),
-                                parked,
-                            );
-                        }
-                        return Err(error);
-                    }
+                    Err(error @ AgentError::TaskSuspended(_)) => return Err(error),
                     result => result?,
                 };
                 if let Some(successor) = successor {
@@ -6260,6 +6315,7 @@ impl RuntimeAgent {
     }
 
     // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
+    // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
     async fn execute_tool_record_scoped(
         &self,
         request: ToolExecutionRequest,
@@ -6267,7 +6323,9 @@ impl RuntimeAgent {
     ) -> Result<ToolExecutionRecord> {
         let _mutations = self.autonomy_mutations.read().await;
         self.check_autonomy_operation()?;
-        let started_at = chrono::Utc::now();
+        let started_at = crate::autonomy::suspension::executor_progress()
+            .and_then(|cursor| cursor.started_at)
+            .unwrap_or_else(chrono::Utc::now);
         let start = Instant::now();
         info!(tool = %request.requested_name, args = %request.arguments, "Executing tool");
 
@@ -6404,9 +6462,16 @@ impl RuntimeAgent {
             &classification,
             initial_recovery_timeout_ms,
         )?;
-        self.hooks
-            .on_tool_start(&canonical_id, &executed_arguments)
-            .await;
+        if crate::autonomy::suspension::executor_progress()
+            .is_none_or(|cursor| cursor.started_at.is_none())
+        {
+            self.hooks
+                .on_tool_start(&canonical_id, &executed_arguments)
+                .await;
+            crate::autonomy::suspension::update_executor_progress(|cursor| {
+                cursor.started_at = Some(started_at)
+            });
+        }
         metadata.insert(
             "classification".to_string(),
             serde_json::to_value(&classification).unwrap_or(Value::Null),
@@ -7558,7 +7623,10 @@ impl RuntimeAgent {
         //
         // Runtime cancellation is terminal for the logical request. Recovery fallback must not mask the cancelled record or start new work after the host asked active execution to stop.
         //
-        let fallback_tool = if !result.success && !cancelled {
+        let fallback_tool = if !result.success
+            && !cancelled
+            && !(timed_out && invoked && crate::autonomy::current_execution().is_some())
+        {
             match &tool_config.on_failure {
                 ToolFailureAction::Skip => {
                     result = ToolResult::ok(format!(

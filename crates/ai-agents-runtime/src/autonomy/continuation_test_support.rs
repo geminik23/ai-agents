@@ -13,6 +13,7 @@ pub(super) struct ReceiptStore {
     pub status: TaskRunStatus,
     pub checkpoint: parking_lot::Mutex<Option<serde_json::Value>>,
     pub reached: tokio::sync::Semaphore,
+    pub release: tokio::sync::Semaphore,
 }
 impl ReceiptStore {
     // A single selected final write distinguishes proven rejection from an ambiguous receipt.
@@ -28,6 +29,7 @@ impl ReceiptStore {
             status,
             checkpoint: parking_lot::Mutex::new(None),
             reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
         })
     }
 
@@ -44,6 +46,7 @@ impl ReceiptStore {
             status: TaskRunStatus::Running,
             checkpoint: parking_lot::Mutex::new(Some(checkpoint)),
             reached: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
         })
     }
 
@@ -83,11 +86,41 @@ impl TaskRunStore for ReceiptStore {
         let selected = if let Some(binding) = &*self.checkpoint.lock() {
             if let TaskRunMutation::Checkpoint { payload, .. } = mutation {
                 let payload: TaskCheckpointPayload = serde_json::from_value(payload.clone())?;
-                if let Some(id) = binding.get("consume").and_then(serde_json::Value::as_str) {
+                if binding.get("prompt") == Some(&serde_json::Value::Bool(true)) {
+                    payload
+                        .adapters
+                        .iter()
+                        .filter(|adapter| adapter.adapter == "runtime.actions")
+                        .any(|adapter| {
+                            serde_json::from_value::<super::location::TaskActionsLocation>(
+                                adapter.state.clone(),
+                            )
+                            .is_ok_and(|state| {
+                                matches!(
+                                    state.actions.get(state.next_action),
+                                    Some(ai_agents_state::StateAction::Prompt { .. })
+                                )
+                            })
+                        })
+                } else if let Some(id) = binding.get("consume").and_then(serde_json::Value::as_str)
+                {
                     payload
                         .consumed_request_ids
                         .iter()
                         .any(|consumed| consumed == id)
+                } else if let Some(tool) = binding.get("tool").and_then(serde_json::Value::as_str) {
+                    payload.reservations.iter().any(|reservation| {
+                        let expected = if binding["phase"] == "admit" {
+                            TaskEffectState::Dispatched
+                        } else {
+                            TaskEffectState::Completed
+                        };
+                        reservation.state == expected
+                            && payload.adapters.iter().any(|adapter| {
+                                adapter.id == format!("invocation:{}", reservation.id)
+                                    && adapter.config["tool"] == tool
+                            })
+                    })
                 } else {
                     payload
                         .reservations
@@ -116,6 +149,9 @@ impl TaskRunStore for ReceiptStore {
             }
             let saved = self.inner.mutate(id, mutation).await?;
             self.reached.add_permits(1);
+            if self.mode == "hold" {
+                self.release.acquire().await.unwrap().forget();
+            }
             if self.mode == "drop" {
                 std::future::pending::<()>().await;
             }
@@ -186,6 +222,13 @@ impl ai_agents_core::LLMProvider for FaultProvider {
         _: Option<&ai_agents_core::LLMConfig>,
     ) -> std::result::Result<ai_agents_core::LLMResponse, ai_agents_core::LLMError> {
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
+        if (self.mode == "errors_after" && index >= self.fault_at)
+            || (self.mode == "alternate_error" && index % 2 == 1)
+        {
+            return Err(ai_agents_core::LLMError::Config(
+                "semantic provider failed".into(),
+            ));
+        }
         if index == self.fault_at {
             self.reached.add_permits(1);
             if self.mode == "drop" {

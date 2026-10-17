@@ -384,7 +384,7 @@ impl AgentRegistry {
             .await
     }
 
-    /// Captures framework-owned parent and child bindings before the sender callback; resume never reissues this delivery.
+    /// Captures framework-owned parent and child bindings and the selected failure policy before the sender callback; resume never reissues delivery.
     /// Erasure separates optional dependency-wait construction from nested model/tool polling stacks.
     pub(crate) fn send_task_message<'a>(
         self: &'a Arc<Self>,
@@ -409,6 +409,7 @@ impl AgentRegistry {
             target.preflight_standalone_autonomy()?;
             target.reject_task_ancestor()?;
             let mut frame = *invocation.frame;
+            frame.required = crate::autonomy::child_required();
             let input = if self.send_with_context {
                 format!("[From {from}]: {message}")
             } else {
@@ -458,7 +459,7 @@ impl AgentRegistry {
         })
     }
 
-    /// Saves an already selected route before child dispatch; resuming does not advance selection or send messaging hooks.
+    /// Saves an already selected route and failure policy before child dispatch; resuming does not repeat selection or messaging hooks.
     /// Erasure keeps optional dependency waits out of nested selected-route polling frames.
     pub(crate) fn route_task_message<'a>(
         self: &'a Arc<Self>,
@@ -489,6 +490,7 @@ impl AgentRegistry {
             child.preflight_standalone_autonomy()?;
             child.reject_task_ancestor()?;
             let mut frame = invocation.frame;
+            frame.required = crate::autonomy::child_required();
             frame.delegate_id = to.into();
             frame.delegate_runtime_id = child.info().id;
             frame.delegate_input = input.into();

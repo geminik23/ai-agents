@@ -91,6 +91,25 @@ pub(crate) struct TaskBatchState {
 pub(crate) struct TaskExecutorCursor {
     pub request: ToolExecutionRequest,
     pub ancestry: Vec<String>,
+    #[serde(default)]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub retry_index: u32,
+    #[serde(default)]
+    pub invoked: bool,
+}
+
+impl TaskExecutorCursor {
+    // Each logical hop owns its lifecycle and retry position independently of the model call ID.
+    pub(crate) fn new(request: ToolExecutionRequest, ancestry: Vec<String>) -> Self {
+        Self {
+            request,
+            ancestry,
+            started_at: None,
+            retry_index: 0,
+            invoked: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +455,56 @@ tokio::task_local! {
     static RESUMED_APPROVAL: std::cell::RefCell<Vec<BatchAuthorization>>;
     static RESUMED_QUESTION: std::cell::RefCell<Option<(String, Value, Value)>>;
     static RESUMED_EXECUTOR: std::cell::RefCell<Vec<TaskExecutorCursor>>;
+    static EXECUTOR_PROGRESS: std::cell::RefCell<TaskExecutorCursor>;
+    static SETTLED_TOOL_RESULT: std::cell::RefCell<Option<(String, ai_agents_core::ToolResult)>>;
+}
+
+/// The shared executor retains logical lifecycle and retry progress across typed transfer.
+pub(crate) async fn scope_executor_progress<F: Future>(
+    cursor: TaskExecutorCursor,
+    future: F,
+) -> F::Output {
+    EXECUTOR_PROGRESS
+        .scope(std::cell::RefCell::new(cursor), future)
+        .await
+}
+
+/// Only the live executor publishes progress; serialized labels cannot install a settled implementation result.
+pub(crate) fn executor_progress() -> Option<TaskExecutorCursor> {
+    EXECUTOR_PROGRESS
+        .try_with(|state| state.borrow().clone())
+        .ok()
+}
+
+/// Progress changes occur within the owning hop, before the next implementation can suspend.
+pub(crate) fn update_executor_progress(update: impl FnOnce(&mut TaskExecutorCursor)) {
+    let _ = EXECUTOR_PROGRESS.try_with(|state| update(&mut state.borrow_mut()));
+}
+
+/// A reauthorized and settled message result returns to recovery without another delivery, admission or settlement.
+pub(crate) async fn scope_settled_tool_result<F: Future>(
+    call_id: String,
+    result: ai_agents_core::ToolResult,
+    future: F,
+) -> F::Output {
+    SETTLED_TOOL_RESULT
+        .scope(std::cell::RefCell::new(Some((call_id, result))), future)
+        .await
+}
+
+/// The private result can be consumed once by its exact logical executor request.
+pub(crate) fn take_settled_tool_result(call_id: &str) -> Option<ai_agents_core::ToolResult> {
+    SETTLED_TOOL_RESULT
+        .try_with(|state| {
+            let mut state = state.borrow_mut();
+            if state.as_ref().is_some_and(|(id, _)| id == call_id) {
+                state.take().map(|(_, result)| result)
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
 }
 
 /// Message dispatch may park only inside a reconstructible model batch with a live task request.

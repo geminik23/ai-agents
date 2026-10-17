@@ -15,9 +15,35 @@ pub(crate) struct CompositionTargets {
     retired: std::sync::atomic::AtomicBool,
     tools: Mutex<BTreeMap<String, Arc<dyn ai_agents_core::Tool>>>,
     compositions: Mutex<BTreeMap<String, CapturedComposition>>,
+    message_contexts: Mutex<BTreeMap<String, ai_agents_core::ToolExecutionContext>>,
 }
 
 impl CompositionTargets {
+    /// The actual admitted context retains cancellation and approval bindings; serialized frames cannot construct it.
+    pub(crate) fn bind_message_context(
+        &self,
+        id: &str,
+        context: ai_agents_core::ToolExecutionContext,
+    ) -> Result<()> {
+        let mut contexts = self.message_contexts.lock();
+        if self.retired.load(std::sync::atomic::Ordering::Acquire)
+            || contexts.len() >= MAX_TASK_CHECKPOINT_RECORDS
+            || contexts.contains_key(id)
+        {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        contexts.insert(id.into(), context);
+        Ok(())
+    }
+
+    /// Recovery resolves only a retained invocation context, never a newly stamped review or serialized capability.
+    pub(crate) fn message_context(&self, id: &str) -> Result<ai_agents_core::ToolExecutionContext> {
+        self.message_contexts
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| TaskRunStorageError::InvalidCheckpoint.into())
+    }
     /// Actual captured tool registries/providers survive suspension; serialized operation names cannot substitute them.
     pub(crate) fn bind_composition(
         &self,
@@ -214,6 +240,7 @@ impl CompositionTargets {
         bindings.clear();
         self.tools.lock().clear();
         self.compositions.lock().clear();
+        self.message_contexts.lock().clear();
     }
 }
 

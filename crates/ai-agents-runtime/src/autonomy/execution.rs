@@ -315,7 +315,8 @@ impl RunExecution {
         self.mutation_generation.load(Ordering::Acquire)
     }
 
-    /// A finalized shared-executor record is captured once with private run/cycle authority.
+    /// A finalized shared-executor hop is captured once with private run/cycle authority.
+    /// Fallbacks keep the model call ID but must not collapse distinct logical hops into an ancestor's evidence.
     pub(crate) async fn capture_tool_record(
         &self,
         record: &ai_agents_core::ToolExecutionRecord,
@@ -353,6 +354,8 @@ impl RunExecution {
                         == Some(runtime_id)
                     && capture.record.metadata.get("_task_child_operation")
                         == Some(&serde_json::to_value(&operation).unwrap_or(Value::Null))
+                    && capture.record.metadata.get("_task_executor_hop")
+                        == record.metadata.get("_task_executor_hop")
             }) {
                 return Ok(());
             }
