@@ -937,7 +937,7 @@ impl RunExecution {
                 },
             )
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?;
+            .inspect_err(|_| self.storage_failure())?;
         self.acknowledge_snapshot(&anchored);
         self.revision
             .store(anchored.revision, std::sync::atomic::Ordering::Release);
@@ -960,6 +960,7 @@ impl RunExecution {
                     payload: serde_json::to_value(payload)?,
                     release: true,
                     expires_at: self.expiry(),
+                    evidence: None,
                     deadline: std::time::Instant::now()
                         .checked_add(self.remaining_duration())
                         .ok_or_else(|| {
@@ -968,7 +969,7 @@ impl RunExecution {
                 },
             )
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?;
+            .inspect_err(|_| self.storage_failure())?;
         self.acknowledge_snapshot(&saved);
         self.revision
             .store(saved.revision, std::sync::atomic::Ordering::Release);

@@ -6,6 +6,46 @@ use ai_agents_core::{AgentError, AgentStorage, Result, StorageCapability};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Verifies exact checkpoint receipts without repeating final deadline admission after a write already committed.
+/// This detects inconsistent replies, not a backend that falsely acknowledges an exact-looking unsaved snapshot.
+pub(crate) fn verify_checkpoint_receipt(
+    previous: &TaskRunSnapshot,
+    mutation: &TaskRunMutation,
+    saved: &TaskRunSnapshot,
+) -> Result<()> {
+    let checkpoint = match mutation {
+        TaskRunMutation::Checkpoint {
+            expected_revision,
+            owner_token,
+            status,
+            payload,
+            release,
+        }
+        | TaskRunMutation::FinalCheckpoint {
+            expected_revision,
+            owner_token,
+            status,
+            payload,
+            release,
+            ..
+        } => TaskRunMutation::Checkpoint {
+            expected_revision: *expected_revision,
+            owner_token: owner_token.clone(),
+            status: *status,
+            payload: payload.clone(),
+            release: *release,
+        },
+        _ => mutation.clone(),
+    };
+    let expected = previous.transition(&checkpoint, saved.updated_at)?;
+    if saved.updated_at < previous.updated_at
+        || serde_json::to_value(&expected)? != serde_json::to_value(saved)?
+    {
+        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    Ok(())
+}
+
 /// Storage operations are CAS transitions; successful claim is required before later execution.
 #[async_trait]
 pub trait TaskRunStore: Send + Sync {
@@ -14,6 +54,7 @@ pub trait TaskRunStore: Send + Sync {
     /// Returns only compatible data in this adapter's agent and actor scope.
     async fn load(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>>;
     /// Applies a conditional operation without executing external work.
+    /// Forward live final-admission guards and validate the transition inside the backend write boundary; serialized IDs cannot replace them.
     async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot>;
     /// Claims a paused revision; None certifies no write, while errors from a custom transport remain ambiguous.
     async fn claim_paused(
@@ -236,6 +277,7 @@ impl TaskRunStore for ScopedTaskRunStore {
             .mutate_task_run(&self.key(run_id), mutation)
             .await?;
         self.validate(&saved)?;
+        verify_checkpoint_receipt(&previous, mutation, &saved)?;
         Ok(saved)
     }
 

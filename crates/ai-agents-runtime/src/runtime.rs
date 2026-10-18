@@ -1045,7 +1045,7 @@ impl RuntimeAgent {
                 .collect(),
             judge: self.llm_registry.default().is_ok(),
             planner: self.llm_registry.default().is_ok(),
-            host_revisions: false,
+            host_revisions: self.autonomy_extensions.has_host_revisions(),
         }
     }
 

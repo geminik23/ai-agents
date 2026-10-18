@@ -1034,8 +1034,8 @@ async fn model_batch_failed_second_suspension_retains_protection() {
         "batch.v1".into(),
     )
     .unwrap();
-    let result = runner.run("objective", None).await.unwrap();
-    assert_eq!(result.run.status, TaskRunStatus::RecoveryRequired);
+    // The original ambiguous storage failure is not replaced by another terminal write; live custody remains protected.
+    assert!(runner.run("objective", None).await.is_err());
     assert!(faulty.fired.load(Ordering::SeqCst));
     assert!(f.parent.chat("cannot steal owner").await.is_err());
     for child in &f.children {

@@ -283,7 +283,9 @@ pub struct AutonomyExtensions {
     validators: BTreeMap<(String, u32), Arc<dyn AutonomyValidator>>,
     progress: BTreeMap<(String, u32), Arc<dyn ProgressAdapter>>,
     host_validation: BTreeMap<String, HostValidationBinding>,
-    conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) validation_targets: BTreeMap<String, super::host_evidence::HostTarget>,
+    pub(super) condition_policies: BTreeMap<String, super::ExternalUnavailablePolicy>,
 }
 
 impl AutonomyExtensions {
@@ -386,6 +388,8 @@ impl AutonomyExtensions {
             progress: self.progress,
             host_validation: self.host_validation,
             conditions: self.conditions,
+            validation_targets: self.validation_targets,
+            condition_policies: self.condition_policies,
         })
     }
 }
@@ -395,7 +399,9 @@ pub struct FrozenAutonomyExtensions {
     validators: BTreeMap<(String, u32), Arc<dyn AutonomyValidator>>,
     progress: BTreeMap<(String, u32), Arc<dyn ProgressAdapter>>,
     host_validation: BTreeMap<String, HostValidationBinding>,
-    conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) validation_targets: BTreeMap<String, super::host_evidence::HostTarget>,
+    pub(super) condition_policies: BTreeMap<String, super::ExternalUnavailablePolicy>,
 }
 
 impl FrozenAutonomyExtensions {
@@ -520,7 +526,9 @@ impl FrozenAutonomyExtensions {
                         })
             }) && (!adapter.descriptor().needs_judge || capabilities.judge)
                 && (!adapter.descriptor().needs_planner || capabilities.planner)
-                && (!adapter.descriptor().requires_host_revision || capabilities.host_revisions);
+                && (!adapter.descriptor().requires_host_revision
+                    || (capabilities.host_revisions
+                        && self.validation_targets.contains_key(&check.id)));
             if check.required.unwrap_or(true) && !available {
                 return Err(AgentError::Config(
                     "required validator capability/authority unavailable".into(),
@@ -569,7 +577,13 @@ impl FrozenAutonomyExtensions {
                 .any(|tool| !capabilities.tools.contains(tool))
             || (progress.descriptor().needs_judge && !capabilities.judge)
             || (progress.descriptor().needs_planner && !capabilities.planner)
-            || (progress.descriptor().requires_host_revision && !capabilities.host_revisions)
+            || (progress.descriptor().requires_host_revision
+                && (!capabilities.host_revisions
+                    || !progress
+                        .descriptor()
+                        .checks
+                        .iter()
+                        .any(|id| self.validation_targets.contains_key(id))))
         {
             return Err(AgentError::Config(
                 "progress adapter dependency/capability unavailable".into(),

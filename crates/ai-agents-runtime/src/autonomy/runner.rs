@@ -1254,7 +1254,8 @@ impl AutonomyRunner {
         outcome
     }
 
-    /// Runs a bounded foreground objective; unsuccessful storage writes never publish a successful task result.
+    /// Runs a bounded foreground objective after sampling required host targets; unsuccessful writes never publish success.
+    /// Revision sources are sampled state, not providers or execution permits, and are rechecked at continuation/publication boundaries.
     pub async fn run(&self, objective: &str, selected: Option<&str>) -> Result<TaskRunResult> {
         let profile = resolve_profile(
             &self.config,
@@ -1337,6 +1338,21 @@ impl AutonomyRunner {
             ));
         }
         let lifecycle = LifecycleState::new(&profile.settings, false)?;
+        let mut preflight_scope = EvaluationScope {
+            key: TaskRunKey {
+                agent_id: self.agent.info().id,
+                run_id: String::new(),
+            },
+            objective_revision: 0,
+            cycle: 0,
+            stage: None,
+            mutation_generation: 0,
+            target_revisions: BTreeMap::new(),
+            target_generations: BTreeMap::new(),
+            validation_bindings: BTreeMap::new(),
+            validation_attempts: BTreeMap::new(),
+        };
+        bound.capture_targets(&mut preflight_scope)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let owner = self.agent.reserve_autonomy_run(run_id.clone()).await?;
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
@@ -1442,10 +1458,11 @@ impl AutonomyRunner {
         .await;
         let result = match result {
             Err(error)
-                if !matches!(
-                    &error,
-                    AgentError::Persistence(_) | AgentError::TaskRunStorage(_)
-                ) =>
+                if !execution.has_storage_failure()
+                    && !matches!(
+                        &error,
+                        AgentError::Persistence(_) | AgentError::TaskRunStorage(_)
+                    ) =>
             {
                 self.finish(
                     &execution,
@@ -1497,7 +1514,8 @@ impl AutonomyRunner {
         result
     }
 
-    /// The controller invokes internal turns and shares one ledger with validation; remaining capacity uses acknowledged limits rather than the original profile after host revision.
+    /// The controller shares one ledger with validation; current target samples invalidate old proof without relabelling completed effects.
+    /// Required stage review and final completion recheck frozen host sources after storage waits; run CAS is not an external-target transaction.
     /// Future erasure isolates retained validation data from nested model-message polling stacks.
     #[allow(clippy::too_many_arguments)]
     fn execute<'a>(
@@ -1607,6 +1625,7 @@ impl AutonomyRunner {
                     super::controller::ControllerProposal::Stage { .. } => {}
                 }
             }
+            let reviewed_scope = continuation.as_ref().map(|saved| saved.scope.clone());
             let reviewed_stage_admission = reviewed.clone();
             let mut reviewed_plan_admission = reviewed
                 .as_ref()
@@ -1657,6 +1676,7 @@ impl AutonomyRunner {
                         .and_then(|stages| stages.get(lifecycle.current_stage))
                         .map(|stage| stage.id.clone());
 
+                    bound.capture_targets(&mut scope)?;
                     execution.set_scope(&scope);
                     // This is an advisory view; live admission remains authoritative if time passes before dispatch.
                     let controller = json!({"objective":objective,"stage":scope.stage,"instruction":instruction,
@@ -1848,7 +1868,9 @@ impl AutonomyRunner {
                     })
                     .await?;
                 scope.mutation_generation = execution.mutation_generation();
+                bound.capture_targets(&mut scope)?;
                 Self::collect_tools(execution, &mut evidence).await?;
+                bound.extensions.ensure_targets_current(&scope)?;
                 if reviewed_stage.is_none() {
                     let observation = bound.observe_progress(&scope, &evidence)?;
                     progress.observe(&scope, &observation)?;
@@ -1921,6 +1943,10 @@ impl AutonomyRunner {
                             .await;
                         }
                         if approved.is_some() {
+                            if let Some(original) = &reviewed_scope {
+                                bound.extensions.ensure_targets_current(original)?;
+                            }
+                            bound.extensions.ensure_targets_current(&scope)?;
                             let review = reviewed_stage_admission
                                 .as_ref()
                                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
@@ -2013,8 +2039,17 @@ impl AutonomyRunner {
                     data: json!({"scope":scope,"gate":gate,"completion":completion,"validations":evidence.validations.iter().filter(|result| result.identity.cycle == scope.cycle).collect::<Vec<_>>(),"progress":progress.last_delta,"decision":decision}) });
                 Ok(())
             }).await?;
+                bound.extensions.ensure_targets_current(&scope)?;
                 match decision {
                     CheckpointDecision::Terminal { status, reason } => {
+                        if status == TaskRunStatus::Completed {
+                            execution.set_final_evidence(Arc::new(
+                                super::host_evidence::HostEvidenceAdmission {
+                                    extensions: bound.extensions.clone(),
+                                    scope: scope.clone(),
+                                },
+                            ));
+                        }
                         return self.finish(execution, status, reason, last_response).await;
                     }
                     CheckpointDecision::Limit => {
@@ -2166,7 +2201,7 @@ impl AutonomyRunner {
         })
     }
 
-    /// Binds one selected check attempt to the same acknowledged revision and invocation ledger as runtime turns.
+    /// Binds one check to its frozen host target and the shared ledger without resetting a retained attempt or its deadline.
     /// Erasure keeps optional observation future construction out of nested runtime turn polling frames.
     #[allow(clippy::too_many_arguments)]
     fn validate<'a>(
@@ -2193,6 +2228,7 @@ impl AutonomyRunner {
             let capacity = execution.load_owned().await?;
             let capacity: TaskCheckpointPayload = serde_json::from_value(capacity.payload)?;
             if resumed.is_none()
+                && check.available
                 && (check.adapter.descriptor().needs_judge
                     || check.adapter.descriptor().needs_planner)
                 && capacity.counters.llm_attempts >= u64::from(capacity.limits.max_llm_calls)
@@ -2205,20 +2241,27 @@ impl AutonomyRunner {
             // A resumed attempt retains its original identity; capture_scope records current invocation/publication freshness separately.
             if resumed.is_none() {
                 scope.mutation_generation = execution.mutation_generation();
+                bound.capture_targets(scope)?;
             }
-            let identity = Self::identity(
+            let mut identity = Self::identity(
                 scope,
                 scope.cycle,
                 Some(attempt),
                 check.config_identity.clone(),
             );
+            if let Some(target) = bound.extensions.validation_target(&check.check.id) {
+                identity.target = Some(target.into());
+                identity.target_revision = scope.target_revisions.get(target).cloned();
+            }
             let mut driver = Box::new(if let Some(driver) = resumed {
-                ValidationDriverState::restore(
-                    serde_json::to_value(driver)?,
+                let mut restored = ValidationDriverState::restore(
+                    serde_json::to_value(&driver)?,
                     check,
                     scope,
                     &bound.extensions,
-                )?
+                )?;
+                restored.retain_deadline_from(&driver);
+                restored
             } else {
                 ValidationDriverState::new(check, identity)?
             });
@@ -2268,6 +2311,7 @@ impl AutonomyRunner {
                 .await?
             {
                 ValidationDriverOutcome::Complete(_) => {
+                    bound.extensions.ensure_targets_current(scope)?;
                     scope.mutation_generation = execution.mutation_generation();
                     evidence.collect_validation(&driver)?;
                     Ok(None)

@@ -11,6 +11,7 @@ struct Validator {
     descriptor: AdapterDescriptor,
     calls: Arc<AtomicUsize>,
     hosted: bool,
+    external: bool,
 }
 impl AutonomyValidator for Validator {
     fn descriptor(&self) -> &AdapterDescriptor {
@@ -36,6 +37,12 @@ impl AutonomyValidator for Validator {
                 checkpoint: json!({}),
             })
         } else {
+            if self.external && input.previous.get("external_signal").is_none() {
+                return Ok(ValidationDecision::AwaitExternal {
+                    binding: "ready".into(),
+                    checkpoint: json!({"child_settled":true}),
+                });
+            }
             let successful = input.observations.values().all(|observation| matches!(&observation.result, ObservationResult::Tool { record } if record.executed && record.success));
             Ok(ValidationDecision::Complete {
                 outcome: if successful {
@@ -135,6 +142,16 @@ async fn fixture_repause(repause: bool) -> Fixture {
 // Private fixed host validation authority survives child parking without exposing the operation to the model.
 // The actual child and configuration remain available for acknowledgement fault injection without replacing runtime execution.
 async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
+    Box::pin(fixture_host_evidence(repause, hosted, None)).await
+}
+
+// Nested host-evidence tests retain the same message and child cursors before entering a real external wait.
+async fn fixture_host_evidence(
+    repause: bool,
+    hosted: bool,
+    source: Option<Arc<dyn HostRevisionSource>>,
+) -> Fixture {
+    let external = source.is_some();
     let registry = Arc::new(AgentRegistry::new());
     let question = ai_agents_core::encode_native_tool_call_markers(
         &[ai_agents_core::ToolCall {
@@ -187,10 +204,17 @@ async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
                 id: "host.message".into(),
                 contract_version: 1,
                 tools: vec!["send_agent_message".into()],
+                conditions: if external {
+                    vec!["ready".into()]
+                } else {
+                    vec![]
+                },
+                requires_host_revision: external,
                 ..Default::default()
             },
             calls: calls.clone(),
             hosted,
+            external,
         }))
         .unwrap();
     if hosted {
@@ -204,6 +228,18 @@ async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
                 tool: "send_agent_message".into(),
                 arguments: json!({"to":"worker","message":"objective"}),
                 require_approval: true,
+            })
+            .unwrap();
+    }
+    if let Some(source) = source {
+        extensions
+            .register_validation_target("check", "ticket", source)
+            .unwrap();
+        extensions
+            .register_condition(HostConditionBinding {
+                id: "ready".into(),
+                version: 1,
+                shape: ExternalSignalShape::Boolean,
             })
             .unwrap();
     }
@@ -262,6 +298,206 @@ async fn fixture_mode(repause: bool, hosted: bool) -> Fixture {
         calls,
         store,
         config,
+    }
+}
+
+// Child re-pauses and fixed host approval settle once before external delivery or host-controlled retirement.
+#[tokio::test]
+async fn host_evidence_nested_child_then_external_preserves_completed_history_and_custody() {
+    for sqlite in super::continuation_test_support::backends() {
+        for hosted in [false, true] {
+            for action in ["signal", "unavailable", "cancel", "objective"] {
+                let source = super::host_evidence_tests::Revision::new();
+                let mut f =
+                    Box::pin(fixture_host_evidence(true, hosted, Some(source.clone()))).await;
+                f.store = super::continuation_test_support::store(
+                    f.root.info().id,
+                    "observation-message.v1",
+                    *sqlite,
+                )
+                .await;
+                f.runner = AutonomyRunner::try_new(
+                    f.root.clone(),
+                    f.config.clone(),
+                    Default::default(),
+                    f.store.clone(),
+                    "observation-message.v1".into(),
+                )
+                .unwrap();
+                let mut result = f.runner.run("objective", None).await.unwrap();
+                let mut pauses = 0;
+                while !matches!(
+                    result.run.pending.as_ref().unwrap().kind,
+                    TaskPendingKind::ExternalCondition
+                ) {
+                    pauses += 1;
+                    assert!(
+                        pauses <= 4,
+                        "sqlite={sqlite} hosted={hosted} action={action} pending={:?} child_calls={} callbacks={}",
+                        result.run.pending,
+                        f.child.calls.load(Ordering::SeqCst),
+                        f.calls.load(Ordering::SeqCst)
+                    );
+                    let request_id = result.run.pending.as_ref().unwrap().id.clone();
+                    let input = if matches!(
+                        result.run.pending.as_ref().unwrap().kind,
+                        TaskPendingKind::Approval
+                    ) {
+                        TaskResumeInput::Approval {
+                            request_id,
+                            result: ai_agents_hitl::ApprovalResult::Approved,
+                        }
+                    } else {
+                        TaskResumeInput::UserAnswer {
+                            request_id,
+                            answer: json!({"answered":true,"selected":["yes"]}),
+                        }
+                    };
+                    result = f
+                        .runner
+                        .resume(&result.run.key.run_id, result.run.revision, input)
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(f.child.calls.load(Ordering::SeqCst), 3);
+                assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+                assert!(f.worker.set_context("blocked", json!(true)).is_err());
+                let old = result.run.pending.as_ref().unwrap().id.clone();
+                let done = match action {
+                    "signal" => f
+                        .runner
+                        .resume(
+                            &result.run.key.run_id,
+                            result.run.revision,
+                            TaskResumeInput::ExternalSignal(ExternalSignal {
+                                request_id: old.clone(),
+                                event_id: "settled-child".into(),
+                                target_revision: Some("r1".into()),
+                                payload: json!(true),
+                            }),
+                        )
+                        .await
+                        .unwrap(),
+                    "unavailable" => {
+                        source.change();
+                        f.runner
+                            .external_unavailable_paused(
+                                &result.run.key.run_id,
+                                result.run.revision,
+                                &old,
+                                "delivery lost",
+                            )
+                            .await
+                            .unwrap()
+                    }
+                    "cancel" => {
+                        source.change();
+                        f.runner
+                            .cancel_paused(&result.run.key.run_id, result.run.revision)
+                            .await
+                            .unwrap()
+                    }
+                    _ => {
+                        source.change();
+                        let revised = f
+                            .runner
+                            .modify_objective_paused(
+                                &result.run.key.run_id,
+                                result.run.revision,
+                                "new objective",
+                                "retire external wait",
+                            )
+                            .await
+                            .unwrap();
+                        assert!(
+                            f.runner
+                                .resume(
+                                    &revised.run.key.run_id,
+                                    revised.run.revision,
+                                    TaskResumeInput::ExternalSignal(ExternalSignal {
+                                        request_id: old,
+                                        event_id: "obsolete".into(),
+                                        target_revision: Some("r1".into()),
+                                        payload: json!(true)
+                                    })
+                                )
+                                .await
+                                .is_err()
+                        );
+                        f.runner
+                            .stop_paused(
+                                &revised.run.key.run_id,
+                                revised.run.revision,
+                                "stop revised run",
+                            )
+                            .await
+                            .unwrap()
+                    }
+                };
+                assert_eq!(
+                    done.run.status,
+                    match action {
+                        "signal" => TaskRunStatus::Completed,
+                        "cancel" => TaskRunStatus::Cancelled,
+                        _ => TaskRunStatus::Incomplete,
+                    }
+                );
+                assert_eq!(f.child.calls.load(Ordering::SeqCst), 3);
+                assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    f.calls.load(Ordering::SeqCst),
+                    if action == "signal" { 3 } else { 2 }
+                );
+                assert!(f.worker.set_context("released", json!(true)).is_ok());
+            }
+        }
+    }
+}
+
+// Freshness refusal at a nested pending question must leave its actual child history safely cancellable.
+#[tokio::test]
+async fn host_evidence_nested_stale_target_cancels_without_answer_delivery() {
+    for sqlite in super::continuation_test_support::backends() {
+        let source = super::host_evidence_tests::Revision::new();
+        let mut f = Box::pin(fixture_host_evidence(true, false, Some(source.clone()))).await;
+        f.store = super::continuation_test_support::store(
+            f.root.info().id,
+            "observation-message.v1",
+            *sqlite,
+        )
+        .await;
+        f.runner = AutonomyRunner::try_new(
+            f.root.clone(),
+            f.config.clone(),
+            Default::default(),
+            f.store.clone(),
+            "observation-message.v1".into(),
+        )
+        .unwrap();
+        let first = f.runner.run("objective", None).await.unwrap();
+        source.change();
+        assert!(
+            f.runner
+                .resume(
+                    &first.run.key.run_id,
+                    first.run.revision,
+                    TaskResumeInput::UserAnswer {
+                        request_id: first.run.pending.as_ref().unwrap().id.clone(),
+                        answer: json!({"answered":true,"selected":["yes"]})
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 1);
+        let done = f
+            .runner
+            .cancel_paused(&first.run.key.run_id, first.run.revision)
+            .await
+            .unwrap();
+        assert_eq!(done.run.status, TaskRunStatus::Cancelled);
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), 1);
+        assert!(f.worker.set_context("released", json!(true)).is_ok());
     }
 }
 
@@ -784,8 +1020,8 @@ mod acknowledgement {
             let expected = if matches!(fault, Fault::RejectWrite) {
                 "observation admission write rejected"
             } else {
-                // The committed but unacknowledged revision fails the subsequent owned read, not just the injected write.
-                "task revision or owner conflicts"
+                // Preserve the original ambiguous write error instead of treating it as a clean clock interruption.
+                "observation admission acknowledgement lost"
             };
             assert!(error.to_string().contains(expected), "{error}");
             assert_eq!(store.hits.load(Ordering::SeqCst), 1);

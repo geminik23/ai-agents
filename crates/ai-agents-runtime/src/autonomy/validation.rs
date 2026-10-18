@@ -123,6 +123,8 @@ pub struct ValidationDriverState {
     pub version: u32,
     pub binding_identity: String,
     pub check_deadline: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip)]
+    check_projection: Option<std::time::Instant>,
     pub host_authorities: BTreeMap<String, HostValidationBinding>,
     pub check_id: String,
     pub adapter: String,
@@ -270,6 +272,9 @@ impl ValidationDriverState {
                         .ok_or_else(|| AgentError::Config("validation deadline overflow".into()))
                 })
                 .transpose()?,
+            check_projection: binding.check.timeout_seconds.and_then(|seconds| {
+                std::time::Instant::now().checked_add(std::time::Duration::from_secs(seconds))
+            }),
             host_authorities: BTreeMap::new(),
             check_id: binding.check.id.clone(),
             adapter: binding.check.adapter.clone(),
@@ -298,7 +303,11 @@ impl ValidationDriverState {
         extensions: &FrozenAutonomyExtensions,
     ) -> Result<Self> {
         bounded_value(&value, 262_144)?;
-        let state: Self = serde_json::from_value(value)?;
+        let mut state: Self = serde_json::from_value(value)?;
+        state.check_projection = state.check_deadline.and_then(|deadline| {
+            std::time::Instant::now()
+                .checked_add((deadline - chrono::Utc::now()).to_std().unwrap_or_default())
+        });
         state.validate(binding, scope, extensions)?;
         if state.in_flight.is_some() {
             return Err(AgentError::Config(
@@ -307,6 +316,68 @@ impl ValidationDriverState {
         }
         Ok(state)
     }
+    /// Preserves the earlier monotonic check bound when a retained live cursor passes through serialized validation.
+    pub(crate) fn retain_deadline_from(&mut self, retained: &Self) {
+        self.check_projection = match (self.check_projection, retained.check_projection) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+    }
+
+    /// Checks original time bounds after awaited persistence; a successful receipt does not extend callback admission.
+    pub(crate) fn expired(&self) -> bool {
+        self.check_deadline
+            .is_some_and(|deadline| chrono::Utc::now() >= deadline)
+            || self
+                .check_projection
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+    }
+
+    // Publication must still be timely and bound after acknowledgement; saved late data remains audit-only.
+    fn check_live(
+        &mut self,
+        context: &ValidationDriveContext<'_>,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        if context.cancellation.is_cancelled() || self.expired() || chrono::Utc::now() >= deadline {
+            self.publication_identity = None;
+            return Err(AgentError::Other(
+                "validation cancelled or deadline exceeded".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    // A snapshot may advance mutation/revision data, but never change the check's run, config or attempt binding.
+    fn capture_publication(
+        &mut self,
+        context: &ValidationDriveContext<'_>,
+    ) -> Result<EvaluationScope> {
+        context
+            .extensions
+            .ensure_driver_target(self)
+            .inspect_err(|_| self.publication_identity = None)?;
+        let current = context
+            .executor
+            .capture_scope(context.scope)
+            .inspect_err(|_| self.publication_identity = None)?;
+        if current.key != context.scope.key
+            || current.objective_revision != context.scope.objective_revision
+            || current.cycle != context.scope.cycle
+            || current.stage != context.scope.stage
+            || current.validation_bindings != context.scope.validation_bindings
+            || current.validation_attempts != context.scope.validation_attempts
+            || current.mutation_generation < context.scope.mutation_generation
+            || !self.identity.eligible(&current, false, false)
+        {
+            self.publication_identity = None;
+            return Err(AgentError::Config(
+                "validation host target or scope changed".into(),
+            ));
+        }
+        Ok(current)
+    }
+
     /// Validates signal data without consuming it or requiring a storage claim.
     pub fn validate_external(
         &self,
@@ -388,7 +459,8 @@ impl ValidationDriverState {
             .is_some_and(|stage| self.identity.stage.as_ref() != Some(stage))
             || scope.validation_bindings.get(&self.check_id) != Some(&self.identity.config_identity)
             || scope.validation_attempts.get(&self.check_id) != self.identity.attempt.as_ref()
-            || (binding.adapter.descriptor().requires_host_revision
+            || (binding.available
+                && binding.adapter.descriptor().requires_host_revision
                 && (self.identity.target.is_none() || self.identity.target_revision.is_none()))
         {
             return Err(AgentError::Config(
@@ -577,6 +649,8 @@ impl ValidationDriverState {
                     "validation cancelled or expired before admission".into(),
                 ));
             }
+            self.check_live(context, deadline)?;
+            self.capture_publication(context)?;
             context
                 .executor
                 .preflight(&self.requests[&id], &self.identity)?;
@@ -590,6 +664,8 @@ impl ValidationDriverState {
                     "validation interrupted after admission acknowledgement".into(),
                 ));
             }
+            self.check_live(context, deadline)?;
+            self.capture_publication(context)?;
             let request = self.requests[&id].clone();
             let before = match &resumed {
                 Some(parked) => parked.before.clone(),
@@ -598,7 +674,7 @@ impl ValidationDriverState {
             let mut future = Box::pin(context.executor.execute(&request, &self.identity));
             let result = loop {
                 tokio::select! { result = &mut future => break result, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                    if context.cancellation.is_cancelled() || chrono::Utc::now() >= deadline { return Err(AgentError::Other("validation interrupted with uncertain effect".into())); }
+                    if context.cancellation.is_cancelled() || self.expired() || chrono::Utc::now() >= deadline { return Err(AgentError::Other("validation interrupted with uncertain effect".into())); }
                 } }
             };
             drop(future);
@@ -758,11 +834,13 @@ impl ValidationDriverState {
     }
 
     /// Finite callbacks request managed observations; every effect has an acknowledged pre-dispatch journal record.
+    /// Callback and publication admission recheck original clocks and host targets after each awaited acknowledgement.
     pub async fn drive(
         &mut self,
         binding: &BoundValidationCheck,
         context: &ValidationDriveContext<'_>,
     ) -> Result<ValidationDriverOutcome> {
+        self.publication_identity = None;
         let ValidationDriveContext {
             scope,
             evidence,
@@ -770,7 +848,7 @@ impl ValidationDriverState {
             executor: _,
             journal,
             limits,
-            cancellation,
+            cancellation: _,
             deadline,
         } = *context;
         let limits = ValidationDriverLimits {
@@ -794,23 +872,29 @@ impl ValidationDriverState {
             ));
         }
         self.validate(binding, scope, extensions)?;
+        extensions.ensure_driver_target(self)?;
         if self.in_flight.is_some() {
             return Err(AgentError::Config("uncertain validation effect".into()));
         }
         loop {
-            if cancellation.is_cancelled() || chrono::Utc::now() >= deadline {
-                return Err(AgentError::Other(
-                    "validation cancelled or deadline exceeded".into(),
-                ));
-            }
+            self.check_live(context, deadline)?;
             if self.result.is_some() {
                 self.acknowledge(journal).await?;
-                return Ok(ValidationDriverOutcome::Complete(
-                    self.result.as_ref().unwrap().clone(),
-                ));
+                self.check_live(context, deadline)?;
+                let current = self.capture_publication(context)?;
+                let result = self.result.as_ref().unwrap();
+                if !result.identity.eligible(&current, false, true) {
+                    self.publication_identity = None;
+                    return Err(AgentError::Config(
+                        "cached validation evidence is stale".into(),
+                    ));
+                }
+                return Ok(ValidationDriverOutcome::Complete(result.clone()));
             }
             if self.wait.is_some() {
                 self.acknowledge(journal).await?;
+                self.check_live(context, deadline)?;
+                self.capture_publication(context)?;
                 return Ok(ValidationDriverOutcome::AwaitExternal(
                     self.wait.as_ref().unwrap().clone(),
                 ));
@@ -826,7 +910,8 @@ impl ValidationDriverState {
             }
             self.rounds += 1;
             journal.checkpoint(self).await?;
-            let publication = context.executor.capture_scope(scope)?;
+            self.check_live(context, deadline)?;
+            let publication = self.capture_publication(context)?;
             self.publication_scope = Some(publication.clone());
             let config = binding.check.config.clone().unwrap_or_else(|| json!({}));
             let decision = if !binding.available {
@@ -846,6 +931,7 @@ impl ValidationDriverState {
                     observations: &self.completed,
                 })?
             };
+            self.check_live(context, deadline)?;
             match decision {
                 ValidationDecision::Complete {
                     outcome,
@@ -880,6 +966,14 @@ impl ValidationDriverState {
                         Some(canonical_identity(&serde_json::to_value(&result)?)?);
                     self.result = Some(result.clone());
                     self.acknowledge(journal).await?;
+                    self.check_live(context, deadline)?;
+                    let current = self.capture_publication(context)?;
+                    if !result.identity.eligible(&current, false, true) {
+                        self.publication_identity = None;
+                        return Err(AgentError::Config(
+                            "validation evidence changed during publication".into(),
+                        ));
+                    }
                     return Ok(ValidationDriverOutcome::Complete(result));
                 }
                 ValidationDecision::AwaitExternal {
@@ -902,6 +996,8 @@ impl ValidationDriverState {
                     };
                     self.wait = Some(wait.clone());
                     self.acknowledge(journal).await?;
+                    self.check_live(context, deadline)?;
+                    self.capture_publication(context)?;
                     return Ok(ValidationDriverOutcome::AwaitExternal(wait));
                 }
                 ValidationDecision::NeedObservations {

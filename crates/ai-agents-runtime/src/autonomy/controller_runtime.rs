@@ -63,13 +63,14 @@ impl AutonomyRunner {
                     payload: serde_json::to_value(payload)?,
                     release: true,
                     expires_at: execution.expiry(),
+                    evidence: None,
                     deadline: std::time::Instant::now()
                         .checked_add(execution.remaining_duration())
                         .ok_or_else(|| AgentError::Config("pause deadline overflow".into()))?,
                 },
             )
             .await
-            .inspect_err(|_| execution.stop("storage_failure"))?;
+            .inspect_err(|_| execution.storage_failure())?;
         if saved.key != anchored.key
             || saved.actor_id != anchored.actor_id
             || saved.schema_version != anchored.schema_version
@@ -93,7 +94,7 @@ impl AutonomyRunner {
         })
     }
 
-    /// Checks the actual retained owner and checkpoint equality before any response can claim controller execution.
+    /// Checks checkpoint equality and returns the actual retained cursor, including nonserialized monotonic deadlines.
     pub(super) fn retained_controller(
         &self,
         snapshot: &TaskRunSnapshot,
@@ -108,10 +109,13 @@ impl AutonomyRunner {
         if serde_json::to_value(&state)? != serde_json::to_value(&retained.controller)? {
             return Err(TaskRunStorageError::NotResumable.into());
         }
-        Ok(state)
+        retained
+            .controller
+            .clone()
+            .ok_or_else(|| TaskRunStorageError::NotResumable.into())
     }
 
-    /// Signals are data, and approval/question responses remain bound to their actual observation implementation.
+    /// Signals remain data; target freshness is checked before claim and after acknowledgements without weakening cleanup authority.
     /// Erasure prevents the optional controller driver from enlarging unrelated nested model resume frames.
     pub(super) fn resume_controller(
         &self,
@@ -154,10 +158,7 @@ impl AutonomyRunner {
                 .driver
                 .as_ref()
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            if driver
-                .check_deadline
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
-            {
+            if driver.expired() {
                 return Err(TaskRunStorageError::AdmissionExpired.into());
             }
             let check = bound
@@ -171,6 +172,8 @@ impl AutonomyRunner {
                 &state.scope,
                 &bound.extensions,
             )?;
+            restored.retain_deadline_from(driver);
+            bound.extensions.ensure_targets_current(&state.scope)?;
             let pending = payload
                 .pending
                 .as_ref()
@@ -487,7 +490,15 @@ impl AutonomyRunner {
                     } else {
                         future.await
                     };
-                    if result.is_err() {
+                    // An ambiguous storage failure is not a clean clock interruption and cannot release retained custody.
+                    if !execution.has_storage_failure()
+                        && result.as_ref().is_err_and(|error| {
+                            !matches!(
+                                error,
+                                AgentError::Persistence(_) | AgentError::TaskRunStorage(_)
+                            )
+                        })
+                    {
                         let driver = state
                             .driver
                             .as_ref()
@@ -646,24 +657,40 @@ impl AutonomyRunner {
         Ok(())
     }
 
-    /// Successful acknowledgement can race cancellation or expiry; settle only after proving no actual invocation remains uncertain.
+    /// Successful acknowledgements can race expiry or host target changes; only proven-safe work can be retired without execution.
     async fn finish_controller_interruption(
         &self,
         execution: &Arc<RunExecution>,
         driver: &ValidationDriverState,
         response: &AgentResponse,
     ) -> Result<Option<TaskRunResult>> {
+        if execution.has_storage_failure() {
+            return Err(AgentError::Persistence(
+                "controller storage acknowledgement requires recovery".into(),
+            ));
+        }
         let snapshot = execution.load_owned().await?;
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
         let reason = if snapshot.cancel_requested {
             Some("cancel_requested")
-        } else if driver
-            .check_deadline
-            .is_some_and(|expiry| chrono::Utc::now() >= expiry)
-        {
+        } else if driver.expired() {
             Some("validation_timeout")
-        } else if execution.check(&payload).is_err() {
-            Some("time_violation")
+        } else if self
+            .agent
+            .autonomy_extensions()
+            .ensure_driver_target(driver)
+            .is_err()
+        {
+            Some("validation_target_changed")
+        } else if let Err(error) = execution.check(&payload) {
+            if matches!(
+                execution.stop_reason().as_deref(),
+                Some("time_violation" | "composition_timeout")
+            ) {
+                Some("time_violation")
+            } else {
+                return Err(error);
+            }
         } else {
             None
         };
@@ -677,6 +704,8 @@ impl AutonomyRunner {
                 execution,
                 if reason == "cancel_requested" {
                     TaskRunStatus::Cancelled
+                } else if reason == "validation_target_changed" {
+                    TaskRunStatus::Incomplete
                 } else {
                     TaskRunStatus::LimitReached
                 },

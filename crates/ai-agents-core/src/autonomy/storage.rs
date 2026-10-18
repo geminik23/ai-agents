@@ -112,6 +112,13 @@ pub struct TaskRunFilter {
     pub limit: Option<usize>,
 }
 
+/// Live bounded admission evaluated inside the backend write boundary, never serialized into a checkpoint.
+/// Implementations must not perform I/O or reenter storage; hosts synchronize external targets separately when stronger atomicity is needed.
+pub trait TaskFinalAdmission: Send + Sync + std::fmt::Debug {
+    /// Rejects stale live evidence before completion is committed.
+    fn validate(&self) -> Result<()>;
+}
+
 /// Mutations are conditional and never constitute authority to invoke external work.
 #[derive(Debug, Clone)]
 pub enum TaskRunMutation {
@@ -135,6 +142,7 @@ pub enum TaskRunMutation {
         release: bool,
         deadline: std::time::Instant,
         expires_at: Option<DateTime<Utc>>,
+        evidence: Option<std::sync::Arc<dyn TaskFinalAdmission>>,
     },
     /// Host control-plane CAS requires authenticated preflight and retains original expiry through backend write admission.
     HostControl {
@@ -166,7 +174,7 @@ pub enum TaskRunMutation {
 }
 
 impl TaskRunMutation {
-    /// Completion and host control cannot pass their original UTC or monotonic admission bound after waiting for a write lock.
+    /// Completion rechecks live evidence and original clocks inside backend admission; host controls retain their original time bounds.
     pub fn validate_final_deadline(&self, now: DateTime<Utc>) -> Result<()> {
         let bounds = match self {
             Self::FinalCheckpoint {
@@ -187,6 +195,14 @@ impl TaskRunMutation {
                 || expiry.is_some_and(|bound| now >= bound)
         }) {
             return Err(TaskRunStorageError::AdmissionExpired.into());
+        }
+        if let Self::FinalCheckpoint {
+            status: TaskRunStatus::Completed,
+            evidence: Some(evidence),
+            ..
+        } = self
+        {
+            evidence.validate()?;
         }
         Ok(())
     }

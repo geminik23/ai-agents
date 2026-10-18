@@ -88,6 +88,10 @@ mod driver_regression_tests;
 mod evaluation_tests;
 mod evidence;
 mod extensions;
+mod host_evidence;
+#[cfg(test)]
+mod host_evidence_tests;
+pub use host_evidence::{ExternalUnavailablePolicy, HostRevisionSource};
 #[cfg(test)]
 mod fallback_acceptance_tests;
 mod gate;

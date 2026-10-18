@@ -43,6 +43,8 @@ pub(crate) struct RunExecution {
     pub(crate) delegate_frames:
         parking_lot::Mutex<std::collections::BTreeMap<String, super::composition::DelegateFrame>>,
     stop: parking_lot::RwLock<Option<String>>,
+    storage_failed: AtomicBool,
+    final_evidence: parking_lot::RwLock<Option<Arc<dyn TaskFinalAdmission>>>,
     lifecycle: parking_lot::RwLock<(AutonomyProfile, LifecycleState)>,
     scope: parking_lot::RwLock<Option<EvaluationScope>>,
     mutation_generation: AtomicU64,
@@ -96,6 +98,8 @@ impl RunExecution {
             parked_executor_cursors: Default::default(),
             delegate_frames: Default::default(),
             stop: parking_lot::RwLock::new(None),
+            storage_failed: AtomicBool::new(false),
+            final_evidence: parking_lot::RwLock::new(None),
             lifecycle: parking_lot::RwLock::new((payload.settings, lifecycle)),
             scope: parking_lot::RwLock::new(None),
             mutation_generation: AtomicU64::new(
@@ -176,6 +180,22 @@ impl RunExecution {
         self.active_millis()?
             .checked_add(self.interrupted_millis)
             .ok_or_else(|| AgentError::Config("recovered active clock overflow".into()))
+    }
+
+    /// Records failure provenance independently of a custom store's error variant or an earlier timeout reason.
+    pub(crate) fn storage_failure(&self) {
+        self.storage_failed.store(true, Ordering::Release);
+        self.stop("storage_failure");
+    }
+
+    /// Ambiguous storage failures forbid normal interruption cleanup and owner release.
+    pub(crate) fn has_storage_failure(&self) -> bool {
+        self.storage_failed.load(Ordering::Acquire)
+    }
+
+    /// Pins the evaluated live evidence for rechecking inside the final backend write admission.
+    pub(crate) fn set_final_evidence(&self, guard: Arc<dyn TaskFinalAdmission>) {
+        *self.final_evidence.write() = Some(guard);
     }
 
     /// Stops admission even if a legacy optional-feature error handler swallows the original error.
@@ -402,8 +422,8 @@ impl RunExecution {
         state.1.allows_tool(&state.0, tool)
     }
 
-    /// All controller, journal and invocation writes share this short CAS boundary.
-    /// Erasure and heap-owned checkpoint decoding keep ledger construction from multiplying nested participant polling stacks.
+    /// Serializes controller and journal writes; new active intervals use acknowledged storage time so wall-clock rollback cannot invalidate them.
+    /// Monotonic active accounting is unchanged; heap-owned decoding bounds nested participant polling stacks.
     pub(crate) fn update<'a>(
         &'a self,
         change: impl FnOnce(&mut TaskCheckpointPayload) -> Result<()> + Send + 'a,
@@ -414,7 +434,11 @@ impl RunExecution {
             let snapshot = self.load_owned_locked(&_serial).await?;
             let mut payload: Box<TaskCheckpointPayload> =
                 serde_json::from_value(snapshot.payload.clone())?;
+            let was_active = payload.clocks.active_interval_started_at.is_some();
             change(&mut payload)?;
+            if !was_active && payload.clocks.active_interval_started_at.is_some() {
+                payload.clocks.active_interval_started_at = Some(snapshot.updated_at);
+            }
             payload.clocks.active_millis = self.active_millis()?;
             self.save(snapshot, payload, TaskRunStatus::Running).await
         })
@@ -440,9 +464,9 @@ impl RunExecution {
             .store
             .load(&self.run_id)
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?
+            .inspect_err(|_| self.storage_failure())?
             .ok_or_else(|| {
-                self.stop("storage_failure");
+                self.storage_failure();
                 AgentError::from(TaskRunStorageError::NotFound)
             })?;
         if snapshot.cancel_requested {
@@ -897,7 +921,8 @@ impl RunExecution {
         self.save(snapshot, payload, status).await
     }
 
-    /// Writes one whole validated successor without holding a database transaction over external work.
+    /// Writes and verifies one exact successor without holding a database transaction over external work.
+    /// A malformed receipt cannot transfer live revision authority or release custody.
     async fn save(
         &self,
         previous: TaskRunSnapshot,
@@ -918,6 +943,7 @@ impl RunExecution {
                 owner_token: self.owner_token.clone(),
                 status,
                 expires_at: payload.clocks.expires_at,
+                evidence: self.final_evidence.read().clone(),
                 payload: serde_json::to_value(payload)?,
                 release: true,
                 deadline: Instant::now()
@@ -929,7 +955,9 @@ impl RunExecution {
             .store
             .mutate(&self.run_id, &mutation)
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?;
+            .inspect_err(|_| self.storage_failure())?;
+        super::store::verify_checkpoint_receipt(&previous, &mutation, &saved)
+            .inspect_err(|_| self.storage_failure())?;
         self.revision.store(saved.revision, Ordering::Release);
         self.acknowledge_snapshot(&saved);
         Ok(saved)

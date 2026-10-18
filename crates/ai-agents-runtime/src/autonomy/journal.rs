@@ -67,7 +67,7 @@ fn observation_reservation_id(state: &ValidationDriverState, id: &str) -> Result
 #[async_trait]
 impl ValidationJournal for TaskValidationJournal {
     /// Checkpoint failure stops before dispatch, while a saved in-flight record remains crash-uncertain.
-    /// Journal writes and owned snapshot reads use the same exact serialization guard without recursive acquisition.
+    /// Journal writes and owned reads share the exact serialization guard; only the requested successor receipt grants publication authority.
     async fn checkpoint(&self, state: &ValidationDriverState) -> Result<()> {
         let _serial = self.serial.lock().await;
         let execution = super::current_execution()
@@ -294,22 +294,30 @@ impl ValidationJournal for TaskValidationJournal {
             payload.consumed_request_ids.push(pending.id.clone());
             payload.pending = None;
         }
+        let mutation = TaskRunMutation::Checkpoint {
+            expected_revision: current.revision,
+            owner_token: self.owner_token.clone(),
+            status: TaskRunStatus::Running,
+            payload: serde_json::to_value(payload)?,
+            release: false,
+        };
+        let mark_failure = |_: &AgentError| {
+            if let Some(execution) = &execution {
+                execution.storage_failure();
+            }
+        };
         let saved = self
             .store
-            .mutate(
-                &self.run_id,
-                &TaskRunMutation::Checkpoint {
-                    expected_revision: current.revision,
-                    owner_token: self.owner_token.clone(),
-                    status: TaskRunStatus::Running,
-                    payload: serde_json::to_value(payload)?,
-                    release: false,
-                },
-            )
-            .await?;
+            .mutate(&self.run_id, &mutation)
+            .await
+            .inspect_err(mark_failure)?;
+        super::store::verify_checkpoint_receipt(&current, &mutation, &saved)
+            .inspect_err(mark_failure)?;
         self.revision.store(saved.revision, Ordering::Release);
         if let Some(execution) = &execution {
             execution.acknowledge_snapshot(&saved);
+            // A cancellation-only revision may commit while the receipt is in transit; expose it before callback admission.
+            execution.load_owned_locked(&_serial).await?;
         }
         Ok(())
     }

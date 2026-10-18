@@ -191,9 +191,12 @@ pub fn validation_judge_provider(
 
 #[async_trait]
 impl ValidationObservationExecutor for RuntimeObservationExecutor {
-    /// Reads the shared mutation generation after managed observations without permitting callbacks to relabel old proof.
+    /// Samples frozen host targets and shared mutation generation without permitting callbacks to relabel old proof.
     fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
         let mut scope = scope.clone();
+        self.agent
+            .autonomy_extensions()
+            .refresh_targets(&mut scope)?;
         if let Some(execution) = super::current_execution() {
             scope.mutation_generation = execution.mutation_generation();
         }

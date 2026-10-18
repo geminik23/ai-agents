@@ -658,6 +658,9 @@ impl AutonomyRunner {
             .agent
             .autonomy_extensions()
             .bind_for_agent(&self.agent, &profile)?;
+        if accepted && !matches!(review.proposal, ControllerProposal::Continue) {
+            bound.extensions.ensure_targets_current(&state.scope)?;
+        }
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let claimed = self.claim_retained(&snapshot, &mut cleanup).await?;
         let mut paused = self
@@ -726,6 +729,14 @@ impl AutonomyRunner {
                     Some((TaskRunStatus::Cancelled, "cancel_requested"))
                 } else if execution.check(&current).is_err() {
                     Some((Self::stopped_status(&execution), "time_violation"))
+                } else if accepted
+                    && !matches!(review.proposal, ControllerProposal::Continue)
+                    && bound
+                        .extensions
+                        .ensure_targets_current(&state.scope)
+                        .is_err()
+                {
+                    Some((TaskRunStatus::Incomplete, "validation_target_changed"))
                 } else if expired_now && !expired {
                     Some((TaskRunStatus::Incomplete, "supervision_timeout"))
                 } else {

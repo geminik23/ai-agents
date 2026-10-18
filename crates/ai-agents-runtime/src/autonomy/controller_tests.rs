@@ -198,6 +198,14 @@ pub(super) struct Fixture {
 }
 // The real registry and executor run with exactly one model slot, so replay cannot accidentally pass.
 pub(super) fn fixture(mode: &'static str) -> Fixture {
+    fixture_configured(mode, |_| {})
+}
+
+// Host evidence fixtures install frozen bindings before any runtime consumer captures the registry.
+pub(super) fn fixture_configured(
+    mode: &'static str,
+    configure: impl FnOnce(&mut AutonomyExtensions),
+) -> Fixture {
     let calls = Arc::new(AtomicUsize::new(0));
     let callbacks = Arc::new(AtomicUsize::new(0));
     let mut extensions = AutonomyExtensions::builtins();
@@ -254,6 +262,7 @@ pub(super) fn fixture(mode: &'static str) -> Fixture {
             })
             .unwrap();
     }
+    configure(&mut extensions);
     let provider = super::runner_tests::RecordingProvider::new(&["done", "ordinary"]);
     let yaml = "name: Observation\nsystem_prompt: test\ntools: [probe, ask_user, mutate, fail_probe]\nerror_recovery:\n  tools:\n    fail_probe:\n      max_retries: 0\n      on_failure:\n        action: fallback\n        fallback_tool: probe\nhitl:\n  tools:\n    probe:\n      require_approval: true\n";
     let yaml = if mode == "fallback_question" {
