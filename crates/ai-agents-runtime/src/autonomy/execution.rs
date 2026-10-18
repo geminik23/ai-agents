@@ -391,6 +391,7 @@ impl RunExecution {
                 target: None,
                 target_revision: None,
                 mutation_generation: scope.mutation_generation,
+                validation_dependencies: Default::default(),
             };
             let mut record = record.clone();
             record
@@ -1033,16 +1034,21 @@ pub(crate) fn current_execution() -> Option<Arc<RunExecution>> {
     RUN_EXECUTION.try_with(Arc::clone).ok()
 }
 
-/// Framework task boundaries must explicitly carry the captured ledger; absence preserves ordinary execution.
+/// Framework task boundaries carry live restrictions and mutation tracking as well as the ledger; none is reconstructed from labels.
 pub(crate) async fn scope_inherited_execution<F: std::future::Future>(
     execution: Option<Arc<RunExecution>>,
+    invocation: super::invocation::InvocationScope,
     future: F,
 ) -> F::Output {
-    if let Some(execution) = execution {
-        scope_execution(execution, future).await
-    } else {
-        future.await
-    }
+    invocation
+        .scope(async {
+            if let Some(execution) = execution {
+                scope_execution(execution, future).await
+            } else {
+                future.await
+            }
+        })
+        .await
 }
 
 /// Installs the same ledger for the controller, tool executor and every frozen provider consumer.

@@ -1351,6 +1351,7 @@ impl AutonomyRunner {
             target_generations: BTreeMap::new(),
             validation_bindings: BTreeMap::new(),
             validation_attempts: BTreeMap::new(),
+            validation_dependencies: BTreeMap::new(),
         };
         bound.capture_targets(&mut preflight_scope)?;
         let run_id = uuid::Uuid::new_v4().to_string();
@@ -1548,6 +1549,7 @@ impl AutonomyRunner {
                 target_generations: BTreeMap::new(),
                 validation_bindings: BTreeMap::new(),
                 validation_attempts: BTreeMap::new(),
+                validation_dependencies: BTreeMap::new(),
             };
             if let Some(controller) = controller {
                 scope = serde_json::from_value(controller.state["scope"].clone())?;
@@ -2254,14 +2256,13 @@ impl AutonomyRunner {
                 identity.target_revision = scope.target_revisions.get(target).cloned();
             }
             let mut driver = Box::new(if let Some(driver) = resumed {
-                let mut restored = ValidationDriverState::restore(
+                ValidationDriverState::restore_retained(
                     serde_json::to_value(&driver)?,
+                    &driver,
                     check,
                     scope,
                     &bound.extensions,
-                )?;
-                restored.retain_deadline_from(&driver);
-                restored
+                )?
             } else {
                 ValidationDriverState::new(check, identity)?
             });
@@ -2393,6 +2394,7 @@ impl AutonomyRunner {
             target: None,
             target_revision: None,
             mutation_generation: scope.mutation_generation,
+            validation_dependencies: BTreeMap::new(),
         }
     }
 

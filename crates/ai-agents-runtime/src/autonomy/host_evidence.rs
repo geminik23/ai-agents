@@ -153,6 +153,68 @@ impl FrozenAutonomyExtensions {
     }
 }
 
+/// A live sample guard uses only the actual frozen source objects selected by the current check and its upstream proofs.
+struct ObservationEvidenceAdmission {
+    targets: Vec<(HostTarget, String)>,
+}
+impl std::fmt::Debug for ObservationEvidenceAdmission {
+    // Source objects and opaque revisions never cross a display boundary.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObservationEvidenceAdmission")
+            .field("targets", &self.targets.len())
+            .finish()
+    }
+}
+impl TaskFinalAdmission for ObservationEvidenceAdmission {
+    /// Samples pinned sources at the actual tool/provider boundary after policy, locks and storage acknowledgement.
+    fn validate(&self) -> Result<()> {
+        for (target, expected) in &self.targets {
+            if target.source.revision()? != *expected {
+                return Err(AgentError::Config(
+                    "validation input host proof changed before invocation".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+impl FrozenAutonomyExtensions {
+    /// Preserves exact check/source bindings without sampling unrelated profile targets or reconstructing authority from IDs.
+    pub(crate) fn observation_admission(
+        &self,
+        identities: &[(String, EvidenceIdentity)],
+    ) -> Result<Arc<dyn TaskFinalAdmission>> {
+        let mut targets = BTreeMap::new();
+        for (check, identity) in identities {
+            if let Some(target) = &identity.target {
+                let binding = self
+                    .validation_targets
+                    .get(check)
+                    .filter(|binding| binding.target == *target)
+                    .ok_or_else(|| {
+                        AgentError::Config("validation proof target binding changed".into())
+                    })?;
+                let revision = identity.target_revision.as_ref().ok_or_else(|| {
+                    AgentError::Config("validation proof revision missing".into())
+                })?;
+                if targets
+                    .get(target)
+                    .is_some_and(|(_, old): &(HostTarget, String)| old != revision)
+                {
+                    return Err(AgentError::Config(
+                        "conflicting validation proof revisions".into(),
+                    ));
+                }
+                targets.insert(target.clone(), (binding.clone(), revision.clone()));
+            }
+        }
+        Ok(Arc::new(ObservationEvidenceAdmission {
+            targets: targets.into_values().collect(),
+        }))
+    }
+}
+
 /// Retains evaluated targets through asynchronous finalization; backends sample them inside completion admission.
 pub(crate) struct HostEvidenceAdmission {
     pub extensions: Arc<FrozenAutonomyExtensions>,

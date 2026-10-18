@@ -2,6 +2,10 @@
 
 use std::str::FromStr;
 
+#[cfg(test)]
+#[path = "sqlite_cancel_tests.rs"]
+mod cancellation_tests;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -95,6 +99,7 @@ impl SqliteStorage {
         self.pool.close().await;
     }
 
+    /// Returns connections only after cancelled custom transaction initialization has relinquished its write lock.
     async fn connect(path: &str) -> Result<sqlx::SqlitePool> {
         // Ensure parent directories exist -- SQLite's create_if_missing only creates the file.
         if path != ":memory:"
@@ -115,9 +120,25 @@ impl SqliteStorage {
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
 
-        sqlx::SqlitePool::connect_with(options)
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .after_release(|connection, _| {
+                Box::pin(Self::rollback_cancelled_initialization(connection))
+            })
+            .connect_with(options)
             .await
             .map_err(|e| AgentError::Persistence(e.to_string()))
+    }
+
+    // SQLx custom BEGIN may be acknowledged before its Transaction guard exists; cancellation must not leak that writer into the pool.
+    // Backend rollback repairs only the connection, never invocation receipts, effect certainty or retained task ownership.
+    async fn rollback_cancelled_initialization(
+        connection: &mut sqlx::SqliteConnection,
+    ) -> std::result::Result<bool, sqlx::Error> {
+        use sqlx::{TransactionManager, sqlite::SqliteTransactionManager};
+        while SqliteTransactionManager::get_transaction_depth(connection) > 0 {
+            SqliteTransactionManager::rollback(connection).await?;
+        }
+        Ok(true)
     }
 
     async fn run_migrations(&self) -> Result<()> {

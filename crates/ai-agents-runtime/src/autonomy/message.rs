@@ -314,6 +314,7 @@ pub(crate) fn settle_cancelled_messages(payload: &mut TaskCheckpointPayload) -> 
                 target: None,
                 target_revision: None,
                 mutation_generation: scope.mutation_generation,
+                validation_dependencies: Default::default(),
             }),
         );
         if !payload.evidence.tool_calls.iter().any(|capture| {

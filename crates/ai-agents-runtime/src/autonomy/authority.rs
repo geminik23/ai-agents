@@ -191,7 +191,7 @@ pub fn validation_judge_provider(
 
 #[async_trait]
 impl ValidationObservationExecutor for RuntimeObservationExecutor {
-    /// Samples frozen host targets and shared mutation generation without permitting callbacks to relabel old proof.
+    /// Samples frozen targets and the authoritative run or independent-tree generation without letting callbacks relabel old proof.
     fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
         let mut scope = scope.clone();
         self.agent
@@ -199,6 +199,15 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
             .refresh_targets(&mut scope)?;
         if let Some(execution) = super::current_execution() {
             scope.mutation_generation = execution.mutation_generation();
+        } else {
+            let clock = super::invocation::current_mutation_clock()
+                .unwrap_or_else(|| self.agent.observation_mutation_clock());
+            scope.mutation_generation = clock.load(std::sync::atomic::Ordering::Acquire);
+            if scope.mutation_generation == u64::MAX {
+                return Err(AgentError::Config(
+                    "observation mutation generation exhausted".into(),
+                ));
+            }
         }
         Ok(scope)
     }
@@ -298,7 +307,8 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
         Ok(Some(parked))
     }
 
-    /// Managed calls preserve identity, policy, approval, locks and exact execution records; run-wide admission is owned by the enclosing controller.
+    /// Managed observations retain shared policy and live tree-wide mutation tracking, including independent SDK execution and resumed children.
+    /// Original check restrictions are inherited from the driver; run-wide admission remains owned by the enclosing controller.
     async fn execute(
         &self,
         request: &ValidationObservationRequest,
@@ -309,6 +319,7 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                 "validation runtime identity mismatch".into(),
             ));
         }
+        super::invocation::InvocationScope::observation(self.agent.observation_mutation_clock()).scope(Box::pin(async {
         match request {
             ValidationObservationRequest::Plan { objective, .. } => {
                 let plan = self.agent.generate_plan(objective).await?;
@@ -410,6 +421,7 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                 })
             }
         }
+        })).await
     }
 }
 

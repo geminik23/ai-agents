@@ -310,8 +310,9 @@ async fn driver_retries_publication_and_never_collects_unacknowledged_result() {
         if mode == "complete" {
             evidence.collect_validation(&state).unwrap();
         } else {
-            let mut restored = ValidationDriverState::restore(
+            let mut restored = ValidationDriverState::restore_retained(
                 serde_json::to_value(&state).unwrap(),
+                &state,
                 check,
                 &s,
                 &bound.extensions,
@@ -472,8 +473,14 @@ async fn driver_restores_batch_cursor_and_enforces_configured_batch_limit() {
         } else {
             assert_eq!(exec.calls.load(Ordering::SeqCst), 1);
             let partial = journal.partial.lock().unwrap().clone().unwrap();
-            let mut restored =
-                ValidationDriverState::restore(partial, check, &s, &bound.extensions).unwrap();
+            let mut restored = ValidationDriverState::restore_retained(
+                partial,
+                &state,
+                check,
+                &s,
+                &bound.extensions,
+            )
+            .unwrap();
             let safe = Journal::default();
             let ctx = ValidationDriveContext {
                 journal: &safe,

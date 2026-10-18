@@ -6,6 +6,7 @@ mod authority;
 mod boundary;
 pub(crate) mod composition;
 mod execution;
+pub(crate) mod invocation;
 mod memory;
 pub(crate) mod message;
 mod participants;
@@ -91,6 +92,10 @@ mod extensions;
 mod host_evidence;
 #[cfg(test)]
 mod host_evidence_tests;
+#[cfg(test)]
+mod retained_admission_tests;
+#[cfg(test)]
+mod retained_proof_tests;
 pub use host_evidence::{ExternalUnavailablePolicy, HostRevisionSource};
 #[cfg(test)]
 mod fallback_acceptance_tests;

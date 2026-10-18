@@ -356,7 +356,7 @@ async fn captured_admission_crosses_spawn_and_join_set_boundaries() {
     let captured = execution.clone();
     let participant = provider.clone();
     tokio::spawn(async move {
-        scope_inherited_execution(Some(captured.clone()), async move {
+        scope_inherited_execution(Some(captured.clone()), Default::default(), async move {
             assert!(Arc::ptr_eq(&captured, &current_execution().unwrap()));
             participant
                 .complete(&[ChatMessage::user("first")], None)
@@ -370,7 +370,7 @@ async fn captured_admission_crosses_spawn_and_join_set_boundaries() {
     let mut tasks = tokio::task::JoinSet::new();
     let captured = execution.clone();
     tasks.spawn(async move {
-        scope_inherited_execution(Some(captured.clone()), async move {
+        scope_inherited_execution(Some(captured.clone()), Default::default(), async move {
             assert!(Arc::ptr_eq(&captured, &current_execution().unwrap()));
             provider
                 .complete(&[ChatMessage::user("second")], None)

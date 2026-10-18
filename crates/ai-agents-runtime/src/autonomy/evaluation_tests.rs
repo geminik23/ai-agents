@@ -32,6 +32,7 @@ pub(super) fn scope() -> EvaluationScope {
         target_generations: BTreeMap::new(),
         validation_bindings: BTreeMap::from([("check".into(), "binding".into())]),
         validation_attempts: BTreeMap::from([("check".into(), "attempt".into())]),
+        validation_dependencies: BTreeMap::new(),
     }
 }
 // Every observed value carries its own immutable scope and event identity.
@@ -47,6 +48,7 @@ pub(super) fn identity(scope: &EvaluationScope) -> EvidenceIdentity {
         target: None,
         target_revision: None,
         mutation_generation: scope.mutation_generation,
+        validation_dependencies: BTreeMap::new(),
     }
 }
 // Shared-record fixtures model final execution evidence, including negative policy and partial-output flags.
@@ -323,6 +325,7 @@ fn progress_retains_high_water_and_bounded_fingerprints() {
         signals: BTreeMap::from([("value".into(), value)]),
         comparisons: BTreeMap::from([("value".into(), comparison)]),
         evidence_refs: vec!["current:1".into()],
+        validation_dependencies: BTreeMap::new(),
     };
     assert_eq!(
         state
@@ -662,8 +665,14 @@ async fn validation_driver_binds_cached_requests_and_external_signals() {
                 ValidationDriverOutcome::Complete(_)
             ));
             let value = serde_json::to_value(&driver).unwrap();
-            let mut restored =
-                ValidationDriverState::restore(value, check, &s, &bound.extensions).unwrap();
+            let mut restored = ValidationDriverState::restore_retained(
+                value,
+                &driver,
+                check,
+                &s,
+                &bound.extensions,
+            )
+            .unwrap();
             restored.drive(check, &ctx).await.unwrap();
             assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         } else {

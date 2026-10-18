@@ -53,6 +53,7 @@ impl ProgressAdapter for Declared {
             signals: BTreeMap::new(),
             comparisons: BTreeMap::new(),
             evidence_refs: vec![],
+            validation_dependencies: BTreeMap::new(),
         })
     }
 }

@@ -226,7 +226,9 @@ async fn journal_contract(storage: Arc<dyn ai_agents_core::AgentStorage>) {
         .unwrap()
         .state["_task_validation_driver"]
         .clone();
-    let mut restored = ValidationDriverState::restore(value, check, &s, &bound.extensions).unwrap();
+    let mut restored =
+        ValidationDriverState::restore_retained(value, &driver, check, &s, &bound.extensions)
+            .unwrap();
     restored.drive(check, &ctx).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let mut stale = ValidationDriverState::new(check, restored.identity.clone()).unwrap();

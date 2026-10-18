@@ -593,7 +593,7 @@ impl AgentRegistry {
             .await
     }
 
-    /// Captures ancestry, shared admission and required/optional failure policy before spawning recipients.
+    /// Captures ancestry, shared admission, original invocation restrictions and mutation tracking before spawning recipients.
     /// Losing task-locals at a broadcast boundary must not turn an optional nested dependency into a global required-child stop.
     async fn broadcast_inner(
         &self,
@@ -638,11 +638,13 @@ impl AgentRegistry {
             let observation_context = observation_context.clone();
             let gate_identity_stack = Arc::clone(&gate_identity_stack);
             let execution = crate::autonomy::current_execution();
+            let invocation = crate::autonomy::invocation::InvocationScope::capture();
             handles.push(tokio::spawn(Box::pin(async move {
                 crate::autonomy::scope_child_requirement(
                     required,
                     crate::autonomy::scope_inherited_execution(
                         execution,
+                        invocation,
                         Box::pin(scope_runtime_gate_identity_stack(
                             &gate_identity_stack,
                             async move {

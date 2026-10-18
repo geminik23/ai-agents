@@ -15,6 +15,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust validation compatibility: development evidence/scope/progress literals add validation dependency maps; executable driver round trips use `restore_retained` with a live predecessor, while JSON-only restore remains audit-only
 - Rust task evidence compatibility: development final-checkpoint literals add a live evidence guard that custom stores must preserve at backend admission; validation drivers retain private monotonic bounds and use constructors rather than external struct literals
 - Rust task host-control compatibility: development response/pending matches add `Continue`/`HostContinue`; stores gain certified no-write claim outcomes and opt-in objective control, and private checkpoints retain review and plan-adoption data without an executable migration promise
 - Rust task checkpoint compatibility: development payloads add multi-call coordination, script/action/controller and non-tool interaction locations, observation child groups, fallback ancestry and deferred finalization; older runtimes are not guaranteed to decode them, and unchanged envelope versions do not promise executable restart
@@ -24,6 +25,10 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task proof eligibility: unavailable or stale metrics cannot prove absence or progress; derived validator and progress results retain exact upstream proof freshness across multiple host targets
+- Task invocation admission: preserve original validation bounds and pinned host proof through tool/provider admission, child tasks and returned streams without refunding already dispatched work
+- SQLite task cancellation: roll back orphaned transaction initialization before connection reuse so interrupted admission or refund cannot retain a write lock in the pool
+- Independent validation: production SDK observations track actual nested and interrupted mutations, while retained restoration preserves the original live monotonic bound without enabling restart
 - Task validation publication: recheck original deadlines, frozen target bindings and cached-result freshness after persistence waits, including reviewed stage credit and backend completion admission
 - Task acknowledgement safety: reject inconsistent checkpoint receipts and retain runtime custody for ambiguous storage errors regardless of error variant
 - Task checkpoint identity: preserve finite JSON numbers exactly across serialization so timing metadata and validation metrics do not spuriously invalidate retained checkpoints

@@ -119,8 +119,9 @@ impl EvaluationEvidence {
 }
 
 impl ProgressObservation {
-    /// Unknown or absent signals are not promoted into a known empty metrics object for negated gates.
-    pub fn scoped(&self, identity: EvidenceIdentity) -> ScopedObservation<Value> {
+    /// Unknown signals remain incomplete, and upstream proof links survive conversion to progress-dependent gate input.
+    pub fn scoped(&self, mut identity: EvidenceIdentity) -> ScopedObservation<Value> {
+        identity.validation_dependencies = self.validation_dependencies.clone();
         ScopedObservation {
             identity,
             complete: !self.signals.is_empty() && !self.evidence_refs.is_empty(),

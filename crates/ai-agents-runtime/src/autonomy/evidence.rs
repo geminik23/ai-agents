@@ -20,6 +20,8 @@ pub struct EvaluationScope {
     pub target_generations: BTreeMap<String, u64>,
     pub validation_bindings: BTreeMap<String, String>,
     pub validation_attempts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub validation_dependencies: BTreeMap<String, Vec<String>>,
 }
 
 /// Freshness includes configuration and target identity, not a timestamp heuristic.
@@ -36,6 +38,9 @@ pub struct EvidenceIdentity {
     pub target: Option<String>,
     pub target_revision: Option<String>,
     pub mutation_generation: u64,
+    /// Exact upstream result fingerprints are proof dependencies, never execution authority.
+    #[serde(default)]
+    pub validation_dependencies: BTreeMap<String, String>,
 }
 
 impl EvidenceIdentity {
@@ -95,6 +100,15 @@ pub struct ValidationResult {
     pub reason: String,
     pub metrics: Value,
     pub evidence_refs: Vec<String>,
+}
+
+impl ValidationResult {
+    /// Fingerprints bounded canonical result data, including transitive dependency links, without duplicating upstream payloads.
+    pub fn proof_identity(&self) -> ai_agents_core::Result<String> {
+        use sha2::{Digest, Sha256};
+        let canonical = super::canonical_identity(&serde_json::to_value(self)?)?;
+        Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+    }
 }
 
 /// Command outputs and diagnostics are derived from exact shared-executor records.

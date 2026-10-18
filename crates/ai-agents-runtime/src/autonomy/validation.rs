@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+#[path = "validation_clock_tests.rs"]
+mod clock_tests;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ValidationObservationRequest {
@@ -146,6 +150,19 @@ pub struct ValidationDriverState {
     pub result_identity: Option<String>,
     #[serde(default)]
     pub publication_scope: Option<EvaluationScope>,
+    #[serde(default)]
+    input_dependencies: Option<BTreeMap<String, String>>,
+    #[serde(skip)]
+    retained: Option<std::sync::Arc<RetainedValidation>>,
+}
+
+/// Live attempt bounds cannot be reconstructed or extended by deserializing a checkpoint.
+#[derive(Debug)]
+struct RetainedValidation {
+    identity: EvidenceIdentity,
+    binding_identity: String,
+    deadline: Option<chrono::DateTime<chrono::Utc>>,
+    projection: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -252,7 +269,7 @@ impl ValidationDriverState {
                 "validation attempt identity mismatch".into(),
             ));
         }
-        Ok(Self {
+        let mut state = Self {
             version: 1,
             binding_identity: canonical_identity(&serde_json::to_value(&binding.check)?)?,
             check_deadline: binding
@@ -293,9 +310,18 @@ impl ValidationDriverState {
             result: None,
             result_identity: None,
             publication_scope: None,
-        })
+            input_dependencies: None,
+            retained: None,
+        };
+        state.retained = Some(std::sync::Arc::new(RetainedValidation {
+            identity: state.identity.clone(),
+            binding_identity: state.binding_identity.clone(),
+            deadline: state.check_deadline,
+            projection: state.check_projection,
+        }));
+        Ok(state)
     }
-    /// Restore rejects changed requests, adapters, outcomes and uncertain dispatched work before callback reentry.
+    /// Decodes and validates audit data only; executable same-process continuation requires `restore_retained` and a live predecessor.
     pub fn restore(
         value: Value,
         binding: &BoundValidationCheck,
@@ -316,12 +342,40 @@ impl ValidationDriverState {
         }
         Ok(state)
     }
-    /// Preserves the earlier monotonic check bound when a retained live cursor passes through serialized validation.
-    pub(crate) fn retain_deadline_from(&mut self, retained: &Self) {
-        self.check_projection = match (self.check_projection, retained.check_projection) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+    /// Restores exactly one live checkpoint without granting restart, rewinding work or extending its original monotonic bound.
+    pub fn restore_retained(
+        value: Value,
+        predecessor: &Self,
+        binding: &BoundValidationCheck,
+        scope: &EvaluationScope,
+        extensions: &FrozenAutonomyExtensions,
+    ) -> Result<Self> {
+        predecessor.check_retained()?;
+        if value != serde_json::to_value(predecessor)? {
+            return Err(AgentError::Config(
+                "retained validation checkpoint differs from live predecessor".into(),
+            ));
+        }
+        let mut state = Self::restore(value, binding, scope, extensions)?;
+        state.retained = predecessor.retained.clone();
+        state.check_projection = predecessor.check_projection;
+        Ok(state)
+    }
+
+    // Public mutable checkpoint fields cannot mint a fresh lifetime or change a retained attempt's binding.
+    fn check_retained(&self) -> Result<()> {
+        let retained = self.retained.as_ref().ok_or_else(|| AgentError::Config(
+            "validation execution requires a live predecessor; serialized restore is audit-only".into()))?;
+        if retained.identity != self.identity
+            || retained.binding_identity != self.binding_identity
+            || retained.deadline != self.check_deadline
+            || retained.projection != self.check_projection
+        {
+            return Err(AgentError::Config(
+                "retained validation identity or original deadline changed".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Checks original time bounds after awaited persistence; a successful receipt does not extend callback admission.
@@ -367,6 +421,7 @@ impl ValidationDriverState {
             || current.stage != context.scope.stage
             || current.validation_bindings != context.scope.validation_bindings
             || current.validation_attempts != context.scope.validation_attempts
+            || current.validation_dependencies != context.scope.validation_dependencies
             || current.mutation_generation < context.scope.mutation_generation
             || !self.identity.eligible(&current, false, false)
         {
@@ -580,6 +635,8 @@ impl ValidationDriverState {
             }
             publication_identity.mutation_generation = publication.mutation_generation;
         }
+        publication_identity.validation_dependencies =
+            self.input_dependencies.clone().unwrap_or_default();
         if let Some(result) = &self.result
             && (result.identity != publication_identity
                 || result.check_id != self.check_id
@@ -636,7 +693,55 @@ impl ValidationDriverState {
         Ok(())
     }
 
-    // Finishes a persisted observation batch before callback reentry; in-flight work is never automatically replayed.
+    // Pinned proof must survive every effect admission, not merely the later callback or result publication.
+    fn check_input_dependencies(
+        &self,
+        context: &ValidationDriveContext<'_>,
+        scope: &EvaluationScope,
+    ) -> Result<()> {
+        if let Some(dependencies) = &self.input_dependencies {
+            let mut identity = self.identity.clone();
+            identity.validation_dependencies = dependencies.clone();
+            if !validation_dependencies_current(&identity, &context.evidence.validations, scope) {
+                return Err(AgentError::Config(
+                    "validation input proof is no longer eligible".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // Retain actual source objects for all transitive proof targets through the executor's own admission waits.
+    fn observation_admission(
+        &self,
+        context: &ValidationDriveContext<'_>,
+        scope: &EvaluationScope,
+    ) -> Result<std::sync::Arc<dyn TaskFinalAdmission>> {
+        let mut identities = vec![(self.check_id.clone(), self.identity.clone())];
+        let mut pending: Vec<_> = self
+            .input_dependencies
+            .iter()
+            .flat_map(|inputs| inputs.keys().cloned())
+            .collect();
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if seen.len() > 256 {
+                return Err(AgentError::Config(
+                    "validation proof dependency bound exceeded".into(),
+                ));
+            }
+            let result = latest_validation(&context.evidence.validations, &id, scope)
+                .ok_or_else(|| AgentError::Config("validation input proof unavailable".into()))?;
+            pending.extend(result.identity.validation_dependencies.keys().cloned());
+            identities.push((id, result.identity.clone()));
+        }
+        context.extensions.observation_admission(&identities)
+    }
+
+    // Finishes a persisted observation batch under the original proof and clocks; in-flight work is never automatically replayed.
     async fn execute_pending(
         &mut self,
         binding: &BoundValidationCheck,
@@ -650,7 +755,8 @@ impl ValidationDriverState {
                 ));
             }
             self.check_live(context, deadline)?;
-            self.capture_publication(context)?;
+            let publication = self.capture_publication(context)?;
+            self.check_input_dependencies(context, &publication)?;
             context
                 .executor
                 .preflight(&self.requests[&id], &self.identity)?;
@@ -665,13 +771,30 @@ impl ValidationDriverState {
                 ));
             }
             self.check_live(context, deadline)?;
-            self.capture_publication(context)?;
+            let publication = self.capture_publication(context)?;
+            self.check_input_dependencies(context, &publication)?;
             let request = self.requests[&id].clone();
             let before = match &resumed {
                 Some(parked) => parked.before.clone(),
                 None => context.executor.capture_scope(context.scope)?,
             };
-            let mut future = Box::pin(context.executor.execute(&request, &self.identity));
+            let projected = std::time::Instant::now()
+                .checked_add((deadline - chrono::Utc::now()).to_std().unwrap_or_default())
+                .ok_or_else(|| {
+                    AgentError::Config("validation invocation deadline overflow".into())
+                })?;
+            let projected = self
+                .check_projection
+                .map_or(projected, |check| check.min(projected));
+            let bounds = ai_agents_llm::InvocationBounds::new(deadline.into(), projected);
+            let guard = self.observation_admission(context, &publication)?;
+            let mut future = Box::pin(ai_agents_llm::scope_invocation_evidence(
+                vec![guard],
+                ai_agents_llm::scope_invocation_bounds(
+                    Some(bounds),
+                    context.executor.execute(&request, &self.identity),
+                ),
+            ));
             let result = loop {
                 tokio::select! { result = &mut future => break result, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
                     if context.cancellation.is_cancelled() || self.expired() || chrono::Utc::now() >= deadline { return Err(AgentError::Other("validation interrupted with uncertain effect".into())); }
@@ -718,6 +841,7 @@ impl ValidationDriverState {
                 .checked_add(self.completed.len() as u64)
                 .ok_or_else(|| AgentError::Config("observation sequence overflow".into()))?;
             observed.mutation_generation = before.mutation_generation;
+            observed.validation_dependencies = self.input_dependencies.clone().unwrap_or_default();
             if matches!(&result, ObservationResult::Tool { record } if record.executed
                 && record.metadata.get("classification").and_then(|value| value.get("read_only")).and_then(Value::as_bool) == Some(false))
             {
@@ -841,6 +965,7 @@ impl ValidationDriverState {
         context: &ValidationDriveContext<'_>,
     ) -> Result<ValidationDriverOutcome> {
         self.publication_identity = None;
+        self.check_retained()?;
         let ValidationDriveContext {
             scope,
             evidence,
@@ -883,7 +1008,13 @@ impl ValidationDriverState {
                 self.check_live(context, deadline)?;
                 let current = self.capture_publication(context)?;
                 let result = self.result.as_ref().unwrap();
-                if !result.identity.eligible(&current, false, true) {
+                if !result.identity.eligible(&current, false, true)
+                    || !validation_dependencies_current(
+                        &result.identity,
+                        &evidence.validations,
+                        &current,
+                    )
+                {
                     self.publication_identity = None;
                     return Err(AgentError::Config(
                         "cached validation evidence is stale".into(),
@@ -914,10 +1045,32 @@ impl ValidationDriverState {
             let publication = self.capture_publication(context)?;
             self.publication_scope = Some(publication.clone());
             let config = binding.check.config.clone().unwrap_or_else(|| json!({}));
-            let decision = if !binding.available {
+            // Declared inputs are pinned once per attempt; callback reentry cannot adopt replacement proof under an old attempt.
+            let dependencies: Option<BTreeMap<_, _>> = binding
+                .dependencies()
+                .into_iter()
+                .map(|id| {
+                    latest_validation(&evidence.validations, &id, &publication)
+                        .filter(|r| r.outcome != GateOutcome::Unknown)
+                        .and_then(|r| r.proof_identity().ok())
+                        .map(|proof| (id, proof))
+                })
+                .collect();
+            if self.input_dependencies.is_some() && self.input_dependencies != dependencies {
+                return Err(AgentError::Config(
+                    "validation input proof changed within attempt".into(),
+                ));
+            }
+            self.input_dependencies = dependencies.clone();
+            let decision = if !binding.available || dependencies.is_none() {
                 ValidationDecision::Complete {
                     outcome: GateOutcome::Unknown,
-                    reason: "optional_capability_unavailable".into(),
+                    reason: if !binding.available {
+                        "optional_capability_unavailable"
+                    } else {
+                        "input_evidence_unavailable"
+                    }
+                    .into(),
                     metrics: json!({}),
                     evidence_refs: vec![],
                 }
@@ -950,6 +1103,8 @@ impl ValidationDriverState {
                     });
                     let mut identity = self.identity.clone();
                     identity.mutation_generation = publication.mutation_generation;
+                    identity.validation_dependencies =
+                        self.input_dependencies.clone().unwrap_or_default();
                     let result = ValidationResult {
                         check_id: self.check_id.clone(),
                         identity,
@@ -968,7 +1123,13 @@ impl ValidationDriverState {
                     self.acknowledge(journal).await?;
                     self.check_live(context, deadline)?;
                     let current = self.capture_publication(context)?;
-                    if !result.identity.eligible(&current, false, true) {
+                    if !result.identity.eligible(&current, false, true)
+                        || !validation_dependencies_current(
+                            &result.identity,
+                            &evidence.validations,
+                            &current,
+                        )
+                    {
                         self.publication_identity = None;
                         return Err(AgentError::Config(
                             "validation evidence changed during publication".into(),

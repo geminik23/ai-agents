@@ -189,8 +189,9 @@ async fn contract(storage: Arc<dyn ai_agents_core::AgentStorage>) {
         journal
             .revision_handle()
             .store(saved.revision, Ordering::SeqCst);
-        driver = ValidationDriverState::restore(
+        driver = ValidationDriverState::restore_retained(
             serde_json::to_value(&driver).unwrap(),
+            &driver,
             check,
             &scope,
             &bound.extensions,

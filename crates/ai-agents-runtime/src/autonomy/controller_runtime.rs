@@ -166,13 +166,13 @@ impl AutonomyRunner {
                 .iter()
                 .find(|check| check.check.id == driver.check_id)
                 .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            let mut restored = ValidationDriverState::restore(
+            let mut restored = ValidationDriverState::restore_retained(
                 serde_json::to_value(driver)?,
+                driver,
                 check,
                 &state.scope,
                 &bound.extensions,
             )?;
-            restored.retain_deadline_from(driver);
             bound.extensions.ensure_targets_current(&state.scope)?;
             let pending = payload
                 .pending

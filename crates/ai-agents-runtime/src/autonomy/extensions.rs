@@ -132,6 +132,24 @@ pub struct BoundValidationCheck {
     pub config_identity: String,
 }
 
+impl BoundValidationCheck {
+    /// Resolves frozen declared inputs, including the built-in's configuration-selected upstream check.
+    pub fn dependencies(&self) -> Vec<String> {
+        let mut ids: BTreeSet<_> = self.adapter.descriptor().checks.iter().cloned().collect();
+        if self.check.adapter == "builtin.evidence"
+            && let Some(id) = self
+                .check
+                .config
+                .as_ref()
+                .and_then(|c| c.get("validator"))
+                .and_then(Value::as_str)
+        {
+            ids.insert(id.into());
+        }
+        ids.into_iter().collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct BoundAutonomyProfile {
     pub checks: Vec<BoundValidationCheck>,
@@ -229,6 +247,11 @@ impl BoundAutonomyProfile {
             .iter()
             .map(|c| (c.check.id.clone(), c.config_identity.clone()))
             .collect();
+        scope.validation_dependencies = self
+            .checks
+            .iter()
+            .map(|check| (check.check.id.clone(), check.dependencies()))
+            .collect();
     }
     /// Progress observes only eligible captures and prior validation, never current progress-dependent gate output.
     pub fn observe_progress(
@@ -238,7 +261,7 @@ impl BoundAutonomyProfile {
     ) -> Result<ProgressObservation> {
         let evidence = evidence.normalized()?;
         let stripped = progress_evidence(&evidence, scope);
-        let observation = self.progress.observe(&ProgressInput {
+        let mut observation = self.progress.observe(&ProgressInput {
             scope,
             evidence: &stripped,
             config: &self.progress_config,
@@ -251,15 +274,33 @@ impl BoundAutonomyProfile {
         {
             eligible.insert(format!("current:{}", current.identity.sequence));
         }
+        // Proof links come from frozen input and verified references, not callback-supplied fingerprints.
+        observation.validation_dependencies.clear();
         for check in &self.checks {
             if let Some(result) =
                 super::latest_validation(&evidence.validations, &check.check.id, scope)
+                && result.outcome != super::GateOutcome::Unknown
             {
-                eligible.insert(format!(
-                    "check:{}:{}",
-                    check.check.id, result.identity.sequence
-                ));
+                let reference = format!("check:{}:{}", check.check.id, result.identity.sequence);
+                if observation.evidence_refs.contains(&reference)
+                    || self.progress.descriptor().checks.contains(&check.check.id)
+                {
+                    observation
+                        .validation_dependencies
+                        .insert(check.check.id.clone(), result.proof_identity()?);
+                }
+                eligible.insert(reference);
             }
+        }
+        if !observation.signals.is_empty()
+            && self
+                .progress
+                .descriptor()
+                .checks
+                .iter()
+                .any(|id| !observation.validation_dependencies.contains_key(id))
+        {
+            return Err(AgentError::Config("progress dependency unavailable".into()));
         }
         if (!observation.signals.is_empty() && observation.evidence_refs.is_empty())
             || observation

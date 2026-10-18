@@ -745,6 +745,8 @@ pub struct RuntimeAgent {
     background_maintenance: Arc<BackgroundMaintenanceQueue>,
     /// Cross-tool locks for side-effecting calls that target the same resource.
     resource_locks: ToolResourceLocks,
+    /// Live mutation clock for independent production observations, including ordinary calls on this runtime.
+    observation_mutations: Arc<AtomicU64>,
     /// Host-only runtime control state.
     runtime_control: Arc<RuntimeControlState>,
     /// Serializes independent externally initiated root turns across blocking and streaming APIs.
@@ -1012,6 +1014,7 @@ impl RuntimeAgent {
             runtime_config: RuntimeConfig::default(),
             background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
             resource_locks: new_tool_resource_locks(),
+            observation_mutations: Arc::new(AtomicU64::new(0)),
             runtime_control: Arc::new(RuntimeControlState::default()),
             root_turn_gate,
             autonomy_owner: Arc::new(RwLock::new(None)),
@@ -1052,6 +1055,11 @@ impl RuntimeAgent {
     /// Capability presence does not authorize a call; host-bound calls retain the complete shared execution path.
     pub(crate) fn validation_operation_available(&self, tool: &str) -> bool {
         self.tools.resolve(tool).is_some() && self.host_tool_unavailability(tool).is_none()
+    }
+
+    /// Retains mutation freshness across independent SDK driver round trips without constructing a task ledger.
+    pub(crate) fn observation_mutation_clock(&self) -> Arc<AtomicU64> {
+        self.observation_mutations.clone()
     }
 
     /// Provides frozen adapters for selected-profile preflight without replacing live bindings.
@@ -3382,7 +3390,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Performs the single rate admission after locks are held and rejects changed runtime, policy, or state authority.
+    /// Performs lock-held rate admission only while original observation bounds, pinned proof and runtime/policy/state authority remain valid.
     fn admit_tool_execution(
         &self,
         expected_runtime_version: u64,
@@ -3417,6 +3425,18 @@ impl RuntimeAgent {
         if current_state_generation != expected_state_generation {
             return SecurityCheckResult::Block {
                 reason: "state scope changed before admission".to_string(),
+            };
+        }
+        if ai_agents_llm::current_invocation_bounds()
+            .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return SecurityCheckResult::Block {
+                reason: "validation deadline expired before rate admission".into(),
+            };
+        }
+        if ai_agents_llm::validate_invocation_evidence().is_err() {
+            return SecurityCheckResult::Block {
+                reason: "validation input proof changed before rate admission".into(),
             };
         }
         security_engine.admit_tool_execution(canonical_id)
@@ -5789,8 +5809,12 @@ impl RuntimeAgent {
         }
     }
 
-    /// Acknowledges task evidence before hooks; persistence failure stops later admission and cannot establish completion.
+    /// Captures actual-hop mutation freshness before hooks or persistence waits; failed task evidence acknowledgement blocks later admission.
     async fn finish_tool_record(&self, record: &ToolExecutionRecord) {
+        crate::autonomy::invocation::capture_observation_mutation(
+            record,
+            &self.observation_mutations,
+        );
         if let Some(execution) = crate::autonomy::current_execution()
             && let Err(error) = Box::pin(execution.capture_tool_record(record, &self.info.id)).await
         {
@@ -5884,7 +5908,8 @@ impl RuntimeAgent {
         Ok((limits, timeout))
     }
 
-    /// Reserves each actual task attempt after final policy admission, then settles it before publishing execution evidence.
+    /// Reserves each actual task attempt after policy admission and rechecks original observation bounds and pinned host proof before first poll.
+    /// Expiry before invocation settles as non-invocation; already dispatched effects retain their existing settlement and uncertainty contract.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
@@ -5892,6 +5917,16 @@ impl RuntimeAgent {
         mut ctx: ToolExecutionContext,
         timeout: ValidatedToolTimeout,
     ) -> Result<(ToolResult, bool, bool, bool)> {
+        if ai_agents_llm::current_invocation_bounds()
+            .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return Ok((
+                ToolResult::error("Validation invocation deadline exceeded"),
+                true,
+                false,
+                false,
+            ));
+        }
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
             return Ok((
                 ToolResult::error("Tool execution cancelled by runtime control"),
@@ -5945,8 +5980,12 @@ impl RuntimeAgent {
         } else {
             None
         };
+        let bounds = ai_agents_llm::current_invocation_bounds();
         let timer_duration = execution.as_ref().map_or(timeout.timer, |run| {
             timeout.timer.min(run.remaining_duration())
+        });
+        let timer_duration = bounds.map_or(timer_duration, |bounds| {
+            timer_duration.min(bounds.remaining())
         });
         let deadline_delta = if timer_duration == timeout.timer {
             timeout.deadline_delta
@@ -5970,7 +6009,9 @@ impl RuntimeAgent {
         } else {
             false
         };
-        if footprint_changed
+        if ai_agents_llm::validate_invocation_evidence().is_err()
+            || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+            || footprint_changed
             || execution.as_ref().is_some_and(|run| {
                 !run.progress_allows(&args, &ctx)
                     || !run.allows_tool(&ctx.canonical_id)
@@ -6013,10 +6054,23 @@ impl RuntimeAgent {
         let mut future = Box::pin(crate::autonomy::message::scope_message(
             message_invocation,
             async move {
+                // Final synchronous host checks may consume time without yielding to the driver's timeout monitor.
+                if ai_agents_llm::validate_invocation_evidence().is_err()
+                    || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+                {
+                    return Ok(ToolResult::error(
+                        "Validation proof or original deadline changed before tool dispatch",
+                    ));
+                }
                 if let Some(custody) = &custody_for_future {
                     custody.store(true, Ordering::SeqCst);
                 }
                 invoked_by_future.store(true, Ordering::SeqCst);
+                if !ctx.classification.read_only {
+                    crate::autonomy::invocation::start_observation_mutation(
+                        &self.observation_mutations,
+                    );
+                }
                 if let Some(answer) = question_result {
                     return Ok(tool.execute_task_question(args, answer, ctx).await);
                 }
@@ -6053,11 +6107,12 @@ impl RuntimeAgent {
                     }
                     let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
                     if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
-                        Box::pin(execution.settle(attempt, serde_json::to_value(&result)?, false)).await?;
+                        let settlement = if invoked.load(Ordering::SeqCst) { serde_json::to_value(&result)? } else { serde_json::json!({"not_invoked":true}) };
+                        Box::pin(execution.settle(attempt, settlement, false)).await?;
                         execution.retire_completed_message(&self.info.id, attempt);
                     }
                     if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
-                    return Ok((result, false, false, true));
+                    return Ok((result, false, false, invoked.load(Ordering::SeqCst)));
                 }
                 _ = &mut timer => {
                     drop(future);
@@ -6141,7 +6196,7 @@ impl RuntimeAgent {
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) || execution.as_ref().is_some_and(|run| ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())) {
+                        if ai_agents_llm::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero()) || self.runtime_control.emergency_deny.load(Ordering::SeqCst) || execution.as_ref().is_some_and(|run| ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())) {
                             drop(lock);
                             drop(locks);
                             drop(resource_guards);

@@ -305,6 +305,7 @@ async fn execution(max_llm_calls: u32) -> (Arc<RuntimeAgent>, Arc<RunExecution>)
         target_generations: Default::default(),
         validation_bindings: Default::default(),
         validation_attempts: Default::default(),
+        validation_dependencies: Default::default(),
     });
     (parent, execution)
 }
