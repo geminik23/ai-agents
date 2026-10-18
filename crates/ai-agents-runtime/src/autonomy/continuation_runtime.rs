@@ -611,6 +611,37 @@ impl RuntimeAgent {
             .collect()
     }
 
+    /// Retained interactions keep both original clocks across claim, consumption and final application waits.
+    pub(super) fn task_response_expired(&self, batch: &TaskBatchState) -> bool {
+        batch.approvals.first().is_some_and(|approval| {
+            approval
+                .expires_at
+                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+                || crate::autonomy::current_execution().is_some_and(|execution| {
+                    execution
+                        .approval_deadlines
+                        .lock()
+                        .get(&approval.request_id)
+                        .is_some_and(|expiry| Instant::now() >= *expiry)
+                })
+        })
+    }
+
+    /// Frozen controller review proposals retain control/reset identity independently of their run and state generation.
+    pub(crate) fn task_review_binding(&self) -> (u64, u64) {
+        (
+            self.runtime_control.version.load(Ordering::SeqCst),
+            self.disambiguation_epoch.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Controller reviews use the configured human-decision timeout without inventing a deadline when HITL is absent.
+    pub(crate) fn task_review_timeout(&self) -> Option<std::time::Duration> {
+        self.hitl_engine
+            .as_ref()
+            .map(|hitl| std::time::Duration::from_secs(hitl.config().default_timeout_seconds))
+    }
+
     /// Applies the configured ordinary timeout policy only after the acknowledged request deadline has expired.
     pub(crate) fn task_approval_timeout_result(&self) -> Result<ApprovalResult> {
         match self

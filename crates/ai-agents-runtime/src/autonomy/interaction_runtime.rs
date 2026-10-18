@@ -20,7 +20,9 @@ impl RuntimeAgent {
         };
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        let enabled = if question.is_some() {
+        let enabled = if matches!(kind, TaskInteractionKind::PlanReview { .. }) {
+            Some(crate::autonomy::InteractionAction::PauseRun)
+        } else if question.is_some() {
             execution
                 .lifecycle_profile()
                 .hitl
@@ -82,6 +84,8 @@ impl RuntimeAgent {
             source: turn.source,
             user_message_committed: self.root_user_message_committed.load(Ordering::SeqCst),
             native_exchanges: self.task_native_expectations(),
+            request_id: Some(request_id.clone()),
+            expires_at,
         };
         let batch = TaskBatchState {
             version: 1,
@@ -160,6 +164,16 @@ impl RuntimeAgent {
             ));
         }
         match &state.kind {
+            TaskInteractionKind::PlanReview {
+                reasoning_config, ..
+            } => {
+                if *reasoning_config != serde_json::to_value(self.get_effective_reasoning_config())?
+                {
+                    return Err(AgentError::Config(
+                        "reviewed plan reasoning binding changed".into(),
+                    ));
+                }
+            }
             TaskInteractionKind::StateApproval {
                 from_state,
                 definition,
@@ -249,6 +263,42 @@ impl RuntimeAgent {
         }
     }
 
+    /// A frozen executable plan keeps its review binding and both original clocks through the final adoption write.
+    pub(super) fn validate_task_plan_review(&self, state: &TaskInteraction) -> Result<()> {
+        self.validate_task_interaction_response(
+            state,
+            &BatchResponse::Approval(ApprovalResult::Approved),
+        )?;
+        let id = state
+            .request_id
+            .as_ref()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        let expired = state
+            .expires_at
+            .is_some_and(|expiry| chrono::Utc::now() >= expiry)
+            || crate::autonomy::current_execution().is_some_and(|execution| {
+                execution
+                    .approval_deadlines
+                    .lock()
+                    .get(id)
+                    .is_some_and(|expiry| Instant::now() >= *expiry)
+            });
+        if expired && !crate::autonomy::suspension::timeout_approved(id) {
+            return Err(AgentError::HITLTimeout);
+        }
+        Ok(())
+    }
+
+    /// A known-safe expired decision finishes without applying its proposal or making another provider/tool call.
+    pub(super) async fn finish_expired_task_response(&self) -> Result<AgentResponse> {
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        execution.stop("response_timeout");
+        let response = AgentResponse::new("Pending response expired before application");
+        self.finish_turn_if_root(&response).await?;
+        Ok(response)
+    }
+
     /// Common response validation dispatches by actual location, never by a fabricated tool name.
     pub(crate) fn validate_task_batch_response(
         &self,
@@ -293,6 +343,7 @@ impl RuntimeAgent {
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
                 .clone();
             self.validate_task_interaction_response(&state, &response)?;
+            let originally_expired = self.task_response_expired(&batch);
             input.source = state.source;
             let _gate = self.root_turn_gate.clone().lock_owned().await;
             if self
@@ -350,7 +401,48 @@ impl RuntimeAgent {
                         let execution = crate::autonomy::current_execution()
                             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
                         execution.parked_batches.lock().remove(&self.info.id);
+                        self.validate_task_interaction_response(&state, &response)?;
+                        // Consuming the request is not permission to apply a proposal after its original deadline.
+                        if !originally_expired && self.task_response_expired(&batch) {
+                            self.clear_task_interaction(&state).await?;
+                            execution.stop("response_timeout");
+                            let response =
+                                AgentResponse::new("Pending response expired before application");
+                            self.finish_turn_if_root(&response).await?;
+                            return Ok(response);
+                        }
                         match (&state.kind, response) {
+                            (
+                                TaskInteractionKind::PlanReview {
+                                    plan,
+                                    attempt,
+                                    processed_input,
+                                    input_context,
+                                    auto_detected,
+                                    ..
+                                },
+                                BatchResponse::Approval(result),
+                            ) => {
+                                if matches!(
+                                    result,
+                                    ApprovalResult::Approved | ApprovalResult::Modified { .. }
+                                ) {
+                                    Box::pin(self.continue_plan_and_execute(
+                                        processed_input,
+                                        input_context,
+                                        *auto_detected,
+                                        plan.clone(),
+                                        *attempt,
+                                        Some((*state).clone()),
+                                    ))
+                                    .await
+                                } else {
+                                    execution.stop("supervision_rejected");
+                                    let response = AgentResponse::new("Plan review declined");
+                                    self.finish_turn_if_root(&response).await?;
+                                    Ok(response)
+                                }
+                            }
                             (
                                 TaskInteractionKind::Clarification { .. },
                                 BatchResponse::QuestionTimeout,

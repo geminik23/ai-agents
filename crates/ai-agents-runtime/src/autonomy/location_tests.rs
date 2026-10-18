@@ -187,6 +187,52 @@ async fn skill_fixture_options(question: bool, repeated: bool, expiry: bool) -> 
     }
 }
 
+// Superseded scripts retain executed prompts/tools without rerouting or executing the retired pending step.
+#[tokio::test]
+async fn host_control_skill_objective_supersession_keeps_completed_prefix() {
+    for sqlite in super::continuation_test_support::backends() {
+        for question in [false, true] {
+            let mut f = Box::pin(skill_fixture(question)).await;
+            f.store =
+                super::continuation_test_support::store(f.agent.info().id, "locations.v1", *sqlite)
+                    .await;
+            f.runner = runner(f.agent.clone(), f.store.clone());
+            let first = f.runner.run("old", None).await.unwrap();
+            let revised = f
+                .runner
+                .modify_objective_paused(
+                    &first.run.key.run_id,
+                    first.run.revision,
+                    "new",
+                    "retire script",
+                )
+                .await
+                .unwrap();
+            assert_eq!(f.first.load(Ordering::SeqCst), 1);
+            assert_eq!(f.second.load(Ordering::SeqCst), 0);
+            let done = f
+                .runner
+                .resume(
+                    &revised.run.key.run_id,
+                    revised.run.revision,
+                    TaskResumeInput::Continue,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                done.run.status,
+                TaskRunStatus::Completed,
+                "{:?}",
+                done.run.stop_reason
+            );
+            assert_eq!(f.first.load(Ordering::SeqCst), 1);
+            assert_eq!(f.second.load(Ordering::SeqCst), 0);
+            assert_eq!(f.router.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(f.main.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+}
+
 // Root fixtures use the explicit development API and preserve the same selected interaction policy.
 fn runner(agent: Arc<RuntimeAgent>, store: Arc<ScopedTaskRunStore>) -> AutonomyRunner {
     let mut config = super::runner_tests::config(8);

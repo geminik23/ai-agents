@@ -60,6 +60,68 @@ struct Fixture {
     store: Arc<ScopedTaskRunStore>,
     config: AutonomyConfig,
 }
+// Superseding a validation child closes its exact history and retires the old check without redispatching it.
+#[tokio::test]
+async fn host_control_observation_child_objective_supersession_keeps_parent_custody() {
+    for sqlite in super::continuation_test_support::backends() {
+        let mut f = Box::pin(fixture()).await;
+        f.config.defaults.max_llm_calls = Some(16);
+        f.config.defaults.max_tool_calls = Some(8);
+        f.store = super::continuation_test_support::store(
+            f.root.info().id,
+            "observation-message.v1",
+            *sqlite,
+        )
+        .await;
+        f.runner = AutonomyRunner::try_new(
+            f.root.clone(),
+            f.config.clone(),
+            Default::default(),
+            f.store.clone(),
+            "observation-message.v1".into(),
+        )
+        .unwrap();
+        let first = f.runner.run("old", None).await.unwrap();
+        let old_calls = f.child.calls.load(Ordering::SeqCst);
+        let revised = f
+            .runner
+            .modify_objective_paused(
+                &first.run.key.run_id,
+                first.run.revision,
+                "new",
+                "retire validation child",
+            )
+            .await
+            .unwrap();
+        assert_eq!(f.child.calls.load(Ordering::SeqCst), old_calls);
+        let saved = f
+            .store
+            .load(&revised.run.key.run_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+        assert!(
+            payload
+                .children
+                .iter()
+                .all(|child| child.pending.is_none() && child.result.is_some())
+        );
+        assert!(f.root.set_context("unrelated", json!(true)).is_err());
+        let stopped = f
+            .runner
+            .stop_paused(
+                &revised.run.key.run_id,
+                revised.run.revision,
+                "stop revised run",
+            )
+            .await
+            .unwrap();
+        assert_eq!(stopped.run.status, TaskRunStatus::Incomplete);
+        assert!(f.worker.set_context("released", json!(true)).is_ok());
+    }
+}
+
 // This observation is an actual Task-origin message, not a model call manufactured to obtain child cursor authority.
 async fn fixture() -> Fixture {
     Box::pin(fixture_mode(false, false)).await

@@ -92,6 +92,22 @@ impl RunTodoAdapter {
         Ok(())
     }
 
+    /// Retires this adapter while atomically installing the acknowledged next objective's canonical binding.
+    /// A failed handoff does not release either run into an unbound session list.
+    pub(crate) fn rebind(&self, binding: TodoRunBinding) -> Result<Self> {
+        if self.released.load(Ordering::Acquire)
+            || !self.store.rebind_run(&self.binding, binding.clone())
+        {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        self.released.store(true, Ordering::Release);
+        Ok(Self {
+            store: self.store.clone(),
+            binding,
+            released: AtomicBool::new(false),
+        })
+    }
+
     /// Empty, cleared and entirely cancelled lists cannot establish successful progress.
     pub fn all_done(&self) -> Result<bool> {
         let items = self.checkpoint()?.items;

@@ -400,7 +400,8 @@ impl RuntimeAgent {
                     .await?;
                 Box::pin(self.run_committed_task_loop(*state)).await
             }
-            TaskStateReturn::SkillFinish { response } => {
+            TaskStateReturn::SkillFinish { response }
+            | TaskStateReturn::PlanFinish { response } => {
                 self.finish_turn_if_root(&response).await?;
                 Ok(response)
             }

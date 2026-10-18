@@ -1204,6 +1204,24 @@ impl TodoStore {
         true
     }
 
+    /// Replaces one objective binding and its list under the same lock without exposing an unbound interval.
+    /// The caller must retain the old list for audit and acknowledge the matching durable handoff before execution.
+    pub fn rebind_run(&self, previous: &TodoRunBinding, next: TodoRunBinding) -> bool {
+        let mut state = self.inner.write();
+        if state.binding.as_ref() != Some(previous)
+            || next.agent_id != previous.agent_id
+            || next.run_id != previous.run_id
+            || previous.objective_revision.checked_add(1) != Some(next.objective_revision)
+            || next.token.is_empty()
+            || next.token == previous.token
+        {
+            return false;
+        }
+        state.binding = Some(next);
+        state.items.clear();
+        true
+    }
+
     /// Returns one authoritative list only when the run binding still matches.
     pub fn list_for_run(&self, binding: &TodoRunBinding) -> Option<Vec<TodoItem>> {
         let state = self.inner.read();

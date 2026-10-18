@@ -19,14 +19,60 @@ pub(crate) struct ControllerContinuation {
     pub checks: Vec<String>,
     pub next_check: usize,
     pub driver: Option<Box<ValidationDriverState>>,
+    #[serde(default)]
+    pub review: Option<ControllerReview>,
+}
+
+/// A frozen host decision returns to one controller boundary, never an obsolete tool or skill cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ControllerReview {
+    pub id: String,
+    pub proposal: ControllerProposal,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub state_generation: Option<u64>,
+    pub control_binding: (u64, u64),
+}
+
+/// Stage and plan proposals are advisory until approved; Continue carries no execution permission from model data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ControllerProposal {
+    Continue,
+    Stage { lifecycle: LifecycleState },
+    Plan { instruction: String },
 }
 
 impl ControllerContinuation {
     /// Structural checks bind a pending wait to the exact enclosing run and controller position.
     pub(crate) fn validate(&self, payload: &TaskCheckpointPayload) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
-        let driver = self.driver.as_ref().ok_or_else(invalid)?;
         let pending = payload.pending.as_ref().ok_or_else(invalid)?;
+        if let Some(review) = &self.review {
+            self.lifecycle.validate(&payload.settings)?;
+            if self.driver.is_some()
+                || review.id != pending.id
+                || review.id.is_empty()
+                || pending.reviewed_action != serde_json::to_value(review)?
+                || self.scope.objective_revision != payload.objective_revision
+                || !matches!(payload.runtime.continuation, TaskContinuation::BetweenTurns)
+                || !matches!(
+                    (&review.proposal, pending.kind),
+                    (ControllerProposal::Continue, TaskPendingKind::HostContinue)
+                        | (
+                            ControllerProposal::Stage { .. } | ControllerProposal::Plan { .. },
+                            TaskPendingKind::Approval
+                        )
+                )
+            {
+                return Err(invalid());
+            }
+            if let ControllerProposal::Stage { lifecycle } = &review.proposal {
+                lifecycle.validate(&payload.settings)?;
+            }
+            return bounded_value(&serde_json::to_value(self)?, MAX_TASK_CHECKPOINT_BYTES);
+        }
+        let driver = self.driver.as_ref().ok_or_else(invalid)?;
         if self.checks.get(self.next_check) != Some(&driver.check_id)
             || self.scope.key != driver.identity.key
             || self.scope.objective_revision != payload.objective_revision
@@ -78,21 +124,25 @@ pub(crate) fn retire_controller(payload: &mut TaskCheckpointPayload) -> Result<(
             return Ok(());
         }
         let state: ControllerContinuation = serde_json::from_value(adapter.state.clone())?;
-        let driver = state
-            .driver
-            .as_ref()
-            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-        let id = driver
-            .wait
-            .as_ref()
-            .map(|wait| wait.request_id.clone())
-            .or_else(|| {
-                driver
-                    .parked
-                    .as_ref()
-                    .map(|parked| parked.pending.id.clone())
-            })
-            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let id = if let Some(review) = &state.review {
+            review.id.clone()
+        } else {
+            let driver = state
+                .driver
+                .as_ref()
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            driver
+                .wait
+                .as_ref()
+                .map(|wait| wait.request_id.clone())
+                .or_else(|| {
+                    driver
+                        .parked
+                        .as_ref()
+                        .map(|parked| parked.pending.id.clone())
+                })
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+        };
         if !payload.consumed_request_ids.contains(&id) {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }

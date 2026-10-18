@@ -10,6 +10,8 @@ use std::{collections::HashMap, future::Future};
 /// A response is bound to one acknowledged checkpoint revision and one pending request.
 #[derive(Debug, Clone)]
 pub enum TaskResumeInput {
+    /// Explicit host continuation consumes only a newly acknowledged objective boundary at the expected revision.
+    Continue,
     Approval {
         request_id: String,
         result: ApprovalResult,
@@ -22,6 +24,24 @@ pub enum TaskResumeInput {
         request_id: String,
     },
     ExternalSignal(ExternalSignal),
+}
+
+tokio::task_local! { static TIMEOUT_APPROVAL: Option<String>; }
+
+/// Only host response admission can retain a configured timeout approval for this exact pending identity.
+/// This live disposition is neither serialized nor transferable to a later proposal.
+pub(crate) async fn scope_timeout_approval<F: std::future::Future>(
+    id: Option<String>,
+    future: F,
+) -> F::Output {
+    TIMEOUT_APPROVAL.scope(id, future).await
+}
+
+/// Late ordinary approvals do not receive the explicit host timeout-policy disposition.
+pub(crate) fn timeout_approved(id: &str) -> bool {
+    TIMEOUT_APPROVAL
+        .try_with(|approved| approved.as_deref() == Some(id))
+        .unwrap_or(false)
 }
 
 /// Keeps question data separate from approval authority while using the same exact batch cursor.

@@ -379,6 +379,8 @@ pub struct TaskPendingRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPendingKind {
+    /// Only an explicit host Continue may consume this objective boundary.
+    HostContinue,
     Approval,
     UserQuestion,
     ExternalCondition,

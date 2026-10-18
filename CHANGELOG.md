@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task host controls: development-only retained objective changes retire safe pending work, preserve audit/usage and canonical todos, and require explicit revision-bound continuation
+- Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
 - Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, strategy and restart integration remains unfinished
 - Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full acceptance and restart remain unfinished
@@ -12,6 +14,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust task host-control compatibility: development response/pending matches add `Continue`/`HostContinue`; stores gain certified no-write claim outcomes and opt-in objective control, and private checkpoints retain review and plan-adoption data without an executable migration promise
 - Rust task checkpoint compatibility: development payloads add multi-call coordination, script/action/controller and non-tool interaction locations, observation child groups, fallback ancestry and deferred finalization; older runtimes are not guaranteed to decode them, and unchanged envelope versions do not promise executable restart
 - Rust task execution compatibility: tools gain an additive typed task-execution bridge, and exhaustive development effect-state matches must handle acknowledged suspended message invocations without refunding consumed attempts
 - Rust task continuation compatibility: development response and validation outcome matches add external signals and safe suspension, driver literals add parked observation data, and executors gain compatible asynchronous suspension acknowledgement; task stores gain default-unsupported paused limit control and host-control literals include original expiry bounds
@@ -19,6 +22,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task review admission: preserve original root/child deadlines and control bindings through claim, consumption and application waits while retaining explicit configured timeout-policy behavior
+- Task objective handoff: preserve intervention limits, archive superseded validator attempts and reconstruct required-check eligibility without replaying completed work
 - Task fallback recovery: retain retry position, original lifecycle and distinct hop evidence across message pauses without duplicate rate admission or stale approval rebinding; uncertain task timeouts cannot start fresh fallback work
 - Task state actions: reject changed state bindings after awaited preparation before prompt dispatch, context publication or the next saved action
 - Task clarification: development-only retained questions honor configured human-review deadlines and settle expiry without semantic replay; in-flight state changes preserve newer exchanges instead of clearing them

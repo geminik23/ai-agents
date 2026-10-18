@@ -92,6 +92,8 @@ mod extensions;
 mod fallback_acceptance_tests;
 mod gate;
 #[cfg(test)]
+mod host_control_tests;
+#[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
 mod model_consumer_tests;

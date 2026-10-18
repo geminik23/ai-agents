@@ -23,7 +23,10 @@ impl AutonomyRunner {
         execution
             .update(|payload| {
                 payload.runtime = runtime;
-                payload.todos = todo.map(RunTodoAdapter::checkpoint).transpose()?;
+                // An objective handoff has already installed its canonical checkpoint before this pause.
+                if let Some(todo) = todo {
+                    payload.todos = Some(todo.checkpoint()?);
+                }
                 payload.pause_reason = Some("validation".into());
                 let adapter = TaskAdapterCheckpoint {
                     id: "runtime.validation".into(),
@@ -48,6 +51,7 @@ impl AutonomyRunner {
                 .ok_or_else(|| AgentError::Config("pause clock overflow".into()))?,
         );
         payload.clocks.active_interval_started_at = None;
+        let exact_payload = serde_json::to_value(&payload)?;
         let saved = execution
             .store
             .mutate(
@@ -66,6 +70,19 @@ impl AutonomyRunner {
             )
             .await
             .inspect_err(|_| execution.stop("storage_failure"))?;
+        if saved.key != anchored.key
+            || saved.actor_id != anchored.actor_id
+            || saved.schema_version != anchored.schema_version
+            || saved.created_at != anchored.created_at
+            || saved.updated_at < anchored.updated_at
+            || saved.revision != anchored.revision + 1
+            || saved.status != TaskRunStatus::Paused
+            || saved.owner_token.is_some()
+            || saved.cancel_requested != anchored.cancel_requested
+            || saved.payload != exact_payload
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
         execution.acknowledge_snapshot(&saved);
         execution
             .revision
@@ -77,7 +94,7 @@ impl AutonomyRunner {
     }
 
     /// Checks the actual retained owner and checkpoint equality before any response can claim controller execution.
-    fn retained_controller(
+    pub(super) fn retained_controller(
         &self,
         snapshot: &TaskRunSnapshot,
         payload: &TaskCheckpointPayload,
@@ -105,6 +122,9 @@ impl AutonomyRunner {
     {
         Box::pin(async move {
             let mut state = self.retained_controller(&snapshot, &payload)?;
+            if state.review.is_some() {
+                return Box::pin(self.resume_host_boundary(snapshot, payload, state, input)).await;
+            }
             let profile = resolve_profile(
                 &self.config,
                 AutonomyScope::Task,
@@ -236,6 +256,9 @@ impl AutonomyRunner {
                         TaskResumeInput::QuestionTimeout { request_id } => {
                             (request_id, BatchResponse::QuestionTimeout)
                         }
+                        TaskResumeInput::Continue => {
+                            return Err(TaskRunStorageError::NotResumable.into());
+                        }
                         TaskResumeInput::ExternalSignal(_) => unreachable!(),
                     };
                     if id != pending.id || payload.consumed_request_ids.contains(&id) {
@@ -337,23 +360,20 @@ impl AutonomyRunner {
                     .collect::<std::result::Result<Vec<_>, _>>()?;
             }
             bounded_value(&serde_json::to_value(&restored)?, 262_144)?;
-            let claimed = self
-                .store
-                .mutate(
-                    &snapshot.key.run_id,
-                    &TaskRunMutation::Claim {
-                        expected_revision: snapshot.revision,
-                        owner_token: uuid::Uuid::new_v4().to_string(),
-                    },
-                )
-                .await?;
+            let owner = self
+                .paused
+                .lock()
+                .get(&snapshot.key.run_id)
+                .map(|paused| paused.owner.clone())
+                .ok_or(TaskRunStorageError::NotResumable)?;
+            let mut cleanup = OwnedTurnCleanup::new(owner.clone());
+            let claimed = self.claim_retained(&snapshot, &mut cleanup).await?;
             let mut paused = self
                 .paused
                 .lock()
                 .remove(&snapshot.key.run_id)
                 .ok_or(TaskRunStorageError::Conflict)?;
             let owner = paused.owner.clone();
-            let mut cleanup = OwnedTurnCleanup::new(owner.clone());
             let mut execution = RunExecution::new(
                 self.store.clone(),
                 &claimed,
@@ -589,7 +609,7 @@ impl AutonomyRunner {
     }
 
     /// Known-safe observation groups close each exact child history and consumed parent attempt without invoking a pending implementation.
-    async fn cleanup_observation_group(
+    pub(super) async fn cleanup_observation_group(
         &self,
         owner: &Arc<RunOwner>,
         group: &TaskGroupState,

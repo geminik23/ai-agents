@@ -129,9 +129,15 @@ async fn fixture(entering: bool, question: bool, reentry: bool, sqlite: bool) ->
         "        - tool: second\n          args: {value: pending}\n"
     };
     let target = if reentry { "active" } else { "ready" };
+    // Only explicit question-expiry fixtures select the short deadline; receipt/phase tests use normal HITL defaults.
+    let deadline = if question {
+        "  default_timeout_seconds: 1\n"
+    } else {
+        ""
+    };
     let actions = format!("        - tool: first\n{action}");
     let yaml = format!(
-        "name: StateFlow\nsystem_prompt: test\ntools: [first,second,ask_user]\nhitl:\n  default_timeout_seconds: 1\n  on_timeout: reject\n  tools:\n    second:\n      require_approval: true\nstates:\n  initial: active\n  states:\n    active:\n{}      transitions:\n        - to: {target}\n          guard: 'true'\n{}",
+        "name: StateFlow\nsystem_prompt: test\ntools: [first,second,ask_user]\nhitl:\n{deadline}  on_timeout: reject\n  tools:\n    second:\n      require_approval: true\nstates:\n  initial: active\n  states:\n    active:\n{}      transitions:\n        - to: {target}\n          guard: 'true'\n{}",
         if !entering && !reentry {
             format!("      on_exit:\n{actions}")
         } else {
@@ -292,6 +298,119 @@ async fn state_acceptance_stop_cancel_and_limit_revision_preserve_actual_commit_
                 );
                 assert!(f.agent.set_context("released", json!(true)).is_ok());
             }
+        }
+    }
+}
+
+// Supersession returns to the actual state, not an obsolete exit/entry action or a replayed transition.
+#[tokio::test]
+async fn state_acceptance_objective_continue_and_supervision_preserve_commit_phase() {
+    for sqlite in support::backends() {
+        for entering in [false, true] {
+            let actions = "        - set_context: {allow_transition: false}\n        - tool: first\n        - tool: second\n";
+            let yaml = format!(
+                "name: SupersedeState\nsystem_prompt: test\ntools: [first,second]\nhitl:\n  tools:\n    second:\n      require_approval: true\nstates:\n  initial: active\n  states:\n    active:\n{}      transitions:\n        - to: ready\n          guard:\n            context:\n              allow_transition:\n                eq: true\n    ready:\n      regenerate_on_enter: false\n{}",
+                if entering {
+                    String::new()
+                } else {
+                    format!("      on_exit:\n{actions}")
+                },
+                if entering {
+                    format!("      on_enter:\n{actions}")
+                } else {
+                    String::new()
+                }
+            );
+            let mut f = Box::pin(from_yaml(
+                &yaml,
+                super::runner_tests::RecordingProvider::new(&["done", "done"]),
+                super::runner_tests::RecordingProvider::new(&[]),
+                *sqlite,
+            ))
+            .await;
+            f.agent
+                .set_context("allow_transition", json!(true))
+                .unwrap();
+            let mut config = super::runner_tests::config(16);
+            config.defaults.hitl = Some(AutonomyHitlConfig {
+                on_approval_required: Some(InteractionAction::PauseRun),
+                on_user_question: Some(InteractionAction::PauseRun),
+            });
+            config.defaults.lifecycle =
+                Some(serde_json::from_value(json!([{"id":"work"}])).unwrap());
+            config.defaults.supervision = Some(SupervisionConfig {
+                stage_changes: Some(ReviewPolicy::RequireApproval),
+                plan_changes: None,
+            });
+            f.runner = AutonomyRunner::try_new(
+                f.agent.clone(),
+                config,
+                Default::default(),
+                f.store.clone(),
+                "state.v1".into(),
+            )
+            .unwrap();
+            let old = f.runner.run("old objective", None).await.unwrap();
+            assert_eq!(old.run.status, TaskRunStatus::Paused);
+            assert_eq!(f.first.load(Ordering::SeqCst), 1);
+            assert_eq!(f.agent.state_history().len(), usize::from(entering));
+            let revised = f
+                .runner
+                .modify_objective_paused(
+                    &old.run.key.run_id,
+                    old.run.revision,
+                    "new objective",
+                    "change work",
+                )
+                .await
+                .unwrap();
+            assert_eq!(f.first.load(Ordering::SeqCst), 1);
+            assert_eq!(f.second.load(Ordering::SeqCst), 0);
+            assert!(
+                f.runner
+                    .resume(
+                        &revised.run.key.run_id,
+                        revised.run.revision,
+                        TaskResumeInput::Approval {
+                            request_id: old.run.pending.unwrap().id,
+                            result: ApprovalResult::Approved
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            let review = f
+                .runner
+                .resume(
+                    &revised.run.key.run_id,
+                    revised.run.revision,
+                    TaskResumeInput::Continue,
+                )
+                .await
+                .unwrap();
+            assert_eq!(review.run.status, TaskRunStatus::Paused);
+            assert!(matches!(
+                review.run.pending.as_ref().unwrap().kind,
+                TaskPendingKind::Approval
+            ));
+            let done = f
+                .runner
+                .resume(
+                    &review.run.key.run_id,
+                    review.run.revision,
+                    TaskResumeInput::Approval {
+                        request_id: review.run.pending.unwrap().id,
+                        result: ApprovalResult::Approved,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(done.run.status, TaskRunStatus::Completed);
+            assert_eq!(f.first.load(Ordering::SeqCst), 1);
+            assert_eq!(f.second.load(Ordering::SeqCst), 0);
+            assert_eq!(f.agent.state_history().len(), usize::from(entering));
+            assert_eq!(f.hooks.responses.load(Ordering::SeqCst), 1);
+            assert_eq!(f.hooks.transitions.load(Ordering::SeqCst), 0);
         }
     }
 }

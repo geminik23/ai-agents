@@ -7,6 +7,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[path = "controller_runtime.rs"]
 mod controller_runtime;
+#[path = "host_runtime.rs"]
+mod host_runtime;
 #[path = "paused_control.rs"]
 mod paused_control;
 
@@ -143,11 +145,12 @@ impl AutonomyRunner {
                             .any(|approval| &approval.request_id == id)
                     })
             }) || paused.controller.as_ref().is_some_and(|state| {
-                state
-                    .driver
-                    .as_ref()
-                    .and_then(|driver| driver.parked.as_ref())
-                    .is_some_and(|parked| &parked.pending.id == id)
+                state.review.as_ref().is_some_and(|review| &review.id == id)
+                    || state
+                        .driver
+                        .as_ref()
+                        .and_then(|driver| driver.parked.as_ref())
+                        .is_some_and(|parked| &parked.pending.id == id)
             }) || paused.batch.as_ref().is_some_and(|batch| {
                 batch
                     .approvals
@@ -244,6 +247,12 @@ impl AutonomyRunner {
             || group.batch.approvals[0]
                 .expires_at
                 .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+        let timeout_id = (expired
+            && matches!(
+                &response,
+                super::suspension::BatchResponse::Approval(ai_agents_hitl::ApprovalResult::Timeout)
+            ))
+        .then(|| group.batch.approvals[0].request_id.clone());
         if expired {
             match response {
                 super::suspension::BatchResponse::Approval(
@@ -287,22 +296,13 @@ impl AutonomyRunner {
         let lifecycle: LifecycleState =
             serde_json::from_value(controller.state["lifecycle"].clone())?;
         lifecycle.validate(&profile.settings)?;
-        let claimed = self
-            .store
-            .mutate(
-                &snapshot.key.run_id,
-                &TaskRunMutation::Claim {
-                    expected_revision: snapshot.revision,
-                    owner_token: uuid::Uuid::new_v4().to_string(),
-                },
-            )
-            .await?;
+        let mut cleanup = OwnedTurnCleanup::new(owner.clone());
+        let claimed = self.claim_retained(&snapshot, &mut cleanup).await?;
         let mut paused = self
             .paused
             .lock()
             .remove(&snapshot.key.run_id)
             .ok_or(TaskRunStorageError::Conflict)?;
-        let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let mut execution = RunExecution::new(
             self.store.clone(),
             &claimed,
@@ -352,9 +352,24 @@ impl AutonomyRunner {
                     ))
                     .await;
                 }
-                let response = self
-                    .agent
-                    .resume_task_group(
+                let late = request_deadline
+                    .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                    || group.batch.approvals[0]
+                        .expires_at
+                        .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                if late && !expired {
+                    execution.stop("response_timeout");
+                    return Box::pin(self.finish_stopped_group(
+                        &execution,
+                        &owner,
+                        &group,
+                        "response_timeout".into(),
+                    ))
+                    .await;
+                }
+                let response = super::suspension::scope_timeout_approval(
+                    timeout_id,
+                    self.agent.resume_task_group(
                         AutonomyTurnInput {
                             owner: owner.clone(),
                             objective: payload.objective.clone(),
@@ -363,8 +378,9 @@ impl AutonomyRunner {
                         },
                         group.clone(),
                         response,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 if let Some(reason) = execution.stop_reason() {
                     return Box::pin(self.finish_stopped_group(&execution, &owner, &group, reason))
                         .await;
@@ -958,7 +974,7 @@ impl AutonomyRunner {
                 super::suspension::BatchResponse::QuestionTimeout,
                 true,
             ),
-            TaskResumeInput::ExternalSignal(_) => {
+            TaskResumeInput::Continue | TaskResumeInput::ExternalSignal(_) => {
                 return Err(TaskRunStorageError::NotResumable.into());
             }
         };
@@ -1019,11 +1035,18 @@ impl AutonomyRunner {
         if whole_expiry.is_some_and(|expiry| std::time::Instant::now() >= expiry) {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
-        if approval_deadline.is_some_and(|expiry| std::time::Instant::now() >= expiry)
+        let original_expired = approval_deadline
+            .is_some_and(|expiry| std::time::Instant::now() >= expiry)
             || batch.approvals[0]
                 .expires_at
-                .is_some_and(|expiry| chrono::Utc::now() >= expiry)
-        {
+                .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+        let timeout_id = (original_expired
+            && matches!(
+                &result,
+                super::suspension::BatchResponse::Approval(ai_agents_hitl::ApprovalResult::Timeout)
+            ))
+        .then(|| batch.approvals[0].request_id.clone());
+        if original_expired {
             match result {
                 super::suspension::BatchResponse::Approval(
                     ai_agents_hitl::ApprovalResult::Timeout,
@@ -1082,22 +1105,13 @@ impl AutonomyRunner {
                 AgentError::Config("this checkpoint needs compatible live-owner restoration".into())
             })?;
         owner.check()?;
-        let claimed = self
-            .store
-            .mutate(
-                run_id,
-                &TaskRunMutation::Claim {
-                    expected_revision,
-                    owner_token: uuid::Uuid::new_v4().to_string(),
-                },
-            )
-            .await?;
+        let mut cleanup = OwnedTurnCleanup::new(owner.clone());
+        let claimed = self.claim_retained(&snapshot, &mut cleanup).await?;
         let mut paused = self
             .paused
             .lock()
             .remove(run_id)
             .ok_or(TaskRunStorageError::Conflict)?;
-        let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let mut execution = RunExecution::new(
             self.store.clone(),
             &claimed,
@@ -1109,6 +1123,7 @@ impl AutonomyRunner {
             let live = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
             live.participants = paused.participants.clone();
             live.targets = paused.targets.clone();
+            *live.approval_deadlines.lock() = paused.approval_deadlines.clone();
         }
         if let Some(expiry) = whole_expiry {
             let execution = Arc::get_mut(&mut execution).ok_or(TaskRunStorageError::Conflict)?;
@@ -1138,9 +1153,41 @@ impl AutonomyRunner {
         let outcome = scope_execution(
             execution.clone(),
             Box::pin(async {
-                let response = self
-                    .agent
-                    .resume_task_batch(
+                // A claim or active-clock acknowledgement may cross the original pending deadline without admitting the operation.
+                let late = approval_deadline
+                    .is_some_and(|expiry| std::time::Instant::now() >= expiry)
+                    || batch.approvals[0]
+                        .expires_at
+                        .is_some_and(|expiry| chrono::Utc::now() >= expiry);
+                if late && !original_expired {
+                    let runtime = self.agent.cancel_task_batch(&owner, batch.clone()).await?;
+                    execution
+                        .update(|payload| {
+                            payload.runtime = runtime;
+                            payload.pending = None;
+                            payload.pause_reason = None;
+                            for approval in &batch.approvals {
+                                if !payload.consumed_request_ids.contains(&approval.request_id) {
+                                    payload
+                                        .consumed_request_ids
+                                        .push(approval.request_id.clone());
+                                }
+                            }
+                            Ok(())
+                        })
+                        .await?;
+                    return self
+                        .finish(
+                            &execution,
+                            TaskRunStatus::Incomplete,
+                            "response_timeout".into(),
+                            None,
+                        )
+                        .await;
+                }
+                let response = super::suspension::scope_timeout_approval(
+                    timeout_id,
+                    self.agent.resume_task_batch(
                         AutonomyTurnInput {
                             owner: owner.clone(),
                             objective: payload.objective.clone(),
@@ -1150,8 +1197,9 @@ impl AutonomyRunner {
                         batch,
                         &request_id,
                         result,
-                    )
-                    .await;
+                    ),
+                )
+                .await;
                 if matches!(&response, Err(AgentError::TaskSuspended(_))) {
                     return self.pause(&execution, paused.todo.as_ref()).await;
                 }
@@ -1278,14 +1326,12 @@ impl AutonomyRunner {
                 || hitl
                     .on_approval_required
                     .is_some_and(|action| action != InteractionAction::PauseRun)
-        }) || profile.settings.supervision.is_some()
-            || profile.settings.on_limit.as_ref().is_some_and(|limit| {
-                !matches!(
-                    limit.action,
-                    None | Some(LimitAction::SummarizeAndStop | LimitAction::Fail)
-                )
-            })
-        {
+        }) || profile.settings.on_limit.as_ref().is_some_and(|limit| {
+            !matches!(
+                limit.action,
+                None | Some(LimitAction::SummarizeAndStop | LimitAction::Fail)
+            )
+        }) {
             return Err(AgentError::Config(
                 "live task suspension is not installed for this profile".into(),
             ));
@@ -1476,7 +1522,7 @@ impl AutonomyRunner {
                 .find(|adapter| adapter.id == "runtime.controller");
             let mut scope = EvaluationScope {
                 key: key.clone(),
-                objective_revision: 0,
+                objective_revision: restored.objective_revision,
                 cycle: 0,
                 stage: None,
                 mutation_generation: 0,
@@ -1519,7 +1565,11 @@ impl AutonomyRunner {
             let mut continuation = execution.controller.lock().take();
             let mut last_response = None;
             let mut instruction = String::new();
-            let mut source = AutonomyTurnSource::InitialObjective;
+            let mut source = if restored.objective_revision == 0 {
+                AutonomyTurnSource::InitialObjective
+            } else {
+                AutonomyTurnSource::Continuation
+            };
             let mut forced_continuation = false;
             if let Some(saved) = &continuation {
                 scope = saved.scope.clone();
@@ -1532,6 +1582,45 @@ impl AutonomyRunner {
                 forced_continuation = saved.forced_continuation;
                 execution.set_scope(&scope);
             }
+            // Required-check inventory is structural configuration, not old-objective completion credit.
+            evidence.required_checks = bound
+                .checks
+                .iter()
+                .filter(|check| check.check.required.unwrap_or(true))
+                .map(|check| check.check.id.clone())
+                .collect();
+            let reviewed = continuation.as_ref().and_then(|saved| saved.review.clone());
+            if let Some(review) = &reviewed {
+                match &review.proposal {
+                    super::controller::ControllerProposal::Continue => {
+                        continuation = None;
+                        last_response = None;
+                        source = AutonomyTurnSource::Continuation;
+                    }
+                    super::controller::ControllerProposal::Plan {
+                        instruction: approved,
+                    } => {
+                        instruction = approved.clone();
+                        continuation = None;
+                        source = AutonomyTurnSource::Continuation;
+                    }
+                    super::controller::ControllerProposal::Stage { .. } => {}
+                }
+            }
+            let reviewed_stage_admission = reviewed.clone();
+            let mut reviewed_plan_admission = reviewed
+                .as_ref()
+                .filter(|review| {
+                    matches!(
+                        review.proposal,
+                        super::controller::ControllerProposal::Plan { .. }
+                    )
+                })
+                .cloned();
+            let mut reviewed_stage = reviewed.and_then(|review| match review.proposal {
+                super::controller::ControllerProposal::Stage { lifecycle } => Some(lifecycle),
+                _ => None,
+            });
             loop {
                 // Validation resumes after the committed turn and must not repeat its counters, observation or hooks.
                 if continuation.is_none() {
@@ -1602,6 +1691,18 @@ impl AutonomyRunner {
                     let response = if let Some(response) = resumed_response.take() {
                         Ok(response)
                     } else {
+                        if let Some(review) = reviewed_plan_admission.take()
+                            && !self.controller_review_current(execution, &review)?
+                        {
+                            return self
+                                .finish(
+                                    execution,
+                                    TaskRunStatus::Incomplete,
+                                    "supervision_timeout".into(),
+                                    last_response,
+                                )
+                                .await;
+                        }
                         self.agent
                             .run_autonomy_turn(AutonomyTurnInput {
                                 owner: owner.clone(),
@@ -1733,6 +1834,7 @@ impl AutonomyRunner {
                             checks: ids.clone(),
                             next_check: index,
                             driver: Some(driver),
+                            review: None,
                         }));
                         return Box::pin(self.pause_controller(execution, todo)).await;
                     }
@@ -1747,14 +1849,16 @@ impl AutonomyRunner {
                     .await?;
                 scope.mutation_generation = execution.mutation_generation();
                 Self::collect_tools(execution, &mut evidence).await?;
-                let observation = bound.observe_progress(&scope, &evidence)?;
-                progress.observe(&scope, &observation)?;
-                evidence.progress = Some(observation.scoped(Self::identity(
-                    &scope,
-                    scope.cycle,
-                    None,
-                    String::new(),
-                )));
+                if reviewed_stage.is_none() {
+                    let observation = bound.observe_progress(&scope, &evidence)?;
+                    progress.observe(&scope, &observation)?;
+                    evidence.progress = Some(observation.scoped(Self::identity(
+                        &scope,
+                        scope.cycle,
+                        None,
+                        String::new(),
+                    )));
+                }
                 let evaluator = CompletionGateEvaluator::default();
                 let previous_stage = lifecycle.current_stage;
                 if let Some(stage) = profile
@@ -1769,18 +1873,72 @@ impl AutonomyRunner {
                         .map(|gate| evaluator.evaluate(gate, &scope, &evidence))
                         .transpose()?
                         .map_or(GateOutcome::Pass, |r| r.outcome);
-                    if lifecycle.complete_stage(
-                        &profile.settings,
-                        &stage.id,
-                        gate,
-                        bound.required_stage_outcome(&scope, &evidence)?,
-                    )? {
-                        execution.set_lifecycle(&profile.settings, &lifecycle);
-                    } else if (gate == GateOutcome::Fail
-                        || bound.required_stage_outcome(&scope, &evidence)? == GateOutcome::Fail)
-                        && lifecycle.validation_failure(&profile.settings)?
-                    {
-                        source = AutonomyTurnSource::ValidationFix;
+                    let approved = reviewed_stage.take();
+                    let mut proposed = approved.clone().unwrap_or_else(|| lifecycle.clone());
+                    let advances = approved.is_some()
+                        || proposed.complete_stage(
+                            &profile.settings,
+                            &stage.id,
+                            gate,
+                            bound.required_stage_outcome(&scope, &evidence)?,
+                        )?;
+                    let rewinds = !advances
+                        && (gate == GateOutcome::Fail
+                            || bound.required_stage_outcome(&scope, &evidence)?
+                                == GateOutcome::Fail)
+                        && proposed.validation_failure(&profile.settings)?;
+                    if advances || rewinds {
+                        if approved.is_none()
+                            && profile.settings.supervision.as_ref().is_some_and(|policy| {
+                                policy.stage_changes == Some(ReviewPolicy::RequireApproval)
+                            })
+                        {
+                            return Box::pin(
+                                self.park_review(
+                                    execution,
+                                    todo,
+                                    ControllerContinuation {
+                                        scope: scope.clone(),
+                                        lifecycle: lifecycle.clone(),
+                                        progress: progress.clone(),
+                                        evidence: evidence.clone(),
+                                        response: last_response
+                                            .clone()
+                                            .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
+                                        instruction: instruction.clone(),
+                                        source,
+                                        forced_continuation,
+                                        checks: ids.clone(),
+                                        next_check: ids.len(),
+                                        driver: None,
+                                        review: None,
+                                    },
+                                    super::controller::ControllerProposal::Stage {
+                                        lifecycle: proposed,
+                                    },
+                                ),
+                            )
+                            .await;
+                        }
+                        if approved.is_some() {
+                            let review = reviewed_stage_admission
+                                .as_ref()
+                                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                            if !self.controller_review_current(execution, review)? {
+                                return self
+                                    .finish(
+                                        execution,
+                                        TaskRunStatus::Incomplete,
+                                        "supervision_timeout".into(),
+                                        last_response,
+                                    )
+                                    .await;
+                            }
+                        }
+                        if proposed.current_stage < lifecycle.current_stage {
+                            source = AutonomyTurnSource::ValidationFix;
+                        }
+                        lifecycle = proposed;
                         execution.set_lifecycle(&profile.settings, &lifecycle);
                     }
                 }
@@ -1891,6 +2049,36 @@ impl AutonomyRunner {
                             .last()
                             .map(|result| result.metrics.to_string())
                             .unwrap_or_default();
+                        if profile.settings.supervision.as_ref().is_some_and(|policy| {
+                            policy.plan_changes == Some(ReviewPolicy::RequireApproval)
+                        }) {
+                            return Box::pin(
+                                self.park_review(
+                                    execution,
+                                    todo,
+                                    ControllerContinuation {
+                                        scope: scope.clone(),
+                                        lifecycle: lifecycle.clone(),
+                                        progress: progress.clone(),
+                                        evidence: evidence.clone(),
+                                        response: last_response
+                                            .clone()
+                                            .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
+                                        instruction: instruction.clone(),
+                                        source,
+                                        forced_continuation,
+                                        checks: Vec::new(),
+                                        next_check: 0,
+                                        driver: None,
+                                        review: None,
+                                    },
+                                    super::controller::ControllerProposal::Plan {
+                                        instruction: instruction.clone(),
+                                    },
+                                ),
+                            )
+                            .await;
+                        }
                     }
                     CheckpointDecision::Wait | CheckpointDecision::AskUser => {
                         return Err(AgentError::Config(
@@ -1993,7 +2181,12 @@ impl AutonomyRunner {
         resumed: Option<Box<ValidationDriverState>>,
     ) -> ControllerFuture<'a, Option<Box<ValidationDriverState>>> {
         Box::pin(async move {
-            let attempt = format!("{}:{}", scope.cycle, check.check.id);
+            // A replan is bound to its selected intervention rather than a generic cycle/check attempt.
+            let attempt = if check.check.adapter == "internal.replan" {
+                check.check.id.clone()
+            } else {
+                format!("{}:{}", scope.cycle, check.check.id)
+            };
             scope
                 .validation_attempts
                 .insert(check.check.id.clone(), attempt.clone());
@@ -2126,6 +2319,8 @@ impl AutonomyRunner {
             Some("cancel_requested") => TaskRunStatus::Cancelled,
             Some(
                 "question_timeout"
+                | "supervision_rejected"
+                | "response_timeout"
                 | "pipeline_timeout"
                 | "composition_timeout"
                 | "scope_ended"

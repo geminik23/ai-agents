@@ -11365,6 +11365,29 @@ Respond in JSON format:
         input_context: &HashMap<String, Value>,
         auto_detected: bool,
     ) -> Result<AgentResponse> {
+        let plan = self.generate_plan(processed_input).await?;
+        Box::pin(self.continue_plan_and_execute(
+            processed_input,
+            input_context,
+            auto_detected,
+            plan,
+            0,
+            None,
+        ))
+        .await
+    }
+
+    /// Adopts a frozen plan only after required review, preserving the reflection attempt and completed prior effects across pauses.
+    /// A review resumes this boundary without rerouting, regenerating the proposal or resetting the root user commit.
+    async fn continue_plan_and_execute(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        auto_detected: bool,
+        mut plan: Plan,
+        first_attempt: u32,
+        mut reviewed: Option<crate::autonomy::interaction::TaskInteraction>,
+    ) -> Result<AgentResponse> {
         let effective = self.get_effective_reasoning_config();
         let plan_reflection = effective
             .get_planning()
@@ -11377,18 +11400,86 @@ Respond in JSON format:
             1
         };
 
-        let mut plan = self.generate_plan(processed_input).await?;
-        info!(
-            plan_id = %plan.id,
-            steps = plan.steps.len(),
-            "Plan generated"
-        );
-
         let mut plan_result = String::new();
-
-        for attempt in 0..max_attempts {
+        for attempt in first_attempt..max_attempts {
+            if reviewed.is_none()
+                && crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+                && crate::autonomy::current_execution().is_some_and(|execution| {
+                    execution
+                        .lifecycle_profile()
+                        .supervision
+                        .as_ref()
+                        .is_some_and(|policy| {
+                            policy.plan_changes
+                                == Some(crate::autonomy::ReviewPolicy::RequireApproval)
+                        })
+                })
+            {
+                let mut approval = ai_agents_hitl::ApprovalRequest::new(
+                    ApprovalTrigger::condition("plan_supervision", &plan.id),
+                    "Review the proposed plan before applying it",
+                )
+                .with_context(HashMap::from([(
+                    "plan".into(),
+                    serde_json::to_value(&plan)?,
+                )]));
+                approval.timeout = self.task_review_timeout();
+                self.park_task_interaction(
+                    crate::autonomy::interaction::TaskInteractionKind::PlanReview {
+                        plan: plan.clone(),
+                        attempt,
+                        processed_input: processed_input.into(),
+                        input_context: input_context.clone(),
+                        auto_detected,
+                        reasoning_config: serde_json::to_value(&effective)?,
+                    },
+                    Some(approval),
+                    None,
+                )
+                .await?;
+                return Err(AgentError::Config(
+                    "required plan supervision did not retain its proposal".into(),
+                ));
+            }
+            let accepted_review = reviewed.take();
+            if let Some(review) = &accepted_review {
+                match self.validate_task_plan_review(review) {
+                    Err(AgentError::HITLTimeout) => {
+                        return self.finish_expired_task_response().await;
+                    }
+                    other => other?,
+                }
+            }
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.update(|payload| {
+                    payload.evidence.records.push(crate::autonomy::TaskEvidenceRecord {
+                        run_id: execution.run_id.clone(), sequence: payload.evidence.records.len() as u64,
+                        stage: payload.stage.clone(), attempt: Some(format!("{}:{attempt}", plan.id)), origin: "runtime.plan.adopt".into(),
+                        data: serde_json::json!({"objective_revision":payload.objective_revision,"plan":plan}),
+                    });
+                    Ok(())
+                }).await?;
+            }
+            if let Some(review) = &accepted_review {
+                match self.validate_task_plan_review(review) {
+                    Err(AgentError::HITLTimeout) => {
+                        return self.finish_expired_task_response().await;
+                    }
+                    other => other?,
+                }
+            }
             *self.current_plan.write() = Some(plan.clone());
             plan_result = self.execute_plan(&mut plan).await?;
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.update(|payload| {
+                    payload.evidence.records.push(crate::autonomy::TaskEvidenceRecord {
+                        run_id: execution.run_id.clone(), sequence: payload.evidence.records.len() as u64,
+                        stage: payload.stage.clone(), attempt: Some(format!("{}:{attempt}", plan.id)), origin: "runtime.plan.result".into(),
+                        data: serde_json::json!({"objective_revision":payload.objective_revision,"plan":plan,"result":plan_result}),
+                    });
+                    Ok(())
+                }).await?;
+            }
 
             info!(
                 plan_status = ?plan.status,
@@ -11436,9 +11527,6 @@ Respond in JSON format:
 
         self.check_memory_compression().await?;
         self.increment_turn();
-        self.evaluate_transitions(processed_input, &final_content)
-            .await?;
-
         let reasoning_metadata =
             ReasoningMetadata::new(ReasoningMode::PlanAndExecute).with_auto_detected(auto_detected);
 
@@ -11447,6 +11535,18 @@ Respond in JSON format:
             serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
         );
 
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+            crate::autonomy::location::scope_state_return(
+                crate::autonomy::location::TaskStateReturn::PlanFinish {
+                    response: response.clone(),
+                },
+                Box::pin(self.evaluate_transitions(processed_input, &final_content)),
+            )
+            .await?;
+        } else {
+            self.evaluate_transitions(processed_input, &final_content)
+                .await?;
+        }
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }

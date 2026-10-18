@@ -252,6 +252,17 @@ impl ProgressState {
             signals: BTreeMap::new(),
         }
     }
+    /// A revised objective loses its old progress credit without replenishing run-wide intervention counts or sequence identities.
+    pub(crate) fn revise_objective(&mut self, scope: EvaluationScope) {
+        self.scope = scope;
+        self.last_cycle = None;
+        self.cycles_without_progress = 0;
+        self.handled_sequence = None;
+        self.decided_sequence = None;
+        self.last_delta = ProgressDelta::Unknown;
+        self.signals.clear();
+    }
+
     /// Commits one completed-cycle observation; repeated cycles and suspended work cannot advance counters.
     pub fn observe(
         &mut self,
