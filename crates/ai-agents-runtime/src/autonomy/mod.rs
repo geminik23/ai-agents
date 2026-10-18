@@ -6,6 +6,7 @@ mod authority;
 mod boundary;
 pub(crate) mod composition;
 mod execution;
+pub(crate) mod invocation;
 mod memory;
 pub(crate) mod message;
 mod participants;
@@ -66,6 +67,8 @@ pub(crate) mod location;
 #[cfg(test)]
 mod location_tests;
 #[cfg(test)]
+mod lp_controller_tests;
+#[cfg(test)]
 mod message_batch_tests;
 #[cfg(test)]
 mod shared_target_tests;
@@ -73,20 +76,34 @@ mod shared_target_tests;
 mod tool_composition_tests;
 pub use authority::{HostValidationContext, RuntimeObservationExecutor, validation_judge_provider};
 pub(crate) use authority::{
-    invoke_bound, validation_arguments_valid, validation_extra_grant, validation_metadata,
-    validation_requires_approval,
+    invoke_bound, scope_message_recovery_authority, validation_arguments_valid,
+    validation_extra_grant, validation_metadata, validation_requires_approval,
 };
 pub use control::HostControlAction;
 pub(crate) use control::prepare_host_control;
 pub use journal::TaskValidationJournal;
 pub use lifecycle::*;
 #[cfg(test)]
+mod continuation_test_support;
+#[cfg(test)]
 mod driver_regression_tests;
 #[cfg(test)]
 mod evaluation_tests;
 mod evidence;
 mod extensions;
+mod host_evidence;
+#[cfg(test)]
+mod host_evidence_tests;
+#[cfg(test)]
+mod retained_admission_tests;
+#[cfg(test)]
+mod retained_proof_tests;
+pub use host_evidence::{ExternalUnavailablePolicy, HostRevisionSource};
+#[cfg(test)]
+mod fallback_acceptance_tests;
 mod gate;
+#[cfg(test)]
+mod host_control_tests;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
@@ -103,6 +120,8 @@ mod progress;
 mod registry_tests;
 mod replanning;
 mod run;
+#[cfg(test)]
+mod state_acceptance_tests;
 mod validation;
 
 pub use evidence::*;

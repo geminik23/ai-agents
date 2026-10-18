@@ -21,6 +21,7 @@ pub struct HostValidationContext<'a> {
     pub run_revision: u64,
 }
 
+#[derive(Clone)]
 pub(crate) struct HostValidationPermit {
     agent_id: String,
     request: ToolExecutionRequest,
@@ -139,9 +140,10 @@ pub(crate) fn validate_observation_pause(parked: &ValidationObservationPause) ->
         || pending.request_id != parked.pending.id
         || matches!(parked.pending.kind, TaskPendingKind::UserQuestion)
             != pending.question.is_some()
+        || matches!(parked.pending.kind, TaskPendingKind::Limit) != pending.capacity()?.is_some()
         || !matches!(
             parked.pending.kind,
-            TaskPendingKind::UserQuestion | TaskPendingKind::Approval
+            TaskPendingKind::UserQuestion | TaskPendingKind::Approval | TaskPendingKind::Limit
         )
     {
         return Err(TaskRunStorageError::InvalidCheckpoint.into());
@@ -190,11 +192,52 @@ pub fn validation_judge_provider(
 
 #[async_trait]
 impl ValidationObservationExecutor for RuntimeObservationExecutor {
-    /// Reads the shared mutation generation after managed observations without permitting callbacks to relabel old proof.
+    /// Capacity is observed before the driver marks dispatch; the actual executor still reserves atomically after any wait.
+    async fn capacity_reason(
+        &self,
+        request: &ValidationObservationRequest,
+    ) -> Result<Option<String>> {
+        let Some(execution) = current_execution() else {
+            return Ok(None);
+        };
+        let snapshot = execution.load_owned().await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        Ok(match request {
+            ValidationObservationRequest::Judge { .. }
+            | ValidationObservationRequest::Plan { .. }
+                if payload.counters.llm_attempts >= u64::from(payload.limits.max_llm_calls) =>
+            {
+                Some("llm_capacity".into())
+            }
+            ValidationObservationRequest::Tool { tool, .. }
+                if payload.counters.tool_attempts >= u64::from(payload.limits.max_tool_calls)
+                    || (tool == "command"
+                        && payload.counters.command_attempts
+                            >= u64::from(payload.limits.max_command_calls)) =>
+            {
+                Some("tool_capacity".into())
+            }
+            _ => None,
+        })
+    }
+
+    /// Samples frozen targets and the authoritative run or independent-tree generation without letting callbacks relabel old proof.
     fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
         let mut scope = scope.clone();
+        self.agent
+            .autonomy_extensions()
+            .refresh_targets(&mut scope)?;
         if let Some(execution) = super::current_execution() {
             scope.mutation_generation = execution.mutation_generation();
+        } else {
+            let clock = super::invocation::current_mutation_clock()
+                .unwrap_or_else(|| self.agent.observation_mutation_clock());
+            scope.mutation_generation = clock.load(std::sync::atomic::Ordering::Acquire);
+            if scope.mutation_generation == u64::MAX {
+                return Err(AgentError::Config(
+                    "observation mutation generation exhausted".into(),
+                ));
+            }
         }
         Ok(scope)
     }
@@ -278,7 +321,9 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                     .revision
                     .load(std::sync::atomic::Ordering::Acquire)
                     + 1,
-                kind: if approval.question.is_some() {
+                kind: if approval.capacity()?.is_some() {
+                    TaskPendingKind::Limit
+                } else if approval.question.is_some() {
                     TaskPendingKind::UserQuestion
                 } else {
                     TaskPendingKind::Approval
@@ -294,7 +339,8 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
         Ok(Some(parked))
     }
 
-    /// Managed calls preserve identity, policy, approval, locks and exact execution records; run-wide admission is owned by the enclosing controller.
+    /// Managed observations retain shared policy and live tree-wide mutation tracking, including independent SDK execution and resumed children.
+    /// Original check restrictions are inherited from the driver; run-wide admission remains owned by the enclosing controller.
     async fn execute(
         &self,
         request: &ValidationObservationRequest,
@@ -305,6 +351,7 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                 "validation runtime identity mismatch".into(),
             ));
         }
+        super::invocation::InvocationScope::observation(self.agent.observation_mutation_clock()).scope(Box::pin(async {
         match request {
             ValidationObservationRequest::Plan { objective, .. } => {
                 let plan = self.agent.generate_plan(objective).await?;
@@ -406,6 +453,7 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                 })
             }
         }
+        })).await
     }
 }
 
@@ -471,6 +519,39 @@ where
         run_revision,
     };
     HOST_VALIDATION_PERMIT.scope(permit, future).await
+}
+
+/// Owned message recovery refreshes only an already installed exact operation after acknowledged journal progress.
+/// It cannot grant a different fallback tool or reconstruct authority from checkpoint data.
+pub(crate) async fn scope_message_recovery_authority<F, T>(
+    agent_id: &str,
+    request: &ToolExecutionRequest,
+    future: F,
+) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let permit = HOST_VALIDATION_PERMIT.try_with(Clone::clone).ok();
+    if let Some(mut permit) = permit {
+        if permit.agent_id != agent_id || permit.request.call_id != request.call_id {
+            return future.await;
+        }
+        let execution = super::current_execution().ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if permit.agent_id != agent_id
+            || permit.run_id != execution.run_id
+            || serde_json::to_value(&permit.request)? != serde_json::to_value(request)?
+        {
+            return Err(AgentError::Config(
+                "message recovery differs from installed host operation".into(),
+            ));
+        }
+        permit.run_revision = execution
+            .revision
+            .load(std::sync::atomic::Ordering::Acquire);
+        HOST_VALIDATION_PERMIT.scope(permit, future).await
+    } else {
+        future.await
+    }
 }
 
 // A live controller scope must match the permit's current run/revision; independent host SDK observations retain their existing contract.
@@ -540,4 +621,58 @@ pub(crate) fn validation_metadata(request: &ToolExecutionRequest) -> Option<Valu
         })
         .ok()
         .flatten()
+}
+
+#[cfg(test)]
+mod recovery_scope_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn fallback_acceptance_unrelated_inherited_permit_is_not_exported_or_refreshed() {
+        for agent_id in ["child", "parent"] {
+            let permit = HostValidationPermit {
+                agent_id: "parent".into(),
+                request: ToolExecutionRequest::new(
+                    "fixed-call",
+                    "fixed",
+                    json!({}),
+                    ToolCallSource::Task,
+                ),
+                binding: HostValidationBinding {
+                    id: "fixed".into(),
+                    validator: "validator".into(),
+                    version: 1,
+                    profile: None,
+                    scope: "task".into(),
+                    tool: "fixed".into(),
+                    arguments: json!({}),
+                    require_approval: false,
+                },
+                run_id: "run".into(),
+                run_revision: 0,
+            };
+            let request =
+                ToolExecutionRequest::new("child-call", "second", json!({}), ToolCallSource::Model);
+            let result = HOST_VALIDATION_PERMIT
+                .scope(
+                    permit,
+                    scope_message_recovery_authority(agent_id, &request, async {
+                        assert!(
+                            validation_extra_grant(agent_id, &request, "second", &json!({}))
+                                .is_none()
+                        );
+                        assert!(validation_arguments_valid(
+                            agent_id,
+                            &request,
+                            "second",
+                            &json!({})
+                        ));
+                        Ok(1usize)
+                    }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result, 1);
+        }
+    }
 }

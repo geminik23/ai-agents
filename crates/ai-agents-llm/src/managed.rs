@@ -34,6 +34,7 @@ struct Attempt {
     admission: Arc<dyn InvocationAdmission>,
     id: String,
     settled: bool,
+    dispatched: bool,
     bound: Option<ProviderCostBound>,
 }
 
@@ -46,6 +47,13 @@ impl Attempt {
         tools: Option<&LLMToolRequest>,
         streaming: bool,
     ) -> Result<Option<Self>, LLMError> {
+        if crate::validate_invocation_evidence().is_err()
+            || crate::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return Err(LLMError::Other(
+                "validation invocation deadline exceeded before provider admission".into(),
+            ));
+        }
         let Some(admission) = current_invocation_admission() else {
             return Ok(None);
         };
@@ -74,6 +82,7 @@ impl Attempt {
             admission,
             id,
             settled: false,
+            dispatched: false,
             bound,
         }))
     }
@@ -123,35 +132,69 @@ impl Drop for Attempt {
 
 // A deadline drop remains uncertain; only a returned provider result may be settled as known.
 async fn bounded_provider<F: Future>(
-    attempt: Option<&Attempt>,
+    mut attempt: Option<&mut Attempt>,
     future: F,
 ) -> Result<F::Output, LLMError> {
-    if let Some(attempt) = attempt {
-        if attempt.admission.execution_stopped() {
-            return Err(LLMError::Other("task execution stopped".into()));
+    let bounds = crate::current_invocation_bounds();
+    let admission = attempt.as_ref().map(|attempt| attempt.admission.clone());
+    if admission
+        .as_ref()
+        .is_some_and(|admission| admission.execution_stopped())
+    {
+        return Err(LLMError::Other("task execution stopped".into()));
+    }
+    let remaining = match (
+        admission
+            .as_ref()
+            .and_then(|admission| admission.remaining_duration()),
+        bounds.map(|b| b.remaining()),
+    ) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let work = async {
+        // Synchronous admission hooks and proof sampling can consume the allowance without yielding to an outer monitor.
+        let proof = crate::validate_invocation_evidence();
+        if proof.is_err() || bounds.is_some_and(|bounds| bounds.remaining().is_zero()) {
+            if let Some(attempt) = attempt.as_mut()
+                && !attempt.dispatched
+            {
+                attempt
+                    .settle(serde_json::json!({"not_invoked":true}))
+                    .await?;
+            }
+            return Err(LLMError::Other(
+                "validation proof or original deadline changed before provider dispatch".into(),
+            ));
         }
-        let remaining = attempt.admission.remaining_duration();
-        let monitored = async {
-            let mut future = Box::pin(future);
+        if let Some(attempt) = attempt.as_mut() {
+            attempt.dispatched = true;
+        }
+        Ok(future.await)
+    };
+    let monitored = async {
+        let mut work = Box::pin(work);
+        if let Some(admission) = admission {
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
             loop {
                 tokio::select! {
-                    result = &mut future => return Ok(result),
-                    _ = tick.tick() => if attempt.admission.execution_stopped() {
+                    result = &mut work => return result,
+                    _ = tick.tick() => if admission.execution_stopped() {
                         return Err(LLMError::Other("task execution stopped".into()));
                     }
                 }
             }
-        };
-        return if let Some(duration) = remaining {
-            tokio::time::timeout(duration, monitored)
-                .await
-                .map_err(|_| LLMError::Other("task provider deadline exceeded".into()))?
         } else {
-            monitored.await
-        };
+            work.await
+        }
+    };
+    if let Some(duration) = remaining {
+        tokio::time::timeout(duration, monitored)
+            .await
+            .map_err(|_| LLMError::Other("task provider deadline exceeded".into()))?
+    } else {
+        monitored.await
     }
-    Ok(future.await)
 }
 
 /// Accounts direct borrowed auxiliary providers without replacing captured handles or charging an already managed layer twice.
@@ -160,11 +203,11 @@ pub async fn managed_completion(
     messages: &[ChatMessage],
     config: Option<&LLMConfig>,
 ) -> Result<LLMResponse, LLMError> {
-    if current_invocation_admission().is_none() || provider.manages_invocation_admission() {
+    if provider.manages_invocation_admission() {
         return provider.complete(messages, config).await;
     }
     let mut attempt = Attempt::admit(provider, messages, config, None, false).await?;
-    let result = bounded_provider(attempt.as_ref(), provider.complete(messages, config)).await?;
+    let result = bounded_provider(attempt.as_mut(), provider.complete(messages, config)).await?;
     if let Some(attempt) = &mut attempt {
         attempt.settle_response(provider, &result).await?;
     }
@@ -195,7 +238,7 @@ impl LLMProvider for ManagedProvider {
         let mut attempt =
             Attempt::admit(self.inner.as_ref(), messages, config, None, false).await?;
         let result =
-            bounded_provider(attempt.as_ref(), self.inner.complete(messages, config)).await?;
+            bounded_provider(attempt.as_mut(), self.inner.complete(messages, config)).await?;
         if let Some(attempt) = &mut attempt {
             attempt
                 .settle_response(self.inner.as_ref(), &result)
@@ -214,7 +257,7 @@ impl LLMProvider for ManagedProvider {
         let mut attempt =
             Attempt::admit(self.inner.as_ref(), messages, config, Some(request), false).await?;
         let result = bounded_provider(
-            attempt.as_ref(),
+            attempt.as_mut(),
             self.inner.complete_with_tools(messages, config, request),
         )
         .await?;
@@ -233,9 +276,11 @@ impl LLMProvider for ManagedProvider {
         config: Option<&LLMConfig>,
     ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
     {
+        let bounds = crate::current_invocation_bounds();
+        let evidence = crate::current_invocation_evidence();
         let mut attempt = Attempt::admit(self.inner.as_ref(), messages, config, None, true).await?;
         let source = match bounded_provider(
-            attempt.as_ref(),
+            attempt.as_mut(),
             self.inner.complete_stream(messages, config),
         )
         .await?
@@ -250,42 +295,54 @@ impl LLMProvider for ManagedProvider {
                 return Err(error);
             }
         };
-        if attempt.is_none() {
+        if attempt.is_none() && bounds.is_none() && evidence.is_empty() {
             return Ok(source);
         }
         use futures::StreamExt;
         let stream = futures::stream::unfold(
-            (source, attempt, false),
-            |(mut source, mut attempt, done)| async move {
-                if done {
-                    return None;
-                }
-                let next = match bounded_provider(attempt.as_ref(), source.next()).await {
-                    Ok(next) => next,
-                    Err(error) => return Some((Err(error), (source, attempt, true))),
-                };
-                match next {
-                    Some(Ok(chunk)) => Some((Ok(chunk), (source, attempt, false))),
-                    Some(Err(error)) => {
-                        let settlement = attempt
-                            .as_mut()
-                            .unwrap()
-                            .settle(serde_json::json!({"error":error.to_string()}))
-                            .await;
-                        Some((
-                            Err(settlement.err().unwrap_or(error)),
-                            (source, attempt, true),
-                        ))
+            (source, attempt, false, bounds),
+            move |(mut source, mut attempt, done, bounds)| {
+                let evidence = evidence.clone();
+                async move {
+                    if done {
+                        return None;
                     }
-                    None => {
-                        match attempt
-                            .as_mut()
-                            .unwrap()
-                            .settle(serde_json::json!({"stream_finished":true}))
-                            .await
-                        {
-                            Ok(()) => None,
-                            Err(error) => Some((Err(error), (source, attempt, true))),
+                    let next = match crate::scope_invocation_evidence(
+                        evidence,
+                        crate::scope_invocation_bounds(
+                            bounds,
+                            bounded_provider(attempt.as_mut(), source.next()),
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(next) => next,
+                        Err(error) => return Some((Err(error), (source, attempt, true, bounds))),
+                    };
+                    match next {
+                        Some(Ok(chunk)) => Some((Ok(chunk), (source, attempt, false, bounds))),
+                        Some(Err(error)) => {
+                            let settlement = if let Some(attempt) = &mut attempt {
+                                attempt
+                                    .settle(serde_json::json!({"error":error.to_string()}))
+                                    .await
+                            } else {
+                                Ok(())
+                            };
+                            Some((
+                                Err(settlement.err().unwrap_or(error)),
+                                (source, attempt, true, bounds),
+                            ))
+                        }
+                        None => {
+                            if let Some(admitted) = &mut attempt
+                                && let Err(error) = admitted
+                                    .settle(serde_json::json!({"stream_finished":true}))
+                                    .await
+                            {
+                                return Some((Err(error), (source, attempt, true, bounds)));
+                            }
+                            None
                         }
                     }
                 }

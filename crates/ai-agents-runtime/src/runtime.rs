@@ -745,6 +745,8 @@ pub struct RuntimeAgent {
     background_maintenance: Arc<BackgroundMaintenanceQueue>,
     /// Cross-tool locks for side-effecting calls that target the same resource.
     resource_locks: ToolResourceLocks,
+    /// Live mutation clock for independent production observations, including ordinary calls on this runtime.
+    observation_mutations: Arc<AtomicU64>,
     /// Host-only runtime control state.
     runtime_control: Arc<RuntimeControlState>,
     /// Serializes independent externally initiated root turns across blocking and streaming APIs.
@@ -1012,6 +1014,7 @@ impl RuntimeAgent {
             runtime_config: RuntimeConfig::default(),
             background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
             resource_locks: new_tool_resource_locks(),
+            observation_mutations: Arc::new(AtomicU64::new(0)),
             runtime_control: Arc::new(RuntimeControlState::default()),
             root_turn_gate,
             autonomy_owner: Arc::new(RwLock::new(None)),
@@ -1045,13 +1048,18 @@ impl RuntimeAgent {
                 .collect(),
             judge: self.llm_registry.default().is_ok(),
             planner: self.llm_registry.default().is_ok(),
-            host_revisions: false,
+            host_revisions: self.autonomy_extensions.has_host_revisions(),
         }
     }
 
     /// Capability presence does not authorize a call; host-bound calls retain the complete shared execution path.
     pub(crate) fn validation_operation_available(&self, tool: &str) -> bool {
         self.tools.resolve(tool).is_some() && self.host_tool_unavailability(tool).is_none()
+    }
+
+    /// Retains mutation freshness across independent SDK driver round trips without constructing a task ledger.
+    pub(crate) fn observation_mutation_clock(&self) -> Arc<AtomicU64> {
+        self.observation_mutations.clone()
     }
 
     /// Provides frozen adapters for selected-profile preflight without replacing live bindings.
@@ -1776,10 +1784,20 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Executes an admitted controller turn while retaining native history, redispatch ownership and one finalizer.
+    /// Executes one admitted ordinary controller turn while retaining the native root owner and a single finalizer.
     pub(crate) async fn run_autonomy_turn(
         &self,
         input: crate::autonomy::AutonomyTurnInput,
+    ) -> Result<AgentResponse> {
+        Box::pin(self.run_autonomy_turn_with_skill(input, None, None)).await
+    }
+
+    /// Resumes a capacity-denied script or model loop under the same root gate without replaying completed work or resetting iterations.
+    pub(crate) async fn run_autonomy_turn_with_skill(
+        &self,
+        input: crate::autonomy::AutonomyTurnInput,
+        skill: Option<Box<crate::autonomy::location::TaskSkillLocation>>,
+        model: Option<Box<crate::autonomy::TaskLoopState>>,
     ) -> Result<AgentResponse> {
         let active = self.autonomy_owner.read().clone();
         if active
@@ -1811,9 +1829,17 @@ impl RuntimeAgent {
         let identities: RootTurnGateIdentityStack = identities.into();
         let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(input.owner.clone());
         let objective = input.objective.clone();
+        let work: Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> =
+            if let Some(skill) = skill {
+                self.resume_capacity_skill(skill)
+            } else if let Some(model) = model {
+                self.resume_capacity_model(model)
+            } else {
+                Box::pin(self.run_loop(&objective))
+            };
         let result = scope_runtime_gate_identity_stack(
             &identities,
-            crate::autonomy::scope_turn(input, Box::pin(self.run_loop(&objective))),
+            crate::autonomy::scope_turn(input, work),
         )
         .await;
         cleanup.finish();
@@ -3382,7 +3408,7 @@ impl RuntimeAgent {
         }
     }
 
-    /// Performs the single rate admission after locks are held and rejects changed runtime, policy, or state authority.
+    /// Performs lock-held rate admission only while original observation bounds, pinned proof and runtime/policy/state authority remain valid.
     fn admit_tool_execution(
         &self,
         expected_runtime_version: u64,
@@ -3417,6 +3443,18 @@ impl RuntimeAgent {
         if current_state_generation != expected_state_generation {
             return SecurityCheckResult::Block {
                 reason: "state scope changed before admission".to_string(),
+            };
+        }
+        if ai_agents_llm::current_invocation_bounds()
+            .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return SecurityCheckResult::Block {
+                reason: "validation deadline expired before rate admission".into(),
+            };
+        }
+        if ai_agents_llm::validate_invocation_evidence().is_err() {
+            return SecurityCheckResult::Block {
+                reason: "validation input proof changed before rate admission".into(),
             };
         }
         security_engine.admit_tool_execution(canonical_id)
@@ -5728,7 +5766,8 @@ impl RuntimeAgent {
         )
     }
 
-    /// Builds evidence with the exact generations used by the corresponding decision.
+    /// Builds evidence with the exact generations and logical executor-hop identity used by the corresponding decision.
+    /// Retained task timing starts at the original lifecycle, not the most recent host resume.
     #[allow(clippy::too_many_arguments)]
     fn record_from_parts_at(
         &self,
@@ -5740,13 +5779,21 @@ impl RuntimeAgent {
         executed: bool,
         success: bool,
         output: String,
-        metadata: HashMap<String, Value>,
+        mut metadata: HashMap<String, Value>,
         policy: ToolPolicyDecisionRecord,
         approval: Option<ToolApprovalRecord>,
         timed_out: bool,
         output_truncated: bool,
         versions: ToolDecisionVersions,
     ) -> ToolExecutionRecord {
+        if let Some(cursor) = crate::autonomy::suspension::executor_progress()
+            && crate::autonomy::current_execution().is_some()
+        {
+            metadata.insert(
+                "_task_executor_hop".into(),
+                serde_json::json!(cursor.ancestry.len()),
+            );
+        }
         ToolExecutionRecord {
             call_id: request.call_id.clone(),
             requested_name: request.requested_name.clone(),
@@ -5764,7 +5811,15 @@ impl RuntimeAgent {
             policy,
             approval,
             started_at,
-            duration_ms: start.elapsed().as_millis() as u64,
+            duration_ms: if crate::autonomy::current_execution().is_some()
+                && crate::autonomy::suspension::executor_progress()
+                    .is_some_and(|cursor| cursor.started_at.is_some())
+            {
+                u64::try_from((chrono::Utc::now() - started_at).num_milliseconds().max(0))
+                    .unwrap_or(u64::MAX)
+            } else {
+                start.elapsed().as_millis() as u64
+            },
             timed_out,
             cancelled: false,
             cancellation_reason: None,
@@ -5772,8 +5827,12 @@ impl RuntimeAgent {
         }
     }
 
-    /// Acknowledges task evidence before hooks; persistence failure stops later admission and cannot establish completion.
+    /// Captures actual-hop mutation freshness before hooks or persistence waits; failed task evidence acknowledgement blocks later admission.
     async fn finish_tool_record(&self, record: &ToolExecutionRecord) {
+        crate::autonomy::invocation::capture_observation_mutation(
+            record,
+            &self.observation_mutations,
+        );
         if let Some(execution) = crate::autonomy::current_execution()
             && let Err(error) = Box::pin(execution.capture_tool_record(record, &self.info.id)).await
         {
@@ -5867,7 +5926,8 @@ impl RuntimeAgent {
         Ok((limits, timeout))
     }
 
-    /// Reserves each actual task attempt after final policy admission, then settles it before publishing execution evidence.
+    /// Reserves each actual task attempt after policy admission and rechecks original observation bounds and pinned host proof before first poll.
+    /// Expiry before invocation settles as non-invocation; already dispatched effects retain their existing settlement and uncertainty contract.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
@@ -5875,6 +5935,16 @@ impl RuntimeAgent {
         mut ctx: ToolExecutionContext,
         timeout: ValidatedToolTimeout,
     ) -> Result<(ToolResult, bool, bool, bool)> {
+        if ai_agents_llm::current_invocation_bounds()
+            .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return Ok((
+                ToolResult::error("Validation invocation deadline exceeded"),
+                true,
+                false,
+                false,
+            ));
+        }
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
             return Ok((
                 ToolResult::error("Tool execution cancelled by runtime control"),
@@ -5921,15 +5991,27 @@ impl RuntimeAgent {
         }
         let mut admitted_footprint = None;
         let attempt = if let Some(execution) = &execution {
-            let (id, footprint) =
-                Box::pin(execution.admit_tool(tool.as_ref(), &args, &ctx)).await?;
+            let admission = Box::pin(execution.admit_tool(tool.as_ref(), &args, &ctx)).await;
+            let (id, footprint) = match admission {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    if let Some(request) = execution.park_capacity(&self.info.id, &ctx, &args)? {
+                        return Err(AgentError::TaskSuspended(request));
+                    }
+                    return Err(error);
+                }
+            };
             admitted_footprint = footprint;
             Some(id)
         } else {
             None
         };
+        let bounds = ai_agents_llm::current_invocation_bounds();
         let timer_duration = execution.as_ref().map_or(timeout.timer, |run| {
             timeout.timer.min(run.remaining_duration())
+        });
+        let timer_duration = bounds.map_or(timer_duration, |bounds| {
+            timer_duration.min(bounds.remaining())
         });
         let deadline_delta = if timer_duration == timeout.timer {
             timeout.deadline_delta
@@ -5953,7 +6035,9 @@ impl RuntimeAgent {
         } else {
             false
         };
-        if footprint_changed
+        if ai_agents_llm::validate_invocation_evidence().is_err()
+            || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+            || footprint_changed
             || execution.as_ref().is_some_and(|run| {
                 !run.progress_allows(&args, &ctx)
                     || !run.allows_tool(&ctx.canonical_id)
@@ -5996,10 +6080,23 @@ impl RuntimeAgent {
         let mut future = Box::pin(crate::autonomy::message::scope_message(
             message_invocation,
             async move {
+                // Final synchronous host checks may consume time without yielding to the driver's timeout monitor.
+                if ai_agents_llm::validate_invocation_evidence().is_err()
+                    || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+                {
+                    return Ok(ToolResult::error(
+                        "Validation proof or original deadline changed before tool dispatch",
+                    ));
+                }
                 if let Some(custody) = &custody_for_future {
                     custody.store(true, Ordering::SeqCst);
                 }
                 invoked_by_future.store(true, Ordering::SeqCst);
+                if !ctx.classification.read_only {
+                    crate::autonomy::invocation::start_observation_mutation(
+                        &self.observation_mutations,
+                    );
+                }
                 if let Some(answer) = question_result {
                     return Ok(tool.execute_task_question(args, answer, ctx).await);
                 }
@@ -6036,11 +6133,12 @@ impl RuntimeAgent {
                     }
                     let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
                     if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
-                        Box::pin(execution.settle(attempt, serde_json::to_value(&result)?, false)).await?;
+                        let settlement = if invoked.load(Ordering::SeqCst) { serde_json::to_value(&result)? } else { serde_json::json!({"not_invoked":true}) };
+                        Box::pin(execution.settle(attempt, settlement, false)).await?;
                         execution.retire_completed_message(&self.info.id, attempt);
                     }
                     if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
-                    return Ok((result, false, false, true));
+                    return Ok((result, false, false, invoked.load(Ordering::SeqCst)));
                 }
                 _ = &mut timer => {
                     drop(future);
@@ -6124,7 +6222,7 @@ impl RuntimeAgent {
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
-                        if self.runtime_control.emergency_deny.load(Ordering::SeqCst) || execution.as_ref().is_some_and(|run| ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())) {
+                        if ai_agents_llm::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero()) || self.runtime_control.emergency_deny.load(Ordering::SeqCst) || execution.as_ref().is_some_and(|run| ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())) {
                             drop(lock);
                             drop(locks);
                             drop(resource_guards);
@@ -6137,7 +6235,8 @@ impl RuntimeAgent {
         Some(resource_guards)
     }
 
-    /// Executes retry sub-attempts inside one logical executor request while assigning every invocation a fresh deadline.
+    /// Executes retry sub-attempts inside one logical executor request while assigning every new invocation a fresh deadline.
+    /// A settled retained-message result consumes no new attempt and continues from its captured retry index.
     ///
     /// Hooks and `ToolExecutionRecord` finalization remain request-level and occur once after this retry loop returns.
     async fn run_tool_with_retries(
@@ -6154,13 +6253,27 @@ impl RuntimeAgent {
         } else {
             0
         };
-        let mut attempts = 0;
-        let mut invoked = false;
+        let progress = crate::autonomy::suspension::executor_progress();
+        let mut attempts = progress.as_ref().map_or(0, |cursor| cursor.retry_index);
+        let mut invoked = progress.as_ref().is_some_and(|cursor| cursor.invoked);
         loop {
-            let (result, timed_out, cancelled, attempt_invoked) = Box::pin(
-                self.execute_resolved_tool_once(tool.clone(), args.clone(), ctx.clone(), timeout),
-            )
-            .await?;
+            crate::autonomy::suspension::update_executor_progress(|cursor| {
+                cursor.retry_index = attempts;
+                cursor.invoked = invoked;
+            });
+            let (result, timed_out, cancelled, attempt_invoked) = if let Some(result) =
+                crate::autonomy::suspension::take_settled_tool_result(&ctx.call_id)
+            {
+                (result, false, false, true)
+            } else {
+                Box::pin(self.execute_resolved_tool_once(
+                    tool.clone(),
+                    args.clone(),
+                    ctx.clone(),
+                    timeout,
+                ))
+                .await?
+            };
             invoked |= attempt_invoked;
             if result.success || timed_out || cancelled || attempts >= max_retries {
                 return Ok((result, timed_out, cancelled, invoked));
@@ -6192,20 +6305,28 @@ impl RuntimeAgent {
     /// Executes a tool request through scope, policy, HITL, timeout, bounded recovery, and evidence recording.
     /// Each fallback hop installs its own private request scope in the inner driver, without duplicating a large outer record-return frame.
     /// A retained resume cursor selects only the actual pending hop so completed failed ancestors and their admission are not replayed.
+    /// Cursor consumption happens when polled, after the caller's private response and executor scopes are installed.
     fn execute_tool_record(
         &self,
         request: ToolExecutionRequest,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
-        if let Some(cursor) = crate::autonomy::suspension::take_resumed_executor(&request.call_id) {
-            self.execute_tool_record_inner(
-                cursor.request,
-                ToolFallbackState {
-                    visited_canonical_ids: cursor.ancestry,
-                },
-            )
-        } else {
-            self.execute_tool_record_inner(request, ToolFallbackState::default())
-        }
+        Box::pin(async move {
+            if let Some(cursor) =
+                crate::autonomy::suspension::take_resumed_executor(&request.call_id)
+            {
+                self.execute_tool_record_inner(
+                    cursor.request.clone(),
+                    ToolFallbackState {
+                        visited_canonical_ids: cursor.ancestry.clone(),
+                    },
+                    Some(cursor),
+                )
+                .await
+            } else {
+                self.execute_tool_record_inner(request, ToolFallbackState::default(), None)
+                    .await
+            }
+        })
     }
 
     /// Implements one logical shared-executor request while preserving policy, HITL, availability, final admission, hooks, retry evidence, and bounded fallback ordering.
@@ -6218,36 +6339,51 @@ impl RuntimeAgent {
         &self,
         request: ToolExecutionRequest,
         fallback_state: ToolFallbackState,
+        mut resumed: Option<crate::autonomy::suspension::TaskExecutorCursor>,
     ) -> Pin<Box<dyn Future<Output = Result<ToolExecutionRecord>> + Send + '_>> {
         Box::pin(async move {
             let mut next = (request, fallback_state);
             loop {
                 let (request, fallback_state) = next;
-                let parked = crate::autonomy::suspension::TaskExecutorCursor {
-                    request: request.clone(),
-                    ancestry: fallback_state.visited_canonical_ids.clone(),
-                };
+                let parked = resumed.take().unwrap_or_else(|| {
+                    crate::autonomy::suspension::TaskExecutorCursor::new(
+                        request.clone(),
+                        fallback_state.visited_canonical_ids.clone(),
+                    )
+                });
                 let result = TOOL_FALLBACK_REQUEST
                     .scope(std::cell::RefCell::new(None), async {
                         let work = Box::pin(
                             self.execute_tool_record_scoped(request.clone(), fallback_state),
                         );
+                        let work = crate::autonomy::scope_task_request(request.clone(), work);
+                        let work = async {
+                            match work.await {
+                                Err(error @ AgentError::TaskSuspended(_)) => {
+                                    let cursor = crate::autonomy::suspension::executor_progress()
+                                        .ok_or(
+                                        crate::autonomy::TaskRunStorageError::InvalidCheckpoint,
+                                    )?;
+                                    if let Some(execution) = crate::autonomy::current_execution() {
+                                        execution.parked_executor_cursors.lock().insert(
+                                            (self.info.id.clone(), cursor.request.call_id.clone()),
+                                            cursor,
+                                        );
+                                    }
+                                    Err(error)
+                                }
+                                result => result,
+                            }
+                        };
                         let record =
-                            Box::pin(crate::autonomy::scope_task_request(request, work)).await?;
+                            crate::autonomy::suspension::scope_executor_progress(parked, work)
+                                .await?;
                         let successor = TOOL_FALLBACK_REQUEST.with(|slot| slot.borrow_mut().take());
                         Ok::<_, AgentError>((record, successor))
                     })
                     .await;
                 let (record, successor) = match result {
-                    Err(error @ AgentError::TaskSuspended(_)) => {
-                        if let Some(execution) = crate::autonomy::current_execution() {
-                            execution.parked_executor_cursors.lock().insert(
-                                (self.info.id.clone(), parked.request.call_id.clone()),
-                                parked,
-                            );
-                        }
-                        return Err(error);
-                    }
+                    Err(error @ AgentError::TaskSuspended(_)) => return Err(error),
                     result => result?,
                 };
                 if let Some(successor) = successor {
@@ -6260,6 +6396,8 @@ impl RuntimeAgent {
     }
 
     // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
+    // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
+    // Task question rejection is recorded before invocation and never manufactures an answer or consumes a tool slot.
     async fn execute_tool_record_scoped(
         &self,
         request: ToolExecutionRequest,
@@ -6267,7 +6405,9 @@ impl RuntimeAgent {
     ) -> Result<ToolExecutionRecord> {
         let _mutations = self.autonomy_mutations.read().await;
         self.check_autonomy_operation()?;
-        let started_at = chrono::Utc::now();
+        let started_at = crate::autonomy::suspension::executor_progress()
+            .and_then(|cursor| cursor.started_at)
+            .unwrap_or_else(chrono::Utc::now);
         let start = Instant::now();
         info!(tool = %request.requested_name, args = %request.arguments, "Executing tool");
 
@@ -6404,9 +6544,16 @@ impl RuntimeAgent {
             &classification,
             initial_recovery_timeout_ms,
         )?;
-        self.hooks
-            .on_tool_start(&canonical_id, &executed_arguments)
-            .await;
+        if crate::autonomy::suspension::executor_progress()
+            .is_none_or(|cursor| cursor.started_at.is_none())
+        {
+            self.hooks
+                .on_tool_start(&canonical_id, &executed_arguments)
+                .await;
+            crate::autonomy::suspension::update_executor_progress(|cursor| {
+                cursor.started_at = Some(started_at)
+            });
+        }
         metadata.insert(
             "classification".to_string(),
             serde_json::to_value(&classification).unwrap_or(Value::Null),
@@ -7406,6 +7553,22 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
+        // Rejecting a question supplies no fabricated answer and consumes no invocation slot; independent escalation can still satisfy task gates.
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.rejects_question()
+            && resolved.tool.task_question(&final_arguments)?.is_some()
+        {
+            let reason = "Task profile rejects required user input".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+                versions,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
         // Park validated questions before locks and atomic rate admission, which belong only to an actual invocation.
         // The answer is bound to final approved arguments and is consumed only after resumed authorization succeeds.
         if let Some(execution) = crate::autonomy::current_execution()
@@ -7558,7 +7721,10 @@ impl RuntimeAgent {
         //
         // Runtime cancellation is terminal for the logical request. Recovery fallback must not mask the cancelled record or start new work after the host asked active execution to stop.
         //
-        let fallback_tool = if !result.success && !cancelled {
+        let fallback_tool = if !result.success
+            && !cancelled
+            && !(timed_out && invoked && crate::autonomy::current_execution().is_some())
+        {
             match &tool_config.on_failure {
                 ToolFailureAction::Skip => {
                     result = ToolResult::ok(format!(
@@ -7648,8 +7814,16 @@ impl RuntimeAgent {
     // This method is branch-safe because it only asks the router which skill matches.
     // Do not add disambiguation, pending-skill writes, or skill execution here.
     //
-    /// Selects a skill without executing it.
+    /// Selects a skill without executing it; an explicitly admitted task skill bypasses only semantic selection, never scope or execution checks.
     async fn select_skill_candidate(&self, input: &str) -> Result<Option<SkillCandidate>> {
+        if let Some(turn) = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            && turn.initial_work()
+            && let Some(skill) = turn.owner.skill.read().clone()
+        {
+            self.validate_autonomy_skill_binding(&skill)?;
+            let available = self.admit_autonomy_skill(&skill.id)?;
+            return Ok(Some(SkillCandidate::new(available.id.clone(), available)));
+        }
         let Some(ref router) = self.skill_router else {
             return Ok(None);
         };
@@ -7675,10 +7849,8 @@ impl RuntimeAgent {
         Ok(Some(SkillCandidate::new(skill_id, skill)))
     }
 
-    //
-    // This is the commit half of skill routing.
-    // It may mutate pending skill state, run clarification, and execute skill steps.
-    //
+    /// Commits selected skill routing, clarification and execution without replaying a completed selection.
+    /// Task generation invalidation preserves newer manager exchanges while ordinary chat retains its reset behavior.
     async fn commit_skill_candidate_route_result(
         &self,
         candidate: SkillCandidate,
@@ -7720,8 +7892,10 @@ impl RuntimeAgent {
             if current_state_generation != expected_state_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
+                if crate::autonomy::current_execution().is_none() {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                }
                 return Err(AgentError::Other(
                     "State or reset ownership changed during skill disambiguation".to_string(),
                 ));
@@ -7850,7 +8024,9 @@ impl RuntimeAgent {
         &'a self,
         input: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<SkillRouteResult>> + Send + 'a>> {
-        if self.skill_router.is_none() {
+        let explicit = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| turn.initial_work() && turn.owner.skill.read().is_some());
+        if self.skill_router.is_none() && !explicit {
             return Box::pin(async { Ok(SkillRouteResult::NoMatch) });
         }
         Box::pin(self.try_skill_route_inner(input))
@@ -10535,6 +10711,7 @@ Respond in JSON format:
     }
 
     /// Installed-manager work retains original task input and skill positions through escalation; exhausted tasks stop before completion gates.
+    /// In-flight task generation changes fail without clearing manager state because a trusted host may have installed a newer exchange.
     /// Its optional future is constructed outside unrelated nested model polling frames.
     async fn resolve_disambiguation_inner(&self, input: &str) -> Result<DisambiguationDispatch> {
         let Some(ref disambiguator) = self.disambiguation_manager else {
@@ -10572,6 +10749,11 @@ Respond in JSON format:
         if current_state_generation != state_generation
             || self.disambiguation_epoch.load(Ordering::SeqCst) != disambiguation_epoch
         {
+            if crate::autonomy::current_execution().is_some() {
+                return Err(AgentError::Other(
+                    "Task clarification ownership changed during semantic work".into(),
+                ));
+            }
             disambiguator.clear_pending().await;
             *self.pending_skill_id.write() = None;
             disambiguation_result = DisambiguationResult::Abandoned { new_input: None };
@@ -11023,6 +11205,7 @@ Respond in JSON format:
     /// This method re-runs the skill's disambiguation pass.
     /// If fields are still missing, it returns the new clarification question and keeps pending_skill_id set.
     /// If all fields are present (Clear), it executes the skill and returns the response.
+    /// Task invalidation keeps manager state protected rather than clearing a possibly replaced exchange.
     async fn recheck_skill_disambiguation(
         &self,
         skill_id: &str,
@@ -11066,8 +11249,10 @@ Respond in JSON format:
             if current_state_generation != expected_state_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != expected_disambiguation_epoch
             {
-                disambiguator.clear_pending().await;
-                *self.pending_skill_id.write() = None;
+                if crate::autonomy::current_execution().is_none() {
+                    disambiguator.clear_pending().await;
+                    *self.pending_skill_id.write() = None;
+                }
                 return Err(AgentError::Other(
                     "State or reset ownership changed during skill disambiguation recheck"
                         .to_string(),
@@ -11288,6 +11473,29 @@ Respond in JSON format:
         input_context: &HashMap<String, Value>,
         auto_detected: bool,
     ) -> Result<AgentResponse> {
+        let plan = self.generate_plan(processed_input).await?;
+        Box::pin(self.continue_plan_and_execute(
+            processed_input,
+            input_context,
+            auto_detected,
+            plan,
+            0,
+            None,
+        ))
+        .await
+    }
+
+    /// Adopts a frozen plan only after required review, preserving the reflection attempt and completed prior effects across pauses.
+    /// A review resumes this boundary without rerouting, regenerating the proposal or resetting the root user commit.
+    async fn continue_plan_and_execute(
+        &self,
+        processed_input: &str,
+        input_context: &HashMap<String, Value>,
+        auto_detected: bool,
+        mut plan: Plan,
+        first_attempt: u32,
+        mut reviewed: Option<crate::autonomy::interaction::TaskInteraction>,
+    ) -> Result<AgentResponse> {
         let effective = self.get_effective_reasoning_config();
         let plan_reflection = effective
             .get_planning()
@@ -11300,18 +11508,86 @@ Respond in JSON format:
             1
         };
 
-        let mut plan = self.generate_plan(processed_input).await?;
-        info!(
-            plan_id = %plan.id,
-            steps = plan.steps.len(),
-            "Plan generated"
-        );
-
         let mut plan_result = String::new();
-
-        for attempt in 0..max_attempts {
+        for attempt in first_attempt..max_attempts {
+            if reviewed.is_none()
+                && crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
+                && crate::autonomy::current_execution().is_some_and(|execution| {
+                    execution
+                        .lifecycle_profile()
+                        .supervision
+                        .as_ref()
+                        .is_some_and(|policy| {
+                            policy.plan_changes
+                                == Some(crate::autonomy::ReviewPolicy::RequireApproval)
+                        })
+                })
+            {
+                let mut approval = ai_agents_hitl::ApprovalRequest::new(
+                    ApprovalTrigger::condition("plan_supervision", &plan.id),
+                    "Review the proposed plan before applying it",
+                )
+                .with_context(HashMap::from([(
+                    "plan".into(),
+                    serde_json::to_value(&plan)?,
+                )]));
+                approval.timeout = self.task_review_timeout();
+                self.park_task_interaction(
+                    crate::autonomy::interaction::TaskInteractionKind::PlanReview {
+                        plan: plan.clone(),
+                        attempt,
+                        processed_input: processed_input.into(),
+                        input_context: input_context.clone(),
+                        auto_detected,
+                        reasoning_config: serde_json::to_value(&effective)?,
+                    },
+                    Some(approval),
+                    None,
+                )
+                .await?;
+                return Err(AgentError::Config(
+                    "required plan supervision did not retain its proposal".into(),
+                ));
+            }
+            let accepted_review = reviewed.take();
+            if let Some(review) = &accepted_review {
+                match self.validate_task_plan_review(review) {
+                    Err(AgentError::HITLTimeout) => {
+                        return self.finish_expired_task_response().await;
+                    }
+                    other => other?,
+                }
+            }
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.update(|payload| {
+                    payload.evidence.records.push(crate::autonomy::TaskEvidenceRecord {
+                        run_id: execution.run_id.clone(), sequence: payload.evidence.records.len() as u64,
+                        stage: payload.stage.clone(), attempt: Some(format!("{}:{attempt}", plan.id)), origin: "runtime.plan.adopt".into(),
+                        data: serde_json::json!({"objective_revision":payload.objective_revision,"plan":plan}),
+                    });
+                    Ok(())
+                }).await?;
+            }
+            if let Some(review) = &accepted_review {
+                match self.validate_task_plan_review(review) {
+                    Err(AgentError::HITLTimeout) => {
+                        return self.finish_expired_task_response().await;
+                    }
+                    other => other?,
+                }
+            }
             *self.current_plan.write() = Some(plan.clone());
             plan_result = self.execute_plan(&mut plan).await?;
+            if let Some(execution) = crate::autonomy::current_execution() {
+                execution.update(|payload| {
+                    payload.evidence.records.push(crate::autonomy::TaskEvidenceRecord {
+                        run_id: execution.run_id.clone(), sequence: payload.evidence.records.len() as u64,
+                        stage: payload.stage.clone(), attempt: Some(format!("{}:{attempt}", plan.id)), origin: "runtime.plan.result".into(),
+                        data: serde_json::json!({"objective_revision":payload.objective_revision,"plan":plan,"result":plan_result}),
+                    });
+                    Ok(())
+                }).await?;
+            }
 
             info!(
                 plan_status = ?plan.status,
@@ -11359,9 +11635,6 @@ Respond in JSON format:
 
         self.check_memory_compression().await?;
         self.increment_turn();
-        self.evaluate_transitions(processed_input, &final_content)
-            .await?;
-
         let reasoning_metadata =
             ReasoningMetadata::new(ReasoningMode::PlanAndExecute).with_auto_detected(auto_detected);
 
@@ -11370,6 +11643,18 @@ Respond in JSON format:
             serde_json::to_value(&reasoning_metadata).unwrap_or_default(),
         );
 
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+            crate::autonomy::location::scope_state_return(
+                crate::autonomy::location::TaskStateReturn::PlanFinish {
+                    response: response.clone(),
+                },
+                Box::pin(self.evaluate_transitions(processed_input, &final_content)),
+            )
+            .await?;
+        } else {
+            self.evaluate_transitions(processed_input, &final_content)
+                .await?;
+        }
         self.finish_turn_if_root(&response).await?;
         Ok(response)
     }
@@ -14357,11 +14642,26 @@ Respond in JSON format:
 
     /// Preserves ordinary approval waits; opted-in executable batches transfer control before hooks or host interaction.
     /// Live waits remain bounded by cancellation/time, while only an acknowledged exact checkpoint establishes a safe pause.
+    /// Explicit reject/policy-only task profiles cannot satisfy a still-required human approval, including during resumed work.
     async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
             return Ok(ApprovalResult::Approved);
         };
 
+        // Profile auto-if-policy never approves a request that the current policy/HITL boundary still requires a human to review.
+        if crate::autonomy::current_execution().is_some_and(|execution| {
+            matches!(
+                execution.task_interaction_policy(),
+                Some(
+                    crate::autonomy::InteractionAction::Reject
+                        | crate::autonomy::InteractionAction::AutoIfPolicy
+                )
+            )
+        }) {
+            return Ok(ApprovalResult::Rejected {
+                reason: Some("Task profile does not authorize required human approval".into()),
+            });
+        }
         if let Some(result) = crate::autonomy::suspension::take_resumed_approval(&request)? {
             return Ok(result);
         }

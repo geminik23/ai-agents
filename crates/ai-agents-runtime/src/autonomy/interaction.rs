@@ -19,6 +19,14 @@ pub(crate) struct TaskModelCalls {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TaskInteractionKind {
+    PlanReview {
+        plan: ai_agents_reasoning::Plan,
+        attempt: u32,
+        processed_input: String,
+        input_context: HashMap<String, Value>,
+        auto_detected: bool,
+        reasoning_config: Value,
+    },
     StateApproval {
         from_state: String,
         target: String,
@@ -74,6 +82,10 @@ pub(crate) struct TaskInteraction {
     pub source: AutonomyTurnSource,
     pub user_message_committed: bool,
     pub native_exchanges: Vec<TaskNativeExchange>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl TaskInteraction {
@@ -94,6 +106,11 @@ impl TaskInteraction {
     /// Structural progress is checked separately from the live manager, state definition and root owner.
     pub(crate) fn validate(&self, batch: &TaskBatchState) -> Result<()> {
         if self.id.is_empty()
+            || self.request_id.as_ref().is_some_and(|id| {
+                batch.approvals.first().is_none_or(|approval| {
+                    &approval.request_id != id || approval.expires_at != self.expires_at
+                })
+            })
             || !batch.calls.is_empty()
             || !batch.results.is_empty()
             || !batch.content.is_empty()

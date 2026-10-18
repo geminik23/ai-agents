@@ -173,7 +173,8 @@ async fn priced_matching_usage_releases_unused_bound_and_persists_identity() {
             .all(|reservation| reservation.reserved_micro_usd == 600_000
                 && reservation.charged_micro_usd == 200_000)
     );
-    assert_eq!(payload.controller_state["remaining_micro_usd"], 800_000);
+    // Final controller views include both settled calls, not the allowance captured before the last work turn.
+    assert_eq!(payload.controller_state["remaining_micro_usd"], 600_000);
 }
 
 #[cfg(feature = "sqlite")]
@@ -356,7 +357,7 @@ async fn captured_admission_crosses_spawn_and_join_set_boundaries() {
     let captured = execution.clone();
     let participant = provider.clone();
     tokio::spawn(async move {
-        scope_inherited_execution(Some(captured.clone()), async move {
+        scope_inherited_execution(Some(captured.clone()), Default::default(), async move {
             assert!(Arc::ptr_eq(&captured, &current_execution().unwrap()));
             participant
                 .complete(&[ChatMessage::user("first")], None)
@@ -370,7 +371,7 @@ async fn captured_admission_crosses_spawn_and_join_set_boundaries() {
     let mut tasks = tokio::task::JoinSet::new();
     let captured = execution.clone();
     tasks.spawn(async move {
-        scope_inherited_execution(Some(captured.clone()), async move {
+        scope_inherited_execution(Some(captured.clone()), Default::default(), async move {
             assert!(Arc::ptr_eq(&captured, &current_execution().unwrap()));
             provider
                 .complete(&[ChatMessage::user("second")], None)

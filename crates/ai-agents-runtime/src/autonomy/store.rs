@@ -6,6 +6,46 @@ use ai_agents_core::{AgentError, AgentStorage, Result, StorageCapability};
 use async_trait::async_trait;
 use std::sync::Arc;
 
+/// Verifies exact checkpoint receipts without repeating final deadline admission after a write already committed.
+/// This detects inconsistent replies, not a backend that falsely acknowledges an exact-looking unsaved snapshot.
+pub(crate) fn verify_checkpoint_receipt(
+    previous: &TaskRunSnapshot,
+    mutation: &TaskRunMutation,
+    saved: &TaskRunSnapshot,
+) -> Result<()> {
+    let checkpoint = match mutation {
+        TaskRunMutation::Checkpoint {
+            expected_revision,
+            owner_token,
+            status,
+            payload,
+            release,
+        }
+        | TaskRunMutation::FinalCheckpoint {
+            expected_revision,
+            owner_token,
+            status,
+            payload,
+            release,
+            ..
+        } => TaskRunMutation::Checkpoint {
+            expected_revision: *expected_revision,
+            owner_token: owner_token.clone(),
+            status: *status,
+            payload: payload.clone(),
+            release: *release,
+        },
+        _ => mutation.clone(),
+    };
+    let expected = previous.transition(&checkpoint, saved.updated_at)?;
+    if saved.updated_at < previous.updated_at
+        || serde_json::to_value(&expected)? != serde_json::to_value(saved)?
+    {
+        return Err(TaskRunStorageError::InvalidCheckpoint.into());
+    }
+    Ok(())
+}
+
 /// Storage operations are CAS transitions; successful claim is required before later execution.
 #[async_trait]
 pub trait TaskRunStore: Send + Sync {
@@ -14,7 +54,25 @@ pub trait TaskRunStore: Send + Sync {
     /// Returns only compatible data in this adapter's agent and actor scope.
     async fn load(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>>;
     /// Applies a conditional operation without executing external work.
+    /// Forward live final-admission guards and validate the transition inside the backend write boundary; serialized IDs cannot replace them.
     async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot>;
+    /// Claims a paused revision; None certifies no write, while errors from a custom transport remain ambiguous.
+    async fn claim_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        owner_token: String,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        self.mutate(
+            run_id,
+            &TaskRunMutation::Claim {
+                expected_revision,
+                owner_token,
+            },
+        )
+        .await
+        .map(Some)
+    }
     /// Declares validated paused-limit support before the runner starts a potentially ambiguous control write.
     fn supports_paused_limit_revision(&self) -> bool {
         false
@@ -32,6 +90,23 @@ pub trait TaskRunStore: Send + Sync {
     ) -> Result<Option<TaskRunSnapshot>> {
         Err(AgentError::Config(
             "paused limit revision is unsupported by this task store".into(),
+        ))
+    }
+    /// Declares host objective revision support before any retained live state is changed.
+    fn supports_objective_revision(&self) -> bool {
+        false
+    }
+    /// Applies authenticated control only at a safe boundary; None certifies no write, while Err retains uncertainty.
+    async fn apply_host_control(
+        &self,
+        _run_id: &str,
+        _expected_revision: u64,
+        _action: super::HostControlAction,
+        _host: &super::AutonomyHostCeilings,
+        _deadline: Option<std::time::Instant>,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        Err(AgentError::Config(
+            "host objective revision is unsupported by this task store".into(),
         ))
     }
     /// Lists safe metadata, never raw recovery data.
@@ -97,6 +172,19 @@ impl ScopedTaskRunStore {
         action: super::HostControlAction,
         host: &super::AutonomyHostCeilings,
     ) -> Result<TaskRunSnapshot> {
+        self.apply_host_action_with_deadline(run_id, expected_revision, action, host, None)
+            .await
+    }
+
+    /// Retained host controls carry their original monotonic expiry through the actual backend admission boundary.
+    async fn apply_host_action_with_deadline(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        action: super::HostControlAction,
+        host: &super::AutonomyHostCeilings,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<TaskRunSnapshot> {
         let previous = self
             .load(run_id)
             .await?
@@ -111,7 +199,7 @@ impl ScopedTaskRunStore {
             owner_token: previous.owner_token.clone(),
             status,
             payload: serde_json::to_value(&payload)?,
-            deadline: None,
+            deadline,
             expires_at: old.clocks.expires_at,
         };
         let proposed = previous.transition(&mutation, chrono::Utc::now())?;
@@ -189,7 +277,35 @@ impl TaskRunStore for ScopedTaskRunStore {
             .mutate_task_run(&self.key(run_id), mutation)
             .await?;
         self.validate(&saved)?;
+        verify_checkpoint_receipt(&previous, mutation, &saved)?;
         Ok(saved)
+    }
+
+    /// Scoped backend claim conflicts are certified no-write outcomes, unlike arbitrary transport errors.
+    async fn claim_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        owner_token: String,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        match self
+            .mutate(
+                run_id,
+                &TaskRunMutation::Claim {
+                    expected_revision,
+                    owner_token,
+                },
+            )
+            .await
+        {
+            Ok(saved) => Ok(Some(saved)),
+            Err(AgentError::TaskRunStorage(
+                TaskRunStorageError::Conflict
+                | TaskRunStorageError::Owned
+                | TaskRunStorageError::NotResumable,
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Both supported scoped backends use the same preflight and conditional host-control transition.
@@ -260,6 +376,34 @@ impl TaskRunStore for ScopedTaskRunStore {
         };
         self.validate(&saved)?;
         Ok(Some(saved))
+    }
+
+    /// Objective control uses the same validated host CAS on both scoped backends.
+    fn supports_objective_revision(&self) -> bool {
+        true
+    }
+
+    /// Only a no-write protocol rejection is recoverable as None; transport and receipt errors remain ambiguous.
+    async fn apply_host_control(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        action: super::HostControlAction,
+        host: &super::AutonomyHostCeilings,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        match self
+            .apply_host_action_with_deadline(run_id, expected_revision, action, host, deadline)
+            .await
+        {
+            Ok(saved) => Ok(Some(saved)),
+            Err(AgentError::TaskRunStorage(
+                TaskRunStorageError::Conflict
+                | TaskRunStorageError::AdmissionExpired
+                | TaskRunStorageError::NotResumable,
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Actorless scope excludes actor-owned runs even though the raw backend supports broad listing.

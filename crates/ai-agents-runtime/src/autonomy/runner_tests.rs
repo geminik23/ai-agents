@@ -32,6 +32,11 @@ impl RecordingProvider {
             release: None,
         })
     }
+    // Captured provider inputs prove rendered templates, not merely canned response or call-count equivalence.
+    pub(super) fn captured_messages(&self) -> Vec<Vec<ChatMessage>> {
+        self.messages.lock().clone()
+    }
+
     // Gated dispatch makes ownership/cancellation ordering deterministic without latency assertions.
     pub(super) fn gated() -> Arc<Self> {
         Arc::new(Self {

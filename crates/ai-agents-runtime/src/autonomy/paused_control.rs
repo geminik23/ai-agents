@@ -3,15 +3,23 @@
 use super::*;
 use std::future::Future;
 
-tokio::task_local! { static HOST_STOP: String; }
+#[derive(Clone)]
+pub(super) struct HostStop {
+    reason: String,
+    kind: &'static str,
+    status: TaskRunStatus,
+    request_id: Option<String>,
+}
+
+tokio::task_local! { static HOST_STOP: HostStop; }
 
 /// Only the explicit Rust host API installs a stop reason; external signals and tool responses cannot deserialize it.
-pub(super) async fn scope_stop<F: Future>(reason: String, future: F) -> F::Output {
-    HOST_STOP.scope(reason, future).await
+async fn scope_stop<F: Future>(control: HostStop, future: F) -> F::Output {
+    HOST_STOP.scope(control, future).await
 }
 
 /// Cancellation helpers retain their original semantics unless the host explicitly owns a stop operation.
-pub(super) fn stop_reason() -> Option<String> {
+pub(super) fn stop_reason() -> Option<HostStop> {
     HOST_STOP.try_with(Clone::clone).ok()
 }
 
@@ -29,7 +37,182 @@ impl AutonomyRunner {
                 "host stop requires a bounded audit reason".into(),
             ));
         }
-        scope_stop(reason.into(), self.cancel_paused(run_id, expected_revision)).await
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "stop",
+                status: TaskRunStatus::Incomplete,
+                request_id: None,
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
+    }
+
+    /// Reports host-confirmed delivery loss for one retained external wait, never inferred from silence or signal payloads.
+    /// Frozen stop/fail policy uses existing safe cleanup and CAS; stale freshness cannot prevent known-safe retirement.
+    pub async fn external_unavailable_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        if reason.trim().is_empty() || reason.chars().count() > 512 {
+            return Err(ai_agents_core::AgentError::Config(
+                "external unavailability requires a bounded audit reason".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let state = self.retained_controller(&snapshot, &payload)?;
+        let wait = state
+            .driver
+            .as_ref()
+            .and_then(|driver| driver.wait.as_ref())
+            .filter(|wait| wait.request_id == request_id)
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        if self.agent.autonomy_extensions().condition(&wait.binding.id) != Some(&wait.binding) {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        let status = match self
+            .agent
+            .autonomy_extensions()
+            .condition_unavailable_policy(&wait.binding.id)
+        {
+            ExternalUnavailablePolicy::Stop => TaskRunStatus::Incomplete,
+            ExternalUnavailablePolicy::Fail => TaskRunStatus::Failed,
+        };
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "external_unavailable",
+                status,
+                request_id: Some(request_id.into()),
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
+    }
+
+    /// Reports host-confirmed delivery loss for one controller question or capacity wait, never inferred from silence.
+    pub async fn controller_unavailable_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        if reason.trim().is_empty() || reason.chars().count() > 512 {
+            return Err(ai_agents_core::AgentError::Config(
+                "controller unavailability requires a bounded audit reason".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        if controller_checkpoint(&payload)?.is_none()
+            && payload.pending.as_ref().is_some_and(|pending| {
+                pending.id == request_id && matches!(pending.kind, TaskPendingKind::Limit)
+            })
+        {
+            super::super::controller::pending_capacity(payload.pending.as_ref().unwrap())?;
+            let fallback = payload
+                .settings
+                .on_limit
+                .as_ref()
+                .and_then(|policy| policy.on_unavailable);
+            return scope_stop(
+                HostStop {
+                    reason: reason.into(),
+                    kind: "controller_unavailable",
+                    status: if fallback == Some(InteractionUnavailableAction::Fail) {
+                        TaskRunStatus::Failed
+                    } else {
+                        TaskRunStatus::Incomplete
+                    },
+                    request_id: Some(request_id.into()),
+                },
+                self.cancel_paused(run_id, expected_revision),
+            )
+            .await;
+        }
+        let state = self.retained_controller(&snapshot, &payload)?;
+        let review = state
+            .review
+            .as_ref()
+            .filter(|review| review.id == request_id)
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        let fallback = match &review.proposal {
+            super::super::controller::ControllerProposal::Capacity { .. }
+            | super::super::controller::ControllerProposal::Question { limit: Some(_), .. } => {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+            }
+            super::super::controller::ControllerProposal::Question { reason: cause, .. }
+                if cause == "no_progress" =>
+            {
+                return scope_stop(
+                    HostStop {
+                        reason: reason.into(),
+                        kind: "controller_unavailable",
+                        status: if payload
+                            .settings
+                            .progress
+                            .as_ref()
+                            .and_then(|p| p.stagnation.as_ref())
+                            .and_then(|p| p.on_unavailable)
+                            == Some(StagnationAction::Fail)
+                        {
+                            TaskRunStatus::Failed
+                        } else {
+                            TaskRunStatus::Incomplete
+                        },
+                        request_id: Some(request_id.into()),
+                    },
+                    self.cancel_paused(run_id, expected_revision),
+                )
+                .await;
+            }
+            super::super::controller::ControllerProposal::Question { .. } => payload
+                .settings
+                .premature_finish
+                .as_ref()
+                .and_then(|policy| policy.on_unavailable),
+            _ => return Err(TaskRunStorageError::NotResumable.into()),
+        };
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "controller_unavailable",
+                status: if fallback == Some(InteractionUnavailableAction::Fail) {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::Incomplete
+                },
+                request_id: Some(request_id.into()),
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
     }
 
     /// Revises numeric ceilings without consuming the pending response or executing work; the host authenticates its caller.
@@ -177,36 +360,48 @@ impl AutonomyRunner {
         })
     }
 
-    /// Stop claims rather than fabricating cancellation; ordinary cancellation keeps its stored-request and acknowledgement protocol.
+    /// Stop claims rather than fabricating cancellation; every cleanup admission requires an exact successor receipt.
     pub(super) async fn admit_paused_cleanup(
         &self,
         snapshot: TaskRunSnapshot,
     ) -> ai_agents_core::Result<TaskRunSnapshot> {
-        if stop_reason().is_some() {
+        let mutation = if let Some(control) = stop_reason() {
+            if let Some(request_id) = &control.request_id {
+                let payload: TaskCheckpointPayload =
+                    serde_json::from_value(snapshot.payload.clone())?;
+                if payload.pending.as_ref().is_none_or(|pending| {
+                    pending.id != *request_id
+                        || if control.kind == "external_unavailable" {
+                            !matches!(pending.kind, TaskPendingKind::ExternalCondition)
+                        } else {
+                            !matches!(
+                                pending.kind,
+                                TaskPendingKind::UserQuestion
+                                    | TaskPendingKind::HostContinue
+                                    | TaskPendingKind::Limit
+                            )
+                        }
+                }) {
+                    return Err(TaskRunStorageError::NotResumable.into());
+                }
+            }
             if snapshot.cancel_requested {
                 return Err(TaskRunStorageError::NotResumable.into());
             }
-            self.store
-                .mutate(
-                    &snapshot.key.run_id,
-                    &TaskRunMutation::Claim {
-                        expected_revision: snapshot.revision,
-                        owner_token: uuid::Uuid::new_v4().to_string(),
-                    },
-                )
-                .await
+            TaskRunMutation::Claim {
+                expected_revision: snapshot.revision,
+                owner_token: uuid::Uuid::new_v4().to_string(),
+            }
         } else if snapshot.cancel_requested {
-            Ok(snapshot)
+            return Ok(snapshot);
         } else {
-            self.store
-                .mutate(
-                    &snapshot.key.run_id,
-                    &TaskRunMutation::RequestCancel {
-                        expected_revision: snapshot.revision,
-                    },
-                )
-                .await
-        }
+            TaskRunMutation::RequestCancel {
+                expected_revision: snapshot.revision,
+            }
+        };
+        let saved = self.store.mutate(&snapshot.key.run_id, &mutation).await?;
+        super::super::store::verify_checkpoint_receipt(&snapshot, &mutation, &saved)?;
+        Ok(saved)
     }
 
     /// A host-stop terminal checkpoint retains usage and exact settled histories and never publishes task completion.
@@ -215,8 +410,15 @@ impl AutonomyRunner {
         admitted: &TaskRunSnapshot,
         mut payload: TaskCheckpointPayload,
     ) -> ai_agents_core::Result<TaskRunSnapshot> {
-        let mutation = if let Some(reason) = stop_reason() {
-            payload.stop_reason = Some("user_stopped".into());
+        let mutation = if let Some(control) = stop_reason() {
+            payload.stop_reason = Some(
+                if control.kind == "stop" {
+                    "user_stopped"
+                } else {
+                    "external_unavailable"
+                }
+                .into(),
+            );
             let sequence = payload
                 .evidence
                 .records
@@ -236,17 +438,18 @@ impl AutonomyRunner {
                     ai_agents_core::AgentError::Config("audit sequence overflow".into())
                 })?;
             payload.evidence.records.push(TaskEvidenceRecord { run_id: admitted.key.run_id.clone(), sequence, stage: payload.stage.clone(), attempt: None,
-                origin: "host.control".into(), data: serde_json::json!({"action":{"kind":"stop"},"reason":reason,"expected_revision":admitted.revision.saturating_sub(1)}) });
+                origin: "host.control".into(), data: serde_json::json!({"action":{"kind":control.kind,"request_id":control.request_id},"reason":control.reason,"expected_revision":admitted.revision.saturating_sub(1)}) });
             TaskRunMutation::FinalCheckpoint {
                 expected_revision: admitted.revision,
                 owner_token: admitted
                     .owner_token
                     .clone()
                     .ok_or(TaskRunStorageError::Owned)?,
-                status: TaskRunStatus::Incomplete,
+                status: control.status,
                 payload: serde_json::to_value(payload)?,
                 release: true,
                 expires_at: None,
+                evidence: None,
                 deadline: std::time::Instant::now(),
             }
         } else {
@@ -255,6 +458,8 @@ impl AutonomyRunner {
                 payload: serde_json::to_value(payload)?,
             }
         };
-        self.store.mutate(&admitted.key.run_id, &mutation).await
+        let saved = self.store.mutate(&admitted.key.run_id, &mutation).await?;
+        super::super::store::verify_checkpoint_receipt(admitted, &mutation, &saved)?;
+        Ok(saved)
     }
 }

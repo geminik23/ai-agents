@@ -432,6 +432,113 @@ async fn message_fixture_with_hooks(
     )
 }
 
+// Returning from a completed child may need another parent model slot; that remains a controller capacity wait.
+#[tokio::test]
+async fn lp_group_return_capacity_resumes_parent_without_replaying_child_or_delivery() {
+    for action in ["pause_run", "fail", "summarize_and_stop"] {
+        let ((parent, child, _, store, first, second, child_provider), provider, sent) =
+            Box::pin(message_fixture(false)).await;
+        let mut config = super::runner_tests::config(3);
+        config.defaults.on_limit =
+            Some(serde_yaml::from_str(&format!("action: {action}")).unwrap());
+        config.defaults.hitl = Some(AutonomyHitlConfig {
+            on_approval_required: Some(InteractionAction::PauseRun),
+            on_user_question: Some(InteractionAction::PauseRun),
+        });
+        let runner = AutonomyRunner::try_new(
+            parent.clone(),
+            config,
+            Default::default(),
+            store.clone(),
+            "message.v1".into(),
+        )
+        .unwrap();
+        let first_pause = runner.run("objective", None).await.unwrap();
+        let pending = first_pause.run.pending.as_ref().unwrap();
+        let input = if matches!(pending.kind, TaskPendingKind::UserQuestion) {
+            TaskResumeInput::UserAnswer {
+                request_id: pending.id.clone(),
+                answer: json!({"answer":"yes"}),
+            }
+        } else {
+            TaskResumeInput::Approval {
+                request_id: pending.id.clone(),
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            }
+        };
+        let paused = runner
+            .resume(&first_pause.run.key.run_id, first_pause.run.revision, input)
+            .await
+            .unwrap();
+        if action != "pause_run" {
+            assert_eq!(
+                paused.run.status,
+                if action == "fail" {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::LimitReached
+                }
+            );
+            assert!(paused.run.pending.is_none());
+            assert_eq!(sent.load(Ordering::SeqCst), 1);
+            continue;
+        }
+        assert_eq!(
+            paused.run.status,
+            TaskRunStatus::Paused,
+            "{:?}",
+            paused.run.stop_reason
+        );
+        assert!(matches!(
+            paused.run.pending.as_ref().unwrap().kind,
+            TaskPendingKind::Limit
+        ));
+        assert_eq!(first.load(Ordering::SeqCst), 1);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        let child_calls = child_provider.calls.load(Ordering::SeqCst);
+        let payload: TaskCheckpointPayload = serde_json::from_value(
+            store
+                .load(&paused.run.key.run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+        )
+        .unwrap();
+        let mut limits = payload.limits;
+        limits.max_llm_calls = 4;
+        let revised = runner
+            .revise_limits_paused(
+                &paused.run.key.run_id,
+                paused.run.revision,
+                limits,
+                "allow parent final response",
+            )
+            .await
+            .unwrap();
+        let done = runner
+            .resume(
+                &revised.run.key.run_id,
+                revised.run.revision,
+                TaskResumeInput::Continue,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            done.run.status,
+            TaskRunStatus::Completed,
+            "{:?}",
+            done.run.stop_reason
+        );
+        assert_eq!(done.run.counters.turns, 1);
+        assert_eq!(sent.load(Ordering::SeqCst), 1);
+        assert_eq!(child_provider.calls.load(Ordering::SeqCst), child_calls);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert!(child.reset().await.is_ok());
+    }
+}
+
 // Fixture construction is isolated from recursive polling; large builder and runtime moves are not part of execution depth.
 async fn nested_message_fixture() -> (
     AutonomyRunner,

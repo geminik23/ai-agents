@@ -91,6 +91,12 @@ fn prepare_host_control_at_boundary(
                 return Err(AgentError::Config("empty revised objective".into()));
             }
             let old = payload.objective.clone();
+            let old_todos = payload.todos.clone();
+            let old_controller = payload
+                .adapters
+                .iter()
+                .find(|adapter| adapter.id == "runtime.controller")
+                .map(|adapter| adapter.state.clone());
             payload.objective = objective.clone();
             payload.objective_revision = payload
                 .objective_revision
@@ -106,7 +112,7 @@ fn prepare_host_control_at_boundary(
             // Old exact evidence and effects remain as audit data; their old objective identity is now ineligible.
             (
                 reason,
-                json!({"kind":"modify_objective","old_objective":old,"new_objective":objective,"objective_revision":payload.objective_revision}),
+                json!({"kind":"modify_objective","old_objective":old,"new_objective":objective,"objective_revision":payload.objective_revision,"retired_todos":old_todos,"retired_controller":old_controller}),
                 snapshot.status,
             )
         }

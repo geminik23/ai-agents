@@ -188,6 +188,9 @@ fn merge_profile(base: &mut AutonomyProfile, overlay: &AutonomyProfile) -> Resul
         if incoming.action.is_some() {
             target.action = incoming.action;
         }
+        if incoming.on_unavailable.is_some() {
+            target.on_unavailable = incoming.on_unavailable;
+        }
         if incoming.max_continuations.is_some() {
             target.max_continuations = incoming.max_continuations;
         }
@@ -199,6 +202,9 @@ fn merge_profile(base: &mut AutonomyProfile, overlay: &AutonomyProfile) -> Resul
         let target = base.on_limit.get_or_insert_with(Default::default);
         if incoming.action.is_some() {
             target.action = incoming.action;
+        }
+        if incoming.on_unavailable.is_some() {
+            target.on_unavailable = incoming.on_unavailable;
         }
     }
     if let Some(incoming) = &overlay.hitl {
@@ -613,6 +619,21 @@ pub(crate) fn validate_agent_config(
     states: Option<&StateConfig>,
     skills: &[SkillRef],
 ) -> Result<()> {
+    validate_config_scopes(config, states, skills, false)
+}
+
+/// Explicit hosts validate scoped profiles without manufacturing execution scope; each invocation still proves its actual entry.
+pub(crate) fn validate_runner_config(config: &AutonomyConfig) -> Result<()> {
+    validate_config_scopes(config, None, &[], true)
+}
+
+// Ordinary construction retains task-default validation; explicit runners can hold profiles that require a later admitted skill entry.
+fn validate_config_scopes(
+    config: &AutonomyConfig,
+    states: Option<&StateConfig>,
+    skills: &[SkillRef],
+    runner: bool,
+) -> Result<()> {
     validate_raw(&config.defaults)?;
     if config
         .default_profile
@@ -635,12 +656,27 @@ pub(crate) fn validate_agent_config(
         let scope = match merged.mode {
             Some(AutonomyMode::StateUntilExit) => AutonomyScope::State,
             Some(AutonomyMode::SkillUntilComplete) => AutonomyScope::Skill,
+            _ if runner
+                && merged.execution.as_ref().and_then(|e| e.strategy)
+                    == Some(ExecutionStrategy::Skill) =>
+            {
+                AutonomyScope::Skill
+            }
             _ => AutonomyScope::Task,
         };
         validate_resolved(&merged, scope)?;
     }
     let default = resolve_raw(config, None, None, None)?;
-    validate_resolved(&default, AutonomyScope::Task)?;
+    let default_scope = if runner
+        && (default.mode == Some(AutonomyMode::SkillUntilComplete)
+            || default.execution.as_ref().and_then(|e| e.strategy)
+                == Some(ExecutionStrategy::Skill))
+    {
+        AutonomyScope::Skill
+    } else {
+        AutonomyScope::Task
+    };
+    validate_resolved(&default, default_scope)?;
     // Nested state overrides inherit declared defaults but cannot silently widen task scope.
     fn state(
         config: &AutonomyConfig,

@@ -10,6 +10,8 @@ use std::{collections::HashMap, future::Future};
 /// A response is bound to one acknowledged checkpoint revision and one pending request.
 #[derive(Debug, Clone)]
 pub enum TaskResumeInput {
+    /// Explicit host continuation consumes only a newly acknowledged objective boundary at the expected revision.
+    Continue,
     Approval {
         request_id: String,
         result: ApprovalResult,
@@ -24,9 +26,28 @@ pub enum TaskResumeInput {
     ExternalSignal(ExternalSignal),
 }
 
+tokio::task_local! { static TIMEOUT_APPROVAL: Option<String>; }
+
+/// Only host response admission can retain a configured timeout approval for this exact pending identity.
+/// This live disposition is neither serialized nor transferable to a later proposal.
+pub(crate) async fn scope_timeout_approval<F: std::future::Future>(
+    id: Option<String>,
+    future: F,
+) -> F::Output {
+    TIMEOUT_APPROVAL.scope(id, future).await
+}
+
+/// Late ordinary approvals do not receive the explicit host timeout-policy disposition.
+pub(crate) fn timeout_approved(id: &str) -> bool {
+    TIMEOUT_APPROVAL
+        .try_with(|approved| approved.as_deref() == Some(id))
+        .unwrap_or(false)
+}
+
 /// Keeps question data separate from approval authority while using the same exact batch cursor.
 #[derive(Debug, Clone)]
 pub(crate) enum BatchResponse {
+    Capacity,
     Approval(ApprovalResult),
     UserAnswer(Value),
     QuestionTimeout,
@@ -91,6 +112,25 @@ pub(crate) struct TaskBatchState {
 pub(crate) struct TaskExecutorCursor {
     pub request: ToolExecutionRequest,
     pub ancestry: Vec<String>,
+    #[serde(default)]
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub retry_index: u32,
+    #[serde(default)]
+    pub invoked: bool,
+}
+
+impl TaskExecutorCursor {
+    // Each logical hop owns its lifecycle and retry position independently of the model call ID.
+    pub(crate) fn new(request: ToolExecutionRequest, ancestry: Vec<String>) -> Self {
+        Self {
+            request,
+            ancestry,
+            started_at: None,
+            retry_index: 0,
+            invoked: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +140,18 @@ pub(crate) struct BatchAuthorization {
     pub trigger: Value,
     pub context: Value,
     pub result: ApprovalResult,
+}
+
+impl BatchApproval {
+    /// Capacity metadata is an exact wait requirement, never an approval trigger or implementation permit.
+    pub(crate) fn capacity(&self) -> Result<Option<super::controller::ControllerLimit>> {
+        self.trigger
+            .get("capacity")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
 }
 
 impl TaskBatchState {
@@ -175,9 +227,11 @@ impl TaskBatchState {
         let pending = payload.pending.as_ref().ok_or_else(invalid)?;
         if matches!(pending.kind, TaskPendingKind::UserQuestion)
             != self.approvals[0].question.is_some()
+            || matches!(pending.kind, TaskPendingKind::Limit)
+                != self.approvals[0].capacity()?.is_some()
             || !matches!(
                 pending.kind,
-                TaskPendingKind::Approval | TaskPendingKind::UserQuestion
+                TaskPendingKind::Approval | TaskPendingKind::UserQuestion | TaskPendingKind::Limit
             )
             || pending.reviewed_action != serde_json::to_value(&self.approvals[0])?
             || pending.id != self.approvals[0].request_id
@@ -436,6 +490,56 @@ tokio::task_local! {
     static RESUMED_APPROVAL: std::cell::RefCell<Vec<BatchAuthorization>>;
     static RESUMED_QUESTION: std::cell::RefCell<Option<(String, Value, Value)>>;
     static RESUMED_EXECUTOR: std::cell::RefCell<Vec<TaskExecutorCursor>>;
+    static EXECUTOR_PROGRESS: std::cell::RefCell<TaskExecutorCursor>;
+    static SETTLED_TOOL_RESULT: std::cell::RefCell<Option<(String, ai_agents_core::ToolResult)>>;
+}
+
+/// The shared executor retains logical lifecycle and retry progress across typed transfer.
+pub(crate) async fn scope_executor_progress<F: Future>(
+    cursor: TaskExecutorCursor,
+    future: F,
+) -> F::Output {
+    EXECUTOR_PROGRESS
+        .scope(std::cell::RefCell::new(cursor), future)
+        .await
+}
+
+/// Only the live executor publishes progress; serialized labels cannot install a settled implementation result.
+pub(crate) fn executor_progress() -> Option<TaskExecutorCursor> {
+    EXECUTOR_PROGRESS
+        .try_with(|state| state.borrow().clone())
+        .ok()
+}
+
+/// Progress changes occur within the owning hop, before the next implementation can suspend.
+pub(crate) fn update_executor_progress(update: impl FnOnce(&mut TaskExecutorCursor)) {
+    let _ = EXECUTOR_PROGRESS.try_with(|state| update(&mut state.borrow_mut()));
+}
+
+/// A reauthorized and settled message result returns to recovery without another delivery, admission or settlement.
+pub(crate) async fn scope_settled_tool_result<F: Future>(
+    call_id: String,
+    result: ai_agents_core::ToolResult,
+    future: F,
+) -> F::Output {
+    SETTLED_TOOL_RESULT
+        .scope(std::cell::RefCell::new(Some((call_id, result))), future)
+        .await
+}
+
+/// The private result can be consumed once by its exact logical executor request.
+pub(crate) fn take_settled_tool_result(call_id: &str) -> Option<ai_agents_core::ToolResult> {
+    SETTLED_TOOL_RESULT
+        .try_with(|state| {
+            let mut state = state.borrow_mut();
+            if state.as_ref().is_some_and(|(id, _)| id == call_id) {
+                state.take().map(|(_, result)| result)
+            } else {
+                None
+            }
+        })
+        .ok()
+        .flatten()
 }
 
 /// Message dispatch may park only inside a reconstructible model batch with a live task request.
@@ -570,14 +674,75 @@ pub(crate) fn take_resumed_question(call_id: &str, args: &Value) -> Option<Value
 }
 
 impl RunExecution {
+    /// Converts only an actual pre-body resource refusal into a typed wait; it adds no approval and consumes no invocation slot.
+    pub(crate) fn park_capacity(
+        &self,
+        runtime_id: &str,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        args: &Value,
+    ) -> Result<Option<String>> {
+        if !self
+            .owner
+            .interaction_delivery
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !matches!(
+                self.lifecycle_profile()
+                    .on_limit
+                    .as_ref()
+                    .and_then(|p| p.action),
+                Some(LimitAction::AskUser | LimitAction::PauseRun)
+            )
+            || !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
+            || !(self.is_coordinator(runtime_id)
+                || current_child_operation().is_some_and(|op| self.has_composition_child(&op)))
+        {
+            return Ok(None);
+        }
+        let Some(reason) = self
+            .stop_reason()
+            .filter(|reason| matches!(reason.as_str(), "tool_capacity" | "write_capacity"))
+        else {
+            return Ok(None);
+        };
+        let payload: TaskCheckpointPayload =
+            serde_json::from_value(self.acknowledged_snapshot().payload)?;
+        let limit = super::controller::ControllerLimit {
+            reason: reason.clone(),
+            original: payload.limits,
+            resume_turn: true,
+            skill: None,
+            model: None,
+            tool: Some(ctx.canonical_id.clone()),
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        super::composition::close_composition_admission();
+        self.parked_approvals
+            .lock()
+            .entry(runtime_id.into())
+            .or_default()
+            .push(BatchApproval {
+                call_id: ctx.call_id.clone(),
+                request_id: request_id.clone(),
+                trigger: json!({"capacity":limit}),
+                context: args.clone(),
+                message: format!("Host capacity revision is required: {reason}"),
+                timeout_millis: None,
+                expires_at: None,
+                question: None,
+            });
+        self.clear_capacity_stop(&reason);
+        Ok(Some(request_id))
+    }
+
     /// Questions share exact batch safety requirements, but use their own configured interaction policy.
     pub(crate) fn pauses_question(&self, runtime_id: &str) -> bool {
-        self.lifecycle_profile()
-            .hitl
-            .as_ref()
-            .and_then(|policy| policy.on_user_question)
-            == Some(InteractionAction::PauseRun)
-            && TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
+        matches!(
+            self.lifecycle_profile()
+                .hitl
+                .as_ref()
+                .and_then(|policy| policy.on_user_question),
+            Some(InteractionAction::PauseRun | InteractionAction::AskEachTime)
+        ) && TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
             && (self.is_coordinator(runtime_id)
                 || current_child_operation()
                     .is_some_and(|operation| self.has_composition_child(&operation)))
@@ -656,8 +821,10 @@ impl RunExecution {
 
     /// Suspension is opt-in and never silently replaces ordinary host approval waits.
     pub(crate) fn pauses_approval(&self, runtime_id: &str) -> bool {
-        if self.task_interaction_policy() != Some(InteractionAction::PauseRun)
-            || !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
+        if !matches!(
+            self.task_interaction_policy(),
+            Some(InteractionAction::PauseRun | InteractionAction::AskEachTime)
+        ) || !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
         {
             return false;
         }
@@ -787,7 +954,9 @@ impl RunExecution {
         payload.pending = Some(TaskPendingRequest {
             id: pending.request_id.clone(),
             issued_revision: previous.revision + 1,
-            kind: if pending.question.is_some() {
+            kind: if pending.capacity()?.is_some() {
+                TaskPendingKind::Limit
+            } else if pending.question.is_some() {
                 TaskPendingKind::UserQuestion
             } else {
                 TaskPendingKind::Approval
@@ -795,7 +964,9 @@ impl RunExecution {
             reviewed_action: json!(pending),
         });
         payload.pause_reason = Some(
-            if pending.question.is_some() {
+            if pending.capacity()?.is_some() {
+                "limit_reached"
+            } else if pending.question.is_some() {
                 "user_question"
             } else {
                 "approval_required"
@@ -833,7 +1004,7 @@ impl RunExecution {
                 },
             )
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?;
+            .inspect_err(|_| self.storage_failure())?;
         self.acknowledge_snapshot(&anchored);
         self.revision
             .store(anchored.revision, std::sync::atomic::Ordering::Release);
@@ -857,13 +1028,14 @@ impl RunExecution {
                     payload: serde_json::to_value(payload)?,
                     release: true,
                     expires_at: self.expiry(),
+                    evidence: None,
                     deadline: std::time::Instant::now()
                         .checked_add(self.remaining_duration())
                         .ok_or_else(|| AgentError::Config("pause deadline overflow".into()))?,
                 },
             )
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?;
+            .inspect_err(|_| self.storage_failure())?;
         self.acknowledge_snapshot(&saved);
         self.revision
             .store(saved.revision, std::sync::atomic::Ordering::Release);

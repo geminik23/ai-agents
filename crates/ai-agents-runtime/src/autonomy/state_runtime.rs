@@ -160,10 +160,12 @@ impl RuntimeAgent {
     }
 
     /// Results and rendered tool arguments are checkpointed at each action boundary under the shared task writer.
+    /// Binding is checked after awaited work so a changed generation cannot publish old prompt context or execute the next stale action.
     async fn drive_task_actions(&self, state: &mut TaskActionsLocation) -> Result<()> {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         while state.next_action < state.actions.len() {
+            self.validate_task_actions(state)?;
             if let Some(reason) = execution.stop_reason() {
                 return Err(AgentError::Other(reason));
             }
@@ -182,6 +184,7 @@ impl RuntimeAgent {
                         ));
                     }
                     Box::pin(self.checkpoint_task_actions(state)).await?;
+                    self.validate_task_actions(state)?;
                     let result = crate::autonomy::scope_task_batch(
                         self.execute_tool_record(state.pending.as_ref().unwrap().clone()),
                     )
@@ -196,6 +199,7 @@ impl RuntimeAgent {
                         }
                         result => result?,
                     };
+                    self.validate_task_actions(state)?;
                     if record.success {
                         self.context_manager.set(
                             "last_tool_result",
@@ -245,6 +249,7 @@ impl RuntimeAgent {
                         .unwrap_or(prompt);
                     let mut messages = self.memory.get_messages(Some(5)).await?;
                     messages.push(ChatMessage::user(rendered));
+                    self.validate_task_actions(state)?;
                     let response = self
                         .observe_purpose(
                             ObservationPurpose::StateAction,
@@ -252,6 +257,7 @@ impl RuntimeAgent {
                         )
                         .await
                         .map_err(|error| AgentError::LLM(error.to_string()))?;
+                    self.validate_task_actions(state)?;
                     if let Some(key) = store_as {
                         self.context_manager
                             .set(&key, Value::String(response.content.clone()))?;
@@ -259,6 +265,7 @@ impl RuntimeAgent {
                     Value::String(response.content)
                 }
             };
+            self.validate_task_actions(state)?;
             state.completed.push(value);
             state.next_action += 1;
             Box::pin(self.checkpoint_task_actions(state)).await?;
@@ -393,7 +400,8 @@ impl RuntimeAgent {
                     .await?;
                 Box::pin(self.run_committed_task_loop(*state)).await
             }
-            TaskStateReturn::SkillFinish { response } => {
+            TaskStateReturn::SkillFinish { response }
+            | TaskStateReturn::PlanFinish { response } => {
                 self.finish_turn_if_root(&response).await?;
                 Ok(response)
             }

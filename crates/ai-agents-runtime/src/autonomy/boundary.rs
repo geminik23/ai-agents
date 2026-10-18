@@ -11,6 +11,9 @@ pub(crate) struct RunOwner {
     pub(crate) actor_id: Option<String>,
     pub(crate) gate: crate::runtime::RootTurnGate,
     pub(crate) targets: Arc<super::CompositionTargets>,
+    // Only explicit admission installs this actual definition; serialized entry data cannot mint a skill scope.
+    pub(crate) skill: parking_lot::RwLock<Option<ai_agents_skills::SkillDefinition>>,
+    pub(crate) interaction_delivery: AtomicBool,
     abandoned: AtomicBool,
     retained_effect_guards: parking_lot::Mutex<Vec<Box<dyn Send>>>,
 }
@@ -30,6 +33,8 @@ impl RunOwner {
             actor_id,
             gate,
             targets: Arc::new(super::CompositionTargets::default()),
+            skill: parking_lot::RwLock::new(None),
+            interaction_delivery: AtomicBool::new(true),
             abandoned: AtomicBool::new(false),
             retained_effect_guards: parking_lot::Mutex::new(Vec::new()),
         }))

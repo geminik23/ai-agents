@@ -145,22 +145,117 @@ pub fn latest_validation<'a>(
                 && r.identity.objective_revision == scope.objective_revision
         })
         .max_by_key(|r| (r.identity.cycle, r.identity.sequence))?;
-    (latest.identity.eligible(scope, false, true)
-        && scope.validation_bindings.get(check) == Some(&latest.identity.config_identity)
-        && scope.validation_attempts.get(check) == latest.identity.attempt.as_ref()
-        && latest.identity.attempt.is_some())
-    .then_some(latest)
+    let mut traversal = ProofTraversal::default();
+    validation_eligible(latest, results, scope, &mut traversal).then_some(latest)
 }
 
-// Validation leaves require the selected attempt and full frozen check binding, unlike cumulative ordinary tool proofs.
+/// Checks exact upstream results recursively; missing, unknown or replaced proof cannot be refreshed by a derived identity.
+pub fn validation_dependencies_current(
+    identity: &EvidenceIdentity,
+    results: &[ValidationResult],
+    scope: &EvaluationScope,
+) -> bool {
+    dependencies_current(identity, results, scope, &mut ProofTraversal::default())
+}
+
+// Memoization bounds shared-subgraph work; recursion detection alone would revisit a valid diamond exponentially.
+#[derive(Default)]
+struct ProofTraversal {
+    visiting: std::collections::BTreeSet<String>,
+    eligible: std::collections::BTreeMap<String, bool>,
+    fingerprints: std::collections::BTreeMap<String, Option<String>>,
+    latest: std::collections::BTreeMap<String, Option<usize>>,
+}
+
+// Each edge selects the latest result first and compares its complete fingerprint before following its own dependencies.
+fn dependencies_current(
+    identity: &EvidenceIdentity,
+    results: &[ValidationResult],
+    scope: &EvaluationScope,
+    traversal: &mut ProofTraversal,
+) -> bool {
+    identity.validation_dependencies.len() <= 256
+        && identity
+            .validation_dependencies
+            .iter()
+            .all(|(id, expected)| {
+                let index = *traversal.latest.entry(id.clone()).or_insert_with(|| {
+                    results
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| {
+                            r.check_id == *id
+                                && r.identity.key == scope.key
+                                && r.identity.objective_revision == scope.objective_revision
+                        })
+                        .max_by_key(|(_, r)| (r.identity.cycle, r.identity.sequence))
+                        .map(|(index, _)| index)
+                });
+                index
+                    .and_then(|index| results.get(index))
+                    .is_some_and(|result| {
+                        let fingerprint = traversal
+                            .fingerprints
+                            .entry(id.clone())
+                            .or_insert_with(|| result.proof_identity().ok());
+                        result.outcome != GateOutcome::Unknown
+                            && fingerprint.as_ref() == Some(expected)
+                            && validation_eligible(result, results, scope, traversal)
+                    })
+            })
+}
+
+// A bounded acyclic proof graph is validated against frozen dependencies as well as current attempts and targets.
+fn validation_eligible(
+    result: &ValidationResult,
+    results: &[ValidationResult],
+    scope: &EvaluationScope,
+    traversal: &mut ProofTraversal,
+) -> bool {
+    let id = &result.check_id;
+    if let Some(valid) = traversal.eligible.get(id) {
+        return *valid;
+    }
+    if traversal.eligible.len() + traversal.visiting.len() >= 256
+        || !traversal.visiting.insert(id.clone())
+    {
+        return false;
+    }
+    let expected = scope.validation_dependencies.get(id);
+    let valid = result.identity.eligible(scope, false, true)
+        && scope.validation_bindings.get(id) == Some(&result.identity.config_identity)
+        && scope.validation_attempts.get(id) == result.identity.attempt.as_ref()
+        && result.identity.attempt.is_some()
+        && (result.outcome == GateOutcome::Unknown
+            || expected.is_none_or(|ids| {
+                ids.len() == result.identity.validation_dependencies.len()
+                    && ids
+                        .iter()
+                        .all(|id| result.identity.validation_dependencies.contains_key(id))
+            }))
+        && dependencies_current(&result.identity, results, scope, traversal);
+    traversal.visiting.remove(id);
+    traversal.eligible.insert(id.clone(), valid);
+    valid
+}
+
+// Typed validation leaves retain declared proof dependencies as well as the selected attempt, unlike cumulative ordinary tool-call facts.
 fn selected_validation_identity(
     identity: &EvidenceIdentity,
     check: &str,
     scope: &EvaluationScope,
+    results: &[ValidationResult],
 ) -> bool {
     identity.attempt.is_some()
         && scope.validation_bindings.get(check) == Some(&identity.config_identity)
         && scope.validation_attempts.get(check) == identity.attempt.as_ref()
+        && scope.validation_dependencies.get(check).is_none_or(|ids| {
+            ids.len() == identity.validation_dependencies.len()
+                && ids
+                    .iter()
+                    .all(|id| identity.validation_dependencies.contains_key(id))
+        })
+        && validation_dependencies_current(identity, results, scope)
 }
 
 // Only bounded, Unicode-safe previews cross the display boundary.
@@ -279,7 +374,11 @@ impl CompletionGateEvaluator {
             CompletionGate::ProgressPath(assertion) => e
                 .progress
                 .as_ref()
-                .filter(|o| o.complete && o.identity.eligible(scope, true, true))
+                .filter(|o| {
+                    o.complete
+                        && o.identity.eligible(scope, true, true)
+                        && validation_dependencies_current(&o.identity, &e.validations, scope)
+                })
                 .map_or(GateOutcome::Unknown, |o| match_path(&o.value, assertion)),
             CompletionGate::Observability(assertion) => e
                 .observability
@@ -334,7 +433,12 @@ impl CompletionGateEvaluator {
                             && executed(&o.value.record)
                             && !o.value.record.output_truncated
                             && o.value.record.canonical_id == "command"
-                            && selected_validation_identity(&o.identity, &o.value.check_id, scope)
+                            && selected_validation_identity(
+                                &o.identity,
+                                &o.value.check_id,
+                                scope,
+                                &e.validations,
+                            )
                             && o.value.termination == "exited"
                     })
                     .and_then(|o| o.value.exit_code)
@@ -353,7 +457,12 @@ impl CompletionGateEvaluator {
                         && executed(&o.value.record)
                         && !o.value.record.output_truncated
                         && o.value.record.canonical_id == "diagnostics"
-                        && selected_validation_identity(&o.identity, &o.value.check_id, scope)
+                        && selected_validation_identity(
+                            &o.identity,
+                            &o.value.check_id,
+                            scope,
+                            &e.validations,
+                        )
                         && o.value.record.success
                 })
                 .map_or(GateOutcome::Unknown, |o| {
@@ -398,7 +507,12 @@ impl CompletionGateEvaluator {
                     .max_by_key(|r| (r.identity.cycle, r.identity.sequence))
                     .filter(|r| {
                         r.identity.eligible(scope, true, true)
-                            && selected_validation_identity(&r.identity, &r.check_id, scope)
+                            && selected_validation_identity(
+                                &r.identity,
+                                &r.check_id,
+                                scope,
+                                &e.validations,
+                            )
                     })
                     .map_or(GateOutcome::Unknown, |r| r.outcome)
             }

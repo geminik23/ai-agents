@@ -277,12 +277,22 @@ pub enum PrematureFinishAction {
     Fail,
 }
 
+/// Deterministic fallback when neither a host channel nor a retained request endpoint is usable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionUnavailableAction {
+    Stop,
+    Fail,
+}
+
 /// Bounded response when gates reject a proposed final answer.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrematureFinishConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<PrematureFinishAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unavailable: Option<InteractionUnavailableAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_continuations: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -305,6 +315,8 @@ pub enum LimitAction {
 pub struct LimitConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<LimitAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unavailable: Option<InteractionUnavailableAction>,
 }
 
 /// Allowed interaction response; it cannot bypass an existing approval requirement.

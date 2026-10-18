@@ -57,6 +57,9 @@ pub(crate) enum TaskStateReturn {
     SkillFinish {
         response: ai_agents_core::AgentResponse,
     },
+    PlanFinish {
+        response: ai_agents_core::AgentResponse,
+    },
     ReadyContext {
         input: String,
     },

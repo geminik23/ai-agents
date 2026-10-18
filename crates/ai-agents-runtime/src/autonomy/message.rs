@@ -19,6 +19,8 @@ pub(crate) struct MessageInvocation {
 pub(crate) struct MessageState {
     pub attempt: String,
     pub record: ToolExecutionRecord,
+    #[serde(default)]
+    pub executor: Option<Box<super::suspension::TaskExecutorCursor>>,
     pub state_generation: Option<u64>,
     pub resource_lock_keys: Vec<String>,
     pub max_output_chars: Option<usize>,
@@ -91,6 +93,23 @@ fn validate_suspended_observation(payload: &TaskCheckpointPayload, id: &str) -> 
         .filter_map(|adapter| adapter.state.get("_task_validation_driver"))
     {
         let state: Box<ValidationDriverState> = serde_json::from_value(value.clone())?;
+        if state.capacity_reason.is_some() && state.parked.is_none() {
+            if state.in_flight.is_some()
+                || state.wait.is_some()
+                || state.result.is_some()
+                || state.pending_batch.is_empty()
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            if state
+                .wait_reservation()?
+                .as_deref()
+                .and_then(|key| key.strip_prefix("validation:"))
+                == Some(id)
+            {
+                matches += 1;
+            }
+        }
         if let Some(parked) = &state.parked {
             super::authority::validate_observation_pause(parked)?;
             if state.in_flight.is_some() || state.pending_batch.first() != Some(&parked.observation)
@@ -312,6 +331,7 @@ pub(crate) fn settle_cancelled_messages(payload: &mut TaskCheckpointPayload) -> 
                 target: None,
                 target_revision: None,
                 mutation_generation: scope.mutation_generation,
+                validation_dependencies: Default::default(),
             }),
         );
         if !payload.evidence.tool_calls.iter().any(|capture| {
@@ -320,6 +340,8 @@ pub(crate) fn settle_cancelled_messages(payload: &mut TaskCheckpointPayload) -> 
                     == record.metadata.get("_task_runtime_id")
                 && capture.record.metadata.get("_task_child_operation")
                     == record.metadata.get("_task_child_operation")
+                && capture.record.metadata.get("_task_executor_hop")
+                    == record.metadata.get("_task_executor_hop")
         }) {
             payload.evidence.tool_calls.push(TaskToolEvidence {
                 run_id: scope.key.run_id.clone(),

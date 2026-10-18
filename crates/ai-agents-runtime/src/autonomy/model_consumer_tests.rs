@@ -360,6 +360,123 @@ async fn assert_finished(f: &Fixture, run: &TaskRun, repeated: bool) {
     }
 }
 
+// Objective control retires all pending leaves but preserves completed signed siblings and parent custody.
+#[tokio::test]
+async fn host_control_broadcast_objective_supersession_preserves_signed_completed_children() {
+    for sqlite in super::continuation_test_support::backends() {
+        for mixed in [false, true] {
+            let mut f = Box::pin(fixture(false, mixed)).await;
+            f.store =
+                super::continuation_test_support::store(f.parent.info().id, "consumer.v1", *sqlite)
+                    .await;
+            f.runner = runner(&f.parent, f.store.clone());
+            let first = f.runner.run("objective", None).await.unwrap();
+            let before: TaskCheckpointPayload = serde_json::from_value(
+                f.store
+                    .load(&first.run.key.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+            )
+            .unwrap();
+            let calls: Vec<_> = f
+                .workers
+                .iter()
+                .map(|provider| provider.calls.load(Ordering::SeqCst))
+                .collect();
+            let revised = f
+                .runner
+                .modify_objective_paused(
+                    &first.run.key.run_id,
+                    first.run.revision,
+                    "new objective",
+                    "retire child questions",
+                )
+                .await
+                .unwrap();
+            let after: TaskCheckpointPayload = serde_json::from_value(
+                f.store
+                    .load(&revised.run.key.run_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .payload,
+            )
+            .unwrap();
+            for old in before
+                .children
+                .iter()
+                .filter(|child| child.result.is_some())
+            {
+                let new = after
+                    .children
+                    .iter()
+                    .find(|child| child.child_id == old.child_id)
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(old).unwrap(),
+                    serde_json::to_value(new).unwrap()
+                );
+            }
+            assert!(
+                after
+                    .children
+                    .iter()
+                    .all(|child| child.pending.is_none() && child.result.is_some())
+            );
+            assert_eq!(
+                f.workers
+                    .iter()
+                    .map(|provider| provider.calls.load(Ordering::SeqCst))
+                    .collect::<Vec<_>>(),
+                calls
+            );
+            assert!(
+                f.runner
+                    .resume(
+                        &revised.run.key.run_id,
+                        revised.run.revision,
+                        TaskResumeInput::UserAnswer {
+                            request_id: first.run.pending.unwrap().id,
+                            answer: json!({"selected":["yes"]})
+                        }
+                    )
+                    .await
+                    .is_err()
+            );
+            let done = if mixed {
+                f.runner
+                    .stop_paused(
+                        &revised.run.key.run_id,
+                        revised.run.revision,
+                        "stop revised task",
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                f.runner
+                    .resume(
+                        &revised.run.key.run_id,
+                        revised.run.revision,
+                        TaskResumeInput::Continue,
+                    )
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(
+                done.run.status,
+                if mixed {
+                    TaskRunStatus::Incomplete
+                } else {
+                    TaskRunStatus::Completed
+                }
+            );
+            assert!(f.parent.set_context("released", json!(true)).is_ok());
+        }
+    }
+}
+
 #[tokio::test]
 async fn model_consumer_broadcast_repause_preserves_results_and_rejects_obsolete_answers() {
     let f = Box::pin(fixture(false, false)).await;

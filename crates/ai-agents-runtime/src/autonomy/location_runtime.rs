@@ -77,6 +77,121 @@ impl SkillExecutionObserver for TaskSkillJournal<'_> {
 }
 
 impl RuntimeAgent {
+    /// Explicit entry selects an installed skill within the current state scope without invoking the semantic router.
+    pub(crate) fn admit_autonomy_skill(&self, skill_id: &str) -> Result<SkillDefinition> {
+        self.get_available_skills()
+            .into_iter()
+            .find(|skill| skill.id == skill_id)
+            .cloned()
+            .ok_or_else(|| {
+                AgentError::Skill(
+                    "selected autonomy skill is unavailable in the current scope".into(),
+                )
+            })
+    }
+
+    /// Retained entry data must agree with both the loaded definition and the private owner that admitted it.
+    pub(crate) fn validate_autonomy_skill_binding(&self, skill: &SkillDefinition) -> Result<()> {
+        let owner = self
+            .autonomy_owner
+            .read()
+            .clone()
+            .ok_or(crate::autonomy::TaskRunStorageError::NotResumable)?;
+        owner.check()?;
+        let admitted = owner.skill.read();
+        let actual = self
+            .skills
+            .iter()
+            .find(|actual| actual.id == skill.id)
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        if serde_json::to_value(actual)? != serde_json::to_value(skill)?
+            || serde_json::to_value(&*admitted)? != serde_json::to_value(Some(skill))?
+        {
+            return Err(crate::autonomy::TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        Ok(())
+    }
+
+    /// Capacity may stop before a prompt as well as a tool, so its exact prefix is validated without requiring a pending tool request.
+    pub(crate) fn validate_capacity_skill(&self, state: &TaskSkillLocation) -> Result<()> {
+        let actual = self
+            .skills
+            .iter()
+            .find(|skill| skill.id == state.cursor.definition.id)
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        state.cursor.validate(actual)?;
+        if state.actions.is_some()
+            || state.cursor.next_step >= actual.steps.len()
+            || self
+                .state_machine
+                .as_ref()
+                .map(|machine| machine.generation())
+                != state.state_generation
+            || !self
+                .get_available_skills()
+                .iter()
+                .any(|skill| skill.id == actual.id)
+        {
+            return Err(crate::autonomy::TaskRunStorageError::NotResumable.into());
+        }
+        crate::autonomy::bounded_value(
+            &serde_json::to_value(state)?,
+            crate::autonomy::MAX_TASK_CHECKPOINT_BYTES,
+        )
+    }
+
+    /// A capacity wait has no approval receipt; its pending script operation reenters ordinary authorization and shared resource admission.
+    pub(crate) fn resume_capacity_skill(
+        &self,
+        mut state: Box<TaskSkillLocation>,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> {
+        Box::pin(async move {
+            self.validate_capacity_skill(&state)?;
+            self.begin_root_turn();
+            let _cleanup = RootTurnCleanup::new(self);
+            self.root_user_message_committed
+                .store(state.user_message_committed, Ordering::SeqCst);
+            *self.active_native_exchanges.write() = state
+                .native_exchanges
+                .iter()
+                .map(|exchange| ActiveNativeExchange {
+                    exchange_id: exchange.exchange_id.clone(),
+                    call_ids: exchange.call_ids.clone(),
+                })
+                .collect();
+            let mut content = Box::pin(self.drive_task_skill(
+                &mut state.cursor,
+                state.input_context.clone(),
+                None,
+            ))
+            .await?;
+            let config = self.get_skill_reflection_config(&state.cursor.definition);
+            if config.requires_evaluation()
+                && config.is_enabled()
+                && self
+                    .should_reflect_with_config(&state.cursor.context.user_input, &content, &config)
+                    .await?
+            {
+                content = self
+                    .evaluate_and_retry_with_config(
+                        &state.cursor.context.user_input,
+                        content,
+                        &config,
+                    )
+                    .await?;
+            }
+            self.commit_root_user_message(&state.cursor.context.user_input)
+                .await?;
+            self.handle_skill_response(
+                &state.cursor.context.user_input,
+                &state.cursor.definition.id,
+                content,
+                &state.input_context,
+            )
+            .await
+        })
+    }
+
     /// Script execution uses an exact local cursor; initial routing and completed template/prompt work are never replayed.
     pub(super) async fn execute_task_skill(
         &self,
@@ -141,6 +256,16 @@ impl RuntimeAgent {
             }));
             Box::pin(self.retain_location_batch(location)).await?;
             return Err(error);
+        }
+        if result.is_ok()
+            && actions.is_none()
+            && crate::autonomy::current_child_operation().is_none()
+        {
+            let execution = crate::autonomy::current_execution()
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+            if execution.is_coordinator(&self.info.id) {
+                execution.complete_skill_segment(&cursor.definition).await?;
+            }
         }
         result
     }
@@ -231,7 +356,7 @@ impl RuntimeAgent {
     }
 
     /// Resumes one exact non-model operation under its retained root owner, then advances the original driver.
-    /// Erasure keeps optional script/action future construction out of nested model polling frames.
+    /// Location binding is rechecked under the root gate before effects; erasure bounds nested polling stack construction.
     pub(super) fn resume_task_location_batch(
         &self,
         mut input: crate::autonomy::AutonomyTurnInput,
@@ -263,6 +388,7 @@ impl RuntimeAgent {
                 return Err(AgentError::Other("location resume owner changed".into()));
             }
             input.owner.check()?;
+            self.validate_task_location(&location)?;
             let mut identities = current_runtime_gate_identity_stack().to_vec();
             if identities
                 .iter()
@@ -369,6 +495,7 @@ impl RuntimeAgent {
     }
 
     /// Advances the bound caller only after its original tool or message has settled; root finalization remains single-owner.
+    /// A changed state-action binding cannot publish its settled result into a newer transition.
     /// The boxed driver prevents unused non-model branches from multiplying the model-message stack.
     pub(super) fn finish_task_location_record(
         &self,
@@ -383,6 +510,7 @@ impl RuntimeAgent {
                     Ok(AgentResponse::new(serde_json::to_string(&record)?))
                 }
                 TaskLocation::Actions(state) => {
+                    self.validate_task_actions(state)?;
                     if record.success {
                         self.context_manager.set(
                             "last_tool_result",

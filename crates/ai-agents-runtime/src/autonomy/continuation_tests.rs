@@ -154,6 +154,7 @@ async fn shared_executor_fixture(
         target_generations: Default::default(),
         validation_bindings: Default::default(),
         validation_attempts: Default::default(),
+        validation_dependencies: Default::default(),
     });
     (agent, execution, calls)
 }

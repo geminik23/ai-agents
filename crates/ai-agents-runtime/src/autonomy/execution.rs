@@ -34,6 +34,7 @@ pub(crate) struct RunExecution {
     >,
     pub(crate) approval_deadlines: parking_lot::Mutex<std::collections::BTreeMap<String, Instant>>,
     pub(crate) controller: parking_lot::Mutex<Option<Box<ControllerContinuation>>>,
+    pub(crate) capacity_model: parking_lot::Mutex<Option<Box<TaskLoopState>>>,
     pub(crate) parked_batches:
         parking_lot::Mutex<std::collections::BTreeMap<String, TaskBatchState>>,
     pub(crate) parked_executor_cursors: parking_lot::Mutex<
@@ -43,6 +44,8 @@ pub(crate) struct RunExecution {
     pub(crate) delegate_frames:
         parking_lot::Mutex<std::collections::BTreeMap<String, super::composition::DelegateFrame>>,
     stop: parking_lot::RwLock<Option<String>>,
+    storage_failed: AtomicBool,
+    final_evidence: parking_lot::RwLock<Option<Arc<dyn TaskFinalAdmission>>>,
     lifecycle: parking_lot::RwLock<(AutonomyProfile, LifecycleState)>,
     scope: parking_lot::RwLock<Option<EvaluationScope>>,
     mutation_generation: AtomicU64,
@@ -93,9 +96,12 @@ impl RunExecution {
             approval_deadlines: Default::default(),
             parked_batches: Default::default(),
             controller: Default::default(),
+            capacity_model: Default::default(),
             parked_executor_cursors: Default::default(),
             delegate_frames: Default::default(),
             stop: parking_lot::RwLock::new(None),
+            storage_failed: AtomicBool::new(false),
+            final_evidence: parking_lot::RwLock::new(None),
             lifecycle: parking_lot::RwLock::new((payload.settings, lifecycle)),
             scope: parking_lot::RwLock::new(None),
             mutation_generation: AtomicU64::new(
@@ -156,6 +162,19 @@ impl RunExecution {
             .and_then(|policy| policy.on_approval_required)
     }
 
+    /// Questions are data requests, so restrictive profiles cannot manufacture an answer or approval.
+    pub(crate) fn rejects_question(&self) -> bool {
+        matches!(
+            self.lifecycle
+                .read()
+                .0
+                .hitl
+                .as_ref()
+                .and_then(|policy| policy.on_user_question),
+            Some(InteractionAction::Reject | InteractionAction::AutoIfPolicy)
+        )
+    }
+
     /// Recomputes cumulative elapsed time; overlapping child/provider durations are not summed.
     pub(crate) fn active_millis(&self) -> Result<u64> {
         self.initial_active_millis
@@ -178,11 +197,40 @@ impl RunExecution {
             .ok_or_else(|| AgentError::Config("recovered active clock overflow".into()))
     }
 
+    /// Records failure provenance independently of a custom store's error variant or an earlier timeout reason.
+    pub(crate) fn storage_failure(&self) {
+        self.storage_failed.store(true, Ordering::Release);
+        self.stop("storage_failure");
+    }
+
+    /// Ambiguous storage failures forbid normal interruption cleanup and owner release.
+    pub(crate) fn has_storage_failure(&self) -> bool {
+        self.storage_failed.load(Ordering::Acquire)
+    }
+
+    /// Pins the evaluated live evidence for rechecking inside the final backend write admission.
+    pub(crate) fn set_final_evidence(&self, guard: Arc<dyn TaskFinalAdmission>) {
+        *self.final_evidence.write() = Some(guard);
+    }
+
     /// Stops admission even if a legacy optional-feature error handler swallows the original error.
     pub(crate) fn stop(&self, reason: &str) {
         let mut stop = self.stop.write();
         if stop.is_none() {
             *stop = Some(reason.into());
+        }
+    }
+
+    /// Only the exact pre-body capacity refusal may become a safe wait; cancellation, uncertainty and other stop reasons remain latched.
+    pub(crate) fn clear_capacity_stop(&self, reason: &str) {
+        let mut stopped = self.stop.write();
+        if stopped.as_deref() == Some(reason)
+            && matches!(
+                reason,
+                "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
+            )
+        {
+            *stopped = None;
         }
     }
 
@@ -315,7 +363,8 @@ impl RunExecution {
         self.mutation_generation.load(Ordering::Acquire)
     }
 
-    /// A finalized shared-executor record is captured once with private run/cycle authority.
+    /// A finalized shared-executor hop is captured once with private run/cycle authority.
+    /// Fallbacks keep the model call ID but must not collapse distinct logical hops into an ancestor's evidence.
     pub(crate) async fn capture_tool_record(
         &self,
         record: &ai_agents_core::ToolExecutionRecord,
@@ -353,6 +402,8 @@ impl RunExecution {
                         == Some(runtime_id)
                     && capture.record.metadata.get("_task_child_operation")
                         == Some(&serde_json::to_value(&operation).unwrap_or(Value::Null))
+                    && capture.record.metadata.get("_task_executor_hop")
+                        == record.metadata.get("_task_executor_hop")
             }) {
                 return Ok(());
             }
@@ -368,6 +419,7 @@ impl RunExecution {
                 target: None,
                 target_revision: None,
                 mutation_generation: scope.mutation_generation,
+                validation_dependencies: Default::default(),
             };
             let mut record = record.clone();
             record
@@ -399,8 +451,8 @@ impl RunExecution {
         state.1.allows_tool(&state.0, tool)
     }
 
-    /// All controller, journal and invocation writes share this short CAS boundary.
-    /// Erasure and heap-owned checkpoint decoding keep ledger construction from multiplying nested participant polling stacks.
+    /// Serializes controller and journal writes; new active intervals use acknowledged storage time so wall-clock rollback cannot invalidate them.
+    /// Monotonic active accounting is unchanged; heap-owned decoding bounds nested participant polling stacks.
     pub(crate) fn update<'a>(
         &'a self,
         change: impl FnOnce(&mut TaskCheckpointPayload) -> Result<()> + Send + 'a,
@@ -411,7 +463,11 @@ impl RunExecution {
             let snapshot = self.load_owned_locked(&_serial).await?;
             let mut payload: Box<TaskCheckpointPayload> =
                 serde_json::from_value(snapshot.payload.clone())?;
+            let was_active = payload.clocks.active_interval_started_at.is_some();
             change(&mut payload)?;
+            if !was_active && payload.clocks.active_interval_started_at.is_some() {
+                payload.clocks.active_interval_started_at = Some(snapshot.updated_at);
+            }
             payload.clocks.active_millis = self.active_millis()?;
             self.save(snapshot, payload, TaskRunStatus::Running).await
         })
@@ -437,9 +493,9 @@ impl RunExecution {
             .store
             .load(&self.run_id)
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?
+            .inspect_err(|_| self.storage_failure())?
             .ok_or_else(|| {
-                self.stop("storage_failure");
+                self.storage_failure();
                 AgentError::from(TaskRunStorageError::NotFound)
             })?;
         if snapshot.cancel_requested {
@@ -468,6 +524,42 @@ impl RunExecution {
             self.cancellation.store(true, Ordering::Release);
         }
         Ok(snapshot)
+    }
+
+    /// Credits only the explicitly admitted coordinating skill after its real cursor completes; nested unrelated scripts cannot satisfy it.
+    pub(crate) async fn complete_skill_segment(
+        &self,
+        skill: &ai_agents_skills::SkillDefinition,
+    ) -> Result<()> {
+        let admitted = self.owner.skill.read().clone();
+        if admitted.as_ref().is_none_or(|entry| entry.id != skill.id)
+            || self.lifecycle.read().1.strategy != ExecutionStrategy::Skill
+        {
+            return Ok(());
+        }
+        if serde_json::to_value(admitted.as_ref().unwrap())? != serde_json::to_value(skill)? {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        self.update(|payload| {
+            let controller = payload
+                .adapters
+                .iter_mut()
+                .find(|adapter| adapter.id == "runtime.controller")
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            let mut lifecycle: LifecycleState =
+                serde_json::from_value(controller.state["lifecycle"].clone())?;
+            lifecycle.skill_segment_completed = true;
+            controller.state["lifecycle"] = serde_json::to_value(lifecycle)?;
+            Ok(())
+        })
+        .await?;
+        self.lifecycle.write().1.skill_segment_completed = true;
+        Ok(())
+    }
+
+    /// Returns the acknowledged live lifecycle after a nested skill completes, without replacing controller stage ownership.
+    pub(crate) fn skill_segment_completed(&self) -> bool {
+        self.lifecycle.read().1.skill_segment_completed
     }
 
     /// Persisted marker and final checks precede dispatch; an exact-cap result is allowed to complete.
@@ -510,6 +602,7 @@ impl RunExecution {
     }
 
     /// Atomic commitment includes settled charges and every outstanding conservative upper bound or target union.
+    /// Live witnesses distinguish a pure resource refusal from any acknowledged admission; only the former can suspend without uncertain execution.
     async fn admit_resources(
         &self,
         tool: Option<&str>,
@@ -566,6 +659,7 @@ impl RunExecution {
                     })
                     .and_then(|total| total.checked_add(bound.max_micro_usd));
                 if committed.is_none_or(|total| total > limit) {
+                    super::invocation::capacity_denied("priced_capacity");
                     self.stop("priced_capacity");
                     return Err(AgentError::Other(
                         "autonomy priced capacity exhausted".into(),
@@ -593,6 +687,7 @@ impl RunExecution {
                     .max_declared_write_paths
                     .is_some_and(|limit| targets.len() > limit as usize)
                 {
+                    super::invocation::capacity_denied("write_capacity");
                     self.stop("write_capacity");
                     return Err(AgentError::Tool(
                         "autonomy declared write capacity exhausted".into(),
@@ -616,6 +711,7 @@ impl RunExecution {
                         && payload.counters.command_attempts
                             >= u64::from(payload.limits.max_command_calls))
                 {
+                    super::invocation::capacity_denied("tool_capacity");
                     self.stop("tool_capacity");
                     return Err(AgentError::Other("autonomy tool capacity exhausted".into()));
                 }
@@ -625,6 +721,7 @@ impl RunExecution {
                 }
             } else {
                 if payload.counters.llm_attempts >= u64::from(payload.limits.max_llm_calls) {
+                    super::invocation::capacity_denied("llm_capacity");
                     self.stop("llm_capacity");
                     return Err(AgentError::Other("autonomy LLM capacity exhausted".into()));
                 }
@@ -649,6 +746,7 @@ impl RunExecution {
             Ok(())
         }))
         .await?;
+        super::invocation::capacity_admitted();
         // Reload under serialization so a sibling settlement cannot turn an owned revision into a spurious conflict.
         let admission_check = {
             let _serial = self.serial.lock().await;
@@ -894,7 +992,8 @@ impl RunExecution {
         self.save(snapshot, payload, status).await
     }
 
-    /// Writes one whole validated successor without holding a database transaction over external work.
+    /// Writes and verifies one exact successor without holding a database transaction over external work.
+    /// A malformed receipt cannot transfer live revision authority or release custody.
     async fn save(
         &self,
         previous: TaskRunSnapshot,
@@ -915,6 +1014,7 @@ impl RunExecution {
                 owner_token: self.owner_token.clone(),
                 status,
                 expires_at: payload.clocks.expires_at,
+                evidence: self.final_evidence.read().clone(),
                 payload: serde_json::to_value(payload)?,
                 release: true,
                 deadline: Instant::now()
@@ -926,7 +1026,9 @@ impl RunExecution {
             .store
             .mutate(&self.run_id, &mutation)
             .await
-            .inspect_err(|_| self.stop("storage_failure"))?;
+            .inspect_err(|_| self.storage_failure())?;
+        super::store::verify_checkpoint_receipt(&previous, &mutation, &saved)
+            .inspect_err(|_| self.storage_failure())?;
         self.revision.store(saved.revision, Ordering::Release);
         self.acknowledge_snapshot(&saved);
         Ok(saved)
@@ -1002,16 +1104,21 @@ pub(crate) fn current_execution() -> Option<Arc<RunExecution>> {
     RUN_EXECUTION.try_with(Arc::clone).ok()
 }
 
-/// Framework task boundaries must explicitly carry the captured ledger; absence preserves ordinary execution.
+/// Framework task boundaries carry live restrictions and mutation tracking as well as the ledger; none is reconstructed from labels.
 pub(crate) async fn scope_inherited_execution<F: std::future::Future>(
     execution: Option<Arc<RunExecution>>,
+    invocation: super::invocation::InvocationScope,
     future: F,
 ) -> F::Output {
-    if let Some(execution) = execution {
-        scope_execution(execution, future).await
-    } else {
-        future.await
-    }
+    invocation
+        .scope(async {
+            if let Some(execution) = execution {
+                scope_execution(execution, future).await
+            } else {
+                future.await
+            }
+        })
+        .await
 }
 
 /// Installs the same ledger for the controller, tool executor and every frozen provider consumer.

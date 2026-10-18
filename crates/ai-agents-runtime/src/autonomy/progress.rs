@@ -32,6 +32,9 @@ pub struct ProgressObservation {
     pub signals: BTreeMap<String, Value>,
     pub comparisons: BTreeMap<String, SignalComparison>,
     pub evidence_refs: Vec<String>,
+    /// The bound registry stamps exact upstream proofs before this observation can become gate input.
+    #[serde(default)]
+    pub validation_dependencies: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,12 +164,12 @@ impl ProgressAdapter for BuiltinProgress {
         } else {
             for signal in parsed.signals {
                 let value = if let Some(check) = &signal.validator {
-                    latest_validation(&input.evidence.validations, check, input.scope).and_then(
-                        |r| {
+                    latest_validation(&input.evidence.validations, check, input.scope)
+                        .filter(|r| r.outcome != GateOutcome::Unknown)
+                        .and_then(|r| {
                             refs.push(format!("check:{check}:{}", r.identity.sequence));
                             evidence_path(&json!({"metrics":r.metrics}), &signal.path).cloned()
-                        },
-                    )
+                        })
                 } else {
                     input
                         .evidence
@@ -194,6 +197,7 @@ impl ProgressAdapter for BuiltinProgress {
             signals,
             comparisons,
             evidence_refs: refs,
+            validation_dependencies: BTreeMap::new(),
         })
     }
 }
@@ -252,6 +256,17 @@ impl ProgressState {
             signals: BTreeMap::new(),
         }
     }
+    /// A revised objective loses its old progress credit without replenishing run-wide intervention counts or sequence identities.
+    pub(crate) fn revise_objective(&mut self, scope: EvaluationScope) {
+        self.scope = scope;
+        self.last_cycle = None;
+        self.cycles_without_progress = 0;
+        self.handled_sequence = None;
+        self.decided_sequence = None;
+        self.last_delta = ProgressDelta::Unknown;
+        self.signals.clear();
+    }
+
     /// Commits one completed-cycle observation; repeated cycles and suspended work cannot advance counters.
     pub fn observe(
         &mut self,

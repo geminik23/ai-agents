@@ -102,7 +102,7 @@ impl AgentRegistry {
             .await
     }
 
-    // Private cursor access is scoped to the exact admitted dispatch, not arbitrary nested callbacks.
+    // Private cursors remain exact-dispatch scoped; spawned recipients also retain live proof, deadline and mutation restrictions.
     async fn drive_task_broadcast(&self) -> Result<Vec<(String, Result<AgentResponse>)>> {
         let execution = autonomy::current_execution()
             .ok_or(autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -142,11 +142,13 @@ impl AgentRegistry {
             let execution = execution.clone();
             let ancestry = ancestry.clone();
             let observation = current_observation_context();
+            let invocation = autonomy::invocation::InvocationScope::capture();
             tasks.spawn(Box::pin(async move {
                 autonomy::scope_child_requirement(
                     required,
                     autonomy::scope_inherited_execution(
                         Some(execution),
+                        invocation,
                         Box::pin(scope_runtime_gate_identity_stack(&ancestry, async move {
                             let started = std::time::Instant::now();
                             let work = composition::run_composition_child(

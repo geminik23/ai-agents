@@ -7,7 +7,7 @@ use crate::autonomy::message::{MessageInvocation, MessageState};
 use serde_json::json;
 
 impl RuntimeAgent {
-    /// Only model batches can install an implementation-bound message cursor at the final invocation boundary.
+    /// Exact task locations install an implementation-bound cursor and retain the live admitted context at final invocation.
     pub(super) fn prepare_message_invocation(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
@@ -27,6 +27,10 @@ impl RuntimeAgent {
         let turn = crate::autonomy::current_turn_input(&self.root_turn_gate)
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let id = uuid::Uuid::new_v4().to_string();
+        crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
+            .targets
+            .bind_message_context(&id, ctx.clone())?;
         let state_generation = self
             .state_machine
             .as_ref()
@@ -60,6 +64,7 @@ impl RuntimeAgent {
         let state = MessageState {
             attempt: attempt.clone(),
             record,
+            executor: crate::autonomy::suspension::executor_progress().map(Box::new),
             state_generation,
             resource_lock_keys: Vec::new(),
             max_output_chars: ctx.limits.max_output_chars,
@@ -99,6 +104,179 @@ impl RuntimeAgent {
             frame: Box::new(frame),
             tool,
         }))
+    }
+
+    /// A settled attempt enters recovery through its retained live context, never a second rate admission or newly stamped approval.
+    /// Fresh retries retain original authorization generations; different fallback operations use the ordinary guarded executor.
+    fn recover_settled_message<'a>(
+        &'a self,
+        frame: &'a DelegateFrame,
+        state: &'a MessageState,
+        cursor: crate::autonomy::suspension::TaskExecutorCursor,
+        initial: ToolResult,
+    ) -> Pin<Box<dyn Future<Output = Result<ai_agents_core::ToolExecutionRecord>> + Send + 'a>>
+    {
+        Box::pin(self.recover_settled_message_inner(frame, state, cursor, initial))
+    }
+
+    // Erasure keeps optional recovery context construction out of nested observation and child polling stacks.
+    // Terminal recovery errors still publish the settled original; typed re-pause stays unfinished and later uncertainty keeps its custody.
+    async fn recover_settled_message_inner(
+        &self,
+        frame: &DelegateFrame,
+        state: &MessageState,
+        cursor: crate::autonomy::suspension::TaskExecutorCursor,
+        initial: ToolResult,
+    ) -> Result<ai_agents_core::ToolExecutionRecord> {
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        let context = execution.targets.message_context(&frame.id)?;
+        let tool = self
+            .tools
+            .get(&state.record.canonical_id)
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        let mut record = state.record.clone();
+        let (output, truncated) =
+            Self::truncate_tool_output(initial.output.clone(), state.max_output_chars);
+        record.output = output;
+        record.output_truncated = truncated;
+        record.success = initial.success;
+        record.duration_ms = u64::try_from(
+            (chrono::Utc::now() - record.started_at)
+                .num_milliseconds()
+                .max(0),
+        )
+        .unwrap_or(u64::MAX);
+        let mut guards = match self.reauthorize_message(frame, state).await {
+            Ok(guards) => guards,
+            Err(error) => {
+                self.finish_tool_record(&record).await;
+                execution.stop("message_authorization_changed");
+                return Err(error);
+            }
+        };
+        let config = self
+            .recovery_manager
+            .get_tool_config(&record.canonical_id)
+            .clone();
+        let timeout = Self::validated_tool_timeout(
+            context
+                .limits
+                .timeout_ms
+                .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
+        )?;
+        let request = cursor.request.clone();
+        let ancestry = cursor.ancestry.clone();
+        let work = async {
+            let outcome = TOOL_EFFECT_CUSTODY
+                .scope(
+                    guards.effect_custody.clone(),
+                    Box::pin(self.run_tool_with_retries(
+                        &record.canonical_id,
+                        tool,
+                        record.executed_arguments.clone(),
+                        context,
+                        timeout,
+                        config.max_retries,
+                    )),
+                )
+                .await;
+            if matches!(&outcome, Err(AgentError::TaskSuspended(_))) {
+                let cursor = crate::autonomy::suspension::executor_progress()
+                    .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                execution.parked_executor_cursors.lock().insert(
+                    (self.info.id.clone(), cursor.request.call_id.clone()),
+                    cursor,
+                );
+            }
+            outcome
+        };
+        let outcome = crate::autonomy::suspension::scope_executor_progress(
+            cursor,
+            crate::autonomy::scope_task_request(
+                request.clone(),
+                crate::autonomy::suspension::scope_settled_tool_result(
+                    request.call_id.clone(),
+                    initial,
+                    work,
+                ),
+            ),
+        )
+        .await;
+        let (mut result, timed_out, cancelled, _) = match outcome {
+            Ok(outcome) => outcome,
+            Err(error @ AgentError::TaskSuspended(_)) => return Err(error),
+            Err(error) => {
+                record
+                    .metadata
+                    .insert("recovery_error".into(), json!(error.to_string()));
+                self.finish_tool_record_after_resource_guards(guards, &record)
+                    .await;
+                return Err(error);
+            }
+        };
+        guards.retain_on_drop = timed_out || cancelled;
+        let fallback = if !result.success
+            && !timed_out
+            && !cancelled
+            && execution.stop_reason().is_none()
+        {
+            match config.on_failure {
+                ToolFailureAction::Skip => {
+                    result = ToolResult::ok(format!(
+                        "{{\"skipped\": true, \"reason\": \"Tool '{}' was skipped after failure\"}}",
+                        record.canonical_id
+                    ));
+                    None
+                }
+                ToolFailureAction::Fallback { fallback_tool } => Some(fallback_tool),
+                ToolFailureAction::ReportError => None,
+            }
+        } else {
+            None
+        };
+        let (output, truncated) = Self::truncate_tool_output(result.output, state.max_output_chars);
+        record.output = output;
+        record.output_truncated = truncated;
+        record.success = result.success;
+        record.timed_out = timed_out;
+        record.cancelled = cancelled;
+        record.duration_ms = u64::try_from(
+            (chrono::Utc::now() - record.started_at)
+                .num_milliseconds()
+                .max(0),
+        )
+        .unwrap_or(u64::MAX);
+        if let Some(metadata) = result.metadata {
+            record.metadata.extend(metadata);
+        }
+        record
+            .metadata
+            .insert("_task_executor_hop".into(), json!(ancestry.len()));
+        self.finish_tool_record_after_resource_guards(guards, &record)
+            .await;
+        if let Some(fallback_tool) = fallback {
+            let mut visited = ancestry;
+            visited.push(record.canonical_id.clone());
+            let request = ai_agents_core::ToolExecutionRequest::new(
+                record.call_id.clone(),
+                fallback_tool,
+                record.executed_arguments.clone(),
+                ai_agents_core::ToolCallSource::Fallback {
+                    original_tool: record.canonical_id,
+                },
+            );
+            return self
+                .execute_tool_record_inner(
+                    request,
+                    ToolFallbackState {
+                        visited_canonical_ids: visited,
+                    },
+                    None,
+                )
+                .await;
+        }
+        Ok(record)
     }
 
     /// Exact tool and target identities are checked before a coordinating response can claim execution.
@@ -271,7 +449,8 @@ impl RuntimeAgent {
         Box::pin(self.resume_message_frame(frame)).await
     }
 
-    /// Completes the original parent result after its child settles; delivery hooks and the tool body are never replayed.
+    /// Completes the original parent result after its child settles; delivery hooks and the consumed attempt are never replayed.
+    /// The settled result returns to captured retry/fallback recovery before the original caller advances.
     pub(super) async fn resume_message_frame(&self, frame: DelegateFrame) -> Result<AgentResponse> {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -481,19 +660,85 @@ impl RuntimeAgent {
         Box::pin(execution.settle(&state.attempt, serde_json::to_value(&tool_result)?, false))
             .await?;
         guards.effect_custody.store(false, Ordering::SeqCst);
-        let (output, truncated) =
-            Self::truncate_tool_output(tool_result.output, state.max_output_chars);
-        state.record.output = output;
-        state.record.output_truncated = truncated;
-        state.record.success = tool_result.success;
-        state.record.duration_ms = u64::try_from(
-            (chrono::Utc::now() - state.record.started_at)
-                .num_milliseconds()
-                .max(0),
-        )
-        .unwrap_or(u64::MAX);
-        self.finish_tool_record_after_resource_guards(guards, &state.record)
+        let recovery_config = self
+            .recovery_manager
+            .get_tool_config(&state.record.canonical_id);
+        let retryable = state
+            .record
+            .metadata
+            .get("classification")
+            .and_then(|value| value.get("safely_retryable"))
+            .and_then(Value::as_bool)
+            == Some(true);
+        let recovery_needed = !tool_result.success
+            && execution.stop_reason().is_none()
+            && (retryable
+                && state
+                    .executor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.retry_index < recovery_config.max_retries)
+                || !matches!(recovery_config.on_failure, ToolFailureAction::ReportError));
+        if recovery_needed && let Some(cursor) = state.executor.take() {
+            drop(guards);
+            execution.retire_completed_message(&self.info.id, &state.attempt);
+            let request = cursor.request.clone();
+            let recovery = crate::autonomy::scope_task_batch(self.recover_settled_message(
+                &frame,
+                &state,
+                *cursor,
+                tool_result,
+            ));
+            let recovered = crate::autonomy::scope_message_recovery_authority(
+                &self.info.id,
+                &request,
+                recovery,
+            )
             .await;
+            state.record = match recovered {
+                Err(error @ AgentError::TaskSuspended(_)) => {
+                    let mut batch = state
+                        .batch
+                        .take()
+                        .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+                    batch
+                        .approvals
+                        .retain(|approval| approval.request_id != frame.id);
+                    let mut pending = execution.take_parked_approvals(&self.info.id);
+                    pending.extend(batch.approvals);
+                    batch.approvals = pending;
+                    if let Some(cursor) = execution
+                        .parked_executor_cursors
+                        .lock()
+                        .remove(&(self.info.id.clone(), state.record.call_id.clone()))
+                    {
+                        batch
+                            .executor_cursors
+                            .retain(|old| old.request.call_id != cursor.request.call_id);
+                        batch.executor_cursors.push(cursor);
+                    }
+                    execution
+                        .retain_message_batch(&self.info.id, batch.clone())
+                        .await?;
+                    execution.retain_batch(&self.info.id, batch);
+                    return Err(error);
+                }
+                result => result?,
+            };
+        } else {
+            let (output, truncated) =
+                Self::truncate_tool_output(tool_result.output, state.max_output_chars);
+            state.record.output = output;
+            state.record.output_truncated = truncated;
+            state.record.success = tool_result.success;
+            state.record.duration_ms = u64::try_from(
+                (chrono::Utc::now() - state.record.started_at)
+                    .num_milliseconds()
+                    .max(0),
+            )
+            .unwrap_or(u64::MAX);
+            self.finish_tool_record_after_resource_guards(guards, &state.record)
+                .await;
+        }
         let mut batch = state
             .batch
             .take()

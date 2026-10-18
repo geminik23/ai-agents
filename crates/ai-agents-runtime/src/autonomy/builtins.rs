@@ -122,6 +122,7 @@ impl AutonomyValidator for BuiltinValidator {
             let config: EvidenceConfig = serde_json::from_value(input.config.clone())?;
             let root = if let Some(id) = config.validator {
                 latest_validation(&input.evidence.validations, &id, input.scope)
+                    .filter(|r| r.outcome != GateOutcome::Unknown)
                     .map(|r| json!({"metrics":r.metrics}))
             } else {
                 input

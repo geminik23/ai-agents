@@ -77,6 +77,7 @@ pub async fn concurrent_with_llms(
 }
 
 /// Only the owning public entry receives parent cursor authority; nested callbacks retain ordinary orchestration semantics.
+/// Spawned participants inherit live invocation bounds, proof guards and mutation tracking alongside the coordinating ledger.
 #[allow(clippy::too_many_arguments)]
 async fn concurrent_dispatch(
     registry: &AgentRegistry,
@@ -190,6 +191,7 @@ async fn concurrent_dispatch(
         let observation_context = current_observation_context();
         let gate_identity_stack = gate_identity_stack.clone();
         let execution = crate::autonomy::current_execution();
+        let invocation = crate::autonomy::invocation::InvocationScope::capture();
         let required = crate::autonomy::child_required()
             && matches!(on_partial_failure, PartialFailureAction::Abort);
 
@@ -198,6 +200,7 @@ async fn concurrent_dispatch(
                 required,
                 crate::autonomy::scope_inherited_execution(
                     execution,
+                    invocation,
                     Box::pin(scope_runtime_gate_identity_stack(
                         &gate_identity_stack,
                         async move {

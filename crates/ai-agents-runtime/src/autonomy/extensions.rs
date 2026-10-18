@@ -132,6 +132,24 @@ pub struct BoundValidationCheck {
     pub config_identity: String,
 }
 
+impl BoundValidationCheck {
+    /// Resolves frozen declared inputs, including the built-in's configuration-selected upstream check.
+    pub fn dependencies(&self) -> Vec<String> {
+        let mut ids: BTreeSet<_> = self.adapter.descriptor().checks.iter().cloned().collect();
+        if self.check.adapter == "builtin.evidence"
+            && let Some(id) = self
+                .check
+                .config
+                .as_ref()
+                .and_then(|c| c.get("validator"))
+                .and_then(Value::as_str)
+        {
+            ids.insert(id.into());
+        }
+        ids.into_iter().collect()
+    }
+}
+
 #[derive(Clone)]
 pub struct BoundAutonomyProfile {
     pub checks: Vec<BoundValidationCheck>,
@@ -139,6 +157,38 @@ pub struct BoundAutonomyProfile {
     pub progress_config: Value,
     pub profile: AutonomyProfile,
     pub extensions: Arc<FrozenAutonomyExtensions>,
+}
+
+// Candidate admission uses only immutable response predicates; deferred observations may still change every other evidence leaf.
+// This is not completion proof: final gate evaluation always uses the original expression and eligible committed evidence.
+fn candidate_outcome(
+    gate: &ai_agents_core::autonomy::CompletionGate,
+    scope: &EvaluationScope,
+    evidence: &EvaluationEvidence,
+) -> Result<super::GateOutcome> {
+    use super::GateOutcome;
+    use ai_agents_core::autonomy::CompletionGate;
+    match gate {
+        CompletionGate::All(children) => Ok(GateOutcome::all(
+            &children
+                .iter()
+                .map(|child| candidate_outcome(child, scope, evidence))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        CompletionGate::Any(children) => Ok(GateOutcome::any(
+            &children
+                .iter()
+                .map(|child| candidate_outcome(child, scope, evidence))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        CompletionGate::Not(child) => Ok(candidate_outcome(child, scope, evidence)?.negate()),
+        CompletionGate::ResponseNotEmpty(_)
+        | CompletionGate::ResponseContains(_)
+        | CompletionGate::ResponseContainsAny(_) => Ok(super::CompletionGateEvaluator::default()
+            .evaluate(gate, scope, evidence)?
+            .outcome),
+        _ => Ok(GateOutcome::Unknown),
+    }
 }
 
 impl BoundAutonomyProfile {
@@ -162,6 +212,55 @@ impl BoundAutonomyProfile {
                         .is_none_or(|stage| scope.stage.as_ref() == Some(stage))
             })
             .collect()
+    }
+
+    /// Selects the current checkpoint's work without treating an unfinished stage or a failed candidate as completion.
+    /// Candidate eligibility cannot block an observation merely because its own future evidence is not present yet.
+    pub(crate) fn controller_checks(
+        &self,
+        scope: &EvaluationScope,
+        lifecycle: &super::LifecycleState,
+        evidence: &EvaluationEvidence,
+        phase: super::controller::ControllerPhase,
+    ) -> Result<Vec<&BoundValidationCheck>> {
+        use super::controller::ControllerPhase;
+        let schedule = match phase {
+            ControllerPhase::EachCycle => {
+                return Ok(self.scheduled_checks(scope, ValidationSchedule::EachCycle));
+            }
+            ControllerPhase::StageEnd => ValidationSchedule::StageEnd,
+            ControllerPhase::Completion => ValidationSchedule::Completion,
+            _ => return Ok(Vec::new()),
+        };
+        let eligible = |gate: Option<&ai_agents_core::autonomy::CompletionGate>| -> Result<bool> {
+            Ok(gate
+                .map(|gate| candidate_outcome(gate, scope, evidence))
+                .transpose()?
+                .is_none_or(|result| result != super::GateOutcome::Fail))
+        };
+        let stages = self.profile.lifecycle.as_deref().unwrap_or_default();
+        let stage = stages.get(lifecycle.current_stage);
+        let stage_candidate = stage
+            .is_some_and(|stage| scope.stage.as_deref() == Some(stage.id.as_str()))
+            && eligible(stage.and_then(|stage| stage.completion.as_ref()))?;
+        let task_candidate = (lifecycle.requirements_met(&self.profile)
+            || (stage_candidate
+                && !stages
+                    .iter()
+                    .skip(lifecycle.current_stage + 1)
+                    .any(|stage| stage.required.unwrap_or(true))))
+            && eligible(self.profile.completion.as_ref())?;
+        Ok(self
+            .scheduled_checks(scope, schedule)
+            .into_iter()
+            .filter(|check| {
+                if check.stage.is_some() {
+                    stage_candidate
+                } else {
+                    task_candidate
+                }
+            })
+            .collect())
     }
 
     /// Required aggregate validation is separate from validation_passed:true, which rejects an empty required set.
@@ -190,7 +289,7 @@ impl BoundAutonomyProfile {
         ))
     }
 
-    /// A stage requires only global and current-stage checks, never a future stage's unavailable proof.
+    /// A stage requires global cycle checks and its own checks, never a future stage or task-completion check's unavailable proof.
     pub fn required_stage_outcome(
         &self,
         scope: &EvaluationScope,
@@ -202,6 +301,8 @@ impl BoundAutonomyProfile {
             .iter()
             .filter(|check| {
                 check.check.required.unwrap_or(true)
+                    && (check.stage.is_some()
+                        || check.check.schedule != Some(ValidationSchedule::Completion))
                     && check
                         .stage
                         .as_ref()
@@ -229,6 +330,11 @@ impl BoundAutonomyProfile {
             .iter()
             .map(|c| (c.check.id.clone(), c.config_identity.clone()))
             .collect();
+        scope.validation_dependencies = self
+            .checks
+            .iter()
+            .map(|check| (check.check.id.clone(), check.dependencies()))
+            .collect();
     }
     /// Progress observes only eligible captures and prior validation, never current progress-dependent gate output.
     pub fn observe_progress(
@@ -238,7 +344,7 @@ impl BoundAutonomyProfile {
     ) -> Result<ProgressObservation> {
         let evidence = evidence.normalized()?;
         let stripped = progress_evidence(&evidence, scope);
-        let observation = self.progress.observe(&ProgressInput {
+        let mut observation = self.progress.observe(&ProgressInput {
             scope,
             evidence: &stripped,
             config: &self.progress_config,
@@ -251,15 +357,33 @@ impl BoundAutonomyProfile {
         {
             eligible.insert(format!("current:{}", current.identity.sequence));
         }
+        // Proof links come from frozen input and verified references, not callback-supplied fingerprints.
+        observation.validation_dependencies.clear();
         for check in &self.checks {
             if let Some(result) =
                 super::latest_validation(&evidence.validations, &check.check.id, scope)
+                && result.outcome != super::GateOutcome::Unknown
             {
-                eligible.insert(format!(
-                    "check:{}:{}",
-                    check.check.id, result.identity.sequence
-                ));
+                let reference = format!("check:{}:{}", check.check.id, result.identity.sequence);
+                if observation.evidence_refs.contains(&reference)
+                    || self.progress.descriptor().checks.contains(&check.check.id)
+                {
+                    observation
+                        .validation_dependencies
+                        .insert(check.check.id.clone(), result.proof_identity()?);
+                }
+                eligible.insert(reference);
             }
+        }
+        if !observation.signals.is_empty()
+            && self
+                .progress
+                .descriptor()
+                .checks
+                .iter()
+                .any(|id| !observation.validation_dependencies.contains_key(id))
+        {
+            return Err(AgentError::Config("progress dependency unavailable".into()));
         }
         if (!observation.signals.is_empty() && observation.evidence_refs.is_empty())
             || observation
@@ -283,7 +407,9 @@ pub struct AutonomyExtensions {
     validators: BTreeMap<(String, u32), Arc<dyn AutonomyValidator>>,
     progress: BTreeMap<(String, u32), Arc<dyn ProgressAdapter>>,
     host_validation: BTreeMap<String, HostValidationBinding>,
-    conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) validation_targets: BTreeMap<String, super::host_evidence::HostTarget>,
+    pub(super) condition_policies: BTreeMap<String, super::ExternalUnavailablePolicy>,
 }
 
 impl AutonomyExtensions {
@@ -386,6 +512,8 @@ impl AutonomyExtensions {
             progress: self.progress,
             host_validation: self.host_validation,
             conditions: self.conditions,
+            validation_targets: self.validation_targets,
+            condition_policies: self.condition_policies,
         })
     }
 }
@@ -395,7 +523,9 @@ pub struct FrozenAutonomyExtensions {
     validators: BTreeMap<(String, u32), Arc<dyn AutonomyValidator>>,
     progress: BTreeMap<(String, u32), Arc<dyn ProgressAdapter>>,
     host_validation: BTreeMap<String, HostValidationBinding>,
-    conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) conditions: BTreeMap<String, HostConditionBinding>,
+    pub(super) validation_targets: BTreeMap<String, super::host_evidence::HostTarget>,
+    pub(super) condition_policies: BTreeMap<String, super::ExternalUnavailablePolicy>,
 }
 
 impl FrozenAutonomyExtensions {
@@ -520,7 +650,9 @@ impl FrozenAutonomyExtensions {
                         })
             }) && (!adapter.descriptor().needs_judge || capabilities.judge)
                 && (!adapter.descriptor().needs_planner || capabilities.planner)
-                && (!adapter.descriptor().requires_host_revision || capabilities.host_revisions);
+                && (!adapter.descriptor().requires_host_revision
+                    || (capabilities.host_revisions
+                        && self.validation_targets.contains_key(&check.id)));
             if check.required.unwrap_or(true) && !available {
                 return Err(AgentError::Config(
                     "required validator capability/authority unavailable".into(),
@@ -569,7 +701,13 @@ impl FrozenAutonomyExtensions {
                 .any(|tool| !capabilities.tools.contains(tool))
             || (progress.descriptor().needs_judge && !capabilities.judge)
             || (progress.descriptor().needs_planner && !capabilities.planner)
-            || (progress.descriptor().requires_host_revision && !capabilities.host_revisions)
+            || (progress.descriptor().requires_host_revision
+                && (!capabilities.host_revisions
+                    || !progress
+                        .descriptor()
+                        .checks
+                        .iter()
+                        .any(|id| self.validation_targets.contains_key(id))))
         {
             return Err(AgentError::Config(
                 "progress adapter dependency/capability unavailable".into(),

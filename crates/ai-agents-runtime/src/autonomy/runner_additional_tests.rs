@@ -87,6 +87,7 @@ async fn expired_final_contract(storage: Arc<dyn AgentStorage>) {
                 payload: running.payload,
                 release: true,
                 expires_at: None,
+                evidence: None,
                 deadline: std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_secs(1))
                     .unwrap(),
@@ -187,6 +188,7 @@ async fn lifecycle_progression_does_not_apply_premature_failure_policy() {
         action: Some(PrematureFinishAction::Fail),
         max_continuations: Some(1),
         prompt: None,
+        on_unavailable: None,
     });
     let runner = AutonomyRunner::try_new(
         agent,
