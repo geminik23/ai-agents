@@ -55,7 +55,10 @@ impl TaskValidationJournal {
 }
 
 // Unambiguous run/check/attempt/observation identity is retained across checkpoint revisions.
-fn observation_reservation_id(state: &ValidationDriverState, id: &str) -> Result<String> {
+pub(crate) fn observation_reservation_id(
+    state: &ValidationDriverState,
+    id: &str,
+) -> Result<String> {
     Ok(format!(
         "validation:{}",
         canonical_identity(
@@ -206,6 +209,26 @@ impl ValidationJournal for TaskValidationJournal {
                     });
                 }
             }
+        }
+        if let Some(id) = state.capacity_noninvocation() {
+            let reservation_id = observation_reservation_id(state, id)?;
+            let reservation = payload
+                .reservations
+                .iter_mut()
+                .find(|r| r.id == reservation_id)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            // This logical reservation never grants or refunds a real invocation slot, priced commitment or write target.
+            if !matches!(
+                reservation.state,
+                TaskEffectState::Dispatched | TaskEffectState::Suspended
+            ) || reservation.result.is_some()
+                || reservation.reserved_micro_usd != 0
+                || reservation.charged_micro_usd != 0
+                || !reservation.write_targets.is_empty()
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            reservation.state = TaskEffectState::Suspended;
         }
         if let Some(parked) = &state.parked {
             let reservation_id = observation_reservation_id(state, &parked.observation)?;

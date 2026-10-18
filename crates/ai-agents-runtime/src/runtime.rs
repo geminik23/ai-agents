@@ -1784,10 +1784,20 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Executes an admitted controller turn while retaining native history, redispatch ownership and one finalizer.
+    /// Executes one admitted ordinary controller turn while retaining the native root owner and a single finalizer.
     pub(crate) async fn run_autonomy_turn(
         &self,
         input: crate::autonomy::AutonomyTurnInput,
+    ) -> Result<AgentResponse> {
+        Box::pin(self.run_autonomy_turn_with_skill(input, None, None)).await
+    }
+
+    /// Resumes a capacity-denied script or model loop under the same root gate without replaying completed work or resetting iterations.
+    pub(crate) async fn run_autonomy_turn_with_skill(
+        &self,
+        input: crate::autonomy::AutonomyTurnInput,
+        skill: Option<Box<crate::autonomy::location::TaskSkillLocation>>,
+        model: Option<Box<crate::autonomy::TaskLoopState>>,
     ) -> Result<AgentResponse> {
         let active = self.autonomy_owner.read().clone();
         if active
@@ -1819,9 +1829,17 @@ impl RuntimeAgent {
         let identities: RootTurnGateIdentityStack = identities.into();
         let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(input.owner.clone());
         let objective = input.objective.clone();
+        let work: Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> =
+            if let Some(skill) = skill {
+                self.resume_capacity_skill(skill)
+            } else if let Some(model) = model {
+                self.resume_capacity_model(model)
+            } else {
+                Box::pin(self.run_loop(&objective))
+            };
         let result = scope_runtime_gate_identity_stack(
             &identities,
-            crate::autonomy::scope_turn(input, Box::pin(self.run_loop(&objective))),
+            crate::autonomy::scope_turn(input, work),
         )
         .await;
         cleanup.finish();
@@ -5973,8 +5991,16 @@ impl RuntimeAgent {
         }
         let mut admitted_footprint = None;
         let attempt = if let Some(execution) = &execution {
-            let (id, footprint) =
-                Box::pin(execution.admit_tool(tool.as_ref(), &args, &ctx)).await?;
+            let admission = Box::pin(execution.admit_tool(tool.as_ref(), &args, &ctx)).await;
+            let (id, footprint) = match admission {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    if let Some(request) = execution.park_capacity(&self.info.id, &ctx, &args)? {
+                        return Err(AgentError::TaskSuspended(request));
+                    }
+                    return Err(error);
+                }
+            };
             admitted_footprint = footprint;
             Some(id)
         } else {
@@ -7771,8 +7797,16 @@ impl RuntimeAgent {
     // This method is branch-safe because it only asks the router which skill matches.
     // Do not add disambiguation, pending-skill writes, or skill execution here.
     //
-    /// Selects a skill without executing it.
+    /// Selects a skill without executing it; an explicitly admitted task skill bypasses only semantic selection, never scope or execution checks.
     async fn select_skill_candidate(&self, input: &str) -> Result<Option<SkillCandidate>> {
+        if let Some(turn) = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            && turn.initial_work()
+            && let Some(skill) = turn.owner.skill.read().clone()
+        {
+            self.validate_autonomy_skill_binding(&skill)?;
+            let available = self.admit_autonomy_skill(&skill.id)?;
+            return Ok(Some(SkillCandidate::new(available.id.clone(), available)));
+        }
         let Some(ref router) = self.skill_router else {
             return Ok(None);
         };
@@ -7973,7 +8007,9 @@ impl RuntimeAgent {
         &'a self,
         input: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<SkillRouteResult>> + Send + 'a>> {
-        if self.skill_router.is_none() {
+        let explicit = crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| turn.initial_work() && turn.owner.skill.read().is_some());
+        if self.skill_router.is_none() && !explicit {
             return Box::pin(async { Ok(SkillRouteResult::NoMatch) });
         }
         Box::pin(self.try_skill_route_inner(input))

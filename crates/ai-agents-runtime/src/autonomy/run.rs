@@ -379,6 +379,8 @@ pub struct TaskPendingRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskPendingKind {
+    /// A capacity response carries no approval grant and cannot resume until the exhausted allowance is revised.
+    Limit,
     /// Only an explicit host Continue may consume this objective boundary.
     HostContinue,
     Approval,

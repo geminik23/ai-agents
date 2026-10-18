@@ -103,6 +103,118 @@ impl AutonomyRunner {
         .await
     }
 
+    /// Reports host-confirmed delivery loss for one controller question or capacity wait, never inferred from silence.
+    pub async fn controller_unavailable_paused(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        request_id: &str,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        if reason.trim().is_empty() || reason.chars().count() > 512 {
+            return Err(ai_agents_core::AgentError::Config(
+                "controller unavailability requires a bounded audit reason".into(),
+            ));
+        }
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != expected_revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        if controller_checkpoint(&payload)?.is_none()
+            && payload.pending.as_ref().is_some_and(|pending| {
+                pending.id == request_id && matches!(pending.kind, TaskPendingKind::Limit)
+            })
+        {
+            super::super::controller::pending_capacity(payload.pending.as_ref().unwrap())?;
+            let fallback = payload
+                .settings
+                .on_limit
+                .as_ref()
+                .and_then(|policy| policy.on_unavailable);
+            return scope_stop(
+                HostStop {
+                    reason: reason.into(),
+                    kind: "controller_unavailable",
+                    status: if fallback == Some(InteractionUnavailableAction::Fail) {
+                        TaskRunStatus::Failed
+                    } else {
+                        TaskRunStatus::Incomplete
+                    },
+                    request_id: Some(request_id.into()),
+                },
+                self.cancel_paused(run_id, expected_revision),
+            )
+            .await;
+        }
+        let state = self.retained_controller(&snapshot, &payload)?;
+        let review = state
+            .review
+            .as_ref()
+            .filter(|review| review.id == request_id)
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        let fallback = match &review.proposal {
+            super::super::controller::ControllerProposal::Capacity { .. }
+            | super::super::controller::ControllerProposal::Question { limit: Some(_), .. } => {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+            }
+            super::super::controller::ControllerProposal::Question { reason: cause, .. }
+                if cause == "no_progress" =>
+            {
+                return scope_stop(
+                    HostStop {
+                        reason: reason.into(),
+                        kind: "controller_unavailable",
+                        status: if payload
+                            .settings
+                            .progress
+                            .as_ref()
+                            .and_then(|p| p.stagnation.as_ref())
+                            .and_then(|p| p.on_unavailable)
+                            == Some(StagnationAction::Fail)
+                        {
+                            TaskRunStatus::Failed
+                        } else {
+                            TaskRunStatus::Incomplete
+                        },
+                        request_id: Some(request_id.into()),
+                    },
+                    self.cancel_paused(run_id, expected_revision),
+                )
+                .await;
+            }
+            super::super::controller::ControllerProposal::Question { .. } => payload
+                .settings
+                .premature_finish
+                .as_ref()
+                .and_then(|policy| policy.on_unavailable),
+            _ => return Err(TaskRunStorageError::NotResumable.into()),
+        };
+        scope_stop(
+            HostStop {
+                reason: reason.into(),
+                kind: "controller_unavailable",
+                status: if fallback == Some(InteractionUnavailableAction::Fail) {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::Incomplete
+                },
+                request_id: Some(request_id.into()),
+            },
+            self.cancel_paused(run_id, expected_revision),
+        )
+        .await
+    }
+
     /// Revises numeric ceilings without consuming the pending response or executing work; the host authenticates its caller.
     /// Failed or lost acknowledgement preserves protection, while a successful revision keeps individual operation deadlines unchanged.
     pub async fn revise_limits_paused(
@@ -259,7 +371,16 @@ impl AutonomyRunner {
                     serde_json::from_value(snapshot.payload.clone())?;
                 if payload.pending.as_ref().is_none_or(|pending| {
                     pending.id != *request_id
-                        || !matches!(pending.kind, TaskPendingKind::ExternalCondition)
+                        || if control.kind == "external_unavailable" {
+                            !matches!(pending.kind, TaskPendingKind::ExternalCondition)
+                        } else {
+                            !matches!(
+                                pending.kind,
+                                TaskPendingKind::UserQuestion
+                                    | TaskPendingKind::HostContinue
+                                    | TaskPendingKind::Limit
+                            )
+                        }
                 }) {
                     return Err(TaskRunStorageError::NotResumable.into());
                 }

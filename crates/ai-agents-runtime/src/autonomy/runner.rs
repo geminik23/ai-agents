@@ -9,6 +9,8 @@ use std::{collections::BTreeMap, sync::Arc};
 mod controller_runtime;
 #[path = "host_runtime.rs"]
 mod host_runtime;
+#[path = "live_controller.rs"]
+mod live_controller;
 #[path = "paused_control.rs"]
 mod paused_control;
 
@@ -25,6 +27,7 @@ pub struct AutonomyRunner {
     active: parking_lot::Mutex<Option<Arc<RunExecution>>>,
     paused: parking_lot::Mutex<BTreeMap<String, PausedTask>>,
     resume_gate: tokio::sync::Mutex<()>,
+    interaction_delivery: bool,
 }
 
 struct PausedTask {
@@ -272,15 +275,7 @@ impl AutonomyRunner {
         ) {
             return Err(AgentError::HITLTimeout);
         }
-        let profile = resolve_profile(
-            &self.config,
-            AutonomyScope::Task,
-            payload.profile.as_deref(),
-            None,
-            None,
-            Some(&payload.objective),
-            &self.host,
-        )?;
+        let profile = self.retained_profile(&payload)?;
         if profile.settings != payload.settings {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
@@ -653,7 +648,7 @@ impl AutonomyRunner {
                 "empty task configuration identity".into(),
             ));
         }
-        super::validate_agent_config(&config, None, &[])?;
+        super::config::validate_runner_config(&config)?;
         agent.preflight_standalone_autonomy()?;
         Ok(Self {
             agent,
@@ -664,6 +659,7 @@ impl AutonomyRunner {
             active: parking_lot::Mutex::new(None),
             paused: Default::default(),
             resume_gate: Default::default(),
+            interaction_delivery: true,
         })
     }
 
@@ -958,29 +954,44 @@ impl AutonomyRunner {
         if controller_checkpoint(&payload)?.is_some() {
             return Box::pin(self.resume_controller(snapshot, payload, input)).await;
         }
-        let (request_id, mut result, question_response) = match input {
-            TaskResumeInput::Approval { request_id, result } => (
-                request_id,
-                super::suspension::BatchResponse::Approval(result),
+        let capacity = payload
+            .pending
+            .as_ref()
+            .filter(|pending| matches!(pending.kind, TaskPendingKind::Limit));
+        let (request_id, mut result, question_response) = if let Some(pending) = capacity {
+            self.validate_capacity_response(&payload, &input)?;
+            (
+                pending.id.clone(),
+                super::suspension::BatchResponse::Capacity,
                 false,
-            ),
-            TaskResumeInput::UserAnswer { request_id, answer } => (
-                request_id,
-                super::suspension::BatchResponse::UserAnswer(answer),
-                true,
-            ),
-            TaskResumeInput::QuestionTimeout { request_id } => (
-                request_id,
-                super::suspension::BatchResponse::QuestionTimeout,
-                true,
-            ),
-            TaskResumeInput::Continue | TaskResumeInput::ExternalSignal(_) => {
-                return Err(TaskRunStorageError::NotResumable.into());
+            )
+        } else {
+            match input {
+                TaskResumeInput::Approval { request_id, result } => (
+                    request_id,
+                    super::suspension::BatchResponse::Approval(result),
+                    false,
+                ),
+                TaskResumeInput::UserAnswer { request_id, answer } => (
+                    request_id,
+                    super::suspension::BatchResponse::UserAnswer(answer),
+                    true,
+                ),
+                TaskResumeInput::QuestionTimeout { request_id } => (
+                    request_id,
+                    super::suspension::BatchResponse::QuestionTimeout,
+                    true,
+                ),
+                TaskResumeInput::Continue | TaskResumeInput::ExternalSignal(_) => {
+                    return Err(TaskRunStorageError::NotResumable.into());
+                }
             }
         };
         if payload.pending.as_ref().is_none_or(|pending| {
             pending.id != request_id
-                || if question_response {
+                || if matches!(result, super::suspension::BatchResponse::Capacity) {
+                    !matches!(pending.kind, TaskPendingKind::Limit)
+                } else if question_response {
                     !matches!(pending.kind, TaskPendingKind::UserQuestion)
                 } else {
                     !matches!(pending.kind, TaskPendingKind::Approval)
@@ -1073,15 +1084,7 @@ impl AutonomyRunner {
         {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
-        let profile = resolve_profile(
-            &self.config,
-            AutonomyScope::Task,
-            payload.profile.as_deref(),
-            None,
-            None,
-            Some(&payload.objective),
-            &self.host,
-        )?;
+        let profile = self.retained_profile(&payload)?;
         if profile.settings != payload.settings {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
@@ -1095,7 +1098,13 @@ impl AutonomyRunner {
             .find(|adapter| adapter.id == "runtime.controller")
             .map(|adapter| serde_json::from_value(adapter.state["lifecycle"].clone()))
             .transpose()?
-            .unwrap_or(LifecycleState::new(&profile.settings, false)?);
+            .map(Ok)
+            .unwrap_or_else(|| {
+                LifecycleState::new(
+                    &profile.settings,
+                    profile.strategy == ExecutionStrategy::Skill,
+                )
+            })?;
         let owner = self
             .paused
             .lock()
@@ -1194,7 +1203,7 @@ impl AutonomyRunner {
                             controller_message: payload.controller_state.to_string(),
                             source: AutonomyTurnSource::ResumeAfterApproval,
                         },
-                        batch,
+                        batch.clone(),
                         &request_id,
                         result,
                     ),
@@ -1202,6 +1211,38 @@ impl AutonomyRunner {
                 .await;
                 if matches!(&response, Err(AgentError::TaskSuspended(_))) {
                     return self.pause(&execution, paused.todo.as_ref()).await;
+                }
+                if let Some(reason) = execution.stop_reason()
+                    && matches!(
+                        reason.as_str(),
+                        "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
+                    )
+                {
+                    if !self.interaction_delivery {
+                        let latest = execution.load_owned().await?;
+                        let current: TaskCheckpointPayload =
+                            serde_json::from_value(latest.payload)?;
+                        if current.pending.is_some() {
+                            let runtime =
+                                self.agent.cancel_task_batch(&owner, batch.clone()).await?;
+                            execution
+                                .update(|payload| {
+                                    payload.runtime = runtime;
+                                    if let Some(pending) = payload.pending.take() {
+                                        payload.consumed_request_ids.push(pending.id);
+                                    }
+                                    payload.pause_reason = None;
+                                    Ok(())
+                                })
+                                .await?;
+                        }
+                    }
+                    return Box::pin(self.pause_admission_limit(
+                        &execution,
+                        paused.todo.as_ref(),
+                        &reason,
+                    ))
+                    .await;
                 }
                 let response = response?;
                 let runtime =
@@ -1257,11 +1298,25 @@ impl AutonomyRunner {
     /// Runs a bounded foreground objective after sampling required host targets; unsuccessful writes never publish success.
     /// Revision sources are sampled state, not providers or execution permits, and are rechecked at continuation/publication boundaries.
     pub async fn run(&self, objective: &str, selected: Option<&str>) -> Result<TaskRunResult> {
+        Box::pin(self.run_entry(objective, selected, None)).await
+    }
+
+    /// Executes one admitted entry under the same controller; automatic routing never creates another run here.
+    async fn run_entry(
+        &self,
+        objective: &str,
+        selected: Option<&str>,
+        skill: Option<ai_agents_skills::SkillDefinition>,
+    ) -> Result<TaskRunResult> {
         let profile = resolve_profile(
             &self.config,
-            AutonomyScope::Task,
+            if skill.is_some() {
+                AutonomyScope::Skill
+            } else {
+                AutonomyScope::Task
+            },
             selected,
-            None,
+            skill.as_ref().and_then(|skill| skill.autonomy.as_ref()),
             None,
             Some(objective),
             &self.host,
@@ -1309,13 +1364,7 @@ impl AutonomyRunner {
                 "unavailable task interaction requires an explicit stop/fail fallback".into(),
             ));
         }
-        if profile.settings.persistence.is_some()
-            || profile
-                .settings
-                .premature_finish
-                .as_ref()
-                .is_some_and(|policy| policy.action == Some(PrematureFinishAction::AskUser))
-        {
+        if profile.settings.persistence.is_some() {
             return Err(AgentError::Config(
                 "task persistence/resume and host-interaction profile controls are not installed"
                     .into(),
@@ -1327,17 +1376,12 @@ impl AutonomyRunner {
                 || hitl
                     .on_approval_required
                     .is_some_and(|action| action != InteractionAction::PauseRun)
-        }) || profile.settings.on_limit.as_ref().is_some_and(|limit| {
-            !matches!(
-                limit.action,
-                None | Some(LimitAction::SummarizeAndStop | LimitAction::Fail)
-            )
         }) {
             return Err(AgentError::Config(
                 "live task suspension is not installed for this profile".into(),
             ));
         }
-        let lifecycle = LifecycleState::new(&profile.settings, false)?;
+        let lifecycle = LifecycleState::new(&profile.settings, skill.is_some())?;
         let mut preflight_scope = EvaluationScope {
             key: TaskRunKey {
                 agent_id: self.agent.info().id,
@@ -1356,6 +1400,11 @@ impl AutonomyRunner {
         bound.capture_targets(&mut preflight_scope)?;
         let run_id = uuid::Uuid::new_v4().to_string();
         let owner = self.agent.reserve_autonomy_run(run_id.clone()).await?;
+        *owner.skill.write() = skill.clone();
+        owner.interaction_delivery.store(
+            self.interaction_delivery,
+            std::sync::atomic::Ordering::Release,
+        );
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let started = std::time::Instant::now();
         let now = chrono::Utc::now();
@@ -1372,6 +1421,15 @@ impl AutonomyRunner {
                 &profile,
                 TaskRuntimeCheckpoint::between_turns(self.agent.save_state().await?)?,
             );
+            if let Some(skill) = &skill {
+                payload.adapters.push(TaskAdapterCheckpoint {
+                    id: "runtime.entry".into(),
+                    adapter: "runtime.entry".into(),
+                    contract_version: 1,
+                    config: serde_json::to_value(skill)?,
+                    state: json!({}),
+                });
+            }
             payload.clocks.active_interval_started_at = Some(now);
             payload.clocks.expires_at = profile
                 .max_wall_time_seconds
@@ -1610,6 +1668,16 @@ impl AutonomyRunner {
                 .map(|check| check.check.id.clone())
                 .collect();
             let reviewed = continuation.as_ref().and_then(|saved| saved.review.clone());
+            let capacity = reviewed.as_ref().and_then(|review| match &review.proposal {
+                super::controller::ControllerProposal::Capacity { limit }
+                | super::controller::ControllerProposal::Question {
+                    limit: Some(limit), ..
+                } => Some(limit.clone()),
+                _ => None,
+            });
+            let mut resuming_turn = capacity.as_ref().is_some_and(|limit| limit.resume_turn);
+            let mut pending_model = capacity.as_ref().and_then(|limit| limit.model.clone());
+            let mut pending_skill = capacity.and_then(|limit| limit.skill);
             if let Some(review) = &reviewed {
                 match &review.proposal {
                     super::controller::ControllerProposal::Continue => {
@@ -1622,6 +1690,18 @@ impl AutonomyRunner {
                     } => {
                         instruction = approved.clone();
                         continuation = None;
+                        source = AutonomyTurnSource::Continuation;
+                    }
+                    super::controller::ControllerProposal::Question { .. }
+                    | super::controller::ControllerProposal::Capacity { .. } => {
+                        if continuation
+                            .as_ref()
+                            .is_some_and(|saved| saved.driver.is_some())
+                        {
+                            continuation.as_mut().unwrap().review = None;
+                        } else {
+                            continuation = None;
+                        }
                         source = AutonomyTurnSource::Continuation;
                     }
                     super::controller::ControllerProposal::Stage { .. } => {}
@@ -1648,10 +1728,25 @@ impl AutonomyRunner {
                     let snapshot = execution.load_owned().await?;
                     let payload: TaskCheckpointPayload =
                         serde_json::from_value(snapshot.payload.clone())?;
-                    if execution.check(&payload).is_err()
-                        || (resumed_response.is_none()
-                            && payload.counters.turns >= u64::from(payload.limits.max_turns))
+                    if execution.stop_reason().is_none()
+                        && resumed_response.is_none()
+                        && !resuming_turn
+                        && payload.counters.turns >= u64::from(payload.limits.max_turns)
                     {
+                        let state = ControllerContinuation::decision(
+                            &scope,
+                            &lifecycle,
+                            &progress,
+                            &evidence,
+                            last_response.as_ref(),
+                            &instruction,
+                            source,
+                            forced_continuation,
+                        );
+                        return Box::pin(self.park_limit(execution, todo, state, "turn_capacity"))
+                            .await;
+                    }
+                    if execution.check(&payload).is_err() {
                         return self
                             .finish(
                                 execution,
@@ -1667,7 +1762,7 @@ impl AutonomyRunner {
                             )
                             .await;
                     }
-                    if resumed_response.is_none() {
+                    if resumed_response.is_none() && !resuming_turn {
                         scope.cycle += 1;
                     }
                     scope.mutation_generation = execution.mutation_generation();
@@ -1696,8 +1791,8 @@ impl AutonomyRunner {
                 "stage_instruction":profile.settings.lifecycle.as_ref().and_then(|stages| stages.get(lifecycle.current_stage)).and_then(|stage| stage.instruction.clone())});
                     execution
                 .update(|payload| {
-                    if resumed_response.is_none() { payload.counters.turns += 1; }
-                    if forced_continuation && resumed_response.is_none() {
+                    if resumed_response.is_none() && !resuming_turn { payload.counters.turns += 1; }
+                    if forced_continuation && resumed_response.is_none() && !resuming_turn {
                         payload.counters.continuations += 1;
                     }
                     payload.stage = scope.stage.clone();
@@ -1725,20 +1820,39 @@ impl AutonomyRunner {
                                 )
                                 .await;
                         }
-                        self.agent
-                            .run_autonomy_turn(AutonomyTurnInput {
-                                owner: owner.clone(),
-                                objective: objective.into(),
-                                controller_message: controller.to_string(),
-                                source,
-                            })
-                            .await
+                        let input = AutonomyTurnInput {
+                            owner: owner.clone(),
+                            objective: objective.into(),
+                            controller_message: controller.to_string(),
+                            source: pending_skill.as_ref().map_or(source, |skill| skill.source),
+                        };
+                        if pending_skill.is_some() || pending_model.is_some() {
+                            self.agent
+                                .run_autonomy_turn_with_skill(
+                                    input,
+                                    pending_skill.take(),
+                                    pending_model.take(),
+                                )
+                                .await
+                        } else {
+                            self.agent.run_autonomy_turn(input).await
+                        }
                     };
                     match response {
                         Ok(response) => last_response = Some(response),
                         Err(AgentError::TaskSuspended(_)) => {
                             return self.pause(execution, todo).await;
                         }
+                        Err(_)
+                            if matches!(
+                                execution.stop_reason().as_deref(),
+                                Some(
+                                    "llm_capacity"
+                                        | "tool_capacity"
+                                        | "priced_capacity"
+                                        | "write_capacity"
+                                )
+                            ) => {}
                         Err(_error) => {
                             return self
                                 .finish(
@@ -1752,7 +1866,34 @@ impl AutonomyRunner {
                                 .await;
                         }
                     }
+                    resuming_turn = false;
                     if let Some(reason) = execution.stop_reason() {
+                        if matches!(
+                            reason.as_str(),
+                            "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
+                        ) {
+                            let runtime = TaskRuntimeCheckpoint::between_turns(
+                                self.agent.save_state_full().await?,
+                            )?;
+                            execution
+                                .update(|payload| {
+                                    payload.runtime = runtime;
+                                    Ok(())
+                                })
+                                .await?;
+                            let state = ControllerContinuation::decision(
+                                &scope,
+                                &lifecycle,
+                                &progress,
+                                &evidence,
+                                last_response.as_ref(),
+                                &instruction,
+                                source,
+                                forced_continuation,
+                            );
+                            return Box::pin(self.park_limit(execution, todo, state, &reason))
+                                .await;
+                        }
                         return self
                             .finish(
                                 execution,
@@ -1762,6 +1903,7 @@ impl AutonomyRunner {
                             )
                             .await;
                     }
+                    lifecycle.skill_segment_completed |= execution.skill_segment_completed();
                     execution.await_children().await?;
                     Box::pin(self.agent.flush_background_tasks()).await?;
                     let runtime =
@@ -1842,6 +1984,7 @@ impl AutonomyRunner {
                     ))
                     .await?
                     {
+                        let capacity_reason = driver.capacity_reason.clone();
                         *execution.controller.lock() = Some(Box::new(ControllerContinuation {
                             scope: scope.clone(),
                             lifecycle: lifecycle.clone(),
@@ -1858,6 +2001,15 @@ impl AutonomyRunner {
                             driver: Some(driver),
                             review: None,
                         }));
+                        if let Some(reason) = capacity_reason {
+                            let state = *execution
+                                .controller
+                                .lock()
+                                .take()
+                                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                            return Box::pin(self.park_limit(execution, todo, state, &reason))
+                                .await;
+                        }
                         return Box::pin(self.pause_controller(execution, todo)).await;
                     }
                 }
@@ -2028,7 +2180,7 @@ impl AutonomyRunner {
                             && payload.counters.turns < u64::from(payload.limits.max_turns)
                             && payload.counters.llm_attempts
                                 < u64::from(payload.limits.max_llm_calls),
-                        interaction_available: false,
+                        interaction_available: self.interaction_delivery,
                     },
                 )?;
                 execution.update(|payload| {
@@ -2055,14 +2207,23 @@ impl AutonomyRunner {
                         return self.finish(execution, status, reason, last_response).await;
                     }
                     CheckpointDecision::Limit => {
-                        return self
-                            .finish(
-                                execution,
-                                TaskRunStatus::LimitReached,
-                                "invocation_capacity".into(),
-                                last_response,
-                            )
-                            .await;
+                        let state = ControllerContinuation::decision(
+                            &scope,
+                            &lifecycle,
+                            &progress,
+                            &evidence,
+                            last_response.as_ref(),
+                            &instruction,
+                            source,
+                            forced_continuation,
+                        );
+                        let reason =
+                            if payload.counters.turns >= u64::from(payload.limits.max_turns) {
+                                "turn_capacity"
+                            } else {
+                                "invocation_capacity"
+                            };
+                        return Box::pin(self.park_limit(execution, todo, state, reason)).await;
                     }
                     CheckpointDecision::Replan => {
                         forced_continuation = false;
@@ -2117,10 +2278,22 @@ impl AutonomyRunner {
                             .await;
                         }
                     }
-                    CheckpointDecision::Wait | CheckpointDecision::AskUser => {
-                        return Err(AgentError::Config(
-                            "task suspension is not installed".into(),
-                        ));
+                    CheckpointDecision::AskUser => {
+                        let state = ControllerContinuation::decision(
+                            &scope,
+                            &lifecycle,
+                            &progress,
+                            &evidence,
+                            last_response.as_ref(),
+                            &instruction,
+                            source,
+                            false,
+                        );
+                        return Box::pin(self.park_question(execution, todo, state, "no_progress",
+                            "Progress has stalled. Provide task guidance, or use an explicit host action to stop, cancel or revise the objective or limits.".into(), None)).await;
+                    }
+                    CheckpointDecision::Wait => {
+                        return Err(TaskRunStorageError::InvalidCheckpoint.into());
                     }
                     CheckpointDecision::Continue => {
                         if lifecycle.current_stage != previous_stage
@@ -2165,14 +2338,24 @@ impl AutonomyRunner {
                                         .await;
                                 }
                                 PrematureFinishAction::AskUser => {
-                                    return self
-                                        .finish(
-                                            execution,
-                                            TaskRunStatus::Incomplete,
-                                            "interaction_unavailable".into(),
-                                            last_response,
-                                        )
-                                        .await;
+                                    progress.handled_sequence = Some(progress.sequence);
+                                    let state = ControllerContinuation::decision(
+                                        &scope,
+                                        &lifecycle,
+                                        &progress,
+                                        &evidence,
+                                        last_response.as_ref(),
+                                        &instruction,
+                                        source,
+                                        false,
+                                    );
+                                    let blocked = evidence.tools.iter().any(|tool| {
+                                        tool.value.policy.outcome
+                                            == ai_agents_core::PermissionOutcome::Deny
+                                    });
+                                    return Box::pin(self.park_question(execution, todo, state,
+                                        if blocked { "policy_blocked" } else { "premature_finish" },
+                                        "Completion is not proven. Provide guidance for the unmet gates; an answer does not waive validation or authorize denied work.".into(), None)).await;
                                 }
                                 PrematureFinishAction::Continue => {}
                             }
@@ -2227,19 +2410,7 @@ impl AutonomyRunner {
             scope
                 .validation_attempts
                 .insert(check.check.id.clone(), attempt.clone());
-            let capacity = execution.load_owned().await?;
-            let capacity: TaskCheckpointPayload = serde_json::from_value(capacity.payload)?;
-            if resumed.is_none()
-                && check.available
-                && (check.adapter.descriptor().needs_judge
-                    || check.adapter.descriptor().needs_planner)
-                && capacity.counters.llm_attempts >= u64::from(capacity.limits.max_llm_calls)
-            {
-                execution.stop("llm_capacity");
-                return Err(AgentError::Other(
-                    "validation has no remaining provider allowance".into(),
-                ));
-            }
+
             // A resumed attempt retains its original identity; capture_scope records current invocation/publication freshness separately.
             if resumed.is_none() {
                 scope.mutation_generation = execution.mutation_generation();

@@ -93,6 +93,23 @@ fn validate_suspended_observation(payload: &TaskCheckpointPayload, id: &str) -> 
         .filter_map(|adapter| adapter.state.get("_task_validation_driver"))
     {
         let state: Box<ValidationDriverState> = serde_json::from_value(value.clone())?;
+        if state.capacity_reason.is_some() && state.parked.is_none() {
+            if state.in_flight.is_some()
+                || state.wait.is_some()
+                || state.result.is_some()
+                || state.pending_batch.is_empty()
+            {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            if state
+                .wait_reservation()?
+                .as_deref()
+                .and_then(|key| key.strip_prefix("validation:"))
+                == Some(id)
+            {
+                matches += 1;
+            }
+        }
         if let Some(parked) = &state.parked {
             super::authority::validate_observation_pause(parked)?;
             if state.in_flight.is_some() || state.pending_batch.first() != Some(&parked.observation)

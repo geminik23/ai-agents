@@ -188,6 +188,7 @@ async fn lifecycle_progression_does_not_apply_premature_failure_policy() {
         action: Some(PrematureFinishAction::Fail),
         max_continuations: Some(1),
         prompt: None,
+        on_unavailable: None,
     });
     let runner = AutonomyRunner::try_new(
         agent,

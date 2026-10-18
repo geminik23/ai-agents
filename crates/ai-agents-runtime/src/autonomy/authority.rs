@@ -140,9 +140,10 @@ pub(crate) fn validate_observation_pause(parked: &ValidationObservationPause) ->
         || pending.request_id != parked.pending.id
         || matches!(parked.pending.kind, TaskPendingKind::UserQuestion)
             != pending.question.is_some()
+        || matches!(parked.pending.kind, TaskPendingKind::Limit) != pending.capacity()?.is_some()
         || !matches!(
             parked.pending.kind,
-            TaskPendingKind::UserQuestion | TaskPendingKind::Approval
+            TaskPendingKind::UserQuestion | TaskPendingKind::Approval | TaskPendingKind::Limit
         )
     {
         return Err(TaskRunStorageError::InvalidCheckpoint.into());
@@ -191,6 +192,35 @@ pub fn validation_judge_provider(
 
 #[async_trait]
 impl ValidationObservationExecutor for RuntimeObservationExecutor {
+    /// Capacity is observed before the driver marks dispatch; the actual executor still reserves atomically after any wait.
+    async fn capacity_reason(
+        &self,
+        request: &ValidationObservationRequest,
+    ) -> Result<Option<String>> {
+        let Some(execution) = current_execution() else {
+            return Ok(None);
+        };
+        let snapshot = execution.load_owned().await?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
+        Ok(match request {
+            ValidationObservationRequest::Judge { .. }
+            | ValidationObservationRequest::Plan { .. }
+                if payload.counters.llm_attempts >= u64::from(payload.limits.max_llm_calls) =>
+            {
+                Some("llm_capacity".into())
+            }
+            ValidationObservationRequest::Tool { tool, .. }
+                if payload.counters.tool_attempts >= u64::from(payload.limits.max_tool_calls)
+                    || (tool == "command"
+                        && payload.counters.command_attempts
+                            >= u64::from(payload.limits.max_command_calls)) =>
+            {
+                Some("tool_capacity".into())
+            }
+            _ => None,
+        })
+    }
+
     /// Samples frozen targets and the authoritative run or independent-tree generation without letting callbacks relabel old proof.
     fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
         let mut scope = scope.clone();
@@ -291,7 +321,9 @@ impl ValidationObservationExecutor for RuntimeObservationExecutor {
                     .revision
                     .load(std::sync::atomic::Ordering::Acquire)
                     + 1,
-                kind: if approval.question.is_some() {
+                kind: if approval.capacity()?.is_some() {
+                    TaskPendingKind::Limit
+                } else if approval.question.is_some() {
                     TaskPendingKind::UserQuestion
                 } else {
                     TaskPendingKind::Approval

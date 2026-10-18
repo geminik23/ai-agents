@@ -1233,7 +1233,9 @@ impl RunExecution {
             child.pending = Some(TaskPendingRequest {
                 id: approval.request_id.clone(),
                 issued_revision: self.revision.load(std::sync::atomic::Ordering::Acquire) + 1,
-                kind: if approval.question.is_some() {
+                kind: if approval.capacity()?.is_some() {
+                    TaskPendingKind::Limit
+                } else if approval.question.is_some() {
                     TaskPendingKind::UserQuestion
                 } else {
                     TaskPendingKind::Approval

@@ -305,6 +305,14 @@ impl RuntimeAgent {
         batch: &TaskBatchState,
         response: &BatchResponse,
     ) -> Result<()> {
+        if matches!(response, BatchResponse::Capacity)
+            && batch
+                .approvals
+                .first()
+                .is_none_or(|pending| pending.capacity().ok().flatten().is_none())
+        {
+            return Err(crate::autonomy::TaskRunStorageError::NotResumable.into());
+        }
         if let Some(interaction) = &batch.interaction {
             return self.validate_task_interaction_response(interaction, response);
         }

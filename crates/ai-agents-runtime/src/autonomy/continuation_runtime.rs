@@ -831,7 +831,8 @@ impl RuntimeAgent {
                             drop(invocation);
                             Err(AgentError::HITLTimeout)
                         }
-                        crate::autonomy::suspension::BatchResponse::Approval(_) => invocation.await,
+                        crate::autonomy::suspension::BatchResponse::Approval(_)
+                        | crate::autonomy::suspension::BatchResponse::Capacity => invocation.await,
                         crate::autonomy::suspension::BatchResponse::UserAnswer(answer) => {
                             crate::autonomy::suspension::scope_resumed_question(
                                 approval.call_id.clone(),
@@ -987,6 +988,29 @@ impl RuntimeAgent {
         Ok(())
     }
 
+    /// A provider-capacity wait resumes the existing model loop instead of rerouting input or resetting its iteration and call history.
+    pub(crate) fn resume_capacity_model(
+        &self,
+        state: Box<TaskLoopState>,
+    ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> {
+        Box::pin(async move {
+            self.begin_root_turn();
+            let _cleanup = RootTurnCleanup::new(self);
+            self.root_user_message_committed
+                .store(true, Ordering::SeqCst);
+            *self.active_native_exchanges.write() = state
+                .native_exchanges
+                .iter()
+                .map(|exchange| ActiveNativeExchange {
+                    exchange_id: exchange.exchange_id.clone(),
+                    call_ids: exchange.call_ids.clone(),
+                })
+                .collect();
+            self.validate_active_native_history(&self.memory.get_messages(None).await?, false)?;
+            Box::pin(self.run_committed_task_loop(*state)).await
+        })
+    }
+
     /// Runs initial or resumed committed model work from exact iteration, reasoning and native history state.
     /// The caller owns user commit; reflection retains this loop's provider and suspension never resets accumulated calls.
     pub(super) async fn run_committed_task_loop(
@@ -1006,6 +1030,14 @@ impl RuntimeAgent {
                 self.hooks.on_error(&error).await;
                 error!(iterations = state.iterations, "Max iterations exceeded");
                 return Err(error);
+            }
+            if let Some(execution) = crate::autonomy::current_execution()
+                && execution.is_coordinator(&self.info.id)
+                && crate::autonomy::current_child_operation().is_none()
+            {
+                // Save the next provider position before its attempt; a resource wait cannot reset the per-turn iteration allowance.
+                state.native_exchanges = self.task_native_expectations();
+                *execution.capacity_model.lock() = Some(Box::new(state.clone()));
             }
             state.iterations += 1;
             *self.iteration_count.write() = state.iterations;

@@ -34,6 +34,7 @@ pub(crate) struct RunExecution {
     >,
     pub(crate) approval_deadlines: parking_lot::Mutex<std::collections::BTreeMap<String, Instant>>,
     pub(crate) controller: parking_lot::Mutex<Option<Box<ControllerContinuation>>>,
+    pub(crate) capacity_model: parking_lot::Mutex<Option<Box<TaskLoopState>>>,
     pub(crate) parked_batches:
         parking_lot::Mutex<std::collections::BTreeMap<String, TaskBatchState>>,
     pub(crate) parked_executor_cursors: parking_lot::Mutex<
@@ -95,6 +96,7 @@ impl RunExecution {
             approval_deadlines: Default::default(),
             parked_batches: Default::default(),
             controller: Default::default(),
+            capacity_model: Default::default(),
             parked_executor_cursors: Default::default(),
             delegate_frames: Default::default(),
             stop: parking_lot::RwLock::new(None),
@@ -203,6 +205,19 @@ impl RunExecution {
         let mut stop = self.stop.write();
         if stop.is_none() {
             *stop = Some(reason.into());
+        }
+    }
+
+    /// Only the exact pre-body capacity refusal may become a safe wait; cancellation, uncertainty and other stop reasons remain latched.
+    pub(crate) fn clear_capacity_stop(&self, reason: &str) {
+        let mut stopped = self.stop.write();
+        if stopped.as_deref() == Some(reason)
+            && matches!(
+                reason,
+                "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
+            )
+        {
+            *stopped = None;
         }
     }
 
@@ -498,6 +513,42 @@ impl RunExecution {
         Ok(snapshot)
     }
 
+    /// Credits only the explicitly admitted coordinating skill after its real cursor completes; nested unrelated scripts cannot satisfy it.
+    pub(crate) async fn complete_skill_segment(
+        &self,
+        skill: &ai_agents_skills::SkillDefinition,
+    ) -> Result<()> {
+        let admitted = self.owner.skill.read().clone();
+        if admitted.as_ref().is_none_or(|entry| entry.id != skill.id)
+            || self.lifecycle.read().1.strategy != ExecutionStrategy::Skill
+        {
+            return Ok(());
+        }
+        if serde_json::to_value(admitted.as_ref().unwrap())? != serde_json::to_value(skill)? {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        self.update(|payload| {
+            let controller = payload
+                .adapters
+                .iter_mut()
+                .find(|adapter| adapter.id == "runtime.controller")
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            let mut lifecycle: LifecycleState =
+                serde_json::from_value(controller.state["lifecycle"].clone())?;
+            lifecycle.skill_segment_completed = true;
+            controller.state["lifecycle"] = serde_json::to_value(lifecycle)?;
+            Ok(())
+        })
+        .await?;
+        self.lifecycle.write().1.skill_segment_completed = true;
+        Ok(())
+    }
+
+    /// Returns the acknowledged live lifecycle after a nested skill completes, without replacing controller stage ownership.
+    pub(crate) fn skill_segment_completed(&self) -> bool {
+        self.lifecycle.read().1.skill_segment_completed
+    }
+
     /// Persisted marker and final checks precede dispatch; an exact-cap result is allowed to complete.
     pub(crate) async fn admit(&self, tool: Option<&str>) -> Result<String> {
         Box::pin(self.admit_resources(tool, None, None)).await
@@ -538,6 +589,7 @@ impl RunExecution {
     }
 
     /// Atomic commitment includes settled charges and every outstanding conservative upper bound or target union.
+    /// Live witnesses distinguish a pure resource refusal from any acknowledged admission; only the former can suspend without uncertain execution.
     async fn admit_resources(
         &self,
         tool: Option<&str>,
@@ -594,6 +646,7 @@ impl RunExecution {
                     })
                     .and_then(|total| total.checked_add(bound.max_micro_usd));
                 if committed.is_none_or(|total| total > limit) {
+                    super::invocation::capacity_denied("priced_capacity");
                     self.stop("priced_capacity");
                     return Err(AgentError::Other(
                         "autonomy priced capacity exhausted".into(),
@@ -621,6 +674,7 @@ impl RunExecution {
                     .max_declared_write_paths
                     .is_some_and(|limit| targets.len() > limit as usize)
                 {
+                    super::invocation::capacity_denied("write_capacity");
                     self.stop("write_capacity");
                     return Err(AgentError::Tool(
                         "autonomy declared write capacity exhausted".into(),
@@ -644,6 +698,7 @@ impl RunExecution {
                         && payload.counters.command_attempts
                             >= u64::from(payload.limits.max_command_calls))
                 {
+                    super::invocation::capacity_denied("tool_capacity");
                     self.stop("tool_capacity");
                     return Err(AgentError::Other("autonomy tool capacity exhausted".into()));
                 }
@@ -653,6 +708,7 @@ impl RunExecution {
                 }
             } else {
                 if payload.counters.llm_attempts >= u64::from(payload.limits.max_llm_calls) {
+                    super::invocation::capacity_denied("llm_capacity");
                     self.stop("llm_capacity");
                     return Err(AgentError::Other("autonomy LLM capacity exhausted".into()));
                 }
@@ -677,6 +733,7 @@ impl RunExecution {
             Ok(())
         }))
         .await?;
+        super::invocation::capacity_admitted();
         // Reload under serialization so a sibling settlement cannot turn an owned revision into a spurious conflict.
         let admission_check = {
             let _serial = self.serial.lock().await;

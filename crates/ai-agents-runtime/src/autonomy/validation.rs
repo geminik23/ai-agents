@@ -142,6 +142,11 @@ pub struct ValidationDriverState {
     #[serde(default)]
     pub parked: Option<Box<ValidationObservationPause>>,
     pub pending_batch: Vec<String>,
+    /// A pre-dispatch capacity wait preserves the pending batch and original attempt clocks without recording an uncertain invocation.
+    #[serde(default)]
+    pub capacity_reason: Option<String>,
+    #[serde(skip)]
+    capacity_not_invoked: Option<String>,
     #[serde(skip)]
     publication_identity: Option<String>,
     pub wait: Option<ExternalWait>,
@@ -190,6 +195,13 @@ pub trait ValidationJournal: Send + Sync {
 /// The production implementation uses RuntimeAgent's shared executor and frozen judge routing.
 #[async_trait]
 pub trait ValidationObservationExecutor: Send + Sync {
+    /// Returns a deterministic capacity wait before dispatch; final execution must still perform atomic admission.
+    async fn capacity_reason(
+        &self,
+        _request: &ValidationObservationRequest,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
     /// Captures authoritative freshness without changing the immutable check/request binding.
     fn capture_scope(&self, scope: &EvaluationScope) -> Result<EvaluationScope> {
         Ok(scope.clone())
@@ -302,6 +314,8 @@ impl ValidationDriverState {
             requests: BTreeMap::new(),
             completed: BTreeMap::new(),
             in_flight: None,
+            capacity_reason: None,
+            capacity_not_invoked: None,
             parked: None,
             pending_batch: vec![],
             publication_identity: None,
@@ -678,6 +692,63 @@ impl ValidationDriverState {
         Ok(())
     }
 
+    /// Only a live zero-admission witness can downgrade the exact in-flight logical observation into a capacity wait.
+    pub(crate) fn capacity_noninvocation(&self) -> Option<&str> {
+        self.capacity_not_invoked.as_deref().filter(|id| {
+            self.capacity_reason.is_some()
+                && self.in_flight.is_none()
+                && self.pending_batch.first().map(String::as_str) == Some(*id)
+        })
+    }
+
+    /// Known-safe logical waits remain separate from actual provider/tool reservations and cannot certify those effects stopped.
+    pub(crate) fn wait_reservation(&self) -> Result<Option<String>> {
+        let observation = self
+            .parked
+            .as_ref()
+            .map(|parked| parked.observation.as_str())
+            .or_else(|| {
+                self.capacity_reason
+                    .as_ref()
+                    .and_then(|_| self.pending_batch.first().map(String::as_str))
+            });
+        observation
+            .map(|id| super::journal::observation_reservation_id(self, id))
+            .transpose()
+    }
+
+    /// Retires only the bound logical wait; capacity preflight may have no reservation, and actual uncertain effects remain protected.
+    pub(crate) fn retire_wait_reservation(
+        &self,
+        payload: &mut TaskCheckpointPayload,
+    ) -> Result<()> {
+        let Some(id) = self.wait_reservation()? else {
+            return Ok(());
+        };
+        let Some(reservation) = payload
+            .reservations
+            .iter_mut()
+            .find(|reservation| reservation.id == id)
+        else {
+            return if self.parked.is_none() {
+                Ok(())
+            } else {
+                Err(TaskRunStorageError::InvalidCheckpoint.into())
+            };
+        };
+        if reservation.state == TaskEffectState::Completed {
+            return Ok(());
+        }
+        if reservation.state != TaskEffectState::Suspended
+            && !(self.parked.is_some() && reservation.state == TaskEffectState::Dispatched)
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        reservation.state = TaskEffectState::Completed;
+        reservation.result = Some(json!({"cancelled":true,"origin":"validation"}));
+        Ok(())
+    }
+
     /// Collection is allowed only for the exact state acknowledged by the journal, not a locally installed failed write.
     pub fn publication_acknowledged(&self) -> bool {
         self.publication_identity
@@ -760,6 +831,16 @@ impl ValidationDriverState {
             context
                 .executor
                 .preflight(&self.requests[&id], &self.identity)?;
+            if let Some(reason) = context
+                .executor
+                .capacity_reason(&self.requests[&id])
+                .await?
+            {
+                self.capacity_reason = Some(reason);
+                self.acknowledge(context.journal).await?;
+                return Ok(true);
+            }
+            self.capacity_reason = None;
             self.publication_identity = None;
             let resumed = self.parked.take();
             self.in_flight = Some(id.clone());
@@ -788,11 +869,15 @@ impl ValidationDriverState {
                 .map_or(projected, |check| check.min(projected));
             let bounds = ai_agents_llm::InvocationBounds::new(deadline.into(), projected);
             let guard = self.observation_admission(context, &publication)?;
+            let witness = std::sync::Arc::new(super::invocation::CapacityWitness::default());
             let mut future = Box::pin(ai_agents_llm::scope_invocation_evidence(
                 vec![guard],
                 ai_agents_llm::scope_invocation_bounds(
                     Some(bounds),
-                    context.executor.execute(&request, &self.identity),
+                    super::invocation::scope_capacity_witness(
+                        witness.clone(),
+                        context.executor.execute(&request, &self.identity),
+                    ),
                 ),
             ));
             let result = loop {
@@ -819,7 +904,25 @@ impl ValidationDriverState {
                     self.acknowledge(context.journal).await?;
                     return Ok(true);
                 }
-                result => result?,
+                Err(error) => {
+                    let capacity = witness.noninvocation().filter(|_| {
+                        super::current_execution()
+                            .is_some_and(|execution| !execution.has_storage_failure())
+                    });
+                    if let Some(reason) = capacity {
+                        self.check_live(context, deadline)?;
+                        self.in_flight = None;
+                        self.capacity_not_invoked = Some(id.clone());
+                        self.capacity_reason = Some(reason.clone());
+                        self.acknowledge(context.journal).await?;
+                        if let Some(execution) = super::current_execution() {
+                            execution.clear_capacity_stop(&reason);
+                        }
+                        return Ok(true);
+                    }
+                    return Err(error);
+                }
+                Ok(result) => result,
             };
             validate_observation_result(&request, &result)?;
             let after = context.executor.capture_scope(context.scope)?;
@@ -898,7 +1001,10 @@ impl ValidationDriverState {
             || (old.result.is_some()
                 && serde_json::to_value(&self.result)? != serde_json::to_value(&old.result)?)
             || old.in_flight.as_ref().is_some_and(|id| {
-                !self.completed.contains_key(id)
+                !(self.capacity_reason.is_some()
+                    && self.capacity_not_invoked.as_ref() == Some(id)
+                    && self.in_flight.is_none())
+                    && !self.completed.contains_key(id)
                     && self
                         .parked
                         .as_ref()

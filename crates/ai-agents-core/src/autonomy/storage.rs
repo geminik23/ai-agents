@@ -174,11 +174,11 @@ pub enum TaskRunMutation {
 }
 
 impl TaskRunMutation {
-    /// Completion rechecks live evidence and original clocks inside backend admission; host controls retain their original time bounds.
+    /// Completion and safe pause recheck original clocks inside backend admission; only completion adopts evidence, and host controls retain their time bounds.
     pub fn validate_final_deadline(&self, now: DateTime<Utc>) -> Result<()> {
         let bounds = match self {
             Self::FinalCheckpoint {
-                status: TaskRunStatus::Completed,
+                status: TaskRunStatus::Completed | TaskRunStatus::Paused,
                 deadline,
                 expires_at,
                 ..

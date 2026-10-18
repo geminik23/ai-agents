@@ -47,6 +47,7 @@ pub(crate) fn timeout_approved(id: &str) -> bool {
 /// Keeps question data separate from approval authority while using the same exact batch cursor.
 #[derive(Debug, Clone)]
 pub(crate) enum BatchResponse {
+    Capacity,
     Approval(ApprovalResult),
     UserAnswer(Value),
     QuestionTimeout,
@@ -141,6 +142,18 @@ pub(crate) struct BatchAuthorization {
     pub result: ApprovalResult,
 }
 
+impl BatchApproval {
+    /// Capacity metadata is an exact wait requirement, never an approval trigger or implementation permit.
+    pub(crate) fn capacity(&self) -> Result<Option<super::controller::ControllerLimit>> {
+        self.trigger
+            .get("capacity")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(Into::into)
+    }
+}
+
 impl TaskBatchState {
     /// The committed model call stays immutable while a resumed fallback uses its exact pending request.
     pub(crate) fn pending_call(&self, call: &ToolCall) -> ToolCall {
@@ -214,9 +227,11 @@ impl TaskBatchState {
         let pending = payload.pending.as_ref().ok_or_else(invalid)?;
         if matches!(pending.kind, TaskPendingKind::UserQuestion)
             != self.approvals[0].question.is_some()
+            || matches!(pending.kind, TaskPendingKind::Limit)
+                != self.approvals[0].capacity()?.is_some()
             || !matches!(
                 pending.kind,
-                TaskPendingKind::Approval | TaskPendingKind::UserQuestion
+                TaskPendingKind::Approval | TaskPendingKind::UserQuestion | TaskPendingKind::Limit
             )
             || pending.reviewed_action != serde_json::to_value(&self.approvals[0])?
             || pending.id != self.approvals[0].request_id
@@ -659,6 +674,66 @@ pub(crate) fn take_resumed_question(call_id: &str, args: &Value) -> Option<Value
 }
 
 impl RunExecution {
+    /// Converts only an actual pre-body resource refusal into a typed wait; it adds no approval and consumes no invocation slot.
+    pub(crate) fn park_capacity(
+        &self,
+        runtime_id: &str,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        args: &Value,
+    ) -> Result<Option<String>> {
+        if !self
+            .owner
+            .interaction_delivery
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !matches!(
+                self.lifecycle_profile()
+                    .on_limit
+                    .as_ref()
+                    .and_then(|p| p.action),
+                Some(LimitAction::AskUser | LimitAction::PauseRun)
+            )
+            || !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
+            || !(self.is_coordinator(runtime_id)
+                || current_child_operation().is_some_and(|op| self.has_composition_child(&op)))
+        {
+            return Ok(None);
+        }
+        let Some(reason) = self
+            .stop_reason()
+            .filter(|reason| matches!(reason.as_str(), "tool_capacity" | "write_capacity"))
+        else {
+            return Ok(None);
+        };
+        let payload: TaskCheckpointPayload =
+            serde_json::from_value(self.acknowledged_snapshot().payload)?;
+        let limit = super::controller::ControllerLimit {
+            reason: reason.clone(),
+            original: payload.limits,
+            resume_turn: true,
+            skill: None,
+            model: None,
+            tool: Some(ctx.canonical_id.clone()),
+        };
+        let request_id = uuid::Uuid::new_v4().to_string();
+        super::composition::close_composition_admission();
+        self.parked_approvals
+            .lock()
+            .entry(runtime_id.into())
+            .or_default()
+            .push(BatchApproval {
+                call_id: ctx.call_id.clone(),
+                request_id: request_id.clone(),
+                trigger: json!({"capacity":limit}),
+                context: args.clone(),
+                message: format!("Host capacity revision is required: {reason}"),
+                timeout_millis: None,
+                expires_at: None,
+                question: None,
+            });
+        self.clear_capacity_stop(&reason);
+        Ok(Some(request_id))
+    }
+
     /// Questions share exact batch safety requirements, but use their own configured interaction policy.
     pub(crate) fn pauses_question(&self, runtime_id: &str) -> bool {
         self.lifecycle_profile()
@@ -876,7 +951,9 @@ impl RunExecution {
         payload.pending = Some(TaskPendingRequest {
             id: pending.request_id.clone(),
             issued_revision: previous.revision + 1,
-            kind: if pending.question.is_some() {
+            kind: if pending.capacity()?.is_some() {
+                TaskPendingKind::Limit
+            } else if pending.question.is_some() {
                 TaskPendingKind::UserQuestion
             } else {
                 TaskPendingKind::Approval
@@ -884,7 +961,9 @@ impl RunExecution {
             reviewed_action: json!(pending),
         });
         payload.pause_reason = Some(
-            if pending.question.is_some() {
+            if pending.capacity()?.is_some() {
+                "limit_reached"
+            } else if pending.question.is_some() {
                 "user_question"
             } else {
                 "approval_required"

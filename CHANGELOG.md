@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task skill execution: development-only explicit skill entry preserves the admitted definition, inherited accounting and completed steps before continuing under the same task controller
+- Task controller interaction: development-only stagnation, blockage and premature-finish questions plus limit questions/pauses retain exact work positions and require explicit responses or host limit revisions
 - Task evidence: development-only frozen host revision sources bind validation and external waits to actual targets; explicit delivery-loss reports follow stop/fail policy without polling or replay
 - Task host controls: development-only retained objective changes retire safe pending work, preserve audit/usage and canonical todos, and require explicit revision-bound continuation
 - Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
@@ -15,6 +17,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust controller compatibility: development premature-finish/limit literals add `on_unavailable`, pending-kind matches add `Limit`, and validator executors gain a defaulted capacity-preflight hook; serialized data still cannot restore live execution authority
 - Rust validation compatibility: development evidence/scope/progress literals add validation dependency maps; executable driver round trips use `restore_retained` with a live predecessor, while JSON-only restore remains audit-only
 - Rust task evidence compatibility: development final-checkpoint literals add a live evidence guard that custom stores must preserve at backend admission; validation drivers retain private monotonic bounds and use constructors rather than external struct literals
 - Rust task host-control compatibility: development response/pending matches add `Continue`/`HostContinue`; stores gain certified no-write claim outcomes and opt-in objective control, and private checkpoints retain review and plan-adoption data without an executable migration promise
@@ -25,6 +28,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task capacity continuation: preserve skill steps, native calls, model iterations and validator attempts across resource waits; publish no new executable pause after actual expiry and retain protection for uncertain acknowledgements
 - Task proof eligibility: unavailable or stale metrics cannot prove absence or progress; derived validator and progress results retain exact upstream proof freshness across multiple host targets
 - Task invocation admission: preserve original validation bounds and pinned host proof through tool/provider admission, child tasks and returned streams without refunding already dispatched work
 - SQLite task cancellation: roll back orphaned transaction initialization before connection reuse so interrupted admission or refund cannot retain a write lock in the pool

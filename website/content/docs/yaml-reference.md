@@ -38,6 +38,8 @@ autonomy:
 
 This configuration-only snippet does not run a task or establish completion evidence. Omitted autonomy preserves ordinary chat behavior.
 
+For profiles supplied explicitly to the development Rust runner, `premature_finish.action: ask_user` and `on_limit.action: ask_user | pause_run` now produce retained controller requests. `premature_finish.on_unavailable` and `on_limit.on_unavailable` accept `stop | fail`, defaulting to `stop`; stagnation questions still require an explicit `progress.stagnation.on_unavailable`. These policies neither grant an `ask_user` tool nor enable YAML task startup. Manual resume is a delivery endpoint, and silence is not channel loss. A capacity response cannot refill counters: use the authenticated host's revision-bound limit update first. See [explicit skill execution and controller decisions](@/docs/rust-api.md#explicit-skills-and-controller-decisions-development-only) for response shapes, original bounds and unsupported surfaces.
+
 ## Agent Identity
 
 These fields define who your agent is.

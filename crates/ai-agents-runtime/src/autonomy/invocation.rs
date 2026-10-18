@@ -8,6 +8,44 @@ use std::sync::{
 };
 
 tokio::task_local! { static OBSERVATION_MUTATIONS: Arc<AtomicU64>; }
+tokio::task_local! { static CAPACITY_WITNESS: Arc<CapacityWitness>; }
+
+/// A live admission witness distinguishes a pure resource refusal from an observation that already admitted any work.
+#[derive(Default)]
+pub(crate) struct CapacityWitness {
+    admitted: AtomicU64,
+    denied: parking_lot::Mutex<Option<String>>,
+}
+
+impl CapacityWitness {
+    /// Certification is restriction-only and requires zero acknowledged admissions in this observation; any admitted parent also excludes nested effects.
+    pub(crate) fn noninvocation(&self) -> Option<String> {
+        if self.admitted.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        self.denied.lock().clone()
+    }
+}
+
+/// Only the shared ledger records a capacity refusal, before dispatch and without a reservation write.
+pub(crate) fn capacity_denied(reason: &str) {
+    let _ = CAPACITY_WITNESS.try_with(|witness| *witness.denied.lock() = Some(reason.into()));
+}
+
+/// Any acknowledged admission poisons non-invocation certification, even when later settled or refunded.
+pub(crate) fn capacity_admitted() {
+    let _ = CAPACITY_WITNESS.try_with(|witness| {
+        witness.admitted.fetch_add(1, Ordering::AcqRel);
+    });
+}
+
+/// The witness is live request-local state; it cannot be decoded from a journal or supplied as execution authority.
+pub(crate) async fn scope_capacity_witness<F: std::future::Future>(
+    witness: Arc<CapacityWitness>,
+    future: F,
+) -> F::Output {
+    CAPACITY_WITNESS.scope(witness, future).await
+}
 
 /// Captured live context is propagated explicitly across framework-spawned tasks, never serialized.
 #[derive(Clone, Default)]

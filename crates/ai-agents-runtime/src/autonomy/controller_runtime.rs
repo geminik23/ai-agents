@@ -43,6 +43,35 @@ impl AutonomyRunner {
         let _serial = execution.serial.lock().await;
         let anchored = execution.load_owned_locked(&_serial).await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(anchored.payload.clone())?;
+        // Pending publication waits remain active work; cancellation and real expiry cannot be exposed as a fresh executable pause.
+        if anchored.cancel_requested || execution.check(&payload).is_err() {
+            drop(_serial);
+            if let Some(driver) = &state.driver {
+                self.settle_controller_cancel(execution, &mut driver.as_ref().clone())
+                    .await?;
+            } else {
+                execution
+                    .update(|payload| {
+                        if let Some(pending) = payload.pending.take() {
+                            payload.consumed_request_ids.push(pending.id);
+                        }
+                        retire_controller(payload)?;
+                        payload.pause_reason = None;
+                        Ok(())
+                    })
+                    .await?;
+            }
+            return self
+                .finish(
+                    execution,
+                    Self::stopped_status(execution),
+                    execution
+                        .stop_reason()
+                        .unwrap_or_else(|| "cancel_requested".into()),
+                    Some(state.response.clone()),
+                )
+                .await;
+        }
         payload.clocks.active_millis = execution.active_millis()?.max(
             payload
                 .clocks
@@ -129,15 +158,7 @@ impl AutonomyRunner {
             if state.review.is_some() {
                 return Box::pin(self.resume_host_boundary(snapshot, payload, state, input)).await;
             }
-            let profile = resolve_profile(
-                &self.config,
-                AutonomyScope::Task,
-                payload.profile.as_deref(),
-                None,
-                None,
-                Some(&payload.objective),
-                &self.host,
-            )?;
+            let profile = self.retained_profile(&payload)?;
             if profile.settings != payload.settings {
                 return Err(TaskRunStorageError::InvalidCheckpoint.into());
             }
@@ -184,6 +205,7 @@ impl AutonomyRunner {
             let mut external = None;
             let mut observation_group = None;
             let mut timed_out = false;
+            let capacity_response = self.validate_capacity_response(&payload, &input)?;
             match input {
                 TaskResumeInput::ExternalSignal(signal) => {
                     if !matches!(pending.kind, TaskPendingKind::ExternalCondition) {
@@ -250,6 +272,12 @@ impl AutonomyRunner {
                         serde_json::from_value(parked.pending.reviewed_action.clone())?
                     };
                     let (id, response) = match response {
+                        TaskResumeInput::Continue if capacity_response => {
+                            (pending.id.clone(), BatchResponse::Capacity)
+                        }
+                        TaskResumeInput::UserAnswer { request_id, .. } if capacity_response => {
+                            (request_id, BatchResponse::Capacity)
+                        }
                         TaskResumeInput::Approval { request_id, result } => {
                             (request_id, BatchResponse::Approval(result))
                         }
@@ -303,6 +331,8 @@ impl AutonomyRunner {
                         cursor.push(serde_json::from_value::<TaskExecutorCursor>(saved.clone())?);
                     }
                     match response {
+                        BatchResponse::Capacity
+                            if matches!(pending.kind, TaskPendingKind::Limit) => {}
                         BatchResponse::Approval(mut result)
                             if matches!(pending.kind, TaskPendingKind::Approval) =>
                         {
@@ -544,31 +574,8 @@ impl AutonomyRunner {
         mut payload: TaskCheckpointPayload,
     ) -> Result<TaskRunResult> {
         let state = self.retained_controller(&snapshot, &payload)?;
-        if let Some(parked) = state
-            .driver
-            .as_ref()
-            .and_then(|driver| driver.parked.as_ref())
-        {
-            let driver = state
-                .driver
-                .as_ref()
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            let id = format!(
-                "validation:{}",
-                canonical_identity(
-                    &json!({"check":driver.check_id,"attempt":driver.identity.attempt,"observation":parked.observation})
-                )?
-            );
-            let reservation = payload
-                .reservations
-                .iter_mut()
-                .find(|r| r.id == id)
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-            if reservation.state != TaskEffectState::Suspended {
-                return Err(TaskRunStorageError::InvalidCheckpoint.into());
-            }
-            reservation.state = TaskEffectState::Completed;
-            reservation.result = Some(json!({"cancelled":true,"origin":"validation"}));
+        if let Some(driver) = &state.driver {
+            driver.retire_wait_reservation(&mut payload)?;
         }
         if let Some(pending) = payload.pending.take() {
             payload.consumed_request_ids.push(pending.id);
@@ -772,26 +779,34 @@ impl AutonomyRunner {
                 .await?;
             return Ok(());
         }
-        execution.update(|payload| {
-            let parked_id = driver.parked.as_ref().map(|parked| canonical_identity(&json!({"check":driver.check_id,"attempt":driver.identity.attempt,"observation":parked.observation})).map(|id| format!("validation:{id}"))).transpose()?;
-            if execution.participants.unsettled() || payload.children.iter().any(|child| child.result.is_none())
-                || payload.reservations.iter().any(|reservation| Some(&reservation.id) != parked_id.as_ref()
-                    && matches!(reservation.state, TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain))
-            { return Err(AgentError::Config("controller stop requires actual invocation quiescence".into())); }
-            if let Some(parked) = &driver.parked {
-                let id = format!("validation:{}", canonical_identity(&json!({"check":driver.check_id,"attempt":driver.identity.attempt,"observation":parked.observation}))?);
-                let reservation = payload.reservations.iter_mut().find(|r| r.id == id).ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                if !matches!(reservation.state, TaskEffectState::Suspended | TaskEffectState::Dispatched | TaskEffectState::Completed) { return Err(TaskRunStorageError::InvalidCheckpoint.into()); }
-                if reservation.state != TaskEffectState::Completed {
-                    reservation.state = TaskEffectState::Completed;
-                    reservation.result = Some(json!({"cancelled":true,"origin":"validation"}));
+        execution
+            .update(|payload| {
+                let parked_id = driver.wait_reservation()?;
+                if execution.participants.unsettled()
+                    || payload.children.iter().any(|child| child.result.is_none())
+                    || payload.reservations.iter().any(|reservation| {
+                        Some(&reservation.id) != parked_id.as_ref()
+                            && matches!(
+                                reservation.state,
+                                TaskEffectState::Dispatched
+                                    | TaskEffectState::Suspended
+                                    | TaskEffectState::Uncertain
+                            )
+                    })
+                {
+                    return Err(AgentError::Config(
+                        "controller stop requires actual invocation quiescence".into(),
+                    ));
                 }
-            }
-            if let Some(pending) = payload.pending.take() { payload.consumed_request_ids.push(pending.id); }
-            payload.pause_reason = None;
-            retire_controller(payload)?;
-            Ok(())
-        }).await?;
+                driver.retire_wait_reservation(payload)?;
+                if let Some(pending) = payload.pending.take() {
+                    payload.consumed_request_ids.push(pending.id);
+                }
+                payload.pause_reason = None;
+                retire_controller(payload)?;
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 }

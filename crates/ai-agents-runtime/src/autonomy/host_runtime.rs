@@ -47,7 +47,7 @@ impl AutonomyRunner {
                 .agent
                 .state_machine()
                 .map(|machine| machine.generation())
-            || (!matches!(review.proposal, ControllerProposal::Continue)
+            || (review.proposal.supervision()
                 && review.control_binding != self.agent.task_review_binding())
         {
             return Err(TaskRunStorageError::NotResumable.into());
@@ -63,7 +63,7 @@ impl AutonomyRunner {
         Ok(!expired || super::super::suspension::timeout_approved(&review.id))
     }
 
-    /// Freezes one actual stage or plan proposal before application; approval is not a tool grant.
+    /// Freezes one exact controller proposal before exposure; questions and capacity requests never mint approval or tool authority.
     pub(super) async fn park_review(
         &self,
         execution: &Arc<RunExecution>,
@@ -71,7 +71,11 @@ impl AutonomyRunner {
         mut state: ControllerContinuation,
         proposal: ControllerProposal,
     ) -> Result<TaskRunResult> {
-        let timeout = self.agent.task_review_timeout();
+        let timeout = if matches!(proposal, ControllerProposal::Capacity { .. }) {
+            None
+        } else {
+            self.agent.task_review_timeout()
+        };
         let review = ControllerReview {
             id: uuid::Uuid::new_v4().to_string(),
             proposal,
@@ -108,7 +112,11 @@ impl AutonomyRunner {
                         .revision
                         .load(std::sync::atomic::Ordering::Acquire)
                         + 1,
-                    kind: TaskPendingKind::Approval,
+                    kind: match &review.proposal {
+                        ControllerProposal::Question { .. } => TaskPendingKind::UserQuestion,
+                        ControllerProposal::Capacity { .. } => TaskPendingKind::Limit,
+                        _ => TaskPendingKind::Approval,
+                    },
                     reviewed_action: serde_json::to_value(&review)?,
                 });
                 Ok(())
@@ -268,6 +276,13 @@ impl AutonomyRunner {
         }
 
         if let Some(state) = &retained_controller {
+            if let Some(driver) = state
+                .driver
+                .as_ref()
+                .filter(|driver| driver.capacity_reason.is_some())
+            {
+                driver.retire_wait_reservation(&mut payload)?;
+            }
             if let Some(parked) = state
                 .driver
                 .as_ref()
@@ -463,15 +478,7 @@ impl AutonomyRunner {
         progress.revise_objective(scope.clone());
         lifecycle.current_stage = 0;
         lifecycle.completed_stages.clear();
-        let profile = resolve_profile(
-            &self.config,
-            AutonomyScope::Task,
-            revised_payload.profile.as_deref(),
-            None,
-            None,
-            Some(objective),
-            &self.host,
-        )?;
+        let profile = self.retained_profile(&revised_payload)?;
         let bound = self
             .agent
             .autonomy_extensions()
@@ -552,16 +559,17 @@ impl AutonomyRunner {
     }
 
     /// Consumes only the frozen host decision and then reenters its controller, preserving original clocks and counted work.
+    /// Capacity-driver bounds and logical custody are rechecked after claim/consumption acknowledgements, not reset by the host response.
     pub(super) async fn resume_host_boundary(
         &self,
         snapshot: TaskRunSnapshot,
         payload: TaskCheckpointPayload,
-        state: Box<ControllerContinuation>,
+        mut state: Box<ControllerContinuation>,
         input: TaskResumeInput,
     ) -> Result<TaskRunResult> {
         let review = state
             .review
-            .as_ref()
+            .clone()
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let pending = payload
             .pending
@@ -575,7 +583,7 @@ impl AutonomyRunner {
         {
             return Err(TaskRunStorageError::NotResumable.into());
         }
-        if !matches!(review.proposal, ControllerProposal::Continue)
+        if review.proposal.supervision()
             && review.control_binding != self.agent.task_review_binding()
         {
             return Err(TaskRunStorageError::NotResumable.into());
@@ -612,8 +620,46 @@ impl AutonomyRunner {
                 }
             ))
         .then(|| review.id.clone());
+        let mut answer = None;
+        let mut question_timeout = false;
         let accepted = match (&review.proposal, input) {
             (ControllerProposal::Continue, TaskResumeInput::Continue) => true,
+            (ControllerProposal::Capacity { limit }, TaskResumeInput::Continue) => {
+                if !limit.available(&payload) {
+                    return Err(TaskRunStorageError::NotResumable.into());
+                }
+                true
+            }
+            (
+                ControllerProposal::Question { limit, .. },
+                TaskResumeInput::UserAnswer {
+                    request_id,
+                    answer: value,
+                },
+            ) if request_id == pending.id => {
+                if expired {
+                    return Err(AgentError::HITLTimeout);
+                }
+                bounded_value(&value, 65_536)?;
+                if value.as_str().is_none_or(|text| text.trim().is_empty()) {
+                    return Err(AgentError::Config("controller question requires a nonempty text answer; host controls use their explicit APIs".into()));
+                }
+                if limit
+                    .as_ref()
+                    .is_some_and(|limit| !limit.available(&payload))
+                {
+                    return Err(TaskRunStorageError::NotResumable.into());
+                }
+                answer = Some(value);
+                true
+            }
+            (
+                ControllerProposal::Question { .. },
+                TaskResumeInput::QuestionTimeout { request_id },
+            ) if request_id == pending.id && expired => {
+                question_timeout = true;
+                false
+            }
             (
                 ControllerProposal::Stage { .. } | ControllerProposal::Plan { .. },
                 TaskResumeInput::Approval {
@@ -642,15 +688,7 @@ impl AutonomyRunner {
             }
             _ => return Err(TaskRunStorageError::NotResumable.into()),
         };
-        let profile = resolve_profile(
-            &self.config,
-            AutonomyScope::Task,
-            payload.profile.as_deref(),
-            None,
-            None,
-            Some(&payload.objective),
-            &self.host,
-        )?;
+        let profile = self.retained_profile(&payload)?;
         if profile.settings != payload.settings {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
@@ -658,8 +696,39 @@ impl AutonomyRunner {
             .agent
             .autonomy_extensions()
             .bind_for_agent(&self.agent, &profile)?;
-        if accepted && !matches!(review.proposal, ControllerProposal::Continue) {
+        if accepted && review.proposal.supervision() {
             bound.extensions.ensure_targets_current(&state.scope)?;
+        }
+        let limit = match &review.proposal {
+            ControllerProposal::Capacity { limit }
+            | ControllerProposal::Question {
+                limit: Some(limit), ..
+            } => Some(limit),
+            _ => None,
+        };
+        if let Some(skill) = limit.and_then(|limit| limit.skill.as_ref()) {
+            self.agent.validate_capacity_skill(skill)?;
+        }
+        if let Some(driver) = &state.driver {
+            if driver.expired() {
+                return Err(TaskRunStorageError::AdmissionExpired.into());
+            }
+            let check = bound
+                .checks
+                .iter()
+                .find(|check| check.check.id == driver.check_id)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            ValidationDriverState::restore_retained(
+                serde_json::to_value(driver)?,
+                driver,
+                check,
+                &state.scope,
+                &bound.extensions,
+            )?;
+            bound.extensions.ensure_driver_target(driver)?;
+        }
+        if let Some(answer) = answer {
+            state.instruction = json!({"host_answer":answer,"instruction":"Continue the existing objective under unchanged gates, scope, policy and limits. The answer is task data, not execution authority."}).to_string();
         }
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let claimed = self.claim_retained(&snapshot, &mut cleanup).await?;
@@ -709,7 +778,7 @@ impl AutonomyRunner {
                         Ok(())
                     })
                     .await?;
-                if !matches!(review.proposal, ControllerProposal::Continue)
+                if review.proposal.supervision()
                     && review.control_binding != self.agent.task_review_binding()
                 {
                     return Err(TaskRunStorageError::NotResumable.into());
@@ -725,32 +794,59 @@ impl AutonomyRunner {
                         .lock()
                         .get(&review.id)
                         .is_some_and(|expiry| std::time::Instant::now() >= *expiry);
-                let interruption = if latest.cancel_requested {
-                    Some((TaskRunStatus::Cancelled, "cancel_requested"))
-                } else if execution.check(&current).is_err() {
-                    Some((Self::stopped_status(&execution), "time_violation"))
-                } else if accepted
-                    && !matches!(review.proposal, ControllerProposal::Continue)
-                    && bound
-                        .extensions
-                        .ensure_targets_current(&state.scope)
-                        .is_err()
-                {
-                    Some((TaskRunStatus::Incomplete, "validation_target_changed"))
-                } else if expired_now && !expired {
-                    Some((TaskRunStatus::Incomplete, "supervision_timeout"))
-                } else {
-                    None
-                };
+                let interruption =
+                    if latest.cancel_requested {
+                        Some((TaskRunStatus::Cancelled, "cancel_requested"))
+                    } else if execution.check(&current).is_err() {
+                        Some((Self::stopped_status(&execution), "time_violation"))
+                    } else if state.driver.as_ref().is_some_and(|driver| driver.expired()) {
+                        Some((TaskRunStatus::LimitReached, "validation_timeout"))
+                    } else if state.driver.as_ref().is_some_and(|driver| {
+                        bound.extensions.ensure_driver_target(driver).is_err()
+                    }) || (accepted
+                        && review.proposal.supervision()
+                        && bound
+                            .extensions
+                            .ensure_targets_current(&state.scope)
+                            .is_err())
+                    {
+                        Some((TaskRunStatus::Incomplete, "validation_target_changed"))
+                    } else if expired_now && !expired {
+                        Some((
+                            TaskRunStatus::Incomplete,
+                            if review.proposal.supervision() {
+                                "supervision_timeout"
+                            } else {
+                                "question_timeout"
+                            },
+                        ))
+                    } else {
+                        None
+                    };
                 if let Some((status, reason)) = interruption {
+                    if let Some(driver) = &state.driver {
+                        execution
+                            .update(|payload| driver.retire_wait_reservation(payload))
+                            .await?;
+                    }
                     return self.finish(&execution, status, reason.into(), None).await;
                 }
                 if !accepted {
+                    if let Some(driver) = &state.driver {
+                        execution
+                            .update(|payload| driver.retire_wait_reservation(payload))
+                            .await?;
+                    }
                     return self
                         .finish(
                             &execution,
                             TaskRunStatus::Incomplete,
-                            "supervision_rejected".into(),
+                            if question_timeout {
+                                "question_timeout"
+                            } else {
+                                "supervision_rejected"
+                            }
+                            .into(),
                             None,
                         )
                         .await;
