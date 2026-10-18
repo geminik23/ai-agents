@@ -4,6 +4,18 @@ use super::*;
 use ai_agents_core::{AgentError, AgentResponse, Result};
 use serde::{Deserialize, Serialize};
 
+/// A position identifies controller-owned work, not another executor or a saved Rust call stack.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControllerPhase {
+    #[default]
+    EachCycle,
+    StageEnd,
+    Completion,
+    Decision,
+    Replan,
+}
+
 /// Saved validation work resumes after the completed turn, not through another runtime response driver.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -18,6 +30,8 @@ pub(crate) struct ControllerContinuation {
     pub forced_continuation: bool,
     pub checks: Vec<String>,
     pub next_check: usize,
+    #[serde(default)]
+    pub phase: ControllerPhase,
     pub driver: Option<Box<ValidationDriverState>>,
     #[serde(default)]
     pub review: Option<ControllerReview>,
@@ -140,15 +154,55 @@ impl ControllerContinuation {
             forced_continuation,
             checks: Vec::new(),
             next_check: 0,
+            phase: ControllerPhase::Decision,
             driver: None,
             review: None,
         }
+    }
+
+    /// Reconstructs only the check selected at this exact position; dynamic replans retain their intervention identity.
+    pub(crate) fn driver_check(
+        &self,
+        bound: &BoundAutonomyProfile,
+        objective: &str,
+    ) -> Result<BoundValidationCheck> {
+        let driver = self
+            .driver
+            .as_ref()
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        let check = if self.phase == ControllerPhase::Replan {
+            bound.replan_check(&self.progress, objective)?
+        } else {
+            bound
+                .checks
+                .iter()
+                .find(|check| check.check.id == driver.check_id)
+                .cloned()
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+        };
+        if check.check.id != driver.check_id
+            || check.config_identity != driver.identity.config_identity
+        {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        Ok(check)
     }
 
     /// Structural checks bind a pending wait to the exact enclosing run and controller position.
     pub(crate) fn validate(&self, payload: &TaskCheckpointPayload) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
         let pending = payload.pending.as_ref().ok_or_else(invalid)?;
+        if self.phase == ControllerPhase::Replan
+            && (self.checks.len() != 1
+                || self.next_check != 0
+                || self.driver.as_ref().is_none_or(|driver| {
+                    driver.check_id != format!("__replan.{}", self.progress.sequence)
+                })
+                || self.progress.decided_sequence != Some(self.progress.sequence)
+                || self.progress.handled_sequence != Some(self.progress.sequence))
+        {
+            return Err(invalid());
+        }
         if let Some(review) = &self.review {
             self.lifecycle.validate(&payload.settings)?;
             if (self.driver.is_some()

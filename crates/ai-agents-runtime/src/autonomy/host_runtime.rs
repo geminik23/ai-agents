@@ -71,6 +71,22 @@ impl AutonomyRunner {
         mut state: ControllerContinuation,
         proposal: ControllerProposal,
     ) -> Result<TaskRunResult> {
+        // Required supervision is still human review; restrictive profiles may refuse it but never auto-approve a frozen proposal.
+        if proposal.supervision()
+            && matches!(
+                execution.task_interaction_policy(),
+                Some(InteractionAction::Reject | InteractionAction::AutoIfPolicy)
+            )
+        {
+            return self
+                .finish(
+                    execution,
+                    TaskRunStatus::Incomplete,
+                    "interaction_rejected".into(),
+                    Some(state.response),
+                )
+                .await;
+        }
         let timeout = if matches!(proposal, ControllerProposal::Capacity { .. }) {
             None
         } else {
@@ -513,6 +529,7 @@ impl AutonomyRunner {
             forced_continuation: false,
             checks: Vec::new(),
             next_check: 0,
+            phase: super::super::controller::ControllerPhase::Decision,
             driver: None,
             review: Some(review.clone()),
         });
@@ -713,15 +730,11 @@ impl AutonomyRunner {
             if driver.expired() {
                 return Err(TaskRunStorageError::AdmissionExpired.into());
             }
-            let check = bound
-                .checks
-                .iter()
-                .find(|check| check.check.id == driver.check_id)
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            let check = state.driver_check(&bound, &payload.objective)?;
             ValidationDriverState::restore_retained(
                 serde_json::to_value(driver)?,
                 driver,
-                check,
+                &check,
                 &state.scope,
                 &bound.extensions,
             )?;

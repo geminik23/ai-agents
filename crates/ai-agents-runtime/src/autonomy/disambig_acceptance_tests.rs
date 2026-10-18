@@ -3,6 +3,45 @@ use super::*;
 use super::super::continuation_test_support::{self as support, ReceiptStore};
 use ai_agents_core::Result;
 
+// Profile question policy uses the existing semantic cursor, not a second detection pass or a fabricated answer.
+#[tokio::test]
+async fn lp_question_profile_supports_real_clarification_and_explicit_rejection() {
+    for action in [
+        InteractionAction::AskEachTime,
+        InteractionAction::Reject,
+        InteractionAction::AutoIfPolicy,
+    ] {
+        let mut f = fixture(CLARIFICATION, &["done"], &[AMBIGUOUS, QUESTION, ANSWER]);
+        let mut config = super::super::runner_tests::config(16);
+        config.defaults.hitl = Some(AutonomyHitlConfig {
+            on_user_question: Some(action),
+            on_approval_required: Some(InteractionAction::PauseRun),
+        });
+        f.runner = AutonomyRunner::try_new(
+            f.agent.clone(),
+            config,
+            Default::default(),
+            f.store.clone(),
+            "interaction.v1".into(),
+        )
+        .unwrap();
+        let first = f.runner.run("objective", None).await.unwrap();
+        assert_eq!(f.router.calls.load(Ordering::SeqCst), 2);
+        if action == InteractionAction::AskEachTime {
+            assert_eq!(first.run.status, TaskRunStatus::Paused);
+            let done = answer(&f, &first.run, "target one").await.unwrap();
+            assert_eq!(done.run.status, TaskRunStatus::Completed);
+            assert_eq!(f.router.calls.load(Ordering::SeqCst), 3);
+            assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(f.finalized.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(first.run.status, TaskRunStatus::Incomplete);
+            assert_eq!(f.main.calls.load(Ordering::SeqCst), 0);
+            assert!(first.run.pending.is_none());
+        }
+    }
+}
+
 const CLEAR: &str = r#"{"is_ambiguous":false,"confidence":1.0}"#;
 const UNCLEAR: &str = r#"{"status":"unclear"}"#;
 const CONFIRM: &str = r#"{"question":"Confirm target one?"}"#;

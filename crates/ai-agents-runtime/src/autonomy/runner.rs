@@ -182,6 +182,7 @@ impl AutonomyRunner {
     }
 
     /// Claims an exact retained composition and resumes its child action before running the parent's saved finalization path.
+    /// Only a fully returned, non-pending group can transfer a configured capacity wait to the controller; rejection still settles siblings.
     async fn resume_group(
         &self,
         snapshot: TaskRunSnapshot,
@@ -377,6 +378,27 @@ impl AutonomyRunner {
                 )
                 .await;
                 if let Some(reason) = execution.stop_reason() {
+                    // A real rejection still settles parked siblings; only a completed group with no pending leaf can hand capacity back to the controller.
+                    let latest = execution.load_owned().await?;
+                    let current: TaskCheckpointPayload = serde_json::from_value(latest.payload)?;
+                    if matches!(
+                        reason.as_str(),
+                        "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
+                    ) && current.pending.is_none()
+                        && current.settings.on_limit.as_ref().is_some_and(|policy| {
+                            matches!(
+                                policy.action,
+                                Some(LimitAction::PauseRun | LimitAction::AskUser)
+                            )
+                        })
+                    {
+                        return Box::pin(self.pause_admission_limit(
+                            &execution,
+                            paused.todo.as_ref(),
+                            &reason,
+                        ))
+                        .await;
+                    }
                     return Box::pin(self.finish_stopped_group(&execution, &owner, &group, reason))
                         .await;
                 }
@@ -1370,17 +1392,7 @@ impl AutonomyRunner {
                     .into(),
             ));
         }
-        if profile.settings.hitl.as_ref().is_some_and(|hitl| {
-            hitl.on_user_question
-                .is_some_and(|action| action != InteractionAction::PauseRun)
-                || hitl
-                    .on_approval_required
-                    .is_some_and(|action| action != InteractionAction::PauseRun)
-        }) {
-            return Err(AgentError::Config(
-                "live task suspension is not installed for this profile".into(),
-            ));
-        }
+
         let lifecycle = LifecycleState::new(&profile.settings, skill.is_some())?;
         let mut preflight_scope = EvaluationScope {
             key: TaskRunKey {
@@ -1576,6 +1588,7 @@ impl AutonomyRunner {
     /// The controller shares one ledger with validation; current target samples invalidate old proof without relabelling completed effects.
     /// Required stage review and final completion recheck frozen host sources after storage waits; run CAS is not an external-target transaction.
     /// Future erasure isolates retained validation data from nested model-message polling stacks.
+    /// Per-schedule prefixes and selected replans resume after committed work without repeating progress or decision accounting.
     #[allow(clippy::too_many_arguments)]
     fn execute<'a>(
         &'a self,
@@ -1641,6 +1654,11 @@ impl AutonomyRunner {
                 evidence = serde_json::from_value(controller.state["evidence"].clone())?;
             }
             let mut continuation = execution.controller.lock().take();
+            let mut phase = continuation
+                .as_ref()
+                .map_or(super::controller::ControllerPhase::EachCycle, |saved| {
+                    saved.phase
+                });
             let mut last_response = None;
             let mut instruction = String::new();
             let mut source = if restored.objective_revision == 0 {
@@ -1684,6 +1702,7 @@ impl AutonomyRunner {
                         continuation = None;
                         last_response = None;
                         source = AutonomyTurnSource::Continuation;
+                        phase = super::controller::ControllerPhase::EachCycle;
                     }
                     super::controller::ControllerProposal::Plan {
                         instruction: approved,
@@ -1691,6 +1710,7 @@ impl AutonomyRunner {
                         instruction = approved.clone();
                         continuation = None;
                         source = AutonomyTurnSource::Continuation;
+                        phase = super::controller::ControllerPhase::EachCycle;
                     }
                     super::controller::ControllerProposal::Question { .. }
                     | super::controller::ControllerProposal::Capacity { .. } => {
@@ -1701,6 +1721,7 @@ impl AutonomyRunner {
                             continuation.as_mut().unwrap().review = None;
                         } else {
                             continuation = None;
+                            phase = super::controller::ControllerPhase::EachCycle;
                         }
                         source = AutonomyTurnSource::Continuation;
                     }
@@ -1723,6 +1744,26 @@ impl AutonomyRunner {
                 _ => None,
             });
             loop {
+                // Replanning is already this observation's selected decision; resume only its managed planner work.
+                if phase == super::controller::ControllerPhase::Replan {
+                    let mut state = continuation
+                        .take()
+                        .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                    if let Some(result) = self
+                        .continue_replan(
+                            execution, todo, bound, &executor, &journal, objective, &mut state,
+                        )
+                        .await?
+                    {
+                        return Ok(result);
+                    }
+                    scope = state.scope;
+                    evidence = state.evidence;
+                    instruction = state.instruction;
+                    resuming_turn = false;
+                    phase = super::controller::ControllerPhase::EachCycle;
+                    source = AutonomyTurnSource::Continuation;
+                }
                 // Validation resumes after the committed turn and must not repeat its counters, observation or hooks.
                 if continuation.is_none() {
                     let snapshot = execution.load_owned().await?;
@@ -1866,7 +1907,6 @@ impl AutonomyRunner {
                                 .await;
                         }
                     }
-                    resuming_turn = false;
                     if let Some(reason) = execution.stop_reason() {
                         if matches!(
                             reason.as_str(),
@@ -1903,6 +1943,10 @@ impl AutonomyRunner {
                             )
                             .await;
                     }
+                    // The next action will be selected afresh; a repair source must not leak into later ordinary cycles.
+                    if source == AutonomyTurnSource::ValidationFix {
+                        source = AutonomyTurnSource::Continuation;
+                    }
                     lifecycle.skill_segment_completed |= execution.skill_segment_completed();
                     execution.await_children().await?;
                     Box::pin(self.agent.flush_background_tasks()).await?;
@@ -1934,86 +1978,125 @@ impl AutonomyRunner {
                     scope.mutation_generation = execution.mutation_generation();
                     Self::collect_tools(execution, &mut evidence).await?;
                 }
-                let schedules = [
-                    ValidationSchedule::EachCycle,
-                    ValidationSchedule::StageEnd,
-                    ValidationSchedule::Completion,
-                ];
-                let checks: Vec<_> = schedules
-                    .into_iter()
-                    .flat_map(|schedule| {
-                        bound
-                            .scheduled_checks(&scope, schedule)
-                            .into_iter()
-                            .map(move |check| (schedule, check))
-                    })
-                    .collect();
-                let ids: Vec<_> = checks
-                    .iter()
-                    .map(|(_, check)| check.check.id.clone())
-                    .collect();
-                if continuation
-                    .as_ref()
-                    .is_some_and(|saved| saved.checks != ids)
-                {
-                    return Err(TaskRunStorageError::InvalidCheckpoint.into());
-                }
-                let next = continuation.as_ref().map_or(0, |saved| saved.next_check);
-                for (index, (schedule, check)) in checks.into_iter().enumerate().skip(next) {
-                    let evaluator = CompletionGateEvaluator::default();
-                    if schedule == ValidationSchedule::Completion
-                        && !check.check.required.unwrap_or(true)
-                        && profile.settings.completion.as_ref().is_some_and(|gate| {
-                            evaluator
-                                .evaluate(gate, &scope, &evidence)
-                                .is_ok_and(|result| result.outcome == GateOutcome::Pass)
-                        })
+                // Each schedule has its own saved prefix; stage/task eligibility is evaluated after earlier observations.
+                use super::controller::ControllerPhase;
+                for check_phase in [
+                    ControllerPhase::EachCycle,
+                    ControllerPhase::StageEnd,
+                    ControllerPhase::Completion,
+                ] {
+                    if phase == ControllerPhase::Decision {
+                        break;
+                    }
+                    if continuation
+                        .as_ref()
+                        .is_some_and(|saved| saved.phase != check_phase)
                     {
                         continue;
                     }
-                    let driver = continuation.as_mut().and_then(|saved| saved.driver.take());
-                    if let Some(driver) = Box::pin(self.validate(
-                        check,
-                        &mut scope,
-                        &mut evidence,
-                        execution,
-                        bound,
-                        &executor,
-                        &journal,
-                        driver,
-                    ))
-                    .await?
-                    {
-                        let capacity_reason = driver.capacity_reason.clone();
-                        *execution.controller.lock() = Some(Box::new(ControllerContinuation {
-                            scope: scope.clone(),
-                            lifecycle: lifecycle.clone(),
-                            progress: progress.clone(),
-                            evidence: evidence.clone(),
-                            response: last_response
-                                .clone()
-                                .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
-                            instruction: instruction.clone(),
-                            source,
-                            forced_continuation,
-                            checks: ids.clone(),
-                            next_check: index,
-                            driver: Some(driver),
-                            review: None,
-                        }));
-                        if let Some(reason) = capacity_reason {
-                            let state = *execution
-                                .controller
-                                .lock()
-                                .take()
-                                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-                            return Box::pin(self.park_limit(execution, todo, state, &reason))
-                                .await;
+                    let checks = if let Some(saved) = &continuation {
+                        let schedule = match check_phase {
+                            ControllerPhase::EachCycle => ValidationSchedule::EachCycle,
+                            ControllerPhase::StageEnd => ValidationSchedule::StageEnd,
+                            _ => ValidationSchedule::Completion,
+                        };
+                        let available = bound.scheduled_checks(&scope, schedule);
+                        saved
+                            .checks
+                            .iter()
+                            .map(|id| {
+                                available
+                                    .iter()
+                                    .find(|check| &check.check.id == id)
+                                    .copied()
+                                    .ok_or(TaskRunStorageError::InvalidCheckpoint)
+                            })
+                            .collect::<std::result::Result<Vec<_>, _>>()?
+                    } else {
+                        bound.controller_checks(&scope, &lifecycle, &evidence, check_phase)?
+                    };
+                    let ids: Vec<_> = checks.iter().map(|check| check.check.id.clone()).collect();
+                    let next = continuation.as_ref().map_or(0, |saved| saved.next_check);
+                    for (index, check) in checks.into_iter().enumerate().skip(next) {
+                        let evaluator = CompletionGateEvaluator::default();
+                        let candidate_gate = check
+                            .stage
+                            .as_ref()
+                            .and_then(|id| {
+                                profile
+                                    .settings
+                                    .lifecycle
+                                    .as_ref()?
+                                    .iter()
+                                    .find(|stage| &stage.id == id)?
+                                    .completion
+                                    .as_ref()
+                            })
+                            .or_else(|| {
+                                if check.stage.is_none() {
+                                    profile.settings.completion.as_ref()
+                                } else {
+                                    None
+                                }
+                            });
+                        if check_phase == ControllerPhase::Completion
+                            && !check.check.required.unwrap_or(true)
+                            && candidate_gate.is_some_and(|gate| {
+                                evaluator
+                                    .evaluate(gate, &scope, &evidence)
+                                    .is_ok_and(|result| result.outcome == GateOutcome::Pass)
+                            })
+                        {
+                            continue;
                         }
-                        return Box::pin(self.pause_controller(execution, todo)).await;
+                        let driver = continuation.as_mut().and_then(|saved| saved.driver.take());
+                        if let Some(driver) = Box::pin(self.validate(
+                            check,
+                            &mut scope,
+                            &mut evidence,
+                            execution,
+                            bound,
+                            &executor,
+                            &journal,
+                            driver,
+                        ))
+                        .await?
+                        {
+                            let capacity_reason = driver.capacity_reason.clone();
+                            *execution.controller.lock() = Some(Box::new(ControllerContinuation {
+                                scope: scope.clone(),
+                                lifecycle: lifecycle.clone(),
+                                progress: progress.clone(),
+                                evidence: evidence.clone(),
+                                response: last_response
+                                    .clone()
+                                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
+                                instruction: instruction.clone(),
+                                source,
+                                forced_continuation,
+                                checks: ids.clone(),
+                                next_check: index,
+                                phase: check_phase,
+                                driver: Some(driver),
+                                review: None,
+                            }));
+                            if let Some(reason) = capacity_reason {
+                                let state = *execution
+                                    .controller
+                                    .lock()
+                                    .take()
+                                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+                                return Box::pin(self.park_limit(execution, todo, state, &reason))
+                                    .await;
+                            }
+                            return Box::pin(self.pause_controller(execution, todo)).await;
+                        }
                     }
+                    continuation = None;
                 }
                 continuation = None;
+                resuming_turn = false;
+                phase = ControllerPhase::EachCycle;
                 execution
                     .update(|payload| {
                         retire_controller(payload)?;
@@ -2065,9 +2148,11 @@ impl AutonomyRunner {
                         && proposed.validation_failure(&profile.settings)?;
                     if advances || rewinds {
                         if approved.is_none()
-                            && profile.settings.supervision.as_ref().is_some_and(|policy| {
+                            && (profile.settings.supervision.as_ref().is_some_and(|policy| {
                                 policy.stage_changes == Some(ReviewPolicy::RequireApproval)
-                            })
+                            }) || profile.settings.hitl.as_ref().is_some_and(|policy| {
+                                policy.on_approval_required == Some(InteractionAction::AskEachTime)
+                            }))
                         {
                             return Box::pin(
                                 self.park_review(
@@ -2084,8 +2169,9 @@ impl AutonomyRunner {
                                         instruction: instruction.clone(),
                                         source,
                                         forced_continuation,
-                                        checks: ids.clone(),
-                                        next_check: ids.len(),
+                                        checks: Vec::new(),
+                                        next_check: 0,
+                                        phase: ControllerPhase::Decision,
                                         driver: None,
                                         review: None,
                                     },
@@ -2183,7 +2269,27 @@ impl AutonomyRunner {
                         interaction_available: self.interaction_delivery,
                     },
                 )?;
+                // Publish the consumed allowance and selected decision, not the advisory pre-turn values, into the result checkpoint.
+                let consumed_active = execution.consumed_active_millis()?;
                 execution.update(|payload| {
+                payload.controller_state["remaining_turns"] = json!((payload.limits.max_turns as u64).saturating_sub(payload.counters.turns));
+                payload.controller_state["remaining_llm_calls"] = json!((payload.limits.max_llm_calls as u64).saturating_sub(payload.counters.llm_attempts));
+                payload.controller_state["remaining_tool_calls"] = json!((payload.limits.max_tool_calls as u64).saturating_sub(payload.counters.tool_attempts));
+                payload.controller_state["remaining_command_calls"] = json!((payload.limits.max_command_calls as u64).saturating_sub(payload.counters.command_attempts));
+                let reserved = payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain))
+                    .try_fold(0u64, |total, reservation| total.checked_add(reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)))
+                    .ok_or_else(|| AgentError::Config("controller commitment overflow".into()))?;
+                payload.controller_state["remaining_micro_usd"] = json!(payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(reserved)));
+                payload.controller_state["remaining_declared_write_paths"] = json!(payload.limits.max_declared_write_paths.map(|limit| (limit as usize).saturating_sub(payload.declared_write_targets.len())));
+                payload.controller_state["remaining_active_seconds"] = json!(payload.limits.max_active_time_seconds.saturating_mul(1000).saturating_sub(consumed_active)/1000);
+                payload.controller_state["remaining_wall_seconds"] = json!(payload.clocks.expires_at.map(|expiry| (expiry-chrono::Utc::now()).num_seconds().max(0)));
+                payload.controller_state["lifecycle"] = serde_json::to_value(&lifecycle)?;
+                payload.controller_state["decision"] = serde_json::to_value(&decision)?;
+                payload.controller_state["progress"] = serde_json::to_value(&progress)?;
+                payload.controller_state["failed_gates"] = serde_json::to_value(&completion)?;
+                if let Some(controller) = payload.adapters.iter_mut().find(|adapter| adapter.id == "runtime.controller") {
+                    controller.state = json!({"scope":scope,"lifecycle":lifecycle,"progress":progress,"evidence":evidence});
+                }
                 payload.progress.observation_sequence = progress.sequence;
                 payload.progress.cycles_without_progress = progress.cycles_without_progress;
                 payload.progress.replans = progress.replans;
@@ -2227,56 +2333,18 @@ impl AutonomyRunner {
                     }
                     CheckpointDecision::Replan => {
                         forced_continuation = false;
-                        let check = bound.replan_check(&progress, objective)?;
-                        scope
-                            .validation_bindings
-                            .insert(check.check.id.clone(), check.config_identity.clone());
-                        self.validate(
-                            &check,
-                            &mut scope,
-                            &mut evidence,
-                            execution,
-                            bound,
-                            &executor,
-                            &journal,
-                            None,
-                        )
-                        .await?;
-                        instruction = evidence
-                            .validations
-                            .last()
-                            .map(|result| result.metrics.to_string())
-                            .unwrap_or_default();
-                        if profile.settings.supervision.as_ref().is_some_and(|policy| {
-                            policy.plan_changes == Some(ReviewPolicy::RequireApproval)
-                        }) {
-                            return Box::pin(
-                                self.park_review(
-                                    execution,
-                                    todo,
-                                    ControllerContinuation {
-                                        scope: scope.clone(),
-                                        lifecycle: lifecycle.clone(),
-                                        progress: progress.clone(),
-                                        evidence: evidence.clone(),
-                                        response: last_response
-                                            .clone()
-                                            .ok_or(TaskRunStorageError::InvalidCheckpoint)?,
-                                        instruction: instruction.clone(),
-                                        source,
-                                        forced_continuation,
-                                        checks: Vec::new(),
-                                        next_check: 0,
-                                        driver: None,
-                                        review: None,
-                                    },
-                                    super::controller::ControllerProposal::Plan {
-                                        instruction: instruction.clone(),
-                                    },
-                                ),
-                            )
-                            .await;
-                        }
+                        phase = ControllerPhase::Replan;
+                        continuation = Some(Box::new(ControllerContinuation::decision(
+                            &scope,
+                            &lifecycle,
+                            &progress,
+                            &evidence,
+                            last_response.as_ref(),
+                            &instruction,
+                            source,
+                            false,
+                        )));
+                        continue;
                     }
                     CheckpointDecision::AskUser => {
                         let state = ControllerContinuation::decision(
@@ -2296,6 +2364,11 @@ impl AutonomyRunner {
                         return Err(TaskRunStorageError::InvalidCheckpoint.into());
                     }
                     CheckpointDecision::Continue => {
+                        if source == AutonomyTurnSource::ValidationFix {
+                            forced_continuation = false;
+                            instruction = "Required validation failed. Repair the reopened stage without resetting completed effects or resource usage.".into();
+                            continue;
+                        }
                         if lifecycle.current_stage != previous_stage
                             && lifecycle.current_stage
                                 < profile.settings.lifecycle.as_ref().map_or(0, Vec::len)
@@ -2303,11 +2376,6 @@ impl AutonomyRunner {
                             forced_continuation = false;
                             source = AutonomyTurnSource::StageInstruction;
                             instruction = String::new();
-                            continue;
-                        }
-                        if source == AutonomyTurnSource::ValidationFix {
-                            forced_continuation = false;
-                            instruction = "Required validation failed. Repair the reopened stage without resetting completed effects or resource usage.".into();
                             continue;
                         }
                         forced_continuation = progress.handled_sequence != Some(progress.sequence);
@@ -2531,7 +2599,19 @@ impl AutonomyRunner {
             Some(
                 "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
                 | "time_violation",
-            ) => TaskRunStatus::LimitReached,
+            ) => {
+                if execution
+                    .lifecycle_profile()
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.action)
+                    == Some(LimitAction::Fail)
+                {
+                    TaskRunStatus::Failed
+                } else {
+                    TaskRunStatus::LimitReached
+                }
+            }
             Some("cancel_requested") => TaskRunStatus::Cancelled,
             Some(
                 "question_timeout"
@@ -2541,6 +2621,7 @@ impl AutonomyRunner {
                 | "composition_timeout"
                 | "scope_ended"
                 | "interaction_unavailable"
+                | "interaction_rejected"
                 | "disambiguation_exhausted",
             ) => TaskRunStatus::Incomplete,
             _ => TaskRunStatus::Failed,

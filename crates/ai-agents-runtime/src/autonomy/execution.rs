@@ -162,6 +162,19 @@ impl RunExecution {
             .and_then(|policy| policy.on_approval_required)
     }
 
+    /// Questions are data requests, so restrictive profiles cannot manufacture an answer or approval.
+    pub(crate) fn rejects_question(&self) -> bool {
+        matches!(
+            self.lifecycle
+                .read()
+                .0
+                .hitl
+                .as_ref()
+                .and_then(|policy| policy.on_user_question),
+            Some(InteractionAction::Reject | InteractionAction::AutoIfPolicy)
+        )
+    }
+
     /// Recomputes cumulative elapsed time; overlapping child/provider durations are not summed.
     pub(crate) fn active_millis(&self) -> Result<u64> {
         self.initial_active_millis

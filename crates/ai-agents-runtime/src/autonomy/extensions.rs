@@ -159,6 +159,38 @@ pub struct BoundAutonomyProfile {
     pub extensions: Arc<FrozenAutonomyExtensions>,
 }
 
+// Candidate admission uses only immutable response predicates; deferred observations may still change every other evidence leaf.
+// This is not completion proof: final gate evaluation always uses the original expression and eligible committed evidence.
+fn candidate_outcome(
+    gate: &ai_agents_core::autonomy::CompletionGate,
+    scope: &EvaluationScope,
+    evidence: &EvaluationEvidence,
+) -> Result<super::GateOutcome> {
+    use super::GateOutcome;
+    use ai_agents_core::autonomy::CompletionGate;
+    match gate {
+        CompletionGate::All(children) => Ok(GateOutcome::all(
+            &children
+                .iter()
+                .map(|child| candidate_outcome(child, scope, evidence))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        CompletionGate::Any(children) => Ok(GateOutcome::any(
+            &children
+                .iter()
+                .map(|child| candidate_outcome(child, scope, evidence))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        CompletionGate::Not(child) => Ok(candidate_outcome(child, scope, evidence)?.negate()),
+        CompletionGate::ResponseNotEmpty(_)
+        | CompletionGate::ResponseContains(_)
+        | CompletionGate::ResponseContainsAny(_) => Ok(super::CompletionGateEvaluator::default()
+            .evaluate(gate, scope, evidence)?
+            .outcome),
+        _ => Ok(GateOutcome::Unknown),
+    }
+}
+
 impl BoundAutonomyProfile {
     /// Declaration-order scheduling never executes a later stage's validation while an earlier stage is active.
     pub fn scheduled_checks(
@@ -180,6 +212,55 @@ impl BoundAutonomyProfile {
                         .is_none_or(|stage| scope.stage.as_ref() == Some(stage))
             })
             .collect()
+    }
+
+    /// Selects the current checkpoint's work without treating an unfinished stage or a failed candidate as completion.
+    /// Candidate eligibility cannot block an observation merely because its own future evidence is not present yet.
+    pub(crate) fn controller_checks(
+        &self,
+        scope: &EvaluationScope,
+        lifecycle: &super::LifecycleState,
+        evidence: &EvaluationEvidence,
+        phase: super::controller::ControllerPhase,
+    ) -> Result<Vec<&BoundValidationCheck>> {
+        use super::controller::ControllerPhase;
+        let schedule = match phase {
+            ControllerPhase::EachCycle => {
+                return Ok(self.scheduled_checks(scope, ValidationSchedule::EachCycle));
+            }
+            ControllerPhase::StageEnd => ValidationSchedule::StageEnd,
+            ControllerPhase::Completion => ValidationSchedule::Completion,
+            _ => return Ok(Vec::new()),
+        };
+        let eligible = |gate: Option<&ai_agents_core::autonomy::CompletionGate>| -> Result<bool> {
+            Ok(gate
+                .map(|gate| candidate_outcome(gate, scope, evidence))
+                .transpose()?
+                .is_none_or(|result| result != super::GateOutcome::Fail))
+        };
+        let stages = self.profile.lifecycle.as_deref().unwrap_or_default();
+        let stage = stages.get(lifecycle.current_stage);
+        let stage_candidate = stage
+            .is_some_and(|stage| scope.stage.as_deref() == Some(stage.id.as_str()))
+            && eligible(stage.and_then(|stage| stage.completion.as_ref()))?;
+        let task_candidate = (lifecycle.requirements_met(&self.profile)
+            || (stage_candidate
+                && !stages
+                    .iter()
+                    .skip(lifecycle.current_stage + 1)
+                    .any(|stage| stage.required.unwrap_or(true))))
+            && eligible(self.profile.completion.as_ref())?;
+        Ok(self
+            .scheduled_checks(scope, schedule)
+            .into_iter()
+            .filter(|check| {
+                if check.stage.is_some() {
+                    stage_candidate
+                } else {
+                    task_candidate
+                }
+            })
+            .collect())
     }
 
     /// Required aggregate validation is separate from validation_passed:true, which rejects an empty required set.
@@ -208,7 +289,7 @@ impl BoundAutonomyProfile {
         ))
     }
 
-    /// A stage requires only global and current-stage checks, never a future stage's unavailable proof.
+    /// A stage requires global cycle checks and its own checks, never a future stage or task-completion check's unavailable proof.
     pub fn required_stage_outcome(
         &self,
         scope: &EvaluationScope,
@@ -220,6 +301,8 @@ impl BoundAutonomyProfile {
             .iter()
             .filter(|check| {
                 check.check.required.unwrap_or(true)
+                    && (check.stage.is_some()
+                        || check.check.schedule != Some(ValidationSchedule::Completion))
                     && check
                         .stage
                         .as_ref()

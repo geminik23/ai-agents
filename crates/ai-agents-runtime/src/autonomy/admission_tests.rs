@@ -173,7 +173,8 @@ async fn priced_matching_usage_releases_unused_bound_and_persists_identity() {
             .all(|reservation| reservation.reserved_micro_usd == 600_000
                 && reservation.charged_micro_usd == 200_000)
     );
-    assert_eq!(payload.controller_state["remaining_micro_usd"], 800_000);
+    // Final controller views include both settled calls, not the allowance captured before the last work turn.
+    assert_eq!(payload.controller_state["remaining_micro_usd"], 600_000);
 }
 
 #[cfg(feature = "sqlite")]

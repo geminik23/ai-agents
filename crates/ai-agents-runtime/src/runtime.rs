@@ -6397,6 +6397,7 @@ impl RuntimeAgent {
 
     // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
     // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
+    // Task question rejection is recorded before invocation and never manufactures an answer or consumes a tool slot.
     async fn execute_tool_record_scoped(
         &self,
         request: ToolExecutionRequest,
@@ -7552,6 +7553,22 @@ impl RuntimeAgent {
             return Ok(record);
         }
 
+        // Rejecting a question supplies no fabricated answer and consumes no invocation slot; independent escalation can still satisfy task gates.
+        if let Some(execution) = crate::autonomy::current_execution()
+            && execution.rejects_question()
+            && resolved.tool.task_question(&final_arguments)?.is_some()
+        {
+            let reason = "Task profile rejects required user input".to_string();
+            let record = final_denial(
+                canonical_id,
+                reason.clone(),
+                ToolPolicyDecisionRecord::deny(reason),
+                metadata,
+                versions,
+            );
+            self.finish_tool_record(&record).await;
+            return Ok(record);
+        }
         // Park validated questions before locks and atomic rate admission, which belong only to an actual invocation.
         // The answer is bound to final approved arguments and is consumed only after resumed authorization succeeds.
         if let Some(execution) = crate::autonomy::current_execution()
@@ -14625,11 +14642,26 @@ Respond in JSON format:
 
     /// Preserves ordinary approval waits; opted-in executable batches transfer control before hooks or host interaction.
     /// Live waits remain bounded by cancellation/time, while only an acknowledged exact checkpoint establishes a safe pause.
+    /// Explicit reject/policy-only task profiles cannot satisfy a still-required human approval, including during resumed work.
     async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
             return Ok(ApprovalResult::Approved);
         };
 
+        // Profile auto-if-policy never approves a request that the current policy/HITL boundary still requires a human to review.
+        if crate::autonomy::current_execution().is_some_and(|execution| {
+            matches!(
+                execution.task_interaction_policy(),
+                Some(
+                    crate::autonomy::InteractionAction::Reject
+                        | crate::autonomy::InteractionAction::AutoIfPolicy
+                )
+            )
+        }) {
+            return Ok(ApprovalResult::Rejected {
+                reason: Some("Task profile does not authorize required human approval".into()),
+            });
+        }
         if let Some(result) = crate::autonomy::suspension::take_resumed_approval(&request)? {
             return Ok(result);
         }

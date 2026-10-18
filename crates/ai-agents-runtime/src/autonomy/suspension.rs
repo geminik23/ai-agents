@@ -736,12 +736,13 @@ impl RunExecution {
 
     /// Questions share exact batch safety requirements, but use their own configured interaction policy.
     pub(crate) fn pauses_question(&self, runtime_id: &str) -> bool {
-        self.lifecycle_profile()
-            .hitl
-            .as_ref()
-            .and_then(|policy| policy.on_user_question)
-            == Some(InteractionAction::PauseRun)
-            && TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
+        matches!(
+            self.lifecycle_profile()
+                .hitl
+                .as_ref()
+                .and_then(|policy| policy.on_user_question),
+            Some(InteractionAction::PauseRun | InteractionAction::AskEachTime)
+        ) && TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
             && (self.is_coordinator(runtime_id)
                 || current_child_operation()
                     .is_some_and(|operation| self.has_composition_child(&operation)))
@@ -820,8 +821,10 @@ impl RunExecution {
 
     /// Suspension is opt-in and never silently replaces ordinary host approval waits.
     pub(crate) fn pauses_approval(&self, runtime_id: &str) -> bool {
-        if self.task_interaction_policy() != Some(InteractionAction::PauseRun)
-            || !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
+        if !matches!(
+            self.task_interaction_policy(),
+            Some(InteractionAction::PauseRun | InteractionAction::AskEachTime)
+        ) || !TASK_BATCH.try_with(|enabled| *enabled).unwrap_or(false)
         {
             return false;
         }

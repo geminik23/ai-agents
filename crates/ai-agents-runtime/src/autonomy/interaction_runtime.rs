@@ -21,7 +21,9 @@ impl RuntimeAgent {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let enabled = if matches!(kind, TaskInteractionKind::PlanReview { .. }) {
-            Some(crate::autonomy::InteractionAction::PauseRun)
+            execution
+                .task_interaction_policy()
+                .or(Some(crate::autonomy::InteractionAction::PauseRun))
         } else if question.is_some() {
             execution
                 .lifecycle_profile()
@@ -30,7 +32,26 @@ impl RuntimeAgent {
         } else {
             execution.task_interaction_policy()
         };
-        if enabled != Some(crate::autonomy::InteractionAction::PauseRun) {
+        // A restrictive task profile stops an unresolved semantic exchange instead of silently invoking a host handler.
+        if matches!(
+            enabled,
+            Some(
+                crate::autonomy::InteractionAction::Reject
+                    | crate::autonomy::InteractionAction::AutoIfPolicy
+            )
+        ) {
+            execution.stop("interaction_rejected");
+            return Err(AgentError::Config(
+                "task profile rejects required interaction".into(),
+            ));
+        }
+        if !matches!(
+            enabled,
+            Some(
+                crate::autonomy::InteractionAction::PauseRun
+                    | crate::autonomy::InteractionAction::AskEachTime
+            )
+        ) {
             return Ok(false);
         }
         let id = uuid::Uuid::new_v4().to_string();
@@ -138,12 +159,16 @@ impl RuntimeAgent {
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
-        if execution
-            .lifecycle_profile()
-            .hitl
-            .and_then(|policy| policy.on_user_question)
-            != Some(crate::autonomy::InteractionAction::PauseRun)
-        {
+        if !matches!(
+            execution
+                .lifecycle_profile()
+                .hitl
+                .and_then(|policy| policy.on_user_question),
+            Some(
+                crate::autonomy::InteractionAction::PauseRun
+                    | crate::autonomy::InteractionAction::AskEachTime
+            )
+        ) {
             manager.clear_pending_checkpoint(&checkpoint).await?;
             *self.pending_skill_id.write() = None;
             execution.stop("interaction_unavailable");

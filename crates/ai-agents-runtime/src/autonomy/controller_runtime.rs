@@ -182,15 +182,11 @@ impl AutonomyRunner {
             if driver.expired() {
                 return Err(TaskRunStorageError::AdmissionExpired.into());
             }
-            let check = bound
-                .checks
-                .iter()
-                .find(|check| check.check.id == driver.check_id)
-                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            let check = state.driver_check(&bound, &payload.objective)?;
             let mut restored = ValidationDriverState::restore_retained(
                 serde_json::to_value(driver)?,
                 driver,
-                check,
+                &check,
                 &state.scope,
                 &bound.extensions,
             )?;

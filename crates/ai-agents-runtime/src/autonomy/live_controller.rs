@@ -187,6 +187,86 @@ impl AutonomyRunner {
         Box::pin(self.park_limit(execution, todo, state, reason)).await
     }
 
+    /// Drives the already selected intervention without observing or deciding its cycle again.
+    /// Boxing keeps optional planner/pause construction out of ordinary nested model-call stack frames.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn continue_replan<'a>(
+        &'a self,
+        execution: &'a Arc<RunExecution>,
+        todo: Option<&'a RunTodoAdapter>,
+        bound: &'a BoundAutonomyProfile,
+        executor: &'a RuntimeObservationExecutor,
+        journal: &'a TaskValidationJournal,
+        objective: &'a str,
+        state: &'a mut ControllerContinuation,
+    ) -> ControllerFuture<'a, Option<TaskRunResult>> {
+        Box::pin(async move {
+            let check = bound.replan_check(&state.progress, objective)?;
+            state
+                .scope
+                .validation_bindings
+                .insert(check.check.id.clone(), check.config_identity.clone());
+            let resumed = state.driver.take();
+            if let Some(driver) = self
+                .validate(
+                    &check,
+                    &mut state.scope,
+                    &mut state.evidence,
+                    execution,
+                    bound,
+                    executor,
+                    journal,
+                    resumed,
+                )
+                .await?
+            {
+                let reason = driver.capacity_reason.clone();
+                state.phase = super::super::controller::ControllerPhase::Replan;
+                state.checks = vec![check.check.id.clone()];
+                state.next_check = 0;
+                state.driver = Some(driver);
+                state.review = None;
+                if let Some(reason) = reason {
+                    return Box::pin(self.park_limit(execution, todo, state.clone(), &reason))
+                        .await
+                        .map(Some);
+                }
+                *execution.controller.lock() = Some(Box::new(state.clone()));
+                return Box::pin(self.pause_controller(execution, todo))
+                    .await
+                    .map(Some);
+            }
+            let plan =
+                latest_validation(&state.evidence.validations, &check.check.id, &state.scope)
+                    .filter(|result| result.outcome == GateOutcome::Pass)
+                    .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            state.instruction = plan.metrics.to_string();
+            state.phase = super::super::controller::ControllerPhase::Decision;
+            state.checks.clear();
+            state.next_check = 0;
+            state.review = None;
+            state.source = AutonomyTurnSource::Continuation;
+            if bound
+                .profile
+                .supervision
+                .as_ref()
+                .is_some_and(|policy| policy.plan_changes == Some(ReviewPolicy::RequireApproval))
+            {
+                return Box::pin(self.park_review(
+                    execution,
+                    todo,
+                    state.clone(),
+                    ControllerProposal::Plan {
+                        instruction: state.instruction.clone(),
+                    },
+                ))
+                .await
+                .map(Some);
+            }
+            Ok(None)
+        })
+    }
+
     /// Capacity decisions are deterministic and consume no provider or tool slot; expiry and uncertainty still take precedence.
     pub(super) async fn park_limit(
         &self,
@@ -228,7 +308,11 @@ impl AutonomyRunner {
             return self
                 .finish(
                     execution,
-                    TaskRunStatus::LimitReached,
+                    if action == LimitAction::Fail {
+                        TaskRunStatus::Failed
+                    } else {
+                        TaskRunStatus::LimitReached
+                    },
                     reason.into(),
                     Some(state.response),
                 )

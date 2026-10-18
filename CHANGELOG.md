@@ -3,13 +3,15 @@
 ## Unreleased
 
 ### Added
+- Task controller scheduling: development-only standalone profiles enforce required stage/check ordering, bounded repair and retained replanning without repeating completed work or selecting interventions twice
+- Task interaction profiles: development-only reject, policy-only and per-stage review settings execute without auto-approving required human decisions; final controller views reflect consumed allowance and selected decisions
 - Task skill execution: development-only explicit skill entry preserves the admitted definition, inherited accounting and completed steps before continuing under the same task controller
 - Task controller interaction: development-only stagnation, blockage and premature-finish questions plus limit questions/pauses retain exact work positions and require explicit responses or host limit revisions
 - Task evidence: development-only frozen host revision sources bind validation and external waits to actual targets; explicit delivery-loss reports follow stop/fail policy without polling or replay
 - Task host controls: development-only retained objective changes retire safe pending work, preserve audit/usage and canonical todos, and require explicit revision-bound continuation
 - Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
-- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, strategy and restart integration remains unfinished
+- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant and restart integration remains unfinished
 - Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full acceptance and restart remain unfinished
 - Task broadcast continuation: development-only `AgentRegistry::broadcast_task` retains recipient operations and ordered results under a live tool-message permit; ordinary broadcast and calls without a permit remain blocking
 - Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and restart reconstruction remain unavailable
@@ -28,6 +30,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task controller continuation: resume only the pending schedule/planner work, preserve parent capacity pauses after completed child delivery, and keep normal stage/repair work separate from forced continuation limits
 - Task capacity continuation: preserve skill steps, native calls, model iterations and validator attempts across resource waits; publish no new executable pause after actual expiry and retain protection for uncertain acknowledgements
 - Task proof eligibility: unavailable or stale metrics cannot prove absence or progress; derived validator and progress results retain exact upstream proof freshness across multiple host targets
 - Task invocation admission: preserve original validation bounds and pinned host proof through tool/provider admission, child tasks and returned streams without refunding already dispatched work

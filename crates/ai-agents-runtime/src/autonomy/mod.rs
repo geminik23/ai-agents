@@ -67,6 +67,8 @@ pub(crate) mod location;
 #[cfg(test)]
 mod location_tests;
 #[cfg(test)]
+mod lp_controller_tests;
+#[cfg(test)]
 mod message_batch_tests;
 #[cfg(test)]
 mod shared_target_tests;
