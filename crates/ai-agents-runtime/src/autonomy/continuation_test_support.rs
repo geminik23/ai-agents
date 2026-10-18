@@ -13,7 +13,10 @@ pub(super) struct ReceiptStore {
     pub status: TaskRunStatus,
     pub checkpoint: parking_lot::Mutex<Option<serde_json::Value>>,
     pub reached: tokio::sync::Semaphore,
+<<<<<<< HEAD
     pub release: tokio::sync::Semaphore,
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
 }
 impl ReceiptStore {
     // A single selected final write distinguishes proven rejection from an ambiguous receipt.
@@ -29,7 +32,10 @@ impl ReceiptStore {
             status,
             checkpoint: parking_lot::Mutex::new(None),
             reached: tokio::sync::Semaphore::new(0),
+<<<<<<< HEAD
             release: tokio::sync::Semaphore::new(0),
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
         })
     }
 
@@ -46,7 +52,10 @@ impl ReceiptStore {
             status: TaskRunStatus::Running,
             checkpoint: parking_lot::Mutex::new(Some(checkpoint)),
             reached: tokio::sync::Semaphore::new(0),
+<<<<<<< HEAD
             release: tokio::sync::Semaphore::new(0),
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
         })
     }
 
@@ -86,6 +95,7 @@ impl TaskRunStore for ReceiptStore {
         let selected = if let Some(binding) = &*self.checkpoint.lock() {
             if let TaskRunMutation::Checkpoint { payload, .. } = mutation {
                 let payload: TaskCheckpointPayload = serde_json::from_value(payload.clone())?;
+<<<<<<< HEAD
                 if binding.get("prompt") == Some(&serde_json::Value::Bool(true)) {
                     payload
                         .adapters
@@ -104,10 +114,14 @@ impl TaskRunStore for ReceiptStore {
                         })
                 } else if let Some(id) = binding.get("consume").and_then(serde_json::Value::as_str)
                 {
+=======
+                if let Some(id) = binding.get("consume").and_then(serde_json::Value::as_str) {
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
                     payload
                         .consumed_request_ids
                         .iter()
                         .any(|consumed| consumed == id)
+<<<<<<< HEAD
                 } else if let Some(tool) = binding.get("tool").and_then(serde_json::Value::as_str) {
                     payload.reservations.iter().any(|reservation| {
                         let expected = if binding["phase"] == "admit" {
@@ -121,6 +135,8 @@ impl TaskRunStore for ReceiptStore {
                                     && adapter.config["tool"] == tool
                             })
                     })
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
                 } else {
                     payload
                         .reservations
@@ -149,9 +165,12 @@ impl TaskRunStore for ReceiptStore {
             }
             let saved = self.inner.mutate(id, mutation).await?;
             self.reached.add_permits(1);
+<<<<<<< HEAD
             if self.mode == "hold" {
                 self.release.acquire().await.unwrap().forget();
             }
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
             if self.mode == "drop" {
                 std::future::pending::<()>().await;
             }
@@ -222,6 +241,7 @@ impl ai_agents_core::LLMProvider for FaultProvider {
         _: Option<&ai_agents_core::LLMConfig>,
     ) -> std::result::Result<ai_agents_core::LLMResponse, ai_agents_core::LLMError> {
         let index = self.calls.fetch_add(1, Ordering::SeqCst);
+<<<<<<< HEAD
         if (self.mode == "errors_after" && index >= self.fault_at)
             || (self.mode == "alternate_error" && index % 2 == 1)
         {
@@ -229,6 +249,8 @@ impl ai_agents_core::LLMProvider for FaultProvider {
                 "semantic provider failed".into(),
             ));
         }
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
         if index == self.fault_at {
             self.reached.add_permits(1);
             if self.mode == "drop" {

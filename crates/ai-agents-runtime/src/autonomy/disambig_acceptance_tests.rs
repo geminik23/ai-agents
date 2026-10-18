@@ -3,6 +3,7 @@ use super::*;
 use super::super::continuation_test_support::{self as support, ReceiptStore};
 use ai_agents_core::Result;
 
+<<<<<<< HEAD
 // Profile question policy uses the existing semantic cursor, not a second detection pass or a fabricated answer.
 #[tokio::test]
 async fn lp_question_profile_supports_real_clarification_and_explicit_rejection() {
@@ -42,6 +43,8 @@ async fn lp_question_profile_supports_real_clarification_and_explicit_rejection(
     }
 }
 
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
 const CLEAR: &str = r#"{"is_ambiguous":false,"confidence":1.0}"#;
 const UNCLEAR: &str = r#"{"status":"unclear"}"#;
 const CONFIRM: &str = r#"{"question":"Confirm target one?"}"#;

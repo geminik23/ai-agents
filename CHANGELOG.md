@@ -11,7 +11,11 @@
 - Task host controls: development-only retained objective changes retire safe pending work, preserve audit/usage and canonical todos, and require explicit revision-bound continuation
 - Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
+<<<<<<< HEAD
 - Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant and restart integration remains unfinished
+=======
+- Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant, strategy and restart integration remains unfinished
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
 - Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full acceptance and restart remain unfinished
 - Task broadcast continuation: development-only `AgentRegistry::broadcast_task` retains recipient operations and ordered results under a live tool-message permit; ordinary broadcast and calls without a permit remain blocking
 - Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and restart reconstruction remain unavailable
@@ -30,6 +34,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+<<<<<<< HEAD
 - Task controller continuation: resume only the pending schedule/planner work, preserve parent capacity pauses after completed child delivery, and keep normal stage/repair work separate from forced continuation limits
 - Task capacity continuation: preserve skill steps, native calls, model iterations and validator attempts across resource waits; publish no new executable pause after actual expiry and retain protection for uncertain acknowledgements
 - Task proof eligibility: unavailable or stale metrics cannot prove absence or progress; derived validator and progress results retain exact upstream proof freshness across multiple host targets
@@ -44,6 +49,8 @@
 - Task objective handoff: preserve intervention limits, archive superseded validator attempts and reconstruct required-check eligibility without replaying completed work
 - Task fallback recovery: retain retry position, original lifecycle and distinct hop evidence across message pauses without duplicate rate admission or stale approval rebinding; uncertain task timeouts cannot start fresh fallback work
 - Task state actions: reject changed state bindings after awaited preparation before prompt dispatch, context publication or the next saved action
+=======
+>>>>>>> e17692e (fix: complete skill and clarification continuation)
 - Task clarification: development-only retained questions honor configured human-review deadlines and settle expiry without semantic replay; in-flight state changes preserve newer exchanges instead of clearing them
 - Task validation continuation: preserve immutable attempt identity after mutations, reject oversized responses before claim, acknowledge signals before callback reentry and safely settle cancellation or expiry racing resume acknowledgement
 - Task action continuation: preserve approval and rejection positions, original escalation input, processed skill context through re-pause and single finalization; exhausted or unavailable clarification cannot pass completion gates, and heap-owned boundaries protect default nested stacks
