@@ -17,16 +17,44 @@ impl ToolInvoker for TaskSkillInvoker<'_> {
     }
 }
 
+// The original script generation restricts real dispatch as well as checkpoints; current tool scope alone cannot adopt an old cursor.
+struct SkillGeneration {
+    machine: Option<Arc<StateMachine>>,
+    expected: Option<u64>,
+}
+impl std::fmt::Debug for SkillGeneration {
+    // Avoid exposing script or host state in admission diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SkillGeneration")
+    }
+}
+impl crate::autonomy::TaskFinalAdmission for SkillGeneration {
+    // Awaiting storage or provider preparation cannot replace the generation that admitted this script.
+    fn validate(&self) -> Result<()> {
+        if self.machine.as_ref().map(|machine| machine.generation()) != self.expected {
+            return Err(AgentError::Config(
+                "skill continuation state or scope changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 struct TaskSkillJournal<'a> {
     agent: &'a RuntimeAgent,
     context: HashMap<String, Value>,
     actions: Option<Box<crate::autonomy::location::TaskActionsLocation>>,
+    generation: Option<u64>,
 }
 #[async_trait]
 impl SkillExecutionObserver for TaskSkillJournal<'_> {
-    /// Completed prompt/tool results and rendered pending arguments are acknowledged before the next effect.
+    /// Completed results retain their original binding before publication and after storage acknowledgement, including final prompt results.
     async fn checkpoint(&self, cursor: &SkillExecutionCursor) -> Result<()> {
-        cursor.validate(&cursor.definition)?;
+        self.agent.validate_skill_cursor_binding(
+            cursor,
+            self.actions.as_deref(),
+            self.generation,
+        )?;
         if cursor.context.step_results.len() > crate::autonomy::MAX_TASK_CHECKPOINT_RECORDS {
             return Err(crate::autonomy::TaskRunStorageError::CheckpointTooLarge.into());
         }
@@ -44,11 +72,7 @@ impl SkillExecutionObserver for TaskSkillJournal<'_> {
             source: crate::autonomy::current_turn_input(&self.agent.root_turn_gate)
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
                 .source,
-            state_generation: self
-                .agent
-                .state_machine
-                .as_ref()
-                .map(|machine| machine.generation()),
+            state_generation: self.generation,
         };
         let id = format!(
             "runtime.skill:{}:{}:{}",
@@ -57,6 +81,11 @@ impl SkillExecutionObserver for TaskSkillJournal<'_> {
             cursor.execution_id
         );
         Box::pin(execution.update(|payload| {
+            self.agent.validate_skill_cursor_binding(
+                cursor,
+                self.actions.as_deref(),
+                self.generation,
+            )?;
             let adapter = crate::autonomy::TaskAdapterCheckpoint {
                 id: id.clone(),
                 adapter: "runtime.skill".into(),
@@ -71,12 +100,89 @@ impl SkillExecutionObserver for TaskSkillJournal<'_> {
             }
             Ok(())
         }))
-        .await
-        .map(|_| ())
+        .await?;
+        self.agent
+            .validate_skill_cursor_binding(cursor, self.actions.as_deref(), self.generation)
     }
 }
 
 impl RuntimeAgent {
+    // Only an executing task can supply the original script finishing restriction; ordinary chat has no added guard.
+    pub(super) fn task_skill_finishing_guard(
+        &self,
+    ) -> Option<Arc<dyn crate::autonomy::TaskFinalAdmission>> {
+        crate::autonomy::current_execution().and_then(|execution| {
+            execution
+                .owner
+                .skill_finishing
+                .lock()
+                .get(&self.info.id)
+                .cloned()
+        })
+    }
+
+    // Reflection is still response-dependent script work and must not dispatch a retry after original-generation invalidation.
+    pub(super) async fn reflect_skill_response(
+        &self,
+        input: &str,
+        mut response: String,
+        config: &ReflectionConfig,
+    ) -> Result<String> {
+        let guard = self.task_skill_finishing_guard();
+        if let Some(guard) = &guard {
+            guard.validate()?;
+        }
+        ai_agents_llm::scope_invocation_evidence(guard.iter().cloned().collect(), async {
+            if config.requires_evaluation()
+                && config.is_enabled()
+                && self
+                    .should_reflect_with_config(input, &response, config)
+                    .await?
+            {
+                response = self
+                    .evaluate_and_retry_with_config(input, response, config)
+                    .await?;
+            }
+            if let Some(guard) = &guard {
+                guard.validate()?;
+            }
+            Ok(response)
+        })
+        .await
+    }
+
+    // Pending-location shape is separate from live binding so completed final-prompt cursors can be checked too.
+    fn validate_skill_cursor_binding(
+        &self,
+        cursor: &SkillExecutionCursor,
+        actions: Option<&crate::autonomy::location::TaskActionsLocation>,
+        generation: Option<u64>,
+    ) -> Result<()> {
+        use crate::autonomy::TaskFinalAdmission;
+        SkillGeneration {
+            machine: self.state_machine.clone(),
+            expected: generation,
+        }
+        .validate()?;
+        if let Some(actions) = actions {
+            self.validate_task_actions(actions)?;
+        } else if !self
+            .get_available_skills()
+            .iter()
+            .any(|skill| skill.id == cursor.definition.id)
+        {
+            return Err(AgentError::Config(
+                "skill continuation state or scope changed".into(),
+            ));
+        }
+        let actual = self
+            .skills
+            .iter()
+            .find(|skill| skill.id == cursor.definition.id)
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        cursor.validate(actual)
+    }
+
     /// Explicit entry selects an installed skill within the current state scope without invoking the semantic router.
     pub(crate) fn admit_autonomy_skill(&self, skill_id: &str) -> Result<SkillDefinition> {
         self.get_available_skills()
@@ -163,23 +269,16 @@ impl RuntimeAgent {
                 &mut state.cursor,
                 state.input_context.clone(),
                 None,
+                state.state_generation,
             ))
             .await?;
-            let config = self.get_skill_reflection_config(&state.cursor.definition);
-            if config.requires_evaluation()
-                && config.is_enabled()
-                && self
-                    .should_reflect_with_config(&state.cursor.context.user_input, &content, &config)
-                    .await?
-            {
-                content = self
-                    .evaluate_and_retry_with_config(
-                        &state.cursor.context.user_input,
-                        content,
-                        &config,
-                    )
-                    .await?;
-            }
+            content = self
+                .reflect_skill_response(
+                    &state.cursor.context.user_input,
+                    content,
+                    &self.get_skill_reflection_config(&state.cursor.definition),
+                )
+                .await?;
             self.commit_root_user_message(&state.cursor.context.user_input)
                 .await?;
             self.handle_skill_response(
@@ -199,6 +298,14 @@ impl RuntimeAgent {
         input: &str,
     ) -> Result<String> {
         let actions = crate::autonomy::location::current_actions_parent().map(Box::new);
+        let generation = actions
+            .as_ref()
+            .map(|actions| actions.transition.expected_generation)
+            .or_else(|| {
+                self.state_machine
+                    .as_ref()
+                    .map(|machine| machine.generation())
+            });
         if actions.is_none() {
             self.commit_root_user_message(input).await?;
         }
@@ -209,23 +316,40 @@ impl RuntimeAgent {
             .as_ref()
             .map(|turn| turn.input_context.clone())
             .unwrap_or_default();
-        Box::pin(self.drive_task_skill(&mut cursor, context, actions)).await
+        Box::pin(self.drive_task_skill(&mut cursor, context, actions, generation)).await
     }
 
-    /// Captures the precise pending tool step when the shared executor transfers control; no fake assistant call is committed.
+    /// Runs an originally bound cursor with pre-dispatch guards and rejects stale result advancement or segment credit after awaited work.
+    /// Suspension preserves the same generation rather than rebinding old script progress to the latest state.
     async fn drive_task_skill(
         &self,
         cursor: &mut SkillExecutionCursor,
         context: HashMap<String, Value>,
         actions: Option<Box<crate::autonomy::location::TaskActionsLocation>>,
+        generation: Option<u64>,
     ) -> Result<String> {
         let executor = self
             .skill_executor
             .as_ref()
             .ok_or_else(|| AgentError::Skill("No skill executor configured".into()))?;
+        self.validate_skill_cursor_binding(cursor, actions.as_deref(), generation)?;
+        let guard: Arc<dyn crate::autonomy::TaskFinalAdmission> = Arc::new(SkillGeneration {
+            machine: self.state_machine.clone(),
+            expected: generation,
+        });
+        if actions.is_none()
+            && let Some(execution) = crate::autonomy::current_execution()
+        {
+            execution
+                .owner
+                .skill_finishing
+                .lock()
+                .insert(self.info.id.clone(), guard.clone());
+        }
         let skill = cursor.definition.clone();
-        let result = self
-            .observe_purpose(
+        let result = ai_agents_llm::scope_invocation_evidence(
+            vec![guard.clone()],
+            self.observe_purpose(
                 ObservationPurpose::SkillPrompt,
                 Box::pin(executor.execute_resumable_with_invoker(
                     &skill,
@@ -235,10 +359,13 @@ impl RuntimeAgent {
                         agent: self,
                         context: context.clone(),
                         actions: actions.clone(),
+                        generation,
                     },
                 )),
-            )
-            .await;
+            ),
+        )
+        .await;
+        self.validate_skill_cursor_binding(cursor, actions.as_deref(), generation)?;
         if let Err(error @ AgentError::TaskSuspended(_)) = result {
             let location = TaskLocation::Skill(Box::new(TaskSkillLocation {
                 cursor: cursor.clone(),
@@ -249,10 +376,7 @@ impl RuntimeAgent {
                 source: crate::autonomy::current_turn_input(&self.root_turn_gate)
                     .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?
                     .source,
-                state_generation: self
-                    .state_machine
-                    .as_ref()
-                    .map(|machine| machine.generation()),
+                state_generation: generation,
             }));
             Box::pin(self.retain_location_batch(location)).await?;
             return Err(error);
@@ -264,7 +388,9 @@ impl RuntimeAgent {
             let execution = crate::autonomy::current_execution()
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
             if execution.is_coordinator(&self.info.id) {
-                execution.complete_skill_segment(&cursor.definition).await?;
+                execution
+                    .complete_skill_segment(&cursor.definition, guard.as_ref())
+                    .await?;
             }
         }
         result
@@ -434,6 +560,7 @@ impl RuntimeAgent {
                         let mut receipts = batch.authorized.clone();
                         if let BatchResponse::Approval(result) = &response {
                             receipts.push(BatchAuthorization {
+                                request_id: pending.request_id.clone(),
                                 call_id: pending.call_id.clone(),
                                 trigger: pending.trigger.clone(),
                                 context: pending.context.clone(),
@@ -446,13 +573,26 @@ impl RuntimeAgent {
                             crate::autonomy::suspension::scope_resumed_approval(
                                 receipts.clone(),
                                 crate::autonomy::scope_task_batch(
-                                    self.execute_tool_record(request),
+                                    ai_agents_llm::scope_invocation_evidence(
+                                        match &location {
+                                            TaskLocation::Skill(state) => {
+                                                vec![Arc::new(SkillGeneration {
+                                                    machine: self.state_machine.clone(),
+                                                    expected: state.state_generation,
+                                                })
+                                                    as Arc<dyn crate::autonomy::TaskFinalAdmission>]
+                                            }
+                                            _ => vec![],
+                                        },
+                                        self.execute_tool_record(request),
+                                    ),
                                 ),
                             ),
                         );
                         let record = match response {
                             BatchResponse::UserAnswer(answer) => {
                                 crate::autonomy::suspension::scope_resumed_question(
+                                    pending.request_id.clone(),
                                     pending.call_id.clone(),
                                     pending.context.clone(),
                                     answer,
@@ -531,6 +671,11 @@ impl RuntimeAgent {
                     Box::pin(self.resume_task_actions((**state).clone())).await
                 }
                 TaskLocation::Skill(state) => {
+                    self.validate_skill_cursor_binding(
+                        &state.cursor,
+                        state.actions.as_deref(),
+                        state.state_generation,
+                    )?;
                     if let Err(error) = state.cursor.accept_tool_result(record) {
                         execution.stop("skill_step_failed");
                         return Box::pin(self.finish_task_location_stop(error.to_string())).await;
@@ -539,6 +684,7 @@ impl RuntimeAgent {
                         &mut state.cursor,
                         state.input_context.clone(),
                         state.actions.clone(),
+                        state.state_generation,
                     ))
                     .await?;
                     if let Some(mut actions) = state.actions.take() {
@@ -546,25 +692,13 @@ impl RuntimeAgent {
                         actions.next_action += 1;
                         return Box::pin(self.resume_task_actions(*actions)).await;
                     }
-                    let config = self.get_skill_reflection_config(&state.cursor.definition);
-                    if config.requires_evaluation()
-                        && config.is_enabled()
-                        && self
-                            .should_reflect_with_config(
-                                &state.cursor.context.user_input,
-                                &content,
-                                &config,
-                            )
-                            .await?
-                    {
-                        content = self
-                            .evaluate_and_retry_with_config(
-                                &state.cursor.context.user_input,
-                                content,
-                                &config,
-                            )
-                            .await?;
-                    }
+                    content = self
+                        .reflect_skill_response(
+                            &state.cursor.context.user_input,
+                            content,
+                            &self.get_skill_reflection_config(&state.cursor.definition),
+                        )
+                        .await?;
                     self.commit_root_user_message(&state.cursor.context.user_input)
                         .await?;
                     self.handle_skill_response(

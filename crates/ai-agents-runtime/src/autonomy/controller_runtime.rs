@@ -201,6 +201,7 @@ impl AutonomyRunner {
             let mut external = None;
             let mut observation_group = None;
             let mut timed_out = false;
+            let mut timeout_id = None;
             let capacity_response = self.validate_capacity_response(&payload, &input)?;
             match input {
                 TaskResumeInput::ExternalSignal(signal) => {
@@ -291,6 +292,7 @@ impl AutonomyRunner {
                     if id != pending.id || payload.consumed_request_ids.contains(&id) {
                         return Err(TaskRunStorageError::NotResumable.into());
                     }
+                    let mut pending_child = None;
                     if let Some(group) = &group {
                         let targets = self
                             .paused
@@ -300,6 +302,7 @@ impl AutonomyRunner {
                             .ok_or(TaskRunStorageError::NotResumable)?;
                         let child = self.agent.task_group_child(group, &targets)?;
                         child.validate_task_batch_response(&group.batch, &response)?;
+                        pending_child = Some(child);
                         observation_group = Some((
                             parked.request.call_id.clone(),
                             group.clone(),
@@ -336,7 +339,12 @@ impl AutonomyRunner {
                                 if !matches!(result, ApprovalResult::Timeout) {
                                     return Err(AgentError::HITLTimeout);
                                 }
-                                result = self.agent.task_approval_timeout_result()?;
+                                // Timeout authority belongs to this exact leaf, not the coordinating validator's profile.
+                                result = pending_child
+                                    .as_deref()
+                                    .unwrap_or(&self.agent)
+                                    .task_approval_timeout_result()?;
+                                timeout_id = Some(approval.request_id.clone());
                             } else if matches!(result, ApprovalResult::Timeout) {
                                 return Err(AgentError::HITLTimeout);
                             }
@@ -344,6 +352,7 @@ impl AutonomyRunner {
                                 *response = BatchResponse::Approval(result.clone());
                             }
                             receipts.push(BatchAuthorization {
+                                request_id: approval.request_id.clone(),
                                 call_id: approval.call_id,
                                 trigger: approval.trigger,
                                 context: approval.context,
@@ -371,7 +380,12 @@ impl AutonomyRunner {
                                     &answer,
                                 )?;
                             }
-                            question = Some((request.call_id, approval.context, answer));
+                            question = Some((
+                                approval.request_id,
+                                request.call_id,
+                                approval.context,
+                                answer,
+                            ));
                         }
                         BatchResponse::QuestionTimeout
                             if matches!(pending.kind, TaskPendingKind::UserQuestion) && expired =>
@@ -510,12 +524,18 @@ impl AutonomyRunner {
                     );
                     let future =
                         super::super::authority::scope_observation_group(observation_group, future);
-                    let result = if let Some((call, args, answer)) = question {
-                        super::super::suspension::scope_resumed_question(call, args, answer, future)
-                            .await
-                    } else {
-                        future.await
-                    };
+                    let result =
+                        super::super::suspension::scope_timeout_approval(timeout_id, async {
+                            if let Some((request_id, call, args, answer)) = question {
+                                super::super::suspension::scope_resumed_question(
+                                    request_id, call, args, answer, future,
+                                )
+                                .await
+                            } else {
+                                future.await
+                            }
+                        })
+                        .await;
                     // An ambiguous storage failure is not a clean clock interruption and cannot release retained custody.
                     if !execution.has_storage_failure()
                         && result.as_ref().is_err_and(|error| {

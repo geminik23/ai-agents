@@ -116,7 +116,7 @@ impl AutonomyRunner {
         }
     }
 
-    /// Refreshes trusted parked state and non-extending request deadlines after another acknowledged safe pause.
+    /// Refreshes acknowledged parked state and original clocks, retaining only live pending/prior-gate review bindings rather than all historical receipts.
     fn refresh_pause(&self, paused: &mut PausedTask, execution: &RunExecution) -> Result<()> {
         (paused.batch, paused.group) = self.capture_pause(execution)?;
         paused.controller = execution.controller.lock().clone();
@@ -178,6 +178,10 @@ impl AutonomyRunner {
                         .any(|approval| &approval.request_id == id)
             })
         });
+        super::response::retain_response_bindings(
+            &paused.owner,
+            &serde_json::to_value((&paused.batch, &paused.group, &paused.controller))?,
+        );
         Ok(())
     }
 

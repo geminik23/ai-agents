@@ -801,6 +801,7 @@ impl RuntimeAgent {
                         batch
                             .authorized
                             .push(crate::autonomy::suspension::BatchAuthorization {
+                                request_id: approval.request_id.clone(),
                                 call_id: approval.call_id.clone(),
                                 trigger: approval.trigger,
                                 context: approval.context.clone(),
@@ -835,6 +836,7 @@ impl RuntimeAgent {
                         | crate::autonomy::suspension::BatchResponse::Capacity => invocation.await,
                         crate::autonomy::suspension::BatchResponse::UserAnswer(answer) => {
                             crate::autonomy::suspension::scope_resumed_question(
+                                approval.request_id.clone(),
                                 approval.call_id.clone(),
                                 approval.context.clone(),
                                 answer,

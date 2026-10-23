@@ -30,6 +30,10 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task checkpoint latency: reduce repeated recovery-data processing during nested continuation while preserving complete validation, exact receipts and original deadlines
+- Task response admission: retain the original reviewed implementation and request deadlines through preparation and admission waits, use the actual pending child's timeout policy, and preserve exact timeout dispositions across later gates without transferring approval
+- Task command evidence: approved replacement commands retain their actual execution records without proving success of the original validation command or changed working-directory, argv or environment operands
+- Task skill bindings: retain the original state generation through prompt, tool, checkpoint, completion-credit, reflection and output waits without replaying completed effects or publishing stale success
 - Task controller continuation: resume only the pending schedule/planner work, preserve parent capacity pauses after completed child delivery, and keep normal stage/repair work separate from forced continuation limits
 - Task capacity continuation: preserve skill steps, native calls, model iterations and validator attempts across resource waits; publish no new executable pause after actual expiry and retain protection for uncertain acknowledgements
 - Task proof eligibility: unavailable or stale metrics cannot prove absence or progress; derived validator and progress results retain exact upstream proof freshness across multiple host targets

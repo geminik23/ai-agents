@@ -153,7 +153,11 @@ impl TaskRuntimeCheckpoint {
                 {
                     return Err(TaskRunStorageError::InvalidCheckpoint.into());
                 }
-                validate_suspended_history(&self.snapshot.memory.messages, batch.as_ref())?;
+                validate_inspected_suspended_history(
+                    &self.snapshot.memory.messages,
+                    batch.as_ref(),
+                    &inspection,
+                )?;
                 if let Some(batch) = batch {
                     let ids: HashSet<_> = batch.call_ids.iter().collect();
                     if batch.next_call >= batch.call_ids.len()
@@ -179,6 +183,15 @@ fn validate_suspended_history(
 ) -> Result<()> {
     let history =
         inspect_native_history(messages).map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
+    validate_inspected_suspended_history(messages, batch, &history)
+}
+
+// Reuse only this immutable history inspection while retaining every pending-prefix and final-exchange check.
+fn validate_inspected_suspended_history(
+    messages: &[ChatMessage],
+    batch: Option<&TaskToolBatchCursor>,
+    history: &ai_agents_core::NativeHistoryInspection,
+) -> Result<()> {
     for (index, exchange) in history.exchanges().iter().enumerate() {
         if exchange.is_complete() {
             continue;
@@ -609,6 +622,17 @@ impl TaskCheckpointPayload {
 
     /// Validates identity, size/count bounds, pending ownership and native history before restoration.
     pub fn validate(&self, envelope: &TaskRunSnapshot, config_identity: &str) -> Result<()> {
+        self.validate_contents(envelope, config_identity)?;
+        envelope.validate()
+    }
+
+    /// Checks all runtime invariants after the scoped adapter has already size-validated this exact immutable envelope.
+    /// Public callers still use validate, which also performs the complete envelope validation.
+    pub(crate) fn validate_contents(
+        &self,
+        envelope: &TaskRunSnapshot,
+        config_identity: &str,
+    ) -> Result<()> {
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
         if self.version != TASK_PAYLOAD_VERSION
             || self.objective.trim().is_empty()
@@ -890,7 +914,7 @@ impl TaskCheckpointPayload {
         if count > MAX_TASK_CHECKPOINT_RECORDS {
             return Err(TaskRunStorageError::CheckpointTooLarge.into());
         }
-        envelope.validate()
+        Ok(())
     }
 
     /// Rejects budget resets, configuration hot-swaps, replayed requests and lost committed effects.

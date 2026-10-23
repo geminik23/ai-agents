@@ -136,6 +136,7 @@ impl TaskExecutorCursor {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BatchAuthorization {
+    pub request_id: String,
     pub call_id: String,
     pub trigger: Value,
     pub context: Value,
@@ -222,9 +223,18 @@ impl TaskBatchState {
 
     /// Cross-checks executable calls and reviewed action against the committed history before any resume claim.
     pub(crate) fn validate_checkpoint(&self, payload: &TaskCheckpointPayload) -> Result<()> {
+        self.validate_runtime_checkpoint(&payload.runtime, payload.pending.as_ref())
+    }
+
+    /// Validates the same complete request/history contract against borrowed root or child state without copying unrelated siblings and evidence.
+    pub(crate) fn validate_runtime_checkpoint(
+        &self,
+        runtime: &TaskRuntimeCheckpoint,
+        pending: Option<&TaskPendingRequest>,
+    ) -> Result<()> {
         self.validate()?;
         let invalid = || AgentError::from(TaskRunStorageError::InvalidCheckpoint);
-        let pending = payload.pending.as_ref().ok_or_else(invalid)?;
+        let pending = pending.ok_or_else(invalid)?;
         if matches!(pending.kind, TaskPendingKind::UserQuestion)
             != self.approvals[0].question.is_some()
             || matches!(pending.kind, TaskPendingKind::Limit)
@@ -239,17 +249,17 @@ impl TaskBatchState {
             return Err(invalid());
         }
         if self.interaction.is_some() {
-            if !matches!(&payload.runtime.continuation, TaskContinuation::Suspended {request_id, batch: None, ..} if request_id == &pending.id)
+            if !matches!(&runtime.continuation, TaskContinuation::Suspended {request_id, batch: None, ..} if request_id == &pending.id)
             {
                 return Err(invalid());
             }
-            return self.validate_model_history(&payload.runtime);
+            return self.validate_model_history(runtime);
         }
         let TaskContinuation::Suspended {
             batch: Some(cursor),
             request_id,
             ..
-        } = &payload.runtime.continuation
+        } = &runtime.continuation
         else {
             return Err(invalid());
         };
@@ -263,8 +273,7 @@ impl TaskBatchState {
                     .collect::<Vec<_>>()
             || cursor.completed_results != self.prefix_outputs()
             || (self.location.is_none()
-                && payload
-                    .runtime
+                && runtime
                     .snapshot
                     .memory
                     .messages
@@ -276,7 +285,7 @@ impl TaskBatchState {
             return Err(invalid());
         }
         if self.location.is_some() {
-            self.validate_model_history(&payload.runtime)?;
+            self.validate_model_history(runtime)?;
             return Ok(());
         }
         if self
@@ -286,8 +295,7 @@ impl TaskBatchState {
             .native_exchanges
             .iter()
             .any(|expected| {
-                !payload
-                    .runtime
+                !runtime
                     .native_exchanges
                     .iter()
                     .any(|actual| actual == expected)
@@ -488,7 +496,7 @@ tokio::task_local! {
     static TASK_REQUEST: ToolExecutionRequest;
     static TASK_BATCH: bool;
     static RESUMED_APPROVAL: std::cell::RefCell<Vec<BatchAuthorization>>;
-    static RESUMED_QUESTION: std::cell::RefCell<Option<(String, Value, Value)>>;
+    static RESUMED_QUESTION: std::cell::RefCell<Option<(String, String, Value, Value)>>;
     static RESUMED_EXECUTOR: std::cell::RefCell<Vec<TaskExecutorCursor>>;
     static EXECUTOR_PROGRESS: std::cell::RefCell<TaskExecutorCursor>;
     static SETTLED_TOOL_RESULT: std::cell::RefCell<Option<(String, ai_agents_core::ToolResult)>>;
@@ -559,12 +567,30 @@ pub(crate) fn message_request() -> Option<ToolExecutionRequest> {
     })
 }
 
-/// A private request scope ties an approval to its original call ID, not a model-selected label.
-pub(crate) async fn scope_task_request<F: Future>(
+/// Each hop pins its exact retained responses before preparation; heap erasure keeps deeply nested message consumers on the default stack.
+pub(crate) fn scope_task_request<'a, F: Future + Send + 'a>(
     request: ToolExecutionRequest,
     future: F,
-) -> F::Output {
-    TASK_REQUEST.scope(request, future).await
+) -> std::pin::Pin<Box<dyn Future<Output = F::Output> + Send + 'a>> {
+    let mut ids = RESUMED_APPROVAL
+        .try_with(|receipts| {
+            receipts
+                .borrow()
+                .iter()
+                .map(|receipt| receipt.request_id.clone())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if let Ok(Some(id)) = RESUMED_QUESTION
+        .try_with(|question| question.borrow().as_ref().map(|(id, _, _, _)| id.clone()))
+    {
+        ids.push(id);
+    }
+    Box::pin(super::response::scope_response_admission(
+        request.clone(),
+        ids,
+        TASK_REQUEST.scope(request, future),
+    ))
 }
 
 /// Only batches whose caller can persist its exact loop state may transfer control by suspension.
@@ -589,7 +615,7 @@ pub(crate) fn take_resumed_approval(request: &ApprovalRequest) -> Result<Option<
         .ok();
     let trigger = serde_json::to_value(&request.trigger)?;
     let context = serde_json::to_value(&request.context)?;
-    Ok(RESUMED_APPROVAL
+    let authorization = RESUMED_APPROVAL
         .try_with(|slot| {
             let mut receipt = slot.borrow_mut();
             receipt
@@ -599,10 +625,14 @@ pub(crate) fn take_resumed_approval(request: &ApprovalRequest) -> Result<Option<
                         && authorization.trigger == trigger
                         && authorization.context == context
                 })
-                .map(|index| receipt.remove(index).result)
+                .map(|index| receipt.remove(index))
         })
         .ok()
-        .flatten())
+        .flatten();
+    if let Some(authorization) = &authorization {
+        super::response::bind_response(&authorization.request_id, &authorization.call_id)?;
+    }
+    Ok(authorization.map(|authorization| authorization.result))
 }
 
 /// Live resume custody supplies the actual pending executor request once; stored source labels cannot install it.
@@ -631,6 +661,7 @@ pub(crate) fn take_resumed_executor(call_id: &str) -> Option<TaskExecutorCursor>
 
 /// Retains a validated response only while the exact resumed invocation is polled.
 pub(crate) async fn scope_resumed_question<F: Future>(
+    request_id: String,
     call_id: String,
     args: Value,
     answer: Value,
@@ -638,7 +669,7 @@ pub(crate) async fn scope_resumed_question<F: Future>(
 ) -> F::Output {
     RESUMED_QUESTION
         .scope(
-            std::cell::RefCell::new(Some((call_id, args, answer))),
+            std::cell::RefCell::new(Some((request_id, call_id, args, answer))),
             future,
         )
         .await
@@ -650,7 +681,13 @@ pub(crate) fn has_resumed_question(call_id: &str, args: &Value) -> bool {
         .try_with(|slot| {
             slot.borrow()
                 .as_ref()
-                .is_some_and(|(id, reviewed, _)| id == call_id && reviewed == args)
+                .is_some_and(|(request_id, id, reviewed, _)| {
+                    if id != call_id || reviewed != args {
+                        return false;
+                    }
+                    let _ = super::response::bind_response(request_id, call_id);
+                    true
+                })
         })
         .unwrap_or(false)
 }
@@ -662,9 +699,12 @@ pub(crate) fn take_resumed_question(call_id: &str, args: &Value) -> Option<Value
             let mut response = slot.borrow_mut();
             if response
                 .as_ref()
-                .is_some_and(|(id, reviewed, _)| id == call_id && reviewed == args)
+                .is_some_and(|(_, id, reviewed, _)| id == call_id && reviewed == args)
             {
-                response.take().map(|(_, _, answer)| answer)
+                response.take().map(|(request_id, _, _, answer)| {
+                    let _ = super::response::bind_response(&request_id, call_id);
+                    answer
+                })
             } else {
                 None
             }
@@ -802,6 +842,19 @@ impl RunExecution {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        self.owner.responses.lock().insert(
+            request_id.clone(),
+            std::sync::Arc::new(super::response::RetainedResponse {
+                request: TASK_REQUEST
+                    .try_with(Clone::clone)
+                    .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?,
+                expires_at,
+                deadline: self.approval_deadlines.lock().get(&request_id).copied(),
+                review: None,
+                timeout_disposition: std::sync::atomic::AtomicBool::new(false),
+                applied: std::sync::atomic::AtomicBool::new(false),
+            }),
+        );
         self.parked_approvals
             .lock()
             .entry(runtime_id.into())
@@ -852,6 +905,7 @@ impl RunExecution {
         &self,
         runtime_id: &str,
         request: &ApprovalRequest,
+        review: Option<std::sync::Arc<dyn TaskFinalAdmission>>,
     ) -> Result<String> {
         super::composition::close_composition_admission();
         let call_id = TASK_REQUEST
@@ -875,6 +929,19 @@ impl RunExecution {
                     .ok_or_else(|| AgentError::Config("approval deadline overflow".into()))
             })
             .transpose()?;
+        self.owner.responses.lock().insert(
+            request.id.clone(),
+            std::sync::Arc::new(super::response::RetainedResponse {
+                request: TASK_REQUEST
+                    .try_with(Clone::clone)
+                    .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?,
+                expires_at,
+                deadline: self.approval_deadlines.lock().get(&request.id).copied(),
+                review,
+                timeout_disposition: std::sync::atomic::AtomicBool::new(false),
+                applied: std::sync::atomic::AtomicBool::new(false),
+            }),
+        );
         let approval = BatchApproval {
             question: None,
             expires_at,

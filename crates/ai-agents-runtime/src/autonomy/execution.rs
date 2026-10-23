@@ -526,10 +526,12 @@ impl RunExecution {
         Ok(snapshot)
     }
 
-    /// Credits only the explicitly admitted coordinating skill after its real cursor completes; nested unrelated scripts cannot satisfy it.
+    /// Credits only the admitted coordinating skill while its original live binding still holds across load and save acknowledgements.
+    /// A stale or uncertain committed write is not usable completion authority and does not certify rollback of already executed effects.
     pub(crate) async fn complete_skill_segment(
         &self,
         skill: &ai_agents_skills::SkillDefinition,
+        binding: &dyn TaskFinalAdmission,
     ) -> Result<()> {
         let admitted = self.owner.skill.read().clone();
         if admitted.as_ref().is_none_or(|entry| entry.id != skill.id)
@@ -541,6 +543,7 @@ impl RunExecution {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
         self.update(|payload| {
+            binding.validate()?;
             let controller = payload
                 .adapters
                 .iter_mut()
@@ -553,6 +556,7 @@ impl RunExecution {
             Ok(())
         })
         .await?;
+        binding.validate()?;
         self.lifecycle.write().1.skill_segment_completed = true;
         Ok(())
     }

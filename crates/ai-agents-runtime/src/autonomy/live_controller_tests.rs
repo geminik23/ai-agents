@@ -650,6 +650,7 @@ async fn live_controller_question_timeout_and_single_winner_stop_preserve_owner_
     }
 }
 
+// Inject failure only after the selected ACK boundary is reached; scheduler latency before that point is not an interrupted acknowledgement.
 #[tokio::test]
 async fn live_controller_pause_and_answer_ack_faults_retain_protection_without_dispatch() {
     for sqlite in support::backends() {
@@ -673,7 +674,7 @@ async fn live_controller_pause_and_answer_ack_faults_retain_protection_without_d
                     None
                 };
                 fault.armed.store(true, Ordering::SeqCst);
-                let outcome = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+                let mut work = Box::pin(async {
                     if let Some(run) = run {
                         runner
                             .resume(&run.key.run_id, run.revision, answer(&run))
@@ -681,9 +682,29 @@ async fn live_controller_pause_and_answer_ack_faults_retain_protection_without_d
                     } else {
                         runner.run("analysis", None).await
                     }
-                })
-                .await;
-                assert!(outcome.is_err() || outcome.unwrap().is_err());
+                });
+                let returned = tokio::select! {
+                    result = &mut work => {
+                        fault.reached.try_acquire().expect("operation failed before the injected ACK fault").forget();
+                        Some(result)
+                    },
+                    permit = fault.reached.acquire() => { permit.unwrap().forget(); None },
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("selected ACK boundary was not reached"),
+                };
+                fault.assert_hit();
+                if mode == "drop" {
+                    assert!(returned.is_none(), "dropped ACK must remain pending");
+                    drop(work);
+                } else {
+                    let outcome = if let Some(result) = returned {
+                        result
+                    } else {
+                        tokio::time::timeout(std::time::Duration::from_secs(5), &mut work)
+                            .await
+                            .expect("injected ACK error handling did not finish")
+                    };
+                    assert!(outcome.is_err());
+                }
                 fault.assert_hit();
                 assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
                 assert!(agent.set_context("protected", json!(true)).is_err());

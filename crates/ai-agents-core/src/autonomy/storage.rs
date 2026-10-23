@@ -208,6 +208,28 @@ impl TaskRunMutation {
     }
 }
 
+// The same compact JSON serializer enforces the exact byte cap without allocating a second copy of sensitive recovery data.
+#[derive(Default)]
+struct JsonByteCount(usize);
+impl std::io::Write for JsonByteCount {
+    // Saturation conservatively exceeds every supported checkpoint cap instead of wrapping an oversized stream.
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+    // There is no external sink or buffered I/O to flush.
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// Counting and materializing JSON must agree on UTF-8, escaping and numeric encoding at the admission boundary.
+fn serialized_byte_len(value: &impl Serialize) -> Result<usize> {
+    let mut count = JsonByteCount::default();
+    serde_json::to_writer(&mut count, value)?;
+    Ok(count.0)
+}
+
 impl TaskRunSnapshot {
     /// Validates envelope invariants and rejects oversized recovery state without truncation.
     pub fn validate(&self) -> Result<()> {
@@ -231,7 +253,7 @@ impl TaskRunSnapshot {
         {
             return Err(InvalidCheckpoint.into());
         }
-        if serde_json::to_vec(self)?.len() > MAX_TASK_CHECKPOINT_BYTES {
+        if serialized_byte_len(self)? > MAX_TASK_CHECKPOINT_BYTES {
             return Err(CheckpointTooLarge.into());
         }
         Ok(())
@@ -263,7 +285,7 @@ impl TaskRunSnapshot {
         }
     }
 
-    /// Applies one state transition while a backend holds its atomic write boundary.
+    /// Applies one state transition under the atomic backend boundary, copying recovery data once only after that mutation's authority checks.
     pub fn transition(&self, mutation: &TaskRunMutation, now: DateTime<Utc>) -> Result<Self> {
         use TaskRunStorageError::*;
         self.validate()?;
@@ -298,7 +320,19 @@ impl TaskRunSnapshot {
             return Err(NotResumable.into());
         }
         mutation.validate_final_deadline(now)?;
-        let mut next = self.clone();
+        // Payload-replacing mutations need no copy of the old recovery tree, and rejected mutations need no copy of the proposed tree.
+        let mut next = Self {
+            schema_version: self.schema_version,
+            key: self.key.clone(),
+            actor_id: self.actor_id.clone(),
+            revision: self.revision,
+            status: self.status,
+            owner_token: self.owner_token.clone(),
+            cancel_requested: self.cancel_requested,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            payload: Value::Null,
+        };
         match mutation {
             TaskRunMutation::Claim { owner_token, .. } => {
                 if self.owner_token.is_some() {
@@ -400,6 +434,14 @@ impl TaskRunSnapshot {
                 };
             }
         }
+        if matches!(
+            mutation,
+            TaskRunMutation::Claim { .. }
+                | TaskRunMutation::RequestCancel { .. }
+                | TaskRunMutation::Recover { .. }
+        ) {
+            next.payload = self.payload.clone();
+        }
         next.revision = next
             .revision
             .checked_add(1)
@@ -408,5 +450,91 @@ impl TaskRunSnapshot {
         next.updated_at = now.max(self.updated_at);
         next.validate()?;
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod byte_count_tests {
+    use super::*;
+
+    // Compact JSON byte counts must match the old materialized encoding for escaping, multibyte text and finite numbers.
+    #[test]
+    fn counting_writer_matches_exact_json_bytes() {
+        for value in [
+            serde_json::json!({"text":"quote\" newline\n slash\\ \u{d55c}\u{1f600}"}),
+            serde_json::json!({"values":[-1,0,1.25,1e100],"nested":[{},null,true]}),
+        ] {
+            assert_eq!(
+                serialized_byte_len(&value).unwrap(),
+                serde_json::to_vec(&value).unwrap().len()
+            );
+        }
+    }
+
+    // The inclusive serialized-byte limit and non-replacing mutation payloads remain unchanged without buffering recovery data twice.
+    #[test]
+    fn exact_byte_limit_and_nonreplacing_transitions_preserve_payload() {
+        let now = Utc::now();
+        let mut snapshot = TaskRunSnapshot {
+            schema_version: TASK_RUN_SCHEMA_VERSION,
+            key: TaskRunKey {
+                agent_id: "agent".into(),
+                run_id: "run".into(),
+            },
+            actor_id: None,
+            revision: 0,
+            status: TaskRunStatus::Paused,
+            owner_token: None,
+            cancel_requested: false,
+            created_at: now,
+            updated_at: now,
+            payload: serde_json::json!({"data":""}),
+        };
+        let overhead = serde_json::to_vec(&snapshot).unwrap().len();
+        snapshot.payload["data"] = Value::String("x".repeat(MAX_TASK_CHECKPOINT_BYTES - overhead));
+        assert_eq!(
+            serialized_byte_len(&snapshot).unwrap(),
+            MAX_TASK_CHECKPOINT_BYTES
+        );
+        snapshot.validate().unwrap();
+
+        snapshot.payload["extra"] = serde_json::json!(true);
+        assert!(matches!(
+            snapshot.validate(),
+            Err(AgentError::TaskRunStorage(
+                TaskRunStorageError::CheckpointTooLarge
+            ))
+        ));
+        snapshot.payload = serde_json::json!({"opaque":["original",1.25,{"signed":"exact"}]});
+        let claimed = snapshot
+            .transition(
+                &TaskRunMutation::Claim {
+                    expected_revision: 0,
+                    owner_token: "owner".into(),
+                },
+                now,
+            )
+            .unwrap();
+        let cancelled = claimed
+            .transition(
+                &TaskRunMutation::RequestCancel {
+                    expected_revision: 1,
+                },
+                now,
+            )
+            .unwrap();
+        let recovered = cancelled
+            .transition(
+                &TaskRunMutation::Recover {
+                    expected_revision: 2,
+                    owner_token: "owner".into(),
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(snapshot.payload, claimed.payload);
+        assert_eq!(snapshot.payload, cancelled.payload);
+        assert_eq!(snapshot.payload, recovered.payload);
+        assert_eq!(recovered.status, TaskRunStatus::RecoveryRequired);
     }
 }

@@ -333,10 +333,8 @@ impl TaskGroupState {
         {
             return Err(invalid());
         }
-        let mut projection = payload.clone();
-        projection.runtime = child.runtime.clone();
-        projection.pending = Some(self.child_request.clone());
-        self.batch.validate_checkpoint(&projection)?;
+        self.batch
+            .validate_runtime_checkpoint(&child.runtime, Some(&self.child_request))?;
         if !self.parked.is_empty() {
             let mut operations = std::collections::HashSet::new();
             let mut requests = std::collections::HashSet::new();
@@ -379,10 +377,8 @@ impl TaskGroupState {
                 {
                     return Err(invalid());
                 }
-                let mut projection = payload.clone();
-                projection.runtime = child.runtime.clone();
-                projection.pending = Some(leaf.request.clone());
-                leaf.batch.validate_checkpoint(&projection)?;
+                leaf.batch
+                    .validate_runtime_checkpoint(&child.runtime, Some(&leaf.request))?;
             }
             let reachable =
                 collect_parked_leaves(&self.frame, &self.frames, payload, &mut Vec::new())?;
@@ -1195,10 +1191,7 @@ impl RunExecution {
             .find(|adapter| adapter.id == format!("runtime.child_batch:{operation}"))
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
         let batch: TaskBatchState = serde_json::from_value(adapter.state.clone())?;
-        let mut projection = payload.clone();
-        projection.runtime = child.runtime.clone();
-        projection.pending = Some(pending.clone());
-        batch.validate_checkpoint(&projection)?;
+        batch.validate_runtime_checkpoint(&child.runtime, Some(pending))?;
         Ok(Some((pending.clone(), batch)))
     }
 

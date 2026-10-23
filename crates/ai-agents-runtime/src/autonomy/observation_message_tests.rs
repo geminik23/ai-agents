@@ -57,7 +57,44 @@ impl AutonomyValidator for Validator {
         }
     }
 }
+struct LeafProbe(Arc<AtomicUsize>);
+#[async_trait::async_trait]
+impl ai_agents_core::Tool for LeafProbe {
+    // This leaf is separate from the parent message invocation whose timeout policy must not apply.
+    fn id(&self) -> &str {
+        "leaf"
+    }
+    // The native request names the exact leaf implementation, without alias routing.
+    fn name(&self) -> &str {
+        "leaf"
+    }
+    // Actual body entry, not a successful receipt, is the fixture's execution evidence.
+    fn description(&self) -> &str {
+        "Counts actual validator-child invocations"
+    }
+    // Argument schema is deliberately neutral so only the selected pending leaf policy determines admission.
+    fn input_schema(&self) -> Value {
+        json!({"type":"object"})
+    }
+    // The fixture has no filesystem/network effects or resource-capability exclusions.
+    fn safety_metadata(&self) -> ai_agents_core::ToolSafetyMetadata {
+        ai_agents_core::ToolSafetyMetadata {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+    // Each admitted body is counted once even when the parent observation re-pauses.
+    async fn execute(
+        &self,
+        _: Value,
+        _: ai_agents_core::ToolExecutionContext,
+    ) -> ai_agents_core::ToolResult {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        ai_agents_core::ToolResult::ok("leaf effect")
+    }
+}
 struct Fixture {
+    leaf_calls: Arc<AtomicUsize>,
     runner: AutonomyRunner,
     root: Arc<crate::RuntimeAgent>,
     main: Arc<super::runner_tests::RecordingProvider>,
@@ -151,13 +188,32 @@ async fn fixture_host_evidence(
     hosted: bool,
     source: Option<Arc<dyn HostRevisionSource>>,
 ) -> Fixture {
+    Box::pin(fixture_leaf_policy(repause, hosted, source, None)).await
+}
+// Opposite parent/leaf policies exercise real validator-child approval rather than a synthetic timeout result.
+async fn fixture_leaf_policy(
+    repause: bool,
+    hosted: bool,
+    source: Option<Arc<dyn HostRevisionSource>>,
+    policies: Option<(&str, &str)>,
+) -> Fixture {
+    let leaf_calls = Arc::new(AtomicUsize::new(0));
     let external = source.is_some();
     let registry = Arc::new(AgentRegistry::new());
     let question = ai_agents_core::encode_native_tool_call_markers(
         &[ai_agents_core::ToolCall {
             id: "child-question".into(),
-            name: "ask_user".into(),
-            arguments: json!({"question":"Choose","options":["yes"],"allow_other":false}),
+            name: if policies.is_some() {
+                "leaf"
+            } else {
+                "ask_user"
+            }
+            .into(),
+            arguments: if policies.is_some() {
+                json!({})
+            } else {
+                json!({"question":"Choose","options":["yes"],"allow_other":false})
+            },
         }],
         None,
     )
@@ -165,8 +221,17 @@ async fn fixture_host_evidence(
     let next = ai_agents_core::encode_native_tool_call_markers(
         &[ai_agents_core::ToolCall {
             id: "child-question-next".into(),
-            name: "ask_user".into(),
-            arguments: json!({"question":"Choose again","options":["yes"],"allow_other":false}),
+            name: if policies.is_some() {
+                "leaf"
+            } else {
+                "ask_user"
+            }
+            .into(),
+            arguments: if policies.is_some() {
+                json!({})
+            } else {
+                json!({"question":"Choose again","options":["yes"],"allow_other":false})
+            },
         }],
         None,
     )
@@ -176,10 +241,11 @@ async fn fixture_host_evidence(
     } else {
         super::runner_tests::RecordingProvider::new(&[&question, "done"])
     };
-    let yaml = "name: ObservationWorker\nsystem_prompt: worker\ntools: [ask_user]\n";
-    let worker = AgentBuilder::from_yaml(yaml)
+    let yaml = policies.map_or_else(|| "name: ObservationWorker\nsystem_prompt: worker\ntools: [ask_user]\n".to_string(), |(_, leaf)| format!("name: ObservationWorker\nsystem_prompt: worker\ntools: [leaf]\nhitl:\n  default_timeout_seconds: 2\n  on_timeout: {leaf}\n  tools:\n    leaf:\n      require_approval: true\n"));
+    let worker = AgentBuilder::from_yaml(&yaml)
         .unwrap()
         .llm(child.clone())
+        .tool(Arc::new(LeafProbe(leaf_calls.clone())))
         .auto_configure_features()
         .unwrap()
         .tool(Arc::new(ai_agents_tools::builtin::AskUserTool::new(
@@ -191,7 +257,7 @@ async fn fixture_host_evidence(
         .register(SpawnedAgent::from_runtime(
             "worker".into(),
             worker,
-            crate::spec::AgentSpec::from_yaml_strict(yaml).unwrap(),
+            crate::spec::AgentSpec::from_yaml_strict(&yaml).unwrap(),
         ))
         .await
         .unwrap();
@@ -249,7 +315,12 @@ async fn fixture_host_evidence(
     } else {
         "name: ObservationRoot\nsystem_prompt: root\ntools: [send_agent_message]\n"
     };
-    let builder = AgentBuilder::from_yaml(yaml)
+    let yaml = if let Some((root, _)) = policies {
+        format!("{yaml}hitl:\n  on_timeout: {root}\n")
+    } else {
+        yaml.into()
+    };
+    let builder = AgentBuilder::from_yaml(&yaml)
         .unwrap()
         .llm(main.clone())
         .auto_configure_features()
@@ -290,6 +361,7 @@ async fn fixture_host_evidence(
     )
     .unwrap();
     Fixture {
+        leaf_calls,
         runner,
         root,
         main,
@@ -298,6 +370,98 @@ async fn fixture_host_evidence(
         calls,
         store,
         config,
+    }
+}
+
+// A validator's parent policy cannot approve a rejecting leaf or reject an approving leaf; the timeout receipt is single-request authority.
+#[tokio::test]
+async fn retained_boundary_validator_child_uses_leaf_timeout_policy_without_transfer() {
+    use ai_agents_hitl::ApprovalResult;
+    for sqlite in super::continuation_test_support::backends() {
+        for (root_policy, leaf_policy) in [
+            ("approve", "reject"),
+            ("reject", "approve"),
+            ("error", "approve"),
+            ("approve", "error"),
+        ] {
+            let repause = leaf_policy == "approve";
+            let mut f = Box::pin(fixture_leaf_policy(
+                repause,
+                false,
+                None,
+                Some((root_policy, leaf_policy)),
+            ))
+            .await;
+            f.store = super::continuation_test_support::store(
+                f.root.info().id,
+                "observation-message.v1",
+                *sqlite,
+            )
+            .await;
+            f.runner = AutonomyRunner::try_new(
+                f.root.clone(),
+                f.config.clone(),
+                Default::default(),
+                f.store.clone(),
+                "observation-message.v1".into(),
+            )
+            .unwrap();
+            let first = f.runner.run("objective", None).await.unwrap();
+            assert_eq!(first.run.status, TaskRunStatus::Paused);
+            let id = first.run.pending.as_ref().unwrap().id.clone();
+            tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+            let outcome = f
+                .runner
+                .resume(
+                    &first.run.key.run_id,
+                    first.run.revision,
+                    TaskResumeInput::Approval {
+                        request_id: id.clone(),
+                        result: ApprovalResult::Timeout,
+                    },
+                )
+                .await;
+            if leaf_policy == "approve" {
+                let next = outcome.unwrap();
+                assert_eq!(
+                    next.run.status,
+                    TaskRunStatus::Paused,
+                    "{:?}",
+                    next.run.stop_reason
+                );
+                assert_ne!(next.run.pending.as_ref().unwrap().id, id);
+                assert_eq!(f.leaf_calls.load(Ordering::SeqCst), 1);
+                let done = f
+                    .runner
+                    .resume(
+                        &next.run.key.run_id,
+                        next.run.revision,
+                        TaskResumeInput::Approval {
+                            request_id: next.run.pending.as_ref().unwrap().id.clone(),
+                            result: ApprovalResult::Approved,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    done.run.status,
+                    TaskRunStatus::Completed,
+                    "{:?}",
+                    done.run.stop_reason
+                );
+                assert_eq!(f.leaf_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(f.child.calls.load(Ordering::SeqCst), 3);
+            } else {
+                assert!(
+                    !outcome
+                        .as_ref()
+                        .is_ok_and(|r| r.run.status == TaskRunStatus::Completed)
+                );
+                assert_eq!(f.leaf_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(f.child.calls.load(Ordering::SeqCst), 1);
+            }
+            assert_eq!(f.main.calls.load(Ordering::SeqCst), 1);
+        }
     }
 }
 

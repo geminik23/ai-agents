@@ -282,6 +282,40 @@ impl ToolApprovalBinding {
     }
 }
 
+// A retained approval pins the reviewed implementation and generations independently of serialized receipt data.
+struct RetainedToolReview {
+    tool: Arc<dyn ai_agents_core::Tool>,
+    tools: Arc<ToolRegistry>,
+    name: String,
+    control: Arc<RuntimeControlState>,
+    control_version: u64,
+    state: Option<Arc<StateMachine>>,
+    generation: Option<u64>,
+}
+impl std::fmt::Debug for RetainedToolReview {
+    // Diagnostics expose only the kind, not reviewed arguments or private configuration.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RetainedToolReview")
+    }
+}
+impl ai_agents_core::autonomy::TaskFinalAdmission for RetainedToolReview {
+    // Old approval cannot be rebound to a currently valid but different implementation or generation.
+    fn validate(&self) -> Result<()> {
+        if self.control.version.load(Ordering::SeqCst) != self.control_version
+            || self.state.as_ref().map(|state| state.generation()) != self.generation
+            || self
+                .tools
+                .resolve(&self.name)
+                .is_none_or(|resolved| !Arc::ptr_eq(&resolved.tool, &self.tool))
+        {
+            return Err(AgentError::Config(
+                "Retained approval binding changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 use crate::turn_context::{current_turn_actor_context, scope_actor_context};
 
 use ai_agents_context::{ContextManager, ContextProvider, TemplateRenderer};
@@ -1767,7 +1801,7 @@ impl RuntimeAgent {
         Ok(owner)
     }
 
-    /// Releases only the exact owner after its controller has acknowledged settlement or recovery.
+    /// Releases only the exact owner after its controller has acknowledged settlement or recovery, then retires private response and skill bindings.
     pub(crate) async fn release_autonomy_run(
         &self,
         owner: &Arc<crate::autonomy::RunOwner>,
@@ -1781,6 +1815,8 @@ impl RuntimeAgent {
             return Err(AgentError::Other("autonomy runtime owner mismatch".into()));
         }
         *current = None;
+        owner.responses.lock().clear();
+        owner.skill_finishing.lock().clear();
         Ok(())
     }
 
@@ -6035,7 +6071,8 @@ impl RuntimeAgent {
         } else {
             false
         };
-        if ai_agents_llm::validate_invocation_evidence().is_err()
+        if crate::autonomy::response::check_response_admission().is_err()
+            || ai_agents_llm::validate_invocation_evidence().is_err()
             || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
             || footprint_changed
             || execution.as_ref().is_some_and(|run| {
@@ -6081,13 +6118,16 @@ impl RuntimeAgent {
             message_invocation,
             async move {
                 // Final synchronous host checks may consume time without yielding to the driver's timeout monitor.
-                if ai_agents_llm::validate_invocation_evidence().is_err()
+                if crate::autonomy::response::check_response_admission().is_err()
+                    || ai_agents_llm::validate_invocation_evidence().is_err()
                     || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
                 {
                     return Ok(ToolResult::error(
                         "Validation proof or original deadline changed before tool dispatch",
                     ));
                 }
+                // This exact response has reached its effect boundary; it cannot constrain or authorize later operations.
+                crate::autonomy::response::response_applied();
                 if let Some(custody) = &custody_for_future {
                     custody.store(true, Ordering::SeqCst);
                 }
@@ -6397,6 +6437,7 @@ impl RuntimeAgent {
 
     // Runs shared policy, approval, admission and record publication under each request's own source and fallback ancestry.
     // The retained hop keeps its original start hook and timing while fresh attempts still reauthorize and consume admission.
+    // Original retained response bindings restrict preparation even if current approval gates disappear; known non-invocation still publishes ordinary denial records.
     // Task question rejection is recorded before invocation and never manufactures an answer or consumes a tool slot.
     async fn execute_tool_record_scoped(
         &self,
@@ -6405,6 +6446,33 @@ impl RuntimeAgent {
     ) -> Result<ToolExecutionRecord> {
         let _mutations = self.autonomy_mutations.read().await;
         self.check_autonomy_operation()?;
+        // Retained responses restrict preparation even when the current approval gate disappeared while paused.
+        // A known pre-body denial still follows ordinary record/cleanup handling rather than abandoning a safely retained caller.
+        if let Err(error) = crate::autonomy::response::check_response_admission()
+            .and_then(|_| ai_agents_llm::validate_invocation_evidence())
+        {
+            return Box::pin(async {
+                let reason = error.to_string();
+                let record = self.record_from_parts(
+                    &request,
+                    request.requested_name.clone(),
+                    request.arguments.clone(),
+                    chrono::Utc::now(),
+                    Instant::now(),
+                    false,
+                    false,
+                    reason.clone(),
+                    HashMap::new(),
+                    ToolPolicyDecisionRecord::deny(reason),
+                    None,
+                    false,
+                    false,
+                );
+                self.finish_tool_record(&record).await;
+                Ok(record)
+            })
+            .await;
+        }
         let started_at = crate::autonomy::suspension::executor_progress()
             .and_then(|cursor| cursor.started_at)
             .unwrap_or_else(chrono::Utc::now);
@@ -8123,19 +8191,9 @@ impl RuntimeAgent {
                 .await?
             };
 
-            if skill_reflection.requires_evaluation() && skill_reflection.is_enabled() {
-                let should_reflect = self
-                    .should_reflect_with_config(input, &response, &skill_reflection)
-                    .await?;
-                if should_reflect {
-                    let evaluated = self
-                        .evaluate_and_retry_with_config(input, response, &skill_reflection)
-                        .await?;
-                    return Ok(evaluated);
-                }
-            }
-
-            return Ok(response);
+            return self
+                .reflect_skill_response(input, response, &skill_reflection)
+                .await;
         }
         Err(AgentError::Skill(
             "No skill executor configured".to_string(),
@@ -11434,7 +11492,8 @@ Respond in JSON format:
     }
 
     /// Handle skill routing result: output processing, memory, transitions.
-    /// Returns a fully formed AgentResponse for skill-routed requests.
+    /// Original script binding covers output/reflection publication but ends before deliberate state-transition evaluation.
+    /// Already acknowledged memory effects are not rolled back if a trusted generation change is detected afterward.
     async fn handle_skill_response(
         &self,
         processed_input: &str,
@@ -11442,14 +11501,33 @@ Respond in JSON format:
         skill_response: String,
         input_context: &HashMap<String, Value>,
     ) -> Result<AgentResponse> {
-        let output_data = self.process_output(&skill_response, input_context).await?;
-        let final_response = output_data.content;
-
-        self.memory
-            .add_message(ChatMessage::assistant(&final_response))
+        let guard = self.task_skill_finishing_guard();
+        if let Some(guard) = &guard {
+            guard.validate()?;
+        }
+        let final_response =
+            ai_agents_llm::scope_invocation_evidence(guard.iter().cloned().collect(), async {
+                let output_data = self.process_output(&skill_response, input_context).await?;
+                if let Some(guard) = &guard {
+                    guard.validate()?;
+                }
+                let content = output_data.content;
+                self.memory
+                    .add_message(ChatMessage::assistant(&content))
+                    .await?;
+                if let Some(guard) = &guard {
+                    guard.validate()?;
+                }
+                self.check_memory_compression().await?;
+                if let Some(guard) = &guard {
+                    guard.validate()?;
+                }
+                Ok::<_, AgentError>(content)
+            })
             .await?;
-
-        self.check_memory_compression().await?;
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.owner.skill_finishing.lock().remove(&self.info.id);
+        }
 
         self.increment_turn();
         let response = AgentResponse::new(final_response.clone())
@@ -14643,6 +14721,7 @@ Respond in JSON format:
     /// Preserves ordinary approval waits; opted-in executable batches transfer control before hooks or host interaction.
     /// Live waits remain bounded by cancellation/time, while only an acknowledged exact checkpoint establishes a safe pause.
     /// Explicit reject/policy-only task profiles cannot satisfy a still-required human approval, including during resumed work.
+    /// Parking pins the actually reviewed tool and control/state generations on the live owner rather than recreating authority from a receipt.
     async fn request_hitl_approval(&self, check_result: HITLCheckResult) -> Result<ApprovalResult> {
         let Some(request) = check_result.into_request() else {
             return Ok(ApprovalResult::Approved);
@@ -14668,7 +14747,25 @@ Respond in JSON format:
         if let Some(execution) = crate::autonomy::current_execution()
             && execution.pauses_approval(&self.info.id)
         {
-            let id = execution.park_approval(&self.info.id, &request)?;
+            let review = crate::autonomy::suspension::message_request()
+                .and_then(|call| {
+                    self.tools
+                        .resolve(&call.requested_name)
+                        .map(|resolved| (call, resolved))
+                })
+                .map(|(call, resolved)| {
+                    let snapshot = self.runtime_safety_snapshot();
+                    Arc::new(RetainedToolReview {
+                        tool: resolved.tool,
+                        tools: self.tools.clone(),
+                        name: call.requested_name,
+                        control: self.runtime_control.clone(),
+                        control_version: snapshot.version,
+                        state: self.state_machine.clone(),
+                        generation: self.state_machine.as_ref().map(|state| state.generation()),
+                    }) as Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>
+                });
+            let id = execution.park_approval(&self.info.id, &request, review)?;
             return Err(AgentError::TaskSuspended(id));
         }
         self.hooks.on_approval_requested(&request).await;

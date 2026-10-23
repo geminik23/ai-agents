@@ -14,32 +14,48 @@ pub(crate) fn verify_checkpoint_receipt(
     saved: &TaskRunSnapshot,
 ) -> Result<()> {
     let checkpoint = match mutation {
-        TaskRunMutation::Checkpoint {
-            expected_revision,
-            owner_token,
-            status,
-            payload,
-            release,
-        }
-        | TaskRunMutation::FinalCheckpoint {
+        TaskRunMutation::FinalCheckpoint {
             expected_revision,
             owner_token,
             status,
             payload,
             release,
             ..
-        } => TaskRunMutation::Checkpoint {
+        } => Some(TaskRunMutation::Checkpoint {
             expected_revision: *expected_revision,
             owner_token: owner_token.clone(),
             status: *status,
             payload: payload.clone(),
             release: *release,
-        },
-        _ => mutation.clone(),
+        }),
+        _ => None,
     };
-    let expected = previous.transition(&checkpoint, saved.updated_at)?;
-    if saved.updated_at < previous.updated_at
-        || serde_json::to_value(&expected)? != serde_json::to_value(saved)?
+    let expected =
+        previous.transition(checkpoint.as_ref().unwrap_or(mutation), saved.updated_at)?;
+    // Exhaustive destructuring makes a newly added envelope field require an explicit receipt-verification decision.
+    let TaskRunSnapshot {
+        schema_version,
+        key,
+        actor_id,
+        revision,
+        status,
+        owner_token,
+        cancel_requested,
+        created_at,
+        updated_at,
+        payload,
+    } = saved;
+    if *updated_at < previous.updated_at
+        || expected.schema_version != *schema_version
+        || expected.key != *key
+        || expected.actor_id != *actor_id
+        || expected.revision != *revision
+        || expected.status != *status
+        || expected.owner_token != *owner_token
+        || expected.cancel_requested != *cancel_requested
+        || expected.created_at != *created_at
+        || expected.updated_at != *updated_at
+        || expected.payload != *payload
     {
         return Err(TaskRunStorageError::InvalidCheckpoint.into());
     }
@@ -213,15 +229,16 @@ impl ScopedTaskRunStore {
         Ok(saved)
     }
 
-    // Never accept a caller-selected agent or actor identity as authority for another scope.
-    fn validate(&self, snapshot: &TaskRunSnapshot) -> Result<()> {
+    // Scope and all payload invariants are checked at each boundary; retaining the decoded value avoids decoding it again for successor validation.
+    fn validate(&self, snapshot: &TaskRunSnapshot) -> Result<TaskCheckpointPayload> {
         if snapshot.key.agent_id != self.agent_id || snapshot.actor_id != self.actor_id {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
         snapshot.validate()?;
-        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())
+        let payload = <TaskCheckpointPayload as serde::Deserialize>::deserialize(&snapshot.payload)
             .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
-        payload.validate(snapshot, &self.config_identity)
+        payload.validate_contents(snapshot, &self.config_identity)?;
+        Ok(payload)
     }
 
     // Derives the storage key solely from this adapter's fixed agent scope.
@@ -250,7 +267,8 @@ impl TaskRunStore for ScopedTaskRunStore {
         Ok(snapshot)
     }
 
-    /// Checks the proposed payload before CAS; concurrent changes still fail in the backend.
+    /// Checks fresh previous/proposed payloads before CAS and reuses each decoded value only within this immutable validation call.
+    /// Backend validation and exact receipt checks remain independent; no acknowledged cache replaces the owned storage read.
     async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot> {
         if matches!(mutation, TaskRunMutation::HostControl { .. }) {
             return Err(AgentError::Config(
@@ -258,15 +276,13 @@ impl TaskRunStore for ScopedTaskRunStore {
             ));
         }
         let previous = self
-            .load(run_id)
+            .storage
+            .load_task_run(&self.key(run_id))
             .await?
             .ok_or(TaskRunStorageError::NotFound)?;
+        let old = self.validate(&previous)?;
         let proposed = previous.transition(mutation, chrono::Utc::now())?;
-        self.validate(&proposed)?;
-        let old: TaskCheckpointPayload = serde_json::from_value(previous.payload.clone())
-            .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
-        let new: TaskCheckpointPayload = serde_json::from_value(proposed.payload.clone())
-            .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
+        let new = self.validate(&proposed)?;
         new.validate_successor(
             &old,
             proposed.revision,

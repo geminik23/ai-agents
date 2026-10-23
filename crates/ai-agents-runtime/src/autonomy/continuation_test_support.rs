@@ -14,6 +14,8 @@ pub(super) struct ReceiptStore {
     pub checkpoint: parking_lot::Mutex<Option<serde_json::Value>>,
     pub reached: tokio::sync::Semaphore,
     pub release: tokio::sync::Semaphore,
+    pub execution: parking_lot::Mutex<std::sync::Weak<RunExecution>>,
+    pub owner: parking_lot::Mutex<Option<Arc<RunOwner>>>,
 }
 impl ReceiptStore {
     // A single selected final write distinguishes proven rejection from an ambiguous receipt.
@@ -28,6 +30,8 @@ impl ReceiptStore {
             mode,
             status,
             checkpoint: parking_lot::Mutex::new(None),
+            execution: Default::default(),
+            owner: Default::default(),
             reached: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
         })
@@ -45,6 +49,8 @@ impl ReceiptStore {
             mode,
             status: TaskRunStatus::Running,
             checkpoint: parking_lot::Mutex::new(Some(checkpoint)),
+            execution: Default::default(),
+            owner: Default::default(),
             reached: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
         })
@@ -84,9 +90,24 @@ impl TaskRunStore for ReceiptStore {
     // Faults target the selected consumption, provider settlement or final write rather than an incidental nearby checkpoint.
     async fn mutate(&self, id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot> {
         let selected = if let Some(binding) = &*self.checkpoint.lock() {
-            if let TaskRunMutation::Checkpoint { payload, .. } = mutation {
+            if binding.get("claim") == Some(&serde_json::Value::Bool(true)) {
+                matches!(mutation, TaskRunMutation::Claim { .. })
+            } else if let TaskRunMutation::Checkpoint { payload, .. } = mutation {
                 let payload: TaskCheckpointPayload = serde_json::from_value(payload.clone())?;
-                if binding.get("prompt") == Some(&serde_json::Value::Bool(true)) {
+                if let Some(step) = binding
+                    .get("skill_step")
+                    .and_then(serde_json::Value::as_u64)
+                {
+                    payload.adapters.iter().any(|adapter| {
+                        adapter.adapter == "runtime.skill"
+                            && adapter.state["cursor"]["next_step"] == step
+                    })
+                } else if binding.get("skill_credit") == Some(&serde_json::Value::Bool(true)) {
+                    payload.adapters.iter().any(|adapter| {
+                        adapter.id == "runtime.controller"
+                            && adapter.state["lifecycle"]["skill_segment_completed"] == true
+                    })
+                } else if binding.get("prompt") == Some(&serde_json::Value::Bool(true)) {
                     payload
                         .adapters
                         .iter()
@@ -141,6 +162,10 @@ impl TaskRunStore for ReceiptStore {
             matches!(mutation, TaskRunMutation::FinalCheckpoint { status, release: true, .. } if *status == self.status)
         };
         if selected && self.armed.swap(false, Ordering::SeqCst) {
+            if let Some(execution) = current_execution() {
+                *self.execution.lock() = Arc::downgrade(&execution);
+                *self.owner.lock() = Some(execution.owner.clone());
+            }
             if self.mode == "reject" {
                 self.reached.add_permits(1);
                 return Err(AgentError::Persistence(

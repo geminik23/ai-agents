@@ -13,6 +13,14 @@ pub(crate) struct RunOwner {
     pub(crate) targets: Arc<super::CompositionTargets>,
     // Only explicit admission installs this actual definition; serialized entry data cannot mint a skill scope.
     pub(crate) skill: parking_lot::RwLock<Option<ai_agents_skills::SkillDefinition>>,
+    // Actual reviewed implementations and request clocks remain owned across same-process pauses, not reconstructed from checkpoint labels.
+    pub(crate) responses: parking_lot::Mutex<
+        std::collections::BTreeMap<String, Arc<super::response::RetainedResponse>>,
+    >,
+    // Finishing reflection/output still belongs to the original script until deliberate state-transition evaluation begins.
+    pub(crate) skill_finishing: parking_lot::Mutex<
+        std::collections::BTreeMap<String, Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>>,
+    >,
     pub(crate) interaction_delivery: AtomicBool,
     abandoned: AtomicBool,
     retained_effect_guards: parking_lot::Mutex<Vec<Box<dyn Send>>>,
@@ -34,6 +42,8 @@ impl RunOwner {
             gate,
             targets: Arc::new(super::CompositionTargets::default()),
             skill: parking_lot::RwLock::new(None),
+            responses: Default::default(),
+            skill_finishing: Default::default(),
             interaction_delivery: AtomicBool::new(true),
             abandoned: AtomicBool::new(false),
             retained_effect_guards: parking_lot::Mutex::new(Vec::new()),

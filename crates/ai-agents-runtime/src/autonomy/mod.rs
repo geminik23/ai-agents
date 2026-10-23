@@ -97,6 +97,8 @@ mod host_evidence_tests;
 #[cfg(test)]
 mod retained_admission_tests;
 #[cfg(test)]
+mod retained_boundary_tests;
+#[cfg(test)]
 mod retained_proof_tests;
 pub use host_evidence::{ExternalUnavailablePolicy, HostRevisionSource};
 #[cfg(test)]
@@ -119,6 +121,7 @@ mod progress;
 #[cfg(test)]
 mod registry_tests;
 mod replanning;
+pub(crate) mod response;
 mod run;
 #[cfg(test)]
 mod state_acceptance_tests;

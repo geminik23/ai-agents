@@ -600,9 +600,20 @@ fn fixture_options(
     repeated: bool,
     expired: bool,
 ) -> Fixture {
+    fixture_request_timeout(approved, two_calls, conditions, repeated, expired, None)
+}
+// A finite timeout approval must survive a second gate on the same operation without approving that newer request.
+fn fixture_request_timeout(
+    approved: bool,
+    two_calls: bool,
+    conditions: bool,
+    repeated: bool,
+    expired: bool,
+    timeout: Option<u64>,
+) -> Fixture {
     let first = Arc::new(AtomicUsize::new(0));
     let second = Arc::new(AtomicUsize::new(0));
-    let calls = if two_calls {
+    let mut calls = if two_calls {
         vec![
             ToolCall {
                 id: "a".into(),
@@ -622,6 +633,9 @@ fn fixture_options(
             arguments: json!({}),
         }]
     };
+    if timeout.is_some() {
+        calls[0].arguments = json!({"amount":2000});
+    }
     let state = ai_agents_core::NativeProviderState::new(
         "root-first",
         "fixture",
@@ -679,6 +693,11 @@ fn fixture_options(
     };
     let yaml = if expired {
         yaml.replace("hitl:\n", "hitl:\n  default_timeout_seconds: 0\n")
+    } else if let Some(seconds) = timeout {
+        yaml.replace(
+            "hitl:\n",
+            &format!("hitl:\n  default_timeout_seconds: {seconds}\n  on_timeout: approve\n"),
+        )
     } else {
         yaml
     };
@@ -1088,6 +1107,46 @@ async fn conditional_reapproval_preserves_other_siblings_and_prior_gate_receipts
     assert_eq!(paused.run.status, TaskRunStatus::Completed);
     assert_eq!(first.load(Ordering::SeqCst), 1);
     assert_eq!(second.load(Ordering::SeqCst), 1);
+}
+
+// A timeout-approved first gate remains an exact original disposition across a later condition pause on the same call.
+#[tokio::test]
+async fn retained_boundary_timeout_disposition_survives_same_operation_repause() {
+    let (_, runner, _, first, _, provider) =
+        fixture_request_timeout(false, false, true, false, false, Some(2));
+    let first_pause = runner.run("objective", None).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+    let second_pause = runner
+        .resume(
+            &first_pause.run.key.run_id,
+            first_pause.run.revision,
+            TaskResumeInput::Approval {
+                request_id: first_pause.run.pending.as_ref().unwrap().id.clone(),
+                result: ai_agents_hitl::ApprovalResult::Timeout,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(second_pause.run.status, TaskRunStatus::Paused);
+    assert_ne!(
+        first_pause.run.pending.as_ref().unwrap().id,
+        second_pause.run.pending.as_ref().unwrap().id
+    );
+    assert_eq!(first.load(Ordering::SeqCst), 0);
+    let done = runner
+        .resume(
+            &second_pause.run.key.run_id,
+            second_pause.run.revision,
+            TaskResumeInput::Approval {
+                request_id: second_pause.run.pending.as_ref().unwrap().id.clone(),
+                result: ai_agents_hitl::ApprovalResult::Approved,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(done.run.status, TaskRunStatus::Completed);
+    assert_eq!(first.load(Ordering::SeqCst), 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
 }
 
 // A cancelled parked batch produces complete native history and releases ownership only after CAS acknowledgement.

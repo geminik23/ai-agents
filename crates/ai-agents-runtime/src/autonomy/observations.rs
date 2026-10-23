@@ -5,7 +5,8 @@ use ai_agents_core::{AgentError, Result};
 use serde_json::Value;
 
 impl EvaluationEvidence {
-    /// Uses the driver's exact executor records and attempt identity, never its display preview.
+    /// Uses acknowledged executor records and attempt identity, never a requested operation relabeled with a replacement's result.
+    /// Changed command operands retain their actual record but cannot prove the original fixed validation.
     pub fn collect_validation(&mut self, state: &ValidationDriverState) -> Result<()> {
         if !state.publication_acknowledged() {
             return Err(AgentError::Persistence(
@@ -39,14 +40,20 @@ impl EvaluationEvidence {
                 });
                 if tool == "command" {
                     let output: Value = serde_json::from_str(&record.output).unwrap_or(Value::Null);
-                    if let Some(command) = arguments.get("command").and_then(Value::as_str) {
+                    if let Some(command) = record
+                        .executed_arguments
+                        .get("command")
+                        .and_then(Value::as_str)
+                    {
                         self.commands.push(ScopedObservation {
                             identity: completed
                                 .identity
                                 .as_ref()
                                 .unwrap_or(&state.identity)
                                 .clone(),
-                            complete: super::evidence::executed(record) && !record.output_truncated,
+                            complete: super::evidence::executed(record)
+                                && !record.output_truncated
+                                && command_operands_match(arguments, &record.executed_arguments),
                             value: CommandObservation {
                                 check_id: state.check_id.clone(),
                                 command: command.into(),
@@ -116,6 +123,18 @@ impl EvaluationEvidence {
         *self = self.normalized()?;
         Ok(())
     }
+}
+
+// Policy normalization may add defaults, but changing cwd, argv or environment changes the operation whose exit code was observed.
+fn command_operands_match(requested: &Value, executed: &Value) -> bool {
+    requested.get("command").and_then(Value::as_str)
+        == executed.get("command").and_then(Value::as_str)
+        && requested.get("cwd").and_then(Value::as_str).unwrap_or(".")
+            == executed.get("cwd").and_then(Value::as_str).unwrap_or(".")
+        && requested.get("argv").unwrap_or(&serde_json::json!([]))
+            == executed.get("argv").unwrap_or(&serde_json::json!([]))
+        && requested.get("env").unwrap_or(&serde_json::json!({}))
+            == executed.get("env").unwrap_or(&serde_json::json!({}))
 }
 
 impl ProgressObservation {
