@@ -56,10 +56,22 @@ pub(crate) struct InvocationScope {
 }
 
 impl InvocationScope {
-    /// Captures the current restriction tree without replacing the run's ledger or fixed-operation authority.
+    /// Captures the restriction tree and composition cut before a spawn without replacing ledger or fixed-operation authority.
     pub(crate) fn capture() -> Self {
+        let bounds = super::composition::current_composition_deadline().map(|deadline| {
+            let now = std::time::SystemTime::now();
+            InvocationBounds::new(
+                now.checked_add(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap_or(now),
+                deadline,
+            )
+        });
+        let bounds = match (current_invocation_bounds(), bounds) {
+            (Some(parent), Some(child)) => Some(parent.intersect(child)),
+            (parent, child) => parent.or(child),
+        };
         Self {
-            bounds: current_invocation_bounds(),
+            bounds,
             mutations: current_mutation_clock(),
             evidence: ai_agents_llm::current_invocation_evidence(),
         }

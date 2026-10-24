@@ -8,7 +8,7 @@ use super::branch::RuntimeOptimizationKind;
 
 /// Tracks lifecycle and staged writes for one optimized runtime turn.
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TurnOptimizationContext {
     /// Stable ID shared by branch and maintenance work for the current turn.
     pub turn_id: Uuid,

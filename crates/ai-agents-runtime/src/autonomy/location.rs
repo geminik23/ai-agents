@@ -38,10 +38,71 @@ pub(crate) struct TaskModelFinal {
     pub response_metadata: Option<HashMap<String, Value>>,
 }
 
+/// A settled speculative selection retains inert alternatives while a selected transition awaits review or actions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskSpeculativeSelection {
+    pub data: ai_agents_process::ProcessData,
+    pub turn: Option<Box<crate::optimization::TurnOptimizationContext>>,
+    pub draft: Option<crate::optimization::MainResponseDraft>,
+    pub draft_error: Option<String>,
+    pub draft_uninvoked: bool,
+    pub skill: Option<crate::optimization::SkillCandidate>,
+    pub skill_checked: bool,
+    pub reasoning: Option<ai_agents_reasoning::ReasoningMode>,
+    pub reasoning_checked: bool,
+    pub auto_detected: bool,
+}
+
+impl TaskSpeculativeSelection {
+    /// Retains settled alternatives as inert recovery data; only the selected existing runtime path can commit them.
+    pub(crate) fn absorb(
+        &mut self,
+        outcome: crate::optimization::RuntimeBranchOutcome,
+        unfinished: bool,
+    ) {
+        use crate::optimization::{RuntimeBranchResult, RuntimeTaskPurpose};
+        if unfinished {
+            match outcome.branch.purpose {
+                RuntimeTaskPurpose::MainResponse => {
+                    self.draft_uninvoked = true;
+                    self.draft_error = None;
+                }
+                RuntimeTaskPurpose::SkillRouting => self.skill_checked = false,
+                RuntimeTaskPurpose::ReasoningJudge => self.reasoning_checked = false,
+                _ => {}
+            }
+            return;
+        }
+        match outcome.branch.purpose {
+            RuntimeTaskPurpose::SkillRouting => self.skill_checked = true,
+            RuntimeTaskPurpose::ReasoningJudge => self.reasoning_checked = true,
+            _ => {}
+        }
+        match outcome.result {
+            RuntimeBranchResult::MainDraft(draft) => self.draft = Some(draft),
+            RuntimeBranchResult::Skill(skill) => {
+                self.skill = skill;
+                self.skill_checked = true;
+            }
+            RuntimeBranchResult::Reasoning(reasoning) => self.reasoning = Some(reasoning),
+            RuntimeBranchResult::Failed(error)
+                if outcome.branch.purpose == RuntimeTaskPurpose::MainResponse =>
+            {
+                self.draft_error = Some(error.to_string())
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Return positions select existing runtime drivers without repeating input processing, semantic selection or finalization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum TaskStateReturn {
+    SpeculativeSelection {
+        selection: Box<TaskSpeculativeSelection>,
+    },
     BeforeCalls {
         saved: Box<super::interaction::TaskModelCalls>,
     },

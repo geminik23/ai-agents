@@ -1,11 +1,16 @@
 //! Development autonomy primitives and guarded standalone execution; full task integration remains unfinished.
 
 #[cfg(test)]
+mod ad_maintenance_fault_tests;
+#[cfg(test)]
 mod admission_tests;
 mod authority;
 mod boundary;
 pub(crate) mod composition;
 mod execution;
+pub(crate) mod speculation;
+pub(crate) mod work;
+pub(crate) use work::owned_maintenance;
 pub(crate) mod invocation;
 mod memory;
 pub(crate) mod message;

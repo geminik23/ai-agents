@@ -130,7 +130,8 @@ impl Drop for Attempt {
     }
 }
 
-// A deadline drop remains uncertain; only a returned provider result may be settled as known.
+// Final admission rechecks the shrinking run allowance after synchronous host proof sampling.
+// A known pre-dispatch stop refunds only its own acknowledged attempt; stream/body drops after dispatch retain uncertainty.
 async fn bounded_provider<F: Future>(
     mut attempt: Option<&mut Attempt>,
     future: F,
@@ -141,6 +142,13 @@ async fn bounded_provider<F: Future>(
         .as_ref()
         .is_some_and(|admission| admission.execution_stopped())
     {
+        if let Some(attempt) = attempt.as_mut()
+            && !attempt.dispatched
+        {
+            attempt
+                .settle(serde_json::json!({"not_invoked":true}))
+                .await?;
+        }
         return Err(LLMError::Other("task execution stopped".into()));
     }
     let remaining = match (
@@ -155,7 +163,16 @@ async fn bounded_provider<F: Future>(
     let work = async {
         // Synchronous admission hooks and proof sampling can consume the allowance without yielding to an outer monitor.
         let proof = crate::validate_invocation_evidence();
-        if proof.is_err() || bounds.is_some_and(|bounds| bounds.remaining().is_zero()) {
+        if proof.is_err()
+            || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+            || attempt.as_ref().is_some_and(|attempt| {
+                attempt.admission.execution_stopped()
+                    || attempt
+                        .admission
+                        .remaining_duration()
+                        .is_some_and(|duration| duration.is_zero())
+            })
+        {
             if let Some(attempt) = attempt.as_mut()
                 && !attempt.dispatched
             {
@@ -388,9 +405,11 @@ impl LLMProvider for ManagedProvider {
     fn supports_tool_choice(&self, choice: &ToolChoice) -> bool {
         self.inner.supports_tool_choice(choice)
     }
-    /// Shared execution stops cannot be hidden by generic retry or static fallback responses.
+    /// Run stops and closed branch-local restrictions prohibit new retry/backoff/fallback without stopping unrelated winning work.
     fn is_terminal_error(&self, error: &LLMError) -> bool {
         current_invocation_admission().is_some_and(|scope| scope.execution_stopped())
+            || crate::validate_invocation_evidence().is_err()
+            || crate::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
             || self.inner.is_terminal_error(error)
     }
 }

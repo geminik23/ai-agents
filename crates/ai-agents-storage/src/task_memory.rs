@@ -19,6 +19,11 @@ pub struct InMemoryTaskStorage {
 
 #[async_trait]
 impl AgentStorage for InMemoryTaskStorage {
+    /// In-memory conditional mutations are provider-free and finish inside the caller's operation.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     fn supports(&self, capability: StorageCapability) -> bool {
         capability == StorageCapability::TaskRuns
     }

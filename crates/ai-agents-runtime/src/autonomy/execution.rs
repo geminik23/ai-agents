@@ -221,6 +221,22 @@ impl RunExecution {
         }
     }
 
+    /// A pure maintenance capacity refusal is a truthful limit, not an uncertain effect or a resumable model cursor.
+    /// Opaque callback futures cannot be replayed as controller turns; already admitted provider reservations retain their own custody.
+    pub(crate) fn stop_maintenance(&self, effects_started: bool) {
+        let mut reason = self.stop.write();
+        if !effects_started
+            && matches!(
+                reason.as_deref(),
+                Some("llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity")
+            )
+        {
+            *reason = Some("maintenance_capacity".into());
+        } else if reason.is_none() {
+            *reason = Some("maintenance_failed".into());
+        }
+    }
+
     /// Only the exact pre-body capacity refusal may become a safe wait; cancellation, uncertainty and other stop reasons remain latched.
     pub(crate) fn clear_capacity_stop(&self, reason: &str) {
         let mut stopped = self.stop.write();
@@ -900,12 +916,17 @@ impl RunExecution {
     }
 
     /// Run and composition windows are cooperative admission checks; synchronous host work may overrun and remains charged.
-    /// An expired parent dispatch cannot admit a fresh provider/tool request while already dispatched work still settles.
+    /// Terminal work closure also rejects captured producers while already dispatched work retains its settlement path.
     pub(crate) fn check(&self, payload: &TaskCheckpointPayload) -> Result<()> {
         // Captured task scopes must not admit new work after their foreground owner is dropped.
         if let Err(error) = self.owner.check() {
             self.stop("owner_abandoned");
             return Err(error);
+        }
+        if self.owner.work.closed() {
+            return Err(AgentError::Other(
+                "autonomy work admission is closed".into(),
+            ));
         }
         if let Some(reason) = self.stop_reason() {
             return Err(AgentError::Other(format!("autonomy stopped: {reason}")));
@@ -932,11 +953,13 @@ impl RunExecution {
 
     /// Final cancellation/time checks and CAS share owner admission; failed persistence never publishes success.
     /// A conservative final millisecond closes an active interval even when its last acknowledged write occurred in the same tick.
+    /// Close maintenance admission before sampling its live custody; unsettled tails cannot publish successful completion.
     pub(crate) async fn terminal(
         &self,
         mut status: TaskRunStatus,
         reason: String,
     ) -> Result<TaskRunSnapshot> {
+        self.owner.work.close();
         let _serial = self.serial.lock().await;
         let snapshot = self.load_owned_locked(&_serial).await?;
         let mut payload: Box<TaskCheckpointPayload> =
@@ -949,6 +972,7 @@ impl RunExecution {
                 .ok_or_else(|| AgentError::Config("terminal active clock overflow".into()))?,
         );
         let uncertain = self.participants.unsettled()
+            || self.owner.work.unsettled()
             || payload.children.iter().any(|child| child.result.is_none())
             || payload.reservations.iter().any(|r| {
                 matches!(

@@ -786,6 +786,11 @@ async fn model_message_checkpoint_rejects_resume_refund_and_unbound_suspension()
 struct MessageResponseWait(Arc<tokio::sync::Semaphore>);
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for MessageResponseWait {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
         self.0.add_permits(1);
         std::future::pending::<()>().await;

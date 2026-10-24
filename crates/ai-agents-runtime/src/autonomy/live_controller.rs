@@ -290,6 +290,7 @@ impl AutonomyRunner {
             .transpose()?
             .flatten();
         let safe = !execution.participants.unsettled()
+            && !execution.owner.work.unsettled()
             && payload.children.iter().all(|child| child.result.is_some())
             && payload.reservations.iter().all(|r| {
                 matches!(

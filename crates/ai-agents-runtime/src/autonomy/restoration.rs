@@ -524,7 +524,7 @@ async fn capture_manifest(
     {
         *cut = (*cut).min(*previous);
     }
-    if paused.participants.unsettled() {
+    if paused.participants.unsettled() || paused.owner.work.unsettled() {
         return Err(TaskRunStorageError::NotResumable.into());
     }
     let mut graph = host.capture_graph(runner.agent.clone())?;

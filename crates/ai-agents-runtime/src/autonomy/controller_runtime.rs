@@ -8,12 +8,14 @@ use ai_agents_core::{ToolCall, ToolExecutionRequest};
 use ai_agents_hitl::ApprovalResult;
 
 impl AutonomyRunner {
-    /// Anchors exact controller progress before releasing the claim and stopping the active clock.
+    /// Anchors exact controller progress only after run-owned maintenance has settled, before releasing the claim and active clock.
     pub(super) async fn pause_controller(
         &self,
         execution: &Arc<RunExecution>,
         todo: Option<&RunTodoAdapter>,
     ) -> Result<TaskRunResult> {
+        execution.await_owned_work().await?;
+        let _work_barrier = execution.owner.work.seal()?;
         let state = execution
             .controller
             .lock()

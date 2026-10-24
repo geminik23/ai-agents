@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "ad_speculative_tests.rs"]
+mod ad_speculative_tests;
 #[path = "disambig_acceptance_tests.rs"]
 mod disambig_acceptance_tests;
 #[path = "interaction_failure_tests.rs"]
@@ -53,6 +55,11 @@ impl Tool for Probe {
 struct Hooks(Arc<AtomicUsize>);
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for Hooks {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }

@@ -1,7 +1,7 @@
 use ai_agents_core::ToolCall;
 
 /// Side-effect-free model output produced before a branch commits.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum MainResponseDraft {
     Text {
         raw_content: String,

@@ -11,6 +11,7 @@ pub(crate) struct RunOwner {
     pub(crate) actor_id: Option<String>,
     pub(crate) gate: crate::runtime::RootTurnGate,
     pub(crate) targets: Arc<super::CompositionTargets>,
+    pub(crate) work: Arc<super::work::OwnedWork>,
     // Only explicit admission installs this actual definition; serialized entry data cannot mint a skill scope.
     pub(crate) skill: parking_lot::RwLock<Option<ai_agents_skills::SkillDefinition>>,
     // Actual reviewed implementations and request clocks remain owned across same-process pauses, not reconstructed from checkpoint labels.
@@ -41,6 +42,7 @@ impl RunOwner {
             actor_id,
             gate,
             targets: Arc::new(super::CompositionTargets::default()),
+            work: Arc::new(super::work::OwnedWork::default()),
             skill: parking_lot::RwLock::new(None),
             responses: Default::default(),
             skill_finishing: Default::default(),

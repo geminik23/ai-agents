@@ -798,11 +798,13 @@ impl RunExecution {
         runtime_id: &str,
         todos: Option<TaskTodoCheckpoint>,
     ) -> Result<TaskRunSnapshot> {
+        let _work_barrier = self.owner.work.seal()?;
         let _serial = self.serial.lock().await;
         let previous = self.load_owned_locked(&_serial).await?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(previous.payload.clone())?;
         self.check(&payload)?;
         if self.participants.unsettled()
+            || self.owner.work.unsettled()
             || payload.reservations.iter().any(|reservation| {
                 matches!(
                     reservation.state,

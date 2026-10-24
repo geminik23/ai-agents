@@ -46,6 +46,8 @@ For the explicit development runner, retained approval/question responses preser
 
 Existing routing, pipeline, concurrent, handoff and group-chat declarations can also be used inside the explicitly invoked development Rust task runner. Repeated same-runtime slots retain distinct operations, generated children share the coordinating run, and partial-failure/aggregation settings keep their existing meaning through retained pauses. These changes add no YAML fields and do not enable automatic task entry. The separate explicit Rust reconstruction API can resume a prepared safe pause using installed host bindings; a stored topology or YAML declaration alone is not executable authority. Persistence flags and automatic startup selection remain unavailable. See [explicit safe-pause reconstruction](@/docs/rust-api.md#explicit-safe-pause-reconstruction-development-only). See [retained composition and ownership](@/docs/rust-api.md#guarded-standalone-execution-development-only).
 
+The existing `runtime.optimization` settings for facts/relationships and speculative routing also apply to conforming agents invoked through the explicit development Rust runner. Managed task completion waits for owned maintenance settlement even when ordinary next-turn freshness is configured as `never` or `same_actor`; ordinary chat retains its configured behavior. Custom consumer capabilities are installed in Rust, not by a YAML label. This adds no fields or enabled autonomy startup. See [managed participation](@/docs/rust-api.md#managed-maintenance-and-speculative-participation-development-only) for callback limits and migration.
+
 ## Agent Identity
 
 These fields define who your agent is.

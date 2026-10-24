@@ -3,8 +3,9 @@ use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use parking_lot::Mutex;
-use tokio::task::JoinHandle;
 
 use ai_agents_core::{AgentError, Result};
 
@@ -77,13 +78,15 @@ impl Hash for MaintenanceSequenceKey {
 
 struct TrackedTask {
     key: Option<MaintenanceSequenceKey>,
-    handle: JoinHandle<Result<()>>,
+    finished: tokio::task::AbortHandle,
+    // The queue retains the join future while a flush borrows a clone, including when that flush is dropped.
+    completion: Shared<BoxFuture<'static, std::result::Result<(), Arc<str>>>>,
 }
 
 /// Bounded queue for post-turn maintenance that can be flushed by eval and shutdown paths.
 pub struct BackgroundMaintenanceQueue {
     max_tasks: usize,
-    tasks: Mutex<Vec<TrackedTask>>,
+    tasks: Mutex<Vec<Arc<TrackedTask>>>,
     locks: Mutex<HashMap<MaintenanceSequenceKey, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -112,7 +115,8 @@ impl BackgroundMaintenanceQueue {
         self.unfinished_count() >= self.max_tasks
     }
 
-    /// Spawns a background task and applies per-key ordering when a key is supplied.
+    /// Spawns bounded work and preserves the queued completion until an acknowledged drain, including across cancelled flushes.
+    /// Same-key predecessors settle before later bodies start; failure does not silently detach admitted siblings.
     pub fn spawn<F>(&self, key: Option<MaintenanceSequenceKey>, future: F) -> Result<()>
     where
         F: Future<Output = Result<()>> + Send + 'static,
@@ -120,7 +124,7 @@ impl BackgroundMaintenanceQueue {
         let mut tasks = self.tasks.lock();
         if tasks
             .iter()
-            .filter(|task| !task.handle.is_finished())
+            .filter(|task| !task.finished.is_finished())
             .count()
             >= self.max_tasks
         {
@@ -138,7 +142,17 @@ impl BackgroundMaintenanceQueue {
                 .clone()
         });
 
+        let predecessor = key.as_ref().and_then(|key| {
+            tasks
+                .iter()
+                .rev()
+                .find(|task| task.key.as_ref() == Some(key))
+                .map(|task| task.completion.clone())
+        });
         let handle = tokio::spawn(async move {
+            if let Some(predecessor) = predecessor {
+                let _ = predecessor.await;
+            }
             if let Some(lock) = lock {
                 let _guard = lock.lock().await;
                 future.await
@@ -146,26 +160,30 @@ impl BackgroundMaintenanceQueue {
                 future.await
             }
         });
-        tasks.push(TrackedTask { key, handle });
+        let finished = handle.abort_handle();
+        let completion = async move {
+            match handle.await {
+                Ok(result) => result.map_err(|error| Arc::<str>::from(error.to_string())),
+                Err(error) => Err(Arc::<str>::from(format!(
+                    "background maintenance task failed to join: {error}"
+                ))),
+            }
+        }
+        .boxed()
+        .shared();
+        tasks.push(Arc::new(TrackedTask {
+            key,
+            finished,
+            completion,
+        }));
         Ok(())
     }
 
-    /// Waits for all tracked background tasks to complete.
+    /// Drains the captured admission set without removing live work from tracking or abandoning siblings on error.
+    /// A dropped drain can be retried; later admissions remain tracked for the caller's next barrier.
     pub async fn flush_all(&self) -> Result<()> {
-        let tasks = std::mem::take(&mut *self.tasks.lock());
-        for task in tasks {
-            match task.handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    return Err(AgentError::Other(format!(
-                        "background maintenance task failed to join: {}",
-                        error
-                    )));
-                }
-            }
-        }
-        Ok(())
+        let selected = self.tasks.lock().clone();
+        self.drain(selected).await
     }
 
     /// Waits for tasks with the requested scope identifier and keeps unrelated work queued.
@@ -188,34 +206,44 @@ impl BackgroundMaintenanceQueue {
             .await
     }
 
+    // Selection and retirement never replace the queue, so concurrent producers cannot lose admitted work.
     async fn flush_matching(
         &self,
         matches_key: impl Fn(&MaintenanceSequenceKey) -> bool,
     ) -> Result<()> {
-        let (matching, remaining): (Vec<_>, Vec<_>) = std::mem::take(&mut *self.tasks.lock())
-            .into_iter()
-            .partition(|task| task.key.as_ref().map(&matches_key).unwrap_or(false));
-        *self.tasks.lock() = remaining;
-        for task in matching {
-            match task.handle.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => return Err(error),
-                Err(error) => {
-                    return Err(AgentError::Other(format!(
-                        "background maintenance task failed to join: {}",
-                        error
-                    )));
-                }
-            }
-        }
-        Ok(())
+        let matching = self
+            .tasks
+            .lock()
+            .iter()
+            .filter(|task| task.key.as_ref().is_some_and(&matches_key))
+            .cloned()
+            .collect();
+        self.drain(matching).await
     }
 
+    // Keep the entire selected set until every completion is known; cancellation leaves cached errors and live joins retrievable.
+    async fn drain(&self, selected: Vec<Arc<TrackedTask>>) -> Result<()> {
+        let mut failure = None;
+        for task in &selected {
+            if let Err(error) = task.completion.clone().await {
+                failure.get_or_insert(error);
+            }
+        }
+        self.tasks
+            .lock()
+            .retain(|task| !selected.iter().any(|done| Arc::ptr_eq(task, done)));
+        match failure {
+            Some(error) => Err(AgentError::Other(error.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    // In-progress drains still occupy capacity until their underlying tasks actually return.
     fn unfinished_count(&self) -> usize {
         self.tasks
             .lock()
             .iter()
-            .filter(|task| !task.handle.is_finished())
+            .filter(|task| !task.finished.is_finished())
             .count()
     }
 }
@@ -225,6 +253,10 @@ impl Default for BackgroundMaintenanceQueue {
         Self::new(16)
     }
 }
+
+#[cfg(test)]
+#[path = "maintenance_ad_tests.rs"]
+mod ad_tests;
 
 #[cfg(test)]
 mod tests {

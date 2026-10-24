@@ -6,6 +6,31 @@ use crate::autonomy::location::{
 };
 
 impl RuntimeAgent {
+    // State effects recheck live authority after awaited preparation; an earlier approval or history ACK cannot extend the original bounds.
+    // A fully recorded tool denial may finish the existing tolerate-failure transition bookkeeping, but never grants another tool/provider attempt.
+    fn check_task_state_admission(&self) -> Result<()> {
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        execution.owner.check()?;
+        let stopped =
+            ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref());
+        let denied_cleanup =
+            execution.stop_reason().as_deref() == Some("retained_response_invalid");
+        if (stopped && !denied_cleanup)
+            || execution.remaining_duration().is_zero()
+            || ai_agents_llm::current_invocation_bounds()
+                .is_some_and(|bounds| bounds.remaining().is_zero())
+        {
+            return Err(AgentError::Other(
+                "task state effect admission expired".into(),
+            ));
+        }
+        if !denied_cleanup {
+            crate::autonomy::response::check_response_admission()?;
+        }
+        ai_agents_llm::validate_invocation_evidence()
+    }
+
     /// Exit work finishes before one transition commit; entry work and hooks follow that acknowledged position.
     pub(super) async fn apply_task_transition_target(
         &self,
@@ -14,6 +39,7 @@ impl RuntimeAgent {
         reason: &str,
         staged: Option<&HashMap<String, Value>>,
     ) -> Result<bool> {
+        self.check_task_state_admission()?;
         let machine = self
             .state_machine
             .as_ref()
@@ -73,6 +99,7 @@ impl RuntimeAgent {
             };
             Box::pin(self.drive_task_actions(&mut actions)).await?;
             let admission = self.disambiguation_admission.write().await;
+            self.check_task_state_admission()?;
             if machine.current() != transition.from_state
                 || machine.generation() != transition.expected_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst) != transition.expected_epoch
@@ -120,6 +147,7 @@ impl RuntimeAgent {
             native_exchanges: self.task_native_expectations(),
         };
         Box::pin(self.drive_task_actions(&mut actions)).await?;
+        self.check_task_state_admission()?;
         self.hooks
             .on_state_transition(Some(&transition.from_state), &entered, &transition.reason)
             .await;
@@ -166,6 +194,7 @@ impl RuntimeAgent {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         while state.next_action < state.actions.len() {
+            self.check_task_state_admission()?;
             self.validate_task_actions(state)?;
             if let Some(reason) = execution.stop_reason() {
                 return Err(AgentError::Other(reason));
@@ -321,6 +350,9 @@ impl RuntimeAgent {
         let reservation = self.reserve_state_transition().ok_or_else(|| {
             AgentError::Other("state continuation already has an active transition".into())
         })?;
+        if let TaskStateReturn::SpeculativeSelection { selection } = &state.return_to {
+            self.restore_speculative_context(selection);
+        }
         Box::pin(self.drive_task_actions(&mut state)).await?;
         if state.transition.entering {
             self.hooks
@@ -336,6 +368,7 @@ impl RuntimeAgent {
                 .as_ref()
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
             let admission = self.disambiguation_admission.write().await;
+            self.check_task_state_admission()?;
             if machine.current() != state.state
                 || machine.generation() != state.transition.expected_generation
                 || self.disambiguation_epoch.load(Ordering::SeqCst)
@@ -378,6 +411,9 @@ impl RuntimeAgent {
         transitioned: bool,
     ) -> Result<AgentResponse> {
         match position {
+            TaskStateReturn::SpeculativeSelection { selection } => {
+                Box::pin(self.resume_speculative_selection(*selection, transitioned)).await
+            }
             TaskStateReturn::BeforeCalls { saved } => {
                 if !transitioned {
                     return Box::pin(self.resume_rejected_tool_transition(*saved)).await;

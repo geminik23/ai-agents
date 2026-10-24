@@ -511,11 +511,17 @@ impl RuntimeAgent {
         outcome
     }
 
-    /// Cleanup may be retried after terminal acknowledgement, but can never clear a newer runtime owner.
+    /// Cleanup may be retried after terminal acknowledgement, but cannot clear a newer owner or skip actual maintenance quiescence.
     pub(crate) async fn release_reconciled_autonomy_owner(
         &self,
         owner: &Arc<crate::autonomy::RunOwner>,
     ) -> Result<()> {
+        owner.work.close();
+        if owner.work.unsettled() {
+            return Err(AgentError::Other(
+                "recovery maintenance is not acknowledged quiescent".into(),
+            ));
+        }
         let _gate = self.root_turn_gate.lock().await;
         let mut current = self.autonomy_owner.write();
         if current

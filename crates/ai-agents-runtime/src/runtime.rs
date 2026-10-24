@@ -35,6 +35,9 @@ mod task_restore;
 mod task_state;
 
 #[cfg(test)]
+#[path = "autonomy/ad_acceptance_tests.rs"]
+mod ad_acceptance_tests;
+#[cfg(test)]
 #[path = "autonomy/boundary_tests.rs"]
 mod autonomy_boundary_tests;
 #[cfg(test)]
@@ -1454,7 +1457,8 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Checks prepared consumer capabilities before standalone or inherited child work begins.
+    /// Checks actual prepared provider, memory and maintenance bindings before standalone or inherited child work begins.
+    /// Managed participation is explicit; registration and optimization flags do not certify hidden custom work.
     pub(crate) fn preflight_standalone_autonomy(&self) -> Result<()> {
         if self.autonomy_owner.read().is_none()
             && self
@@ -1482,28 +1486,7 @@ impl RuntimeAgent {
                 "memory lacks provenance/admission capability".into(),
             ));
         }
-        if self.actor_memory_config.is_some()
-            || self.facts_config.is_some()
-            || self.relationship_manager.is_some()
-        {
-            return Err(AgentError::Config(
-                "autonomy actor maintenance admission is not installed".into(),
-            ));
-        }
-
-        let optimization = &self.runtime_config.optimization;
-        if optimization.enabled
-            && (optimization.speculative_state_transitions
-                || optimization.speculative_skill_routing
-                || optimization.speculative_reasoning_auto
-                || optimization.parallel_post_turn_memory
-                || optimization.background_observability_export
-                || optimization.post_turn.any_background_tasks_enabled())
-        {
-            return Err(AgentError::Config(
-                "autonomy speculative settlement is not installed".into(),
-            ));
-        }
+        self.task_maintenance_providers()?;
 
         Ok(())
     }
@@ -1756,14 +1739,54 @@ impl RuntimeAgent {
         environment.render_str(template, serde_json::json!({"input":input,"objective":input,"context":self.context_manager.get_all(),"state":self.current_state()})).map_err(|error| AgentError::TemplateError(error.to_string()))
     }
 
-    /// Checks frozen provider participants before creating a hard-priced run; each actual request still needs a bound.
+    /// Captures actual maintenance, storage and callback providers without replacing frozen handles or granting new effects.
+    /// Custom consumers must explicitly preserve caller scope; labels and registered names cannot certify hidden work.
+    fn task_maintenance_providers(&self) -> Result<Vec<Arc<dyn LLMProvider>>> {
+        let mut providers = self.hooks.task_providers().ok_or_else(|| {
+            AgentError::Config("runtime hooks lack task admission capability".into())
+        })?;
+        if let Some(storage) = self.storage.read().as_ref() {
+            providers.extend(storage.task_providers().ok_or_else(|| {
+                AgentError::Config("runtime storage lacks task admission capability".into())
+            })?);
+        }
+        if let Some(store) = self.fact_store.read().as_ref() {
+            providers.extend(store.task_providers().ok_or_else(|| {
+                AgentError::Config("fact storage lacks task admission capability".into())
+            })?);
+        }
+        if let Some(extractor) = self.fact_extractor.read().as_ref() {
+            providers.extend(extractor.task_providers().ok_or_else(|| {
+                AgentError::Config("fact extractor lacks task admission capability".into())
+            })?);
+        }
+        if let Some(manager) = &self.relationship_manager {
+            providers.extend(manager.task_providers().ok_or_else(|| {
+                AgentError::Config("relationship evaluator lacks task admission capability".into())
+            })?);
+        }
+        if providers
+            .iter()
+            .any(|provider| !provider.manages_invocation_admission())
+        {
+            return Err(AgentError::Config(
+                "maintenance provider lacks task admission capability".into(),
+            ));
+        }
+        Ok(providers)
+    }
+
+    /// Checks frozen registry and maintenance participants before a hard-priced run; each actual request still needs its own bound.
     pub(crate) fn preflight_priced_autonomy(&self, priced: bool) -> Result<()> {
         if priced
-            && self.llm_registry.aliases().iter().any(|alias| {
+            && (self.llm_registry.aliases().iter().any(|alias| {
                 self.llm_registry
                     .get(alias)
                     .is_ok_and(|provider| provider.priced_capability_identity().is_none())
-            })
+            }) || self
+                .task_maintenance_providers()?
+                .iter()
+                .any(|provider| provider.priced_capability_identity().is_none()))
         {
             return Err(AgentError::Config(
                 "priced cost needs a verified provider accounting binding before task admission"
@@ -1780,6 +1803,7 @@ impl RuntimeAgent {
     ) -> Result<Arc<crate::autonomy::RunOwner>> {
         let admission = self.acquire_root_turn().await?;
         scope_runtime_gate_identity_stack(&admission.identity_stack, self.init_storage()).await?;
+        self.preflight_standalone_autonomy()?;
         self.flush_background_tasks().await?;
         if self
             .disambiguation_manager
@@ -1807,11 +1831,18 @@ impl RuntimeAgent {
         Ok(owner)
     }
 
-    /// Releases only the exact owner after its controller has acknowledged settlement or recovery, then retires private response and skill bindings.
+    /// Releases only the exact owner after acknowledged settlement and maintenance quiescence, then retires private response and skill bindings.
+    /// Close work admission before waiting for the gate so a captured producer cannot race cleanup.
     pub(crate) async fn release_autonomy_run(
         &self,
         owner: &Arc<crate::autonomy::RunOwner>,
     ) -> Result<()> {
+        owner.work.close();
+        if owner.work.unsettled() {
+            return Err(AgentError::Other(
+                "runtime maintenance is not acknowledged quiescent".into(),
+            ));
+        }
         let _gate = self.root_turn_gate.lock().await;
         let mut current = self.autonomy_owner.write();
         if current
@@ -1907,10 +1938,18 @@ impl RuntimeAgent {
         self.chat_with_actor_context(input, actor_context).await
     }
 
-    /// Ensure the effective actor's relationship is loaded from storage into the relationship manager.
+    /// Loads a relationship only under the actual runtime owner, retaining its storage and callback tail across cancellation.
     pub async fn load_actor_relationship(&self) -> Result<()> {
-        self.maybe_load_actor_relationship().await;
-        Ok(())
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance(
+            "relationship_load",
+            self.maybe_load_actor_relationship(),
+        )
+        .await
     }
 
     /// Manually apply a delta to the effective actor's `agent_to_actor` relationship perspective and persist the updated relationship when storage is configured.
@@ -1939,6 +1978,26 @@ impl RuntimeAgent {
         delta: f64,
         reason: Option<&str>,
     ) -> Result<ai_agents_relationships::DimensionChange> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance(
+            "relationship_update",
+            self.update_relationship_owned(perspective, dimension, delta, reason),
+        )
+        .await
+    }
+
+    // Mutation, persistence and hooks share one logical effect boundary; a returned model request is not their completion.
+    async fn update_relationship_owned(
+        &self,
+        perspective: ai_agents_relationships::RelationshipPerspective,
+        dimension: &str,
+        delta: f64,
+        reason: Option<&str>,
+    ) -> Result<ai_agents_relationships::DimensionChange> {
         let manager = self
             .relationship_manager
             .as_ref()
@@ -1946,6 +2005,7 @@ impl RuntimeAgent {
         let actor_id = self.effective_actor_id().ok_or_else(|| {
             AgentError::Config("No actor ID set. Use set_actor_id() first".into())
         })?;
+        crate::autonomy::work::maintenance_effect();
         let change = manager.update_dimension_for_perspective(
             &actor_id,
             perspective,
@@ -2050,8 +2110,18 @@ impl RuntimeAgent {
         self.set_actor_id(user_id)
     }
 
-    /// Load facts for the current actor from storage and cache them for prompt injection.
+    /// Loads actor facts only under the current runtime owner; the mutation lease excludes competing run admission across storage and hooks.
     pub async fn load_actor_memory(&self) -> ai_agents_core::Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance("facts_load", self.load_actor_memory_owned()).await
+    }
+
+    // Cache publication and the loaded hook remain owned even after the storage read has returned.
+    async fn load_actor_memory_owned(&self) -> Result<()> {
         let actor_id = match self.effective_actor_id() {
             Some(id) => id,
             None => return Ok(()),
@@ -2061,6 +2131,7 @@ impl RuntimeAgent {
         if let Some(store) = store_opt {
             let facts = store.get_facts(&actor_id).await?;
             let count = facts.len();
+            crate::autonomy::work::maintenance_effect();
             self.actor_facts_cache
                 .write()
                 .insert(actor_id.clone(), facts);
@@ -2072,34 +2143,47 @@ impl RuntimeAgent {
     }
 
     /// Load actor memory only when the effective actor has no cached facts yet.
-    async fn maybe_load_actor_memory(&self) {
+    async fn maybe_load_actor_memory(&self) -> Result<()> {
         let Some(actor_id) = self.effective_actor_id() else {
-            return;
+            return Ok(());
         };
         if self.actor_facts_cache.read().contains_key(&actor_id) {
-            return;
+            return Ok(());
         }
-        let _ = self.load_actor_memory().await;
+        match self.load_actor_memory().await {
+            Ok(()) => Ok(()),
+            Err(error) => self.maintenance_failure(error),
+        }
     }
 
-    /// Pre-turn lifecycle shared by streaming and non-streaming paths.
-    async fn pre_turn_session_lifecycle(&self) {
+    /// Pre-turn lifecycle shared by streaming and non-streaming paths, including owned actor loading before the first provider request.
+    async fn pre_turn_session_lifecycle(&self) -> Result<()> {
         if *self.redispatch_depth.read() > 0 {
-            return;
+            return Ok(());
         }
         self.resolve_actor_id_from_context();
         self.await_background_before_next_turn().await;
         self.record_session_actor_if_needed();
-        self.maybe_load_actor_memory().await;
-        self.maybe_load_actor_relationship().await;
+        if self.actor_memory_config.is_some()
+            || self.facts_config.is_some()
+            || self.relationship_manager.is_some()
+        {
+            crate::autonomy::owned_maintenance("actor_load", async {
+                self.maybe_load_actor_memory().await?;
+                self.maybe_load_actor_relationship().await
+            })
+            .await?;
+        }
         if !crate::autonomy::current_turn_input(&self.root_turn_gate)
             .is_some_and(|input| input.controller_only())
         {
             *self.messages_since_extraction.write() += 1;
         }
+        Ok(())
     }
 
     /// Post-turn lifecycle shared by streaming and non-streaming paths.
+    /// Task maintenance owns its full persistence and hook tail, not only the nested model requests.
     async fn post_turn_session_lifecycle(&self) -> Result<()> {
         if crate::autonomy::current_turn_input(&self.root_turn_gate)
             .is_some_and(|input| input.controller_only())
@@ -2110,7 +2194,15 @@ impl RuntimeAgent {
             return Ok(());
         }
         *self.messages_since_extraction.write() += 1;
-        self.run_post_turn_maintenance().await
+        if !self
+            .facts_config
+            .as_ref()
+            .is_some_and(|config| config.enabled && config.auto_extract)
+            && self.relationship_manager.is_none()
+        {
+            return Ok(());
+        }
+        crate::autonomy::owned_maintenance("post_turn", self.run_post_turn_maintenance()).await
     }
 
     /// Starts root-turn bookkeeping for user-message commit tracking.
@@ -2279,8 +2371,8 @@ impl RuntimeAgent {
         }
         let optimization = &self.runtime_config.optimization;
         if !optimization.enabled {
-            self.auto_extract_facts().await;
-            self.auto_update_relationship().await;
+            self.auto_extract_facts().await?;
+            self.auto_update_relationship().await?;
             return Ok(());
         }
 
@@ -2295,13 +2387,15 @@ impl RuntimeAgent {
 
         match (facts_mode, relationships_mode) {
             (MaintenanceMode::InlineSerial, MaintenanceMode::InlineSerial) => {
-                self.auto_extract_facts().await;
-                self.auto_update_relationship().await;
+                self.auto_extract_facts().await?;
+                self.auto_update_relationship().await?;
             }
             (MaintenanceMode::InlineParallel, MaintenanceMode::InlineParallel) => {
                 let facts = self.auto_extract_facts();
                 let relationships = self.auto_update_relationship();
-                tokio::join!(facts, relationships);
+                let (facts, relationships) = tokio::join!(facts, relationships);
+                facts?;
+                relationships?;
             }
             (MaintenanceMode::Background, MaintenanceMode::Background) => {
                 self.schedule_facts_background().await?;
@@ -2310,16 +2404,16 @@ impl RuntimeAgent {
             (MaintenanceMode::Background, MaintenanceMode::InlineParallel)
             | (MaintenanceMode::Background, MaintenanceMode::InlineSerial) => {
                 self.schedule_facts_background().await?;
-                self.auto_update_relationship().await;
+                self.auto_update_relationship().await?;
             }
             (MaintenanceMode::InlineParallel, MaintenanceMode::Background)
             | (MaintenanceMode::InlineSerial, MaintenanceMode::Background) => {
-                self.auto_extract_facts().await;
+                self.auto_extract_facts().await?;
                 self.schedule_relationship_background().await?;
             }
             _ => {
-                self.auto_extract_facts().await;
-                self.auto_update_relationship().await;
+                self.auto_extract_facts().await?;
+                self.auto_update_relationship().await?;
             }
         }
         Ok(())
@@ -2335,6 +2429,15 @@ impl RuntimeAgent {
             .unwrap_or(false);
         if !should_extract {
             return Ok(());
+        }
+        if crate::autonomy::current_execution().is_some()
+            && let Some(actor_id) = self.effective_actor_id()
+        {
+            self.flush_background_tasks_for_actor_purpose(
+                &actor_id,
+                RuntimeTaskPurpose::PostTurnFacts,
+            )
+            .await?;
         }
         let msgs_since = *self.messages_since_extraction.read();
         if msgs_since < 2 {
@@ -2356,7 +2459,7 @@ impl RuntimeAgent {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(error = %error, "failed to snapshot messages for fact extraction");
-                return Ok(());
+                return self.maintenance_failure(error);
             }
         };
         let messages = Self::actor_memory_messages(messages)?;
@@ -2399,6 +2502,7 @@ impl RuntimeAgent {
                     .extract(&recent, &existing, Some(&actor_for_task), &categories)
                     .await?;
                 if !facts.is_empty() {
+                    crate::autonomy::work::maintenance_effect();
                     if let Some(store) = store {
                         let authoritative = store.add_facts(&actor_for_task, facts.clone()).await?;
                         cache.write().insert(actor_for_task.clone(), authoritative);
@@ -2455,12 +2559,19 @@ impl RuntimeAgent {
             );
             return Ok(());
         };
+        if crate::autonomy::current_execution().is_some() {
+            self.flush_background_tasks_for_actor_purpose(
+                &actor_id,
+                RuntimeTaskPurpose::PostTurnRelationship,
+            )
+            .await?;
+        }
         let recent_messages = manager.config().auto_update.recent_messages;
         let messages = match self.memory.get_messages(Some(recent_messages)).await {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(actor = %actor_id, error = %error, "failed to snapshot messages for relationship update");
-                return Ok(());
+                return self.maintenance_failure(error);
             }
         };
         let messages = Self::actor_memory_messages(messages)?;
@@ -2477,7 +2588,9 @@ impl RuntimeAgent {
         let task = async move {
             let run = async move {
                 if manager.config().auto_update.enabled {
-                    let update = manager.auto_update(&actor_for_task, &messages).await?;
+                    let proposal = manager.propose_update(&actor_for_task, &messages).await?;
+                    crate::autonomy::work::maintenance_effect();
+                    let update = manager.apply_evaluation(&actor_for_task, proposal)?;
                     if !update.changes.is_empty() {
                         hooks
                             .on_relationship_change(&actor_for_task, &update.changes)
@@ -2491,6 +2604,7 @@ impl RuntimeAgent {
                     && let (Some(storage), Some(value)) =
                         (storage, manager.relationship_as_value(&actor_for_task)?)
                 {
+                    crate::autonomy::work::maintenance_effect();
                     storage
                         .save_relationship(&agent_id, &actor_for_task, &value)
                         .await?;
@@ -2511,7 +2625,8 @@ impl RuntimeAgent {
             .await
     }
 
-    /// Queues background maintenance or applies the configured overflow behavior.
+    /// Queues maintenance with its live run lease and restrictions captured before spawning or inline overflow.
+    /// Already admitted task work must settle before gates; required task maintenance cannot silently use the ordinary drop policy.
     async fn spawn_or_handle_background<F>(
         &self,
         key: Option<MaintenanceSequenceKey>,
@@ -2522,6 +2637,8 @@ impl RuntimeAgent {
     where
         F: Future<Output = Result<()>> + Send + 'static,
     {
+        let managed = crate::autonomy::current_execution().is_some();
+        let task = crate::autonomy::owned_maintenance(label, task);
         if self.background_maintenance.is_full() {
             match self
                 .runtime_config
@@ -2530,6 +2647,12 @@ impl RuntimeAgent {
                 .on_background_overflow
             {
                 BackgroundOverflowPolicy::RunInline => {
+                    // The inline overflow body cannot overtake the queued predecessor for the same actor and purpose.
+                    if let Some(key) = &key {
+                        self.background_maintenance
+                            .flush_scope_purpose(&key.scope_id, key.task_kind)
+                            .await?;
+                    }
                     record_background_maintenance_event(
                         self.observability_manager.as_ref(),
                         label,
@@ -2566,6 +2689,11 @@ impl RuntimeAgent {
                     }
                 }
                 BackgroundOverflowPolicy::Drop => {
+                    if managed {
+                        return Err(AgentError::Other(
+                            "required task maintenance cannot be dropped on overflow".into(),
+                        ));
+                    }
                     self.record_skipped_maintenance(
                         label,
                         ObservationPurpose::Other(label.to_string()),
@@ -2687,12 +2815,21 @@ impl RuntimeAgent {
         self.format_relationship_for_context().map(|(_, text)| text)
     }
 
-    /// Manually extract facts from the last N messages.
+    /// Manually extracts facts under the actual runtime owner; raw host component handles remain a separate trusted boundary.
     pub async fn extract_facts(
         &self,
         last_n: usize,
     ) -> ai_agents_core::Result<Vec<ai_agents_core::KeyFact>> {
-        self.extract_facts_with_source(last_n, "manual").await
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_operation()?;
+        crate::autonomy::owned_maintenance(
+            "manual_facts",
+            self.extract_facts_with_source(last_n, "manual"),
+        )
+        .await
     }
 
     // Extracts only actor-visible messages while retaining exact task/native history in the backing memory.
@@ -2734,6 +2871,7 @@ impl RuntimeAgent {
 
         // Save to storage and update the actor-scoped cache when an actor is known.
         if !facts.is_empty() {
+            crate::autonomy::work::maintenance_effect();
             let fact_store_opt = self.fact_store.read().clone();
             let mut stored_total = 0usize;
             let mut cache_updated = false;
@@ -2960,16 +3098,18 @@ impl RuntimeAgent {
         None
     }
 
-    async fn maybe_load_actor_relationship(&self) {
+    // Loading and interaction bookkeeping are distinct; task load errors cannot silently manufacture a default relationship.
+    async fn maybe_load_actor_relationship(&self) -> Result<()> {
         let Some(manager) = self.relationship_manager.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(actor_id) = self.effective_actor_id() else {
-            return;
+            return Ok(());
         };
 
         let mut should_fire_loaded = false;
         if manager.get(&actor_id).is_none() {
+            crate::autonomy::work::maintenance_effect();
             let mut loaded = false;
             if manager.config().persistence.enabled {
                 let storage = self.storage.read().clone();
@@ -2978,12 +3118,14 @@ impl RuntimeAgent {
                         Ok(Some(value)) => match manager.insert_from_value(value) {
                             Ok(_) => loaded = true,
                             Err(e) => {
-                                warn!(actor = %actor_id, error = %e, "failed to restore relationship")
+                                warn!(actor = %actor_id, error = %e, "failed to restore relationship");
+                                self.maintenance_failure(e)?;
                             }
                         },
                         Ok(None) => {}
                         Err(e) => {
-                            warn!(actor = %actor_id, error = %e, "failed to load relationship")
+                            warn!(actor = %actor_id, error = %e, "failed to load relationship");
+                            self.maintenance_failure(e)?;
                         }
                     }
                 }
@@ -2996,12 +3138,21 @@ impl RuntimeAgent {
         }
 
         let actor_name = self.resolve_actor_name_from_context();
-        let relationship = manager.touch_interaction(&actor_id, actor_name.as_deref());
+        crate::autonomy::work::maintenance_effect();
+        // Controller continuations may read the relationship, but are not additional actor interactions.
+        let relationship = if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|input| input.controller_only())
+        {
+            manager.get_or_create(&actor_id, actor_name.as_deref())
+        } else {
+            manager.touch_interaction(&actor_id, actor_name.as_deref())
+        };
         if should_fire_loaded {
             self.hooks
                 .on_relationship_loaded(&actor_id, &relationship)
                 .await;
         }
+        Ok(())
     }
 
     fn format_relationship_for_context(&self) -> Option<(String, String)> {
@@ -3042,6 +3193,7 @@ impl RuntimeAgent {
             return Ok(());
         };
         if let Some(value) = manager.relationship_as_value(actor_id)? {
+            crate::autonomy::work::maintenance_effect();
             storage
                 .save_relationship(&self.info.id, actor_id, &value)
                 .await?;
@@ -3049,17 +3201,19 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    // Updates relationships from conversational evidence only; task-derived output is not actor evidence.
-    async fn auto_update_relationship(&self) {
+    // Task maintenance propagates failure to the owning ledger; ordinary chat retains best-effort relationship updates.
+    async fn auto_update_relationship(&self) -> Result<()> {
         let Some(manager) = self.relationship_manager.as_ref() else {
-            return;
+            return Ok(());
         };
         let Some(actor_id) = self.effective_actor_id() else {
-            return;
+            return Ok(());
         };
         if !manager.config().auto_update.enabled {
-            let _ = self.persist_actor_relationship(&actor_id).await;
-            return;
+            if let Err(error) = self.persist_actor_relationship(&actor_id).await {
+                return self.maintenance_failure(error);
+            }
+            return Ok(());
         }
 
         let recent_messages = manager.config().auto_update.recent_messages;
@@ -3067,25 +3221,30 @@ impl RuntimeAgent {
             Ok(messages) => messages,
             Err(e) => {
                 warn!(actor = %actor_id, error = %e, "failed to read messages for relationship update");
-                return;
+                return self.maintenance_failure(e);
             }
         };
         let messages = match Self::actor_memory_messages(messages) {
             Ok(messages) => messages,
             Err(error) => {
                 warn!(actor = %actor_id, error = %error, "failed to project native history for relationship update");
-                return;
+                return self.maintenance_failure(error);
             }
         };
 
         match self
             .observe_purpose(
                 ObservationPurpose::RelationshipUpdate,
-                manager.auto_update(&actor_id, &messages),
+                manager.propose_update(&actor_id, &messages),
             )
             .await
         {
-            Ok(update) => {
+            Ok(proposal) => {
+                crate::autonomy::work::maintenance_effect();
+                let update = match manager.apply_evaluation(&actor_id, proposal) {
+                    Ok(update) => update,
+                    Err(error) => return self.maintenance_failure(error),
+                };
                 if !update.changes.is_empty() {
                     self.hooks
                         .on_relationship_change(&actor_id, &update.changes)
@@ -3098,6 +3257,7 @@ impl RuntimeAgent {
                     Ok(()) => true,
                     Err(e) => {
                         warn!(actor = %actor_id, error = %e, "failed to persist relationship");
+                        self.maintenance_failure(e)?;
                         false
                     }
                 };
@@ -3119,12 +3279,26 @@ impl RuntimeAgent {
                     debug!(actor_id = %actor_id, persisted = persisted, "relationship evaluation ran but found no changes");
                 }
             }
-            Err(e) => warn!(actor = %actor_id, error = %e, "relationship update failed"),
+            Err(e) => {
+                warn!(actor = %actor_id, error = %e, "relationship update failed");
+                self.maintenance_failure(e)?;
+            }
+        }
+        Ok(())
+    }
+
+    // Best-effort chat maintenance cannot swallow a managed task failure and fabricate settled successful work.
+    fn maintenance_failure(&self, error: AgentError) -> Result<()> {
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.stop("maintenance_failed");
+            Err(error)
+        } else {
+            Ok(())
         }
     }
 
-    /// Run auto-extraction after a chat turn.
-    async fn auto_extract_facts(&self) {
+    /// Runs conversational fact extraction once; managed failures propagate without changing ordinary best-effort chat.
+    async fn auto_extract_facts(&self) -> Result<()> {
         let should_extract = self
             .facts_config
             .as_ref()
@@ -3133,7 +3307,7 @@ impl RuntimeAgent {
 
         if !should_extract {
             debug!("fact extraction skipped because auto extraction is disabled");
-            return;
+            return Ok(());
         }
 
         let msgs_since = *self.messages_since_extraction.read();
@@ -3142,7 +3316,7 @@ impl RuntimeAgent {
                 messages_since_extraction = msgs_since,
                 "fact extraction skipped until threshold is reached"
             );
-            return;
+            return Ok(());
         }
 
         match self.extract_facts_with_source(msgs_since, "auto").await {
@@ -3155,8 +3329,10 @@ impl RuntimeAgent {
             }
             Err(e) => {
                 warn!("fact extraction failed: {}", e);
+                self.maintenance_failure(e)?;
             }
         }
+        Ok(())
     }
 
     pub fn with_persona(mut self, manager: Arc<ai_agents_persona::PersonaManager>) -> Self {
@@ -8167,6 +8343,8 @@ impl RuntimeAgent {
                         .await?;
                 }
                 drop(admission);
+                self.park_task_clarification(processed_input, &response)
+                    .await?;
                 self.finish_turn_if_root(&response).await?;
                 Ok(Some(response))
             }
@@ -8983,6 +9161,12 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        // An explicit script and later controller turns keep their installed no-reroute contract; ordinary initial work can speculate.
+        if crate::autonomy::current_turn_input(&self.root_turn_gate)
+            .is_some_and(|turn| !turn.initial_work() || turn.owner.skill.read().is_some())
+        {
+            return Ok(None);
+        }
         let effective_reasoning_mode = self.get_effective_reasoning_config().mode.clone();
         if !matches!(
             effective_reasoning_mode,
@@ -9035,6 +9219,10 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        let speculative_binding = (
+            self.task_review_binding(),
+            self.state_machine.as_ref().map(|state| state.generation()),
+        );
         let main_kind = if transition_enabled {
             RuntimeOptimizationKind::ParallelStateTransition
         } else if skill_enabled {
@@ -9181,12 +9369,12 @@ OVERALL: PASS/FAIL"#,
         }
 
         if matches!(effective_reasoning_mode, ReasoningMode::Auto) && !reasoning_enabled {
-            self.finalize_pending_branches(branch_set.cancel_pending());
+            Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
             return Ok(None);
         }
 
         if !transition_enabled && !skill_enabled && !reasoning_enabled {
-            self.finalize_pending_branches(branch_set.cancel_pending());
+            Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
             return Ok(None);
         }
 
@@ -9208,6 +9396,77 @@ OVERALL: PASS/FAIL"#,
 
         loop {
             if let Some(candidate) = transition_candidate.take() {
+                if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+                    // Settle admitted alternatives before review/actions can suspend and unwind the branch set.
+                    let outcomes = Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
+                    if speculative_binding
+                        != (
+                            self.task_review_binding(),
+                            self.state_machine.as_ref().map(|state| state.generation()),
+                        )
+                    {
+                        return Err(AgentError::Other(
+                            "speculative transition binding changed before adoption".into(),
+                        ));
+                    }
+                    let skill_checked = skill_finalized || skill_candidate.is_some();
+                    let reasoning_checked = reasoning_finalized || reasoning_decision.is_some();
+                    let mut selection = crate::autonomy::location::TaskSpeculativeSelection {
+                        data: crate::autonomy::interaction::prepared_input()
+                            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
+                        turn: self.active_turn_context.read().clone().map(Box::new),
+                        draft: None,
+                        draft_error: None,
+                        draft_uninvoked: false,
+                        skill: skill_candidate.take(),
+                        skill_checked,
+                        reasoning: reasoning_decision.take(),
+                        reasoning_checked,
+                        auto_detected: reasoning_enabled,
+                    };
+                    if let Some(result) = main_result.take() {
+                        match result {
+                            Ok(draft) => selection.draft = Some(draft),
+                            Err(error) => selection.draft_error = Some(error.to_string()),
+                        }
+                    }
+                    for (outcome, unfinished) in outcomes {
+                        selection.absorb(outcome, unfinished);
+                    }
+                    let position =
+                        crate::autonomy::location::TaskStateReturn::SpeculativeSelection {
+                            selection: Box::new(selection),
+                        };
+                    let approved = crate::autonomy::location::scope_state_return(
+                        position.clone(),
+                        Box::pin(self.approve_transition_target(
+                            &candidate.from_state,
+                            candidate.target(),
+                            &candidate.reason,
+                            None,
+                            Some(processed_input),
+                        )),
+                    )
+                    .await?;
+                    let transitioned = if approved {
+                        self.commit_root_user_message(processed_input).await?;
+                        crate::autonomy::location::scope_state_return(
+                            position.clone(),
+                            Box::pin(self.apply_transition_target(
+                                &candidate.from_state,
+                                candidate.target(),
+                                &candidate.reason,
+                                None,
+                            )),
+                        )
+                        .await?
+                    } else {
+                        false
+                    };
+                    return Box::pin(self.resume_state_return_outcome(position, transitioned))
+                        .await
+                        .map(Some);
+                }
                 if self
                     .approve_transition_target(
                         &candidate.from_state,
@@ -9218,8 +9477,8 @@ OVERALL: PASS/FAIL"#,
                     )
                     .await?
                 {
-                    // Drop losing provider futures before transition side effects can reuse their shared resources.
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    // Managed losers settle before winner effects; ordinary chat retains its existing drop-before-reuse behavior.
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     if !main_pending {
                         self.finalize_branch_loss(
                             &main_id,
@@ -9303,8 +9562,8 @@ OVERALL: PASS/FAIL"#,
                     Ok(Some(candidate)) => skill_candidate = Some(candidate),
                     Ok(None) => {}
                     Err(error) => {
-                        // Serial selection failure ends the turn exactly as the serial path would.
-                        self.finalize_pending_branches(branch_set.cancel_pending());
+                        // Serial selection failure ends the turn after managed siblings settle, without executing their results.
+                        Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                         return Err(error);
                     }
                 }
@@ -9341,7 +9600,7 @@ OVERALL: PASS/FAIL"#,
                         Some(false),
                     );
                 }
-                self.finalize_pending_branches(branch_set.cancel_pending());
+                Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                 return self
                     .commit_winning_skill_candidate(candidate, processed_input, input_context)
                     .await;
@@ -9368,7 +9627,7 @@ OVERALL: PASS/FAIL"#,
                             main_result.as_ref().map(|result| result.is_err()),
                         );
                     }
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     self.commit_root_user_message(processed_input).await?;
                     return if matches!(reasoning_mode, ReasoningMode::PlanAndExecute) {
                         self.handle_plan_and_execute(processed_input, input_context, true)
@@ -9409,7 +9668,7 @@ OVERALL: PASS/FAIL"#,
                             main_result.as_ref().map(|result| result.is_err()),
                         );
                     }
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     return Ok(None);
                 }
 
@@ -9424,7 +9683,7 @@ OVERALL: PASS/FAIL"#,
                                 "failed",
                                 false,
                             );
-                            self.finalize_pending_branches(branch_set.cancel_pending());
+                            Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                             return Err(error);
                         }
                     };
@@ -9435,7 +9694,7 @@ OVERALL: PASS/FAIL"#,
                         "committed",
                         true,
                     );
-                    self.finalize_pending_branches(branch_set.cancel_pending());
+                    Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
                     return self
                         .commit_main_response_draft(
                             processed_input,
@@ -9443,6 +9702,7 @@ OVERALL: PASS/FAIL"#,
                             draft,
                             ReasoningMode::None,
                             reasoning_enabled,
+                            false,
                         )
                         .await
                         .map(Some);
@@ -9559,6 +9819,151 @@ OVERALL: PASS/FAIL"#,
         }
     }
 
+    // A resumed review or state action restores data and consumed local speculative capacity, never a live runtime capability.
+    fn restore_speculative_context(
+        &self,
+        selection: &crate::autonomy::location::TaskSpeculativeSelection,
+    ) {
+        if let Some(saved) = &selection.turn {
+            let mut current = self.active_turn_context.write();
+            if current
+                .as_ref()
+                .is_none_or(|turn| turn.turn_id != saved.turn_id)
+            {
+                let mut saved = (**saved).clone();
+                saved.user_message_committed =
+                    self.root_user_message_committed.load(Ordering::SeqCst);
+                *current = Some(saved);
+            }
+        }
+        self.update_active_turn_context(&selection.data.content, selection.data.context.clone());
+    }
+
+    // Resumes the selected transition's exact return point: accepted routes reuse prepared input, rejected routes adopt settled alternatives without rerouting.
+    // Serialized alternatives are inert data; ordinary state, skill, tool and final-response drivers keep their existing live admission checks.
+    async fn resume_speculative_selection(
+        &self,
+        selection: crate::autonomy::location::TaskSpeculativeSelection,
+        transitioned: bool,
+    ) -> Result<AgentResponse> {
+        self.restore_speculative_context(&selection);
+        let execution = crate::autonomy::current_execution()
+            .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
+        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) {
+            return Err(AgentError::Other(
+                "task speculative adoption is no longer admitted".into(),
+            ));
+        }
+        if transitioned {
+            return Box::pin(self.run_accepted_input(selection.data)).await;
+        }
+        let data = selection.data;
+        let skill = if selection.skill_checked {
+            selection.skill
+        } else {
+            self.select_skill_candidate(&data.content).await?
+        };
+        if let Some(skill) = skill {
+            if !self.skills.iter().any(|actual| {
+                actual.id == skill.skill_id
+                    && serde_json::to_value(actual).ok() == serde_json::to_value(&skill.skill).ok()
+            }) {
+                return Err(AgentError::Config(
+                    "saved speculative skill binding changed".into(),
+                ));
+            }
+            if let Some(response) = crate::autonomy::interaction::scope_prepared_input(
+                data.clone(),
+                Box::pin(self.commit_winning_skill_candidate(skill, &data.content, &data.context)),
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+        }
+        let reasoning = if selection.reasoning_checked {
+            selection.reasoning
+        } else {
+            Some(self.determine_reasoning_mode_strict(&data.content).await?)
+        };
+        if let Some(mode) = reasoning
+            && !matches!(mode, ReasoningMode::None)
+        {
+            self.commit_root_user_message(&data.content).await?;
+            return if matches!(mode, ReasoningMode::PlanAndExecute) {
+                Box::pin(self.handle_plan_and_execute(&data.content, &data.context, true)).await
+            } else {
+                Box::pin(self.run_committed_response_loop_with_reasoning(
+                    &data.content,
+                    &data.context,
+                    mode,
+                    true,
+                ))
+                .await
+            };
+        }
+        let draft = if selection.draft_uninvoked {
+            Some(
+                Box::pin(self.generate_main_response_draft(&data.content, &ReasoningMode::None))
+                    .await?,
+            )
+        } else {
+            selection.draft
+        };
+        match draft {
+            Some(draft) => {
+                Box::pin(self.commit_main_response_draft(
+                    &data.content,
+                    &data.context,
+                    draft,
+                    ReasoningMode::None,
+                    selection.auto_detected,
+                    true,
+                ))
+                .await
+            }
+            None => Err(AgentError::LLM(selection.draft_error.unwrap_or_else(
+                || "speculative draft has no settled outcome".into(),
+            ))),
+        }
+    }
+
+    // A selected task winner cannot erase dispatched loser attempts or release their provider resources before acknowledged settlement.
+    // Drain the existing same-task branch set; losers remain inert data and never execute tools, history commits or root finalizers.
+    async fn settle_pending_branches(
+        &self,
+        branches: &mut ScheduledBranchSet<'_>,
+    ) -> Result<Vec<(crate::optimization::RuntimeBranchOutcome, bool)>> {
+        let Some(execution) = crate::autonomy::current_execution() else {
+            self.finalize_pending_branches(branches.cancel_pending());
+            return Ok(vec![]);
+        };
+        branches.close_admission();
+        let mut outcomes = vec![];
+        while let Some(outcome) = branches.next_completed().await {
+            let failed = matches!(outcome.result, RuntimeBranchResult::Failed(_));
+            self.finalize_optional_branch(
+                &outcome.branch.branch_id(),
+                outcome.branch.optimization,
+                outcome.branch.commit_behavior,
+                if failed { "failed" } else { "discarded" },
+                false,
+            );
+            let unfinished = branches.unfinished(&outcome);
+            outcomes.push((outcome, unfinished));
+        }
+        if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) {
+            return Err(AgentError::Other(format!(
+                "task speculative settlement stopped: {}",
+                execution
+                    .stop_reason()
+                    .unwrap_or_else(|| "execution_stopped".into())
+            )));
+        }
+        Ok(outcomes)
+    }
+
+    // Only ordinary non-task branches use drop as local scheduler cancellation, never as task effect settlement.
     fn finalize_pending_branches(&self, branches: Vec<RuntimeBranch>) {
         for branch in branches {
             self.finalize_optional_branch(
@@ -11810,6 +12215,7 @@ Respond in JSON format:
     //
     // This is the only place where a winning draft is allowed to become runtime state.
     // Prompt and native tool calls remain inert until this method commits the draft into the shared executor path.
+    // Task drafts seed the existing loop before tools can suspend; rejected route review skips only that original transition check.
     //
     async fn commit_main_response_draft(
         &self,
@@ -11818,8 +12224,16 @@ Respond in JSON format:
         draft: MainResponseDraft,
         reasoning_mode: ReasoningMode,
         auto_detected: bool,
+        skip_tool_transition: bool,
     ) -> Result<AgentResponse> {
         self.commit_root_user_message(processed_input).await?;
+        if let Some(execution) = crate::autonomy::current_execution()
+            && ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref())
+        {
+            return Err(AgentError::Other(
+                "task draft admission expired during history acknowledgement".into(),
+            ));
+        }
         match draft {
             MainResponseDraft::Text {
                 raw_content,
@@ -11843,8 +12257,58 @@ Respond in JSON format:
             MainResponseDraft::ToolCalls {
                 raw_content,
                 calls,
-                thinking: _,
+                thinking,
             } => {
+                if crate::autonomy::current_execution().is_some() {
+                    let mut state = crate::autonomy::TaskLoopState {
+                        version: 1,
+                        processed_input: processed_input.into(),
+                        input_context: input_context.clone(),
+                        reasoning_mode,
+                        auto_detected,
+                        iterations: 1,
+                        all_tool_calls: vec![],
+                        thinking_content: thinking,
+                        native_exchanges: self.task_native_expectations(),
+                        deferred_final: None,
+                    };
+                    let position = crate::autonomy::location::TaskStateReturn::BeforeCalls {
+                        saved: Box::new(crate::autonomy::interaction::TaskModelCalls {
+                            state: Box::new(state.clone()),
+                            content: raw_content.clone(),
+                            calls: calls.clone(),
+                        }),
+                    };
+                    let work = crate::autonomy::location::scope_state_return(
+                        position,
+                        Box::pin(self.handle_tool_calls(
+                            processed_input,
+                            &raw_content,
+                            calls,
+                            &mut state.all_tool_calls,
+                            None,
+                        )),
+                    );
+                    let outcome = if skip_tool_transition {
+                        crate::autonomy::interaction::scope_skipped_tool_transition(work).await
+                    } else {
+                        work.await
+                    };
+                    return match outcome {
+                        Err(AgentError::TaskSuspended(id)) => {
+                            Box::pin(self.retain_task_loop(state)).await?;
+                            Err(AgentError::TaskSuspended(id))
+                        }
+                        Err(error) => Err(error),
+                        Ok(ToolCallOutcome::Rejected(response)) => {
+                            self.finish_turn_if_root(&response).await?;
+                            Ok(response)
+                        }
+                        Ok(ToolCallOutcome::Continue | ToolCallOutcome::TransitionFired) => {
+                            Box::pin(self.run_committed_task_loop(state)).await
+                        }
+                    };
+                }
                 let mut all_tool_calls = Vec::new();
                 match self
                     .handle_tool_calls(
@@ -13499,8 +13963,8 @@ Respond in JSON format:
     // Boxed composition dispatch keeps nested participants from multiplying large future stack frames.
     async fn run_loop_internal(&self, input: &str) -> Result<AgentResponse> {
         self.begin_root_turn();
-        // Resolve actor_id from context, reload facts if actor changed, bump counter.
-        self.pre_turn_session_lifecycle().await;
+        // Actor loading and callbacks share the admitted run's original lifetime before input processing begins.
+        self.pre_turn_session_lifecycle().await?;
 
         let input_data = self.process_input(input).await?;
         self.update_active_turn_context(&input_data.content, input_data.context.clone());
@@ -13956,6 +14420,7 @@ Respond in JSON format:
                         stream_draft.draft,
                         ReasoningMode::None,
                         false,
+                        false,
                     )
                     .await?;
                 let chunks = if response.content == raw_draft_content {
@@ -14055,8 +14520,11 @@ Respond in JSON format:
 
         Box::pin(async_stream::stream! {
             self.begin_root_turn();
-            // Parity with non-stream: resolve actor from context and load facts if changed.
-            self.pre_turn_session_lifecycle().await;
+            // Preserve the blocking path's actor-load failure and owned-tail contract before emitting any content.
+            if let Err(error) = self.pre_turn_session_lifecycle().await {
+                yield StreamChunk::error(error.to_string());
+                return;
+            }
 
             let input_data = match self.process_input(input).await {
                 Ok(data) => data,

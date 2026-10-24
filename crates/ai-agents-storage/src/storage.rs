@@ -112,6 +112,11 @@ fn is_safe_legacy_session_id(session_id: &str) -> bool {
 
 #[async_trait]
 impl AgentStorage for FileStorage {
+    /// Filesystem operations use caller-owned futures without internal model work; errors do not certify rollback.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn save(&self, session_id: &str, snapshot: &AgentSnapshot) -> Result<()> {
         tokio::fs::create_dir_all(&self.base_path).await?;
         let envelope = SnapshotEnvelope {

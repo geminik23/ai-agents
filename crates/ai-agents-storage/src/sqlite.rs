@@ -608,6 +608,11 @@ impl SqliteStorage {
 #[cfg(feature = "sqlite")]
 #[async_trait]
 impl AgentStorage for SqliteStorage {
+    /// SQL operations contain no provider invocations; commit acknowledgements and cancellation retain the existing backend contract.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn create_task_run(
         &self,
         snapshot: &ai_agents_core::autonomy::TaskRunSnapshot,

@@ -808,6 +808,7 @@ impl AutonomyRunner {
         {
             return Err(TaskRunStorageError::NotResumable.into());
         }
+        execution.owner.work.acknowledge_reconciliation()?;
         execution.participants.acknowledge_reconciliation()?;
         // A conditional claim excludes competing resume/control writes while live protection is retired.
         // Terminal snapshots are already immutable and need no temporary claim.
@@ -1972,6 +1973,7 @@ impl AutonomyRunner {
                     }
                     lifecycle.skill_segment_completed |= execution.skill_segment_completed();
                     execution.await_children().await?;
+                    execution.await_owned_work().await?;
                     Box::pin(self.agent.flush_background_tasks()).await?;
                     let runtime =
                         TaskRuntimeCheckpoint::between_turns(self.agent.save_state_full().await?)?;
@@ -2620,8 +2622,12 @@ impl AutonomyRunner {
     fn stopped_status(execution: &RunExecution) -> TaskRunStatus {
         match execution.stop_reason().as_deref() {
             Some(
-                "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
-                | "time_violation",
+                "llm_capacity"
+                | "tool_capacity"
+                | "priced_capacity"
+                | "write_capacity"
+                | "time_violation"
+                | "maintenance_capacity",
             ) => {
                 if execution
                     .lifecycle_profile()

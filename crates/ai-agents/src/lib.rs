@@ -99,6 +99,24 @@
 ///     Ok((runner, paused))
 /// }
 /// ```
+///
+/// Managed actor maintenance and speculative alternatives reuse the same live owner and invocation ledger.
+/// Custom callbacks and storage consumers opt in with their actual captured provider handles; an empty list certifies no hidden model work, not an execution grant.
+///
+/// ```
+/// use ai_agents::{AgentHooks, LLMProvider};
+/// use std::sync::Arc;
+///
+/// struct CallerOwnedAudit;
+/// impl AgentHooks for CallerOwnedAudit {
+///     fn task_providers(&self) -> Option<Vec<Arc<dyn LLMProvider>>> {
+///         // This implementation uses only the trait's no-op callbacks and has no model or detached work.
+///         Some(Vec::new())
+///     }
+/// }
+/// let hooks: Arc<dyn AgentHooks> = Arc::new(CallerOwnedAudit);
+/// assert!(hooks.task_providers().unwrap().is_empty());
+/// ```
 pub mod autonomy {
     pub use ai_agents_runtime::autonomy::*;
 }

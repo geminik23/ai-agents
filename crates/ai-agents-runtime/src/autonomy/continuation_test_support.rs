@@ -140,6 +140,28 @@ impl TaskRunStore for ReceiptStore {
                         .consumed_request_ids
                         .iter()
                         .any(|consumed| consumed == id)
+                } else if let Some(purpose) = binding
+                    .get("maintenance")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    let expected = if binding["phase"] == "admit" {
+                        TaskEffectState::Dispatched
+                    } else {
+                        TaskEffectState::Completed
+                    };
+                    payload
+                        .adapters
+                        .iter()
+                        .filter(|adapter| {
+                            adapter.adapter == "runtime.maintenance"
+                                && adapter.config["purpose"] == purpose
+                        })
+                        .any(|adapter| {
+                            let id = adapter.id.strip_prefix("maintenance:").unwrap();
+                            payload.reservations.iter().any(|reservation| {
+                                reservation.id == id && reservation.state == expected
+                            })
+                        })
                 } else if let Some(tool) = binding.get("tool").and_then(serde_json::Value::as_str) {
                     payload.reservations.iter().any(|reservation| {
                         let expected = if binding["phase"] == "admit" {
@@ -324,6 +346,11 @@ impl ResponseGate {
 }
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for ResponseGate {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     // A dropped finalization callback is not acknowledgement that the root completed.
     async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
         self.calls.fetch_add(1, Ordering::SeqCst);

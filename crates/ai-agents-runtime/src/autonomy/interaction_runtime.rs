@@ -418,6 +418,11 @@ impl RuntimeAgent {
                         {
                             self.update_active_turn_context(&data.content, data.context.clone());
                         }
+                        if let TaskInteractionKind::StateApproval { return_to, .. } = &state.kind
+                            && let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } = return_to.as_ref()
+                        {
+                            self.restore_speculative_context(selection);
+                        }
                         *self.active_native_exchanges.write() = state
                             .native_exchanges
                             .iter()

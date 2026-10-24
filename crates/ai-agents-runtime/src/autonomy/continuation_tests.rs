@@ -1,4 +1,7 @@
 use super::*;
+
+#[path = "ad_narrow_tests.rs"]
+mod ad_narrow_tests;
 use ai_agents_core::{
     FinishReason, LLMResponse, Tool, ToolCallSource, ToolExecutionContext, ToolExecutionRequest,
     ToolInvoker, ToolResult, ToolSafetyMetadata,

@@ -227,6 +227,11 @@ fn decode_nibble(value: u8) -> Option<u8> {
 
 #[async_trait]
 impl AgentStorage for NamespacedStorage {
+    /// Namespace forwarding preserves the actual backend's task conformity and captured model handles.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        self.inner.task_providers()
+    }
+
     fn supports(&self, capability: StorageCapability) -> bool {
         FORWARDED_CAPABILITIES.contains(&capability) && self.inner.supports(capability)
     }

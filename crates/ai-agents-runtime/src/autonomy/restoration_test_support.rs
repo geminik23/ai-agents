@@ -155,10 +155,14 @@ pub(super) struct RebuildHost {
     providers: parking_lot::Mutex<Providers>,
     pub staged: parking_lot::Mutex<Weak<RuntimeAgent>>,
     pub clock: parking_lot::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+    epoch: chrono::DateTime<chrono::Utc>,
+    started: std::time::Instant,
 }
 impl RebuildHost {
-    // Weak indexes witness actual host implementations without extending the lifetime of any old executable object.
+    // Weak indexes witness actual implementations; one certified local UTC anchor and monotonic elapsed time keep positive fixtures independent of later OS clock rollback.
     pub fn new(recipe: &'static str, source: &FreshRuntime, factory: Box<Factory>) -> Arc<Self> {
+        let started = std::time::Instant::now();
+        let epoch = chrono::Utc::now();
         let host = Arc::new(Self {
             recipe,
             factory,
@@ -169,6 +173,8 @@ impl RebuildHost {
             providers: Default::default(),
             staged: Default::default(),
             clock: Default::default(),
+            epoch,
+            started,
         });
         host.register(source);
         host
@@ -194,9 +200,17 @@ impl TaskRestoreHost for RebuildHost {
     fn reconstruction_budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(5)
     }
-    // The test host certifies UTC continuity and can deliberately provide an invalid sample for denial regressions.
+    // This same-process fixture certifies continuity from its fixed UTC epoch, not repeated unchecked OS samples.
+    // Deliberate overrides still exercise rollback rejection; no work budget or original request deadline is widened.
     fn now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
-        Ok(self.clock.lock().unwrap_or_else(chrono::Utc::now))
+        if let Some(clock) = *self.clock.lock() {
+            return Ok(clock);
+        }
+        let elapsed = chrono::Duration::from_std(self.started.elapsed())
+            .map_err(|_| AgentError::Config("fixture clock elapsed overflow".into()))?;
+        self.epoch
+            .checked_add_signed(elapsed)
+            .ok_or_else(|| AgentError::Config("fixture clock projection overflow".into()))
     }
     // Behavioral queue state is opaque host data; invocation counters are not execution state and are not restored.
     fn runtime_binding(

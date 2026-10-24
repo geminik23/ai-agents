@@ -64,6 +64,11 @@ impl ai_agents_hitl::ApprovalHandler for NoApproval {
 struct Responses(Arc<AtomicUsize>);
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for Responses {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
         self.0.fetch_add(1, Ordering::SeqCst);
     }

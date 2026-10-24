@@ -18,6 +18,11 @@ use std::sync::{
 struct Trace(parking_lot::Mutex<Vec<String>>);
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for Trace {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_tool_start(&self, id: &str, _: &Value) {
         self.0.lock().push(format!("start:{id}"));
     }

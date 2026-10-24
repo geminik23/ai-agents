@@ -83,6 +83,11 @@ fn purpose_for_tool_record(record: &ToolExecutionRecord) -> ObservationPurpose {
 
 #[async_trait]
 impl AgentHooks for ObservabilityHooks {
+    /// These hooks record events in the existing manager without model calls or detached effect work.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_tool_execution_record(&self, record: &ToolExecutionRecord) {
         if !self.manager.config().latency.track_tools || record.executed {
             return;

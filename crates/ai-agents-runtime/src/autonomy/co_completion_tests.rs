@@ -469,6 +469,11 @@ struct DelegateGate {
 }
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for DelegateGate {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     // Hold the successor before its declared frame exists, until its predecessor has a durable failed outcome.
     async fn on_delegate_start(&self, _: &str, _: &str) {
         self.entered.add_permits(1);

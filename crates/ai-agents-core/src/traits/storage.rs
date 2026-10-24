@@ -110,6 +110,13 @@ impl std::fmt::Display for StorageCapability {
 /// Implement this for custom persistence (e.g., PostgreSQL, DynamoDB).
 #[async_trait]
 pub trait AgentStorage: Send + Sync {
+    /// Certifies caller-owned storage operations and enumerates captured model handles for managed task participation.
+    /// A returned error may represent a partial commit; no detached work or automatic effect replay is certified by this declaration.
+    /// None leaves ordinary storage usable but rejects managed actor maintenance; provider-free conforming stores return an empty list.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn super::llm::LLMProvider>>> {
+        None
+    }
+
     /// Return whether this backend implements a storage feature.
     fn supports(&self, capability: StorageCapability) -> bool {
         capability == StorageCapability::Snapshot
@@ -296,6 +303,11 @@ pub struct NoopStorage;
 
 #[async_trait]
 impl AgentStorage for NoopStorage {
+    /// Unsupported operations have no provider work; capability checks still reject actual persistence requirements.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn super::llm::LLMProvider>>> {
+        Some(vec![])
+    }
+
     fn supports(&self, _capability: StorageCapability) -> bool {
         false
     }

@@ -85,7 +85,7 @@ impl RuntimeAgent {
                 Ok((alias, provider.provider_name().to_string()))
             })
             .collect::<Result<_>>()?;
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "prompt": self.base_system_prompt, "iterations":self.max_iterations,
             "context_tokens":self.max_context_tokens, "skills":self.skills,
             "states":self.state_machine.as_ref().map(|machine| machine.config()),
@@ -99,6 +99,9 @@ impl RuntimeAgent {
             "disambiguation":self.disambiguation_manager.as_ref().map(|manager| manager.config()),
             "actor_memory":self.actor_memory_config,"facts":self.facts_config,
         });
+        if let Some(manager) = &self.relationship_manager {
+            value["relationships"] = serde_json::to_value(manager.config())?;
+        }
         Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(&value)?)))
     }
 
@@ -147,18 +150,28 @@ impl RuntimeAgent {
     }
 
     /// Session and local bookkeeping are exact restoration state, not conversation replay or semantic callbacks.
+    /// Actor caches and extraction progress survive a prepared safe pause without repeating completed maintenance.
     pub(crate) async fn task_restore_session(&self) -> Result<Value> {
         let manager = match &self.disambiguation_manager {
             Some(manager) => manager.pending_checkpoint().await?,
             None => None,
         };
-        Ok(serde_json::json!({
+        let mut value = serde_json::json!({
             "id":*self.current_session_id.read(), "metadata":*self.session_metadata.read(),
             "actor":*self.actor_id.read(), "initialized":self.context_initialized.load(Ordering::SeqCst),
             "pending_skill":*self.pending_skill_id.read(),"plan":*self.current_plan.read(),
             "manager":manager,
             "mutations":self.observation_mutations.load(Ordering::SeqCst),
-        }))
+        });
+        if self.facts_config.is_some()
+            || self.actor_memory_config.is_some()
+            || self.relationship_manager.is_some()
+        {
+            value["actor_facts"] = serde_json::to_value(&*self.actor_facts_cache.read())?;
+            value["extraction_count"] =
+                serde_json::to_value(*self.messages_since_extraction.read())?;
+        }
+        Ok(value)
     }
 
     /// Captures the prepared provider registry as an actual host binding, not a deserialized alias map.
@@ -266,6 +279,12 @@ impl RuntimeAgent {
         *self.current_session_id.write() = serde_json::from_value(session["id"].clone())?;
         *self.session_metadata.write() = serde_json::from_value(session["metadata"].clone())?;
         *self.actor_id.write() = serde_json::from_value(session["actor"].clone())?;
+        if let Some(facts) = session.get("actor_facts") {
+            *self.actor_facts_cache.write() = serde_json::from_value(facts.clone())?;
+        }
+        if let Some(count) = session.get("extraction_count") {
+            *self.messages_since_extraction.write() = serde_json::from_value(count.clone())?;
+        }
         *self.pending_skill_id.write() = serde_json::from_value(session["pending_skill"].clone())?;
         *self.current_plan.write() = serde_json::from_value(session["plan"].clone())?;
         self.context_initialized.store(

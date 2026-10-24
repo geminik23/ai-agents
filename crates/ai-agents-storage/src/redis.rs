@@ -272,6 +272,11 @@ impl RedisStorage {
 #[cfg(feature = "redis-storage")]
 #[async_trait]
 impl AgentStorage for RedisStorage {
+    /// The snapshot adapter has no model work; transport errors retain their existing ambiguous-effect semantics.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn save(&self, session_id: &str, snapshot: &AgentSnapshot) -> Result<()> {
         let mut conn = self.get_connection().await?;
 

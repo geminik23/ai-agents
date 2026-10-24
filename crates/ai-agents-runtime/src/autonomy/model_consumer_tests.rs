@@ -58,6 +58,11 @@ struct Gate {
 }
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for Gate {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
         if self.active.load(Ordering::SeqCst) {
             self.entered.add_permits(1);

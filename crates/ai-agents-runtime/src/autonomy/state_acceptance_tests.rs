@@ -51,6 +51,11 @@ struct Hooks {
 }
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for Hooks {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_response(&self, _: &ai_agents_core::AgentResponse) {
         self.responses.fetch_add(1, Ordering::SeqCst);
     }
@@ -617,6 +622,11 @@ struct HookGate {
 }
 #[async_trait]
 impl ai_agents_hooks::AgentHooks for HookGate {
+    // This fixture owns its counters and gated waits in the caller and performs no hidden provider or detached work.
+    fn task_providers(&self) -> Option<Vec<std::sync::Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(vec![])
+    }
+
     async fn on_state_transition(&self, _: Option<&str>, _: &str, _: &str) {
         if self.point == "transition" {
             self.calls.fetch_add(1, Ordering::SeqCst);
