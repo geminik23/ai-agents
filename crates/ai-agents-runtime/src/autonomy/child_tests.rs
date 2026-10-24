@@ -234,7 +234,7 @@ async fn register(
 }
 
 // Direct orchestration SDK calls share exactly the same foreground reservation and conditional ledger as the runner.
-async fn execution(max_llm_calls: u32) -> (Arc<RuntimeAgent>, Arc<RunExecution>) {
+pub(super) async fn execution(max_llm_calls: u32) -> (Arc<RuntimeAgent>, Arc<RunExecution>) {
     let mut provider = MockLLMProvider::new("parent");
     provider.set_response("done");
     let parent = Arc::new(
@@ -311,7 +311,7 @@ async fn execution(max_llm_calls: u32) -> (Arc<RuntimeAgent>, Arc<RunExecution>)
 }
 
 // Acknowledged success releases children only after the parent terminal CAS, never at the end of an individual child turn.
-async fn finish(parent: &RuntimeAgent, execution: &RunExecution) {
+pub(super) async fn finish(parent: &RuntimeAgent, execution: &RunExecution) {
     let saved = execution
         .terminal(TaskRunStatus::Completed, "complete".into())
         .await

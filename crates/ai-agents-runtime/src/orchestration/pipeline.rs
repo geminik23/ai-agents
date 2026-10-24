@@ -36,6 +36,7 @@ pub async fn pipeline(
 }
 
 /// Saved stage cursor selection belongs only to the framework parent entry, not to callbacks invoking a nested public pipeline.
+/// A task-scoped SDK pipeline pins unstarted registered stages across earlier turns and awaited hooks.
 async fn pipeline_dispatch(
     registry: &AgentRegistry,
     input: &str,
@@ -55,6 +56,8 @@ async fn pipeline_dispatch(
         .map(|execution| execution.composition_frame())
         .transpose()?
         .flatten();
+    let _catalogue =
+        registry.capture_task_catalogue(stages.iter().map(|stage| stage.agent_id.as_str()))?;
     let original_input = input.to_string();
     let mut cursor = if let Some(value) = frame
         .as_ref()
@@ -122,6 +125,9 @@ async fn pipeline_dispatch(
                 i, agent_id
             ))
         })?;
+
+        // A target registered after initial catalogue capture still needs protection before its first gate wait.
+        let _target_pin = registry.capture_task_target(agent_id, &agent)?;
 
         // Build the effective input for this stage.
         let effective_input = if let Some(prepared) = &cursor.prepared_input {

@@ -30,6 +30,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task composition: preserve distinct repeated-child operations through pause and outcome acknowledgement, and unblock successors after settled optional nested failures without replaying completed work
+- Task owner cleanup: interrupted child release can resume without inspecting or clearing a newer owner of an already released runtime
 - Task checkpoint latency: reduce repeated recovery-data processing during nested continuation while preserving complete validation, exact receipts and original deadlines
 - Task response admission: retain the original reviewed implementation and request deadlines through preparation and admission waits, use the actual pending child's timeout policy, and preserve exact timeout dispositions across later gates without transferring approval
 - Task command evidence: approved replacement commands retain their actual execution records without proving success of the original validation command or changed working-directory, argv or environment operands
@@ -54,7 +56,7 @@
 - Task message continuation: retain pipeline/concurrent/group/handoff/broadcast cursors and generated-child identity; capture all prior declared/model dispatches, validate dynamic group predecessors and reject ancestor-source waits without replay or premature reentry
 - Task limit revision: keep controller and admission ceilings consistent, reject expired backend control writes and invalid acknowledgements, and preserve live pauses after proven non-writing refusal
 - Task checkpoint reads: serialize snapshot delivery with shared updates so parallel participants do not spuriously stop with ownership conflicts
-- Task registry: retain actual registered instances through task cleanup, prevent removal and admission races, and protect newer catalogue reservations from stale cleanup
+- Task registry: retain actual registered instances through task cleanup and blocking SDK preparation, including unstarted manager/synthesizer agents and late-registered targets; prevent removal and admission races without granting execution authority
 - Task broadcasts: preserve optional dependency failure policy across spawned recipients and return results in stable registry-ID order
 - Interrupted turns: dropping a pending state re-dispatch no longer leaves later messages and response hooks attached to the abandoned turn
 - Shared model providers: concurrent requests retain their own prompt and model settings through dispatch and stream opening, including extra fallback settings and exact configuration cache matching

@@ -88,6 +88,7 @@ pub async fn group_chat_with_llms(
 }
 
 /// The original conversation algorithms share one cursor only with the owning dispatch; provider callbacks cannot borrow it.
+/// Registered participants remain pinned across speaker/consensus waits even for inherited blocking SDK participation.
 async fn group_chat_dispatch(
     registry: &AgentRegistry,
     topic: &str,
@@ -99,6 +100,24 @@ async fn group_chat_dispatch(
         return Err(AgentError::Config("No participants in group chat".into()));
     }
 
+    let _catalogue = registry.capture_task_catalogue(
+        config
+            .participants
+            .iter()
+            .map(|participant| participant.id.as_str())
+            .chain(
+                config
+                    .manager
+                    .iter()
+                    .filter_map(|manager| manager.agent.as_deref()),
+            )
+            .chain(
+                config
+                    .debate
+                    .iter()
+                    .map(|debate| debate.synthesizer.as_str()),
+            ),
+    )?;
     let start = std::time::Instant::now();
     let mut cursor =
         read_chat_cursor::<GroupChatCursor>("group_chat")?.unwrap_or_else(|| GroupChatCursor {
@@ -192,6 +211,7 @@ async fn group_chat_dispatch(
                     ))
                 })?;
 
+                let _target_pin = registry.capture_task_target(participant_id, &agent)?;
                 let role_line = match find_role(&config.participants, participant_id) {
                     Some(role) => format!("\nYour role: {}\n", role),
                     None => String::new(),
@@ -275,6 +295,7 @@ async fn group_chat_dispatch(
                             manager_id
                         ))
                     })?;
+                    let _target_pin = registry.capture_task_target(manager_id, &manager_agent)?;
                     let decision = ask_manager_continue(
                         manager_agent.as_ref(),
                         topic,
@@ -506,6 +527,7 @@ async fn run_llm_directed_round(
                         manager_id
                     ))
                 })?;
+                let _target_pin = registry.capture_task_target(manager_id, &manager_agent)?;
                 manager_select_speaker(
                     manager_agent.as_ref(),
                     &config.participants,
@@ -526,6 +548,7 @@ async fn run_llm_directed_round(
             AgentError::Other(format!("Group chat participant not found: {}", next_id))
         })?;
 
+        let _target_pin = registry.capture_task_target(&next_id, &agent)?;
         let role_line = match find_role(&config.participants, &next_id) {
             Some(role) => format!("\nYour role: {}\n", role),
             None => String::new(),
@@ -782,6 +805,8 @@ async fn run_maker_checker(
         .get(checker_id)
         .ok_or_else(|| AgentError::Other(format!("Checker agent not found: {}", checker_id)))?;
 
+    let _maker_pin = registry.capture_task_target(maker_id, &maker)?;
+    let _checker_pin = registry.capture_task_target(checker_id, &checker)?;
     let mut cursor =
         read_chat_cursor::<MakerCheckerCursor>("maker_checker")?.unwrap_or_else(|| {
             MakerCheckerCursor {
@@ -967,6 +992,7 @@ async fn run_debate(
                 AgentError::Other(format!("Debate participant not found: {}", participant.id))
             })?;
 
+            let _target_pin = registry.capture_task_target(&participant.id, &agent)?;
             let role_hint = participant.role.as_deref().unwrap_or("participant");
 
             let prompt = format!(
@@ -1022,6 +1048,8 @@ async fn run_debate(
         conclusion.clone()
     } else if let Some(ref debate_config) = config.debate {
         if let Some(synth_agent) = registry.get(&debate_config.synthesizer) {
+            let _target_pin =
+                registry.capture_task_target(&debate_config.synthesizer, &synth_agent)?;
             let synth_prompt = format!(
                 "Synthesize this debate into a balanced conclusion:\n\n{}",
                 debate_text

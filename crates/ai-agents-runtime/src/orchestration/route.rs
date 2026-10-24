@@ -11,7 +11,8 @@ use crate::Agent;
 use crate::spawner::AgentRegistry;
 use crate::turn_context::current_turn_actor_context;
 
-/// Routes ordinary input using the existing selection behavior and actor-scoped child entry.
+/// Routes input using existing selection behavior and actor-scoped child entry.
+/// Inherited task execution pins the selected registration before waiting for the child's root gate.
 pub async fn route(
     registry: &AgentRegistry,
     llm: &dyn LLMProvider,
@@ -24,6 +25,7 @@ pub async fn route(
     let agent = registry.get(&selected).ok_or_else(|| {
         AgentError::Other(format!("Routed agent not found in registry: {selected}"))
     })?;
+    let _target_pin = registry.capture_task_target(&selected, &agent)?;
     let response = if let Some(context) = current_turn_actor_context() {
         agent.chat_with_actor_context(input, context).await?
     } else {

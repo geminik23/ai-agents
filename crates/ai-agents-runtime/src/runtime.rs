@@ -1508,6 +1508,7 @@ impl RuntimeAgent {
 
     /// Runs a child under its own gate and reservation with inherited accounting and protection after drop or failed acknowledgement.
     /// Dependency-only reentry needs acknowledged predecessor retirement, and child outcome acknowledgement precedes aggregation and release.
+    /// A slot waiting for the root gate must observe a sibling's closed admission barrier before classifying a parked-target conflict.
     fn run_task_participant<'a>(
         &'a self,
         input: &'a str,
@@ -1589,6 +1590,9 @@ impl RuntimeAgent {
                     } }
                 }
             }).await.map_err(|_| AgentError::Other("child root admission deadline exceeded".into()))??;
+            if let Some(parent) = crate::autonomy::composition::composition_admission_denial() {
+                return Err(AgentError::TaskSuspended(parent));
+            }
             let incoming = crate::autonomy::current_child_invocation(&self.info.id);
             if execution.target_has_pending_operation(&self.info.id, incoming.as_deref()) {
                 return Err(AgentError::Config(

@@ -30,17 +30,18 @@ pub struct SpawnedAgentInfo {
 
 /// Tracks spawned agents and provides inter-agent messaging.
 pub struct AgentRegistry {
-    agents: RwLock<HashMap<String, Arc<SpawnedAgent>>>,
+    agents: Arc<RwLock<HashMap<String, Arc<SpawnedAgent>>>>,
     hooks: Option<Arc<dyn RegistryHooks>>,
     /// When true, `send()` prefixes messages with `[From {sender}]: `.
     send_with_context: bool,
-    task_pins: Mutex<HashMap<String, usize>>,
+    task_pins: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 /// A live catalogue reservation pins one actual registered instance, including before its first turn is admitted.
 pub(crate) struct PinnedTaskAgent {
     pub(crate) agent: Arc<RuntimeAgent>,
-    registry: Arc<AgentRegistry>,
+    agents: Arc<RwLock<HashMap<String, Arc<SpawnedAgent>>>>,
+    pins: Arc<Mutex<HashMap<String, usize>>>,
     id: String,
 }
 
@@ -50,7 +51,7 @@ impl PinnedTaskAgent {
         &self,
         action: impl FnOnce(&Arc<RuntimeAgent>) -> Result<T>,
     ) -> Result<T> {
-        let agents = self.registry.agents.read();
+        let agents = self.agents.read();
         let actual = agents
             .get(&self.id)
             .ok_or_else(|| AgentError::Config("task registry target disappeared".into()))?;
@@ -66,7 +67,7 @@ impl PinnedTaskAgent {
 impl Drop for PinnedTaskAgent {
     /// Each guard retires only its own reservation; another run's pin cannot be released by stale cleanup.
     fn drop(&mut self) {
-        let mut pins = self.registry.task_pins.lock();
+        let mut pins = self.pins.lock();
         if let Some(count) = pins.get_mut(&self.id) {
             *count -= 1;
             if *count == 0 {
@@ -79,10 +80,10 @@ impl Drop for PinnedTaskAgent {
 impl AgentRegistry {
     pub fn new() -> Self {
         Self {
-            agents: RwLock::new(HashMap::new()),
+            agents: Arc::new(RwLock::new(HashMap::new())),
             hooks: None,
             send_with_context: true,
-            task_pins: Mutex::new(HashMap::new()),
+            task_pins: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -235,7 +236,7 @@ impl AgentRegistry {
 
     /// Capture the actual implementation under the registry lock; labels alone cannot establish a task catalogue binding.
     pub(crate) fn pin_task_target(
-        self: &Arc<Self>,
+        &self,
         id: &str,
         runtime_id: &str,
     ) -> Result<Arc<PinnedTaskAgent>> {
@@ -253,9 +254,47 @@ impl AgentRegistry {
             .ok_or_else(|| AgentError::Config("task catalogue reservation overflow".into()))?;
         Ok(Arc::new(PinnedTaskAgent {
             agent: actual.agent.clone(),
-            registry: self.clone(),
+            agents: self.agents.clone(),
+            pins: self.task_pins.clone(),
             id: id.into(),
         }))
+    }
+
+    /// Blocking SDK consumers retain the exact registered object across preparation and root-gate waits under an inherited task.
+    /// This registration guard grants no invocation authority; the child still passes its own final admission.
+    pub(crate) fn capture_task_target(
+        &self,
+        id: &str,
+        target: &Arc<RuntimeAgent>,
+    ) -> Result<Option<Arc<PinnedTaskAgent>>> {
+        if crate::autonomy::current_execution().is_none() {
+            return Ok(None);
+        }
+        let pinned = self.pin_task_target(id, &target.info().id)?;
+        if !Arc::ptr_eq(&pinned.agent, target) {
+            return Err(AgentError::Config(
+                "task target changed before capture".into(),
+            ));
+        }
+        Ok(Some(pinned))
+    }
+
+    /// Pins available catalogue entries for a blocking SDK composition before hooks or auxiliary calls can yield.
+    /// The original algorithm still validates missing targets when used; this guard adds no new selection or execution authority.
+    pub(crate) fn capture_task_catalogue<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a str>,
+    ) -> Result<Vec<Arc<PinnedTaskAgent>>> {
+        if crate::autonomy::current_execution().is_none() {
+            return Ok(Vec::new());
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                self.get(id)
+                    .map(|agent| self.capture_task_target(id, &agent))
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(|pins| pins.into_iter().flatten().collect())
     }
 
     /// Clone an Arc handle to a registered agent's RuntimeAgent.
@@ -474,6 +513,7 @@ impl AgentRegistry {
                 let child = self
                     .get(to)
                     .ok_or_else(|| AgentError::Other(format!("Routed agent not found: {to}")))?;
+                let _target_pin = self.capture_task_target(to, &child)?;
                 return if let Some(actor) = actor {
                     child.chat_with_actor_context(input, actor).await
                 } else {
@@ -538,6 +578,7 @@ impl AgentRegistry {
         })
     }
 
+    /// Task-scoped blocking messages pin membership before sender hooks, while ordinary messaging keeps its snapshot semantics.
     async fn send_inner(
         &self,
         from: &str,
@@ -553,6 +594,7 @@ impl AgentRegistry {
         let target =
             target.ok_or_else(|| AgentError::Other(format!("Target agent not found: {}", to)))?;
 
+        let _target_pin = self.capture_task_target(to, &target)?;
         if let Some(ref hooks) = self.hooks {
             hooks.on_message_sent(from, to, message).await;
         }
@@ -595,6 +637,7 @@ impl AgentRegistry {
 
     /// Captures ancestry, shared admission, original invocation restrictions and mutation tracking before spawning recipients.
     /// Losing task-locals at a broadcast boundary must not turn an optional nested dependency into a global required-child stop.
+    /// Each task-scoped recipient retains its actual registration until its invocation returns, including while its root gate is busy.
     async fn broadcast_inner(
         &self,
         from: &str,
@@ -639,6 +682,7 @@ impl AgentRegistry {
             let gate_identity_stack = Arc::clone(&gate_identity_stack);
             let execution = crate::autonomy::current_execution();
             let invocation = crate::autonomy::invocation::InvocationScope::capture();
+            let target_pin = self.capture_task_target(&id, &agent);
             handles.push(tokio::spawn(Box::pin(async move {
                 crate::autonomy::scope_child_requirement(
                     required,
@@ -648,6 +692,10 @@ impl AgentRegistry {
                         Box::pin(scope_runtime_gate_identity_stack(
                             &gate_identity_stack,
                             async move {
+                                let _target_pin = match target_pin {
+                                    Ok(pin) => pin,
+                                    Err(error) => return (id, Err(error)),
+                                };
                                 let run = async move {
                                     if let Some(context) = context {
                                         agent.chat_with_actor_context(&msg, context).await

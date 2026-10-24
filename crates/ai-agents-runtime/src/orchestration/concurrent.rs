@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ai_agents_core::{AgentError, Result};
@@ -78,6 +79,9 @@ pub async fn concurrent_with_llms(
 
 /// Only the owning public entry receives parent cursor authority; nested callbacks retain ordinary orchestration semantics.
 /// Spawned participants inherit live invocation bounds, proof guards and mutation tracking alongside the coordinating ledger.
+/// Blocking SDK participation also pins every resolved registration before spawning children or awaiting settlement.
+/// Task-scoped repeated actual runtimes wait for predecessor return, including ordinary outcome acknowledgement, not only the shorter root-gate interval.
+/// An already parked incoming operation precedes unstarted slots even when JoinSet polls the successor first.
 #[allow(clippy::too_many_arguments)]
 async fn concurrent_dispatch(
     registry: &AgentRegistry,
@@ -121,6 +125,11 @@ async fn concurrent_dispatch(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let _target_pins = agents
+        .iter()
+        .zip(&targets)
+        .map(|(reference, target)| registry.capture_task_target(reference.id(), target))
+        .collect::<Result<Vec<_>>>()?;
     let deadlines: Vec<Option<chrono::DateTime<chrono::Utc>>> = if let Some(value) = frame
         .as_ref()
         .and_then(|frame| frame.cursor.get("deadlines"))
@@ -158,16 +167,35 @@ async fn concurrent_dispatch(
     // Tokio task-locals do not cross JoinSet::spawn, so all children inherit one immutable snapshot of the caller's complete root ownership chain.
     //
     let gate_identity_stack = current_runtime_gate_identity_stack();
+    let mut target_completions = HashMap::new();
+    let mut incoming: Vec<_> = (0..agents.len())
+        .filter(|index| !results.iter().any(|result| result.agent_index == *index))
+        .collect();
+    if let (Some(execution), Some(frame)) = (&execution, &frame) {
+        let snapshot = execution.acknowledged_snapshot();
+        incoming.sort_by_key(|index| {
+            let parked = frame.children.get(*index).is_some_and(|slot| {
+                snapshot.payload["children"]
+                    .as_array()
+                    .is_some_and(|children| {
+                        children.iter().any(|child| {
+                            child["child_id"] == slot.operation && !child["pending"].is_null()
+                        })
+                    })
+            });
+            (!parked, *index)
+        });
+    }
 
-    for (agent_index, agent_ref) in agents.iter().enumerate() {
-        if results
-            .iter()
-            .any(|result| result.agent_index == agent_index)
-        {
-            continue;
-        }
-        let agent_id = agent_ref.id().to_string();
+    for agent_index in incoming {
+        let agent_id = agents[agent_index].id().to_string();
         let agent = targets[agent_index].clone();
+        let (completed, completion) = tokio::sync::oneshot::channel::<()>();
+        let predecessor = if execution.is_some() {
+            target_completions.insert(Arc::as_ptr(&agent) as usize, completion)
+        } else {
+            None
+        };
         let slot = frame
             .as_ref()
             .map(|frame| {
@@ -212,12 +240,23 @@ async fn concurrent_dispatch(
                                     agent.chat(&input_owned).await
                                 }
                             };
-                            let run = composition::run_composition_child(
-                                scope,
-                                slot,
-                                response_custody,
-                                run,
-                            );
+                            let run = async {
+                                // A successor cannot overtake its exact same-target predecessor merely because its spawned task polls first.
+                                if let Some(predecessor) = predecessor {
+                                    predecessor.await.map_err(|_| {
+                                        AgentError::Other(
+                                            "concurrent predecessor did not settle".into(),
+                                        )
+                                    })?;
+                                }
+                                composition::run_composition_child(
+                                    scope,
+                                    slot,
+                                    response_custody,
+                                    run,
+                                )
+                                .await
+                            };
                             let result = if let Some(t) = timeout {
                                 match tokio::time::timeout(t, async {
                                     if let Some(context) = observation_context.clone() {
@@ -241,6 +280,9 @@ async fn concurrent_dispatch(
                                 run.await
                             };
 
+                            // Notification orders returned attempts, including errors/timeouts; it is not an ACK or proof of quiescence.
+                            // Existing stop, owner and final-admission guards still prohibit unsafe successor execution; drop/panic does not notify.
+                            let _ = completed.send(());
                             let duration_ms = agent_start.elapsed().as_millis() as u64;
                             match result {
                                 Err(error @ AgentError::TaskSuspended(_)) => Err(error),

@@ -46,6 +46,7 @@ pub async fn handoff(
 }
 
 /// A nested public handoff cannot consume its caller's already selected cursor or routing decision.
+/// Task-scoped SDK callers also pin available registrations before hooks and routing decisions can yield.
 async fn handoff_dispatch(
     registry: &AgentRegistry,
     input: &str,
@@ -62,6 +63,9 @@ async fn handoff_dispatch(
         .map(|execution| execution.composition_frame())
         .transpose()?
         .flatten();
+    let _catalogue = registry.capture_task_catalogue(
+        std::iter::once(initial_agent).chain(available_agents.iter().map(String::as_str)),
+    )?;
     let saved = frame.as_ref().and_then(|frame| frame.cursor.get("handoff"));
     let mut cursor = saved
         .map(|value| serde_json::from_value::<TaskHandoffCursor>(value.clone()))
@@ -110,6 +114,7 @@ async fn handoff_dispatch(
             AgentError::Other(format!("Handoff agent not found: {}", current_agent))
         })?;
 
+        let _target_pin = registry.capture_task_target(&current_agent, &agent)?;
         debug!(agent = %current_agent, "Handoff chain executing agent");
 
         let response = if let Some(response) = &cursor.response {

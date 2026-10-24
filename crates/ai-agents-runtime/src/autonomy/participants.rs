@@ -118,7 +118,8 @@ impl Participants {
         Ok(())
     }
 
-    /// Release follows acknowledgement and quiescence; already retired slots are idempotent, but foreign owners remain protected.
+    /// Release follows acknowledgement and quiescence; each retired member is forgotten before awaiting another gate.
+    /// Interrupted cleanup can retry without touching a newer owner of an already released runtime, while foreign live members remain protected.
     /// Uncertain owners remain reserved until an explicit host reconciliation.
     pub(crate) async fn release(&self) -> Result<()> {
         if self.unsettled() {
@@ -134,6 +135,13 @@ impl Participants {
             .collect();
         for (owner, slot) in members {
             let _gate = owner.gate.lock().await;
+            let mut members = self.members.lock();
+            if !members
+                .iter()
+                .any(|member| Arc::ptr_eq(&member.owner, &owner))
+            {
+                continue;
+            }
             let mut current = slot.write();
             if current
                 .as_ref()
@@ -142,8 +150,8 @@ impl Participants {
                 return Err(AgentError::Other("child release owner mismatch".into()));
             }
             *current = None;
+            members.retain(|member| !Arc::ptr_eq(&member.owner, &owner));
         }
-        self.members.lock().clear();
         Ok(())
     }
 }
@@ -320,6 +328,7 @@ impl RunExecution {
     }
 
     /// Stores the exact child runtime before its first effect, then an immutable result after its local turn settles.
+    /// An acknowledged settled outcome retires its declared dispatch even on optional failure; uncertain work retains its recovery protection.
     pub(crate) async fn checkpoint_child(
         &self,
         operation: &str,
@@ -327,6 +336,7 @@ impl RunExecution {
         input: &str,
         outcome: Option<&Result<AgentResponse>>,
     ) -> Result<()> {
+        let runtime_id = runtime.snapshot.agent_id.clone();
         let result = outcome.map(|outcome| match outcome {
             Ok(response) => json!({"response":response}),
             Err(error) => json!({"error":error.to_string()}),
@@ -373,6 +383,15 @@ impl RunExecution {
             Ok(())
         })
         .await?;
+        if outcome.is_some() && self.stop_reason().is_none() {
+            let mut frames = self.delegate_frames.lock();
+            if frames
+                .get(&runtime_id)
+                .is_some_and(|frame| frame.parent_operation.as_deref() == Some(operation))
+            {
+                frames.remove(&runtime_id);
+            }
+        }
         Ok(())
     }
 
@@ -389,5 +408,39 @@ impl RunExecution {
             }
             tokio::select! { _ = notified => {}, _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {} }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A dropped release may have already freed one slot; retry must not inspect or clear its newer owner.
+    #[tokio::test]
+    async fn co_completion_partial_release_retries_without_touching_new_owner() {
+        let members = Participants::default();
+        let first =
+            RunOwner::new("old".into(), Arc::new(tokio::sync::Mutex::new(())), None).unwrap();
+        let second =
+            RunOwner::new("old".into(), Arc::new(tokio::sync::Mutex::new(())), None).unwrap();
+        let first_slot = Arc::new(parking_lot::RwLock::new(None));
+        let second_slot = Arc::new(parking_lot::RwLock::new(None));
+        members.enroll(first.clone(), first_slot.clone()).unwrap();
+        members.enroll(second.clone(), second_slot.clone()).unwrap();
+        members.active.store(0, Ordering::Release);
+        let blocked = second.gate.lock().await;
+        let mut release = Box::pin(members.release());
+        assert!(futures::poll!(release.as_mut()).is_pending());
+        assert!(first_slot.read().is_none());
+        assert!(second_slot.read().is_some());
+        drop(release);
+        let newer = RunOwner::new("new".into(), first.gate.clone(), None).unwrap();
+        *first_slot.write() = Some(newer.clone());
+        drop(blocked);
+        members.release().await.unwrap();
+        assert!(Arc::ptr_eq(first_slot.read().as_ref().unwrap(), &newer));
+        assert!(second_slot.read().is_none());
+        assert!(members.members.lock().is_empty());
+        members.release().await.unwrap();
     }
 }

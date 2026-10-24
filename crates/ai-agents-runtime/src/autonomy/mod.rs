@@ -45,6 +45,12 @@ mod checkpoint_tests;
 #[cfg(test)]
 mod child_tests;
 #[cfg(test)]
+mod co_completion_tests;
+#[cfg(test)]
+mod co_generated_tests;
+#[cfg(test)]
+mod co_routing_tests;
+#[cfg(test)]
 mod composition_tests;
 mod config;
 #[cfg(test)]
