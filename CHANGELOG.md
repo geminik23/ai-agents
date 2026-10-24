@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task artifact validation: development profiles collect authorized file metadata or explicit host artifact projections with exact validation-proof freshness
+- Task numeric telemetry: development completion gates consume acknowledged run-scoped observations across pause and reconstruction; missing, lossy and unmeasured metrics remain unknown
 - Task recovery: development-only reviewed recovery preserves interrupted usage and effect commitments without replay, including cancellation-only reconstruction of prepared cursors
 - Task persistence policies: development-only Rust profiles prepare restartable safe pauses and select a unique compatible startup checkpoint without consuming human decisions or adopting abandoned owners
 - Task priced execution: development-only audited model and endpoint contracts reserve complete token ceilings and bounded internal retries, settling matching complete usage while retaining unknown commitments
@@ -26,6 +28,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Task validation names: development check IDs reserve the runtime journal namespace and reject collisions before ownership or execution
 - Rust recovery compatibility: development task mutations add guarded reconciliation and cleanup-only claim/publication; custom stores opt into recovery and compatibility-aware candidate inspection
 - Rust session metadata: the setter now returns an ownership-aware result, and ordinary session rebinding and actor deletion reject reserved task runtimes
 - Rust recovery errors: exhaustive development storage-error matches distinguish clock continuity loss from actual admission deadline exhaustion
@@ -43,6 +46,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task reconstruction bounds: reject predictable intermediate-journal size failures before claiming a usable pause and compare registry membership independently of listing order
+- Task pause acknowledgements: verify exact batch and composed checkpoint receipts before transferring revision, numeric-observation cursors or safe-pause ownership
 - Task effect boundaries: recheck cancellation and clocks after final host proof, preserve acknowledged effects while rejecting late task credit, and retain ordinary timeout recovery and resumed-message history cleanup
 - Task branch identity: pre-invocation cancellations retain correlatable branch identities and truthful dispositions without refunding consumed alternatives
 - Task reconstruction clocks: distinguish backward UTC from expired allowance while preserving preclaim pauses and charged post-claim custody

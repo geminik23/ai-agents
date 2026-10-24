@@ -2,9 +2,9 @@
 use super::*;
 use crate::autonomy::restoration_test_support::{FreshRuntime, RebuildHost};
 
-struct CleanupAckStore {
-    inner: Arc<ScopedTaskRunStore>,
-    lost: AtomicBool,
+pub(super) struct CleanupAckStore {
+    pub(super) inner: Arc<ScopedTaskRunStore>,
+    pub(super) lost: AtomicBool,
 }
 #[async_trait]
 impl TaskRunStore for CleanupAckStore {

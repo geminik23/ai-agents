@@ -121,94 +121,228 @@ async fn rc_cancelled_interrupted_constructor_rebuilds_only_for_typed_cleanup_ev
 // Declared and nested child cursors use the same cleanup reconstruction; completed child effects and native prefixes are never replayed.
 #[tokio::test]
 async fn rc_cancelled_prepared_child_groups_keep_exact_ownership_and_native_cleanup() {
-    for pattern in [
-        "delegate: worker",
-        "concurrent:\n        agents: [worker, peer]\n        aggregation:\n          strategy: all",
-        "delegate: middle",
-    ] {
-        let mut host = host();
-        Arc::get_mut(&mut host).unwrap().root = AgentSpec::from_yaml_strict(&format!("name: RestoreRoot\nsystem_prompt: root\nstates:\n  initial: work\n  states:\n    work:\n      {pattern}\n")).unwrap();
-        let root = Box::pin(declared_source(&host, pattern)).await;
-        let store = Arc::new(
-            ScopedTaskRunStore::in_memory(root.info().id, None, "restore.v1".into()).unwrap(),
-        );
-        let runner = AutonomyRunner::try_new(
-            root,
-            config(),
-            Default::default(),
-            store.clone(),
-            "restore.v1".into(),
-        )
-        .unwrap();
-        let paused = runner.run("composed support", None).await.unwrap();
-        let prepared = runner
-            .checkpoint_for_restore(&paused.run.key.run_id, paused.run.revision, host.as_ref())
-            .await
-            .unwrap();
-        drop(runner);
-        let claimed = store
-            .mutate(
-                &prepared.run.key.run_id,
-                &TaskRunMutation::Claim {
-                    expected_revision: prepared.run.revision,
-                    owner_token: "interrupted-child-constructor".into(),
-                },
-            )
-            .await
-            .unwrap();
-        let source = store
-            .mutate(
-                &claimed.key.run_id,
-                &TaskRunMutation::RequestCancel {
-                    expected_revision: claimed.revision,
-                },
-            )
-            .await
-            .unwrap();
-        let mut cleanup = decision(&source, TaskRecoveryDisposition::CancelPrepared);
-        cleanup.interrupted_started_at = Some(claimed.updated_at);
-        let recovered = AutonomyRunner::reconcile_recovery(
-            store.clone(),
-            &source.key.run_id,
-            cleanup,
-            RecoveryProof::new(&source),
-        )
-        .await
-        .unwrap();
-        let calls = host.calls.load(Ordering::SeqCst);
-        let effects = host.effects.load(Ordering::SeqCst);
-        let done = AutonomyRunner::restore_cancelled(
-            TaskRestoreRequest {
-                expected_revision: recovered.revision,
-                ..request(&prepared.run, config())
-            },
-            store.clone(),
-            host.clone(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(done.run.status, TaskRunStatus::Cancelled, "{pattern}");
-        assert_eq!(host.calls.load(Ordering::SeqCst), calls);
-        assert_eq!(host.effects.load(Ordering::SeqCst), effects);
-        let saved = store.load(&source.key.run_id).await.unwrap().unwrap();
-        let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
-        assert!(
-            payload
-                .children
-                .iter()
-                .all(|child| child.pending.is_none() && child.result.is_some())
-        );
-        for child in &payload.children {
-            child.runtime.validate().unwrap();
-            assert!(
-                ai_agents_core::inspect_native_history(&child.runtime.snapshot.memory.messages)
-                    .unwrap()
-                    .exchanges()
+    for &sqlite in crate::autonomy::continuation_test_support::backends() {
+        for lost_ack in [false, true] {
+            for pattern in [
+                "delegate: worker",
+                "concurrent:\n        agents: [worker, peer]\n        aggregation:\n          strategy: all",
+                "delegate: middle",
+            ] {
+                let mut host = host();
+                Arc::get_mut(&mut host).unwrap().root = AgentSpec::from_yaml_strict(&format!("name: RestoreRoot\nsystem_prompt: root\nstates:\n  initial: work\n  states:\n    work:\n      {pattern}\n")).unwrap();
+                let root = Box::pin(declared_source(&host, pattern)).await;
+                let store = crate::autonomy::continuation_test_support::store(
+                    root.info().id,
+                    "restore.v1",
+                    sqlite,
+                )
+                .await;
+                let runner = AutonomyRunner::try_new(
+                    root,
+                    config(),
+                    Default::default(),
+                    store.clone(),
+                    "restore.v1".into(),
+                )
+                .unwrap();
+                let paused = runner.run("composed support", None).await.unwrap();
+                let prepared = runner
+                    .checkpoint_for_restore(
+                        &paused.run.key.run_id,
+                        paused.run.revision,
+                        host.as_ref(),
+                    )
+                    .await
+                    .unwrap();
+                let saved_prefix = store.load(&prepared.run.key.run_id).await.unwrap().unwrap();
+                let saved_prefix: TaskCheckpointPayload =
+                    serde_json::from_value(saved_prefix.payload).unwrap();
+                let root_prefix = completed_native_prefix(&saved_prefix.runtime);
+                let mut child_prefixes: std::collections::BTreeMap<_, _> = saved_prefix
+                    .children
                     .iter()
-                    .all(|exchange| exchange.is_complete())
-            );
+                    .map(|child| {
+                        (
+                            child.child_id.clone(),
+                            completed_native_prefix(&child.runtime),
+                        )
+                    })
+                    .collect();
+                // Out-of-order completed results may still be parked in the typed batch until its earlier question closes.
+                for adapter in saved_prefix
+                    .adapters
+                    .iter()
+                    .filter(|adapter| adapter.adapter == "runtime.child_batch")
+                {
+                    let operation = adapter.config["operation"].as_str().unwrap();
+                    let facts = child_prefixes.get_mut(operation).unwrap();
+                    let batch: crate::autonomy::TaskBatchState =
+                        serde_json::from_value(adapter.state.clone()).unwrap();
+                    if let Some(calls) =
+                        ai_agents_core::decode_native_tool_call_markers(&batch.content).unwrap()
+                    {
+                        facts.insert(
+                            format!("calls:{}", calls.calls()[0].id),
+                            json!({"calls":calls.calls(),"state":calls.provider_state()}),
+                        );
+                    }
+                    for (call, result) in batch.calls.iter().zip(&batch.results) {
+                        if let Some(result) = result {
+                            let output = match result {
+                                Ok(output) => output.clone(),
+                                Err(error) => format!("Error: {error}"),
+                            };
+                            let output = serde_json::from_str::<Value>(&output)
+                                .unwrap_or(Value::String(output));
+                            facts.insert(
+                                format!("result:{}", call.id),
+                                json!({"tool":call.name,"output":output}),
+                            );
+                        }
+                    }
+                }
+                assert!(
+                    root_prefix
+                        .keys()
+                        .chain(child_prefixes.values().flat_map(|facts| facts.keys()))
+                        .any(|key| key.starts_with("result:")),
+                    "fixture must contain actual completed signed work"
+                );
+                drop(runner);
+                let claimed = store
+                    .mutate(
+                        &prepared.run.key.run_id,
+                        &TaskRunMutation::Claim {
+                            expected_revision: prepared.run.revision,
+                            owner_token: "interrupted-child-constructor".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let source = store
+                    .mutate(
+                        &claimed.key.run_id,
+                        &TaskRunMutation::RequestCancel {
+                            expected_revision: claimed.revision,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let mut cleanup = decision(&source, TaskRecoveryDisposition::CancelPrepared);
+                cleanup.interrupted_started_at = Some(claimed.updated_at);
+                let recovered = AutonomyRunner::reconcile_recovery(
+                    store.clone(),
+                    &source.key.run_id,
+                    cleanup,
+                    RecoveryProof::new(&source),
+                )
+                .await
+                .unwrap();
+                let calls = host.calls.load(Ordering::SeqCst);
+                let effects = host.effects.load(Ordering::SeqCst);
+                let mut cleanup_revision = recovered.revision;
+                if lost_ack {
+                    let fault = Arc::new(controller::CleanupAckStore {
+                        inner: store.clone(),
+                        lost: AtomicBool::new(true),
+                    });
+                    assert!(
+                        AutonomyRunner::restore_cancelled(
+                            TaskRestoreRequest {
+                                expected_revision: cleanup_revision,
+                                ..request(&prepared.run, config())
+                            },
+                            fault,
+                            host.clone()
+                        )
+                        .await
+                        .is_err()
+                    );
+                    let authoritative = store.load(&source.key.run_id).await.unwrap().unwrap();
+                    assert_eq!(authoritative.status, TaskRunStatus::Paused);
+                    assert!(authoritative.cancel_requested);
+                    assert!(authoritative.revision > cleanup_revision);
+                    cleanup_revision = authoritative.revision;
+                    assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+                    assert_eq!(host.effects.load(Ordering::SeqCst), effects);
+                }
+                let done = AutonomyRunner::restore_cancelled(
+                    TaskRestoreRequest {
+                        expected_revision: cleanup_revision,
+                        ..request(&prepared.run, config())
+                    },
+                    store.clone(),
+                    host.clone(),
+                )
+                .await
+                .unwrap();
+                assert_eq!(done.run.status, TaskRunStatus::Cancelled, "{pattern}");
+                assert_eq!(host.calls.load(Ordering::SeqCst), calls);
+                assert_eq!(host.effects.load(Ordering::SeqCst), effects);
+                let saved = store.load(&source.key.run_id).await.unwrap().unwrap();
+                let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload).unwrap();
+                assert!(
+                    payload
+                        .children
+                        .iter()
+                        .all(|child| child.pending.is_none() && child.result.is_some())
+                );
+                let final_root = completed_native_prefix(&payload.runtime);
+                assert!(
+                    root_prefix
+                        .iter()
+                        .all(|(key, value)| final_root.get(key) == Some(value))
+                );
+                for child in &payload.children {
+                    child.runtime.validate().unwrap();
+                    let final_child = completed_native_prefix(&child.runtime);
+                    assert!(
+                        child_prefixes[&child.child_id]
+                            .iter()
+                            .all(|(key, value)| final_child.get(key) == Some(value))
+                    );
+                    assert!(
+                        ai_agents_core::inspect_native_history(
+                            &child.runtime.snapshot.memory.messages
+                        )
+                        .unwrap()
+                        .exchanges()
+                        .iter()
+                        .all(|exchange| exchange.is_complete())
+                    );
+                }
+            }
         }
     }
+}
+
+// Exact signed call groups and already present results survive even when another result in the same group is still pending.
+fn completed_native_prefix(
+    runtime: &TaskRuntimeCheckpoint,
+) -> std::collections::BTreeMap<String, Value> {
+    let mut facts = std::collections::BTreeMap::new();
+    for message in &runtime.snapshot.memory.messages {
+        if let Some(batch) =
+            ai_agents_core::decode_native_tool_call_markers(&message.content).unwrap()
+        {
+            let first = &batch.calls()[0].id;
+            facts.insert(
+                format!("calls:{first}"),
+                json!({"calls":batch.calls(),"state":batch.provider_state()}),
+            );
+        }
+        if let Some(results) =
+            ai_agents_core::decode_native_tool_result_markers(&message.content).unwrap()
+        {
+            for result in results {
+                facts.insert(
+                    format!("result:{}", result.id()),
+                    json!({"tool":result.tool(),"output":result.output()}),
+                );
+            }
+        }
+    }
+    facts
 }
 
 // Cancellation racing recovery publication wins its revision and retains exact pending work until explicitly reviewed typed cleanup.

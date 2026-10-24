@@ -383,7 +383,11 @@ impl CompletionGateEvaluator {
             CompletionGate::Observability(assertion) => e
                 .observability
                 .as_ref()
-                .filter(|o| o.complete && o.identity.eligible(scope, true, false))
+                .filter(|o| {
+                    o.complete
+                        && o.identity.eligible(scope, true, false)
+                        && super::telemetry::metric_available(&o.value, &assertion.path)
+                })
                 .map_or(GateOutcome::Unknown, |o| match_path(&o.value, assertion)),
             CompletionGate::ResponseNotEmpty(expected) => current
                 .map_or(GateOutcome::Unknown, |c| {
@@ -476,7 +480,11 @@ impl CompletionGateEvaluator {
                 .iter()
                 .filter(|o| o.value.path == *path && o.identity.key == scope.key)
                 .max_by_key(|o| (o.identity.cycle, o.identity.sequence))
-                .filter(|o| o.complete && o.identity.eligible(scope, true, true))
+                .filter(|o| {
+                    o.complete
+                        && o.identity.eligible(scope, true, true)
+                        && validation_dependencies_current(&o.identity, &e.validations, scope)
+                })
                 .map_or(GateOutcome::Unknown, |o| known(o.value.exists)),
             CompletionGate::ValidatorPassed(check) => {
                 latest_validation(&e.validations, check, scope)

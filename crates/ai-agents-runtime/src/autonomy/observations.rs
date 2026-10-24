@@ -123,6 +123,52 @@ impl EvaluationEvidence {
         *self = self.normalized()?;
         Ok(())
     }
+    /// Collects bounded host projections only through the exact installed check after publication ACK.
+    /// The exact result fingerprint remains a dependency, so later mutation, configuration or attempt replacement invalidates the artifact too.
+    pub fn collect_artifacts(
+        &mut self,
+        state: &ValidationDriverState,
+        check: &BoundValidationCheck,
+    ) -> Result<()> {
+        if !state.publication_acknowledged()
+            || state.check_id != check.check.id
+            || state.adapter != check.check.adapter
+            || state.identity.config_identity != check.config_identity
+        {
+            return Err(AgentError::Config(
+                "artifact projection lacks acknowledged check binding".into(),
+            ));
+        }
+        let result = state
+            .result
+            .as_ref()
+            .ok_or_else(|| AgentError::Config("artifact projection has no result".into()))?;
+        if result.outcome == GateOutcome::Unknown {
+            return Ok(());
+        }
+        let artifacts = check.adapter.artifacts(result)?;
+        if artifacts.len() > 256 {
+            return Err(AgentError::Config(
+                "artifact projection exceeds record bound".into(),
+            ));
+        }
+        let mut identity = result.identity.clone();
+        identity
+            .validation_dependencies
+            .insert(check.check.id.clone(), result.proof_identity()?);
+        for artifact in artifacts {
+            if artifact.path.trim().is_empty() || artifact.path.len() > 4096 {
+                return Err(AgentError::Config("invalid projected artifact path".into()));
+            }
+            self.artifacts.push(ScopedObservation {
+                identity: identity.clone(),
+                complete: true,
+                value: artifact,
+            });
+        }
+        *self = self.normalized()?;
+        Ok(())
+    }
 }
 
 // Policy normalization may add defaults, but changing cwd, argv or environment changes the operation whose exit code was observed.

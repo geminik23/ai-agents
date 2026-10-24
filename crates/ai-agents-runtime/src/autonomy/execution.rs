@@ -55,6 +55,7 @@ pub(crate) struct RunExecution {
 
 impl RunExecution {
     /// Called only after an acknowledged running claim; restart clocks cannot be refilled here.
+    /// A fresh collector cannot certify a missing historical observation interval.
     pub(crate) fn new(
         store: Arc<dyn TaskRunStore>,
         snapshot: &TaskRunSnapshot,
@@ -63,6 +64,16 @@ impl RunExecution {
         started: Instant,
     ) -> Result<Arc<Self>> {
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        // A new collector cannot certify an earlier unobserved execution interval from a legacy image.
+        if snapshot.revision > 0
+            && (payload.counters.llm_attempts > 0 || payload.counters.tool_attempts > 0)
+            && !payload
+                .adapters
+                .iter()
+                .any(|adapter| adapter.id == "runtime.telemetry")
+        {
+            owner.telemetry.mark_missing();
+        }
         Ok(Arc::new(Self {
             store,
             owner: owner.clone(),
@@ -1049,12 +1060,14 @@ impl RunExecution {
     /// Writes and verifies one exact successor without holding a database transaction over external work.
     /// A malformed receipt cannot transfer live revision authority or release custody.
     /// Running writes bind a sampled usage anchor separately from backend metadata, and invalidate old prepared images before semantic work.
+    /// Numeric collector cuts share the exact payload ACK; a lost or malformed receipt cannot advance their live cursors.
     async fn save(
         &self,
         previous: TaskRunSnapshot,
         mut payload: Box<TaskCheckpointPayload>,
         status: TaskRunStatus,
     ) -> Result<TaskRunSnapshot> {
+        let telemetry = self.owner.telemetry.prepare(&mut payload, &self.run_id)?;
         if status == TaskRunStatus::Running && payload.clocks.active_interval_started_at.is_some() {
             let sampled_at = chrono::Utc::now();
             payload.clocks.active_millis = payload.clocks.active_millis.max(self.active_millis()?);
@@ -1109,6 +1122,7 @@ impl RunExecution {
             .inspect_err(|_| self.storage_failure())?;
         self.revision.store(saved.revision, Ordering::Release);
         self.acknowledge_snapshot(&saved);
+        self.owner.telemetry.acknowledge(telemetry);
         Ok(saved)
     }
 }
@@ -1205,14 +1219,22 @@ pub(crate) async fn scope_inherited_execution<F: std::future::Future>(
 }
 
 /// Installs the same ledger for the controller, tool executor and every frozen provider consumer.
+/// Opaque run attribution follows the existing observation context without granting execution or mixing ordinary session telemetry.
 pub(crate) async fn scope_execution<F: std::future::Future>(
     execution: Arc<RunExecution>,
     future: F,
 ) -> F::Output {
     let todos = execution.task_todos();
+    let run_id = execution.run_id.clone();
     let scoped = ai_agents_llm::scope_invocation_admission(
         execution.clone(),
-        RUN_EXECUTION.scope(execution, future),
+        RUN_EXECUTION.scope(
+            execution,
+            ai_agents_observability::with_updated_observation_context(
+                |context| context.with_tag("task_run", run_id),
+                future,
+            ),
+        ),
     );
     if let Some((store, binding)) = todos {
         ai_agents_tools::scope_task_todos(store, binding, scoped).await

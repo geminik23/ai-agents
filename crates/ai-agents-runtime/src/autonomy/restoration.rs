@@ -18,6 +18,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 mod bindings;
 #[path = "restoration_driver.rs"]
 mod driver;
+#[cfg(test)]
+#[path = "rg_checkpoint_tests.rs"]
+mod rg_checkpoint_tests;
 
 pub(crate) const RESTORE_ADAPTER: &str = "runtime.restore";
 pub(crate) const RESTORE_REVIEW: &str = "runtime.restore_review";
@@ -1276,15 +1279,7 @@ async fn begin_work(
     if Instant::now() >= deadline {
         return Err(TaskRunStorageError::AdmissionExpired.into());
     }
-    let mut running = ready.clone();
-    mark_work(&mut running, kind, "running", budget, started_at)?;
-    let source_digest = review_digest(&running)?;
-    running
-        .adapters
-        .iter_mut()
-        .find(|adapter| adapter.id == RESTORE_WORK)
-        .ok_or(TaskRunStorageError::InvalidCheckpoint)?
-        .state["source_digest"] = json!(source_digest);
+    let running = work_payload(ready, kind, budget, started_at)?;
     let mutation = TaskRunMutation::Checkpoint {
         expected_revision: claimed.revision,
         owner_token: claimed
@@ -1301,6 +1296,56 @@ async fn begin_work(
         return Err(TaskRunStorageError::AdmissionExpired.into());
     }
     Ok(saved)
+}
+
+// Builds the exact intermediate journal in both preflight and execution so digest overhead cannot appear only after claim.
+fn work_payload(
+    ready: &TaskCheckpointPayload,
+    kind: &str,
+    budget: std::time::Duration,
+    started_at: DateTime<Utc>,
+) -> Result<TaskCheckpointPayload> {
+    let mut running = ready.clone();
+    mark_work(&mut running, kind, "running", budget, started_at)?;
+    let source_digest = review_digest(&running)?;
+    running
+        .adapters
+        .iter_mut()
+        .find(|adapter| adapter.id == RESTORE_WORK)
+        .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+        .state["source_digest"] = json!(source_digest);
+    Ok(running)
+}
+
+// Checks the full envelope for prepared and intermediate work before ownership changes; timestamps reserve maximum fractional precision.
+// This predicts data-size failures only, not concurrent cancellation, backend failure or a host constructor's later output.
+fn preflight_work(
+    snapshot: &TaskRunSnapshot,
+    ready: &TaskCheckpointPayload,
+    kind: &str,
+    budget: std::time::Duration,
+    started_at: DateTime<Utc>,
+) -> Result<()> {
+    use chrono::Timelike;
+    for payload in [
+        ready.clone(),
+        work_payload(ready, kind, budget, started_at)?,
+    ] {
+        let mut proposed = snapshot.clone();
+        proposed.revision = snapshot
+            .revision
+            .checked_add(3)
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        proposed.updated_at = proposed
+            .updated_at
+            .with_nanosecond(999_999_999)
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        proposed.status = TaskRunStatus::Running;
+        proposed.owner_token = Some("00000000-0000-0000-0000-000000000000".into());
+        proposed.payload = serde_json::to_value(payload)?;
+        proposed.validate()?;
+    }
+    Ok(())
 }
 
 // One fixed monotonic deadline spans preflight, claim, staging and publication; later phases cannot renew it.
@@ -1358,6 +1403,7 @@ fn prepare_capture(
     proposed.status = TaskRunStatus::Running;
     proposed.owner_token = Some("00000000-0000-0000-0000-000000000000".into());
     payload.validate(&proposed, &payload.config_identity)?;
+    preflight_work(snapshot, payload, "capture", budget, started_at)?;
     Ok(())
 }
 

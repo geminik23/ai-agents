@@ -366,7 +366,9 @@ fn validate_raw(profile: &AutonomyProfile) -> Result<()> {
 // Stage-end checks require a stage owner; check lists keep explicit empty replacement semantics.
 fn validate_validation(config: &ValidationConfig, in_stage: bool) -> Result<()> {
     for check in config.checks.iter().flatten() {
+        // Framework journals own this namespace; accepting a collision can fail only after model/tool effects have begun.
         if check.id.trim().is_empty()
+            || check.id.starts_with("runtime.")
             || check.adapter.trim().is_empty()
             || check.contract_version == Some(0)
             || check.timeout_seconds == Some(0)

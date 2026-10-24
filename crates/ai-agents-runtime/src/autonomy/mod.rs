@@ -146,9 +146,12 @@ mod progress;
 mod registry_tests;
 mod replanning;
 pub(crate) mod response;
+#[cfg(test)]
+mod rg_tests;
 mod run;
 #[cfg(test)]
 mod state_acceptance_tests;
+pub(crate) mod telemetry;
 mod validation;
 
 pub use evidence::*;

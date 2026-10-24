@@ -29,6 +29,13 @@ struct DiagnosticsConfig {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ArtifactConfig {
+    path: String,
+    #[serde(default)]
+    host_binding: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EvidenceConfig {
     assertion: PathAssertion,
     #[serde(default)]
@@ -47,7 +54,9 @@ impl BuiltinValidator {
                 id: format!("builtin.{kind}"),
                 contract_version: 1,
                 checks: vec![],
-                tools: if matches!(kind, "command" | "diagnostics") {
+                tools: if kind == "artifact" {
+                    vec!["file_info".into()]
+                } else if matches!(kind, "command" | "diagnostics") {
                     vec![kind.into()]
                 } else {
                     vec![]
@@ -92,6 +101,12 @@ impl AutonomyValidator for BuiltinValidator {
                 ai_agents_core::autonomy::CompletionGate::Judge(config)
                     .validate()
                     .map_err(AgentError::Config)?;
+            }
+            "artifact" => {
+                let config: ArtifactConfig = serde_json::from_value(config.clone())?;
+                if config.path.trim().is_empty() || config.path.len() > 4096 {
+                    return Err(AgentError::Config("invalid artifact path".into()));
+                }
             }
             "evidence" => {
                 let config: EvidenceConfig = serde_json::from_value(config.clone())
@@ -141,6 +156,35 @@ impl AutonomyValidator for BuiltinValidator {
         }
         if let Some(observation) = input.observations.get("observe") {
             return match (&*self.kind, &observation.result) {
+                ("artifact", ObservationResult::Tool { record }) => {
+                    let config: ArtifactConfig = serde_json::from_value(input.config.clone())?;
+                    let output: Value = serde_json::from_str(&record.output).unwrap_or(Value::Null);
+                    let valid = super::evidence::executed(record)
+                        && record.success
+                        && !record.output_truncated
+                        && record.canonical_id == "file_info"
+                        && record
+                            .executed_arguments
+                            .get("path")
+                            .and_then(Value::as_str)
+                            == Some(config.path.as_str())
+                        && output.get("path").and_then(Value::as_str) == Some(config.path.as_str());
+                    let Some(exists) = output
+                        .get("exists")
+                        .and_then(Value::as_bool)
+                        .filter(|_| valid)
+                    else {
+                        return Ok(complete(GateOutcome::Unknown, json!({})));
+                    };
+                    Ok(complete(
+                        if exists {
+                            GateOutcome::Pass
+                        } else {
+                            GateOutcome::Fail
+                        },
+                        json!({"artifact":{"path":config.path,"exists":exists}}),
+                    ))
+                }
                 ("command", ObservationResult::Tool { record }) => {
                     if !super::evidence::executed(record) {
                         return Ok(complete(GateOutcome::Unknown, json!({})));
@@ -258,6 +302,15 @@ impl AutonomyValidator for BuiltinValidator {
             };
         }
         let request = match self.kind.as_str() {
+            "artifact" => {
+                let config: ArtifactConfig = serde_json::from_value(input.config.clone())?;
+                ValidationObservationRequest::Tool {
+                    id: "observe".into(),
+                    tool: "file_info".into(),
+                    arguments: json!({"path":config.path}),
+                    host_binding: config.host_binding,
+                }
+            }
             "command" => {
                 let config: CommandConfig = serde_json::from_value(input.config.clone())?;
                 ValidationObservationRequest::Tool {
@@ -299,5 +352,15 @@ impl AutonomyValidator for BuiltinValidator {
             requests: vec![request],
             checkpoint: json!({"requested":true}),
         })
+    }
+
+    /// Only a verified file-info result projects existence; an unknown or malformed observation supplies no artifact proof.
+    fn artifacts(&self, result: &ValidationResult) -> Result<Vec<ArtifactObservation>> {
+        if self.kind != "artifact" || result.outcome == GateOutcome::Unknown {
+            return Ok(Vec::new());
+        }
+        Ok(vec![serde_json::from_value(
+            result.metrics["artifact"].clone(),
+        )?])
     }
 }

@@ -140,6 +140,8 @@ fn is_safe_dimension(key: &str) -> bool {
     matches!(
         key,
         "agent"
+            // Framework-minted opaque run IDs allow scoped numeric collection; they are not execution authority or task content.
+            | "task_run"
             | "actor"
             | "session"
             | "purpose"

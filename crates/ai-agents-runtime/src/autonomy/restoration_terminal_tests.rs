@@ -1,5 +1,6 @@
 //! Reconstructed runs keep actual live ownership through terminal ACK uncertainty and explicit cleanup retry.
 use super::*;
+use crate::Agent;
 use crate::autonomy::continuation_test_support::ReceiptStore;
 
 // A terminal row is immutable even when its ACK is lost; cleanup can retire only that old owner, never a newer run.
@@ -82,6 +83,23 @@ async fn restoration_terminal_ack_fault_and_cleanup_retry_protect_newer_owner() 
                     )
                     .unwrap(),
                     serde_json::to_value(&saved).unwrap()
+                );
+                // A released reconstructed runtime must admit an ordinary independent turn without stale task ownership or duplicated input.
+                let ordinary = root
+                    .chat("ordinary after acknowledged cleanup")
+                    .await
+                    .unwrap();
+                assert!(!ordinary.content.is_empty());
+                let history = root.save_state_full().await.unwrap();
+                assert_eq!(
+                    history
+                        .memory
+                        .messages
+                        .iter()
+                        .filter(|message| message.role == ai_agents_core::Role::User
+                            && message.content == "ordinary after acknowledged cleanup")
+                        .count(),
+                    1
                 );
                 let newer = root
                     .reserve_reconstructed_owner("newer-run".into(), None)

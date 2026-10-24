@@ -34,6 +34,14 @@ pub trait AutonomyValidator: Send + Sync {
     fn validate_config(&self, config: &Value) -> Result<()>;
     /// Returns completion, typed observations or a typed host wait, not direct effects.
     fn evaluate(&self, input: &ValidationInput<'_>) -> Result<ValidationDecision>;
+    /// Projects explicit host artifact observations from an acknowledged result without I/O or model-written authority.
+    /// The driver binds the result to this installed adapter; freshness and exact proof dependencies remain framework-owned.
+    fn artifacts(
+        &self,
+        _result: &super::ValidationResult,
+    ) -> Result<Vec<super::ArtifactObservation>> {
+        Ok(Vec::new())
+    }
 }
 
 pub trait ProgressAdapter: Send + Sync {
@@ -416,7 +424,7 @@ impl AutonomyExtensions {
     /// Installs the required built-ins without granting their tools or constructing providers.
     pub fn builtins() -> Self {
         let mut registry = Self::default();
-        for kind in ["command", "diagnostics", "judge", "evidence"] {
+        for kind in ["command", "diagnostics", "judge", "evidence", "artifact"] {
             registry
                 .register_validator(Arc::new(super::builtins::BuiltinValidator::new(kind)))
                 .expect("unique builtin");
@@ -589,6 +597,11 @@ impl FrozenAutonomyExtensions {
                 || check.timeout_seconds == Some(0)
             {
                 return Err(AgentError::Config("invalid validation check limits".into()));
+            }
+            if check.id.starts_with("runtime.") {
+                return Err(AgentError::Config(
+                    "validation check uses reserved runtime journal namespace".into(),
+                ));
             }
             if !available_ids.insert(check.id.clone()) {
                 return Err(AgentError::Config("duplicate validation check".into()));

@@ -922,19 +922,19 @@ impl RunExecution {
         if let Some(deadline) = child_deadline {
             self.approval_deadlines.lock().insert(request_id, deadline);
         }
+        let anchor = TaskRunMutation::Checkpoint {
+            expected_revision: previous.revision,
+            owner_token: self.owner_token.clone(),
+            status: TaskRunStatus::Running,
+            payload: serde_json::to_value(&payload)?,
+            release: false,
+        };
         let anchored = self
             .store
-            .mutate(
-                &self.run_id,
-                &TaskRunMutation::Checkpoint {
-                    expected_revision: previous.revision,
-                    owner_token: self.owner_token.clone(),
-                    status: TaskRunStatus::Running,
-                    payload: serde_json::to_value(&payload)?,
-                    release: false,
-                },
-            )
+            .mutate(&self.run_id, &anchor)
             .await
+            .inspect_err(|_| self.storage_failure())?;
+        super::store::verify_checkpoint_receipt(&previous, &anchor, &anchored)
             .inspect_err(|_| self.storage_failure())?;
         self.acknowledge_snapshot(&anchored);
         self.revision
@@ -947,28 +947,29 @@ impl RunExecution {
                 .ok_or_else(|| AgentError::Config("group active clock overflow".into()))?,
         );
         payload.clocks.active_interval_started_at = None;
+        // The coordinating pause seals completed parent/child collector events before releasing the writer token.
+        let telemetry = self.owner.telemetry.prepare(&mut payload, &self.run_id)?;
+        let publication = TaskRunMutation::FinalCheckpoint {
+            expected_revision: anchored.revision,
+            owner_token: self.owner_token.clone(),
+            status: TaskRunStatus::Paused,
+            payload: serde_json::to_value(payload)?,
+            release: true,
+            expires_at: self.expiry(),
+            evidence: None,
+            deadline: std::time::Instant::now()
+                .checked_add(self.remaining_duration())
+                .ok_or_else(|| AgentError::Config("group pause deadline overflow".into()))?,
+        };
         let saved = self
             .store
-            .mutate(
-                &self.run_id,
-                &TaskRunMutation::FinalCheckpoint {
-                    expected_revision: anchored.revision,
-                    owner_token: self.owner_token.clone(),
-                    status: TaskRunStatus::Paused,
-                    payload: serde_json::to_value(payload)?,
-                    release: true,
-                    expires_at: self.expiry(),
-                    evidence: None,
-                    deadline: std::time::Instant::now()
-                        .checked_add(self.remaining_duration())
-                        .ok_or_else(|| {
-                            AgentError::Config("group pause deadline overflow".into())
-                        })?,
-                },
-            )
+            .mutate(&self.run_id, &publication)
             .await
             .inspect_err(|_| self.storage_failure())?;
+        super::store::verify_checkpoint_receipt(&anchored, &publication, &saved)
+            .inspect_err(|_| self.storage_failure())?;
         self.acknowledge_snapshot(&saved);
+        self.owner.telemetry.acknowledge(telemetry);
         self.revision
             .store(saved.revision, std::sync::atomic::Ordering::Release);
         Ok(saved)

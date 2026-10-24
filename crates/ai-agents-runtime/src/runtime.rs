@@ -1580,6 +1580,8 @@ impl RuntimeAgent {
                 ));
             }
 
+            // Capture even parked continuations on the coordinating collector set before any resumed child work.
+            execution.owner.telemetry.register(self.observability());
             let ancestry = current_runtime_gate_identity_stack();
             if ancestry
                 .iter()
@@ -1942,6 +1944,7 @@ impl RuntimeAgent {
             self.root_turn_gate.clone(),
             self.effective_actor_id(),
         )?;
+        owner.telemetry.register(self.observability());
         *self.autonomy_owner.write() = Some(owner.clone());
         drop(admission);
         Ok(owner)

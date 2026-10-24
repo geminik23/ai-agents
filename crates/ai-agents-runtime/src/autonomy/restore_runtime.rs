@@ -203,6 +203,7 @@ impl RuntimeAgent {
             ));
         }
         let owner = crate::autonomy::RunOwner::new(run_id, self.root_turn_gate.clone(), actor)?;
+        owner.telemetry.register(self.observability());
         *self.autonomy_owner.write() = Some(owner.clone());
         drop(admission);
         Ok(owner)

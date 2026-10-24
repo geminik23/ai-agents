@@ -92,7 +92,8 @@ pub(super) fn validate_current_host(
     Ok(())
 }
 
-// Capture timestamps and equivalent YAML formatting are not semantic snapshot differences; memory/native content stays exact.
+// Capture timestamps, equivalent YAML formatting and unordered registry listings are not semantic snapshot differences; memory/native content stays exact.
+// Registry entry order is not child invocation order, which remains bound by the separate typed composition cursor.
 fn snapshot_identity(snapshot: &ai_agents_core::AgentSnapshot) -> Result<Value> {
     let mut value = serde_json::to_value(snapshot)?;
     value
@@ -100,13 +101,56 @@ fn snapshot_identity(snapshot: &ai_agents_core::AgentSnapshot) -> Result<Value> 
         .ok_or(TaskRunStorageError::InvalidCheckpoint)?
         .remove("timestamp");
     if let Some(entries) = value["spawned_agents"].as_array_mut() {
-        for entry in entries {
+        for entry in entries.iter_mut() {
             if let Some(text) = entry["spec_yaml"].as_str() {
                 entry["spec_yaml"] = serde_json::to_value(AgentSpec::from_yaml_strict(text)?)?;
             }
         }
+        entries.sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
     }
     Ok(value)
+}
+
+// Semantic normalization cannot erase changed membership, specification or exact native-history content.
+#[cfg(test)]
+#[test]
+fn rg_snapshot_registry_order_normalizes_without_hiding_configuration_changes() {
+    let mut left = ai_agents_core::AgentSnapshot::new("root".into());
+    left.spawned_agents = Some(vec![
+        ai_agents_core::SpawnedAgentEntry {
+            id: "b".into(),
+            name: "B".into(),
+            spec_yaml: "name: B\nsystem_prompt: b\n".into(),
+        },
+        ai_agents_core::SpawnedAgentEntry {
+            id: "a".into(),
+            name: "A".into(),
+            spec_yaml: "name: A\nsystem_prompt: a\n".into(),
+        },
+    ]);
+    let mut right = left.clone();
+    right.spawned_agents.as_mut().unwrap().reverse();
+    assert_eq!(
+        snapshot_identity(&left).unwrap(),
+        snapshot_identity(&right).unwrap()
+    );
+    right.spawned_agents.as_mut().unwrap()[0].spec_yaml =
+        "name: A\nsystem_prompt: changed\n".into();
+    assert_ne!(
+        snapshot_identity(&left).unwrap(),
+        snapshot_identity(&right).unwrap()
+    );
+    right = left.clone();
+    right
+        .memory
+        .messages
+        .push(ai_agents_core::ChatMessage::assistant(
+            "changed exact history",
+        ));
+    assert_ne!(
+        snapshot_identity(&left).unwrap(),
+        snapshot_identity(&right).unwrap()
+    );
 }
 
 // Shape/reference validation precedes any mutable staging, claim or component restore.
@@ -147,9 +191,19 @@ pub(super) fn validate_manifest(
                 != snapshot_identity(&authoritative.snapshot)?
                 || node.runtime.native_exchanges != authoritative.native_exchanges)
         {
-            return Err(AgentError::Config(
-                "current node image differs from its acknowledged pending checkpoint".into(),
-            ));
+            let captured = snapshot_identity(&node.runtime.snapshot)?;
+            let stored = snapshot_identity(&authoritative.snapshot)?;
+            let fields = captured
+                .as_object()
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+                .keys()
+                .filter(|key| captured.get(*key) != stored.get(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(AgentError::Config(format!(
+                "current node image differs from its acknowledged pending checkpoint (node={id}, fields={fields:?}, native={})",
+                node.runtime.native_exchanges != authoritative.native_exchanges
+            )));
         }
         // Every runtime provider view is mandatory even when no composition references it; reject missing structure before claiming the usable pause.
         if node.runtime.snapshot.agent_id != *id
@@ -1005,6 +1059,7 @@ impl AutonomyRunner {
             charge_reconstruction(&mut payload, budget)?;
         }
         mark_work(&mut payload, "restore", "paused", budget, started_at)?;
+        preflight_work(&snapshot, &payload, "restore", budget, started_at)?;
         let token = uuid::Uuid::new_v4().to_string();
         let claimed = if cleanup_only {
             store
@@ -1070,6 +1125,10 @@ impl AutonomyRunner {
         owners.insert(manifest.root.clone(), owner.clone());
         let participants = Arc::new(Participants::default());
         for (id, runtime) in &graph.runtimes {
+            // Only actual retained participants contribute; unused catalogue nodes are registered if later admitted to work.
+            if *id == manifest.root || manifest.nodes[id].participant_actor.is_some() {
+                owner.telemetry.register(runtime.observability());
+            }
             if *id != manifest.root {
                 let node = &manifest.nodes[id];
                 let child = tokio::time::timeout_at(
@@ -1407,6 +1466,7 @@ impl AutonomyRunner {
         let deadline = reconstruction_deadline(started, budget, whole)?;
         charge_reconstruction(&mut payload, budget)?;
         mark_work(&mut payload, "review", "paused", budget, started_at)?;
+        preflight_work(&snapshot, &payload, "review", budget, started_at)?;
         let mut cleanup = OwnedTurnCleanup::new(owner);
         let claimed = self.claim_retained(&snapshot, &mut cleanup).await?;
         let claimed = begin_work(

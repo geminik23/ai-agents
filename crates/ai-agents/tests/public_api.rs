@@ -272,6 +272,39 @@ fn autonomy_evaluation_migration_exposes_bounded_host_primitives() {
 }
 
 #[test]
+fn artifact_validator_projection_and_configuration_are_available_through_facade() {
+    use ai_agents::autonomy::*;
+    fn project(
+        adapter: &dyn AutonomyValidator,
+        result: &ValidationResult,
+    ) -> ai_agents::error::Result<Vec<ArtifactObservation>> {
+        adapter.artifacts(result)
+    }
+    let _projection = project;
+    let extensions = AutonomyExtensions::builtins();
+    let profile = AutonomyProfile {
+        validation: Some(
+            serde_yaml::from_str(
+                "checks: [{id: report, adapter: builtin.artifact, config: {path: report.json}}]",
+            )
+            .unwrap(),
+        ),
+        ..Default::default()
+    };
+    let bound = extensions
+        .freeze()
+        .bind(
+            &profile,
+            &ValidationCapabilities {
+                tools: std::collections::BTreeSet::from(["file_info".into()]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(bound.checks[0].check.adapter, "builtin.artifact");
+}
+
+#[test]
 fn facade_exposes_reviewed_v1_type_closure() {
     let mut templates = HashMap::new();
     templates.insert(

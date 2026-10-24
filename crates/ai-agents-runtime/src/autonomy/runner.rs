@@ -2153,6 +2153,14 @@ impl AutonomyRunner {
                 scope.mutation_generation = execution.mutation_generation();
                 bound.capture_targets(&mut scope)?;
                 Self::collect_tools(execution, &mut evidence).await?;
+                // The existing post-validation journal ACK seals numeric collector events; telemetry never substitutes for admission.
+                let telemetry_snapshot = execution.load_owned().await?;
+                let telemetry_payload: TaskCheckpointPayload =
+                    serde_json::from_value(telemetry_snapshot.payload)?;
+                evidence.observability = super::telemetry::observation(
+                    &telemetry_payload,
+                    Self::identity(&scope, scope.cycle, None, String::new()),
+                )?;
                 bound.extensions.ensure_targets_current(&scope)?;
                 if reviewed_stage.is_none() {
                     let observation = bound.observe_progress(&scope, &evidence)?;
@@ -2600,6 +2608,7 @@ impl AutonomyRunner {
                     bound.extensions.ensure_targets_current(scope)?;
                     scope.mutation_generation = execution.mutation_generation();
                     evidence.collect_validation(&driver)?;
+                    evidence.collect_artifacts(&driver, check)?;
                     Ok(None)
                 }
                 ValidationDriverOutcome::AwaitExternal(_) | ValidationDriverOutcome::Suspended => {

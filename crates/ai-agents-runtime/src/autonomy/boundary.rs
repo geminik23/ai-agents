@@ -12,6 +12,8 @@ pub(crate) struct RunOwner {
     pub(crate) gate: crate::runtime::RootTurnGate,
     pub(crate) targets: Arc<super::CompositionTargets>,
     pub(crate) work: Arc<super::work::OwnedWork>,
+    // Live collector cursors advance only with a task journal ACK; serialized telemetry is never admission authority.
+    pub(crate) telemetry: super::telemetry::TaskTelemetry,
     // Observation receipts survive same-process pauses and cleanup retries but authorize no execution.
     pub(crate) observed_branches: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     // Only explicit admission installs this actual definition; serialized entry data cannot mint a skill scope.
@@ -45,6 +47,7 @@ impl RunOwner {
             gate,
             targets: Arc::new(super::CompositionTargets::default()),
             work: Arc::new(super::work::OwnedWork::default()),
+            telemetry: Default::default(),
             observed_branches: Default::default(),
             skill: parking_lot::RwLock::new(None),
             responses: Default::default(),

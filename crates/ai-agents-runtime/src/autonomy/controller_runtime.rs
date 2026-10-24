@@ -82,6 +82,11 @@ impl AutonomyRunner {
                 .ok_or_else(|| AgentError::Config("pause clock overflow".into()))?,
         );
         payload.clocks.active_interval_started_at = None;
+        // Preserve the same numeric prefix across controller review, external and capacity waits without a post-pause read.
+        let telemetry = execution
+            .owner
+            .telemetry
+            .prepare(&mut payload, &execution.run_id)?;
         let exact_payload = serde_json::to_value(&payload)?;
         let saved = execution
             .store
@@ -116,6 +121,7 @@ impl AutonomyRunner {
             return Err(TaskRunStorageError::InvalidCheckpoint.into());
         }
         execution.acknowledge_snapshot(&saved);
+        execution.owner.telemetry.acknowledge(telemetry);
         execution
             .revision
             .store(saved.revision, std::sync::atomic::Ordering::Release);
