@@ -263,6 +263,71 @@ async fn fixture_pattern_gated(question: bool, pattern: &str, gated: bool) -> Gr
     (parent, child, runner, store, first, second, provider)
 }
 
+// Streamed composition returns real pending child cursors and cannot replay already completed sibling effects.
+#[tokio::test]
+async fn ev_composed_streams_keep_child_effects_and_exact_parent_resume() {
+    use futures::StreamExt;
+    for pattern in [
+        "delegate: worker",
+        "concurrent:\n        agents: [worker, peer]\n        aggregation:\n          strategy: all",
+        "delegate: middle",
+    ] {
+        let (parent, _, runner, _, first, second, _) = fixture_pattern(true, pattern).await;
+        let mut stream = runner
+            .stream_operation(
+                TaskStreamOperation::Run {
+                    objective: "objective".into(),
+                    profile: None,
+                },
+                TaskStreamConfig { capacity: 1 },
+            )
+            .unwrap();
+        let mut events = vec![];
+        while let Some(event) = stream.next().await {
+            events.push(event);
+        }
+        let mut result = stream.take_result().unwrap().unwrap();
+        assert_eq!(result.run.status, TaskRunStatus::Paused);
+        let completed = second.load(Ordering::SeqCst);
+        assert!(completed > 0);
+        for _ in 0..8 {
+            if result.run.status != TaskRunStatus::Paused {
+                break;
+            }
+            let pending = result.run.pending.as_ref().unwrap();
+            let input = TaskResumeInput::UserAnswer {
+                request_id: pending.id.clone(),
+                answer: json!({"answered":true,"selected":["yes"]}),
+            };
+            let mut stream = runner
+                .resume_stream(&result.run.key.run_id, result.run.revision, input)
+                .unwrap();
+            while let Some(event) = stream.next().await {
+                events.push(event);
+            }
+            result = stream.take_result().unwrap().unwrap();
+        }
+        assert_eq!(result.run.status, TaskRunStatus::Completed, "{pattern}");
+        assert_eq!(second.load(Ordering::SeqCst), completed);
+        assert_eq!(
+            first.load(Ordering::SeqCst),
+            0,
+            "retained question answers must not invoke an ordinary handler"
+        );
+        assert!(parent.captured_task_owner().is_none());
+        assert!(
+            events
+                .iter()
+                .any(|e| e.kind == TaskRunEventKind::ToolCompleted && e.data["executed"] == true)
+        );
+        assert!(
+            !serde_json::to_string(&events)
+                .unwrap()
+                .contains("exact-child-state")
+        );
+    }
+}
+
 struct UnboundCounterTool(CounterTool);
 #[async_trait]
 impl Tool for UnboundCounterTool {

@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Task event streams: development-only Rust hosts observe bounded, default-redacted task execution, retained decisions and acknowledged outcomes with explicit foreground close and recovery-safe drop
 - Task artifact validation: development profiles collect authorized file metadata or explicit host artifact projections with exact validation-proof freshness
 - Task numeric telemetry: development completion gates consume acknowledged run-scoped observations across pause and reconstruction; missing, lossy and unmeasured metrics remain unknown
 - Task recovery: development-only reviewed recovery preserves interrupted usage and effect commitments without replay, including cancellation-only reconstruction of prepared cursors

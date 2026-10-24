@@ -1,4 +1,6 @@
 //! Reconstruction fault tests distinguish certified no-write refusal from ambiguous committed custody.
+#[path = "ev_restore_tests.rs"]
+mod event_acceptance;
 #[path = "restoration_fault_matrix_tests.rs"]
 mod matrix_tests;
 

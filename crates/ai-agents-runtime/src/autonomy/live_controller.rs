@@ -242,6 +242,7 @@ impl AutonomyRunner {
                 latest_validation(&state.evidence.validations, &check.check.id, &state.scope)
                     .filter(|result| result.outcome == GateOutcome::Pass)
                     .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+            super::super::events::emit(execution, super::super::events::TaskRunEventKind::ReplanCompleted, || json!({"check":super::super::events::safe_text(&check.check.id),"outcome":plan.outcome})).await;
             state.instruction = plan.metrics.to_string();
             state.phase = super::super::controller::ControllerPhase::Decision;
             state.checks.clear();

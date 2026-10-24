@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// An internal capability is minted only while the runtime's root gate excludes competing admission.
 pub(crate) struct RunOwner {
+    pub(crate) events: parking_lot::RwLock<Option<Arc<super::events::EventSink>>>,
     pub(crate) run_id: String,
     pub(crate) actor_id: Option<String>,
     pub(crate) gate: crate::runtime::RootTurnGate,
@@ -41,7 +42,8 @@ impl RunOwner {
         if run_id.trim().is_empty() {
             return Err(AgentError::Config("empty autonomy run identity".into()));
         }
-        Ok(Arc::new(Self {
+        let owner = Arc::new(Self {
+            events: parking_lot::RwLock::new(super::events::current_sink()),
             run_id,
             actor_id,
             gate,
@@ -55,7 +57,11 @@ impl RunOwner {
             interaction_delivery: AtomicBool::new(true),
             abandoned: AtomicBool::new(false),
             retained_effect_guards: parking_lot::Mutex::new(Vec::new()),
-        }))
+        });
+        if let Some(sink) = owner.events.read().as_ref() {
+            sink.owner(&owner);
+        }
+        Ok(owner)
     }
 
     /// Observation disposition is single-use across pause, drop and cleanup retries; it settles no external effect or accounting reservation.

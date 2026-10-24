@@ -25,7 +25,14 @@ pub(crate) use participants::{
 };
 pub(crate) use targets::CompositionTargets;
 
+#[cfg(test)]
+mod ev_tests;
+pub(crate) mod events;
 mod runner;
+pub use events::{
+    MAX_TASK_EVENT_BYTES, TaskEventCursor, TaskRunEvent, TaskRunEventKind, TaskRunStream,
+    TaskStreamConfig, TaskStreamOperation,
+};
 pub(crate) mod suspension;
 #[cfg(test)]
 mod suspension_tests;

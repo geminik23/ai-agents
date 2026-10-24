@@ -6988,6 +6988,10 @@ impl RuntimeAgent {
         if crate::autonomy::suspension::executor_progress()
             .is_none_or(|cursor| cursor.started_at.is_none())
         {
+            if let Some(execution) = crate::autonomy::current_execution() {
+                // This is a logical request, not invocation evidence or approval authority.
+                crate::autonomy::events::emit(&execution, crate::autonomy::TaskRunEventKind::ToolStarted, || serde_json::json!({"tool":crate::autonomy::events::safe_text(&canonical_id),"call":crate::autonomy::events::safe_text(&request.call_id),"source":crate::autonomy::events::safe_source(&request.source)})).await;
+            }
             self.hooks
                 .on_tool_start(&canonical_id, &executed_arguments)
                 .await;
@@ -9172,6 +9176,10 @@ OVERALL: PASS/FAIL"#,
 
         self.execute_state_enter_actions(&entered, is_reentry).await;
         drop(reservation);
+        if let Some(execution) = crate::autonomy::current_execution() {
+            // State commitment remains distinct from task completion and its later evidence checks.
+            crate::autonomy::events::emit(&execution, crate::autonomy::TaskRunEventKind::StateTransition, || serde_json::json!({"from":crate::autonomy::events::safe_text(from_state),"to":crate::autonomy::events::safe_text(&entered)})).await;
+        }
         self.hooks
             .on_state_transition(Some(from_state), &entered, reason)
             .await;

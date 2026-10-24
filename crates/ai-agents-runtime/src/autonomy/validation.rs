@@ -1127,6 +1127,7 @@ impl ValidationDriverState {
 
     /// Finite callbacks request managed observations; every effect has an acknowledged pre-dispatch journal record.
     /// Callback and publication admission recheck original clocks and host targets after each awaited acknowledgement.
+    /// Result events use the exact acknowledged result rather than normalized collection order, and delivery does not refresh its original lifetime.
     pub async fn drive(
         &mut self,
         binding: &BoundValidationCheck,
@@ -1188,7 +1189,10 @@ impl ValidationDriverState {
                         "cached validation evidence is stale".into(),
                     ));
                 }
-                return Ok(ValidationDriverOutcome::Complete(result.clone()));
+                let result = result.clone();
+                super::events::validation_result(&result, true).await;
+                self.check_live(context, deadline)?;
+                return Ok(ValidationDriverOutcome::Complete(result));
             }
             if self.wait.is_some() {
                 self.acknowledge(journal).await?;
@@ -1303,6 +1307,8 @@ impl ValidationDriverState {
                             "validation evidence changed during publication".into(),
                         ));
                     }
+                    super::events::validation_result(&result, false).await;
+                    self.check_live(context, deadline)?;
                     return Ok(ValidationDriverOutcome::Complete(result));
                 }
                 ValidationDecision::AwaitExternal {

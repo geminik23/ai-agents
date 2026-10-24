@@ -27,3 +27,7 @@ path = "src/openai_compatible.rs"
 [[bin]]
 name = "multi-provider"
 path = "src/multi_provider.rs"
+
+[[bin]]
+name = "task-events"
+path = "src/task_events.rs"

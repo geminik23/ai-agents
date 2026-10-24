@@ -274,7 +274,7 @@ State-transition approval now retains both successful and rejected caller positi
 
 The authenticated Rust host can use `AutonomyRunner::stop_paused(run_id, expected_revision, reason)` to retire known-safe pending work without approving it. A bounded audit reason and conditional claim precede cleanup, and terminal acknowledgement precedes owner release. Stop reports `Incomplete` with `user_stopped`, not successful completion or fabricated cancellation. Stop is not parsed from model output, answers or external signals. `AutonomyRunner::revise_limits_paused(run_id, expected_revision, limits, reason)` now revises numeric limits on a retained safe pause without consuming its pending request, resetting usage or invoking work. It returns a new paused revision; answer the same pending ID explicitly at that revision. Host ceilings and consumed/reserved usage remain binding. An authorized wall-limit change is measured from original admission and leaves question, approval, check and composition deadlines unchanged. Original UTC and monotonic admission bounds are rechecked inside the backend control write so a delayed extension cannot revive an expired run. Proven no-write refusal leaves the pause usable, while ambiguous writes, lost/dropped acknowledgement and invalid receipts retain recovery protection. Capacity-pause production is available for the supported retained controller/skill/model/validation paths described below; the standalone controller also retains a selected planner attempt when its actual admission needs more capacity.
 
-Full integrated runtime acceptance and automatic YAML hosting remain unfinished; the explicit Rust persistence/recovery contracts above do not enable those surfaces. Conforming actor maintenance, run-owned background tails and speculative alternatives use the managed participation boundary below; this is not continuation of arbitrary custom host futures. The model-call consumer closure is restricted to actual captured same-process execution, not arbitrary custom host call stacks. The implemented composition paths do not complete the overall task execution contract. Full task streaming, CLI/TUI task commands and task eval integration are also unavailable. The in-memory and SQLite task stores can be supplied explicitly for the supported foreground path.
+Integrated runtime acceptance is implemented for the documented managed paths; automatic YAML hosting and the complete task product remain unfinished. The explicit Rust persistence/recovery contracts above do not enable automatic task entry. Conforming actor maintenance, run-owned background tails and speculative alternatives use the managed participation boundary below; this is not continuation of arbitrary custom host futures. The model-call consumer closure is restricted to actual captured same-process execution, not arbitrary custom host call stacks. The implemented composition paths do not complete the overall task execution contract. Explicit Rust task lifecycle streaming is described below; CLI/TUI task commands and task eval integration remain unavailable. The in-memory and SQLite task stores can be supplied explicitly for the supported foreground path.
 
 Fixed host validation recovery remains bound to the installed tool and exact arguments through acknowledged journal progress. Its permit is not transferred to another fallback, even if that fallback is ordinarily granted. Unrelated nested operations receive no parent fixed grant. Required-child stops and uncertain effects take precedence over recovery; dropping or timing out a dispatched task tool does not authorize fresh fallback work.
 
@@ -543,6 +543,47 @@ The `AgentResponse` struct contains:
 A `RuntimeAgent` runs one independent root turn at a time. Blocking `Agent::chat()`, legacy `chat_stream()`, and `chat_stream_events()` share the same per-agent turn gate, so concurrent calls on the same runtime are serialized rather than interleaving memory, state, hooks, or finalization. Internal redispatch remains part of its owning root turn. Once a stream owns the turn, it retains ownership until terminal completion or until the stream is dropped; another independent turn on that same runtime waits. A directly nested call, response hook, or framework-owned spawned call such as concurrent orchestration or registry broadcast that targets a runtime already in its current ownership chain fails before waiting, including an `A -> B -> A` cycle. Non-cyclic calls to another runtime remain allowed, and separate runtime instances remain independently concurrent.
 
 ---
+
+## Task event streams (development only)
+
+The explicit development `AutonomyRunner` exposes `run_stream(objective, profile)`, `resume_stream(run_id, revision, input)` and `stream_operation(operation, config)`. They return `TaskRunStream`, which implements `Stream<Item = TaskRunEvent>` and also provides `next_event()`. These APIs drive the existing controller and managed tools/providers; they do not repeatedly call public chat streams, create a detached worker, enable YAML task entry or provide CLI task commands. Task events describe lifecycle and committed turn output, not provider token deltas. A provider need not implement incremental streaming to participate.
+
+```rust
+use ai_agents::autonomy::{AutonomyRunner, TaskRunResult};
+
+async fn observe(runner: &AutonomyRunner) -> ai_agents::Result<TaskRunResult> {
+    let mut events = runner.run_stream("Prepare the report", None)?;
+    while let Some(event) = events.next_event().await {
+        // The event projection is safe by default; exact host results are separate.
+        println!("{:?}: {:?}", event.kind, event.cursor);
+    }
+    events.take_result().ok_or_else(|| {
+        ai_agents::AgentError::Other("task stream ended without an operation result".into())
+    })?
+}
+```
+
+`RuntimeAgent::run_task_stream(&runner, objective, profile)` and `task_operation_stream(&runner, operation, config)` adapt an explicitly configured runner for that exact runtime. A runner bound to another runtime rejects before execution. They do not construct a parallel runner or install builder/YAML hosting. Facade root exports and `ai_agents::autonomy` expose the same event types.
+
+### Event identity and meaning
+
+Each `TaskRunEvent` contains an `operation_id`, operation-local `sequence`, optional `run_id`/source `revision`, a `TaskEventCursor`, `kind` and structured `data`. The cursor orders delivery by coordinating acknowledged revision and then an index within that revision; concurrent producers may carry an older source revision than the delivery high-water. New admitted resume/control claims advance revisions. Sequence is not an invocation count, cursor is not evidence authority, and gaps do not imply an effect. This API is not a durable event log, subscriber replay service or exactly-once transport.
+
+Categories cover task start/resume, stages, optional todos/artifacts, tool requests/results, validation, tri-state gate checks, domain progress, interventions/replanning, forced continuation, committed turns/state changes, pending approval/question/external conditions, host controls and every returned task status. `ToolStarted` is a logical request, not invocation proof. `ToolCompleted` separates actual `executed`, `success` and `eligible_at_record`; none alone proves task completion or continuing freshness. Validation reentry retains its attempt rather than inventing another start. Child tool observations carry redacted runtime/operation identity under the coordinating run. Discarded model content is not task completion evidence.
+
+`TaskStreamOperation` selects initial task/explicit skill execution, retained resume, paused cancel/stop, objective/limit changes, confirmed external/controller delivery loss or restoration review. All use the existing authentication, exact-revision and current-policy contracts. Restoration review still does not answer the original pending question or approve its tool. A safe pause ends this operation's stream while retaining the runner's owner; explicit resume creates the next stream. Consume the operation result before responding to a pending notice, because final pause preparation may be part of the operation. Existing host preparation/startup/reconstruction APIs remain explicit; reconnecting does not execute saved display events.
+
+### Results, privacy and ownership
+
+The final status event follows the existing public operation's acknowledged outcome and ownership handoff, including requested persistence preparation for safe pauses. A storage/API error produces `OperationError`, not a fabricated successful task status. `take_result()` returns the exact original `Result<TaskRunResult>` once the operation finishes; its objective, pending details and evidence are trusted-host data, not a safe JSON export. Status, revision and counters in final events match that result. EOF without a result is not success.
+
+Text and host-defined identifiers are summarized with the existing default privacy policy before queueing. Structured domain maps use redacted name/value entries, including reserved-looking keys; numeric values remain numeric. Display structure is bounded, nested projections are limited to 2 KiB and the complete envelope to 4 KiB, with explicit `display_unavailable` markers rather than unrestricted recovery dumps. These display limits do not truncate exact native history, task evidence or checkpoints. Trusted hosts use the exact returned pending request to render an authorized question/review interface; event identifiers cannot grant approval.
+
+`TaskStreamConfig.capacity` defaults to 32 and accepts 1 through 1,024 events. Full queues backpressure the owned operation instead of dropping control/status events. No work progresses when the stream is not polled, except already admitted framework/host work that has its own existing lifetime. Original deadlines/accounting remain authoritative when polling resumes; this is cooperative control, not hard preemption. Observability's lossy queue is not used as the task delivery channel.
+
+Dropping a never-polled stream admits nothing. Dropping an interrupted active operation blocks further admission and retains uncertain work/owners for explicit recovery; it does not acknowledge cancellation or rollback. `stream.close().await` requests cancellation while continuing to poll the original operation and drain its events, then returns its actual result. Completion can win that race. A returned pause/terminal outcome is not undone merely because display delivery is later lost. Close before first poll returns `None`; interruption before execution acknowledgement reports an error and preserves existing recovery guards. A host may bound its close wait, but dropping that wait still does not prove cleanup. Keep the runner alive for volatile pause/resume or use the existing explicitly prepared durable reconstruction contract.
+
+Run the credential-free example from the checkout with `cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-events --locked --offline`. It uses a finite fixture provider, no tools or external effects, and demonstrates a real question pause and explicit resume. These are development APIs, not the published 1.1.1 release contract.
 
 ## Streaming
 

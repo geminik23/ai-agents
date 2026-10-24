@@ -29,6 +29,17 @@ fn development_standalone_and_provenance_migration_surface_compiles() {
             "prepared-host-binding".into(),
         )?;
         let _run = runner.run("objective", None);
+        let _events: ai_agents::TaskRunStream<'_> = runner.run_stream("objective", None)?;
+        let _runtime_events = agent.run_task_stream(&runner, "objective", None)?;
+        let _controlled = agent.task_operation_stream(
+            &runner,
+            ai_agents::TaskStreamOperation::Resume {
+                run_id: "retained-run".into(),
+                revision: 1,
+                input: ai_agents::autonomy::TaskResumeInput::Continue,
+            },
+            ai_agents::TaskStreamConfig { capacity: 1 },
+        )?;
         let _cancel = runner.request_cancel("retained-run");
         let _resume = runner.resume(
             "retained-run",

@@ -14,6 +14,10 @@ The ai-agents framework connects YAML agent definitions to a Rust runtime. This 
 
 ---
 
+## Development task execution and events
+
+The development Rust task runner supervises objectives using the existing runtime, shared resource ledger and eligible completion evidence. It is not a separate coding-agent engine: tools, todos and local files are optional. Its explicit event streams describe execution, validation, progress, human decisions and acknowledged results through that same controller. A turn response is not task completion, a pending event is not approval authority, and dropping a stream is not cleanup acknowledgement. Default-safe display events are separate from exact host results and recovery data. Automatic YAML/state/skill task entry and full CLI/TUI/eval hosting remain unavailable. See [task event streams](@/docs/rust-api.md#task-event-streams-development-only) for the development-only lifetime and privacy contract.
+
 ## Architecture
 
 

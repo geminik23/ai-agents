@@ -1649,6 +1649,7 @@ impl AutonomyRunner {
         Box::pin(async move {
             let restored = execution.load_owned().await?;
             let restored: TaskCheckpointPayload = serde_json::from_value(restored.payload)?;
+            super::events::emit(execution, if restored.counters.turns == 0 { super::events::TaskRunEventKind::TaskStarted } else { super::events::TaskRunEventKind::TaskResumed }, || json!({"objective_revision":restored.objective_revision,"counters":restored.counters})).await;
             let controller = restored
                 .adapters
                 .iter()
@@ -1859,6 +1860,8 @@ impl AutonomyRunner {
 
                     bound.capture_targets(&mut scope)?;
                     execution.set_scope(&scope);
+                    let starting_stage =
+                        payload.stage != scope.stage || payload.counters.turns == 0;
                     // This is an advisory view; live admission remains authoritative if time passes before dispatch.
                     let controller = json!({"objective":objective,"stage":scope.stage,"instruction":instruction,
                 "todos":todo.map(RunTodoAdapter::checkpoint).transpose()?,
@@ -1889,6 +1892,18 @@ impl AutonomyRunner {
                     Ok(())
                 })
                 .await?;
+                    // Delivery follows the turn checkpoint and holds no ledger lock; a slow consumer cannot extend its execution authority.
+                    if starting_stage && scope.stage.is_some() {
+                        super::events::emit(execution, super::events::TaskRunEventKind::StageStarted, || json!({"stage":scope.stage.as_deref().map(super::events::safe_text),"cycle":scope.cycle})).await;
+                    }
+                    if forced_continuation {
+                        super::events::emit(
+                            execution,
+                            super::events::TaskRunEventKind::ContinuationForced,
+                            || json!({"cycle":scope.cycle}),
+                        )
+                        .await;
+                    }
                     let response = if let Some(response) = resumed_response.take() {
                         Ok(response)
                     } else {
@@ -1923,7 +1938,10 @@ impl AutonomyRunner {
                         }
                     };
                     match response {
-                        Ok(response) => last_response = Some(response),
+                        Ok(response) => {
+                            super::events::emit(execution, super::events::TaskRunEventKind::TurnCompleted, || json!({"cycle":scope.cycle,"response":super::events::safe_text(&response.content)})).await;
+                            last_response = Some(response);
+                        }
                         Err(AgentError::TaskSuspended(_)) => {
                             return self.pause(execution, todo).await;
                         }
@@ -2006,6 +2024,9 @@ impl AutonomyRunner {
                             Ok(())
                         })
                         .await?;
+                    if let Some(todos) = &todos {
+                        super::events::emit(execution, super::events::TaskRunEventKind::TodoUpdated, || json!({"count":todos.items.len(),"items":super::events::safe_value(&serde_json::to_value(&todos.items).unwrap_or(serde_json::Value::Null))})).await;
+                    }
                     scope.mutation_generation = execution.mutation_generation();
                     let identity = Self::identity(&scope, scope.cycle, None, String::new());
                     evidence.current = Some(ScopedObservation {
@@ -2353,6 +2374,28 @@ impl AutonomyRunner {
                     data: json!({"scope":scope,"gate":gate,"completion":completion,"validations":evidence.validations.iter().filter(|result| result.identity.cycle == scope.cycle).collect::<Vec<_>>(),"progress":progress.last_delta,"decision":decision}) });
                 Ok(())
             }).await?;
+                // Only the acknowledged controller decision is exported; delivery never selects another intervention.
+                super::events::emit(
+                    execution,
+                    super::events::TaskRunEventKind::ProgressObserved,
+                    || json!({"observation_sequence":progress.sequence,"delta":progress.last_delta,"metrics":evidence.progress.as_ref().map(|p|super::events::safe_value(&p.value))}),
+                )
+                .await;
+                super::events::emit(
+                    execution,
+                    super::events::TaskRunEventKind::CompletionGateChecked,
+                    || json!({"outcome":gate,"cycle":scope.cycle,"details":completion.as_ref().map(|c|super::events::safe_value(&serde_json::to_value(c).unwrap_or(serde_json::Value::Null)))}),
+                )
+                .await;
+                super::events::emit(execution, super::events::TaskRunEventKind::InterventionSelected, || json!({"decision":match &decision { CheckpointDecision::Terminal { .. } => "terminal", CheckpointDecision::Wait => "wait", CheckpointDecision::Replan => "replan", CheckpointDecision::AskUser => "ask_user", CheckpointDecision::Continue => "continue", CheckpointDecision::Limit => "limit" },"cycle":scope.cycle})).await;
+                if lifecycle.current_stage > previous_stage {
+                    super::events::emit(
+                        execution,
+                        super::events::TaskRunEventKind::StageCompleted,
+                        || json!({"stage_index":previous_stage,"stage":profile.settings.lifecycle.as_ref().and_then(|stages|stages.get(previous_stage)).map(|stage|super::events::safe_text(&stage.id)),"cycle":scope.cycle}),
+                    )
+                    .await;
+                }
                 bound.extensions.ensure_targets_current(&scope)?;
                 match decision {
                     CheckpointDecision::Terminal { status, reason } => {
@@ -2548,6 +2591,7 @@ impl AutonomyRunner {
                 identity.target = Some(target.into());
                 identity.target_revision = scope.target_revisions.get(target).cloned();
             }
+            let resuming_validation = resumed.is_some();
             let mut driver = Box::new(if let Some(driver) = resumed {
                 ValidationDriverState::restore_retained(
                     serde_json::to_value(&driver)?,
@@ -2559,6 +2603,9 @@ impl AutonomyRunner {
             } else {
                 ValidationDriverState::new(check, identity)?
             });
+            if !resuming_validation {
+                super::events::emit(execution, super::events::TaskRunEventKind::ValidationStarted, || json!({"check":super::events::safe_text(&check.check.id),"attempt":super::events::safe_text(driver.identity.attempt.as_deref().unwrap_or(""))})).await;
+            }
             let snapshot = execution.load_owned().await?;
             let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload)?;
             let millis = payload
@@ -2609,6 +2656,19 @@ impl AutonomyRunner {
                     scope.mutation_generation = execution.mutation_generation();
                     evidence.collect_validation(&driver)?;
                     evidence.collect_artifacts(&driver, check)?;
+                    // Normalization may retire older artifacts, so select the acknowledged attempt rather than slicing by the old vector length.
+                    for artifact in evidence.artifacts.iter().filter(|artifact| {
+                        artifact.identity.attempt == driver.identity.attempt
+                            && artifact.identity.cycle == driver.identity.cycle
+                            && artifact.identity.config_identity == driver.identity.config_identity
+                            && artifact
+                                .identity
+                                .validation_dependencies
+                                .contains_key(&check.check.id)
+                    }) {
+                        super::events::emit(execution, super::events::TaskRunEventKind::ArtifactObserved, || json!({"path":super::events::safe_text(&artifact.value.path),"exists":artifact.value.exists,"check":super::events::safe_text(&check.check.id)})).await;
+                    }
+
                     Ok(None)
                 }
                 ValidationDriverOutcome::AwaitExternal(_) | ValidationDriverOutcome::Suspended => {

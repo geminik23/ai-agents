@@ -74,7 +74,7 @@ impl RunExecution {
         {
             owner.telemetry.mark_missing();
         }
-        Ok(Arc::new(Self {
+        let execution = Arc::new(Self {
             store,
             owner: owner.clone(),
             participants: Arc::new(super::participants::Participants::default()),
@@ -132,7 +132,13 @@ impl RunExecution {
                     .unwrap_or(0),
             ),
             todos: parking_lot::RwLock::new(None),
-        }))
+        });
+        if let Some(sink) = super::events::current_sink() {
+            *owner.events.write() = Some(sink.clone());
+            sink.owner(&owner);
+            // Resume still needs exclusive Arc initialization; publish weak execution handles only when entering its scope.
+        }
+        Ok(execution)
     }
 
     /// Explicit recovery retires the original canonical binding; it cannot replace another run's list.
@@ -392,6 +398,7 @@ impl RunExecution {
 
     /// A finalized shared-executor hop is captured once with private run/cycle authority.
     /// Fallbacks keep the model call ID but must not collapse distinct logical hops into an ancestor's evidence.
+    /// Only a newly acknowledged capture emits a redacted result event, outside ledger serialization; event delivery supplies no completion credit.
     pub(crate) async fn capture_tool_record(
         &self,
         record: &ai_agents_core::ToolExecutionRecord,
@@ -418,6 +425,7 @@ impl RunExecution {
         }
         scope.mutation_generation = self.mutation_generation();
         let operation = super::current_child_operation();
+        let mut fresh = false;
         self.update(|payload| {
             if payload.evidence.tool_calls.iter().any(|capture| {
                 capture.record.call_id == record.call_id
@@ -434,6 +442,7 @@ impl RunExecution {
             }) {
                 return Ok(());
             }
+            fresh = true;
             let sequence = payload.evidence.tool_calls.len() as u64;
             let identity = EvidenceIdentity {
                 key: scope.key.clone(),
@@ -469,6 +478,9 @@ impl RunExecution {
             Ok(())
         })
         .await?;
+        if fresh {
+            super::events::emit(self, super::events::TaskRunEventKind::ToolCompleted, || json!({"runtime":super::events::safe_text(runtime_id),"operation":operation.as_deref().map(super::events::safe_text),"call":super::events::safe_text(&record.call_id),"tool":super::events::safe_text(&record.canonical_id),"source":super::events::safe_source(&record.source),"executed":record.executed,"success":record.success,"eligible_at_record":super::evidence::executed(record),"output":super::events::safe_text(&record.output)})).await;
+        }
         Ok(())
     }
 
@@ -1224,6 +1236,11 @@ pub(crate) async fn scope_execution<F: std::future::Future>(
     execution: Arc<RunExecution>,
     future: F,
 ) -> F::Output {
+    // Resume has finished exclusive initialization before this scope publishes a cancellation handle.
+    if let Some(sink) = super::events::current_sink() {
+        *execution.owner.events.write() = Some(sink.clone());
+        sink.execution(&execution);
+    }
     let todos = execution.task_todos();
     let run_id = execution.run_id.clone();
     let scoped = ai_agents_llm::scope_invocation_admission(
