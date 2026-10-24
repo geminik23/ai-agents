@@ -96,6 +96,24 @@ impl AgentRegistry {
         }
     }
 
+    /// Computes only coordination/hook writes; child invocations still require their own shared-ledger admission.
+    /// The registry holds an immutable actual hook handle, so this binding cannot be replaced between quote and callback.
+    pub(crate) fn declared_write_footprint(
+        &self,
+        operation: &str,
+        args: &serde_json::Value,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        max_targets: usize,
+    ) -> Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        if let Some(hooks) = &self.hooks {
+            hooks.declared_write_footprint(operation, args, ctx, max_targets)
+        } else {
+            Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+                format!("framework.registry.{operation}.v1"),
+            )))
+        }
+    }
+
     /// Attach lifecycle hooks to the registry.
     pub fn with_hooks(mut self, hooks: Arc<dyn RegistryHooks>) -> Self {
         self.hooks = Some(hooks);
@@ -808,6 +826,17 @@ impl std::fmt::Debug for AgentRegistry {
 /// Optional lifecycle hooks for registry events.
 #[async_trait]
 pub trait RegistryHooks: Send + Sync {
+    /// Declares the complete logical write set for this operation's callback tail; unsupported is conservative by default.
+    /// This capability does not authorize child work, provider calls or hidden detached execution.
+    fn declared_write_footprint(
+        &self,
+        _operation: &str,
+        _args: &serde_json::Value,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Called after an agent is successfully registered.
     async fn on_agent_spawned(&self, _id: &str, _spec: &AgentSpec) {}
 

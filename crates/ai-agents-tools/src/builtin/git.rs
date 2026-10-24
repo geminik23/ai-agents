@@ -108,6 +108,16 @@ struct GitDiffOutput {
 
 #[async_trait]
 impl Tool for GitStatusTool {
+    fn declared_write_footprint(
+        &self,
+        _: &Value,
+        _: &ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.git_status.inspect.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "git_status"
     }
@@ -222,6 +232,16 @@ impl Tool for GitStatusTool {
 
 #[async_trait]
 impl Tool for GitDiffTool {
+    fn declared_write_footprint(
+        &self,
+        _: &Value,
+        _: &ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "builtin.git_diff.inspect.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "git_diff"
     }
@@ -278,13 +298,14 @@ impl Tool for GitDiffTool {
         let mut diff_args = vec![
             "diff",
             "--no-ext-diff",
+            "--no-textconv",
             "--src-prefix=a/",
             "--dst-prefix=b/",
         ];
         if input.staged {
             diff_args.push("--cached");
         }
-        let mut summary_args = vec!["diff", "--name-status"];
+        let mut summary_args = vec!["diff", "--no-ext-diff", "--no-textconv", "--name-status"];
         if input.staged {
             summary_args.push("--cached");
         }
@@ -333,7 +354,16 @@ fn vcs_metadata() -> ToolSafetyMetadata {
 }
 
 fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    // Inspection must not refresh the index or invoke configured fsmonitor, textconv or external-diff helpers.
     let output = Command::new("git")
+        .args([
+            "--no-pager",
+            "--no-optional-locks",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+        ])
         .args(args)
         .current_dir(cwd)
         .output()

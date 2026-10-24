@@ -60,6 +60,11 @@ impl TaskFinalAdmission for BranchRestriction {
             Ok(())
         }
     }
+
+    // Local closure prohibits new requests and retries, not settlement of an already dispatched losing call.
+    fn validate_dispatched(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct BranchLedger {

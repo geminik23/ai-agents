@@ -2,6 +2,8 @@
 
 pub mod builtin;
 mod condition;
+mod footprint;
+
 pub mod mcp;
 mod provider;
 mod registry;

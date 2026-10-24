@@ -70,6 +70,27 @@ struct CommandToolOutput {
 
 #[async_trait]
 impl Tool for CommandTool {
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        let request = prepare_request(args, ctx).map_err(ai_agents_core::AgentError::Tool)?;
+        let runner = self.runner.read().clone();
+        let footprint = runner.declared_write_footprint(&request, ctx, max_targets)?;
+        Ok(crate::footprint::prepare(&self.runner, runner, footprint))
+    }
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(self
+            .prepare_write_footprint(args, ctx, max_targets)?
+            .map(|prepared| prepared.footprint))
+    }
     fn id(&self) -> &str {
         "command"
     }
@@ -131,47 +152,56 @@ impl Tool for CommandTool {
     }
 
     async fn execute(&self, args: Value, ctx: ToolExecutionContext) -> ToolResult {
-        let input: CommandInput = match serde_json::from_value(args) {
-            Ok(input) => input,
-            Err(error) => return ToolResult::error(format!("Invalid input: {}", error)),
-        };
-        let argv = match command_argv(&input) {
-            Ok(argv) => argv,
+        let request = match prepare_request(&args, &ctx) {
+            Ok(request) => request,
             Err(error) => return ToolResult::error(error),
         };
-        if argv.is_empty() {
-            return ToolResult::error("argv must not be empty");
-        }
-        if input.command.is_some() && contains_shell_syntax(&argv.join(" ")) {
-            return ToolResult::error("command string contains shell syntax denied by default");
-        }
-        let policy = CommandPolicySnapshot::from_context(&ctx.policy_snapshot);
-        let env = filter_env(input.env, &policy);
-        let timeout_ms = input
-            .timeout_ms
-            .unwrap_or(DEFAULT_TIMEOUT_MS)
-            .min(ctx.limits.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
-        let max_output_chars = input
-            .max_output_chars
-            .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
-            .min(
-                ctx.limits
-                    .max_output_chars
-                    .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
-            );
-        let cwd = input.cwd.unwrap_or_else(|| ".".to_string());
-        let request = CommandRequest {
-            argv: argv.clone(),
-            cwd: Some(cwd.clone()),
-            env,
-            timeout_ms: Some(timeout_ms),
-            max_output_chars: Some(max_output_chars),
-            reason: input.reason.clone(),
-        };
         let runner = self.runner.read().clone();
+        if let Err(error) = crate::footprint::verify_host(&ctx, &runner) {
+            return ToolResult::error(error.to_string());
+        }
+        let cwd = request.cwd.clone().unwrap_or_else(|| ".".into());
+        let argv = request.argv.clone();
+        let reason = request.reason.clone();
         let response = runner.run_command(request, ctx).await;
-        command_response_to_result(response, cwd, argv, input.reason)
+        command_response_to_result(response, cwd, argv, reason)
     }
+}
+
+// Quotes and execution share policy-normalized argv, environment and limits rather than model-supplied hints.
+fn prepare_request(args: &Value, ctx: &ToolExecutionContext) -> Result<CommandRequest, String> {
+    let input: CommandInput =
+        serde_json::from_value(args.clone()).map_err(|error| format!("Invalid input: {error}"))?;
+    let argv = command_argv(&input)?;
+    if argv.is_empty() {
+        return Err("argv must not be empty".into());
+    }
+    if input.command.is_some() && contains_shell_syntax(&argv.join(" ")) {
+        return Err("command string contains shell syntax denied by default".into());
+    }
+    let policy = CommandPolicySnapshot::from_context(&ctx.policy_snapshot);
+    Ok(CommandRequest {
+        argv,
+        cwd: Some(input.cwd.unwrap_or_else(|| ".".into())),
+        env: filter_env(input.env, &policy),
+        timeout_ms: Some(
+            input
+                .timeout_ms
+                .unwrap_or(DEFAULT_TIMEOUT_MS)
+                .min(ctx.limits.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
+        ),
+        max_output_chars: Some(
+            input
+                .max_output_chars
+                .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS)
+                .min(
+                    ctx.limits
+                        .max_output_chars
+                        .unwrap_or(DEFAULT_MAX_OUTPUT_CHARS),
+                ),
+        ),
+        reason: input.reason,
+    })
 }
 
 #[derive(Debug, Default)]

@@ -379,6 +379,8 @@ impl RuntimeAgent {
             limits: field!(limits),
             policy_snapshot,
             custom_config,
+            // Persisted footprint data is audit-only; current shared admission must derive a fresh live binding.
+            admitted_write_footprint: None,
         })
     }
 

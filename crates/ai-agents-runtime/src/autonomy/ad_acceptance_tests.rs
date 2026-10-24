@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "ad_closure_tests.rs"]
+mod closure;
 #[path = "ad_completion_tests.rs"]
 mod completion;
 #[path = "ad_resource_tests.rs"]

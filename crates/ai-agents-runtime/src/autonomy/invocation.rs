@@ -53,6 +53,8 @@ pub(crate) struct InvocationScope {
     bounds: Option<InvocationBounds>,
     mutations: Option<Arc<AtomicU64>>,
     evidence: Vec<Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>>,
+    child_operation: Option<String>,
+    child_required: Option<bool>,
 }
 
 impl InvocationScope {
@@ -74,6 +76,8 @@ impl InvocationScope {
             bounds,
             mutations: current_mutation_clock(),
             evidence: ai_agents_llm::current_invocation_evidence(),
+            child_operation: super::current_child_operation(),
+            child_required: Some(super::child_required()),
         }
     }
 
@@ -84,8 +88,23 @@ impl InvocationScope {
         scope
     }
 
-    /// Nested restrictions intersect; inherited mutation tracking observes actual child/fallback hops rather than only the outer record.
+    /// Nested restrictions intersect; child attribution and failure policy survive spawned callbacks without minting another operation.
+    /// Inherited mutation tracking observes actual child/fallback hops rather than only the outer record.
     pub(crate) async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        let future = Box::pin(future);
+        let attributed = Box::pin(async {
+            if let Some(operation) = super::current_child_operation().or(self.child_operation) {
+                Box::pin(super::scope_child_operation(operation, future)).await
+            } else {
+                future.await
+            }
+        });
+        let future = Box::pin(super::scope_child_requirement(
+            super::participants::current_child_requirement()
+                .or(self.child_required)
+                .unwrap_or(true),
+            attributed,
+        ));
         let work = async {
             if let Some(clock) = self.mutations {
                 OBSERVATION_MUTATIONS.scope(clock, future).await

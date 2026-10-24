@@ -54,7 +54,7 @@ mod builtins;
 #[cfg(test)]
 mod checkpoint_tests;
 #[cfg(test)]
-mod child_tests;
+pub(crate) mod child_tests;
 #[cfg(test)]
 mod co_completion_tests;
 #[cfg(test)]
@@ -107,7 +107,7 @@ pub(crate) use control::prepare_host_control;
 pub use journal::TaskValidationJournal;
 pub use lifecycle::*;
 #[cfg(test)]
-mod continuation_test_support;
+pub(crate) mod continuation_test_support;
 #[cfg(test)]
 mod driver_regression_tests;
 #[cfg(test)]

@@ -87,6 +87,16 @@ pub trait LLMProvider: Send + Sync {
         Ok(None)
     }
 
+    /// Settles only complete final stream usage from this implementation after normal EOF.
+    /// The unsupported default retains the complete bound; errors, partial streams and drop never infer a refund.
+    fn settle_stream_request_cost(
+        &self,
+        _bound: &crate::autonomy::ProviderCostBound,
+        _usage: Option<&crate::TokenUsage>,
+    ) -> Result<Option<crate::autonomy::ProviderCostSettlement>, LLMError> {
+        Ok(None)
+    }
+
     /// Reports whether a provider error is terminal for this exact attempt.
     ///
     /// Terminal errors represent local configuration, protocol, or history failures that retry,

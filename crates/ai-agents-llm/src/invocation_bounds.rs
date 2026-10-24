@@ -55,6 +55,15 @@ pub fn validate_invocation_evidence() -> ai_agents_core::Result<()> {
     Ok(())
 }
 
+/// Rechecks live proof after dispatch while admission-only restrictions leave consumed work eligible for settlement.
+/// This never permits another invocation; its pre-dispatch path still calls each guard's full validation.
+pub(crate) fn validate_dispatched_evidence() -> ai_agents_core::Result<()> {
+    for guard in current_invocation_evidence() {
+        guard.validate_dispatched()?;
+    }
+    Ok(())
+}
+
 /// Nested work retains all parent proof guards and cannot replace them by passing an empty set.
 pub async fn scope_invocation_evidence<F: Future>(
     guards: Vec<Arc<dyn TaskFinalAdmission>>,

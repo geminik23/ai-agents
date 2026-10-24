@@ -144,8 +144,46 @@ impl FreshRuntime {
         Ok(graph)
     }
 }
+// A host must sample the backend's certified UTC source, not extrapolate a different clock domain from an old epoch.
+#[test]
+fn reconstruction_host_uses_backend_clock_source_without_projected_utc_drift() {
+    let provider = crate::autonomy::runner_tests::RecordingProvider::new(&["done"]);
+    let agent = Arc::new(
+        crate::AgentBuilder::new()
+            .system_prompt("clock fixture")
+            .llm(provider.clone())
+            .build()
+            .unwrap(),
+    );
+    let source = FreshRuntime::new(agent, vec![provider]);
+    let epoch = chrono::DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+    let backend_clock = Arc::new(parking_lot::Mutex::new(epoch));
+    let installed_clock = backend_clock.clone();
+    let host = RebuildHost::with_clock_source(
+        "clock-source.v1",
+        &source,
+        Box::new(|| Box::pin(async { panic!("clock regression must not stage a runtime") })),
+        Arc::new(move || *installed_clock.lock()),
+    );
+    let updated_at = epoch + chrono::Duration::milliseconds(20);
+    *backend_clock.lock() = updated_at;
+    assert_eq!(
+        host.now().unwrap(),
+        updated_at,
+        "the backend UTC change must be observed without renewing an invocation deadline"
+    );
+    let rollback = epoch - chrono::Duration::seconds(1);
+    *host.clock.lock() = Some(rollback);
+    assert_eq!(
+        host.now().unwrap(),
+        rollback,
+        "an explicit untrusted clock must not be clamped to a safe value"
+    );
+}
+
 type Factory = dyn Fn() -> Pin<Box<dyn Future<Output = FreshRuntime> + Send>> + Send + Sync;
 type Providers = BTreeMap<usize, Vec<Weak<RecordingProvider>>>;
+type UtcSource = dyn Fn() -> chrono::DateTime<chrono::Utc> + Send + Sync;
 
 /// Test integration reconstructs established fixtures; the framework still owns topology, state, clocks and execution admission.
 pub(super) struct RebuildHost {
@@ -155,14 +193,22 @@ pub(super) struct RebuildHost {
     providers: parking_lot::Mutex<Providers>,
     pub staged: parking_lot::Mutex<Weak<RuntimeAgent>>,
     pub clock: parking_lot::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
-    epoch: chrono::DateTime<chrono::Utc>,
-    started: std::time::Instant,
+
+    utc_source: Arc<UtcSource>,
 }
 impl RebuildHost {
-    // Weak indexes witness actual implementations; one certified local UTC anchor and monotonic elapsed time keep positive fixtures independent of later OS clock rollback.
+    // Weak indexes witness actual implementations; the host and backend share a certified UTC source rather than independent clock projections.
     pub fn new(recipe: &'static str, source: &FreshRuntime, factory: Box<Factory>) -> Arc<Self> {
-        let started = std::time::Instant::now();
-        let epoch = chrono::Utc::now();
+        Self::with_clock_source(recipe, source, factory, Arc::new(chrono::Utc::now))
+    }
+
+    // Clock-contract regressions can advance the backend's UTC source without changing the OS clock or work allowance.
+    fn with_clock_source(
+        recipe: &'static str,
+        source: &FreshRuntime,
+        factory: Box<Factory>,
+        utc_source: Arc<UtcSource>,
+    ) -> Arc<Self> {
         let host = Arc::new(Self {
             recipe,
             factory,
@@ -173,8 +219,7 @@ impl RebuildHost {
             providers: Default::default(),
             staged: Default::default(),
             clock: Default::default(),
-            epoch,
-            started,
+            utc_source,
         });
         host.register(source);
         host
@@ -200,17 +245,13 @@ impl TaskRestoreHost for RebuildHost {
     fn reconstruction_budget(&self) -> std::time::Duration {
         std::time::Duration::from_secs(5)
     }
-    // This same-process fixture certifies continuity from its fixed UTC epoch, not repeated unchecked OS samples.
-    // Deliberate overrides still exercise rollback rejection; no work budget or original request deadline is widened.
+    // Backend updated_at values use this same UTC domain; extrapolating an old epoch with Instant can lag a later backend timestamp.
+    // Original work/invocation bounds still use their fixed monotonic deadlines, and explicit rollback overrides are never clamped.
     fn now(&self) -> Result<chrono::DateTime<chrono::Utc>> {
         if let Some(clock) = *self.clock.lock() {
             return Ok(clock);
         }
-        let elapsed = chrono::Duration::from_std(self.started.elapsed())
-            .map_err(|_| AgentError::Config("fixture clock elapsed overflow".into()))?;
-        self.epoch
-            .checked_add_signed(elapsed)
-            .ok_or_else(|| AgentError::Config("fixture clock projection overflow".into()))
+        Ok((self.utc_source)())
     }
     // Behavioral queue state is opaque host data; invocation counters are not execution state and are not restored.
     fn runtime_binding(
@@ -287,6 +328,7 @@ impl TaskRestoreHost for RebuildHost {
 }
 
 // Explicit reconstruction never consumes the pending response; acceptance must approve restoration and answer separately.
+// Failure diagnostics expose only phase, clocks and budgets, never provider queues or recovery payloads.
 pub(super) async fn restore(
     runner: AutonomyRunner,
     store: Arc<dyn TaskRunStore>,
@@ -295,10 +337,29 @@ pub(super) async fn restore(
     identity: &str,
     host: Arc<dyn TaskRestoreHost>,
 ) -> (AutonomyRunner, TaskRunResult) {
-    let prepared = runner
+    let capture_started = std::time::Instant::now();
+    let prepared = match runner
         .checkpoint_for_restore(&run.key.run_id, run.revision, host.as_ref())
         .await
-        .unwrap();
+    {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let snapshot = store.load(&run.key.run_id).await.unwrap().unwrap();
+            let payload: Box<TaskCheckpointPayload> =
+                serde_json::from_value(snapshot.payload).unwrap();
+            panic!(
+                "capture failed: {error}; identity={identity}; elapsed={:?}; host_now={:?}; updated_at={}; expiry={:?}; active_ms={}; interrupted_ms={}; max_active_s={}; work_budget={:?}",
+                capture_started.elapsed(),
+                host.now(),
+                snapshot.updated_at,
+                payload.clocks.expires_at,
+                payload.clocks.active_millis,
+                payload.clocks.interrupted_interval_millis,
+                payload.limits.max_active_time_seconds,
+                host.reconstruction_budget()
+            );
+        }
+    };
     drop(runner);
     let (restored, paused) = AutonomyRunner::restore_paused(
         TaskRestoreRequest {

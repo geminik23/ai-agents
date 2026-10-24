@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-pub(super) struct ReceiptStore {
+pub(crate) struct ReceiptStore {
     pub inner: Arc<ScopedTaskRunStore>,
     pub armed: AtomicBool,
     pub mode: &'static str,
@@ -223,7 +223,7 @@ impl TaskRunStore for ReceiptStore {
 }
 
 // Each test runs the same conditional journal against process-local and SQL storage when enabled.
-pub(super) async fn store(
+pub(crate) async fn store(
     agent_id: String,
     identity: &str,
     sqlite: bool,
@@ -243,7 +243,7 @@ pub(super) async fn store(
     assert!(!sqlite);
     Arc::new(ScopedTaskRunStore::in_memory(agent_id, None, identity.into()).unwrap())
 }
-pub(super) fn backends() -> &'static [bool] {
+pub(crate) fn backends() -> &'static [bool] {
     if cfg!(feature = "sqlite") {
         &[false, true]
     } else {

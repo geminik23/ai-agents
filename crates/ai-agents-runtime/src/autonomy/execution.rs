@@ -589,12 +589,26 @@ impl RunExecution {
 
     /// Footprints are computed from the actual implementation and approved arguments while existing executor locks are held.
     /// Box the conditional resource journal before nesting child-tool polling so exact checkpoint temporaries do not multiply on the host stack.
+    #[cfg(test)]
     pub(crate) async fn admit_tool(
         &self,
         tool: &dyn ai_agents_core::Tool,
         args: &Value,
         ctx: &ai_agents_core::ToolExecutionContext,
     ) -> Result<(String, Option<ToolWriteFootprint>)> {
+        let (id, prepared) = self.admit_tool_path(tool, args, ctx, false).await?;
+        Ok((id, prepared.map(|prepared| prepared.footprint)))
+    }
+
+    /// Selects the actual ordinary or resumed-answer implementation and retains its exact live footprint binding through admission.
+    /// The caller keeps that binding through final revalidation, body execution and settlement; only inert target data is journaled.
+    pub(crate) async fn admit_tool_path(
+        &self,
+        tool: &dyn ai_agents_core::Tool,
+        args: &Value,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        question: bool,
+    ) -> Result<(String, Option<ai_agents_core::autonomy::ToolWriteAdmission>)> {
         if !self.progress_allows(args, ctx) {
             return Err(AgentError::Tool(
                 "task work requires canonical todo progress before invocation".into(),
@@ -602,11 +616,19 @@ impl RunExecution {
         }
         let footprint = if let Some(limit) = self.limits.max_declared_write_paths {
             Some(
-                tool.declared_write_footprint(
-                    args,
-                    ctx,
-                    usize::try_from(limit).unwrap_or(usize::MAX),
-                )?
+                if question {
+                    tool.prepare_question_write_footprint(
+                        args,
+                        ctx,
+                        usize::try_from(limit).unwrap_or(usize::MAX),
+                    )
+                } else {
+                    tool.prepare_write_footprint(
+                        args,
+                        ctx,
+                        usize::try_from(limit).unwrap_or(usize::MAX),
+                    )
+                }?
                 .ok_or_else(|| {
                     AgentError::Tool(
                         "declared write limit requires a verified footprint binding".into(),
@@ -616,8 +638,12 @@ impl RunExecution {
         } else {
             None
         };
-        let id = Box::pin(self.admit_resources(Some(&ctx.canonical_id), None, footprint.as_ref()))
-            .await?;
+        let id = Box::pin(self.admit_resources(
+            Some(&ctx.canonical_id),
+            None,
+            footprint.as_ref().map(|prepared| &prepared.footprint),
+        ))
+        .await?;
         Ok((id, footprint))
     }
 
@@ -1110,11 +1136,16 @@ impl ai_agents_core::autonomy::InvocationAdmission for RunExecution {
         self.stop("uncertain_effect");
     }
     /// Recovery must not route around a run-wide stop using another provider alias.
+    /// A local composition cut remains an incomplete operation, not fabricated exhaustion of the coordinating run's own clock.
     fn execution_stopped(&self) -> bool {
         if self.owner.check().is_err() {
             self.stop("owner_abandoned");
         }
-        if self.remaining_duration().is_zero() {
+        if super::composition::current_composition_deadline()
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.stop("composition_timeout");
+        } else if self.remaining_duration().is_zero() {
             self.stop("time_violation");
         }
         self.stop_reason().is_some()

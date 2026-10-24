@@ -38,6 +38,17 @@ pub(crate) struct TaskModelFinal {
     pub response_metadata: Option<HashMap<String, Value>>,
 }
 
+/// Branch receipts are observation data, not execution authority; final disposition waits for the reviewed return path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskSpeculativeBranch {
+    pub id: String,
+    pub optimization: crate::optimization::RuntimeOptimizationKind,
+    pub behavior: crate::optimization::RuntimeCommitBehavior,
+    pub failed: bool,
+    pub uninvoked: bool,
+}
+
 /// A settled speculative selection retains inert alternatives while a selected transition awaits review or actions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -52,6 +63,8 @@ pub(crate) struct TaskSpeculativeSelection {
     pub reasoning: Option<ai_agents_reasoning::ReasoningMode>,
     pub reasoning_checked: bool,
     pub auto_detected: bool,
+    #[serde(default)]
+    pub branches: Vec<TaskSpeculativeBranch>,
 }
 
 impl TaskSpeculativeSelection {
@@ -62,6 +75,13 @@ impl TaskSpeculativeSelection {
         unfinished: bool,
     ) {
         use crate::optimization::{RuntimeBranchResult, RuntimeTaskPurpose};
+        self.branches.push(TaskSpeculativeBranch {
+            id: outcome.branch.branch_id(),
+            optimization: outcome.branch.optimization,
+            behavior: outcome.branch.commit_behavior,
+            failed: matches!(outcome.result, RuntimeBranchResult::Failed(_)),
+            uninvoked: unfinished,
+        });
         if unfinished {
             match outcome.branch.purpose {
                 RuntimeTaskPurpose::MainResponse => {

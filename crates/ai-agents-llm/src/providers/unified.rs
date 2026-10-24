@@ -13,6 +13,12 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::google::GoogleProvider;
+use super::pricing::DeclaredPricing;
+use ai_agents_core::autonomy::{ProviderCostBound, ProviderCostSettlement, ProviderRequest};
+
+#[cfg(test)]
+#[path = "pricing_tests.rs"]
+mod pricing_tests;
 
 static NEXT_NORMALIZED_TOOL_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -139,6 +145,7 @@ pub struct UnifiedLLMProvider {
     tool_choice: Option<ToolChoice>,
     client: std::sync::Arc<tokio::sync::Mutex<Option<CachedClient>>>,
     google: Option<GoogleProvider>,
+    pricing: Option<DeclaredPricing>,
 }
 
 impl std::fmt::Debug for UnifiedLLMProvider {
@@ -556,7 +563,14 @@ impl UnifiedLLMProvider {
             None
         };
 
-        Ok(Self {
+        let pricing = default_config
+            .extra
+            .get("declared_pricing")
+            .cloned()
+            .map(serde_json::from_value::<DeclaredPricing>)
+            .transpose()
+            .map_err(|_| LLMError::Config("invalid declared_pricing contract".into()))?;
+        let mut provider = Self {
             provider_type,
             model: model.to_string(),
             api_key: Some(actual_api_key),
@@ -566,7 +580,12 @@ impl UnifiedLLMProvider {
             tool_choice: None,
             client: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             google,
-        })
+            pricing: None,
+        };
+        if let Some(pricing) = pricing {
+            provider = provider.with_declared_pricing(pricing)?;
+        }
+        Ok(provider)
     }
 
     pub fn from_env(
@@ -1026,6 +1045,41 @@ impl UnifiedLLMProvider {
             .map_err(|e| LLMError::Config(format!("Failed to build LLM: {}", e)))
     }
 
+    /// Installs an immutable audited model/endpoint contract before registry consumers capture this provider.
+    /// Unsupported upstream transports remain usable without hard pricing, but cannot advertise an unverified priced capability.
+    pub fn with_declared_pricing(mut self, pricing: DeclaredPricing) -> Result<Self, LLMError> {
+        let endpoint = self.priced_endpoint()?;
+        pricing.validate(&self.model, &endpoint)?;
+        self.pricing = Some(pricing);
+        Ok(self)
+    }
+
+    // Only transports whose actual endpoint selection and request-class mapping are audited participate here.
+    fn priced_endpoint(&self) -> Result<String, LLMError> {
+        if let Some(google) = &self.google {
+            return Ok(google.accounting_endpoint().to_owned());
+        }
+        let default = match self.provider_type {
+            ProviderType::OpenAI => "https://api.openai.com/v1/",
+            ProviderType::OpenAICompatible => "",
+            ProviderType::Google => "https://generativelanguage.googleapis.com/v1beta/",
+            ProviderType::Groq => "https://api.groq.com/openai/v1/",
+            ProviderType::Cohere => "https://api.cohere.ai/compatibility/v1/",
+            ProviderType::Mistral => "https://api.mistral.ai/v1/",
+            ProviderType::OpenRouter => "https://openrouter.ai/api/v1/",
+            _ => {
+                return Err(LLMError::Config(
+                    "this upstream adapter has no audited hard-priced dispatch contract".into(),
+                ));
+            }
+        };
+        // Match the exact normalization performed by the pinned OpenAI-compatible upstream implementation.
+        let raw = self.base_url.as_deref().unwrap_or(default);
+        reqwest::Url::parse(&format!("{}/", raw.trim_end_matches('/')))
+            .map(|url| url.to_string())
+            .map_err(|_| LLMError::Config("invalid priced endpoint".into()))
+    }
+
     /// Public backward-compatible `build_llm` — used by tests and legacy call-sites.
     pub fn build_llm(
         &self,
@@ -1235,6 +1289,81 @@ impl LLMProvider for UnifiedLLMProvider {
         }));
 
         Ok(Box::new(Box::pin(final_stream)))
+    }
+
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.pricing
+            .as_ref()
+            .map(|pricing| pricing.identity(self.provider_name()))
+    }
+
+    fn request_cost_bound(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> Result<Option<ProviderCostBound>, LLMError> {
+        let Some(pricing) = &self.pricing else {
+            return Ok(None);
+        };
+        // Run the same conversion and local protocol validation used by dispatch before admitting any paid attempt.
+        if let Some(google) = &self.google {
+            google.validate_priced_request(request)?;
+        } else {
+            let projected = Self::project_foreign_messages(request.messages)?;
+            let (_, non_system) = extract_system_and_messages(&projected);
+            if let Some(tools) = request.tools {
+                self.convert_messages_with_tools(&non_system)?;
+                if !self.supports_tool_choice(&tools.choice)
+                    || (matches!(tools.choice, ToolChoice::Required | ToolChoice::Specific(_))
+                        && tools.tools.is_empty())
+                    || matches!(&tools.choice, ToolChoice::Specific(name) if !tools.tools.iter().any(|tool| &tool.name == name))
+                {
+                    return Err(LLMError::Config(
+                        "unsupported priced native tool choice".into(),
+                    ));
+                }
+            } else {
+                for message in non_system {
+                    self.convert_message(message);
+                }
+            }
+        }
+        pricing
+            .quote(self.provider_name(), request, &self.default_config)
+            .map(Some)
+    }
+
+    fn settle_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        response: &LLMResponse,
+    ) -> Result<Option<ProviderCostSettlement>, LLMError> {
+        self.pricing.as_ref().map_or(Ok(None), |pricing| {
+            pricing.settle(self.provider_name(), bound, response)
+        })
+    }
+
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        usage: Option<&TokenUsage>,
+    ) -> Result<Option<ProviderCostSettlement>, LLMError> {
+        let Some(pricing) = &self.pricing else {
+            return Ok(None);
+        };
+        // Only GenerateContent currently preserves a complete raw final billing receipt through stream normalization.
+        if self.provider_type != ProviderType::Google {
+            return Ok(None);
+        }
+        let Some(usage) = usage else {
+            return Ok(None);
+        };
+        let mut response = LLMResponse::new("", FinishReason::Stop);
+        response.usage = Some(*usage);
+        response.metadata.insert(
+            "_ai_agents_complete_priced_usage".into(),
+            serde_json::Value::Bool(true),
+        );
+        pricing.settle(self.provider_name(), bound, &response)
     }
 
     fn provider_name(&self) -> &str {

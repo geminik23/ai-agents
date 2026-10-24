@@ -102,6 +102,9 @@
 ///
 /// Managed actor maintenance and speculative alternatives reuse the same live owner and invocation ledger.
 /// Custom callbacks and storage consumers opt in with their actual captured provider handles; an empty list certifies no hidden model work, not an execution grant.
+/// Root/child entry settles earlier ordinary maintenance before ownership; spawned callbacks preserve child attribution and optional failure policy.
+/// Managed providers recheck result eligibility after settlement acknowledgement, while consumed attempts remain charged and unknown cleanup remains protected.
+/// Reviewed branch observations follow actual adoption and state commit; they neither grant effects nor supply completion credit from discarded content.
 ///
 /// ```
 /// use ai_agents::{AgentHooks, LLMProvider};
@@ -178,7 +181,9 @@ pub mod llm {
     pub use ai_agents_llm::routing::*;
 
     pub mod providers {
-        pub use ai_agents_llm::providers::{ProviderBuilder, ProviderType, UnifiedLLMProvider};
+        pub use ai_agents_llm::providers::{
+            DeclaredPricing, ProviderBuilder, ProviderType, UnifiedLLMProvider,
+        };
     }
 }
 
@@ -609,7 +614,9 @@ pub use tools::{
     TextTool, Tool, ToolRegistry, ToolResult, create_builtin_registry,
 };
 
-pub use llm::providers::{ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider};
+pub use llm::providers::{
+    DeclaredPricing, ProviderType, ProviderType as LLMProviderType, UnifiedLLMProvider,
+};
 pub use llm::{
     ChatMessage, LLMProvider, LLMRegistry, LLMResponse, LLMToolDefinition, LLMToolRequest,
     MessageProvenance, MultiLLMRouter, NativeCallBinding, NativeProviderState,

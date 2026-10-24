@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task priced execution: development-only audited model and endpoint contracts reserve complete token ceilings and bounded internal retries, settling matching complete usage while retaining unknown commitments
+- Task write capabilities: development-only local utilities and host-bound footprints preserve actual implementation ownership; retained question answers do not invoke ordinary UI handlers
 - Task maintenance: development-only actor facts and relationships share task ownership, invocation accounting and original bounds through inline, parallel and background work
 - Task speculation: development-only alternatives settle before winner effects, retain exact transition review and tool-batch pauses, and resume only genuinely uninvoked work without resetting allowance
 - Task restoration: development-only explicit host reconstruction resumes prepared safe pauses in fresh runtimes or processes with preserved topology, progress and usage, separate restoration review and current authorization
@@ -22,6 +24,8 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust recovery errors: exhaustive development storage-error matches distinguish clock continuity loss from actual admission deadline exhaustion
+- Rust resource compatibility: development tool contexts add an optional admitted-footprint receipt, transparent tools forward combined preparation and response-only capabilities, and host footprint methods default to unsupported
 - Rust task participation: custom hooks, storage, fact extractors and relationship evaluators declare captured providers through default-unsupported `task_providers` methods; ordinary chat remains usable without opting in
 - Rust restoration compatibility: development host reconstruction bindings and versioned manifests are explicit, custom task stores opt into guarded reconstruction writes, and legacy checkpoints require live preparation rather than automatic executable migration
 - Rust controller compatibility: development premature-finish/limit literals add `on_unavailable`, pending-kind matches add `Limit`, and validator executors gain a defaulted capacity-preflight hook; serialized data still cannot restore live execution authority
@@ -35,6 +39,10 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task reconstruction clocks: distinguish backward UTC from expired allowance while preserving preclaim pauses and charged post-claim custody
+- Task admission handoff: settle earlier ordinary maintenance without holding a gate needed by its callbacks, and preserve child operation attribution and optional failure policy across spawned work
+- Task branch outcomes: preserve reviewed alternatives until actual adoption, distinguish uninvoked selection from no-match, and retire interrupted observations without replaying effects or erasing committed transitions
+- Task provider lifetime: reject late synchronous results and post-acknowledgement success while preserving consumed attempts, original stream restrictions and proven pre-dispatch refunds
 - Background maintenance: preserve tracked joins through cancelled drains and sibling failures, retain late admissions and preserve same-key inline-overflow ordering
 - Actor maintenance: reject foreign runtime mutation during a task, exclude controller-only relationship interactions and propagate failed fact eviction instead of publishing a false authoritative cache
 - Task restoration custody: cancelled preclaim capture preserves its usable pause, failed reconstruction does not leak owner cycles, and temporary participant retirement cannot clear newer ownership

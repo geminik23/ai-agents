@@ -82,6 +82,31 @@ struct WebSearchOutput {
 
 #[async_trait]
 impl Tool for WebSearchTool {
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        let request = prepare_search(args, ctx).map_err(ai_agents_core::AgentError::Tool)?;
+        let provider = self.provider.read().clone();
+        let footprint = provider.declared_write_footprint(&request, ctx, max_targets)?;
+        Ok(crate::footprint::prepare(
+            &self.provider,
+            provider,
+            footprint,
+        ))
+    }
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(self
+            .prepare_write_footprint(args, ctx, max_targets)?
+            .map(|prepared| prepared.footprint))
+    }
     fn id(&self) -> &str {
         "web_search"
     }
@@ -148,9 +173,32 @@ impl Tool for WebSearchTool {
             safe_search: input.safe_search,
         };
         let provider = self.provider.read().clone();
+        if let Err(error) = crate::footprint::verify_host(&ctx, &provider) {
+            return ToolResult::error(error.to_string());
+        }
         let response = provider.search(request).await;
         result_from_response(input.query, response, max_results)
     }
+}
+
+// Host capability checks use the same final result cap and query filters as the real request.
+fn prepare_search(args: &Value, ctx: &ToolExecutionContext) -> Result<WebSearchRequest, String> {
+    let input: WebSearchInput =
+        serde_json::from_value(args.clone()).map_err(|error| format!("Invalid input: {error}"))?;
+    crate::validate_positive_max_results(ctx.limits.max_results).map_err(str::to_string)?;
+    Ok(WebSearchRequest {
+        query: input.query,
+        max_results: Some(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .min(ctx.limits.max_results.unwrap_or(DEFAULT_MAX_RESULTS)),
+        ),
+        include_domains: input.include_domains,
+        language: input.language,
+        region: input.region,
+        safe_search: input.safe_search,
+    })
 }
 
 fn result_from_response(

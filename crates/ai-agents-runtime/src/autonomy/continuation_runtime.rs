@@ -708,6 +708,9 @@ impl RuntimeAgent {
             if let Some(interaction) = &batch.interaction {
                 self.clear_task_interaction(interaction).await?;
             }
+            if let Some(location) = &mut batch.location {
+                self.retire_location_observations(location);
+            }
             for result in &mut batch.results {
                 if result.is_none() {
                     *result = Some(Err("task cancelled before invocation".into()));

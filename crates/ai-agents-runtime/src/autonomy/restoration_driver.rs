@@ -1388,17 +1388,20 @@ impl AutonomyRunner {
     }
 }
 
-// Time samples are checked again after every potentially awaited staging boundary before publication.
+// Fresh UTC is checked after awaited staging before publication; rollback keeps charged claim custody and is distinct from true deadline exhaustion.
 fn safe_claim_time(
     snapshot: &TaskRunSnapshot,
     payload: &TaskCheckpointPayload,
     now: DateTime<Utc>,
 ) -> Result<()> {
-    if now < snapshot.updated_at
-        || payload
-            .clocks
-            .expires_at
-            .is_some_and(|expiry| now >= expiry)
+    // Post-claim UTC rollback keeps the charged Running quarantine; it must not masquerade as ordinary resource exhaustion.
+    if now < snapshot.updated_at {
+        return Err(TaskRunStorageError::ClockDiscontinuity.into());
+    }
+    if payload
+        .clocks
+        .expires_at
+        .is_some_and(|expiry| now >= expiry)
     {
         return Err(TaskRunStorageError::AdmissionExpired.into());
     }

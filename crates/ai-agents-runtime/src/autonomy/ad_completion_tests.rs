@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "ad_branch_closure_tests.rs"]
+mod branch_closure;
+
 struct DraftGateMemory {
     inner: Arc<dyn ai_agents_memory::Memory>,
     armed: AtomicBool,
@@ -120,6 +123,7 @@ fn ad_speculative_saved_context_keeps_values_and_local_allowance() {
         reasoning: None,
         reasoning_checked: true,
         auto_detected: false,
+        branches: Vec::new(),
     };
     let saved: crate::autonomy::location::TaskSpeculativeSelection =
         serde_json::from_value(serde_json::to_value(&selection).unwrap()).unwrap();

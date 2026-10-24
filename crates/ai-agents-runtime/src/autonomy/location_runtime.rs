@@ -492,7 +492,7 @@ impl RuntimeAgent {
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> {
         let request_id = request_id.to_string();
         Box::pin(async move {
-            let location = batch
+            let mut location = batch
                 .location
                 .clone()
                 .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -549,6 +549,7 @@ impl RuntimeAgent {
                             false,
                         )?;
                         if matches!(response, BatchResponse::QuestionTimeout) {
+                            self.retire_location_observations(&mut location);
                             execution.stop("question_timeout");
                             self.acknowledge_completed_task_batch().await?;
                             execution.parked_batches.lock().remove(&self.info.id);
@@ -659,6 +660,7 @@ impl RuntimeAgent {
                         self.context_manager
                             .set("last_tool_record", serde_json::to_value(&record)?)?;
                     } else if matches!(record.policy.outcome, PermissionOutcome::RequiresApproval) {
+                        self.retire_speculative_actions(state);
                         execution.stop("approval_rejected");
                         return Box::pin(
                             self.finish_task_location_stop("State action rejected".into()),
@@ -677,6 +679,9 @@ impl RuntimeAgent {
                         state.state_generation,
                     )?;
                     if let Err(error) = state.cursor.accept_tool_result(record) {
+                        if let Some(actions) = &mut state.actions {
+                            self.retire_speculative_actions(actions);
+                        }
                         execution.stop("skill_step_failed");
                         return Box::pin(self.finish_task_location_stop(error.to_string())).await;
                     }

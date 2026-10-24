@@ -556,6 +556,59 @@ impl Drop for StateTransitionReservation<'_> {
     }
 }
 
+// Deferred observations outlive scheduler collection only when an exact retained continuation accepts them.
+// This guard is declared before the branch set so provider spans drop before interrupted observations are published.
+struct TaskBranchObservations {
+    owner: Option<Arc<crate::autonomy::RunOwner>>,
+    manager: Option<Arc<ObservabilityManager>>,
+    receipts: Vec<crate::autonomy::location::TaskSpeculativeBranch>,
+    retained: bool,
+}
+
+impl TaskBranchObservations {
+    // Capture actual owner and manager handles; dropping outside task-local scope must not lose or duplicate observations.
+    fn new(agent: &RuntimeAgent) -> Self {
+        Self {
+            owner: crate::autonomy::current_execution().map(|execution| execution.owner.clone()),
+            manager: agent.observability_manager.clone(),
+            receipts: Vec::new(),
+            retained: false,
+        }
+    }
+
+    // Resumed actions receive inert receipt data from their exact return position, not a new observation or execution identity.
+    fn for_return(
+        agent: &RuntimeAgent,
+        position: &crate::autonomy::location::TaskStateReturn,
+    ) -> Self {
+        let mut guard = Self::new(agent);
+        if let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } =
+            position
+        {
+            guard.receipts = selection.branches.clone();
+        }
+        guard
+    }
+}
+
+impl Drop for TaskBranchObservations {
+    // Interrupted observation publication is not proof that cancellation stopped an external provider or retired its reservation.
+    fn drop(&mut self) {
+        if !self.retained
+            && let Some(owner) = &self.owner
+        {
+            for receipt in &self.receipts {
+                owner.finalize_branch_observation(
+                    self.manager.as_ref(),
+                    receipt,
+                    "cancelled",
+                    false,
+                );
+            }
+        }
+    }
+}
+
 struct RootTurnCleanup<'a> {
     agent: &'a RuntimeAgent,
 }
@@ -1566,8 +1619,17 @@ impl RuntimeAgent {
                 return Err(AgentError::TaskSuspended(pending.id));
             }
 
-            let lock = self.root_turn_gate.clone().lock_owned();
-            let guard = tokio::time::timeout(execution.remaining_duration(), async {
+            let guard = loop {
+                // Ordinary callbacks may reenter this runtime; drain without its gate, then recheck under the gate before installing an owner.
+                if execution
+                    .participants
+                    .owner_for(&self.root_turn_gate)
+                    .is_none()
+                {
+                    Box::pin(self.await_task_maintenance_handoff(&execution)).await?;
+                }
+                let lock = self.root_turn_gate.clone().lock_owned();
+                let guard = tokio::time::timeout(execution.remaining_duration(), async {
                 tokio::pin!(lock);
                 loop {
                     tokio::select! { guard = &mut lock => return Ok(guard), _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {
@@ -1575,6 +1637,16 @@ impl RuntimeAgent {
                     } }
                 }
             }).await.map_err(|_| AgentError::Other("child root admission deadline exceeded".into()))??;
+                if execution
+                    .participants
+                    .owner_for(&self.root_turn_gate)
+                    .is_some()
+                    || self.background_maintenance.is_empty()
+                {
+                    break guard;
+                }
+                drop(guard);
+            };
             if let Some(parent) = crate::autonomy::composition::composition_admission_denial() {
                 return Err(AgentError::TaskSuspended(parent));
             }
@@ -1584,6 +1656,7 @@ impl RuntimeAgent {
                     "another incoming operation still owns this parked runtime".into(),
                 ));
             }
+
             let _mutations = self.autonomy_mutations.try_write().map_err(|_| {
                 AgentError::Other("child runtime has an active host operation".into())
             })?;
@@ -1732,6 +1805,38 @@ impl RuntimeAgent {
         })
     }
 
+    /// Drains pre-existing ordinary work without adopting its effects or charging it to the incoming task.
+    /// Dropping or stopping this wait leaves the queue's shared completions intact; no child owner is installed until acknowledged quiescence.
+    async fn await_task_maintenance_handoff(
+        &self,
+        execution: &crate::autonomy::RunExecution,
+    ) -> Result<()> {
+        let drain = self.flush_background_tasks();
+        tokio::pin!(drain);
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(10));
+        loop {
+            if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution)
+                || ai_agents_llm::current_invocation_bounds()
+                    .is_some_and(|bounds| bounds.remaining().is_zero())
+            {
+                return Err(AgentError::Other(
+                    "child maintenance handoff stopped".into(),
+                ));
+            }
+            ai_agents_llm::validate_invocation_evidence()?;
+            tokio::select! {
+                result = &mut drain => {
+                    result?;
+                    let payload: Box<crate::autonomy::TaskCheckpointPayload> = serde_json::from_value(execution.load_owned().await?.payload)?;
+                    execution.check(&payload)?;
+                    ai_agents_llm::validate_invocation_evidence()?;
+                    return Ok(());
+                },
+                _ = tick.tick() => {}
+            }
+        }
+    }
+
     /// Renders one accepted objective from immutable invocation data before the run owns or mutates the runtime.
     pub(crate) fn render_autonomy_objective(&self, template: &str, input: &str) -> Result<String> {
         let mut environment = minijinja::Environment::new();
@@ -1801,10 +1906,18 @@ impl RuntimeAgent {
         &self,
         run_id: String,
     ) -> Result<Arc<crate::autonomy::RunOwner>> {
-        let admission = self.acquire_root_turn().await?;
-        scope_runtime_gate_identity_stack(&admission.identity_stack, self.init_storage()).await?;
-        self.preflight_standalone_autonomy()?;
-        self.flush_background_tasks().await?;
+        let admission = loop {
+            let admission = self.acquire_root_turn().await?;
+            scope_runtime_gate_identity_stack(&admission.identity_stack, self.init_storage())
+                .await?;
+            self.preflight_standalone_autonomy()?;
+            if self.background_maintenance.is_empty() {
+                break admission;
+            }
+            // A previous ordinary callback can need this gate; never wait for it while preventing its own completion.
+            drop(admission);
+            self.flush_background_tasks().await?;
+        };
         if self
             .disambiguation_manager
             .as_ref()
@@ -6207,9 +6320,17 @@ impl RuntimeAgent {
                 ));
             }
         }
+        // Retain the real host implementation through admission and execution so a slot swap cannot reuse a dead pointer's receipt.
+        let mut footprint_binding = None;
         let mut admitted_footprint = None;
         let attempt = if let Some(execution) = &execution {
-            let admission = Box::pin(execution.admit_tool(tool.as_ref(), &args, &ctx)).await;
+            let admission = Box::pin(execution.admit_tool_path(
+                tool.as_ref(),
+                &args,
+                &ctx,
+                question_result.is_some(),
+            ))
+            .await;
             let (id, footprint) = match admission {
                 Ok(admitted) => admitted,
                 Err(error) => {
@@ -6219,7 +6340,10 @@ impl RuntimeAgent {
                     return Err(error);
                 }
             };
-            admitted_footprint = footprint;
+            if let Some(prepared) = footprint {
+                admitted_footprint = Some(prepared.footprint);
+                footprint_binding = prepared.binding;
+            }
             Some(id)
         } else {
             None
@@ -6245,7 +6369,12 @@ impl RuntimeAgent {
         // Revalidate with the exact final context, including deadline, that the implementation will receive.
         // Storage admission can wait; changed entry targets must not reuse the previously reserved union.
         let footprint_changed = if let Some(footprint) = &admitted_footprint {
-            let limit = tool.declared_write_footprint(&args, &ctx, footprint.targets.len().max(1));
+            let limit = if question_result.is_some() {
+                tool.prepare_question_write_footprint(&args, &ctx, footprint.targets.len().max(1))
+                    .map(|prepared| prepared.map(|prepared| prepared.footprint))
+            } else {
+                tool.declared_write_footprint(&args, &ctx, footprint.targets.len().max(1))
+            };
             match limit {
                 Ok(Some(current)) => &current != footprint,
                 _ => true,
@@ -6253,10 +6382,16 @@ impl RuntimeAgent {
         } else {
             false
         };
+        // Host tools compare this attempt's acknowledged receipt with their captured actual implementation before effects.
+        // It is not a grant and reconstruction cannot turn its serialized identity into live authority.
+        ctx.admitted_write_footprint = admitted_footprint;
         if crate::autonomy::response::check_response_admission().is_err()
             || ai_agents_llm::validate_invocation_evidence().is_err()
             || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
             || footprint_changed
+            || footprint_binding
+                .as_ref()
+                .is_some_and(|binding| binding.validate().is_err())
             || execution.as_ref().is_some_and(|run| {
                 !run.progress_allows(&args, &ctx)
                     || !run.allows_tool(&ctx.canonical_id)
@@ -7949,6 +8084,7 @@ impl RuntimeAgent {
             limits: limits.clone(),
             policy_snapshot,
             custom_config: security_engine.custom_config(&canonical_id),
+            admitted_write_footprint: None,
         };
         // Arm custody only on the first implementation poll; progress or capability denial is proven non-invocation.
         let (mut result, timed_out, cancelled, invoked) = TOOL_EFFECT_CUSTODY
@@ -9234,6 +9370,7 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        let mut task_branch_observations = TaskBranchObservations::new(self);
         let mut branch_set = ScheduledBranchSet::new(optimization.max_parallel_runtime_tasks)?;
         let main_branch = RuntimeBranch::new(
             RuntimeTaskPurpose::MainResponse,
@@ -9378,6 +9515,44 @@ OVERALL: PASS/FAIL"#,
             return Ok(None);
         }
 
+        for (enabled, id, optimization, behavior) in [
+            (
+                true,
+                &main_id,
+                main_kind,
+                RuntimeCommitBehavior::FinalResponse,
+            ),
+            (
+                transition_enabled,
+                &transition_id,
+                RuntimeOptimizationKind::ParallelStateTransition,
+                RuntimeCommitBehavior::TransitionDecision,
+            ),
+            (
+                skill_enabled,
+                &skill_id,
+                RuntimeOptimizationKind::SpeculativeSkillRouting,
+                RuntimeCommitBehavior::SkillSelection,
+            ),
+            (
+                reasoning_enabled,
+                &reasoning_id,
+                RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                RuntimeCommitBehavior::ReasoningDecision,
+            ),
+        ] {
+            if enabled {
+                task_branch_observations.receipts.push(
+                    crate::autonomy::location::TaskSpeculativeBranch {
+                        id: id.clone(),
+                        optimization,
+                        behavior,
+                        failed: false,
+                        uninvoked: false,
+                    },
+                );
+            }
+        }
         let mut main_pending = true;
         let mut skill_pending = skill_enabled;
         let mut reasoning_pending = reasoning_enabled;
@@ -9386,6 +9561,9 @@ OVERALL: PASS/FAIL"#,
         // so they start unfinalized; only "no skill branch and no skills at all" is finalized up front.
         let mut skill_finalized = !skill_enabled && self.skill_router.is_none();
         let mut reasoning_finalized = !reasoning_enabled;
+        let mut skill_unfinished = false;
+        let mut reasoning_unfinished = false;
+        let mut main_observed = false;
         let mut main_result: Option<Result<MainResponseDraft>> = None;
         let mut transition_candidate: Option<TransitionCandidate> = None;
         let mut skill_candidate: Option<SkillCandidate> = None;
@@ -9398,7 +9576,8 @@ OVERALL: PASS/FAIL"#,
             if let Some(candidate) = transition_candidate.take() {
                 if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
                     // Settle admitted alternatives before review/actions can suspend and unwind the branch set.
-                    let outcomes = Box::pin(self.settle_pending_branches(&mut branch_set)).await?;
+                    let outcomes =
+                        Box::pin(self.collect_pending_task_branches(&mut branch_set)).await?;
                     if speculative_binding
                         != (
                             self.task_review_binding(),
@@ -9409,8 +9588,10 @@ OVERALL: PASS/FAIL"#,
                             "speculative transition binding changed before adoption".into(),
                         ));
                     }
-                    let skill_checked = skill_finalized || skill_candidate.is_some();
-                    let reasoning_checked = reasoning_finalized || reasoning_decision.is_some();
+                    let skill_checked =
+                        (skill_finalized || skill_candidate.is_some()) && !skill_unfinished;
+                    let reasoning_checked = (reasoning_finalized || reasoning_decision.is_some())
+                        && !reasoning_unfinished;
                     let mut selection = crate::autonomy::location::TaskSpeculativeSelection {
                         data: crate::autonomy::interaction::prepared_input()
                             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?,
@@ -9423,8 +9604,48 @@ OVERALL: PASS/FAIL"#,
                         reasoning: reasoning_decision.take(),
                         reasoning_checked,
                         auto_detected: reasoning_enabled,
+                        branches: vec![crate::autonomy::location::TaskSpeculativeBranch {
+                            id: transition_id.clone(),
+                            optimization: RuntimeOptimizationKind::ParallelStateTransition,
+                            behavior: RuntimeCommitBehavior::TransitionDecision,
+                            failed: false,
+                            uninvoked: false,
+                        }],
                     };
+                    if selection.skill.is_some() {
+                        selection
+                            .branches
+                            .push(crate::autonomy::location::TaskSpeculativeBranch {
+                                id: skill_id.clone(),
+                                optimization: RuntimeOptimizationKind::SpeculativeSkillRouting,
+                                behavior: RuntimeCommitBehavior::SkillSelection,
+                                failed: false,
+                                uninvoked: false,
+                            });
+                    }
+                    if selection.reasoning.is_some() {
+                        selection
+                            .branches
+                            .push(crate::autonomy::location::TaskSpeculativeBranch {
+                                id: reasoning_id.clone(),
+                                optimization: RuntimeOptimizationKind::SpeculativeReasoningAuto,
+                                behavior: RuntimeCommitBehavior::ReasoningDecision,
+                                failed: false,
+                                uninvoked: false,
+                            });
+                    }
                     if let Some(result) = main_result.take() {
+                        if !main_observed {
+                            selection.branches.push(
+                                crate::autonomy::location::TaskSpeculativeBranch {
+                                    id: main_id.clone(),
+                                    optimization: main_kind,
+                                    behavior: RuntimeCommitBehavior::FinalResponse,
+                                    failed: result.is_err(),
+                                    uninvoked: false,
+                                },
+                            );
+                        }
                         match result {
                             Ok(draft) => selection.draft = Some(draft),
                             Err(error) => selection.draft_error = Some(error.to_string()),
@@ -9437,7 +9658,7 @@ OVERALL: PASS/FAIL"#,
                         crate::autonomy::location::TaskStateReturn::SpeculativeSelection {
                             selection: Box::new(selection),
                         };
-                    let approved = crate::autonomy::location::scope_state_return(
+                    let approval = crate::autonomy::location::scope_state_return(
                         position.clone(),
                         Box::pin(self.approve_transition_target(
                             &candidate.from_state,
@@ -9447,8 +9668,16 @@ OVERALL: PASS/FAIL"#,
                             Some(processed_input),
                         )),
                     )
-                    .await?;
-                    let transitioned = if approved {
+                    .await;
+                    let approved = match approval {
+                        Ok(approved) => approved,
+                        Err(error) => {
+                            task_branch_observations.retained =
+                                matches!(error, AgentError::TaskSuspended(_));
+                            return Err(error);
+                        }
+                    };
+                    let transition = if approved {
                         self.commit_root_user_message(processed_input).await?;
                         crate::autonomy::location::scope_state_return(
                             position.clone(),
@@ -9459,9 +9688,17 @@ OVERALL: PASS/FAIL"#,
                                 None,
                             )),
                         )
-                        .await?
+                        .await
                     } else {
-                        false
+                        Ok(false)
+                    };
+                    let transitioned = match transition {
+                        Ok(transitioned) => transitioned,
+                        Err(error) => {
+                            task_branch_observations.retained =
+                                matches!(error, AgentError::TaskSuspended(_));
+                            return Err(error);
+                        }
                     };
                     return Box::pin(self.resume_state_return_outcome(position, transitioned))
                         .await
@@ -9716,6 +9953,7 @@ OVERALL: PASS/FAIL"#,
             let Some(outcome) = branch_set.next_completed().await else {
                 return Ok(None);
             };
+            let unfinished = branch_set.unfinished(&outcome);
             let branch_id = outcome.branch.branch_id();
             match outcome.result {
                 RuntimeBranchResult::MainDraft(draft) => {
@@ -9799,6 +10037,7 @@ OVERALL: PASS/FAIL"#,
                         false,
                     );
                     if branch_id == main_id {
+                        main_observed = true;
                         main_pending = false;
                         main_result =
                             Some(Err(AgentError::Other("main branch cancelled".to_string())));
@@ -9806,10 +10045,12 @@ OVERALL: PASS/FAIL"#,
                         transition_finalized = true;
                         transition_fallback_required = true;
                     } else if branch_id == skill_id {
+                        skill_unfinished = unfinished;
                         skill_pending = false;
                         skill_finalized = true;
                         skill_fallback_required = true;
                     } else if branch_id == reasoning_id {
+                        reasoning_unfinished = unfinished;
                         reasoning_pending = false;
                         reasoning_finalized = true;
                         reasoning_fallback_required = true;
@@ -9843,27 +10084,38 @@ OVERALL: PASS/FAIL"#,
     // Serialized alternatives are inert data; ordinary state, skill, tool and final-response drivers keep their existing live admission checks.
     async fn resume_speculative_selection(
         &self,
-        selection: crate::autonomy::location::TaskSpeculativeSelection,
+        mut selection: crate::autonomy::location::TaskSpeculativeSelection,
         transitioned: bool,
     ) -> Result<AgentResponse> {
+        let mut observation_cleanup = TaskBranchObservations::new(self);
+        observation_cleanup.receipts = selection.branches.clone();
         self.restore_speculative_context(&selection);
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
         if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) {
+            self.finalize_speculative_receipts(&mut selection, None);
             return Err(AgentError::Other(
                 "task speculative adoption is no longer admitted".into(),
             ));
         }
         if transitioned {
+            self.finalize_speculative_receipts(
+                &mut selection,
+                Some(RuntimeCommitBehavior::TransitionDecision),
+            );
             return Box::pin(self.run_accepted_input(selection.data)).await;
         }
-        let data = selection.data;
+        let data = selection.data.clone();
         let skill = if selection.skill_checked {
-            selection.skill
+            selection.skill.take()
         } else {
             self.select_skill_candidate(&data.content).await?
         };
         if let Some(skill) = skill {
+            self.finalize_speculative_receipts(
+                &mut selection,
+                Some(RuntimeCommitBehavior::SkillSelection),
+            );
             if !self.skills.iter().any(|actual| {
                 actual.id == skill.skill_id
                     && serde_json::to_value(actual).ok() == serde_json::to_value(&skill.skill).ok()
@@ -9882,13 +10134,17 @@ OVERALL: PASS/FAIL"#,
             }
         }
         let reasoning = if selection.reasoning_checked {
-            selection.reasoning
+            selection.reasoning.take()
         } else {
             Some(self.determine_reasoning_mode_strict(&data.content).await?)
         };
         if let Some(mode) = reasoning
             && !matches!(mode, ReasoningMode::None)
         {
+            self.finalize_speculative_receipts(
+                &mut selection,
+                Some(RuntimeCommitBehavior::ReasoningDecision),
+            );
             self.commit_root_user_message(&data.content).await?;
             return if matches!(mode, ReasoningMode::PlanAndExecute) {
                 Box::pin(self.handle_plan_and_execute(&data.content, &data.context, true)).await
@@ -9902,6 +10158,10 @@ OVERALL: PASS/FAIL"#,
                 .await
             };
         }
+        self.finalize_speculative_receipts(
+            &mut selection,
+            Some(RuntimeCommitBehavior::FinalResponse),
+        );
         let draft = if selection.draft_uninvoked {
             Some(
                 Box::pin(self.generate_main_response_draft(&data.content, &ReasoningMode::None))
@@ -9938,9 +10198,8 @@ OVERALL: PASS/FAIL"#,
             self.finalize_pending_branches(branches.cancel_pending());
             return Ok(vec![]);
         };
-        branches.close_admission();
-        let mut outcomes = vec![];
-        while let Some(outcome) = branches.next_completed().await {
+        let outcomes = Box::pin(self.collect_pending_task_branches(branches)).await?;
+        for (outcome, _) in &outcomes {
             let failed = matches!(outcome.result, RuntimeBranchResult::Failed(_));
             self.finalize_optional_branch(
                 &outcome.branch.branch_id(),
@@ -9949,8 +10208,6 @@ OVERALL: PASS/FAIL"#,
                 if failed { "failed" } else { "discarded" },
                 false,
             );
-            let unfinished = branches.unfinished(&outcome);
-            outcomes.push((outcome, unfinished));
         }
         if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref()) {
             return Err(AgentError::Other(format!(
@@ -9961,6 +10218,102 @@ OVERALL: PASS/FAIL"#,
             )));
         }
         Ok(outcomes)
+    }
+
+    // Reviewed alternatives remain pending observation data until their actual adoption or cancellation is known.
+    // Closing new invocation admission never discards consumed attempts or drops an already dispatched loser.
+    async fn collect_pending_task_branches(
+        &self,
+        branches: &mut ScheduledBranchSet<'_>,
+    ) -> Result<Vec<(crate::optimization::RuntimeBranchOutcome, bool)>> {
+        branches.close_admission();
+        let mut outcomes = Vec::new();
+        while let Some(outcome) = branches.next_completed().await {
+            let unfinished = branches.unfinished(&outcome);
+            outcomes.push((outcome, unfinished));
+        }
+        Ok(outcomes)
+    }
+
+    // A reviewed continuation resolves each deferred observation once; receipt metadata cannot authorize any provider, tool or transition.
+    fn finalize_speculative_receipts(
+        &self,
+        selection: &mut crate::autonomy::location::TaskSpeculativeSelection,
+        selected: Option<RuntimeCommitBehavior>,
+    ) {
+        for receipt in selection.branches.drain(..) {
+            let winner =
+                !receipt.failed && !receipt.uninvoked && selected == Some(receipt.behavior);
+            let status = if receipt.uninvoked {
+                "cancelled"
+            } else if receipt.failed {
+                "failed"
+            } else if winner {
+                "committed"
+            } else if selected.is_none() {
+                "cancelled"
+            } else {
+                "discarded"
+            };
+            self.finalize_optional_branch(
+                &receipt.id,
+                receipt.optimization,
+                receipt.behavior,
+                status,
+                winner,
+            );
+        }
+    }
+
+    // State commit resolves the winning transition before entry actions can fail or pause; observation cleanup must not erase that committed state.
+    fn finalize_speculative_transition(
+        &self,
+        position: &mut crate::autonomy::location::TaskStateReturn,
+    ) {
+        if let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } =
+            position
+        {
+            self.finalize_speculative_receipts(
+                selection,
+                Some(RuntimeCommitBehavior::TransitionDecision),
+            );
+        }
+    }
+
+    // Action cancellation preserves an already committed transition but cannot force an unfinished exit to commit.
+    fn retire_speculative_actions(
+        &self,
+        actions: &mut crate::autonomy::location::TaskActionsLocation,
+    ) {
+        if actions.transition.entering {
+            self.finalize_speculative_transition(&mut actions.return_to);
+        } else {
+            self.cancel_speculative_return(&mut actions.return_to);
+        }
+    }
+
+    // Terminal non-model exits retire deferred observations without polling any saved tool, skill or provider.
+    fn retire_location_observations(&self, location: &mut crate::autonomy::location::TaskLocation) {
+        match location {
+            crate::autonomy::location::TaskLocation::Actions(actions) => {
+                self.retire_speculative_actions(actions)
+            }
+            crate::autonomy::location::TaskLocation::Skill(skill) => {
+                if let Some(actions) = &mut skill.actions {
+                    self.retire_speculative_actions(actions);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Cancelling a known-safe pause retires observations only; it cannot replay selection or grant pending effects.
+    fn cancel_speculative_return(&self, position: &mut crate::autonomy::location::TaskStateReturn) {
+        if let crate::autonomy::location::TaskStateReturn::SpeculativeSelection { selection } =
+            position
+        {
+            self.finalize_speculative_receipts(selection, None);
+        }
     }
 
     // Only ordinary non-task branches use drop as local scheduler cancellation, never as task effect settlement.
@@ -10010,6 +10363,22 @@ OVERALL: PASS/FAIL"#,
         status: &str,
         winner: bool,
     ) {
+        // The live owner, not serialized receipt metadata, deduplicates disposition across pause and cleanup retries.
+        if let Some(execution) = crate::autonomy::current_execution() {
+            execution.owner.finalize_branch_observation(
+                self.observability_manager.as_ref(),
+                &crate::autonomy::location::TaskSpeculativeBranch {
+                    id: branch_id.into(),
+                    optimization,
+                    behavior: commit_behavior,
+                    failed: status == "failed",
+                    uninvoked: false,
+                },
+                status,
+                winner,
+            );
+            return;
+        }
         crate::optimization::observability::finalize_branch(
             self.observability_manager.as_ref(),
             branch_id,

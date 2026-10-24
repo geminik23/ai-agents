@@ -202,6 +202,15 @@ impl LLMProvider for ObservedLLMProvider {
         self.inner.settle_request_cost(bound, response)
     }
 
+    fn settle_stream_request_cost(
+        &self,
+        bound: &ai_agents_core::autonomy::ProviderCostBound,
+        usage: Option<&ai_agents_core::TokenUsage>,
+    ) -> std::result::Result<Option<ai_agents_core::autonomy::ProviderCostSettlement>, LLMError>
+    {
+        self.inner.settle_stream_request_cost(bound, usage)
+    }
+
     fn configured_tool_choice(&self) -> Option<ToolChoice> {
         self.inner.configured_tool_choice()
     }
@@ -339,6 +348,25 @@ impl Tool for ObservedTool {
 
     fn manages_task_todos(&self) -> bool {
         self.inner.manages_task_todos()
+    }
+
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        self.inner.prepare_write_footprint(args, ctx, max_targets)
+    }
+
+    fn prepare_question_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteAdmission>> {
+        self.inner
+            .prepare_question_write_footprint(args, ctx, max_targets)
     }
 
     fn declared_write_footprint(

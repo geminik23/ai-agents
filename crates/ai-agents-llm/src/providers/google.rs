@@ -79,6 +79,34 @@ impl GoogleProvider {
         self.tool_choice = Some(choice);
     }
 
+    // Binding uses the adapter's actual parsed route, including significant repeated path separators.
+    pub(super) fn accounting_endpoint(&self) -> &str {
+        self.base_url.as_str()
+    }
+
+    // Pricing validates the same native history, generation merge and transport restrictions as actual dispatch.
+    pub(super) fn validate_priced_request(
+        &self,
+        request: &ai_agents_core::autonomy::ProviderRequest<'_>,
+    ) -> Result<(), LLMError> {
+        if let Some(tools) = request.tools
+            && !self.supports_tool_choice(&tools.choice)
+        {
+            return Err(LLMError::Config(
+                "unsupported priced Google tool choice".into(),
+            ));
+        }
+        native_call_ids(request.messages)?;
+        build_request(
+            request.messages,
+            self.effective_config(request.config),
+            request.tools.map(|tools| tools.tools.as_slice()),
+            &self.model,
+            &self.base_url,
+        )?;
+        Ok(())
+    }
+
     fn effective_config<'a>(&'a self, config: Option<&'a LLMConfig>) -> &'a LLMConfig {
         config.unwrap_or(&self.default_config)
     }
@@ -986,6 +1014,20 @@ fn parse_response(
         model: Some(requested_model.to_string()),
         metadata: HashMap::new(),
     };
+    // Display usage may synthesize a missing total; only explicit complete billing reports may release a priced bound.
+    if crate::current_invocation_admission()
+        .is_some_and(|admission| admission.requires_priced_llm())
+    {
+        normalized.metadata.insert(
+            "_ai_agents_complete_priced_usage".into(),
+            Value::Bool(
+                response
+                    .get("usageMetadata")
+                    .and_then(|usage| usage.get("totalTokenCount"))
+                    .is_some(),
+            ),
+        );
+    }
     if !calls.is_empty() {
         let state = build_provider_state(requested_model, endpoint, content, &calls)?;
         normalized.set_provider_state(state)?;
@@ -1267,10 +1309,14 @@ async fn read_bounded(response: Response, limit: usize) -> Result<Vec<u8>, LLMEr
 fn google_sse_stream(
     response: Response,
 ) -> impl futures::Stream<Item = Result<LLMChunk, LLMError>> + Send {
+    // Capture the opening request class; a returned stream can be polled outside its task-local opening scope.
+    let priced = crate::current_invocation_admission()
+        .is_some_and(|admission| admission.requires_priced_llm());
     async_stream::stream! {
         let mut bytes_stream = response.bytes_stream();
         let mut pending = Vec::<u8>::new();
         let mut latest_usage = None;
+        let mut complete_final_usage = false;
         let mut terminal_reason = None;
         while let Some(chunk) = bytes_stream.next().await {
             let chunk = match chunk {
@@ -1294,8 +1340,10 @@ fn google_sse_stream(
                 match parse_sse_frame(&frame) {
                     Ok(None) => {}
                     Ok(Some(event)) => {
-                        if let Some(usage) = event.usage {
-                            latest_usage = Some(usage);
+                        if event.has_usage {
+                            if priced || event.usage.is_some() { latest_usage = event.usage; }
+                            // Early cumulative counters are not final billing evidence; later partial reports invalidate older totals.
+                            complete_final_usage = event.complete_usage && (terminal_reason.is_some() || event.finish_reason.is_some());
                         }
                         if terminal_reason.is_some()
                             && (!event.text.is_empty()
@@ -1336,7 +1384,7 @@ fn google_sse_stream(
             return;
         }
         match terminal_reason {
-            Some(reason) => yield Ok(LLMChunk::final_chunk("", reason, latest_usage)),
+            Some(reason) => yield Ok(LLMChunk::final_chunk("", reason, if priced && !complete_final_usage { None } else { latest_usage })),
             None => yield Err(protocol_error("Google SSE ended before a terminal finishReason")),
         }
     }
@@ -1345,6 +1393,8 @@ fn google_sse_stream(
 struct SseEvent {
     text: String,
     usage: Option<TokenUsage>,
+    has_usage: bool,
+    complete_usage: bool,
     finish_reason: Option<String>,
     has_function_calls: bool,
 }
@@ -1368,6 +1418,12 @@ fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseEvent>, LLMError> {
     let value: Value = serde_json::from_str(&data)
         .map_err(|error| protocol_error(format!("invalid Google SSE JSON: {error}")))?;
     let usage = parse_usage(value.get("usageMetadata"))?;
+    let has_usage = value.get("usageMetadata").is_some();
+    let complete_usage = usage.is_some()
+        && value
+            .get("usageMetadata")
+            .and_then(|usage| usage.get("totalTokenCount"))
+            .is_some();
     let candidate = value
         .get("candidates")
         .and_then(Value::as_array)
@@ -1382,9 +1438,11 @@ fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseEvent>, LLMError> {
                 "Google blocked the prompt ({reason})"
             )));
         }
-        return Ok(usage.map(|usage| SseEvent {
+        return Ok(has_usage.then_some(SseEvent {
             text: String::new(),
-            usage: Some(usage),
+            usage,
+            has_usage,
+            complete_usage,
             finish_reason: None,
             has_function_calls: false,
         }));
@@ -1398,6 +1456,8 @@ fn parse_sse_frame(frame: &[u8]) -> Result<Option<SseEvent>, LLMError> {
     Ok(Some(SseEvent {
         text: visible_text(parts)?,
         usage,
+        has_usage,
+        complete_usage,
         finish_reason: candidate
             .get("finishReason")
             .and_then(Value::as_str)

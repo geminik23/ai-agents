@@ -64,6 +64,8 @@ pub enum TaskRunStorageError {
     CheckpointTooLarge,
     #[error("task final admission deadline expired")]
     AdmissionExpired,
+    #[error("task reconstruction clock moved backwards")]
+    ClockDiscontinuity,
 }
 
 impl From<TaskRunStorageError> for AgentError {
@@ -117,6 +119,12 @@ pub struct TaskRunFilter {
 pub trait TaskFinalAdmission: Send + Sync + std::fmt::Debug {
     /// Rejects stale live evidence before completion is committed.
     fn validate(&self) -> Result<()>;
+
+    /// Rechecks a dispatched result without treating admission-only closure as cancellation of already consumed work.
+    /// The conservative default retains the full proof; only restriction-only guards may relax their own admission closure here.
+    fn validate_dispatched(&self) -> Result<()> {
+        self.validate()
+    }
 }
 
 /// Mutations are conditional and never constitute authority to invoke external work.

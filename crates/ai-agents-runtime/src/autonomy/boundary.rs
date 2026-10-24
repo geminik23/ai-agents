@@ -12,6 +12,8 @@ pub(crate) struct RunOwner {
     pub(crate) gate: crate::runtime::RootTurnGate,
     pub(crate) targets: Arc<super::CompositionTargets>,
     pub(crate) work: Arc<super::work::OwnedWork>,
+    // Observation receipts survive same-process pauses and cleanup retries but authorize no execution.
+    pub(crate) observed_branches: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     // Only explicit admission installs this actual definition; serialized entry data cannot mint a skill scope.
     pub(crate) skill: parking_lot::RwLock<Option<ai_agents_skills::SkillDefinition>>,
     // Actual reviewed implementations and request clocks remain owned across same-process pauses, not reconstructed from checkpoint labels.
@@ -43,6 +45,7 @@ impl RunOwner {
             gate,
             targets: Arc::new(super::CompositionTargets::default()),
             work: Arc::new(super::work::OwnedWork::default()),
+            observed_branches: Default::default(),
             skill: parking_lot::RwLock::new(None),
             responses: Default::default(),
             skill_finishing: Default::default(),
@@ -50,6 +53,26 @@ impl RunOwner {
             abandoned: AtomicBool::new(false),
             retained_effect_guards: parking_lot::Mutex::new(Vec::new()),
         }))
+    }
+
+    /// Observation disposition is single-use across pause, drop and cleanup retries; it settles no external effect or accounting reservation.
+    pub(crate) fn finalize_branch_observation(
+        &self,
+        manager: Option<&Arc<ai_agents_observability::ObservabilityManager>>,
+        receipt: &super::location::TaskSpeculativeBranch,
+        status: &str,
+        winner: bool,
+    ) {
+        if self.observed_branches.lock().insert(receipt.id.clone()) {
+            crate::optimization::observability::finalize_branch(
+                manager,
+                &receipt.id,
+                status,
+                winner,
+                receipt.optimization,
+                receipt.behavior,
+            );
+        }
     }
 
     /// Dropped foreground work prevents later execution until its owner acknowledges cleanup.

@@ -622,8 +622,11 @@ impl RuntimeAgent {
         })
     }
 
-    /// Cancellation clears only the exact manager exchange and performs no semantic or transition work.
+    /// Cancellation retires deferred branch observations and clears only the exact manager exchange, without semantic or transition work.
     pub(super) async fn clear_task_interaction(&self, state: &TaskInteraction) -> Result<()> {
+        if let TaskInteractionKind::StateApproval { return_to, .. } = &state.kind {
+            self.cancel_speculative_return(&mut return_to.as_ref().clone());
+        }
         if let TaskInteractionKind::Clarification {
             manager, skill_id, ..
         } = &state.kind

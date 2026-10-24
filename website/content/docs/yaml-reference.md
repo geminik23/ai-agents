@@ -46,7 +46,7 @@ For the explicit development runner, retained approval/question responses preser
 
 Existing routing, pipeline, concurrent, handoff and group-chat declarations can also be used inside the explicitly invoked development Rust task runner. Repeated same-runtime slots retain distinct operations, generated children share the coordinating run, and partial-failure/aggregation settings keep their existing meaning through retained pauses. These changes add no YAML fields and do not enable automatic task entry. The separate explicit Rust reconstruction API can resume a prepared safe pause using installed host bindings; a stored topology or YAML declaration alone is not executable authority. Persistence flags and automatic startup selection remain unavailable. See [explicit safe-pause reconstruction](@/docs/rust-api.md#explicit-safe-pause-reconstruction-development-only). See [retained composition and ownership](@/docs/rust-api.md#guarded-standalone-execution-development-only).
 
-The existing `runtime.optimization` settings for facts/relationships and speculative routing also apply to conforming agents invoked through the explicit development Rust runner. Managed task completion waits for owned maintenance settlement even when ordinary next-turn freshness is configured as `never` or `same_actor`; ordinary chat retains its configured behavior. Custom consumer capabilities are installed in Rust, not by a YAML label. This adds no fields or enabled autonomy startup. See [managed participation](@/docs/rust-api.md#managed-maintenance-and-speculative-participation-development-only) for callback limits and migration.
+The existing `runtime.optimization` settings for facts/relationships and speculative routing also apply to conforming agents invoked through the explicit development Rust runner. Managed task completion waits for owned maintenance settlement even when ordinary next-turn freshness is configured as `never` or `same_actor`; ordinary chat retains its configured behavior. Incoming root/child tasks first settle earlier ordinary maintenance without charging it to the new run. In task mode, background overflow `drop` cannot silently discard required work, while `run_inline` preserves same-key ordering. Review rejection does not turn a locally uninvoked speculative selection into a completed no-match or reset used local slots. Custom consumer capabilities are installed in Rust, not by a YAML label. This adds no fields or enabled autonomy startup. See [managed participation](@/docs/rust-api.md#managed-maintenance-and-speculative-participation-development-only) for callback limits and migration.
 
 ## Agent Identity
 
@@ -196,6 +196,7 @@ The simplest form: one LLM for everything. Use `llm` as a flat object.
 | `num_ctx` | `u32` | `null` | Ollama context window; merged under request `options` |
 | `keep_alive` | `string` or `number` | `null` | Ollama keep-alive duration; top-level request body field |
 | `num_gpu` | `i32` | `null` | Ollama GPU layer count; merged under request `options` |
+| `declared_pricing` | object | `null` | Development-only, host-audited priced capability for the explicit Rust task API; omitted means no built-in hard-priced binding |
 | *(any other key)* | | | Passed through as provider-specific extra parameter |
 
 ```yaml
@@ -240,6 +241,46 @@ llm:
   function_calling: true
   json_mode: true
 ```
+
+### Declared pricing (development only)
+
+A provider's optional `declared_pricing` object prepares a hard-priced capability; it does not enable YAML task execution. Its model/endpoint and server-enforced token ceilings must be verified by the trusted host, and prices must conservatively cover every supported billable token class. This is separate from floating-point `observability.cost` estimates. See the [provider/request-class inventory](@/docs/providers.md#declared-priced-task-capabilities-development-only) before selecting an adapter.
+
+| Field | Type | Default | Contract |
+|---|---|---|---|
+| `schedule_id` | string | required | Nonempty host version of the audited schedule; numeric content is also pinned |
+| `model` | string | required | Exact configured model |
+| `endpoint` | string | required | Exact normalized HTTP(S) base endpoint; credentials, query strings and fragments are forbidden |
+| `server_input_token_limit` | positive `u32` | required | Audited maximum billable input tokens, including framing/native history/tool schemas |
+| `server_output_token_limit` | positive `u32` | required | Audited maximum total output tokens, including hidden reasoning |
+| `input_micro_usd_per_million` | `u64` | required | Maximum input micro-USD rate per million tokens, not a floating-point estimate |
+| `output_micro_usd_per_million` | `u64` | required | Maximum output micro-USD rate per million tokens |
+| `request_fee_micro_usd` | `u64` | `0` | Complete fixed fee per upstream request |
+| `max_internal_attempts` | positive `u32` | `1` | Total upstream attempts including the first; separate managed retries reserve separately |
+| `complete_usage` | bool | `false` | Host audit of complete usage-reporting semantics; false retains the full upper bound |
+
+The following is fictional configuration syntax, not a current model price or proof of an endpoint's limits. Do not copy its ceilings into a production contract without auditing the actual server.
+
+```yaml
+llm:
+  provider: openai-compatible
+  model: audited-model
+  base_url: https://model.example.invalid/v1/
+  max_tokens: 2048
+  declared_pricing:
+    schedule_id: host-audit-v1
+    model: audited-model
+    endpoint: https://model.example.invalid/v1/
+    server_input_token_limit: 64000
+    server_output_token_limit: 8192
+    input_micro_usd_per_million: 2500000
+    output_micro_usd_per_million: 10000000
+    request_fee_micro_usd: 0
+    max_internal_attempts: 1
+    complete_usage: false
+```
+
+This object is host configuration, not model-supplied authority: model-generated children in hard-priced tasks must use the spawner's authoritative shared providers and cannot install their own prices. The adapter reserves the complete ceilings rather than guessing the current prompt's token count. Effective configuration still needs an explicit output limit within the audited ceiling. With a hard-priced task, unknown extras, arbitrary `extra_body`, unbounded native services and unbounded internal retries are rejected before dispatch. Matching complete unary/native usage may release unused commitment. Google streams may settle complete terminal usage after normal EOF; streams without that receipt, incomplete usage and multi-attempt contracts retain the bound. Ordinary calls without a hard-priced task keep their existing extra-parameter behavior.
 
 ### Tool choice
 

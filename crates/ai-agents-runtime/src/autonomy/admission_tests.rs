@@ -1,4 +1,6 @@
 use super::*;
+#[path = "rs_tests.rs"]
+mod resources;
 
 use ai_agents_core::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
@@ -231,6 +233,11 @@ async fn priced_mismatched_usage_keeps_dispatched_reservation_for_recovery() {
 
 // Ledger tests exercise the same conditional memory store as foreground runs, without replacing the executor.
 async fn ledger(write_limit: Option<u32>, cost: bool) -> Arc<RunExecution> {
+    ledger_backend(write_limit, cost, false).await
+}
+
+// Memory and SQLite use identical real conditional admission and settlement logic.
+async fn ledger_backend(write_limit: Option<u32>, cost: bool, sqlite: bool) -> Arc<RunExecution> {
     let mut mock = ai_agents_llm::mock::MockLLMProvider::new("test");
     mock.set_response("done");
     let agent = Arc::new(
@@ -241,8 +248,7 @@ async fn ledger(write_limit: Option<u32>, cost: bool) -> Arc<RunExecution> {
             .unwrap(),
     );
 
-    let store =
-        Arc::new(ScopedTaskRunStore::in_memory(agent.info().id, None, "ledger-v1".into()).unwrap());
+    let store = super::continuation_test_support::store(agent.info().id, "ledger-v1", sqlite).await;
     let owner = agent.reserve_autonomy_run("ledger".into()).await.unwrap();
     let mut config = super::runner_tests::config(8);
     config.defaults.max_declared_write_paths = write_limit;
@@ -565,6 +571,95 @@ async fn non_invocation_cannot_release_a_target_used_by_a_sibling_attempt() {
     .unwrap();
     assert_eq!(payload.counters.tool_attempts, 1);
     assert_eq!(payload.declared_write_targets.len(), 1);
+}
+
+// Refunding one proven uninvoked hop preserves a sibling's live, completed or uncertain target commitment.
+#[tokio::test]
+async fn ad_refund_target_union_preserves_all_sibling_states() {
+    for state in ["dispatched", "completed", "uncertain"] {
+        for shared in [false, true] {
+            let execution = ledger(Some(2), false).await;
+            let tool = ai_agents_tools::builtin::FileWriteTool::new();
+            let directory = TestDirectory::new();
+            let ctx = ToolExecutionContext::test("file_write");
+            let first = json!({"path":directory.path().join("first"),"content":"x"});
+            let second = json!({"path":directory.path().join(if shared { "first" } else { "second" }),"content":"y"});
+            let (first_id, footprint) = execution.admit_tool(&tool, &first, &ctx).await.unwrap();
+            let (second_id, _) = execution.admit_tool(&tool, &second, &ctx).await.unwrap();
+            if state != "dispatched" {
+                execution
+                    .settle(
+                        &first_id,
+                        json!({"success":state == "completed"}),
+                        state == "uncertain",
+                    )
+                    .await
+                    .unwrap();
+            }
+            execution
+                .settle(&second_id, json!({"not_invoked":true}), false)
+                .await
+                .unwrap();
+            let payload: Box<TaskCheckpointPayload> =
+                serde_json::from_value(execution.load_owned().await.unwrap().payload).unwrap();
+            assert_eq!(payload.counters.tool_attempts, 1, "{state}/{shared}");
+            assert_eq!(
+                payload.declared_write_targets,
+                footprint.unwrap().targets,
+                "{state}/{shared}"
+            );
+            assert!(
+                execution
+                    .settle(&second_id, json!({"not_invoked":true}), false)
+                    .await
+                    .is_err(),
+                "refund is single-use"
+            );
+        }
+    }
+}
+
+// Proven non-invocation releases only its own quote; another outstanding request's commitment still limits new admission.
+#[tokio::test]
+async fn ad_refund_price_preserves_sibling_commitment() {
+    let execution = ledger(None, true).await;
+    let bound = |id: &str, max_micro_usd| ProviderCostBound {
+        provider_identity: "test".into(),
+        pricing_identity: "v1".into(),
+        request_id: id.into(),
+        max_micro_usd,
+    };
+    let _first = execution
+        .admit_priced_llm(Some(bound("first", 400_000)))
+        .await
+        .unwrap();
+    let second = execution
+        .admit_priced_llm(Some(bound("second", 400_000)))
+        .await
+        .unwrap();
+    execution
+        .settle_llm(&second, json!({"not_invoked":true}))
+        .await
+        .unwrap();
+    assert!(
+        execution
+            .admit_priced_llm(Some(bound("third", 700_000)))
+            .await
+            .is_err()
+    );
+    let payload: Box<TaskCheckpointPayload> =
+        serde_json::from_value(execution.load_owned().await.unwrap().payload).unwrap();
+    assert_eq!(payload.counters.llm_attempts, 1);
+    assert_eq!(payload.counters.charged_micro_usd, 0);
+    assert_eq!(
+        payload
+            .reservations
+            .iter()
+            .filter(|reservation| reservation.state == TaskEffectState::Dispatched)
+            .map(|reservation| reservation.reserved_micro_usd)
+            .sum::<u64>(),
+        400_000
+    );
 }
 
 #[tokio::test]

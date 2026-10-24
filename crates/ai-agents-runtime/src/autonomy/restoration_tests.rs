@@ -1,5 +1,7 @@
 //! Executable reconstruction uses fresh objects, real stores and isolated effect witnesses, never retained owner Arcs.
 
+#[path = "restoration_clock_tests.rs"]
+mod clock_tests;
 #[path = "restoration_custody_tests.rs"]
 mod custody_tests;
 #[path = "restoration_topology_tests.rs"]
@@ -684,12 +686,14 @@ async fn answer(runner: &AutonomyRunner, run: &TaskRun) -> ai_agents_core::Resul
 }
 
 // Explicit review is independent of tool answers and must not itself dispatch work.
+// A failed review reports only its phase and elapsed work, not the recovery payload.
 async fn approve(runner: &AutonomyRunner, run: &TaskRun) -> TaskRunResult {
     let review = runner
         .restoration_review(&run.key.run_id)
         .await
         .unwrap()
         .unwrap();
+    let review_started = std::time::Instant::now();
     runner
         .approve_restoration(
             &run.key.run_id,
@@ -698,7 +702,12 @@ async fn approve(runner: &AutonomyRunner, run: &TaskRun) -> TaskRunResult {
             ai_agents_hitl::ApprovalResult::Approved,
         )
         .await
-        .unwrap()
+        .unwrap_or_else(|error| {
+            panic!(
+                "restoration review failed: {error}; elapsed={:?}",
+                review_started.elapsed()
+            )
+        })
 }
 
 // Source composition uses real registry membership; stage reconstruction creates those entries silently from the manifest.
@@ -805,10 +814,11 @@ async fn restore_paused_declared_nested_and_repeated_operations_preserve_topolog
                 config: config(),
                 ceilings: Default::default(),
             };
+            let restore_started = std::time::Instant::now();
             let (restored, result) =
                 AutonomyRunner::restore_paused(request, store.clone(), host.clone())
                     .await
-                    .unwrap();
+                    .unwrap_or_else(|error| panic!("topology restore failed: {error}; pattern={pattern}; sqlite={sqlite}; elapsed={:?}; budget_ms={}", restore_started.elapsed(), host.budget_millis.load(Ordering::SeqCst)));
             assert_eq!(
                 host.calls.load(Ordering::SeqCst),
                 before,
@@ -1188,6 +1198,7 @@ async fn restore_rejects_lower_host_ceilings_and_untrusted_clock_without_claim()
 }
 
 // Staging time and publication share one fixed deadline, while a failed claimed attempt retains its prepaid time and recovery marker.
+// True work exhaustion remains AdmissionExpired rather than being relabelled as a backward-clock failure.
 #[tokio::test]
 async fn restore_stage_overrun_cannot_refill_active_allowance_or_publish_pause() {
     let (host, store, prepared) = prepared_fixture(false).await;
@@ -1215,7 +1226,12 @@ async fn restore_stage_overrun_cannot_refill_active_allowance_or_publish_pause()
         .await
         .unwrap()
         .unwrap();
-    assert!(result.is_err());
+    assert!(matches!(
+        result,
+        Err(ai_agents_core::AgentError::TaskRunStorage(
+            TaskRunStorageError::AdmissionExpired
+        ))
+    ));
     let saved = store.load(&prepared.run.key.run_id).await.unwrap().unwrap();
     assert_eq!(saved.status, TaskRunStatus::Running);
     assert!(saved.owner_token.is_some());

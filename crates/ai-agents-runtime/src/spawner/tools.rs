@@ -100,6 +100,16 @@ impl GenerateAgentTool {
 
 #[async_trait]
 impl Tool for GenerateAgentTool {
+    /// Generation uses managed providers and framework storage; only registration hooks add coordination write targets.
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.registry
+            .declared_write_footprint(self.id(), args, ctx, max_targets)
+    }
     fn id(&self) -> &str {
         "spawn_agent"
     }
@@ -329,6 +339,16 @@ impl SendMessageTool {
 
 #[async_trait]
 impl Tool for SendMessageTool {
+    /// Messaging does not preauthorize child effects; actual child tools reserve their own targets in the same run ledger.
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.registry
+            .declared_write_footprint(self.id(), args, ctx, max_targets)
+    }
     fn id(&self) -> &str {
         "send_agent_message"
     }
@@ -426,6 +446,17 @@ impl ListAgentsTool {
 
 #[async_trait]
 impl Tool for ListAgentsTool {
+    /// Registry inspection reads an in-memory catalogue without invoking host callbacks or authorizing its members.
+    fn declared_write_footprint(
+        &self,
+        _: &Value,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "framework.registry.list.v1",
+        )))
+    }
     fn id(&self) -> &str {
         "list_agents"
     }
@@ -479,6 +510,16 @@ impl RemoveAgentTool {
 
 #[async_trait]
 impl Tool for RemoveAgentTool {
+    /// Membership retirement is framework state, while an installed removal hook must declare its own writes.
+    fn declared_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ai_agents_core::ToolExecutionContext,
+        max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        self.registry
+            .declared_write_footprint(self.id(), args, ctx, max_targets)
+    }
     fn id(&self) -> &str {
         "remove_agent"
     }

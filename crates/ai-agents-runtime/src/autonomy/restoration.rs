@@ -78,6 +78,7 @@ pub trait TaskRestoreHost: Send + Sync {
     async fn stage(&self, manifest: &TaskRestoreManifest) -> Result<TaskRestoreGraph>;
     /// The installed host certifies a trustworthy UTC epoch/continuity for stored bounds across processes and returns an error when it cannot.
     /// Sampling an unchecked OS clock alone is not a continuity proof; backward anchors are rejected and original monotonic cuts are preserved.
+    /// Returned UTC must share the backend timestamp domain; projecting an independent old epoch cannot certify continuity with later backend writes.
     fn now(&self) -> Result<DateTime<Utc>>;
 }
 
@@ -261,6 +262,7 @@ fn review_digest(payload: &TaskCheckpointPayload) -> Result<String> {
 }
 
 /// Requires a truly safe acknowledged pause; claims, cancellation receipts and unknown effects are not quiescence.
+/// Backward UTC is a separate clock-contract failure, never fresh allowance or ordinary expiry.
 fn safe_pause(
     snapshot: &TaskRunSnapshot,
     payload: &TaskCheckpointPayload,
@@ -293,11 +295,14 @@ fn safe_pause(
     {
         return Err(TaskRunStorageError::NotResumable.into());
     }
-    if now < snapshot.updated_at
-        || payload
-            .clocks
-            .expires_at
-            .is_some_and(|expiry| now >= expiry)
+    // Metadata high-water marks reveal backward UTC; this is not exhaustion of a valid original allowance.
+    if now < snapshot.updated_at {
+        return Err(TaskRunStorageError::ClockDiscontinuity.into());
+    }
+    if payload
+        .clocks
+        .expires_at
+        .is_some_and(|expiry| now >= expiry)
     {
         return Err(TaskRunStorageError::AdmissionExpired.into());
     }
@@ -418,6 +423,7 @@ fn capture_deadline(deadline: Instant, host: &dyn TaskRestoreHost) -> Result<Dat
 }
 
 // A capture contains every actual catalogue and current runtime, including unstarted entries and tool-specific auxiliary registries.
+// The installed host and its UTC history remain immutable authorities; a rollback cannot be recaptured as an ordinary expiry.
 async fn capture_manifest(
     runner: &AutonomyRunner,
     paused: &PausedTask,
@@ -459,13 +465,16 @@ async fn capture_manifest(
         .find(|adapter| adapter.id == RESTORE_ADAPTER)
         .map(|adapter| serde_json::from_value::<TaskRestoreManifest>(adapter.state.clone()))
         .transpose()?;
-    if prior
-        .as_ref()
-        .is_some_and(|prior| prior.host != host.identity() || captured_at < prior.captured_at)
-    {
-        return Err(AgentError::Config(
-            "restore clock/host continuity could not be established".into(),
-        ));
+    if let Some(prior) = &prior {
+        if prior.host != host.identity() {
+            return Err(AgentError::Config(
+                "restore host continuity could not be established".into(),
+            ));
+        }
+        // A rollback is a clock-contract failure, not an expired work budget or permission to recapture under a new epoch.
+        if captured_at < prior.captured_at {
+            return Err(TaskRunStorageError::ClockDiscontinuity.into());
+        }
     }
     let mut deadlines = BTreeMap::new();
     for (id, deadline) in &paused.approval_deadlines {

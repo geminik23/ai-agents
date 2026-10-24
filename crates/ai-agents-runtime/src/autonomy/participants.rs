@@ -19,9 +19,12 @@ pub(crate) async fn scope_child_requirement<F: std::future::Future>(
 
 /// Dependency outcomes are mandatory unless an existing composition policy explicitly tolerates failure.
 pub(crate) fn child_required() -> bool {
-    CHILD_REQUIRED
-        .try_with(|required| *required)
-        .unwrap_or(true)
+    current_child_requirement().unwrap_or(true)
+}
+
+/// An explicit dispatcher policy takes precedence over a context captured before that dispatcher selected the child.
+pub(crate) fn current_child_requirement() -> Option<bool> {
+    CHILD_REQUIRED.try_with(|required| *required).ok()
 }
 
 /// Attribution scopes keep native call IDs unchanged while distinguishing identical IDs in different child operations.

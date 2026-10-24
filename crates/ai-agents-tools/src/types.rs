@@ -310,6 +310,15 @@ pub struct QuestionResponse {
 /// Host bridge for asking preference or clarification questions.
 #[async_trait]
 pub trait QuestionHandler: Send + Sync {
+    /// Bounds all logical writes made while serving this exact question; unsupported is not inferred from UI labels.
+    fn declared_write_footprint(
+        &self,
+        _request: &QuestionRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Ask a structured question and return a bounded answer.
     async fn ask_question(&self, request: QuestionRequest) -> QuestionResponse;
 }
@@ -377,6 +386,15 @@ pub struct DiagnosticsResponse {
 /// Provider hook for compiler, linter, or editor diagnostics.
 #[async_trait]
 pub trait DiagnosticsProvider: Send + Sync {
+    /// Declares implementation-owned logical writes; diagnostic collection is not assumed side-effect-free.
+    fn declared_write_footprint(
+        &self,
+        _request: &DiagnosticsRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this provider can serve diagnostics now.
     fn is_available(&self) -> bool {
         true
@@ -392,6 +410,16 @@ pub struct UnavailableDiagnosticsProvider;
 
 #[async_trait]
 impl DiagnosticsProvider for UnavailableDiagnosticsProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &DiagnosticsRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.diagnostics.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -432,6 +460,16 @@ impl StaticDiagnosticsProvider {
 
 #[async_trait]
 impl DiagnosticsProvider for StaticDiagnosticsProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &DiagnosticsRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.diagnostics.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -550,6 +588,15 @@ pub struct WebSearchResponse {
 /// Host bridge for provider-neutral public web search.
 #[async_trait]
 pub trait WebSearchProvider: Send + Sync {
+    /// Covers host-local logical writes, not the search service's invoice or unrelated remote storage.
+    fn declared_write_footprint(
+        &self,
+        _request: &WebSearchRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this provider can serve search requests now.
     fn is_available(&self) -> bool {
         true
@@ -565,6 +612,16 @@ pub struct UnavailableWebSearchProvider;
 
 #[async_trait]
 impl WebSearchProvider for UnavailableWebSearchProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &WebSearchRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.search.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -609,6 +666,16 @@ impl StaticWebSearchProvider {
 
 #[async_trait]
 impl WebSearchProvider for StaticWebSearchProvider {
+    fn declared_write_footprint(
+        &self,
+        _: &WebSearchRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.search.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }
@@ -726,6 +793,16 @@ pub struct CommandResponse {
 /// Host bridge for controlled command execution.
 #[async_trait]
 pub trait CommandRunner: Send + Sync {
+    /// Trusted hosts may declare an enforced complete logical footprint for the actual policy-normalized request.
+    /// Process runners remain unsupported by default; a command name or argv allowlist is not write containment.
+    fn declared_write_footprint(
+        &self,
+        _request: &CommandRequest,
+        _ctx: &ai_agents_core::ToolExecutionContext,
+        _max_targets: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(None)
+    }
     /// Return whether this runner can execute commands now.
     fn is_available(&self) -> bool {
         true
@@ -745,6 +822,16 @@ pub struct UnavailableCommandRunner;
 
 #[async_trait]
 impl CommandRunner for UnavailableCommandRunner {
+    fn declared_write_footprint(
+        &self,
+        _: &CommandRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.unavailable.command.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         false
     }
@@ -794,6 +881,16 @@ impl StaticCommandRunner {
 
 #[async_trait]
 impl CommandRunner for StaticCommandRunner {
+    fn declared_write_footprint(
+        &self,
+        _: &CommandRequest,
+        _: &ai_agents_core::ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ai_agents_core::autonomy::ToolWriteFootprint>> {
+        Ok(Some(ai_agents_core::autonomy::ToolWriteFootprint::empty(
+            "host.static.command.v1",
+        )))
+    }
     fn is_available(&self) -> bool {
         self.available
     }

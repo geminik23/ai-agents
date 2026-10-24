@@ -431,7 +431,18 @@ impl AgentSpawner {
         Ok(AdmittedChild { id, spec, base_dir })
     }
 
+    // Model-generated child declarations cannot install their own prices or server limits inside a hard-priced run.
+    // Only the spawner's host-installed authoritative registry may supply provider capabilities in that scope.
     fn validate_admission(&self, id: &str, spec: &AgentSpec) -> Result<()> {
+        if self.llm_registry.is_none()
+            && ai_agents_llm::current_invocation_admission()
+                .is_some_and(|admission| admission.requires_priced_llm())
+        {
+            return Err(AgentError::Config(
+                "priced task children require host-installed authoritative provider bindings"
+                    .into(),
+            ));
+        }
         spec.validate()?;
         validate_child_id(id)?;
 

@@ -227,7 +227,12 @@ where
             )
             .await?;
         lease.acknowledged = true;
-        if result.is_err() {
+        // Existing optional-child policy may tolerate only an acknowledged effect-free error; shared stops and uncertain effects remain run-wide.
+        let optional_failure = super::current_child_operation().is_some()
+            && !super::child_required()
+            && !effects.load(std::sync::atomic::Ordering::Acquire)
+            && execution.stop_reason().is_none();
+        if result.is_err() && !optional_failure {
             execution.stop_maintenance(effects.load(std::sync::atomic::Ordering::Acquire));
         }
         result

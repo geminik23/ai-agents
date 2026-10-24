@@ -152,6 +152,33 @@ pub trait Tool: Send + Sync {
         Ok(None)
     }
 
+    /// Prepares the footprint and retained implementation from the same selection, preventing mutable host-slot ABA.
+    /// Fixed implementations inherit their existing footprint; mutable host adapters must override this method.
+    fn prepare_write_footprint(
+        &self,
+        args: &Value,
+        ctx: &ToolExecutionContext,
+        max_targets: usize,
+    ) -> Result<Option<crate::autonomy::ToolWriteAdmission>> {
+        Ok(self
+            .declared_write_footprint(args, ctx, max_targets)?
+            .map(|footprint| crate::autonomy::ToolWriteAdmission {
+                footprint,
+                binding: None,
+            }))
+    }
+
+    /// Covers only the validated response executor, not the ordinary interactive handler.
+    /// Unsupported defaults prevent a custom response override from inheriting an unproven empty footprint.
+    fn prepare_question_write_footprint(
+        &self,
+        _args: &Value,
+        _ctx: &ToolExecutionContext,
+        _max_targets: usize,
+    ) -> Result<Option<crate::autonomy::ToolWriteAdmission>> {
+        Ok(None)
+    }
+
     /// Returns a [`ToolInfo`] struct from the above methods.
     fn info(&self) -> ToolInfo {
         ToolInfo {

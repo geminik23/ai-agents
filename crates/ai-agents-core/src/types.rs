@@ -361,6 +361,9 @@ pub struct ToolExecutionContext {
     pub policy_snapshot: Value,
     /// Custom settings from tool_security.tools.<tool_id>.config.
     pub custom_config: Value,
+    /// Current invocation's admitted logical targets; inert evidence, never a grant or a durable host binding.
+    /// Host-backed implementations recheck this against the captured actual implementation before invoking it.
+    pub admitted_write_footprint: Option<crate::autonomy::ToolWriteFootprint>,
 }
 
 impl ToolExecutionContext {
@@ -389,6 +392,7 @@ impl ToolExecutionContext {
             limits: ToolExecutionLimits::default(),
             policy_snapshot: Value::Null,
             custom_config: Value::Null,
+            admitted_write_footprint: None,
         }
     }
 }

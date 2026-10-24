@@ -68,11 +68,23 @@ impl RuntimeAgent {
         Ok(true)
     }
 
-    /// Serial action lists use the existing executor and captured configuration, with no completed-effect replay.
+    /// Serial actions retain observation custody across a reviewed resume; only an exact suspension transfers it to a saved cursor.
     async fn continue_task_transition(
         &self,
-        mut transition: TaskTransitionLocation,
+        transition: TaskTransitionLocation,
         return_to: TaskStateReturn,
+    ) -> Result<()> {
+        let mut observations = TaskBranchObservations::for_return(self, &return_to);
+        let result = Box::pin(self.drive_task_transition(transition, return_to)).await;
+        observations.retained = matches!(result, Err(AgentError::TaskSuspended(_)));
+        result
+    }
+
+    /// Drives serial exit/commit/entry actions with the existing executor and captured configuration, without completed-effect replay.
+    async fn drive_task_transition(
+        &self,
+        mut transition: TaskTransitionLocation,
+        mut return_to: TaskStateReturn,
     ) -> Result<()> {
         let machine = self
             .state_machine
@@ -109,6 +121,7 @@ impl RuntimeAgent {
                 ));
             }
             machine.transition_to(&transition.target, &transition.reason)?;
+            self.finalize_speculative_transition(&mut return_to);
             self.invalidate_pending_confirmation("state_transition")
                 .await;
             machine.reset_no_transition();
@@ -342,8 +355,19 @@ impl RuntimeAgent {
         .map(|_| ())
     }
 
-    /// Completes only unfinished actions, commits a saved exit transition once and returns to the already prepared caller.
+    /// Resumed actions retain branch observation custody until completion or another acknowledged typed suspension.
     pub(super) async fn resume_task_actions(
+        &self,
+        state: TaskActionsLocation,
+    ) -> Result<AgentResponse> {
+        let mut observations = TaskBranchObservations::for_return(self, &state.return_to);
+        let result = Box::pin(self.drive_resumed_task_actions(state)).await;
+        observations.retained = matches!(result, Err(AgentError::TaskSuspended(_)));
+        result
+    }
+
+    /// Completes only unfinished actions, commits a saved exit transition once and returns to the already prepared caller.
+    async fn drive_resumed_task_actions(
         &self,
         mut state: TaskActionsLocation,
     ) -> Result<AgentResponse> {
@@ -379,6 +403,7 @@ impl RuntimeAgent {
                 ));
             }
             machine.transition_to(&state.transition.target, &state.transition.reason)?;
+            self.finalize_speculative_transition(&mut state.return_to);
             self.invalidate_pending_confirmation("state_transition")
                 .await;
             machine.reset_no_transition();

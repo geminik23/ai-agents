@@ -39,6 +39,14 @@ pub struct ToolWriteFootprint {
     pub targets: Vec<String>,
 }
 
+/// A logical footprint and the actual live implementation binding selected together by a tool.
+/// Only the footprint is persisted; the binding retains real objects and must be prepared again after restoration.
+#[derive(Debug, Clone)]
+pub struct ToolWriteAdmission {
+    pub footprint: ToolWriteFootprint,
+    pub binding: Option<std::sync::Arc<dyn super::TaskFinalAdmission>>,
+}
+
 impl ToolWriteFootprint {
     /// Declares a proven side-effect-free implementation or preview, not model-supplied read-only metadata.
     pub fn empty(binding_identity: impl Into<String>) -> Self {

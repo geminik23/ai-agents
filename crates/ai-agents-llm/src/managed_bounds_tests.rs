@@ -1,4 +1,7 @@
 use crate::*;
+
+#[path = "managed_stream_tests.rs"]
+mod stream_tests;
 use ai_agents_core::autonomy::InvocationAdmission;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -150,6 +153,115 @@ async fn invocation_bounds_stream_lifetime_retains_accounting_and_independent_li
             admission.abandonments.load(Ordering::SeqCst),
             usize::from(ledger)
         );
+    }
+}
+
+struct OverrunProvider;
+#[async_trait]
+impl LLMProvider for OverrunProvider {
+    async fn complete(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> Result<LLMResponse, LLMError> {
+        std::thread::sleep(
+            current_invocation_bounds().unwrap().remaining() + Duration::from_millis(2),
+        );
+        Ok(LLMResponse::new("late success", FinishReason::Stop))
+    }
+    async fn complete_stream(
+        &self,
+        _: &[ChatMessage],
+        _: Option<&LLMConfig>,
+    ) -> Result<Box<dyn futures::Stream<Item = Result<LLMChunk, LLMError>> + Unpin + Send>, LLMError>
+    {
+        unreachable!()
+    }
+    fn provider_name(&self) -> &str {
+        "overrun"
+    }
+    fn supports(&self, _: LLMFeature) -> bool {
+        false
+    }
+}
+
+// Non-preemptible provider work can overrun, but its late return cannot become an eligible result or an unused-attempt refund.
+#[tokio::test]
+async fn invocation_bounds_synchronous_overrun_rejects_late_success() {
+    let admission = Arc::new(Admission::default());
+    let provider = managed_provider(Arc::new(OverrunProvider));
+    let bounds = InvocationBounds::new(
+        SystemTime::now() + Duration::from_secs(10),
+        Instant::now() + Duration::from_millis(30),
+    );
+    let result = scope_invocation_bounds(
+        Some(bounds),
+        scope_invocation_admission(
+            admission.clone(),
+            provider.complete(&[ChatMessage::user("test")], None),
+        ),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "late synchronous success escaped its original bound"
+    );
+    assert_eq!(admission.admissions.load(Ordering::SeqCst), 1);
+    assert_eq!(admission.refunds.load(Ordering::SeqCst), 0);
+}
+
+#[derive(Debug)]
+struct LastPollProof {
+    checks: AtomicUsize,
+    slow: bool,
+}
+impl ai_agents_core::autonomy::TaskFinalAdmission for LastPollProof {
+    fn validate(&self) -> ai_agents_core::Result<()> {
+        if self.checks.fetch_add(1, Ordering::SeqCst) == 1 {
+            if self.slow {
+                std::thread::sleep(
+                    current_invocation_bounds().unwrap().remaining() + Duration::from_millis(2),
+                );
+            } else {
+                return Err(ai_agents_core::AgentError::Other(
+                    "last pre-poll rejection".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+// A rejected or slow last proof sample cannot mark an unpolled provider dispatched or lose its proven non-invocation refund.
+#[tokio::test]
+async fn invocation_bounds_last_proof_precedes_actual_first_poll() {
+    for slow in [false, true] {
+        let admission = Arc::new(Admission::default());
+        let raw = Arc::new(Provider::default());
+        let provider = managed_provider(raw.clone());
+        let bounds = InvocationBounds::new(
+            SystemTime::now() + Duration::from_secs(10),
+            Instant::now() + Duration::from_millis(30),
+        );
+        let proof = Arc::new(LastPollProof {
+            checks: AtomicUsize::new(0),
+            slow,
+        });
+        let result = scope_invocation_evidence(
+            vec![proof],
+            scope_invocation_bounds(
+                Some(bounds),
+                scope_invocation_admission(
+                    admission.clone(),
+                    provider.complete(&[ChatMessage::user("test")], None),
+                ),
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(raw.0.load(Ordering::SeqCst), 0);
+        assert_eq!(admission.refunds.load(Ordering::SeqCst), 1);
+        assert_eq!(admission.abandonments.load(Ordering::SeqCst), 0);
     }
 }
 
