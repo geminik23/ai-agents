@@ -4,6 +4,8 @@
 mod clock_tests;
 #[path = "restoration_custody_tests.rs"]
 mod custody_tests;
+#[path = "rc_tests.rs"]
+mod rc_tests;
 #[path = "restoration_topology_tests.rs"]
 mod topology_tests;
 use super::*;
@@ -52,6 +54,7 @@ fn fixture_native(messages: &[ChatMessage], mut calls: Vec<ai_agents_core::ToolC
 
 struct RestoreProvider {
     calls: Arc<AtomicUsize>,
+    priced: bool,
 }
 #[async_trait]
 impl LLMProvider for RestoreProvider {
@@ -176,6 +179,23 @@ impl LLMProvider for RestoreProvider {
             } else {
                 "done: routed evidence".into()
             }
+        } else if systems.contains("restore-repeat-question") {
+            let answered = messages[start..]
+                .iter()
+                .filter(|m| {
+                    matches!(m.role, ai_agents_core::Role::Function)
+                        && m.name.as_deref() == Some("ask_user")
+                })
+                .count();
+            if answered < 2 {
+                model_call(
+                    if answered == 0 { "first" } else { "second" },
+                    "ask_user",
+                    json!({"question":"Confirm","options":["yes"],"allow_other":false}),
+                )
+            } else {
+                "done: repeated questions".into()
+            }
         } else if replied {
             "done: verified evidence".to_string()
         } else {
@@ -211,6 +231,33 @@ impl LLMProvider for RestoreProvider {
     // Stable versioned provider behavior is covered by the installed test host contract, not this name alone.
     fn provider_name(&self) -> &str {
         "restore-request-state-v1"
+    }
+    // Optional flat-fee bounds exercise the same managed ledger before and after constructing a fresh provider.
+    fn priced_capability_identity(&self) -> Option<String> {
+        self.priced.then(|| "restore-price.v1".into())
+    }
+    // Each actual request has a fixed complete billable ceiling and its original request identity.
+    fn request_cost_bound(
+        &self,
+        request: &ProviderRequest<'_>,
+    ) -> std::result::Result<Option<ProviderCostBound>, LLMError> {
+        Ok(self.priced.then(|| ProviderCostBound {
+            provider_identity: "restore-endpoint.v1".into(),
+            pricing_identity: "restore-price.v1".into(),
+            request_id: request.request_id.into(),
+            max_micro_usd: 10,
+        }))
+    }
+    // Matching complete usage settles once; no stored receipt can dispatch the newly constructed provider.
+    fn settle_request_cost(
+        &self,
+        bound: &ProviderCostBound,
+        _: &LLMResponse,
+    ) -> std::result::Result<Option<ProviderCostSettlement>, LLMError> {
+        Ok(self.priced.then(|| ProviderCostSettlement {
+            bound: bound.clone(),
+            charged_micro_usd: 7,
+        }))
     }
     // Exercise the shared legacy completion wrapper rather than optional native network adapters.
     fn supports(&self, _: LLMFeature) -> bool {
@@ -248,6 +295,18 @@ impl Tool for RestoreProbe {
             concurrency_safe: true,
             ..Default::default()
         }
+    }
+    // The fixture declares one logical audit target; the host fixes its actual isolated implementation and destination.
+    fn declared_write_footprint(
+        &self,
+        _: &Value,
+        _: &ToolExecutionContext,
+        _: usize,
+    ) -> ai_agents_core::Result<Option<ToolWriteFootprint>> {
+        Ok(Some(ToolWriteFootprint {
+            binding_identity: "restore-probe.v1".into(),
+            targets: vec![format!("fixture:{}", self.runtime)],
+        }))
     }
     // Only a real executor body increments the witness; a tool-shaped response does not.
     async fn execute(&self, _: Value, context: ToolExecutionContext) -> ToolResult {
@@ -291,6 +350,7 @@ pub(super) struct RestoreHost {
     clock: parking_lot::Mutex<Option<chrono::DateTime<chrono::Utc>>>,
     clock_failure: std::sync::atomic::AtomicBool,
     contract: &'static str,
+    priced: bool,
 }
 struct RegistrationWitness(Arc<AtomicUsize>);
 #[async_trait]
@@ -305,6 +365,7 @@ impl RestoreHost {
     fn provider_registry(&self) -> ai_agents_llm::LLMRegistry {
         let provider = Arc::new(RestoreProvider {
             calls: self.calls.clone(),
+            priced: self.priced,
         });
         let mut registry = ai_agents_llm::LLMRegistry::new();
         registry.register("default", provider.clone());
@@ -473,7 +534,7 @@ impl TaskRestoreHost for RestoreHost {
         Ok(TaskRestoreBinding {
             id: self.contract.into(),
             contract_version: 1,
-            configuration: json!({"program":"request-state-v1","spec":declaration.unwrap_or(&self.root),"effect_scope":self.effect_file,"binding_version":self.binding_version.load(Ordering::SeqCst)}),
+            configuration: json!({"program":"request-state-v1","spec":declaration.unwrap_or(&self.root),"effect_scope":self.effect_file,"binding_version":self.binding_version.load(Ordering::SeqCst),"priced":self.priced}),
             state: self
                 .routes
                 .lock()
@@ -491,7 +552,7 @@ impl TaskRestoreHost for RestoreHost {
         Ok(TaskRestoreBinding {
             id: self.contract.into(),
             contract_version: 1,
-            configuration: json!({"backend":"offline-request-state-v1"}),
+            configuration: json!({"backend":"offline-request-state-v1","priced":self.priced}),
             state: Value::Null,
         })
     }
@@ -660,6 +721,7 @@ pub(super) fn host() -> Arc<RestoreHost> {
         clock: Default::default(),
         clock_failure: std::sync::atomic::AtomicBool::new(false),
         contract: "restore-test.v1",
+        priced: false,
     })
 }
 // Exact per-run config remains disabled in YAML; restoration does not enable automatic entry or startup selection.

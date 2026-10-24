@@ -12,8 +12,16 @@ pub use restoration::{
     TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest,
     TaskRestoreResponse, TaskRestoreTarget,
 };
+#[path = "persistence.rs"]
+mod persistence;
+#[path = "recovery.rs"]
+mod recovery;
 #[path = "restoration.rs"]
 mod restoration;
+pub use persistence::TaskStartupRequest;
+pub use recovery::{
+    TaskRecoveryCheckpoint, TaskRecoveryDecision, TaskRecoveryDisposition, TaskRecoveryHost,
+};
 
 #[path = "controller_runtime.rs"]
 mod controller_runtime;
@@ -38,6 +46,7 @@ pub struct AutonomyRunner {
     paused: parking_lot::Mutex<BTreeMap<String, PausedTask>>,
     resume_gate: tokio::sync::Mutex<()>,
     interaction_delivery: bool,
+    restore_host: Option<Arc<dyn TaskRestoreHost>>,
 }
 
 struct PausedTask {
@@ -697,6 +706,7 @@ impl AutonomyRunner {
             paused: Default::default(),
             resume_gate: Default::default(),
             interaction_delivery: true,
+            restore_host: None,
         })
     }
 
@@ -963,7 +973,19 @@ impl AutonomyRunner {
     /// Validates one bound approval, question answer or external signal before claiming its same-process exact continuation.
     /// The implementation-owned question contract is checked before claim and final authorization still runs on resume.
     /// A losing or invalid response cannot mutate the runtime, and failed execution retains the owner for recovery.
+    /// Opted-in persistence prepares any returned safe pause only after the retained resume gate has been released.
     pub async fn resume(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        input: TaskResumeInput,
+    ) -> Result<TaskRunResult> {
+        let result = Box::pin(self.resume_inner(run_id, expected_revision, input)).await?;
+        self.persist_returned_pause(result).await
+    }
+
+    // The retained gate is released before optional restart preparation reacquires it; pending work remains owner-protected throughout.
+    async fn resume_inner(
         &self,
         run_id: &str,
         expected_revision: u64,
@@ -1342,8 +1364,10 @@ impl AutonomyRunner {
 
     /// Runs a bounded foreground objective after sampling required host targets; unsuccessful writes never publish success.
     /// Revision sources are sampled state, not providers or execution permits, and are rechecked at continuation/publication boundaries.
+    /// Opted-in persistence prepares the acknowledged safe pause before returning it; failed preparation never reports a durable restart point.
     pub async fn run(&self, objective: &str, selected: Option<&str>) -> Result<TaskRunResult> {
-        Box::pin(self.run_entry(objective, selected, None)).await
+        let result = Box::pin(self.run_entry(objective, selected, None)).await?;
+        self.persist_returned_pause(result).await
     }
 
     /// Executes one admitted entry under the same controller; automatic routing never creates another run here.
@@ -1409,12 +1433,7 @@ impl AutonomyRunner {
                 "unavailable task interaction requires an explicit stop/fail fallback".into(),
             ));
         }
-        if profile.settings.persistence.is_some() {
-            return Err(AgentError::Config(
-                "task persistence/resume and host-interaction profile controls are not installed"
-                    .into(),
-            ));
-        }
+        self.preflight_persistence(&profile.settings)?;
 
         let lifecycle = LifecycleState::new(&profile.settings, skill.is_some())?;
         let mut preflight_scope = EvaluationScope {
@@ -2002,6 +2021,8 @@ impl AutonomyRunner {
                     // Shared executor records remain authoritative; capturing a logical request does not charge another attempt.
                     scope.mutation_generation = execution.mutation_generation();
                     Self::collect_tools(execution, &mut evidence).await?;
+                    self.checkpoint_persistence_step(execution, &profile.settings, scope.cycle)
+                        .await?;
                 }
                 // Each schedule has its own saved prefix; stage/task eligibility is evaluated after earlier observations.
                 use super::controller::ControllerPhase;

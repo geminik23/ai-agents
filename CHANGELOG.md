@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task recovery: development-only reviewed recovery preserves interrupted usage and effect commitments without replay, including cancellation-only reconstruction of prepared cursors
+- Task persistence policies: development-only Rust profiles prepare restartable safe pauses and select a unique compatible startup checkpoint without consuming human decisions or adopting abandoned owners
 - Task priced execution: development-only audited model and endpoint contracts reserve complete token ceilings and bounded internal retries, settling matching complete usage while retaining unknown commitments
 - Task write capabilities: development-only local utilities and host-bound footprints preserve actual implementation ownership; retained question answers do not invoke ordinary UI handlers
 - Task maintenance: development-only actor facts and relationships share task ownership, invocation accounting and original bounds through inline, parallel and background work
@@ -17,13 +19,14 @@
 - Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
 - Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
 - Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant and restart integration remains unfinished
-- Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full acceptance and restart remain unfinished
+- Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full task-surface acceptance remains unfinished
 - Task broadcast continuation: development-only `AgentRegistry::broadcast_task` retains recipient operations and ordered results under a live tool-message permit; ordinary broadcast and calls without a permit remain blocking
-- Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and restart reconstruction remain unavailable
+- Task recovery cleanup: development-only explicit host acknowledgement releases abandoned live protection after acknowledged host effect reconciliation, including interrupted terminal cleanup; automatic replay and arbitrary in-flight reconstruction remain unavailable
 - Task checkpoint storage: development-only conditional in-memory and SQLite persistence with explicit ownership, recovery, cancellation and actor deletion safety; full autonomous execution remains unavailable
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust recovery compatibility: development task mutations add guarded reconciliation and cleanup-only claim/publication; custom stores opt into recovery and compatibility-aware candidate inspection
 - Rust session metadata: the setter now returns an ownership-aware result, and ordinary session rebinding and actor deletion reject reserved task runtimes
 - Rust recovery errors: exhaustive development storage-error matches distinguish clock continuity loss from actual admission deadline exhaustion
 - Rust resource compatibility: development tool contexts add an optional admitted-footprint receipt, transparent tools forward combined preparation and response-only capabilities, and host footprint methods default to unsupported

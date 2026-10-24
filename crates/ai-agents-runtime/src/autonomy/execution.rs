@@ -1048,12 +1048,36 @@ impl RunExecution {
 
     /// Writes and verifies one exact successor without holding a database transaction over external work.
     /// A malformed receipt cannot transfer live revision authority or release custody.
+    /// Running writes bind a sampled usage anchor separately from backend metadata, and invalidate old prepared images before semantic work.
     async fn save(
         &self,
         previous: TaskRunSnapshot,
-        payload: Box<TaskCheckpointPayload>,
+        mut payload: Box<TaskCheckpointPayload>,
         status: TaskRunStatus,
     ) -> Result<TaskRunSnapshot> {
+        if status == TaskRunStatus::Running && payload.clocks.active_interval_started_at.is_some() {
+            let sampled_at = chrono::Utc::now();
+            payload.clocks.active_millis = payload.clocks.active_millis.max(self.active_millis()?);
+            let marker = TaskAdapterCheckpoint {
+                id: "runtime.recovery_clock".into(),
+                adapter: "runtime.recovery_clock".into(),
+                contract_version: 1,
+                config: json!({"contract":"sampled_active_utc_v1"}),
+                state: json!({"sampled_at":sampled_at,"active_millis":payload.clocks.active_millis}),
+            };
+            if let Some(old) = payload.adapters.iter_mut().find(|a| a.id == marker.id) {
+                *old = marker;
+            } else {
+                payload.adapters.push(marker);
+            }
+            if let Some(work) = payload
+                .adapters
+                .iter_mut()
+                .find(|a| a.id == "runtime.restore_work")
+            {
+                work.state["phase"] = json!("execution");
+            }
+        }
         let mutation = if status == TaskRunStatus::Running {
             TaskRunMutation::Checkpoint {
                 expected_revision: previous.revision,

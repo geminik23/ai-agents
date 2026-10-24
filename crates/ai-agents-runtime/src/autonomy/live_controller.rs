@@ -6,6 +6,7 @@ use super::*;
 impl AutonomyRunner {
     /// Runs one explicitly selected loaded skill without semantic rerouting or automatic YAML task startup.
     /// Nested skills inherit the existing execution through the ordinary runtime instead of recursively invoking this API.
+    /// Explicit skill profiles use the same opted-in safe-pause persistence as model-led tasks.
     pub async fn run_skill(
         &self,
         objective: &str,
@@ -13,7 +14,8 @@ impl AutonomyRunner {
         selected: Option<&str>,
     ) -> Result<TaskRunResult> {
         let skill = self.agent.admit_autonomy_skill(skill_id)?;
-        Box::pin(self.run_entry(objective, selected, Some(skill))).await
+        let result = Box::pin(self.run_entry(objective, selected, Some(skill))).await?;
+        self.persist_returned_pause(result).await
     }
 
     /// Manual resume is a delivery endpoint by default; hosts can explicitly declare that no usable endpoint is exposed.

@@ -5,10 +5,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // Stored limits cannot exceed the current authenticated host even when raw profile settings still compare equal.
-fn validate_current_host(
+pub(super) fn current_host_compatible(
     request: &TaskRestoreRequest,
     payload: &TaskCheckpointPayload,
-) -> Result<()> {
+) -> Result<bool> {
     let skill = payload
         .adapters
         .iter()
@@ -31,9 +31,7 @@ fn validate_current_host(
         &request.ceilings,
     )?;
     if profile.settings != payload.settings || !profile.enabled {
-        return Err(AgentError::Config(
-            "restored profile differs from current configuration".into(),
-        ));
+        return Ok(false);
     }
     let limits = &payload.limits;
     let ceilings = &request.ceilings;
@@ -60,7 +58,7 @@ fn validate_current_host(
         ),
     ] {
         if current.is_some_and(|current| old > current) {
-            return Err(AgentError::Config("stored task allowance exceeds current host ceiling; explicit narrowing is required".into()));
+            return Ok(false);
         }
     }
     for (old, current) in [
@@ -75,10 +73,21 @@ fn validate_current_host(
         ),
     ] {
         if current.is_some_and(|current| old.is_none_or(|old| old > current)) {
-            return Err(AgentError::Config(
-                "stored optional allowance exceeds current host ceiling".into(),
-            ));
+            return Ok(false);
         }
+    }
+    Ok(true)
+}
+
+// Explicit restoration rejects incompatible profiles or ceilings without silently narrowing stored allowances.
+pub(super) fn validate_current_host(
+    request: &TaskRestoreRequest,
+    payload: &TaskCheckpointPayload,
+) -> Result<()> {
+    if !current_host_compatible(request, payload)? {
+        return Err(AgentError::Config(
+            "stored task profile or allowance is incompatible with the current host".into(),
+        ));
     }
     Ok(())
 }
@@ -102,7 +111,7 @@ fn snapshot_identity(snapshot: &ai_agents_core::AgentSnapshot) -> Result<Value> 
 
 // Shape/reference validation precedes any mutable staging, claim or component restore.
 // Task-origin observation groups use the existing invocation projection, not the controller's already completed-turn continuation.
-fn validate_manifest(
+pub(super) fn validate_manifest(
     manifest: &TaskRestoreManifest,
     snapshot: &TaskRunSnapshot,
     payload: &TaskCheckpointPayload,
@@ -721,14 +730,16 @@ fn deadline_projection(
 fn restored_pause(
     runner: &AutonomyRunner,
     payload: &TaskCheckpointPayload,
-    owner: Arc<RunOwner>,
-    participants: Arc<Participants>,
+    authority: (Arc<RunOwner>, Arc<Participants>),
     review: LiveRestoreReview,
     manifest: &TaskRestoreManifest,
     now: RecoveryClock,
+    cleanup_only: bool,
 ) -> Result<PausedTask> {
+    let (owner, participants) = authority;
     let mut controller = controller_checkpoint(payload)?;
-    if let Some(controller) = &mut controller
+    if !cleanup_only
+        && let Some(controller) = &mut controller
         && let Some(driver) = &controller.driver
     {
         let profile = runner.retained_profile(payload)?;
@@ -914,6 +925,29 @@ impl AutonomyRunner {
         store: Arc<dyn TaskRunStore>,
         host: Arc<dyn TaskRestoreHost>,
     ) -> Result<(Self, TaskRunResult)> {
+        Box::pin(Self::restore_prepared(request, store, host, false)).await
+    }
+
+    /// Reconstructs only an acknowledged cancellation cursor and uses the existing typed cleanup without approving or polling pending work.
+    /// Original expiry may forbid execution but not cancellation cleanup; lost/drop ACK retains its truthful stored phase and live custody.
+    pub async fn restore_cancelled(
+        request: TaskRestoreRequest,
+        store: Arc<dyn TaskRunStore>,
+        host: Arc<dyn TaskRestoreHost>,
+    ) -> Result<TaskRunResult> {
+        let (runner, paused) = Box::pin(Self::restore_prepared(request, store, host, true)).await?;
+        runner
+            .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+            .await
+    }
+
+    // Construction is shared by execution and cleanup; the latter never clears cancellation or creates ordinary resume authority.
+    async fn restore_prepared(
+        request: TaskRestoreRequest,
+        store: Arc<dyn TaskRunStore>,
+        host: Arc<dyn TaskRestoreHost>,
+        cleanup_only: bool,
+    ) -> Result<(Self, TaskRunResult)> {
         if !store.supports_reconstruction() {
             return Err(AgentError::Config(
                 "task store lacks reconstruction admission".into(),
@@ -927,7 +961,7 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotFound)?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.validate(&snapshot, &request.config_identity)?;
-        safe_pause(&snapshot, &payload, host.now()?)?;
+        safe_pause_mode(&snapshot, &payload, host.now()?, false, cleanup_only)?;
         if snapshot.revision != request.expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
@@ -950,20 +984,50 @@ impl AutonomyRunner {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, right) => left.or(right),
         };
-        let whole = deadline_projection(expires, sample_clock(host.as_ref())?)?;
+        let whole = if cleanup_only {
+            None
+        } else {
+            deadline_projection(expires, sample_clock(host.as_ref())?)?
+        };
         let deadline = reconstruction_deadline(started, budget, whole)?;
-        charge_reconstruction(&mut payload, budget)?;
+        if cleanup_only {
+            let millis = u64::try_from(budget.as_nanos().div_ceil(1_000_000))
+                .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
+            if millis == 0 {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            payload.clocks.active_millis = payload
+                .clocks
+                .active_millis
+                .checked_add(millis)
+                .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        } else {
+            charge_reconstruction(&mut payload, budget)?;
+        }
         mark_work(&mut payload, "restore", "paused", budget, started_at)?;
         let token = uuid::Uuid::new_v4().to_string();
-        let claimed = store
-            .claim_paused(&request.run_id, snapshot.revision, token.clone())
-            .await?
-            .ok_or(TaskRunStorageError::Conflict)?;
+        let claimed = if cleanup_only {
+            store
+                .claim_cleanup(&request.run_id, snapshot.revision, token.clone())
+                .await?
+        } else {
+            store
+                .claim_paused(&request.run_id, snapshot.revision, token.clone())
+                .await?
+        }
+        .ok_or(TaskRunStorageError::Conflict)?;
         super::super::super::store::verify_checkpoint_receipt(
             &snapshot,
-            &TaskRunMutation::Claim {
-                expected_revision: snapshot.revision,
-                owner_token: token.clone(),
+            &if cleanup_only {
+                TaskRunMutation::ClaimCleanup {
+                    expected_revision: snapshot.revision,
+                    owner_token: token.clone(),
+                }
+            } else {
+                TaskRunMutation::Claim {
+                    expected_revision: snapshot.revision,
+                    owner_token: token.clone(),
+                }
             },
             &claimed,
         )?;
@@ -991,7 +1055,8 @@ impl AutonomyRunner {
             request.ceilings,
             store.clone(),
             request.config_identity,
-        )?;
+        )?
+        .with_restore_host(host.clone());
         let mut owners = BTreeMap::new();
         let owner = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
@@ -1126,11 +1191,11 @@ impl AutonomyRunner {
         let mut paused = restored_pause(
             &runner,
             &payload,
-            owner.clone(),
-            participants.clone(),
+            (owner.clone(), participants.clone()),
             live_review,
             &manifest,
             clock,
+            cleanup_only,
         )
         .map_err(|error| AgentError::Config(format!("restoration paused validation: {error}")))?;
         if let Some(whole) = whole {
@@ -1159,6 +1224,7 @@ impl AutonomyRunner {
             host.as_ref(),
             claimed.revision + 1,
             false,
+            cleanup_only,
         )
         .await?;
         for (id, node) in &mut refreshed.nodes {
@@ -1185,20 +1251,39 @@ impl AutonomyRunner {
             .state = serde_json::to_value(&live.view)?;
         let execution = claimed_execution(&runner, &claimed, &paused)?;
         *runner.active.lock() = Some(execution.clone());
-        let final_guard: Arc<dyn TaskFinalAdmission> =
-            Arc::new(RestorePublication { guards: all_guards });
-        safe_claim_time(&snapshot, &payload, host.now()?)?;
+        let final_guard: Arc<dyn TaskFinalAdmission> = if cleanup_only {
+            Arc::new(CleanupPublication {
+                guards: RestorePublication { guards: all_guards },
+                deadline,
+                host: host.clone(),
+                not_before: claimed.updated_at,
+            })
+        } else {
+            Arc::new(RestorePublication { guards: all_guards })
+        };
+        if !cleanup_only {
+            safe_claim_time(&snapshot, &payload, host.now()?)?;
+        }
         let checkpoint = TaskReconstructionCheckpoint {
             previous: claimed.clone(),
-            mutation: TaskRunMutation::FinalCheckpoint {
-                expected_revision: claimed.revision,
-                owner_token: token,
-                status: TaskRunStatus::Paused,
-                payload: serde_json::to_value(&payload)?,
-                release: true,
-                deadline,
-                expires_at: payload.clocks.expires_at,
-                evidence: Some(final_guard),
+            mutation: if cleanup_only {
+                TaskRunMutation::CleanupCheckpoint {
+                    expected_revision: claimed.revision,
+                    owner_token: token.clone(),
+                    payload: serde_json::to_value(&payload)?,
+                    evidence: final_guard.clone(),
+                }
+            } else {
+                TaskRunMutation::FinalCheckpoint {
+                    expected_revision: claimed.revision,
+                    owner_token: token,
+                    status: TaskRunStatus::Paused,
+                    payload: serde_json::to_value(&payload)?,
+                    release: true,
+                    deadline,
+                    expires_at: payload.clocks.expires_at,
+                    evidence: Some(final_guard),
+                }
             },
         };
         let saved = store
@@ -1264,7 +1349,7 @@ impl AutonomyRunner {
             .await?
             .ok_or(TaskRunStorageError::NotFound)?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
-        safe_pause(&snapshot, &payload, clock_host.now()?)?;
+        safe_pause(&snapshot, &payload, clock_host.now()?, false)?;
         if snapshot.revision != expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
@@ -1345,6 +1430,7 @@ impl AutonomyRunner {
             &payload,
             host.as_ref(),
             claimed.revision + 1,
+            false,
             false,
         )
         .await?;

@@ -82,6 +82,8 @@
 /// Development autonomy primitives and restricted standalone execution; complete YAML task execution remains unavailable.
 /// Explicit safe-pause reconstruction uses installed host bindings and never consumes the pending response or takes over abandoned Running work.
 /// The host must authenticate restoration review separately before using the newly advertised pending request and revision.
+/// Opted-in persistence uses with_restore_host and restore_on_start; startup never consumes a pending decision or adopts an abandoned owner.
+/// Explicit reviewed recovery preserves interrupted usage and uncertain commitments; restore_cancelled reconstructs only for typed cleanup.
 ///
 /// ```no_run
 /// use ai_agents::autonomy::{AutonomyRunner, TaskRestoreHost, TaskRestoreRequest, TaskRunResult, TaskRunStore};

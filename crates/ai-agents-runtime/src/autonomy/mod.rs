@@ -45,10 +45,11 @@ pub(crate) use execution::{
 pub(crate) use memory::TaskMemory;
 pub use runner::TaskRestoreParticipant;
 pub use runner::{
-    AutonomyRunner, TaskReconstructionCheckpoint, TaskRestorationReview, TaskRestoreBinding,
+    AutonomyRunner, TaskReconstructionCheckpoint, TaskRecoveryCheckpoint, TaskRecoveryDecision,
+    TaskRecoveryDisposition, TaskRecoveryHost, TaskRestorationReview, TaskRestoreBinding,
     TaskRestoreComposition, TaskRestoreEntry, TaskRestoreGenerations, TaskRestoreGraph,
     TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest,
-    TaskRestoreResponse, TaskRestoreTarget,
+    TaskRestoreResponse, TaskRestoreTarget, TaskStartupRequest,
 };
 mod builtins;
 #[cfg(test)]

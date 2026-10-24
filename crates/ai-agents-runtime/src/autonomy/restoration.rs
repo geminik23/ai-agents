@@ -70,6 +70,10 @@ pub trait TaskRestoreHost: Send + Sync {
     ) -> Result<TaskRestoreBinding>;
     /// Resolves supported immutable configuration references and native-history compatibility without constructing providers or mutating topology.
     fn validate_manifest(&self, manifest: &TaskRestoreManifest) -> Result<()>;
+    /// Startup may classify an unsupported host configuration as a non-candidate; errors still mean failed validation, integrity or host availability.
+    fn compatible_manifest(&self, manifest: &TaskRestoreManifest) -> Result<bool> {
+        self.validate_manifest(manifest).map(|()| true)
+    }
     /// Supplies the actual source topology; common root/spawner catalogues are discovered without custom code.
     fn capture_graph(&self, root: Arc<RuntimeAgent>) -> Result<TaskRestoreGraph> {
         TaskRestoreGraph::from_root(root)
@@ -217,6 +221,112 @@ pub(crate) fn restore_digest(value: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(value)?)))
 }
 
+/// Validates an interrupted preparation against its exact semantic image, never against a merely matching run or host name.
+pub(super) fn validate_recovery_source(
+    snapshot: &TaskRunSnapshot,
+    payload: &TaskCheckpointPayload,
+) -> Result<()> {
+    let work = payload
+        .adapters
+        .iter()
+        .find(|adapter| adapter.id == RESTORE_WORK)
+        .ok_or(TaskRunStorageError::NotResumable)?;
+    let manifest: TaskRestoreManifest = serde_json::from_value(
+        payload
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == RESTORE_ADAPTER)
+            .ok_or(TaskRunStorageError::NotResumable)?
+            .state
+            .clone(),
+    )?;
+    let valid = match work.state["phase"].as_str() {
+        Some("paused") => manifest.payload_digest == payload_digest(payload)?,
+        Some("running") => {
+            work.state["source_digest"].as_str() == Some(review_digest(payload)?.as_str())
+        }
+        _ => false,
+    };
+    if !valid
+        || manifest.root != snapshot.key.agent_id
+        || payload.reservations.iter().any(|r| {
+            matches!(
+                r.state,
+                TaskEffectState::Dispatched | TaskEffectState::Uncertain
+            )
+        })
+    {
+        return Err(TaskRunStorageError::NotResumable.into());
+    }
+    Ok(())
+}
+
+/// Only reviewed preparation recovery may refresh transport metadata; semantic state and original deadlines are unchanged.
+pub(super) fn rebind_recovery_manifest(
+    payload: &mut TaskCheckpointPayload,
+    revision: u64,
+) -> Result<()> {
+    let work = payload
+        .adapters
+        .iter_mut()
+        .find(|adapter| adapter.id == RESTORE_WORK)
+        .ok_or(TaskRunStorageError::NotResumable)?;
+    work.state["phase"] = json!("paused");
+    let digest = payload_digest(payload)?;
+    let adapter = payload
+        .adapters
+        .iter_mut()
+        .find(|adapter| adapter.id == RESTORE_ADAPTER)
+        .ok_or(TaskRunStorageError::NotResumable)?;
+    let mut manifest: TaskRestoreManifest = serde_json::from_value(adapter.state.clone())?;
+    manifest.revision = revision;
+    manifest.payload_digest = digest;
+    adapter.state = serde_json::to_value(manifest)?;
+    Ok(())
+}
+
+/// Startup performs the same side-effect-free compatibility checks as explicit reconstruction before selecting any candidate.
+pub(super) fn validate_startup_candidate(
+    request: &TaskRestoreRequest,
+    snapshot: &TaskRunSnapshot,
+    payload: &TaskCheckpointPayload,
+    host: &dyn TaskRestoreHost,
+) -> Result<bool> {
+    payload.validate(snapshot, &request.config_identity)?;
+    let now = host.now()?;
+    if now < snapshot.updated_at {
+        return Err(TaskRunStorageError::ClockDiscontinuity.into());
+    }
+    if payload.clocks.expires_at.is_some_and(|cut| now >= cut)
+        || payload
+            .adapters
+            .iter()
+            .find(|a| a.id == RESTORE_WORK)
+            .is_some_and(|a| a.state["phase"] != "paused")
+    {
+        return Ok(false);
+    }
+    match safe_pause(snapshot, payload, now, false) {
+        Err(AgentError::TaskRunStorage(
+            TaskRunStorageError::NotResumable | TaskRunStorageError::AdmissionExpired,
+        )) => return Ok(false),
+        other => other?,
+    }
+    let Some(adapter) = payload.adapters.iter().find(|a| a.id == RESTORE_ADAPTER) else {
+        return Ok(false);
+    };
+    let manifest: TaskRestoreManifest = serde_json::from_value(adapter.state.clone())?;
+    if manifest.version != 1
+        || manifest.host != host.identity()
+        || !driver::current_host_compatible(request, payload)?
+        || !host.compatible_manifest(&manifest)?
+    {
+        return Ok(false);
+    }
+    driver::validate_manifest(&manifest, snapshot, payload, host)?;
+    Ok(true)
+}
+
 /// A prepared image becomes stale after any task progress; a new explicit checkpoint is required before another restart.
 fn payload_digest(payload: &TaskCheckpointPayload) -> Result<String> {
     let mut value = serde_json::to_value(payload)?;
@@ -262,17 +372,33 @@ fn review_digest(payload: &TaskCheckpointPayload) -> Result<String> {
 }
 
 /// Requires a truly safe acknowledged pause; claims, cancellation receipts and unknown effects are not quiescence.
+/// Fresh capture may replace an invalidated image after live progress, but restoration cannot consume that stale image.
 /// Backward UTC is a separate clock-contract failure, never fresh allowance or ordinary expiry.
 fn safe_pause(
     snapshot: &TaskRunSnapshot,
     payload: &TaskCheckpointPayload,
     now: DateTime<Utc>,
+    fresh_capture: bool,
+) -> Result<()> {
+    safe_pause_mode(snapshot, payload, now, fresh_capture, false)
+}
+
+// Cleanup reconstruction preserves cancellation and original expiry, but neither may prevent retiring known-safe pending histories.
+fn safe_pause_mode(
+    snapshot: &TaskRunSnapshot,
+    payload: &TaskCheckpointPayload,
+    now: DateTime<Utc>,
+    fresh_capture: bool,
+    cleanup_only: bool,
 ) -> Result<()> {
     if payload
         .adapters
         .iter()
         .find(|adapter| adapter.id == RESTORE_WORK)
-        .is_some_and(|adapter| adapter.state["phase"] != "paused")
+        .is_some_and(|adapter| {
+            adapter.state["phase"] != "paused"
+                && !(fresh_capture && adapter.state["phase"] == "execution")
+        })
     {
         return Err(AgentError::Config(
             "reconstruction work requires explicit clock/effect reconciliation".into(),
@@ -280,7 +406,7 @@ fn safe_pause(
     }
     if snapshot.status != TaskRunStatus::Paused
         || snapshot.owner_token.is_some()
-        || snapshot.cancel_requested
+        || snapshot.cancel_requested != cleanup_only
         || payload.clocks.active_interval_started_at.is_some()
         || payload.reservations.iter().any(|reservation| {
             matches!(
@@ -299,10 +425,11 @@ fn safe_pause(
     if now < snapshot.updated_at {
         return Err(TaskRunStorageError::ClockDiscontinuity.into());
     }
-    if payload
-        .clocks
-        .expires_at
-        .is_some_and(|expiry| now >= expiry)
+    if !cleanup_only
+        && payload
+            .clocks
+            .expires_at
+            .is_some_and(|expiry| now >= expiry)
     {
         return Err(TaskRunStorageError::AdmissionExpired.into());
     }
@@ -431,6 +558,7 @@ async fn capture_manifest(
     host: &dyn TaskRestoreHost,
     revision: u64,
     check_response_guards: bool,
+    cleanup_only: bool,
 ) -> Result<TaskRestoreManifest> {
     paused.owner.check()?;
     // A writable store cannot replace the exact executable cursor retained by the actual source owner.
@@ -513,17 +641,24 @@ async fn capture_manifest(
     if let Some(previous) = prior.as_ref().and_then(|prior| prior.whole_expiry) {
         whole_expiry = Some(whole_expiry.map_or(previous, |cut| cut.min(previous)));
     }
-    let mut validation_bound = paused
-        .controller
-        .as_ref()
-        .and_then(|controller| controller.driver.as_ref())
-        .map(|driver| {
-            driver
-                .reconstruction_expiry(host.now()?)
-                .map(|cut| cut.map(|cut| (driver.identity.clone(), cut)))
-        })
-        .transpose()?
-        .flatten();
+    let mut validation_bound = if cleanup_only {
+        // Cleanup preserves the verified stored cut as audit data; it must not mint an executable driver witness to retire a wait.
+        prior
+            .as_ref()
+            .and_then(|manifest| manifest.validation_bound.clone())
+    } else {
+        paused
+            .controller
+            .as_ref()
+            .and_then(|controller| controller.driver.as_ref())
+            .map(|driver| {
+                driver
+                    .reconstruction_expiry(host.now()?)
+                    .map(|cut| cut.map(|cut| (driver.identity.clone(), cut)))
+            })
+            .transpose()?
+            .flatten()
+    };
     if let (Some((identity, cut)), Some((old, previous))) = (
         &mut validation_bound,
         prior
@@ -881,15 +1016,20 @@ impl TaskReconstructionCheckpoint {
         if serde_json::to_value(actual)? != serde_json::to_value(&self.previous)? {
             return Err(TaskRunStorageError::Conflict.into());
         }
-        let TaskRunMutation::FinalCheckpoint {
-            status: TaskRunStatus::Paused,
-            release: true,
-            payload,
-            evidence: Some(guard),
-            ..
-        } = &self.mutation
-        else {
-            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        let (payload, guard) = match &self.mutation {
+            TaskRunMutation::FinalCheckpoint {
+                status: TaskRunStatus::Paused,
+                release: true,
+                payload,
+                evidence: Some(guard),
+                ..
+            } if !actual.cancel_requested => (payload, guard),
+            TaskRunMutation::CleanupCheckpoint {
+                payload,
+                evidence: guard,
+                ..
+            } if actual.cancel_requested => (payload, guard),
+            _ => return Err(TaskRunStorageError::InvalidCheckpoint.into()),
         };
         guard.validate()?;
         let old: TaskCheckpointPayload = serde_json::from_value(actual.payload.clone())?;
@@ -972,6 +1112,32 @@ impl TaskFinalAdmission for RestorePublication {
     fn validate(&self) -> Result<()> {
         for guard in &self.guards {
             guard.validate()?;
+        }
+        Ok(())
+    }
+}
+
+struct CleanupPublication {
+    guards: RestorePublication,
+    deadline: Instant,
+    host: Arc<dyn TaskRestoreHost>,
+    not_before: DateTime<Utc>,
+}
+impl std::fmt::Debug for CleanupPublication {
+    // Cleanup guards never expose the prepared graph or host proof.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CleanupPublication")
+    }
+}
+impl TaskFinalAdmission for CleanupPublication {
+    // Only cleanup ignores expired execution bounds; its own bounded transaction and actual owners remain mandatory.
+    fn validate(&self) -> Result<()> {
+        self.guards.validate()?;
+        if self.host.now()? < self.not_before {
+            return Err(TaskRunStorageError::ClockDiscontinuity.into());
+        }
+        if Instant::now() >= self.deadline {
+            return Err(TaskRunStorageError::AdmissionExpired.into());
         }
         Ok(())
     }
@@ -1112,6 +1278,13 @@ async fn begin_work(
     }
     let mut running = ready.clone();
     mark_work(&mut running, kind, "running", budget, started_at)?;
+    let source_digest = review_digest(&running)?;
+    running
+        .adapters
+        .iter_mut()
+        .find(|adapter| adapter.id == RESTORE_WORK)
+        .ok_or(TaskRunStorageError::InvalidCheckpoint)?
+        .state["source_digest"] = json!(source_digest);
     let mutation = TaskRunMutation::Checkpoint {
         expected_revision: claimed.revision,
         owner_token: claimed
@@ -1224,7 +1397,7 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotFound)?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.validate(&snapshot, &self.config_identity)?;
-        safe_pause(&snapshot, &payload, host.now()?)?;
+        safe_pause(&snapshot, &payload, host.now()?, true)?;
         if snapshot.revision != expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
@@ -1246,7 +1419,8 @@ impl AutonomyRunner {
             .revision
             .checked_add(3)
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-        let manifest = capture_manifest(self, paused, &payload, host, next_revision, true).await?;
+        let manifest =
+            capture_manifest(self, paused, &payload, host, next_revision, true, false).await?;
         host.validate_manifest(&manifest)?;
         if paused
             .whole_expiry

@@ -28,6 +28,28 @@ pub(crate) fn verify_checkpoint_receipt(
             payload: payload.clone(),
             release: *release,
         }),
+        TaskRunMutation::CleanupCheckpoint {
+            expected_revision,
+            owner_token,
+            payload,
+            ..
+        } => Some(TaskRunMutation::CleanupCheckpoint {
+            expected_revision: *expected_revision,
+            owner_token: owner_token.clone(),
+            payload: payload.clone(),
+            evidence: Arc::new(ReceiptAdmission),
+        }),
+        TaskRunMutation::ReconcileRecovery {
+            expected_revision,
+            status,
+            payload,
+            ..
+        } => Some(TaskRunMutation::ReconcileRecovery {
+            expected_revision: *expected_revision,
+            status: *status,
+            payload: payload.clone(),
+            evidence: Arc::new(ReceiptAdmission),
+        }),
         _ => None,
     };
     let expected =
@@ -62,6 +84,16 @@ pub(crate) fn verify_checkpoint_receipt(
     Ok(())
 }
 
+// Receipt comparison checks committed facts, not whether a once-valid live recovery proof remains valid after ACK.
+#[derive(Debug)]
+struct ReceiptAdmission;
+impl TaskFinalAdmission for ReceiptAdmission {
+    // This guard is used only to reconstruct an expected receipt and is never submitted to a backend.
+    fn validate(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// Storage operations are CAS transitions; successful claim is required before later execution.
 #[async_trait]
 pub trait TaskRunStore: Send + Sync {
@@ -89,6 +121,23 @@ pub trait TaskRunStore: Send + Sync {
         .await
         .map(Some)
     }
+    /// Claims an acknowledged cancellation cursor for cleanup only; implementations must preserve cancellation and exact no-write conflict semantics.
+    async fn claim_cleanup(
+        &self,
+        _run_id: &str,
+        _expected_revision: u64,
+        _owner_token: String,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        Err(AgentError::Config(
+            "reconstructed task cleanup is unsupported by this store".into(),
+        ))
+    }
+
+    /// Candidate inspection validates exact data but may retain another configuration identity for compatibility filtering; ordinary loads remain strict.
+    async fn inspect_candidate(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>> {
+        self.load(run_id).await
+    }
+
     /// Declares validated paused-limit support before the runner starts a potentially ambiguous control write.
     fn supports_paused_limit_revision(&self) -> bool {
         false
@@ -137,6 +186,21 @@ pub trait TaskRunStore: Send + Sync {
     ) -> Result<TaskRunSnapshot> {
         Err(AgentError::Config(
             "task reconstruction is unsupported by this store".into(),
+        ))
+    }
+
+    /// Declares reviewed recovery publication; custom stores must preserve the opaque proof and live backend guard.
+    fn supports_recovery(&self) -> bool {
+        false
+    }
+    /// Publishes a framework-prepared recovery decision, never an arbitrary replacement payload.
+    async fn checkpoint_recovery(
+        &self,
+        _run_id: &str,
+        _checkpoint: &super::TaskRecoveryCheckpoint,
+    ) -> Result<TaskRunSnapshot> {
+        Err(AgentError::Config(
+            "reviewed task recovery is unsupported by this store".into(),
         ))
     }
 
@@ -285,7 +349,12 @@ impl TaskRunStore for ScopedTaskRunStore {
     /// Checks fresh previous/proposed payloads before CAS and reuses each decoded value only within this immutable validation call.
     /// Backend validation and exact receipt checks remain independent; no acknowledged cache replaces the owned storage read.
     async fn mutate(&self, run_id: &str, mutation: &TaskRunMutation) -> Result<TaskRunSnapshot> {
-        if matches!(mutation, TaskRunMutation::HostControl { .. }) {
+        if matches!(
+            mutation,
+            TaskRunMutation::HostControl { .. }
+                | TaskRunMutation::ReconcileRecovery { .. }
+                | TaskRunMutation::CleanupCheckpoint { .. }
+        ) {
             return Err(AgentError::Config(
                 "host mutations require apply_host_action preflight".into(),
             ));
@@ -337,6 +406,76 @@ impl TaskRunStore for ScopedTaskRunStore {
         self.validate(&saved)?;
         verify_checkpoint_receipt(&previous, checkpoint.mutation(), &saved)?;
         Ok(saved)
+    }
+
+    /// Memory and SQLite preserve reviewed recovery admission inside their existing atomic transition.
+    fn supports_recovery(&self) -> bool {
+        true
+    }
+
+    /// An exact predecessor and framework-owned transformation are checked before the backend CAS and exact receipt comparison.
+    async fn checkpoint_recovery(
+        &self,
+        run_id: &str,
+        checkpoint: &super::TaskRecoveryCheckpoint,
+    ) -> Result<TaskRunSnapshot> {
+        let previous = self
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        checkpoint.validate(&previous)?;
+        let proposed = previous.transition(checkpoint.mutation(), chrono::Utc::now())?;
+        self.validate(&proposed)?;
+        let saved = self
+            .storage
+            .mutate_task_run(&self.key(run_id), checkpoint.mutation())
+            .await?;
+        self.validate(&saved)?;
+        verify_checkpoint_receipt(&previous, checkpoint.mutation(), &saved)?;
+        Ok(saved)
+    }
+
+    /// Candidate inspection retains scope and full schema/native validation without mistaking an old config for corrupt data.
+    async fn inspect_candidate(&self, run_id: &str) -> Result<Option<TaskRunSnapshot>> {
+        let snapshot = self.storage.load_task_run(&self.key(run_id)).await?;
+        if let Some(snapshot) = &snapshot {
+            if snapshot.key.agent_id != self.agent_id || snapshot.actor_id != self.actor_id {
+                return Err(TaskRunStorageError::InvalidCheckpoint.into());
+            }
+            snapshot.validate()?;
+            let payload: TaskCheckpointPayload =
+                serde_json::from_value(snapshot.payload.clone())
+                    .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?;
+            payload.validate(snapshot, &payload.config_identity)?;
+        }
+        Ok(snapshot)
+    }
+
+    /// A cancellation claim cannot clear cancellation or grant ordinary resume, even when its acknowledgement is lost.
+    async fn claim_cleanup(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        owner_token: String,
+    ) -> Result<Option<TaskRunSnapshot>> {
+        match self
+            .mutate(
+                run_id,
+                &TaskRunMutation::ClaimCleanup {
+                    expected_revision,
+                    owner_token,
+                },
+            )
+            .await
+        {
+            Ok(saved) => Ok(Some(saved)),
+            Err(AgentError::TaskRunStorage(
+                TaskRunStorageError::Conflict
+                | TaskRunStorageError::Owned
+                | TaskRunStorageError::NotResumable,
+            )) => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Scoped backend claim conflicts are certified no-write outcomes, unlike arbitrary transport errors.

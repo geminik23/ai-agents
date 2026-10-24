@@ -134,6 +134,18 @@ pub enum TaskRunMutation {
         expected_revision: u64,
         owner_token: String,
     },
+    /// Claims only cancellation cleanup; the monotonic cancel flag still prevents ordinary execution claims.
+    ClaimCleanup {
+        expected_revision: u64,
+        owner_token: String,
+    },
+    /// Publishes a reconstructed cancellation cursor, never a resumable execution grant.
+    CleanupCheckpoint {
+        expected_revision: u64,
+        owner_token: String,
+        payload: Value,
+        evidence: std::sync::Arc<dyn TaskFinalAdmission>,
+    },
     Checkpoint {
         expected_revision: u64,
         owner_token: String,
@@ -174,6 +186,13 @@ pub enum TaskRunMutation {
         expected_revision: u64,
         owner_token: String,
     },
+    /// Reviewed recovery is checked again inside the backend transaction; it cannot declare task completion or adopt a live owner.
+    ReconcileRecovery {
+        expected_revision: u64,
+        status: TaskRunStatus,
+        payload: Value,
+        evidence: std::sync::Arc<dyn TaskFinalAdmission>,
+    },
     /// A host must reconcile uncertain effects before explicitly supplying a safe replacement payload.
     ResolveRecovery {
         expected_revision: u64,
@@ -204,6 +223,11 @@ impl TaskRunMutation {
                 || expiry.is_some_and(|bound| now >= bound)
         }) {
             return Err(TaskRunStorageError::AdmissionExpired.into());
+        }
+        if let Self::ReconcileRecovery { evidence, .. } | Self::CleanupCheckpoint { evidence, .. } =
+            self
+        {
+            evidence.validate()?;
         }
         if let Self::FinalCheckpoint {
             status: TaskRunStatus::Completed | TaskRunStatus::Paused,
@@ -308,6 +332,12 @@ impl TaskRunSnapshot {
             TaskRunMutation::Claim {
                 expected_revision, ..
             }
+            | TaskRunMutation::ClaimCleanup {
+                expected_revision, ..
+            }
+            | TaskRunMutation::CleanupCheckpoint {
+                expected_revision, ..
+            }
             | TaskRunMutation::Checkpoint {
                 expected_revision, ..
             }
@@ -325,6 +355,9 @@ impl TaskRunSnapshot {
                 expected_revision, ..
             }
             | TaskRunMutation::ResolveRecovery {
+                expected_revision, ..
+            }
+            | TaskRunMutation::ReconcileRecovery {
                 expected_revision, ..
             } => *expected_revision,
         };
@@ -358,6 +391,31 @@ impl TaskRunSnapshot {
                 }
                 next.owner_token = Some(owner_token.clone());
                 next.status = TaskRunStatus::Running;
+            }
+            TaskRunMutation::ClaimCleanup { owner_token, .. } => {
+                if self.owner_token.is_some()
+                    || self.status != TaskRunStatus::Paused
+                    || !self.cancel_requested
+                {
+                    return Err(NotResumable.into());
+                }
+                next.owner_token = Some(owner_token.clone());
+                next.status = TaskRunStatus::Running;
+            }
+            TaskRunMutation::CleanupCheckpoint {
+                owner_token,
+                payload,
+                ..
+            } => {
+                if self.owner_token.as_deref() != Some(owner_token)
+                    || self.status != TaskRunStatus::Running
+                    || !self.cancel_requested
+                {
+                    return Err(Conflict.into());
+                }
+                next.owner_token = None;
+                next.status = TaskRunStatus::Paused;
+                next.payload = payload.clone();
             }
             TaskRunMutation::Checkpoint {
                 owner_token,
@@ -437,6 +495,27 @@ impl TaskRunSnapshot {
                 next.owner_token = None;
                 next.status = TaskRunStatus::RecoveryRequired;
             }
+            TaskRunMutation::ReconcileRecovery {
+                status, payload, ..
+            } => {
+                if self.status != TaskRunStatus::RecoveryRequired
+                    || self.owner_token.is_some()
+                    || !matches!(
+                        status,
+                        TaskRunStatus::Paused
+                            | TaskRunStatus::Incomplete
+                            | TaskRunStatus::Failed
+                            | TaskRunStatus::LimitReached
+                            | TaskRunStatus::Cancelled
+                    )
+                    || (self.cancel_requested
+                        && !matches!(status, TaskRunStatus::Paused | TaskRunStatus::Cancelled))
+                {
+                    return Err(NotResumable.into());
+                }
+                next.payload = payload.clone();
+                next.status = *status;
+            }
             TaskRunMutation::ResolveRecovery { payload, .. } => {
                 if self.status != TaskRunStatus::RecoveryRequired || self.owner_token.is_some() {
                     return Err(NotResumable.into());
@@ -452,6 +531,7 @@ impl TaskRunSnapshot {
         if matches!(
             mutation,
             TaskRunMutation::Claim { .. }
+                | TaskRunMutation::ClaimCleanup { .. }
                 | TaskRunMutation::RequestCancel { .. }
                 | TaskRunMutation::Recover { .. }
         ) {
