@@ -1,6 +1,8 @@
 use super::*;
 #[path = "host_evidence_acceptance_tests.rs"]
 mod acceptance;
+#[path = "restoration_host_evidence_tests.rs"]
+mod restoration_tests;
 use crate::Agent;
 use ai_agents_core::{AgentError, Result};
 use async_trait::async_trait;

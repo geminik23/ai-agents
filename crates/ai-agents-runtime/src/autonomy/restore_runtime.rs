@@ -6,8 +6,9 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 struct RestoreRuntimeGuard {
-    owner: Arc<crate::autonomy::RunOwner>,
-    slot: crate::autonomy::RunOwnerSlot,
+    // Owners retain response guards themselves; weak backreferences prevent cycles after an unpublished reconstruction fails.
+    owner: std::sync::Weak<crate::autonomy::RunOwner>,
+    slot: std::sync::Weak<parking_lot::RwLock<Option<Arc<crate::autonomy::RunOwner>>>>,
     control: Arc<RuntimeControlState>,
     state: Option<Arc<StateMachine>>,
     expected_state: Option<u64>,
@@ -25,12 +26,19 @@ impl std::fmt::Debug for RestoreRuntimeGuard {
 impl ai_agents_core::autonomy::TaskFinalAdmission for RestoreRuntimeGuard {
     // Fresh object/generation binding is validated at backend publication and every restored response admission.
     fn validate(&self) -> Result<()> {
-        self.owner.check()?;
-        if self
+        let owner = self
+            .owner
+            .upgrade()
+            .ok_or(crate::autonomy::TaskRunStorageError::Owned)?;
+        let slot = self
             .slot
+            .upgrade()
+            .ok_or(crate::autonomy::TaskRunStorageError::Owned)?;
+        owner.check()?;
+        if slot
             .read()
             .as_ref()
-            .is_none_or(|owner| !Arc::ptr_eq(owner, &self.owner))
+            .is_none_or(|current| !Arc::ptr_eq(current, &owner))
             || self.state.as_ref().map(|state| state.generation()) != self.expected_state
             || self.control.version.load(Ordering::SeqCst) != self.expected_control
             || self.tools.version() != self.expected_tools
@@ -188,9 +196,11 @@ impl RuntimeAgent {
     }
 
     /// Unstarted staged nodes have no admitted effects; after publication they retain registration pins rather than fabricated task membership.
+    /// Slot release and membership retirement share the node gate, so a new owner cannot interleave between them.
     pub(crate) fn release_reconstruction_temporary(
         &self,
         owner: &Arc<crate::autonomy::RunOwner>,
+        participants: &crate::autonomy::Participants,
     ) -> Result<()> {
         let _gate = self
             .root_turn_gate
@@ -204,7 +214,8 @@ impl RuntimeAgent {
             return Err(crate::autonomy::TaskRunStorageError::Owned.into());
         }
         *current = None;
-        Ok(())
+        drop(current);
+        participants.retire_reconstructed_member(owner)
     }
 
     /// A reconstructed runtime is reserved before component mutation; this does not bypass ordinary public restore guards.
@@ -291,14 +302,15 @@ impl RuntimeAgent {
     }
 
     /// Reconstructs a fresh generation guard over the actual installed runtime; optional review gates still require explicit host approval.
+    /// The guard cannot keep its containing owner or owner slot alive; dropped authority denies admission instead of leaking a self-cycle.
     pub(crate) fn task_reconstruction_guard(
         &self,
         owner: Arc<crate::autonomy::RunOwner>,
         reviewed: Option<Arc<AtomicBool>>,
     ) -> Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission> {
         Arc::new(RestoreRuntimeGuard {
-            owner,
-            slot: self.autonomy_owner.clone(),
+            owner: Arc::downgrade(&owner),
+            slot: Arc::downgrade(&self.autonomy_owner),
             control: self.runtime_control.clone(),
             state: self.state_machine.clone(),
             expected_state: self.state_machine.as_ref().map(|state| state.generation()),

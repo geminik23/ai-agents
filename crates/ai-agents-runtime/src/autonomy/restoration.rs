@@ -48,6 +48,8 @@ pub struct TaskRestoreGraph {
 /// Host-installed reconstruction and compatibility authority; model-selected IDs cannot install this service.
 /// Capture/validation perform no semantic work or hidden I/O. Staging constructs unpublished objects without providers, tools or lifecycle-hook effects.
 /// Binding implementations and configured native-history destinations must be checked by the host before returning staged objects.
+/// Common behavior remains declarative; this service binds trusted host implementations and hidden state, not task objectives or domain completion logic.
+/// Immutable configuration must distinguish different implementations even when their display names match; mutable state may advance only through admitted work.
 #[async_trait]
 pub trait TaskRestoreHost: Send + Sync {
     /// Stable host contract identity, distinct from the task profile's compatibility identity.
@@ -316,21 +318,20 @@ impl TaskRestoreGraph {
         loop {
             let before = (self.runtimes.len(), self.registries.len());
             for (id, runtime) in self.runtimes.clone() {
-                if let Some(registry) = runtime.spawner_registry() {
-                    if !self
+                if let Some(registry) = runtime.spawner_registry()
+                    && !self
                         .registries
                         .values()
                         .any(|old| Arc::ptr_eq(old, registry))
-                    {
-                        self.registries
-                            .insert(format!("registry:{id}"), registry.clone());
-                    }
+                {
+                    self.registries
+                        .insert(format!("registry:{id}"), registry.clone());
                 }
-                if let Some(spawner) = runtime.spawner() {
-                    if !self.spawners.values().any(|old| Arc::ptr_eq(old, spawner)) {
-                        self.spawners
-                            .insert(format!("spawner:{id}"), spawner.clone());
-                    }
+                if let Some(spawner) = runtime.spawner()
+                    && !self.spawners.values().any(|old| Arc::ptr_eq(old, spawner))
+                {
+                    self.spawners
+                        .insert(format!("spawner:{id}"), spawner.clone());
                 }
                 self.providers
                     .entry(format!("runtime:{id}"))
@@ -356,10 +357,10 @@ impl TaskRestoreGraph {
                         ));
                     }
                     self.runtimes.insert(id.clone(), entry.agent.clone());
-                    if let Some(old) = self.declarations.get(&id) {
-                        if serde_json::to_value(old)? != serde_json::to_value(&entry.spec)? {
-                            return Err(AgentError::Config("registry aliases with different retained declarations require an explicit host migration".into()));
-                        }
+                    if let Some(old) = self.declarations.get(&id)
+                        && serde_json::to_value(old)? != serde_json::to_value(&entry.spec)?
+                    {
+                        return Err(AgentError::Config("registry aliases with different retained declarations require an explicit host migration".into()));
                     }
                     self.declarations
                         .entry(id)
@@ -519,10 +520,9 @@ async fn capture_manifest(
         prior
             .as_ref()
             .and_then(|prior| prior.validation_bound.as_ref()),
-    ) {
-        if identity == old {
-            *cut = (*cut).min(*previous);
-        }
+    ) && identity == old
+    {
+        *cut = (*cut).min(*previous);
     }
     if paused.participants.unsettled() {
         return Err(TaskRunStorageError::NotResumable.into());
@@ -777,10 +777,8 @@ async fn capture_manifest(
     }
     let mut responses = BTreeMap::new();
     for (id, response) in source_responses {
-        if check_response_guards {
-            if let Some(review) = &response.review {
-                review.validate()?;
-            }
+        if check_response_guards && let Some(review) = &response.review {
+            review.validate()?;
         }
         responses.insert(
             id.clone(),
@@ -1181,9 +1179,25 @@ fn prepare_capture(
     Ok(())
 }
 
+// Preclaim capture is read-only custody: errors or future cancellation must return the exact retained pause without abandoning its owner.
+struct PausePreparation<'a> {
+    retained: &'a parking_lot::Mutex<BTreeMap<String, PausedTask>>,
+    run_id: &'a str,
+    paused: Option<PausedTask>,
+}
+impl Drop for PausePreparation<'_> {
+    // The resume gate still excludes competing local control; disarming before claim separates safe rollback from ambiguous writes.
+    fn drop(&mut self) {
+        if let Some(paused) = self.paused.take() {
+            self.retained.lock().insert(self.run_id.into(), paused);
+        }
+    }
+}
+
 impl AutonomyRunner {
     /// Prepares one explicit durable restart point from an acknowledged safe live pause.
     /// Current node state, host bindings and complete topology are captured without replay; subsequent progress requires a fresh preparation.
+    /// Preclaim capture cancellation preserves the original live pause; cancellation after a claim starts retains ambiguous custody.
     pub async fn checkpoint_for_restore(
         &self,
         run_id: &str,
@@ -1205,45 +1219,38 @@ impl AutonomyRunner {
         if snapshot.revision != expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
-        let paused = self
+        let mut preparation = PausePreparation {
+            retained: &self.paused,
+            run_id,
+            paused: Some(
+                self.paused
+                    .lock()
+                    .remove(run_id)
+                    .ok_or(TaskRunStorageError::NotResumable)?,
+            ),
+        };
+        let paused = preparation
             .paused
-            .lock()
-            .remove(run_id)
+            .as_ref()
             .ok_or(TaskRunStorageError::NotResumable)?;
         let next_revision = snapshot
             .revision
             .checked_add(3)
             .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
-        let capture = capture_manifest(self, &paused, &payload, host, next_revision, true).await;
-        let manifest = match capture {
-            Ok(manifest) => {
-                if let Err(error) = host.validate_manifest(&manifest) {
-                    self.paused.lock().insert(run_id.into(), paused);
-                    return Err(error);
-                }
-                manifest
-            }
-            Err(error) => {
-                self.paused.lock().insert(run_id.into(), paused);
-                return Err(error);
-            }
-        };
+        let manifest = capture_manifest(self, paused, &payload, host, next_revision, true).await?;
+        host.validate_manifest(&manifest)?;
         if paused
             .whole_expiry
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            self.paused.lock().insert(run_id.into(), paused);
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
-        let prepared = prepare_capture(&snapshot, &mut payload, manifest, budget, started_at)
-            .and_then(|()| reconstruction_deadline(started, budget, paused.whole_expiry));
-        let deadline = match prepared {
-            Ok(deadline) => deadline,
-            Err(error) => {
-                self.paused.lock().insert(run_id.into(), paused);
-                return Err(error);
-            }
-        };
+        prepare_capture(&snapshot, &mut payload, manifest, budget, started_at)?;
+        let deadline = reconstruction_deadline(started, budget, paused.whole_expiry)?;
+        let paused = preparation
+            .paused
+            .take()
+            .ok_or(TaskRunStorageError::NotResumable)?;
         let mut cleanup = OwnedTurnCleanup::new(paused.owner.clone());
         let token = uuid::Uuid::new_v4().to_string();
         let claimed = match self

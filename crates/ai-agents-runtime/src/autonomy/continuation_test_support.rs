@@ -75,6 +75,17 @@ impl ReceiptStore {
 }
 #[async_trait]
 impl TaskRunStore for ReceiptStore {
+    // Fault injection forwards the exact opaque reconstruction proof and live guard to the production scoped backend.
+    fn supports_reconstruction(&self) -> bool {
+        true
+    }
+    async fn checkpoint_reconstruction(
+        &self,
+        id: &str,
+        checkpoint: &super::TaskReconstructionCheckpoint,
+    ) -> Result<TaskRunSnapshot> {
+        self.inner.checkpoint_reconstruction(id, checkpoint).await
+    }
     async fn create(&self, snapshot: &TaskRunSnapshot) -> Result<()> {
         self.inner.create(snapshot).await
     }

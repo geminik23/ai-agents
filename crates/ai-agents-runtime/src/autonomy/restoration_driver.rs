@@ -101,6 +101,7 @@ fn snapshot_identity(snapshot: &ai_agents_core::AgentSnapshot) -> Result<Value> 
 }
 
 // Shape/reference validation precedes any mutable staging, claim or component restore.
+// Task-origin observation groups use the existing invocation projection, not the controller's already completed-turn continuation.
 fn validate_manifest(
     manifest: &TaskRestoreManifest,
     snapshot: &TaskRunSnapshot,
@@ -132,17 +133,18 @@ fn validate_manifest(
                 .find(|child| child.runtime.snapshot.agent_id == *id && child.pending.is_some())
                 .map(|child| &child.runtime)
         };
-        if let Some(authoritative) = authoritative {
-            if snapshot_identity(&node.runtime.snapshot)?
+        if let Some(authoritative) = authoritative
+            && (snapshot_identity(&node.runtime.snapshot)?
                 != snapshot_identity(&authoritative.snapshot)?
-                || node.runtime.native_exchanges != authoritative.native_exchanges
-            {
-                return Err(AgentError::Config(
-                    "current node image differs from its acknowledged pending checkpoint".into(),
-                ));
-            }
+                || node.runtime.native_exchanges != authoritative.native_exchanges)
+        {
+            return Err(AgentError::Config(
+                "current node image differs from its acknowledged pending checkpoint".into(),
+            ));
         }
+        // Every runtime provider view is mandatory even when no composition references it; reject missing structure before claiming the usable pause.
         if node.runtime.snapshot.agent_id != *id
+            || !manifest.providers.contains_key(&format!("runtime:{id}"))
             || node.binding.id.trim().is_empty()
             || node.binding.contract_version == 0
             || node
@@ -268,37 +270,34 @@ fn validate_manifest(
         )?;
         group.validate_checkpoint(payload)?;
         for frame in group.frames.values() {
-            if let Some(old) = frames.get(&frame.id) {
-                if serde_json::to_value(old)? != serde_json::to_value(frame)? {
-                    return Err(AgentError::Config(
-                        "group and delegate frame copies differ".into(),
-                    ));
-                }
+            if let Some(old) = frames.get(&frame.id)
+                && serde_json::to_value(old)? != serde_json::to_value(frame)?
+            {
+                return Err(AgentError::Config(
+                    "group and delegate frame copies differ".into(),
+                ));
             }
             frames.insert(frame.id.clone(), frame.clone());
         }
         active.extend(group.frames.values().map(|frame| frame.id.clone()));
     }
-    if let Some(controller) = controller_checkpoint(payload)? {
-        if let Some(value) = controller
-            .driver
-            .and_then(|driver| driver.parked)
-            .and_then(|parked| parked.group)
-        {
-            let group: TaskGroupState = serde_json::from_value(value)?;
-            group.validate_checkpoint(payload)?;
-            for frame in group.frames.values() {
-                if let Some(old) = frames.get(&frame.id) {
-                    if serde_json::to_value(old)? != serde_json::to_value(frame)? {
-                        return Err(AgentError::Config(
-                            "observation group and delegate frame copies differ".into(),
-                        ));
-                    }
-                }
-                frames.insert(frame.id.clone(), frame.clone());
+    if let Some(controller) = controller_checkpoint(payload)?
+        && let Some(parked) = controller.driver.and_then(|driver| driver.parked)
+        && let Some(value) = &parked.group
+    {
+        let group: TaskGroupState = serde_json::from_value(value.clone())?;
+        crate::autonomy::authority::validate_observation_group(&group, payload, &parked.pending)?;
+        for frame in group.frames.values() {
+            if let Some(old) = frames.get(&frame.id)
+                && serde_json::to_value(old)? != serde_json::to_value(frame)?
+            {
+                return Err(AgentError::Config(
+                    "observation group and delegate frame copies differ".into(),
+                ));
             }
-            active.extend(group.frames.values().map(|frame| frame.id.clone()));
+            frames.insert(frame.id.clone(), frame.clone());
         }
+        active.extend(group.frames.values().map(|frame| frame.id.clone()));
     }
     active.sort();
     active.dedup();
@@ -729,28 +728,28 @@ fn restored_pause(
     now: RecoveryClock,
 ) -> Result<PausedTask> {
     let mut controller = controller_checkpoint(payload)?;
-    if let Some(controller) = &mut controller {
-        if let Some(driver) = &controller.driver {
-            let profile = runner.retained_profile(payload)?;
-            let bound = runner
-                .agent
-                .autonomy_extensions()
-                .bind_for_agent(&runner.agent, &profile)?;
-            let check = controller.driver_check(&bound, &payload.objective)?;
-            controller.driver = Some(Box::new(ValidationDriverState::restore_reconstructed(
-                serde_json::to_value(driver)?,
-                &check,
-                &controller.scope,
-                runner.agent.autonomy_extensions(),
-                now.utc,
-                manifest
-                    .validation_bound
-                    .as_ref()
-                    .filter(|(identity, _)| *identity == driver.identity)
-                    .map(|(_, bound)| *bound),
-                now.mono,
-            )?));
-        }
+    if let Some(controller) = &mut controller
+        && let Some(driver) = &controller.driver
+    {
+        let profile = runner.retained_profile(payload)?;
+        let bound = runner
+            .agent
+            .autonomy_extensions()
+            .bind_for_agent(&runner.agent, &profile)?;
+        let check = controller.driver_check(&bound, &payload.objective)?;
+        controller.driver = Some(Box::new(ValidationDriverState::restore_reconstructed(
+            serde_json::to_value(driver)?,
+            &check,
+            &controller.scope,
+            runner.agent.autonomy_extensions(),
+            now.utc,
+            manifest
+                .validation_bound
+                .as_ref()
+                .filter(|(identity, _)| *identity == driver.identity)
+                .map(|(_, bound)| *bound),
+            now.mono,
+        )?));
     }
     let group =
         if controller.is_none() && payload.pause_reason.as_deref() == Some("child_interaction") {
@@ -806,10 +805,10 @@ fn restored_pause(
         }
     }
     if let Some(controller) = &controller {
-        if let Some(review) = &controller.review {
-            if let Some(deadline) = deadline_projection(review.expires_at, now)? {
-                deadlines.insert(review.id.clone(), deadline);
-            }
+        if let Some(review) = &controller.review
+            && let Some(deadline) = deadline_projection(review.expires_at, now)?
+        {
+            deadlines.insert(review.id.clone(), deadline);
         }
         if let Some(value) = controller
             .driver
@@ -836,10 +835,10 @@ fn restored_pause(
             }
         }
     }
-    if let Some(group) = &group {
-        if let Some(deadline) = deadlines.get(&group.child_request.id).copied() {
-            deadlines.insert(group.request_id.clone(), deadline);
-        }
+    if let Some(group) = &group
+        && let Some(deadline) = deadlines.get(&group.child_request.id).copied()
+    {
+        deadlines.insert(group.request_id.clone(), deadline);
     }
     let todo = payload
         .todos
@@ -1216,8 +1215,7 @@ impl AutonomyRunner {
         execution.acknowledge_snapshot(&saved);
         for (id, runtime) in &graph.runtimes {
             if *id != manifest.root && manifest.nodes[id].participant_actor.is_none() {
-                runtime.release_reconstruction_temporary(&owners[id])?;
-                participants.retire_reconstructed_member(&owners[id])?;
+                runtime.release_reconstruction_temporary(&owners[id], &participants)?;
             }
         }
         runner.paused.lock().insert(request.run_id, paused);
@@ -1242,6 +1240,7 @@ impl AutonomyRunner {
 
     /// Fresh restoration approval covers exactly the reconstructed ongoing operations; pending tool/question replies remain separate.
     /// Modification and timeout are not blanket approvals, and a policy/generation change invalidates the review before a write.
+    /// The installed host's certified clock remains authoritative after awaited storage reads, just as at capture and reconstruction.
     pub async fn approve_restoration(
         &self,
         run_id: &str,
@@ -1265,7 +1264,7 @@ impl AutonomyRunner {
             .await?
             .ok_or(TaskRunStorageError::NotFound)?;
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
-        safe_pause(&snapshot, &payload, Utc::now())?;
+        safe_pause(&snapshot, &payload, clock_host.now()?)?;
         if snapshot.revision != expected_revision {
             return Err(TaskRunStorageError::Conflict.into());
         }
@@ -1294,7 +1293,7 @@ impl AutonomyRunner {
             drop(gate);
             return self.cancel_paused(run_id, expected_revision).await;
         }
-        if !matches!(decision, ai_agents_hitl::ApprovalResult::Approved { .. }) {
+        if !matches!(decision, ai_agents_hitl::ApprovalResult::Approved) {
             return Err(AgentError::Config(
                 "restoration requires explicit approval or rejection".into(),
             ));

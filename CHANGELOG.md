@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Task restoration: development-only explicit host reconstruction resumes prepared safe pauses in fresh runtimes or processes with preserved topology, progress and usage, separate restoration review and current authorization
 - Task controller scheduling: development-only standalone profiles enforce required stage/check ordering, bounded repair and retained replanning without repeating completed work or selecting interventions twice
 - Task interaction profiles: development-only reject, policy-only and per-stage review settings execute without auto-approving required human decisions; final controller views reflect consumed allowance and selected decisions
 - Task skill execution: development-only explicit skill entry preserves the admitted definition, inherited accounting and completed steps before continuing under the same task controller
@@ -19,6 +20,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust restoration compatibility: development host reconstruction bindings and versioned manifests are explicit, custom task stores opt into guarded reconstruction writes, and legacy checkpoints require live preparation rather than automatic executable migration
 - Rust controller compatibility: development premature-finish/limit literals add `on_unavailable`, pending-kind matches add `Limit`, and validator executors gain a defaulted capacity-preflight hook; serialized data still cannot restore live execution authority
 - Rust validation compatibility: development evidence/scope/progress literals add validation dependency maps; executable driver round trips use `restore_retained` with a live predecessor, while JSON-only restore remains audit-only
 - Rust task evidence compatibility: development final-checkpoint literals add a live evidence guard that custom stores must preserve at backend admission; validation drivers retain private monotonic bounds and use constructors rather than external struct literals
@@ -30,6 +32,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task restoration custody: cancelled preclaim capture preserves its usable pause, failed reconstruction does not leak owner cycles, and temporary participant retirement cannot clear newer ownership
 - Task composition: preserve distinct repeated-child operations through pause and outcome acknowledgement, and unblock successors after settled optional nested failures without replaying completed work
 - Task owner cleanup: interrupted child release can resume without inspecting or clearing a newer owner of an already released runtime
 - Task checkpoint latency: reduce repeated recovery-data processing during nested continuation while preserving complete validation, exact receipts and original deadlines

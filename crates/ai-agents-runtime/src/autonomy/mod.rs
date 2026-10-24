@@ -70,6 +70,8 @@ mod controller_tests;
 #[cfg(test)]
 mod restoration_failure_tests;
 #[cfg(test)]
+mod restoration_test_support;
+#[cfg(test)]
 mod restoration_tests;
 pub(crate) use controller::{ControllerContinuation, controller_checkpoint, retire_controller};
 pub(crate) mod interaction;

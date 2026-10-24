@@ -1,3 +1,5 @@
+#[path = "restoration_state_tests.rs"]
+mod restoration_tests;
 use super::continuation_test_support::{self as support, ReceiptStore};
 use super::*;
 use crate::{AgentBuilder, RuntimeAgent};
@@ -64,6 +66,7 @@ struct Fixture {
     second: Arc<AtomicUsize>,
     arguments: Arc<parking_lot::Mutex<Vec<Value>>>,
     hooks: Arc<Hooks>,
+    restore_providers: Vec<Arc<super::runner_tests::RecordingProvider>>,
 }
 fn runner(agent: Arc<RuntimeAgent>, store: Arc<dyn TaskRunStore>) -> AutonomyRunner {
     let mut config = super::runner_tests::config(16);
@@ -119,6 +122,7 @@ async fn from_yaml(
         second,
         arguments,
         hooks,
+        restore_providers: vec![],
     }
 }
 // The same logical transition parks before commit or after entry, so cleanup must preserve the actual phase.
@@ -153,13 +157,11 @@ async fn fixture(entering: bool, question: bool, reentry: bool, sqlite: bool) ->
             "    ready:\n      regenerate_on_enter: false\n".into()
         }
     );
-    Box::pin(from_yaml(
-        &yaml,
-        super::runner_tests::RecordingProvider::new(&["done"]),
-        super::runner_tests::RecordingProvider::new(&[]),
-        sqlite,
-    ))
-    .await
+    let main = super::runner_tests::RecordingProvider::new(&["done"]);
+    let router = super::runner_tests::RecordingProvider::new(&[]);
+    let mut fixture = Box::pin(from_yaml(&yaml, main.clone(), router.clone(), sqlite)).await;
+    fixture.restore_providers = vec![main, router];
+    fixture
 }
 async fn approve(f: &Fixture, run: &TaskRun) -> ai_agents_core::Result<TaskRunResult> {
     f.runner

@@ -37,6 +37,22 @@ impl RecordingProvider {
         self.messages.lock().clone()
     }
 
+    // The reconstruction host captures behavioral queue state, not telemetry, so a fresh provider cannot replay consumed responses.
+    pub(super) fn restoration_state(&self) -> Value {
+        serde_json::to_value(&*self.replies.lock()).unwrap()
+    }
+
+    // Only a newly constructed fixture provider may receive a saved queue before any admitted work.
+    pub(super) fn install_restoration_state(&self, state: Value) -> Result<()> {
+        if self.calls.load(Ordering::SeqCst) != 0 {
+            return Err(ai_agents_core::AgentError::Config(
+                "fixture provider is not fresh".into(),
+            ));
+        }
+        *self.replies.lock() = serde_json::from_value(state)?;
+        Ok(())
+    }
+
     // Gated dispatch makes ownership/cancellation ordering deterministic without latency assertions.
     pub(super) fn gated() -> Arc<Self> {
         Arc::new(Self {

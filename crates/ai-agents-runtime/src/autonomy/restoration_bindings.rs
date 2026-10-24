@@ -408,13 +408,13 @@ impl Rebinding<'_> {
             .map(|adapter| serde_json::from_value::<ControllerContinuation>(adapter.state.clone()))
             .transpose()?
             .and_then(|controller| controller.driver);
-        if let Some(driver) = driver {
-            if let Some(adapter) = payload.adapters.iter_mut().find(|adapter| {
+        if let Some(driver) = driver
+            && let Some(adapter) = payload.adapters.iter_mut().find(|adapter| {
                 adapter.id == driver.check_id
                     && adapter.state.get("_task_validation_driver").is_some()
-            }) {
-                adapter.state["_task_validation_driver"] = serde_json::to_value(driver)?;
-            }
+            })
+        {
+            adapter.state["_task_validation_driver"] = serde_json::to_value(driver)?;
         }
         for old in self.requests.keys() {
             if !payload.consumed_request_ids.contains(old) {

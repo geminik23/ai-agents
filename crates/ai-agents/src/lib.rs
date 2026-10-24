@@ -80,6 +80,25 @@
 //! | `full` | All optional features enabled |
 
 /// Development autonomy primitives and restricted standalone execution; complete YAML task execution remains unavailable.
+/// Explicit safe-pause reconstruction uses installed host bindings and never consumes the pending response or takes over abandoned Running work.
+/// The host must authenticate restoration review separately before using the newly advertised pending request and revision.
+///
+/// ```no_run
+/// use ai_agents::autonomy::{AutonomyRunner, TaskRestoreHost, TaskRestoreRequest, TaskRunResult, TaskRunStore};
+/// use std::sync::Arc;
+///
+/// async fn reconstruct(
+///     request: TaskRestoreRequest,
+///     store: Arc<dyn TaskRunStore>,
+///     host: Arc<dyn TaskRestoreHost>,
+/// ) -> ai_agents::Result<(AutonomyRunner, TaskRunResult)> {
+///     // The request must identify an explicitly prepared safe pause, not a guessed latest run.
+///     let (runner, paused) = AutonomyRunner::restore_paused(request, store, host).await?;
+///     let _review = runner.restoration_review(&paused.run.key.run_id).await?;
+///     // Deliver this review to the authenticated host; do not treat reconstruction as an approval.
+///     Ok((runner, paused))
+/// }
+/// ```
 pub mod autonomy {
     pub use ai_agents_runtime::autonomy::*;
 }

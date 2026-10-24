@@ -1,3 +1,5 @@
+#[path = "restoration_response_tests.rs"]
+mod restoration_tests;
 use super::*;
 use crate::Agent;
 use ai_agents_core::{Tool, ToolCall, ToolExecutionContext, ToolResult, ToolSafetyMetadata};

@@ -1,3 +1,5 @@
+#[path = "restoration_controller_tests.rs"]
+mod restoration_tests;
 use super::*;
 use crate::{Agent, AgentBuilder};
 use ai_agents_core::{Tool, ToolExecutionContext, ToolResult, ToolSafetyMetadata};
@@ -193,7 +195,7 @@ pub(super) struct Fixture {
     pub(super) store: Arc<ScopedTaskRunStore>,
     pub(super) calls: Arc<AtomicUsize>,
     pub(super) callbacks: Arc<AtomicUsize>,
-    provider: Arc<super::runner_tests::RecordingProvider>,
+    pub(super) provider: Arc<super::runner_tests::RecordingProvider>,
     pub(super) config: AutonomyConfig,
 }
 // The real registry and executor run with exactly one model slot, so replay cannot accidentally pass.
@@ -267,6 +269,8 @@ pub(super) fn fixture_configured(
     let yaml = "name: Observation\nsystem_prompt: test\ntools: [probe, ask_user, mutate, fail_probe]\nerror_recovery:\n  tools:\n    fail_probe:\n      max_retries: 0\n      on_failure:\n        action: fallback\n        fallback_tool: probe\nhitl:\n  tools:\n    probe:\n      require_approval: true\n";
     let yaml = if mode == "fallback_question" {
         yaml.replace("fallback_tool: probe", "fallback_tool: ask_user")
+    } else if mode == "external_tool_free" {
+        yaml.replace("tools: [probe, ask_user, mutate, fail_probe]", "tools: []")
     } else {
         yaml.into()
     };

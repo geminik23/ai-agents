@@ -1,5 +1,9 @@
 //! Executable reconstruction uses fresh objects, real stores and isolated effect witnesses, never retained owner Arcs.
 
+#[path = "restoration_custody_tests.rs"]
+mod custody_tests;
+#[path = "restoration_topology_tests.rs"]
+mod topology_tests;
 use super::*;
 use crate::{
     AgentBuilder, RuntimeAgent,
@@ -274,6 +278,10 @@ pub(super) struct RestoreHost {
     >,
     registrations: Arc<AtomicUsize>,
     pub(super) stages: AtomicUsize,
+    pub(super) binding_version: AtomicUsize,
+    pub(super) staged:
+        parking_lot::Mutex<std::collections::BTreeMap<String, std::sync::Weak<RuntimeAgent>>>,
+    memory_gate: Option<Arc<super::restoration_test_support::MemoryGate>>,
     pub(super) budget_millis: std::sync::atomic::AtomicU64,
     pub(super) stage_hold: std::sync::atomic::AtomicBool,
     pub(super) stage_reached: tokio::sync::Semaphore,
@@ -335,6 +343,9 @@ impl RestoreHost {
             })
             .unwrap_or_default();
         let mut builder = AgentBuilder::from_spec(spec).llm_registry(self.provider_registry());
+        if let Some(gate) = &self.memory_gate {
+            builder = builder.memory(gate.memory(id.clone()));
+        }
         if tools.iter().any(|tool| tool == "restore_probe") {
             builder = builder.tool(Arc::new(RestoreProbe {
                 effects: self.effects.clone(),
@@ -460,7 +471,7 @@ impl TaskRestoreHost for RestoreHost {
         Ok(TaskRestoreBinding {
             id: self.contract.into(),
             contract_version: 1,
-            configuration: json!({"program":"request-state-v1","spec":declaration.unwrap_or(&self.root),"effect_scope":self.effect_file}),
+            configuration: json!({"program":"request-state-v1","spec":declaration.unwrap_or(&self.root),"effect_scope":self.effect_file,"binding_version":self.binding_version.load(Ordering::SeqCst)}),
             state: self
                 .routes
                 .lock()
@@ -614,6 +625,11 @@ impl TaskRestoreHost for RestoreHost {
                 .providers
                 .insert(key.clone(), runtime.task_restore_providers());
         }
+        *self.staged.lock() = graph
+            .runtimes
+            .iter()
+            .map(|(id, runtime)| (id.clone(), Arc::downgrade(runtime)))
+            .collect();
         Ok(graph)
     }
 }
@@ -632,6 +648,9 @@ pub(super) fn host() -> Arc<RestoreHost> {
         routes: Default::default(),
         registrations: Arc::new(AtomicUsize::new(0)),
         stages: AtomicUsize::new(0),
+        binding_version: AtomicUsize::new(1),
+        staged: Default::default(),
+        memory_gate: None,
         budget_millis: std::sync::atomic::AtomicU64::new(5000),
         stage_hold: std::sync::atomic::AtomicBool::new(false),
         stage_reached: tokio::sync::Semaphore::new(0),
@@ -815,26 +834,27 @@ async fn restore_paused_declared_nested_and_repeated_operations_preserve_topolog
                 expected,
                 "{pattern}: completed effects replayed or unstarted work skipped"
             );
-            let events = host.events.lock();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.as_str() == "Worker")
-                    .count(),
-                if pattern.starts_with("pipeline") {
-                    2
-                } else {
-                    1
-                }
-            );
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.as_str() == "Peer")
-                    .count(),
-                usize::from(pattern.contains("concurrent") || pattern.contains("middle"))
-            );
-            drop(events);
+            {
+                let events = host.events.lock();
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.as_str() == "Worker")
+                        .count(),
+                    if pattern.starts_with("pipeline") {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| event.as_str() == "Peer")
+                        .count(),
+                    usize::from(pattern.contains("concurrent") || pattern.contains("middle"))
+                );
+            }
             let saved = store.load(&result.run.key.run_id).await.unwrap().unwrap();
             for child in historical
                 .as_array()
@@ -1218,7 +1238,14 @@ async fn restore_stage_overrun_cannot_refill_active_allowance_or_publish_pause()
 // Missing framework-owned references are typed preflight errors, never panicking indexing after component mutation.
 #[tokio::test]
 async fn restore_corrupt_manifest_references_reject_before_claim() {
-    for kind in ["tool", "finishing", "context", "active_frame", "snapshot"] {
+    for kind in [
+        "tool",
+        "finishing",
+        "context",
+        "active_frame",
+        "snapshot",
+        "provider",
+    ] {
         let (host, store, prepared) = prepared_fixture(false).await;
         let claimed = store
             .claim_paused(
@@ -1243,6 +1270,13 @@ async fn restore_corrupt_manifest_references_reject_before_claim() {
             "finishing" => manifest["skill_finishing"] = json!(["missing-runtime"]),
             "context" => manifest["message_contexts"]["missing-frame"] = json!({}),
             "active_frame" => manifest["active_frames"] = json!(["missing-frame"]),
+            "provider" => {
+                let root = manifest["root"].as_str().unwrap().to_string();
+                manifest["providers"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(&format!("runtime:{root}"));
+            }
             _ => {
                 manifest["nodes"]["RestoreRoot"]["runtime"]["snapshot"]["context"]["corrupt"] =
                     json!(true)

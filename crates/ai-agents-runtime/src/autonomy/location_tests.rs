@@ -3,6 +3,8 @@ use super::*;
 mod live_controller_tests;
 #[path = "location_matrix_tests.rs"]
 mod matrix_tests;
+#[path = "restoration_location_tests.rs"]
+mod restoration_tests;
 #[path = "skill_acceptance_tests.rs"]
 mod skill_acceptance_tests;
 use crate::{Agent, AgentBuilder, RuntimeAgent};
@@ -236,15 +238,20 @@ async fn host_control_skill_objective_supersession_keeps_completed_prefix() {
 }
 
 // Root fixtures use the explicit development API and preserve the same selected interaction policy.
-fn runner(agent: Arc<RuntimeAgent>, store: Arc<ScopedTaskRunStore>) -> AutonomyRunner {
+fn task_config() -> AutonomyConfig {
     let mut config = super::runner_tests::config(8);
     config.defaults.hitl = Some(AutonomyHitlConfig {
         on_approval_required: Some(InteractionAction::PauseRun),
         on_user_question: Some(InteractionAction::PauseRun),
     });
+    config
+}
+
+// Source and reconstructed fixtures share the exact selected profile rather than weakening it for restart.
+fn runner(agent: Arc<RuntimeAgent>, store: Arc<ScopedTaskRunStore>) -> AutonomyRunner {
     AutonomyRunner::try_new(
         agent,
-        config,
+        task_config(),
         Default::default(),
         store,
         "locations.v1".into(),

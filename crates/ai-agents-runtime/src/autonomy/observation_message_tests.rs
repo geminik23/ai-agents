@@ -1,3 +1,5 @@
+#[path = "restoration_observation_tests.rs"]
+mod restoration_tests;
 use super::*;
 use crate::AgentBuilder;
 use crate::spawner::{AgentRegistry, AgentSpawner, SpawnedAgent};
@@ -103,6 +105,7 @@ struct Fixture {
     calls: Arc<AtomicUsize>,
     store: Arc<ScopedTaskRunStore>,
     config: AutonomyConfig,
+    worker_spec: crate::spec::AgentSpec,
 }
 // Superseding a validation child closes its exact history and retires the old check without redispatching it.
 #[tokio::test]
@@ -197,6 +200,20 @@ async fn fixture_leaf_policy(
     source: Option<Arc<dyn HostRevisionSource>>,
     policies: Option<(&str, &str)>,
 ) -> Fixture {
+    Box::pin(fixture_leaf_policy_membership(
+        repause, hosted, source, policies, true,
+    ))
+    .await
+}
+
+// Unpublished reconstruction builds the same objects but leaves membership for the framework's validated silent installation.
+async fn fixture_leaf_policy_membership(
+    repause: bool,
+    hosted: bool,
+    source: Option<Arc<dyn HostRevisionSource>>,
+    policies: Option<(&str, &str)>,
+    register: bool,
+) -> Fixture {
     let leaf_calls = Arc::new(AtomicUsize::new(0));
     let external = source.is_some();
     let registry = Arc::new(AgentRegistry::new());
@@ -253,15 +270,20 @@ async fn fixture_leaf_policy(
         )))
         .build()
         .unwrap();
-    registry
-        .register(SpawnedAgent::from_runtime(
-            "worker".into(),
-            worker,
-            crate::spec::AgentSpec::from_yaml_strict(&yaml).unwrap(),
-        ))
-        .await
-        .unwrap();
-    let worker = registry.get("worker").unwrap();
+    let worker_spec = crate::spec::AgentSpec::from_yaml_strict(&yaml).unwrap();
+    let worker = if register {
+        registry
+            .register(SpawnedAgent::from_runtime(
+                "worker".into(),
+                worker,
+                worker_spec.clone(),
+            ))
+            .await
+            .unwrap();
+        registry.get("worker").unwrap()
+    } else {
+        Arc::new(worker)
+    };
     let calls = Arc::new(AtomicUsize::new(0));
     let mut extensions = AutonomyExtensions::builtins();
     extensions
@@ -370,6 +392,7 @@ async fn fixture_leaf_policy(
         calls,
         store,
         config,
+        worker_spec,
     }
 }
 
