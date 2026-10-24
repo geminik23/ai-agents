@@ -2588,7 +2588,7 @@ impl AutonomyRunner {
         })
     }
 
-    /// Replaces duplicate driver captures with the acknowledged shared-executor records.
+    /// Replaces duplicate driver captures with acknowledged shared-executor records, retaining late effects as ineligible audit evidence.
     async fn collect_tools(
         execution: &RunExecution,
         evidence: &mut EvaluationEvidence,
@@ -2610,7 +2610,8 @@ impl AutonomyRunner {
                 )?;
                 Ok(ScopedObservation {
                     identity,
-                    complete: true,
+                    complete: capture.record.metadata.get("_task_result_eligible")
+                        != Some(&serde_json::Value::Bool(false)),
                     value: capture.record,
                 })
             })

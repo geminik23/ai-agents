@@ -307,7 +307,7 @@ async fn ad_uninvoked_skill_before_transition_is_not_a_completed_no_match() {
             )
     );
     let (agent, _output) = observed_yaml(main.clone(), router.clone(), &yaml);
-    let runner = reviewed_runner(agent);
+    let runner = reviewed_runner(agent.clone());
     let mut work = Box::pin(runner.run("objective", None));
     tokio::select! { result = &mut work => panic!("main not dispatched: {:?}", result.err()), permit = main.entered.acquire() => permit.unwrap().forget() }
     tokio::select! { result = &mut work => panic!("transition not dispatched: {:?}", result.err()), permit = router.entered.acquire() => permit.unwrap().forget() }
@@ -335,6 +335,11 @@ async fn ad_uninvoked_skill_before_transition_is_not_a_completed_no_match() {
     assert_eq!(router.calls.load(Ordering::SeqCst), 2);
     assert_eq!(main.calls.load(Ordering::SeqCst), 2);
     assert_eq!(result.run.counters.llm_attempts, 4);
+    assert!(
+        dispositions(&agent)
+            .values()
+            .any(|(status, behavior)| status == "cancelled" && behavior == "skill_selection")
+    );
     assert!(
         main.requests
             .lock()

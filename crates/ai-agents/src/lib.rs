@@ -103,7 +103,9 @@
 /// Managed actor maintenance and speculative alternatives reuse the same live owner and invocation ledger.
 /// Custom callbacks and storage consumers opt in with their actual captured provider handles; an empty list certifies no hidden model work, not an execution grant.
 /// Root/child entry settles earlier ordinary maintenance before ownership; spawned callbacks preserve child attribution and optional failure policy.
-/// Managed providers recheck result eligibility after settlement acknowledgement, while consumed attempts remain charged and unknown cleanup remains protected.
+/// Managed providers, tools, resumed messages and maintenance recheck continuing result eligibility across settlement acknowledgement.
+/// Actual effects and consumed attempts remain recorded; late results cannot supply completion credit and unknown cleanup remains protected.
+/// Reserved runtimes reject actor deletion and ordinary session rebinding; set_session_metadata now returns an ownership-aware Result.
 /// Reviewed branch observations follow actual adoption and state commit; they neither grant effects nor supply completion credit from discarded content.
 ///
 /// ```

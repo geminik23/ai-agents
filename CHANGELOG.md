@@ -24,6 +24,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust session metadata: the setter now returns an ownership-aware result, and ordinary session rebinding and actor deletion reject reserved task runtimes
 - Rust recovery errors: exhaustive development storage-error matches distinguish clock continuity loss from actual admission deadline exhaustion
 - Rust resource compatibility: development tool contexts add an optional admitted-footprint receipt, transparent tools forward combined preparation and response-only capabilities, and host footprint methods default to unsupported
 - Rust task participation: custom hooks, storage, fact extractors and relationship evaluators declare captured providers through default-unsupported `task_providers` methods; ordinary chat remains usable without opting in
@@ -39,6 +40,8 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task effect boundaries: recheck cancellation and clocks after final host proof, preserve acknowledged effects while rejecting late task credit, and retain ordinary timeout recovery and resumed-message history cleanup
+- Task branch identity: pre-invocation cancellations retain correlatable branch identities and truthful dispositions without refunding consumed alternatives
 - Task reconstruction clocks: distinguish backward UTC from expired allowance while preserving preclaim pauses and charged post-claim custody
 - Task admission handoff: settle earlier ordinary maintenance without holding a gate needed by its callbacks, and preserve child operation attribution and optional failure policy across spawned work
 - Task branch outcomes: preserve reviewed alternatives until actual adoption, distinguish uninvoked selection from no-match, and retire interrupted observations without replaying effects or erasing committed transitions

@@ -140,6 +140,111 @@ async fn ad_work_original_bound_blocks_late_callback_effect() {
     }).await;
 }
 
+#[derive(Debug)]
+struct LastWorkProof(AtomicUsize);
+impl TaskFinalAdmission for LastWorkProof {
+    // Exhaust the inherited allowance at the actual body-poll check, not before wrapper admission.
+    fn validate(&self) -> ai_agents_core::Result<()> {
+        if self.0.fetch_add(1, Ordering::SeqCst) == 1 {
+            std::thread::sleep(
+                ai_agents_llm::current_invocation_bounds()
+                    .unwrap()
+                    .remaining()
+                    + Duration::from_millis(2),
+            );
+        }
+        Ok(())
+    }
+}
+
+// A successful synchronous proof sample is not permission to start a maintenance effect after its original allowance ended.
+#[tokio::test]
+async fn ad_final_maintenance_last_proof_cannot_dispatch_after_expiry() {
+    let (_, execution) = crate::autonomy::child_tests::execution(2).await;
+    let calls = AtomicUsize::new(0);
+    let proof = Arc::new(LastWorkProof(AtomicUsize::new(0)));
+    let bounds = ai_agents_llm::InvocationBounds::new(
+        std::time::SystemTime::now() + Duration::from_secs(10),
+        std::time::Instant::now() + Duration::from_millis(100),
+    );
+    let result = ai_agents_llm::scope_invocation_evidence(
+        vec![proof],
+        ai_agents_llm::scope_invocation_bounds(
+            Some(bounds),
+            scope_execution(execution.clone(), async {
+                owned_maintenance("last-proof", async {
+                    maintenance_effect();
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+            }),
+        ),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    let payload: TaskCheckpointPayload =
+        serde_json::from_value(execution.load_owned().await.unwrap().payload).unwrap();
+    assert_eq!(payload.counters.tool_attempts, 0);
+    assert_eq!(payload.counters.llm_attempts, 0);
+    assert!(
+        payload
+            .reservations
+            .iter()
+            .all(|entry| entry.state == TaskEffectState::Completed)
+    );
+    assert!(!execution.owner.work.unsettled());
+}
+
+#[derive(Debug)]
+struct CompletedBodyProof(Arc<std::sync::atomic::AtomicBool>);
+impl TaskFinalAdmission for CompletedBodyProof {
+    fn validate(&self) -> ai_agents_core::Result<()> {
+        if self.0.load(Ordering::SeqCst) {
+            return Err(ai_agents_core::AgentError::Other(
+                "post-body proof changed".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+// A known body success is not an unknown effect merely because continuing proof refuses its subsequent adoption.
+#[tokio::test]
+async fn ad_final_maintenance_known_body_success_remains_completed_after_proof_change() {
+    let (_, execution) = crate::autonomy::child_tests::execution(2).await;
+    let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let result = ai_agents_llm::scope_invocation_evidence(
+        vec![Arc::new(CompletedBodyProof(completed.clone()))],
+        scope_execution(execution.clone(), async {
+            owned_maintenance("completed-effect", async {
+                maintenance_effect();
+                completed.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+        }),
+    )
+    .await;
+    assert!(result.is_err());
+    let payload: TaskCheckpointPayload =
+        serde_json::from_value(execution.load_owned().await.unwrap().payload).unwrap();
+    assert!(payload.reservations.iter().all(|entry| {
+        entry.state == TaskEffectState::Completed
+            && entry
+                .result
+                .as_ref()
+                .is_some_and(|value| value["completed"] == true)
+    }));
+    assert!(!execution.owner.work.unsettled());
+    let terminal = execution
+        .terminal(TaskRunStatus::Completed, "candidate".into())
+        .await
+        .unwrap();
+    assert_eq!(terminal.status, TaskRunStatus::Failed);
+}
+
 // Actual managed calls retain the shared cap while a denied pure proposal does not fabricate an uncertain external mutation.
 #[tokio::test]
 async fn ad_work_capacity_refusal_preserves_real_attempt_and_known_limit() {

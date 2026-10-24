@@ -65,7 +65,7 @@ mod co_routing_tests;
 mod composition_tests;
 mod config;
 #[cfg(test)]
-mod continuation_tests;
+pub(crate) mod continuation_tests;
 mod control;
 mod controller;
 #[cfg(test)]

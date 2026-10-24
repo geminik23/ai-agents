@@ -239,10 +239,11 @@ fn unique<T: Clone + Serialize>(
     Ok(output)
 }
 
-/// Successful policy admission and real invocation are required for executable proof.
+/// Executable proof requires actual admitted work and continued result eligibility; a settled late effect remains audit-only.
 pub(crate) fn executed(record: &ToolExecutionRecord) -> bool {
     record.executed
         && matches!(record.policy.outcome, PermissionOutcome::Allow)
         && !record.cancelled
         && !record.timed_out
+        && record.metadata.get("_task_result_eligible") != Some(&Value::Bool(false))
 }

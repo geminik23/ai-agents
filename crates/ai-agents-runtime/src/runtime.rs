@@ -38,6 +38,9 @@ mod task_state;
 #[path = "autonomy/ad_acceptance_tests.rs"]
 mod ad_acceptance_tests;
 #[cfg(test)]
+#[path = "autonomy/ad_dispatch_tests.rs"]
+mod ad_dispatch_tests;
+#[cfg(test)]
 #[path = "autonomy/boundary_tests.rs"]
 mod autonomy_boundary_tests;
 #[cfg(test)]
@@ -3987,8 +3990,13 @@ impl RuntimeAgent {
     }
 
     /// Delete all facts and sessions for an actor, gated by privacy.allow_deletion.
-    /// Returns Err when actor_memory.privacy.allow_deletion is false.
+    /// Reserved runtimes reject deletion before storage or cache changes; privacy deletion requires acknowledged task cleanup first.
     pub async fn delete_actor_data(&self, actor_id: &str) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_access()?;
         let allowed = self
             .actor_memory_config
             .as_ref()
@@ -4026,9 +4034,15 @@ impl RuntimeAgent {
         Ok(())
     }
 
-    /// Overwrite session metadata (tags, ttl, custom fields).
-    pub fn set_session_metadata(&self, meta: ai_agents_core::SessionMetadata) {
+    /// Overwrites session metadata only outside task ownership, without changing a reserved runtime's actor/session binding.
+    pub fn set_session_metadata(&self, meta: ai_agents_core::SessionMetadata) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_access()?;
         *self.session_metadata.write() = meta;
+        Ok(())
     }
 
     /// Delete sessions whose TTL has expired. Returns number of sessions removed.
@@ -4241,7 +4255,7 @@ impl RuntimeAgent {
         } else {
             self.clear_actor_id()?;
         }
-        self.set_session_metadata(metadata);
+        self.set_session_metadata(metadata)?;
         *self.current_session_id.write() = Some(session_id.to_string());
         Ok(())
     }
@@ -4259,7 +4273,7 @@ impl RuntimeAgent {
         } else {
             self.clear_actor_id()?;
         }
-        self.set_session_metadata(restore_point.metadata.clone());
+        self.set_session_metadata(restore_point.metadata.clone())?;
         *self.current_session_id.write() = restore_point.session_id.clone();
         Ok(())
     }
@@ -4326,7 +4340,14 @@ impl RuntimeAgent {
         Ok(true)
     }
 
+    /// Saves and binds an ordinary session under the mutation lease; task-owned runtimes cannot switch identity or run unrelated session hooks.
+    /// Snapshot export through save_to remains a separate host operation and is not executable task persistence.
     pub async fn save_session(&self, session_id: &str) -> Result<()> {
+        let _mutations = self
+            .autonomy_mutations
+            .try_read()
+            .map_err(|_| AgentError::Other("runtime is admitting an autonomy run".into()))?;
+        self.check_autonomy_access()?;
         let storage = self.storage.read().clone();
         match storage {
             Some(s) => {
@@ -6258,14 +6279,15 @@ impl RuntimeAgent {
     }
 
     /// Reserves each actual task attempt after policy admission and rechecks original observation bounds and pinned host proof before first poll.
-    /// Expiry before invocation settles as non-invocation; already dispatched effects retain their existing settlement and uncertainty contract.
+    /// Expiry before invocation settles as non-invocation; returned effects settle factually before continuing restrictions decide result eligibility.
+    /// An ineligible acknowledged result cannot retry, fall back or supply completion credit, but its consumption and actual result remain auditable.
     async fn execute_resolved_tool_once(
         &self,
         tool: Arc<dyn ai_agents_core::Tool>,
         args: Value,
         mut ctx: ToolExecutionContext,
         timeout: ValidatedToolTimeout,
-    ) -> Result<(ToolResult, bool, bool, bool)> {
+    ) -> Result<(ToolResult, bool, bool, bool, bool)> {
         if ai_agents_llm::current_invocation_bounds()
             .is_some_and(|bounds| bounds.remaining().is_zero())
         {
@@ -6274,6 +6296,7 @@ impl RuntimeAgent {
                 true,
                 false,
                 false,
+                true,
             ));
         }
         if self.runtime_control.emergency_deny.load(Ordering::SeqCst) {
@@ -6282,6 +6305,7 @@ impl RuntimeAgent {
                 false,
                 true,
                 false,
+                true,
             ));
         }
         //
@@ -6355,6 +6379,9 @@ impl RuntimeAgent {
         let timer_duration = bounds.map_or(timer_duration, |bounds| {
             timer_duration.min(bounds.remaining())
         });
+        let invocation_deadline = std::time::Instant::now()
+            .checked_add(timer_duration)
+            .ok_or_else(|| AgentError::Config("tool deadline overflow".into()))?;
         let deadline_delta = if timer_duration == timeout.timer {
             timeout.deadline_delta
         } else {
@@ -6418,6 +6445,7 @@ impl RuntimeAgent {
                 false,
                 true,
                 false,
+                true,
             ));
         }
         let message_invocation =
@@ -6431,16 +6459,25 @@ impl RuntimeAgent {
             );
         }
         let managed = execution.is_some();
+        let dispatch_execution = execution.clone();
         let mut future = Box::pin(crate::autonomy::message::scope_message(
             message_invocation,
             async move {
                 // Final synchronous host checks may consume time without yielding to the driver's timeout monitor.
                 if crate::autonomy::response::check_response_admission().is_err()
                     || ai_agents_llm::validate_invocation_evidence().is_err()
+                    || self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                    || ctx.cancellation.is_cancelled()
+                    || dispatch_execution.as_ref().is_some_and(|run| {
+                        ai_agents_core::autonomy::InvocationAdmission::execution_stopped(
+                            run.as_ref(),
+                        )
+                    })
                     || bounds.is_some_and(|bounds| bounds.remaining().is_zero())
+                    || (managed && std::time::Instant::now() >= invocation_deadline)
                 {
                     return Ok(ToolResult::error(
-                        "Validation proof or original deadline changed before tool dispatch",
+                        "Validation proof, cancellation or original deadline changed before tool dispatch",
                     ));
                 }
                 // This exact response has reached its effect boundary; it cannot constrain or authorize later operations.
@@ -6471,7 +6508,7 @@ impl RuntimeAgent {
                 }
             },
         ));
-        let timer = tokio::time::sleep(timer_duration);
+        let timer = tokio::time::sleep_until(invocation_deadline.into());
         tokio::pin!(timer);
         let mut cancel_tick = tokio::time::interval(std::time::Duration::from_millis(50));
 
@@ -6489,13 +6526,24 @@ impl RuntimeAgent {
                         return Err(AgentError::TaskSuspended(id));
                     }
                     let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
+                    // Preserve the actual returned effect separately from its eligibility; a late ACK cannot renew this invocation.
+                    let result_eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                        && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                        && (!managed || std::time::Instant::now() < invocation_deadline);
                     if let (Some(execution), Some(attempt)) = (&execution, &attempt) {
                         let settlement = if invoked.load(Ordering::SeqCst) { serde_json::to_value(&result)? } else { serde_json::json!({"not_invoked":true}) };
                         Box::pin(execution.settle(attempt, settlement, false)).await?;
                         execution.retire_completed_message(&self.info.id, attempt);
                     }
                     if let Some(custody) = &effect_custody { custody.store(false, Ordering::SeqCst); }
-                    return Ok((result, false, false, invoked.load(Ordering::SeqCst)));
+                    let eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                        && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                        && (!managed || std::time::Instant::now() < invocation_deadline)
+                        && result_eligible;
+                    if !eligible && let Some(execution) = &execution {
+                        execution.stop("tool_result_ineligible");
+                    }
+                    return Ok((result, false, false, invoked.load(Ordering::SeqCst), eligible));
                 }
                 _ = &mut timer => {
                     drop(future);
@@ -6507,6 +6555,7 @@ impl RuntimeAgent {
                         true,
                         false,
                         invoked.load(Ordering::SeqCst),
+                        true,
                     ));
                 }
                 _ = cancel_tick.tick() => {
@@ -6522,6 +6571,7 @@ impl RuntimeAgent {
                             false,
                             true,
                             invoked.load(Ordering::SeqCst),
+                            true,
                         ));
                     }
                 }
@@ -6594,6 +6644,7 @@ impl RuntimeAgent {
 
     /// Executes retry sub-attempts inside one logical executor request while assigning every new invocation a fresh deadline.
     /// A settled retained-message result consumes no new attempt and continues from its captured retry index.
+    /// Known returned but ineligible effects stay factual and cannot trigger a retry or fallback.
     ///
     /// Hooks and `ToolExecutionRecord` finalization remain request-level and occur once after this retry loop returns.
     async fn run_tool_with_retries(
@@ -6604,7 +6655,7 @@ impl RuntimeAgent {
         ctx: ToolExecutionContext,
         timeout: ValidatedToolTimeout,
         max_retries: u32,
-    ) -> Result<(ToolResult, bool, bool, bool)> {
+    ) -> Result<(ToolResult, bool, bool, bool, bool)> {
         let max_retries = if ctx.classification.safely_retryable {
             max_retries
         } else {
@@ -6618,10 +6669,12 @@ impl RuntimeAgent {
                 cursor.retry_index = attempts;
                 cursor.invoked = invoked;
             });
-            let (result, timed_out, cancelled, attempt_invoked) = if let Some(result) =
+            let (result, timed_out, cancelled, attempt_invoked, eligible) = if let Some(result) =
                 crate::autonomy::suspension::take_settled_tool_result(&ctx.call_id)
             {
-                (result, false, false, true)
+                let eligible = crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                    && !self.runtime_control.emergency_deny.load(Ordering::SeqCst);
+                (result, false, false, true, eligible)
             } else {
                 Box::pin(self.execute_resolved_tool_once(
                     tool.clone(),
@@ -6632,8 +6685,8 @@ impl RuntimeAgent {
                 .await?
             };
             invoked |= attempt_invoked;
-            if result.success || timed_out || cancelled || attempts >= max_retries {
-                return Ok((result, timed_out, cancelled, invoked));
+            if !eligible || result.success || timed_out || cancelled || attempts >= max_retries {
+                return Ok((result, timed_out, cancelled, invoked, eligible));
             }
             attempts += 1;
             warn!(tool = %canonical_id, attempt = attempts, error = %result.output, "Retrying failed tool call");
@@ -8087,7 +8140,7 @@ impl RuntimeAgent {
             admitted_write_footprint: None,
         };
         // Arm custody only on the first implementation poll; progress or capability denial is proven non-invocation.
-        let (mut result, timed_out, cancelled, invoked) = TOOL_EFFECT_CUSTODY
+        let (mut result, timed_out, cancelled, invoked, eligible) = TOOL_EFFECT_CUSTODY
             .scope(
                 resource_guards.effect_custody.clone(),
                 Box::pin(self.run_tool_with_retries(
@@ -8108,6 +8161,7 @@ impl RuntimeAgent {
         // Runtime cancellation is terminal for the logical request. Recovery fallback must not mask the cancelled record or start new work after the host asked active execution to stop.
         //
         let fallback_tool = if !result.success
+            && eligible
             && !cancelled
             && !(timed_out && invoked && crate::autonomy::current_execution().is_some())
         {
@@ -8148,6 +8202,15 @@ impl RuntimeAgent {
             output_truncated,
             versions,
         );
+        // Tool metadata cannot forge eligibility: install the executor's private decision after merging the actual result metadata.
+        if crate::autonomy::current_execution().is_some() {
+            record
+                .metadata
+                .insert("_task_result_eligible".into(), Value::Bool(eligible));
+            if !eligible && let Some(execution) = crate::autonomy::current_execution() {
+                execution.stop("tool_result_ineligible");
+            }
+        }
         record.cancelled = cancelled;
         if cancelled {
             record.cancellation_reason = Some("runtime control cancellation".to_string());
@@ -8174,6 +8237,11 @@ impl RuntimeAgent {
         }
         self.finish_tool_record_after_resource_guards(resource_guards, &record)
             .await;
+        if !eligible && crate::autonomy::current_execution().is_some() {
+            return Err(AgentError::Tool(
+                "tool result exceeded its original authority after acknowledged settlement".into(),
+            ));
+        }
         Ok(record)
     }
 
@@ -10199,13 +10267,19 @@ OVERALL: PASS/FAIL"#,
             return Ok(vec![]);
         };
         let outcomes = Box::pin(self.collect_pending_task_branches(branches)).await?;
-        for (outcome, _) in &outcomes {
+        for (outcome, unfinished) in &outcomes {
             let failed = matches!(outcome.result, RuntimeBranchResult::Failed(_));
             self.finalize_optional_branch(
                 &outcome.branch.branch_id(),
                 outcome.branch.optimization,
                 outcome.branch.commit_behavior,
-                if failed { "failed" } else { "discarded" },
+                if *unfinished || matches!(outcome.result, RuntimeBranchResult::Cancelled) {
+                    "cancelled"
+                } else if failed {
+                    "failed"
+                } else {
+                    "discarded"
+                },
                 false,
             );
         }
@@ -18694,17 +18768,21 @@ states:
                 .unwrap(),
         );
         let agent = runtime_storage_agent().with_storage(storage.clone());
-        agent.set_session_metadata(ai_agents_core::SessionMetadata {
-            tags: vec!["initial".into()],
-            ..Default::default()
-        });
+        agent
+            .set_session_metadata(ai_agents_core::SessionMetadata {
+                tags: vec!["initial".into()],
+                ..Default::default()
+            })
+            .unwrap();
         agent.chat("persist this turn").await.unwrap();
         agent.save_session("session").await.unwrap();
 
-        agent.set_session_metadata(ai_agents_core::SessionMetadata {
-            tags: vec!["updated".into()],
-            ..Default::default()
-        });
+        agent
+            .set_session_metadata(ai_agents_core::SessionMetadata {
+                tags: vec!["updated".into()],
+                ..Default::default()
+            })
+            .unwrap();
         agent.save_session("session").await.unwrap();
         assert!(
             agent

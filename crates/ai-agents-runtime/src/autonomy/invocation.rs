@@ -47,6 +47,23 @@ pub(crate) async fn scope_capacity_witness<F: std::future::Future>(
     CAPACITY_WITNESS.scope(witness, future).await
 }
 
+/// Rechecks continuing restrictions after dispatch without reopening admission-only gates or undoing acknowledged effects.
+/// Host proof is sampled before clocks so synchronous validation cannot make a late result eligible.
+pub(crate) fn check_dispatched_invocation() -> ai_agents_core::Result<()> {
+    for guard in ai_agents_llm::current_invocation_evidence() {
+        guard.validate_dispatched()?;
+    }
+    if super::current_execution().is_some_and(|execution| {
+        ai_agents_core::autonomy::InvocationAdmission::execution_stopped(execution.as_ref())
+    }) || current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
+    {
+        return Err(ai_agents_core::AgentError::Other(
+            "invocation result exceeded its original authority".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Captured live context is propagated explicitly across framework-spawned tasks, never serialized.
 #[derive(Clone, Default)]
 pub(crate) struct InvocationScope {

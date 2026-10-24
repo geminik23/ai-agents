@@ -1,3 +1,5 @@
+#[path = "ad_message_final_tests.rs"]
+mod ad_final;
 use super::*;
 use crate::{
     Agent, RuntimeAgent,

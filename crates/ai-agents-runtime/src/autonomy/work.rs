@@ -181,9 +181,10 @@ where
             let mut tick = tokio::time::interval(Duration::from_millis(10));
             let result = {
             let mut watched = std::pin::pin!(std::future::poll_fn(|cx| {
-                if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())
+                // Sample proof first: even bounded host validation can consume the last live millisecond before an effect poll.
+                if ai_agents_llm::validate_invocation_evidence().is_err()
+                    || ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())
                     || ai_agents_llm::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
-                    || ai_agents_llm::validate_invocation_evidence().is_err()
                 {
                     return std::task::Poll::Ready(Err(AgentError::Other("task maintenance authority changed before polling its body".into())));
                 }
@@ -203,14 +204,10 @@ where
             }
             };
             drop(body);
-            if ai_agents_core::autonomy::InvocationAdmission::execution_stopped(run.as_ref())
-                || ai_agents_llm::current_invocation_bounds().is_some_and(|bounds| bounds.remaining().is_zero())
-            {
-                return Err(AgentError::Other("task maintenance exceeded its active authority".into()));
-            }
-            ai_agents_llm::validate_invocation_evidence()?;
             result
         }).await;
+        // Preserve a known successful body as completed even when its post-body proof or clock no longer permits adoption.
+        let result_eligible = invocation::check_dispatched_invocation().is_ok();
         let data = match &result {
             Ok(_) => json!({"maintenance":label,"completed":true}),
             Err(error) => json!({"maintenance":label,"error":error.to_string()}),
@@ -227,6 +224,14 @@ where
             )
             .await?;
         lease.acknowledged = true;
+        // A late ACK remains settled; only result adoption fails, without a refund, replay or fabricated uncertain effect.
+        let result = match invocation::check_dispatched_invocation() {
+            Ok(()) if result_eligible => result,
+            eligibility => {
+                execution.stop("maintenance_result_ineligible");
+                Err(eligibility.err().unwrap_or_else(|| AgentError::Other("maintenance result exceeded its original authority".into())))
+            }
+        };
         // Existing optional-child policy may tolerate only an acknowledged effect-free error; shared stops and uncertain effects remain run-wide.
         let optional_failure = super::current_child_operation().is_some()
             && !super::child_required()

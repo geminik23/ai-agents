@@ -121,6 +121,7 @@ impl RuntimeAgent {
 
     // Erasure keeps optional recovery context construction out of nested observation and child polling stacks.
     // Terminal recovery errors still publish the settled original; typed re-pause stays unfinished and later uncertainty keeps its custody.
+    // Continued result restrictions also govern resumed hops, without refunding their acknowledged original effects.
     async fn recover_settled_message_inner(
         &self,
         frame: &DelegateFrame,
@@ -203,7 +204,7 @@ impl RuntimeAgent {
             ),
         )
         .await;
-        let (mut result, timed_out, cancelled, _) = match outcome {
+        let (mut result, timed_out, cancelled, _, eligible) = match outcome {
             Ok(outcome) => outcome,
             Err(error @ AgentError::TaskSuspended(_)) => return Err(error),
             Err(error) => {
@@ -217,6 +218,7 @@ impl RuntimeAgent {
         };
         guards.retain_on_drop = timed_out || cancelled;
         let fallback = if !result.success
+            && eligible
             && !timed_out
             && !cancelled
             && execution.stop_reason().is_none()
@@ -250,11 +252,23 @@ impl RuntimeAgent {
         if let Some(metadata) = result.metadata {
             record.metadata.extend(metadata);
         }
+        // A resumed hop preserves actual effects but cannot republish an ineligible result as fresh execution proof.
+        record
+            .metadata
+            .insert("_task_result_eligible".into(), json!(eligible));
+        if !eligible {
+            execution.stop("tool_result_ineligible");
+        }
         record
             .metadata
             .insert("_task_executor_hop".into(), json!(ancestry.len()));
         self.finish_tool_record_after_resource_guards(guards, &record)
             .await;
+        if !eligible {
+            return Err(AgentError::Tool(
+                "resumed tool result exceeded its original authority".into(),
+            ));
+        }
         if let Some(fallback_tool) = fallback {
             let mut visited = ancestry;
             visited.push(record.canonical_id.clone());
@@ -451,6 +465,7 @@ impl RuntimeAgent {
 
     /// Completes the original parent result after its child settles; delivery hooks and the consumed attempt are never replayed.
     /// The settled result returns to captured retry/fallback recovery before the original caller advances.
+    /// Both successful delivery and recovery preserve factual settlement while rechecking the original message clock after its ACK.
     pub(super) async fn resume_message_frame(&self, frame: DelegateFrame) -> Result<AgentResponse> {
         let execution = crate::autonomy::current_execution()
             .ok_or(crate::autonomy::TaskRunStorageError::InvalidCheckpoint)?;
@@ -657,9 +672,26 @@ impl RuntimeAgent {
                                 crate::autonomy::message::MessageResponse::Broadcast => format!("broadcast failed: {error}"),
             }),
         };
+        // Successful message resumes bypass retry recovery, but retain the same post-body and post-ACK adoption restrictions.
+        let result_eligible = !tool_result.success
+            || (crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                && std::time::Instant::now() < original_deadline);
         Box::pin(execution.settle(&state.attempt, serde_json::to_value(&tool_result)?, false))
             .await?;
         guards.effect_custody.store(false, Ordering::SeqCst);
+        let eligible = !tool_result.success
+            || (crate::autonomy::invocation::check_dispatched_invocation().is_ok()
+                && !self.runtime_control.emergency_deny.load(Ordering::SeqCst)
+                && std::time::Instant::now() < original_deadline
+                && result_eligible);
+        if !eligible {
+            execution.stop("tool_result_ineligible");
+        }
+        state
+            .record
+            .metadata
+            .insert("_task_result_eligible".into(), json!(eligible));
         let recovery_config = self
             .recovery_manager
             .get_tool_config(&state.record.canonical_id);
@@ -671,6 +703,7 @@ impl RuntimeAgent {
             .and_then(Value::as_bool)
             == Some(true);
         let recovery_needed = !tool_result.success
+            && eligible
             && execution.stop_reason().is_none()
             && (retryable
                 && state
@@ -739,6 +772,7 @@ impl RuntimeAgent {
             self.finish_tool_record_after_resource_guards(guards, &state.record)
                 .await;
         }
+        // Known failure or ineligible success must still close the exact native batch and pending sibling histories before terminal publication.
         let mut batch = state
             .batch
             .take()
@@ -748,6 +782,12 @@ impl RuntimeAgent {
             self.acknowledge_completed_task_batch().await?;
             execution.parked_batches.lock().remove(&self.info.id);
             execution.delegate_frames.lock().remove(&self.info.id);
+            if !eligible {
+                return Err(AgentError::Tool(
+                    "resumed message result exceeded its original authority after settlement"
+                        .into(),
+                ));
+            }
             return Box::pin(self.finish_task_location_record(location, state.record)).await;
         }
         let mut loop_state = batch
@@ -762,7 +802,7 @@ impl RuntimeAgent {
         batch
             .executor_cursors
             .retain(|cursor| cursor.request.call_id != state.record.call_id);
-        batch.results[index] = Some(if state.record.success {
+        batch.results[index] = Some(if state.record.success && eligible {
             Ok(state.record.model_output_string())
         } else {
             Err(state.record.model_output_string())

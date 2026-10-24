@@ -4,6 +4,11 @@ use super::*;
 mod closure;
 #[path = "ad_completion_tests.rs"]
 mod completion;
+#[cfg(feature = "sqlite")]
+#[path = "ad_custom_final_tests.rs"]
+mod custom_final;
+#[path = "ad_owner_tests.rs"]
+mod owners;
 #[path = "ad_resource_tests.rs"]
 mod resources;
 use crate::autonomy::{

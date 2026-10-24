@@ -60,14 +60,29 @@ impl Tool for WorkProbe {
             },
         }))
     }
-    async fn execute(&self, _: Value, _: ToolExecutionContext) -> ToolResult {
+    async fn execute(&self, args: Value, _: ToolExecutionContext) -> ToolResult {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if args["synchronous_overrun"] == true {
+            // A returned effect can be factual while too late for task credit, even if the tool tries to forge executor metadata.
+            std::thread::sleep(
+                ai_agents_llm::current_invocation_bounds()
+                    .unwrap()
+                    .remaining()
+                    + std::time::Duration::from_millis(2),
+            );
+            let mut result = ToolResult::ok("actual late effect");
+            result.metadata = Some(std::collections::HashMap::from([(
+                "_task_result_eligible".into(),
+                json!(true),
+            )]));
+            return result;
+        }
         ToolResult::ok("observed")
     }
 }
 
 // These fixtures use the production ToolInvoker and real run reservation rather than direct Tool::execute.
-async fn shared_executor_fixture(
+pub(crate) async fn shared_executor_fixture(
     profile: AutonomyProfile,
     deadline_target: bool,
 ) -> (
