@@ -14,6 +14,7 @@ use std::{
 /// Live review and original clocks survive pauses through the owner, never through serialized identifiers alone.
 #[derive(Debug)]
 pub(crate) struct RetainedResponse {
+    pub(crate) runtime_id: String,
     pub(crate) request: ToolExecutionRequest,
     pub(crate) expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub(crate) deadline: Option<Instant>,

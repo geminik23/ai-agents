@@ -5,6 +5,16 @@ use ai_agents_core::{AgentError, AgentResponse, Result, ToolCancellationToken};
 use serde_json::json;
 use std::{collections::BTreeMap, sync::Arc};
 
+pub use restoration::TaskRestoreParticipant;
+pub use restoration::{
+    TaskReconstructionCheckpoint, TaskRestorationReview, TaskRestoreBinding,
+    TaskRestoreComposition, TaskRestoreEntry, TaskRestoreGenerations, TaskRestoreGraph,
+    TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest,
+    TaskRestoreResponse, TaskRestoreTarget,
+};
+#[path = "restoration.rs"]
+mod restoration;
+
 #[path = "controller_runtime.rs"]
 mod controller_runtime;
 #[path = "host_runtime.rs"]
@@ -40,6 +50,7 @@ struct PausedTask {
     controller: Option<Box<ControllerContinuation>>,
     whole_expiry: Option<std::time::Instant>,
     approval_deadlines: BTreeMap<String, std::time::Instant>,
+    restoration: Option<restoration::LiveRestoreReview>,
 }
 
 impl Drop for PausedTask {
@@ -689,6 +700,12 @@ impl AutonomyRunner {
         })
     }
 
+    /// Returns the actual root for host control/inspection, including roots created by explicit reconstruction.
+    /// Holding this handle does not bypass foreground ownership, fresh restoration review or shared execution admission.
+    pub fn runtime(&self) -> &Arc<crate::RuntimeAgent> {
+        &self.agent
+    }
+
     /// Acknowledged cleanup always retires this owner's catalogue, while active-slot clearing still requires exact pointer identity.
     fn retire_owner(&self, owner: &Arc<RunOwner>) {
         owner.targets.release();
@@ -965,6 +982,7 @@ impl AutonomyRunner {
         }
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.validate(&snapshot, &self.config_identity)?;
+        self.ensure_restoration_review(&payload, run_id)?;
         if payload
             .clocks
             .active_millis
@@ -1559,6 +1577,7 @@ impl AutonomyRunner {
             self.paused.lock().insert(
                 run_id.clone(),
                 PausedTask {
+                    restoration: None,
                     participants: execution.participants.clone(),
                     targets: execution.targets.clone(),
                     owner,

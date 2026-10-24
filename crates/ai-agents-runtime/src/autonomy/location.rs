@@ -69,6 +69,9 @@ pub(crate) enum TaskStateReturn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TaskTransitionLocation {
+    /// Stable action execution identity is separate from process-local state authorization generations.
+    #[serde(default)]
+    pub execution_id: String,
     pub from_state: String,
     pub target: String,
     pub reason: String,

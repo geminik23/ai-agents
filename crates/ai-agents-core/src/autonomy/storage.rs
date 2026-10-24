@@ -174,7 +174,8 @@ pub enum TaskRunMutation {
 }
 
 impl TaskRunMutation {
-    /// Completion and safe pause recheck original clocks inside backend admission; only completion adopts evidence, and host controls retain their time bounds.
+    /// Completion and safe pause recheck original clocks inside backend admission; supplied live guards also protect reconstruction pauses.
+    /// Ordinary pauses supply no completion guard, while host controls retain their independent time bounds.
     pub fn validate_final_deadline(&self, now: DateTime<Utc>) -> Result<()> {
         let bounds = match self {
             Self::FinalCheckpoint {
@@ -197,12 +198,18 @@ impl TaskRunMutation {
             return Err(TaskRunStorageError::AdmissionExpired.into());
         }
         if let Self::FinalCheckpoint {
-            status: TaskRunStatus::Completed,
+            status: TaskRunStatus::Completed | TaskRunStatus::Paused,
             evidence: Some(evidence),
             ..
         } = self
         {
             evidence.validate()?;
+            // Pure host guards are cooperative rather than preemptible; a late return cannot authorize a commit past the fixed monotonic bound.
+            if bounds.is_some_and(|(deadline, _)| {
+                deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            }) {
+                return Err(TaskRunStorageError::AdmissionExpired.into());
+            }
         }
         Ok(())
     }

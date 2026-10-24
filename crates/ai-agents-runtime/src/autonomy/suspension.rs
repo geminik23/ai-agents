@@ -845,6 +845,7 @@ impl RunExecution {
         self.owner.responses.lock().insert(
             request_id.clone(),
             std::sync::Arc::new(super::response::RetainedResponse {
+                runtime_id: runtime_id.into(),
                 request: TASK_REQUEST
                     .try_with(Clone::clone)
                     .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?,
@@ -932,6 +933,7 @@ impl RunExecution {
         self.owner.responses.lock().insert(
             request.id.clone(),
             std::sync::Arc::new(super::response::RetainedResponse {
+                runtime_id: runtime_id.into(),
                 request: TASK_REQUEST
                     .try_with(Clone::clone)
                     .map_err(|_| TaskRunStorageError::InvalidCheckpoint)?,

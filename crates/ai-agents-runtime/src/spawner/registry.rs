@@ -46,6 +46,15 @@ pub(crate) struct PinnedTaskAgent {
 }
 
 impl PinnedTaskAgent {
+    /// Source-only coordinates describe the actual captured registry; they cannot mint a new pin after reconstruction.
+    pub(crate) fn reconstruction_target(&self) -> (usize, String, Arc<RuntimeAgent>) {
+        (
+            Arc::as_ptr(&self.agents) as usize,
+            self.id.clone(),
+            self.agent.clone(),
+        )
+    }
+
     /// The registry read guard spans final participant enrollment, preventing removal between validation and owner installation.
     pub(crate) fn with_binding<T>(
         &self,
@@ -295,6 +304,44 @@ impl AgentRegistry {
             })
             .collect::<Result<Vec<_>>>()
             .map(|pins| pins.into_iter().flatten().collect())
+    }
+
+    /// Sender formatting is part of future message semantics and must survive reconstruction unchanged.
+    pub(crate) fn reconstruction_send_context(&self) -> bool {
+        self.send_with_context
+    }
+
+    /// Source identity is used only to match actual registry handles within one capture.
+    pub(crate) fn reconstruction_identity(&self) -> usize {
+        Arc::as_ptr(&self.agents) as usize
+    }
+
+    /// Complete source membership includes unstarted and generated entries, not only already invoked child operations.
+    pub(crate) fn reconstruction_entries(&self) -> Vec<Arc<SpawnedAgent>> {
+        let mut entries: Vec<_> = self.agents.read().values().cloned().collect();
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        entries
+    }
+
+    /// Publishes a completely validated empty staging registry without replaying registration hooks.
+    /// This internal method does not replace entries, remove foreign owners or grant child invocation authority.
+    pub(crate) fn reconstruct_entries(&self, entries: Vec<SpawnedAgent>) -> Result<()> {
+        let mut agents = self.agents.write();
+        if !agents.is_empty() || !self.task_pins.lock().is_empty() {
+            return Err(AgentError::Config(
+                "reconstruction registry is not empty".into(),
+            ));
+        }
+        let mut names = HashSet::new();
+        if entries.iter().any(|entry| !names.insert(entry.id.clone())) {
+            return Err(AgentError::Config(
+                "duplicate restored registry entry".into(),
+            ));
+        }
+        for entry in entries {
+            agents.insert(entry.id.clone(), Arc::new(entry));
+        }
+        Ok(())
     }
 
     /// Clone an Arc handle to a registered agent's RuntimeAgent.

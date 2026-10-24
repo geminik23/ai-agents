@@ -29,6 +29,8 @@ mod task_location;
 mod task_message;
 #[path = "autonomy/observation_runtime.rs"]
 mod task_observation;
+#[path = "autonomy/restore_runtime.rs"]
+mod task_restore;
 #[path = "autonomy/state_runtime.rs"]
 mod task_state;
 

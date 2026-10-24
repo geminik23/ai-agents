@@ -36,6 +36,18 @@ struct RouteToAgentInput {
 }
 
 impl RouteToAgentTool {
+    /// Captures the next round-robin position for an installed host's opaque reconstruction-state binding.
+    pub fn round_robin_position(&self) -> usize {
+        self.counter.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Seeds only an unpublished tool instance; a frozen registered Arc cannot be moved here to reset live selection state.
+    pub fn with_round_robin_position(self, position: usize) -> Self {
+        self.counter
+            .store(position, std::sync::atomic::Ordering::Release);
+        self
+    }
+
     pub fn new(registry: Arc<AgentRegistry>, llm: Arc<LLMRegistry>) -> Self {
         Self {
             registry,

@@ -9,6 +9,14 @@ use std::{collections::BTreeMap, sync::Arc};
 
 type CapturedComposition = (Arc<AgentRegistry>, Option<Arc<ai_agents_llm::LLMRegistry>>);
 
+pub(crate) struct ReconstructionBindings {
+    pub(crate) registries: BTreeMap<usize, Arc<AgentRegistry>>,
+    pub(crate) targets: BTreeMap<String, (usize, String, Arc<crate::RuntimeAgent>)>,
+    pub(crate) tools: BTreeMap<String, Arc<dyn ai_agents_core::Tool>>,
+    pub(crate) compositions: BTreeMap<String, CapturedComposition>,
+    pub(crate) contexts: BTreeMap<String, ai_agents_core::ToolExecutionContext>,
+}
+
 #[derive(Default)]
 pub(crate) struct CompositionTargets {
     bindings: Mutex<BTreeMap<String, Arc<PinnedTaskAgent>>>,
@@ -16,9 +24,29 @@ pub(crate) struct CompositionTargets {
     tools: Mutex<BTreeMap<String, Arc<dyn ai_agents_core::Tool>>>,
     compositions: Mutex<BTreeMap<String, CapturedComposition>>,
     message_contexts: Mutex<BTreeMap<String, ai_agents_core::ToolExecutionContext>>,
+    catalogues: Mutex<BTreeMap<usize, Arc<AgentRegistry>>>,
 }
 
 impl CompositionTargets {
+    /// Captures actual live objects only while the source owner remains usable; JSON identities do not reconstruct them.
+    pub(crate) fn reconstruction_bindings(&self) -> Result<ReconstructionBindings> {
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        Ok(ReconstructionBindings {
+            registries: self.catalogues.lock().clone(),
+            targets: self
+                .bindings
+                .lock()
+                .iter()
+                .map(|(operation, pinned)| (operation.clone(), pinned.reconstruction_target()))
+                .collect(),
+            tools: self.tools.lock().clone(),
+            compositions: self.compositions.lock().clone(),
+            contexts: self.message_contexts.lock().clone(),
+        })
+    }
+
     /// The actual admitted context retains cancellation and approval bindings; serialized frames cannot construct it.
     pub(crate) fn bind_message_context(
         &self,
@@ -76,6 +104,7 @@ impl CompositionTargets {
         if self.retired.load(std::sync::atomic::Ordering::Acquire) {
             return Err(AgentError::Other("task catalogue has been retired".into()));
         }
+        self.remember_registry(registry.clone())?;
         let slots = if frame.dispatch == composition::CompositionDispatch::Delegate {
             vec![composition::CompositionChild {
                 registry_id: frame.delegate_id.clone(),
@@ -114,6 +143,19 @@ impl CompositionTargets {
             captured.push((slot.operation, pinned));
         }
         Ok(captured)
+    }
+
+    /// Records an actual catalogue for explicit host reconstruction; this does not enroll or authorize any member.
+    pub(crate) fn remember_registry(&self, registry: Arc<AgentRegistry>) -> Result<()> {
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        let mut catalogues = self.catalogues.lock();
+        if catalogues.len() >= MAX_TASK_CHECKPOINT_RECORDS {
+            return Err(TaskRunStorageError::CheckpointTooLarge.into());
+        }
+        catalogues.insert(registry.reconstruction_identity(), registry);
+        Ok(())
     }
 
     /// Publication follows frame acknowledgement, so a stored operation never gains authority from serialization alone.
@@ -241,6 +283,7 @@ impl CompositionTargets {
         self.tools.lock().clear();
         self.compositions.lock().clear();
         self.message_contexts.lock().clear();
+        self.catalogues.lock().clear();
     }
 }
 

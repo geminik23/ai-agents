@@ -28,6 +28,7 @@ impl RuntimeAgent {
             return Ok(false);
         };
         let transition = TaskTransitionLocation {
+            execution_id: uuid::Uuid::new_v4().to_string(),
             from_state: from.into(),
             target: target.into(),
             reason: reason.into(),
@@ -281,7 +282,11 @@ impl RuntimeAgent {
             "runtime.actions:{}:{}:{}:{}",
             self.info.id,
             crate::autonomy::current_child_operation().unwrap_or_default(),
-            state.transition.expected_generation,
+            if state.transition.execution_id.is_empty() {
+                state.transition.expected_generation.to_string()
+            } else {
+                state.transition.execution_id.clone()
+            },
             if state.transition.entering {
                 "enter"
             } else {

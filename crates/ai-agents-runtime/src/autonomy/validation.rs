@@ -376,6 +376,68 @@ impl ValidationDriverState {
         Ok(state)
     }
 
+    /// Exports the tighter live monotonic/absolute check bound without exposing or renewing its execution seal.
+    pub(crate) fn reconstruction_expiry(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.check_retained()?;
+        let projected = self
+            .check_projection
+            .map(|deadline| {
+                chrono::Duration::from_std(
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .map_err(|_| AgentError::Config("validation recovery clock overflow".into()))
+                .and_then(|remaining| {
+                    now.checked_add_signed(remaining).ok_or_else(|| {
+                        AgentError::Config("validation recovery clock overflow".into())
+                    })
+                })
+            })
+            .transpose()?;
+        Ok(match (self.check_deadline, projected) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        })
+    }
+
+    /// Rehydrates a validated driver only inside the framework's claimed reconstruction boundary.
+    /// Attempt identity, completed observations and absolute deadline remain unchanged; publication still requires a new journal ACK.
+    pub(crate) fn restore_reconstructed(
+        value: Value,
+        binding: &BoundValidationCheck,
+        scope: &EvaluationScope,
+        extensions: &FrozenAutonomyExtensions,
+        now: chrono::DateTime<chrono::Utc>,
+        upper: Option<chrono::DateTime<chrono::Utc>>,
+        anchor: std::time::Instant,
+    ) -> Result<Self> {
+        let mut state = Self::restore(value, binding, scope, extensions)?;
+        let bound = match (state.check_deadline, upper) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, right) => left.or(right),
+        };
+        state.check_projection = bound
+            .map(|deadline| {
+                anchor
+                    .checked_add((deadline - now).to_std().unwrap_or_default())
+                    .ok_or_else(|| {
+                        AgentError::Config("restored validation deadline overflow".into())
+                    })
+            })
+            .transpose()?;
+        state.publication_identity = None;
+        state.capacity_not_invoked = None;
+        state.retained = Some(std::sync::Arc::new(RetainedValidation {
+            identity: state.identity.clone(),
+            binding_identity: state.binding_identity.clone(),
+            deadline: state.check_deadline,
+            projection: state.check_projection,
+        }));
+        Ok(state)
+    }
+
     // Public mutable checkpoint fields cannot mint a fresh lifetime or change a retained attempt's binding.
     fn check_retained(&self) -> Result<()> {
         let retained = self.retained.as_ref().ok_or_else(|| AgentError::Config(

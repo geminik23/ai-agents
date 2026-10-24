@@ -33,7 +33,8 @@ pub struct DisambiguationManager {
 }
 
 /// Manager-owned request retained across clarification and confirmation turns.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PendingClarification {
     id: u64,
     original_input: String,
@@ -46,7 +47,8 @@ struct PendingClarification {
 }
 
 /// Pending phases keep unresolved and resolved payloads mutually exclusive.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 enum PendingPhase {
     Clarification {
         required_clarity: Vec<String>,
@@ -188,6 +190,34 @@ impl DisambiguationManager {
             ));
         }
         *pending = None;
+        Ok(())
+    }
+
+    /// Installs exact pending state into a fresh host-reconstructed manager without semantic work or consuming an answer.
+    /// The host must validate configuration and runtime ownership first; this trusted integration API is not a sandbox or response permit.
+    pub async fn restore_pending_checkpoint(&self, value: serde_json::Value) -> Result<()> {
+        if serde_json::to_vec(&value)?.len() > 262_144 {
+            return Err(ai_agents_core::AgentError::Config(
+                "clarification checkpoint is too large".into(),
+            ));
+        }
+        let restored: PendingClarification = serde_json::from_value(value)?;
+        let next = restored.id.checked_add(1).ok_or_else(|| {
+            ai_agents_core::AgentError::Config("clarification identity overflow".into())
+        })?;
+        if restored.id == 0 || restored.original_input.trim().is_empty() {
+            return Err(ai_agents_core::AgentError::Config(
+                "invalid clarification checkpoint".into(),
+            ));
+        }
+        let mut pending = self.pending_clarification.write().await;
+        if pending.is_some() {
+            return Err(ai_agents_core::AgentError::Config(
+                "cannot replace a live clarification exchange".into(),
+            ));
+        }
+        self.next_pending_id.fetch_max(next, Ordering::SeqCst);
+        *pending = Some(restored);
         Ok(())
     }
 

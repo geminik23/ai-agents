@@ -125,6 +125,21 @@ pub trait TaskRunStore: Send + Sync {
             "host objective revision is unsupported by this task store".into(),
         ))
     }
+    /// Declares reconstruction writes with opaque framework proof and backend live final admission.
+    fn supports_reconstruction(&self) -> bool {
+        false
+    }
+    /// Commits only the framework-prepared restoration successor; arbitrary payload replacement remains unavailable.
+    async fn checkpoint_reconstruction(
+        &self,
+        _run_id: &str,
+        _checkpoint: &super::TaskReconstructionCheckpoint,
+    ) -> Result<TaskRunSnapshot> {
+        Err(AgentError::Config(
+            "task reconstruction is unsupported by this store".into(),
+        ))
+    }
+
     /// Lists safe metadata, never raw recovery data.
     async fn list(&self) -> Result<Vec<TaskRunSummary>>;
     /// Deletes unowned data at the expected revision.
@@ -294,6 +309,33 @@ impl TaskRunStore for ScopedTaskRunStore {
             .await?;
         self.validate(&saved)?;
         verify_checkpoint_receipt(&previous, mutation, &saved)?;
+        Ok(saved)
+    }
+
+    /// Scoped backends preserve the opaque reconstruction proof and final guard at the existing conditional write boundary.
+    fn supports_reconstruction(&self) -> bool {
+        true
+    }
+
+    /// Validates the exact claimed predecessor before applying a reconstruction-specific successor and verifying its full receipt.
+    async fn checkpoint_reconstruction(
+        &self,
+        run_id: &str,
+        checkpoint: &super::TaskReconstructionCheckpoint,
+    ) -> Result<TaskRunSnapshot> {
+        let previous = self
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        checkpoint.validate(&previous)?;
+        let proposed = previous.transition(checkpoint.mutation(), chrono::Utc::now())?;
+        self.validate(&proposed)?;
+        let saved = self
+            .storage
+            .mutate_task_run(&self.key(run_id), checkpoint.mutation())
+            .await?;
+        self.validate(&saved)?;
+        verify_checkpoint_receipt(&previous, checkpoint.mutation(), &saved)?;
         Ok(saved)
     }
 

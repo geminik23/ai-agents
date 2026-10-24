@@ -93,6 +93,67 @@ impl Participants {
         Ok(())
     }
 
+    /// Reconstruction installs already quiescent members without inventing an active lease or a new invocation.
+    pub(crate) fn restore_member(
+        &self,
+        owner: Arc<RunOwner>,
+        slot: boundary::RunOwnerSlot,
+    ) -> Result<()> {
+        if self.active.load(Ordering::Acquire) != 0 || self.uncertain.load(Ordering::Acquire) {
+            return Err(TaskRunStorageError::Owned.into());
+        }
+        let mut members = self.members.lock();
+        if members
+            .iter()
+            .any(|member| Arc::ptr_eq(&member.owner.gate, &owner.gate))
+        {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        if slot
+            .read()
+            .as_ref()
+            .is_none_or(|current| !Arc::ptr_eq(current, &owner))
+        {
+            return Err(TaskRunStorageError::Owned.into());
+        }
+        members.push(Participant { owner, slot });
+        Ok(())
+    }
+
+    /// An unstarted staged node retires only its temporary membership after its actual owner slot is cleared under the node gate.
+    pub(crate) fn retire_reconstructed_member(&self, owner: &Arc<RunOwner>) -> Result<()> {
+        let mut members = self.members.lock();
+        let member = members
+            .iter()
+            .find(|member| Arc::ptr_eq(&member.owner, owner))
+            .ok_or(TaskRunStorageError::InvalidCheckpoint)?;
+        if member.slot.read().is_some() {
+            return Err(TaskRunStorageError::Owned.into());
+        }
+        members.retain(|member| !Arc::ptr_eq(&member.owner, owner));
+        Ok(())
+    }
+
+    /// Preserves incoming-operation high-water marks independently of historical child result ordering.
+    pub(crate) fn restore_ordinals(
+        &self,
+        ordinals: std::collections::BTreeMap<String, u64>,
+    ) -> Result<()> {
+        if !self.next_operation.lock().is_empty() || ordinals.len() > MAX_TASK_CHECKPOINT_RECORDS {
+            return Err(TaskRunStorageError::InvalidCheckpoint.into());
+        }
+        *self.next_operation.lock() = ordinals;
+        Ok(())
+    }
+
+    /// Capture reads exact allocation state only after all admitted child leases have settled or safely parked.
+    pub(crate) fn capture_ordinals(&self) -> Result<std::collections::BTreeMap<String, u64>> {
+        if self.unsettled() {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        Ok(self.next_operation.lock().clone())
+    }
+
     /// A missing child result or unacknowledged child cleanup prevents a truthful successful terminal checkpoint.
     pub(crate) fn unsettled(&self) -> bool {
         self.active.load(Ordering::Acquire) != 0 || self.uncertain.load(Ordering::Acquire)

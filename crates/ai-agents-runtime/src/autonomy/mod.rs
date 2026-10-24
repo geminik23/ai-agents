@@ -38,7 +38,13 @@ pub(crate) use execution::{
     RunExecution, current_execution, scope_execution, scope_inherited_execution,
 };
 pub(crate) use memory::TaskMemory;
-pub use runner::AutonomyRunner;
+pub use runner::TaskRestoreParticipant;
+pub use runner::{
+    AutonomyRunner, TaskReconstructionCheckpoint, TaskRestorationReview, TaskRestoreBinding,
+    TaskRestoreComposition, TaskRestoreEntry, TaskRestoreGenerations, TaskRestoreGraph,
+    TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest,
+    TaskRestoreResponse, TaskRestoreTarget,
+};
 mod builtins;
 #[cfg(test)]
 mod checkpoint_tests;
@@ -61,6 +67,10 @@ mod controller;
 mod controller_failure_tests;
 #[cfg(test)]
 mod controller_tests;
+#[cfg(test)]
+mod restoration_failure_tests;
+#[cfg(test)]
+mod restoration_tests;
 pub(crate) use controller::{ControllerContinuation, controller_checkpoint, retire_controller};
 pub(crate) mod interaction;
 #[cfg(test)]

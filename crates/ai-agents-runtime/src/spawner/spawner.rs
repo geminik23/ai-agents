@@ -119,6 +119,31 @@ impl SpawnedAgent {
         }
     }
 
+    /// Identifies only this live reservation's capacity owner while capturing a quiescent source graph.
+    pub(crate) fn reconstruction_capacity(&self) -> Option<usize> {
+        self.capacity_reservation
+            .as_ref()
+            .filter(|reservation| !reservation.released.load(Ordering::Acquire))
+            .map(|reservation| Arc::as_ptr(&reservation.agent_count) as usize)
+    }
+
+    /// Rehydrates a validated actual runtime without generation, initialization or business registration callbacks.
+    pub(crate) fn reconstructed(
+        id: String,
+        agent: Arc<RuntimeAgent>,
+        spec: AgentSpec,
+        reservation: Option<CapacityReservation>,
+        spawned_at: chrono::DateTime<Utc>,
+    ) -> Self {
+        Self {
+            id,
+            agent,
+            spec,
+            spawned_at,
+            capacity_reservation: reservation,
+        }
+    }
+
     pub(super) fn release_capacity(&self) {
         if let Some(reservation) = self.capacity_reservation.as_ref() {
             reservation.release();
@@ -195,6 +220,69 @@ impl AgentSpawner {
             counter: AtomicU32::new(1),
             agent_count: Arc::new(AtomicU32::new(0)),
         }
+    }
+
+    /// Captures naming high-water and configured capacity without serializing shared providers or host credentials.
+    pub(crate) fn reconstruction_state(&self) -> Result<serde_json::Value> {
+        use sha2::{Digest, Sha256};
+        let templates: std::collections::BTreeMap<_, _> = self.templates.iter().map(|(id, template)| (id, serde_json::json!({"content":template.content,"description":template.description,"variables":template.variables}))).collect();
+        let shared = self
+            .llm_registry
+            .as_ref()
+            .map(|registry| {
+                registry
+                    .aliases()
+                    .into_iter()
+                    .map(|alias| {
+                        let provider = registry.get(&alias)?;
+                        Ok((alias, provider.provider_name().to_string()))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>>>()
+            })
+            .transpose()?;
+        let config = serde_json::json!({"maximum":self.max_agents,"prefix":self.name_prefix,"tools":self.allowed_tools,"context":self.shared_context,"templates":templates,"shared":shared,"observed":self.llm_registry_observed,"storage":self.storage.is_some()});
+        Ok(
+            serde_json::json!({"version":1,"counter":self.counter.load(Ordering::SeqCst),"occupied":self.agent_count.load(Ordering::SeqCst),"maximum":self.max_agents,"prefix":self.name_prefix,"shared":self.llm_registry.is_some(),"observed":self.llm_registry_observed,"storage":self.storage.is_some(),"configuration":format!("{:x}",Sha256::digest(serde_json::to_vec(&config)?))}),
+        )
+    }
+
+    /// Source capture binds shared provider handles separately from capacity/naming metadata.
+    pub(crate) fn reconstruction_providers(&self) -> Option<LLMRegistry> {
+        self.llm_registry.clone()
+    }
+
+    /// Live pointer identity groups capacity reservations during capture; it is never persisted as authority.
+    pub(crate) fn reconstruction_identity(&self) -> usize {
+        Arc::as_ptr(&self.agent_count) as usize
+    }
+
+    /// Reserves a fresh staging spawner's exact occupancy and naming position without replaying creation.
+    pub(crate) fn reconstruct_capacity(
+        &self,
+        state: &serde_json::Value,
+    ) -> Result<Vec<CapacityReservation>> {
+        let current = self.reconstruction_state()?;
+        let count = state["occupied"]
+            .as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| AgentError::Config("invalid restored capacity".into()))?;
+        let counter = state["counter"]
+            .as_u64()
+            .and_then(|counter| u32::try_from(counter).ok())
+            .filter(|counter| *counter > 0)
+            .ok_or_else(|| AgentError::Config("invalid restored naming position".into()))?;
+        if state["version"] != 1
+            || current["configuration"] != state["configuration"]
+            || self.spawned_count() != 0
+            || self.counter.load(Ordering::SeqCst) != 1
+        {
+            return Err(AgentError::Config(
+                "restored spawner is incompatible or already used".into(),
+            ));
+        }
+        let reservations = self.reserve_restore_capacity(count, 0)?;
+        self.counter.store(counter, Ordering::SeqCst);
+        Ok(reservations)
     }
 
     /// Share LLM connections across all spawned agents.
