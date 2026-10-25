@@ -31,6 +31,14 @@ pub struct EvalMetrics {
     pub by_assertion: HashMap<String, AssertionMetrics>,
     /// Scenario counts grouped by failure category.
     pub by_failure_category: HashMap<String, usize>,
+    /// Distinct observed runs across attempts; resume snapshots are not counted as new runs.
+    #[serde(default)]
+    pub observed_task_runs: usize,
+    /// Latest observed status, not a claim about later cleanup or an unseen final revision.
+    #[serde(default)]
+    pub observed_task_statuses: HashMap<String, usize>,
+    #[serde(default)]
+    pub observed_task_llm_attempts: u64,
 }
 
 /// Pass, fail, and skip counts for one grouping key.
@@ -61,6 +69,7 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
     let total = results.len();
     let passed = results.iter().filter(|r| r.status.is_passed()).count();
     let mut latencies = Vec::new();
+    let mut task_runs = HashMap::new();
     let mut metrics = EvalMetrics {
         pass_rate: if total == 0 {
             0.0
@@ -94,6 +103,14 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
         for attempt in &result.attempts {
             for turn in &attempt.turns {
                 latencies.push(turn.latency_ms);
+                if let Some(task) = &turn.task {
+                    let run_id = serde_json::to_string(&task.display.summary.key)
+                        .expect("serializable task key");
+                    let previous = task_runs.entry(run_id).or_insert(task);
+                    if previous.display.summary.revision < task.display.summary.revision {
+                        *previous = task;
+                    }
+                }
                 for assertion in &turn.assertion_results {
                     let entry = metrics
                         .by_assertion
@@ -110,6 +127,16 @@ pub fn compute_metrics(results: &[ScenarioResult]) -> EvalMetrics {
         }
     }
 
+    metrics.observed_task_runs = task_runs.len();
+    for task in task_runs.into_values() {
+        let status =
+            serde_json::to_value(task.display.summary.status).expect("serializable task status");
+        *metrics
+            .observed_task_statuses
+            .entry(status.as_str().unwrap().into())
+            .or_default() += 1;
+        metrics.observed_task_llm_attempts += task.display.counters.llm_attempts;
+    }
     metrics.total_turns = latencies.len();
     if !latencies.is_empty() {
         latencies.sort_unstable();
@@ -168,6 +195,7 @@ mod tests {
             attempts: vec![AttemptResult {
                 attempt: 0,
                 turns: vec![TurnResult {
+                    task: None,
                     index: 0,
                     input: RedactedString::redacted("[redacted]"),
                     response: RedactedString::redacted("[redacted]"),
@@ -176,6 +204,7 @@ mod tests {
                     state: None,
                     metadata: None,
                     evidence: crate::evidence::TurnEvidence {
+                        task: None,
                         response_metadata: None,
                         state: None,
                         state_history: Vec::new(),

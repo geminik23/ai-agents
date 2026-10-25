@@ -35,7 +35,16 @@ pub fn suite_from_jsonl(name: String, content: &str) -> Result<EvalSuite> {
         if line.trim().is_empty() {
             continue;
         }
-        let row: JsonlRow = serde_json::from_str(line).map_err(|error| {
+        let raw: Value = serde_json::from_str(line).map_err(|error| {
+            EvalError::Config(format!("invalid JSONL row {}: {error}", line_idx + 1))
+        })?;
+        if raw.get("task").is_some() || raw.get("steps").is_some() {
+            return Err(EvalError::Config(
+                "JSONL compatibility rows do not support task/steps; use a strict YAML suite"
+                    .into(),
+            ));
+        }
+        let row: JsonlRow = serde_json::from_value(raw).map_err(|error| {
             EvalError::Config(format!("invalid JSONL row {}: {}", line_idx + 1, error))
         })?;
         scenarios.push(Scenario {

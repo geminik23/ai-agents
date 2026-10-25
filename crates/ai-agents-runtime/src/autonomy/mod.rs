@@ -74,7 +74,7 @@ pub use runner::{
     TaskRestorationReview, TaskRestoreBinding, TaskRestoreComposition, TaskRestoreEntry,
     TaskRestoreGenerations, TaskRestoreGraph, TaskRestoreHost, TaskRestoreManifest,
     TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest, TaskRestoreResponse,
-    TaskRestoreTarget, TaskRunDisplay, TaskStartupRequest,
+    TaskRestoreTarget, TaskRunDisplay, TaskRunInspection, TaskStartupRequest,
 };
 mod builtins;
 #[cfg(test)]

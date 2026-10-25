@@ -1,0 +1,42 @@
+name: Task Approval and Rejection
+agent: ../../../yaml/autonomy/approval_task.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"http","arguments":{"method":"GET","url":"https://api.example.test/task"}}'
+      - The approved fixture request returned status 200.
+  tools:
+    http: {success: true, output: {status: 200, body: fixture-approved}}
+  approvals:
+    default: {outcome: reject, reason: unexpected ordinary approval}
+scenarios:
+  - id: explicit-approval-is-not-execution-evidence
+    steps:
+      - !task
+        operation: {action: run, objective: Fetch the fixture resource.}
+        assert:
+          all:
+            - task: {status: paused, pending_kind: approval, counters: {path: llm_attempts, eq: 1}, event_result_parity: true}
+            - tool_not_called: http
+      - !task
+        operation: {action: resume, response: {kind: approval, decision: {status: approved}}}
+        assert:
+          all:
+            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 2}, event_result_parity: true}
+            - tool_called: {id: http, count: 1, executed: true, success: true, result_path: {path: status, eq: 200}}
+            - response_contains: status 200
+  - id: rejection-never-executes-the-pending-request
+    steps:
+      - !task
+        operation: {action: run, objective: Fetch the fixture resource.}
+        assert: {task: {status: paused, pending_kind: approval}}
+      - !task
+        operation: {action: resume, response: {kind: approval, decision: {status: rejected, reason: Do not execute.}}}
+        assert:
+          all:
+            - task: {status: failed, same_run: true, counters: {path: llm_attempts, eq: 1}}
+            - task: {counters: {path: tool_attempts, eq: 0}}
+            - tool_called: {id: http, count: 1}
+            - tool_called: {id: http, count: 1, executed: false, success: false}

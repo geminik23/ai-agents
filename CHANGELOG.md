@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task evaluation: development typed task operations, exact continuation and structural assertions share configured hosts with isolated domain fixtures and bounded redacted reports
+- Task observability: development task lifecycle facts carry run, profile and stage attribution through existing aggregation without replacing authoritative invocation accounting
 - Task TUI: development terminal sessions share task hosting and exact human decisions with the plain frontend, show bounded task evidence and retain original work through acknowledged shutdown
 - Local task details: authenticated development hosts can read bounded human-readable observations without exporting recovery data or treating historical checks as current completion proof
 - Task CLI: development task commands and plain REPL share configured runners, retained human decisions, scoped provider-free journal management, bounded output and acknowledged foreground shutdown; default production restart remains unavailable
@@ -36,6 +38,8 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Evaluation compatibility: development report schema 2 aggregates observed attempt events, separates task snapshots from scenario outcomes and distinguishes controller tool sources; chat-only JSONL rejects task fields
+- Rust evaluation compatibility: typed task fields extend assertion, evidence, result and fixture literals, while task steps and lifecycle categories require exhaustive-match updates
 - TUI integration compatibility: low-level question, log and app constructors use bounded senders; modal literals include review scrolling and constructors remain the preferred interface
 - Approval review: configured and host-selected context fields remain visible without tool-specific field filters, while automatic approval styles use the foreground bridge without raw terminal output
 - CLI command compatibility: development command matches include the task family while ordinary run, validation and evaluation retain their distinct result contracts
@@ -58,6 +62,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
+- Evaluation custody: task timeouts drain original work, retain files and stop retries after uncertain cleanup, while missing or truncated evidence cannot pass through negation
 - Task host pause lifetimes: retire unserviceable volatile questions and reviews through acknowledged cleanup, preserve cancellation precedence and retain protection after failed or lost receipts
 - Task reconstruction bounds: reject predictable intermediate-journal size failures before claiming a usable pause and compare registry membership independently of listing order
 - Task pause acknowledgements: verify exact batch and composed checkpoint receipts before transferring revision, numeric-observation cursors or safe-pause ownership

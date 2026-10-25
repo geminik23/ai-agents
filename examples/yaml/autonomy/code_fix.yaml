@@ -1,0 +1,42 @@
+name: CodeFixTask
+version: "1.0.0"
+description: "Scoped code work with command and diagnostics completion evidence"
+
+# Development task example. The mocked suite replaces command/diagnostics hosts and isolates mutation fixtures.
+# Real use requires authorized workspace paths and a diagnostics host; this configuration is not an OS sandbox.
+# Flow: discover/read -> propose or apply scoped fix -> validate command and diagnostics -> complete only with fresh passing checks.
+system_prompt: Inspect relevant source before mutation, fix only the requested issue, and use validation evidence rather than completion claims.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [glob, grep, file_read, file_edit, patch, diagnostics, command, git_status, git_diff, todo]
+tool_security:
+  enabled: true
+  fail_closed: true
+  tools:
+    grep: {read_paths: [], allow_without_confirmation: true}
+    file_read: {read_paths: [], allow_without_confirmation: true}
+    file_edit: {read_paths: [], write_paths: [], allow_without_confirmation: true}
+    diagnostics: {read_paths: [], allow_without_confirmation: true}
+    command:
+      allow_without_confirmation: true
+      allowed_commands: [{argv: [cargo, test]}]
+      working_dirs: ['{{ eval.workspace }}']
+      deny_shell: true
+      deny_interactive: true
+      timeout_ms: 120000
+      max_output_chars: 16000
+      env_passthrough: []
+autonomy:
+  enabled: true
+  max_turns: 8
+  max_llm_calls: 20
+  validation:
+    checks:
+      - id: tests
+        adapter: builtin.command
+        config: {command: "cargo test", cwd: '{{ eval.workspace }}'}
+      - id: diagnostics
+        adapter: builtin.diagnostics
+        config: {path: '{{ eval.workspace }}', severity: error}
+  completion: {all: [{validator_passed: tests}, {validator_passed: diagnostics}]}
+# A validation result predating a later mutation is not eligible completion evidence.
+# eval.workspace is an eval-generated token, not a general runtime template; application hosts must supply their authorized workspace.

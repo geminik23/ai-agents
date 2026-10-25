@@ -1,0 +1,27 @@
+name: ToolFreeAnalysis
+version: "1.0.0"
+description: "Tool-free iterative analysis with bounded semantic validation"
+
+# No tools, todo store or filesystem are required. Mocked judge scores exercise the protocol, not factual answer quality.
+# Flow: draft -> semantic check -> revise or stop at the original resource limit.
+system_prompt: Develop an answer addressing the requested criteria and revise it using validation feedback.
+llms:
+  main: {provider: openai, model: gpt-5.4-mini}
+  judge: {provider: openai, model: gpt-5.4-nano}
+llm: {default: main}
+tools: []
+autonomy:
+  enabled: true
+  max_turns: 4
+  max_llm_calls: 8
+  validation:
+    checks:
+      - id: quality
+        adapter: builtin.judge
+        config: {llm: judge, pass_threshold: 0.8, criteria: [The answer is useful and addresses the requested criteria.]}
+  completion: {validator_passed: quality}
+  progress:
+    adapter: builtin.evidence
+    config:
+      signals: [{id: quality, validator: quality, path: metrics.score, comparison: increase}]
+    stagnation: {max_cycles_without_progress: 2, action: stop}

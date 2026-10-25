@@ -9,6 +9,64 @@ use std::sync::{Arc, atomic::Ordering};
 const TASK: &str = "name: SessionHost\nsystem_prompt: Helpful\nautonomy:\n  enabled: true\n  max_turns: 4\n  max_llm_calls: 4\n  completion: {response_contains: done}\n  premature_finish: {action: ask_user, on_unavailable: stop}\n";
 const STATE: &str = "name: SessionChild\nsystem_prompt: Helpful\nstates:\n  initial: work\n  states:\n    work:\n      autonomy:\n        enabled: true\n        mode: state_until_exit\n        max_turns: 4\n        max_llm_calls: 4\n        completion: {response_contains: done}\n        premature_finish: {action: ask_user, on_unavailable: stop}\n";
 
+// A supplied SDK controller joins only when its exact pointer enters real work; equivalent labels cannot replace the retained handle.
+#[tokio::test]
+async fn session_supplied_sdk_runner_is_admitted_before_dispatch_and_cannot_be_rebound() {
+    let provider = RecordingProvider::gated();
+    let agent = Arc::new(
+        AgentBuilder::from_yaml(TASK)
+            .unwrap()
+            .llm(provider.clone())
+            .build()
+            .unwrap(),
+    );
+    let config = crate::spec::AgentSpec::from_yaml_strict(TASK)
+        .unwrap()
+        .autonomy;
+    let store = Arc::new(
+        ScopedTaskRunStore::in_memory(agent.info().id, None, "sdk-session.v1".into()).unwrap(),
+    );
+    let runner = Arc::new(
+        AutonomyRunner::try_new(
+            agent.clone(),
+            config.clone(),
+            Default::default(),
+            store.clone(),
+            "sdk-session.v1".into(),
+        )
+        .unwrap(),
+    );
+    let session = TaskHostSession::new(true);
+    let work = session.scope_runner(runner.clone(), runner.run("analysis", None));
+    tokio::pin!(work);
+    tokio::select! { _ = provider.entered.as_ref().unwrap().acquire() => {}, result = &mut work => panic!("provider did not gate: {result:?}") }
+    let admitted = session.runs();
+    assert_eq!(admitted.len(), 1);
+    assert!(admitted[0].execution_admitted());
+    assert_eq!(admitted[0].published_revision(), None);
+    assert!(Arc::ptr_eq(&admitted[0].runner, &runner));
+    provider.release.as_ref().unwrap().add_permits(1);
+    let result = work.await.unwrap();
+    assert_eq!(result.run.status, TaskRunStatus::Completed);
+    session
+        .observe_result(runner.clone(), &result)
+        .await
+        .unwrap();
+    let other = Arc::new(
+        AutonomyRunner::try_new(
+            agent,
+            config,
+            Default::default(),
+            store,
+            "sdk-session.v1".into(),
+        )
+        .unwrap(),
+    );
+    assert!(session.observe_result(other, &result).await.is_err());
+    assert_eq!(session.runs().len(), 1);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+}
+
 // Checked scope binding freezes the builder's actual loaded definitions instead of trusting two matching but unrelated filesystem samples.
 #[tokio::test]
 async fn session_scope_checks_and_retains_actual_external_skill_definitions() {

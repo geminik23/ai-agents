@@ -1,0 +1,39 @@
+name: ResearchTask
+version: "1.0.0"
+description: "Validate distinct source and citation evidence without files or todos"
+
+# Development task profile. Rust installs host.records and host.record_progress; YAML selects their meaning.
+# Run its no-key suite with the task-domain-evals host example; a profile name alone does not install host authority.
+# Flow: source observations -> deduplication/citation check -> quality check -> completion or bounded intervention.
+system_prompt: |
+  Research the objective with the installed source catalog and compare the evidence.
+  Return a JSON answer containing a sources array of the actual source identities. State uncertainty.
+llms:
+  main: {provider: openai, model: gpt-5.4-mini}
+  judge: {provider: openai, model: gpt-5.4-nano}
+llm: {default: main}
+tools: [domain]
+autonomy:
+  enabled: true
+  default_profile: research
+  max_turns: 8
+  max_llm_calls: 24
+  profiles:
+    research:
+      execution: {strategy: model_led}
+      validation:
+        checks:
+          - id: records
+            adapter: host.records
+            config: {domain: research, min_unique: 2}
+          - id: quality
+            adapter: builtin.judge
+            schedule: completion
+            config: {llm: judge, pass_threshold: 0.8, criteria: [Compare the cited evidence and state uncertainty.]}
+      completion:
+        all: [{validator_passed: records}, {validator_passed: quality}]
+      progress:
+        adapter: host.record_progress
+        config: {}
+        stagnation: {max_cycles_without_progress: 3, action: stop}
+# Loading this file does not start a task; use an explicit task invocation in the Rust host.

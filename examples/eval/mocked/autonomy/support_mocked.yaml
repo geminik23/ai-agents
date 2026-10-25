@@ -1,0 +1,29 @@
+# Eval host: task-domain-evals
+name: Support Question and Ticket Evidence
+agent: ../../../yaml/autonomy/support_resolution.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses:
+      - '{"tool":"ask_user","arguments":{"question":"Confirm the requested resolution","options":["yes"]}}'
+      - '{"tool":"domain","arguments":{"op":"resolve"}}'
+      - The actual ticket record is resolved.
+scenarios:
+  - id: typed-answer-resumes-original-ticket-task
+    turns:
+      - input: Resolve this ticket.
+        stream: true
+        assert:
+          all:
+            - task: {status: paused, pending_kind: user_question, counters: {path: llm_attempts, eq: 1}, event_result_parity: true}
+            - tool_not_called: domain
+    steps:
+      - !task
+        operation: {action: resume, response: {kind: answer, value: {answered: true, selected: [yes]}}}
+        assert:
+          all:
+            - task: {status: completed, same_run: true, counters: {path: llm_attempts, eq: 3}, checks: [{id: records, outcome: pass}], event_result_parity: true}
+            - tool_called: {id: domain, count: 1, executed: true, success: true}
+            - tool_called: {id: ask_user, count: 1, executed: true, success: true}
+            - response_contains: actual ticket record

@@ -16,6 +16,8 @@ use crate::fixtures::RecordingToolLog;
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecutionSource {
     Llm,
+    /// Controller-managed observation through the shared executor, not a model tool proposal.
+    Task,
     Skill,
     /// Tool step requested by the plan-and-execute runtime.
     Plan,
@@ -165,6 +167,9 @@ pub struct PersonaEvidence {
 /// Observability evidence attached to one evaluated turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnObservabilityEvidence {
+    /// Already-redacted observed events retained only in memory for de-duplicated suite aggregation.
+    #[serde(skip)]
+    pub events: Vec<ObservationEvent>,
     /// Trace ID associated with the turn when available.
     pub trace_id: Option<String>,
     /// Span IDs observed during the turn.
@@ -347,6 +352,9 @@ impl LlmRequestEvidence {
 /// Full assertion-time evidence collected after a turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnEvidence {
+    /// Exact host observations are never serialized with reports or cassettes.
+    #[serde(skip)]
+    pub task: Option<crate::task::TaskEvidence>,
     /// Response metadata produced by the runtime.
     pub response_metadata: Option<Value>,
     /// Current or expected state name.
@@ -463,6 +471,7 @@ fn collect_turn_evidence_with_observability(
     let persona = collect_persona(agent, &context_map);
 
     TurnEvidence {
+        task: None,
         response_metadata: metadata_value,
         state: agent.current_state(),
         state_history: agent.state_history(),
@@ -489,6 +498,7 @@ fn observability_evidence(
         trace_id: events.last().map(|event| event.trace_id.clone()),
         span_ids: events.iter().map(|event| event.span_id.clone()).collect(),
         report: Some(report),
+        events,
     }
 }
 

@@ -296,6 +296,104 @@ fn project_untrusted(value: &Value, depth: usize, nodes: &mut usize) -> Value {
     }
 }
 
+// Lifecycle records use the acknowledged task identity even outside an ordinary turn's tracing scope.
+// Dynamic profile/stage labels are projected before export; the ledger remains the only invocation authority.
+struct ObservationLabels<'a> {
+    key: &'a TaskRunKey,
+    actor: Option<&'a str>,
+    profile: Option<&'a str>,
+    stage: Option<&'a str>,
+}
+impl ObservationLabels<'_> {
+    // Existing observation aggregation/export receives one fact, never one duplicated fact per participating collector.
+    fn record(
+        &self,
+        manager: &ai_agents_observability::ObservabilityManager,
+        kind: TaskRunEventKind,
+        payload: Value,
+    ) {
+        use ai_agents_observability::{EventStatus, EventType, ObservationPurpose, SpanContext};
+        if !manager.config().enabled {
+            return;
+        }
+        let label = serde_json::to_value(kind)
+            .expect("serializable event kind")
+            .as_str()
+            .unwrap()
+            .to_string();
+        let purpose = match kind {
+            TaskRunEventKind::ValidationStarted | TaskRunEventKind::ValidationCompleted => {
+                "autonomy_validation"
+            }
+            TaskRunEventKind::CompletionGateChecked => "autonomy_completion_gate",
+            TaskRunEventKind::StageStarted | TaskRunEventKind::StageCompleted => "autonomy_stage",
+            TaskRunEventKind::ContinuationForced | TaskRunEventKind::ReplanCompleted => {
+                "autonomy_continuation"
+            }
+            _ => "autonomy_task",
+        };
+        let mut context = ai_agents_observability::current_observation_context()
+            .map(|context| context.child())
+            .unwrap_or_else(|| SpanContext::new_root(&self.key.agent_id));
+        context.agent_id = self.key.agent_id.clone();
+        context.actor_id = self.actor.map(str::to_owned);
+        context.purpose = ObservationPurpose::Other(purpose.into());
+        context.tags.extend(std::collections::HashMap::from([
+            ("task_run".into(), self.key.run_id.clone()),
+            ("custom:task_run".into(), self.key.run_id.clone()),
+            (
+                "custom:task_profile".into(),
+                self.profile
+                    .map(safe_text)
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            ),
+            (
+                "custom:task_stage".into(),
+                self.stage.map(safe_text).unwrap_or(Value::Null).to_string(),
+            ),
+            ("custom:task_event".into(), label.clone()),
+        ]));
+        let status = match kind {
+            TaskRunEventKind::TaskFailed | TaskRunEventKind::OperationError => EventStatus::Error,
+            TaskRunEventKind::TaskCancelled => EventStatus::Cancelled,
+            _ => EventStatus::Success,
+        };
+        let event = manager.build_event_from_span(
+            context,
+            EventType::TaskLifecycle { kind: label },
+            std::time::Duration::ZERO,
+            status,
+            None,
+            None,
+            Default::default(),
+            Some(payload),
+        );
+        manager.record_event(event);
+    }
+}
+
+// Public-result observation follows pause preparation and ownership handoff in both blocking and streaming paths.
+pub(crate) fn observe_result(agent: &crate::RuntimeAgent, result: &TaskRunResult) {
+    let Some(manager) = agent.observability() else {
+        return;
+    };
+    let run = &result.run;
+    let kind = match run.status {
+        TaskRunStatus::Running => TaskRunEventKind::HostControlApplied,
+        TaskRunStatus::Paused => TaskRunEventKind::TaskPaused,
+        TaskRunStatus::Completed => TaskRunEventKind::TaskCompleted,
+        TaskRunStatus::Incomplete => TaskRunEventKind::TaskIncomplete,
+        TaskRunStatus::LimitReached => TaskRunEventKind::TaskLimitReached,
+        TaskRunStatus::RecoveryRequired => TaskRunEventKind::TaskRecoveryRequired,
+        TaskRunStatus::Failed => TaskRunEventKind::TaskFailed,
+        TaskRunStatus::Cancelled => TaskRunEventKind::TaskCancelled,
+    };
+    ObservationLabels { key: &run.key, actor: run.actor_id.as_deref(), profile: run.profile.as_deref(), stage: run.current_stage.as_deref() }
+        .record(&manager, kind, json!({"revision":run.revision,"status":run.status,"counters":run.counters,
+            "pause_reason":run.pause_reason.as_deref().map(safe_text),"stop_reason":run.stop_reason.as_deref().map(safe_text)}));
+}
+
 /// Existing execution supplies authority and revision; events cannot feed back into task completion.
 /// Lazy projection and future erasure keep optional event allocation and polling frames out of deeply nested ordinary task execution.
 pub(crate) fn emit<'a>(
@@ -307,6 +405,18 @@ pub(crate) fn emit<'a>(
         .or_else(|| execution.owner.events.read().clone())
         .filter(|sink| sink.active.load(std::sync::atomic::Ordering::Acquire));
     Box::pin(async move {
+        let manager = execution.owner.telemetry.primary();
+        let projected = (sink.is_some() || manager.is_some()).then(data);
+        if let Some(manager) = manager {
+            let snapshot = execution.acknowledged_snapshot();
+            ObservationLabels {
+                key: &snapshot.key,
+                actor: snapshot.actor_id.as_deref(),
+                profile: snapshot.payload.get("profile").and_then(Value::as_str),
+                stage: snapshot.payload.get("stage").and_then(Value::as_str),
+            }
+            .record(&manager, kind, projected.clone().unwrap_or(Value::Null));
+        }
         if let Some(sink) = sink {
             let root = sink.execution.lock().upgrade();
             let coordinating = root.as_deref().unwrap_or(execution);
@@ -318,7 +428,7 @@ pub(crate) fn emit<'a>(
                         .load(std::sync::atomic::Ordering::Acquire),
                 ),
                 kind,
-                data(),
+                projected.unwrap_or(Value::Null),
             )
             .await;
         }

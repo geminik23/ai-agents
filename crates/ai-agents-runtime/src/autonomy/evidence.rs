@@ -239,8 +239,14 @@ fn unique<T: Clone + Serialize>(
     Ok(output)
 }
 
-/// Executable proof requires actual admitted work and continued result eligibility; a settled late effect remains audit-only.
+// Runtime gates and public host adapters share factual eligibility; success and scope freshness remain separate predicates.
 pub(crate) fn executed(record: &ToolExecutionRecord) -> bool {
+    tool_record_eligible(record)
+}
+
+/// Tests factual result eligibility for an acknowledged managed tool observation, without granting execution or proving success.
+/// A failed but eligible result can prove a validation failure; freshness and exact operation binding must still be checked by its consumer.
+pub fn tool_record_eligible(record: &ToolExecutionRecord) -> bool {
     record.executed
         && matches!(record.policy.outcome, PermissionOutcome::Allow)
         && !record.cancelled

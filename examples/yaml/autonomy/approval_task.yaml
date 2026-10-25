@@ -1,0 +1,23 @@
+name: ApprovalTask
+version: "1.0.0"
+description: "A retained tool approval with current policy reauthorization"
+
+# Run the mocked HITL task suite: approved HTTP output is fixture-backed and no socket is opened.
+# Normal application hosts must provide appropriate HTTP policy and human delivery; approval never overrides policy denial.
+# Flow: proposed HTTP request -> retained approval -> exact host decision -> shared executor -> acknowledged result.
+system_prompt: Perform only the requested approved operation and report its actual result.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [http]
+hitl:
+  default_timeout_seconds: 120
+  on_timeout: reject
+  tools:
+    http:
+      require_approval: true
+      approval_message: 'Approve {{ method }} request to {{ url }}?'
+autonomy:
+  enabled: true
+  max_turns: 4
+  max_llm_calls: 8
+  hitl: {on_approval_required: pause_run}
+  completion: {tool_called: {id: http, count: 1, executed: true, success: true}}

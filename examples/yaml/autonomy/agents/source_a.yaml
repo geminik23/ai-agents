@@ -1,0 +1,8 @@
+name: SourceA
+version: "1.0.0"
+description: "One admitted research participant"
+
+# The parent installs shared providers and task ownership; this child does not start a nested autonomous run.
+system_prompt: Give one concise source finding; ask the host if an explicit decision is needed.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [ask_user]

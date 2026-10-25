@@ -1,0 +1,31 @@
+name: ComposedResearchTask
+version: "1.0.0"
+description: "Concurrent research with one coordinating owner and shared limits"
+
+# Existing concurrent composition is reused; child results and any retained questions stay under the same task owner.
+# Flow: two researchers -> optional coordinating question -> synthesize settled results -> completion.
+# No filesystem, todo, scheduler or independent child task runner is required.
+system_prompt: Coordinate both researchers and synthesize only their actual settled findings.
+llms:
+  default: {provider: openai, model: gpt-5.4-mini}
+  router: {provider: openai, model: gpt-5.4-nano}
+llm: {default: default, router: router}
+tools: []
+spawner:
+  shared_llms: true
+  auto_spawn:
+    - {id: source_a, agent: agents/source_a.yaml}
+    - {id: source_b, agent: agents/source_b.yaml}
+states:
+  initial: research
+  states:
+    research:
+      concurrent:
+        agents: [source_a, source_b]
+        aggregation: {strategy: llm_synthesis, synthesizer_llm: router}
+autonomy:
+  enabled: true
+  max_turns: 3
+  max_llm_calls: 4
+  hitl: {on_user_question: pause_run}
+  completion: {response_contains: aggregated research}

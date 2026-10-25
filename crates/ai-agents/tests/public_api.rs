@@ -60,7 +60,14 @@ fn development_automatic_task_hosting_surface_compiles() {
             input: ai_agents::autonomy::TaskResumeInput::Continue,
         });
     }
+    fn eval_types() {
+        let _: ai_agents::eval::assertion::Assertion = Default::default();
+        let _: ai_agents::eval::TaskAssertion = Default::default();
+        let _: Option<ai_agents::eval::TaskStep> = None;
+        let _: Option<ai_agents::eval::TaskReport> = None;
+    }
     fn store_only(store: &dyn ai_agents::TaskRunStore) {
+        eval_types();
         let _display = ai_agents::TaskRunDisplay::read(store, "retained");
         let _cancel = ai_agents::CancellationOutcome::request(store, "retained", 1);
     }
@@ -84,6 +91,11 @@ fn development_automatic_task_hosting_surface_compiles() {
             let _cleanup = run.runner.input_unavailable_paused("run", 1);
             let _local_details = run.runner.task_host_details("run");
             let _typed: Option<ai_agents::TaskHostDetails> = None;
+            let _inspection = run.runner.task_inspection("run", 1);
+            let _typed_inspection: Option<ai_agents::TaskRunInspection> = None;
+            let _lexical = session.scope_runner(run.runner.clone(), async {});
+            let _observe = ai_agents::TaskHostSession::observe_result;
+            let _record_eligibility = ai_agents::autonomy::tool_record_eligible;
         }
         let _protected = session.has_protected_work();
         session.close_input();

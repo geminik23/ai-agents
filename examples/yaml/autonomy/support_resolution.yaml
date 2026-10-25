@@ -1,0 +1,24 @@
+name: SupportTask
+version: "1.0.0"
+description: "State-owned support work completed by host ticket evidence"
+
+# Rust installs the ticket integration; the offline example uses isolated records, never a real customer system.
+# Flow: user input -> support task -> clarification/approval if needed -> verified resolution or escalation.
+system_prompt: Resolve the ticket or create a real escalation record; do not claim a ticket changed before executing the tool.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [domain, ask_user]
+autonomy:
+  max_turns: 8
+  max_llm_calls: 20
+  hitl: {on_approval_required: pause_run, on_user_question: pause_run}
+states:
+  initial: support
+  states:
+    support:
+      autonomy:
+        enabled: true
+        mode: state_until_exit
+        validation:
+          checks: [{id: records, adapter: host.records, schedule: completion, config: {domain: support}}]
+        completion: {validator_passed: records}
+# Retained questions need a live host. Durable reconstruction additionally needs an explicitly installed restore host; SQLite alone is insufficient.

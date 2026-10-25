@@ -58,6 +58,26 @@ fn render_summary(result: &EvalResult) -> String {
             scenario.duration_ms
         ));
     }
+    if result.metrics.observed_task_runs > 0 {
+        out.push_str("\n## Task observations\n\nThese are acknowledged operation snapshots, not inferred cleanup or current completion permits.\n\n| Scenario | Attempt | Operation | Status | Revision | Events complete |\n|---|---|---|---|---|---|\n");
+        for scenario in &result.scenarios {
+            for attempt in &scenario.attempts {
+                for turn in &attempt.turns {
+                    if let Some(task) = &turn.task {
+                        out.push_str(&format!(
+                            "| `{}` | {} | {} | {:?} | {} | {} |\n",
+                            scenario.id,
+                            attempt.attempt,
+                            turn.index,
+                            task.display.summary.status,
+                            task.display.summary.revision,
+                            task.events_complete
+                        ));
+                    }
+                }
+            }
+        }
+    }
     out
 }
 
@@ -138,6 +158,30 @@ fn render_junit(result: &EvalResult) -> String {
                 ));
             }
         }
+        let tasks: Vec<_> = scenario
+            .attempts
+            .iter()
+            .flat_map(|attempt| &attempt.turns)
+            .filter_map(|turn| turn.task.as_ref())
+            .collect();
+        if !tasks.is_empty() {
+            let text = tasks
+                .iter()
+                .map(|task| {
+                    format!(
+                        "task status={:?} revision={} events_complete={}",
+                        task.display.summary.status,
+                        task.display.summary.revision,
+                        task.events_complete
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            out.push_str(&format!(
+                "    <system-out>{}</system-out>\n",
+                escape_xml(&text)
+            ));
+        }
         out.push_str("  </testcase>\n");
     }
     out.push_str("</testsuite>\n");
@@ -190,6 +234,7 @@ mod tests {
                 attempts: vec![AttemptResult {
                     attempt: 0,
                     turns: vec![TurnResult {
+                        task: None,
                         index: 0,
                         input: RedactedString::redacted("[redacted]"),
                         response: RedactedString::redacted("[redacted]"),
@@ -198,6 +243,7 @@ mod tests {
                         state: None,
                         metadata: None,
                         evidence: crate::evidence::TurnEvidence {
+                            task: None,
                             response_metadata: Some(
                                 serde_json::json!({"secret":"should-not-serialize"}),
                             ),

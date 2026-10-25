@@ -328,7 +328,19 @@ impl RunExecution {
     }
 
     /// Installs the controller's immutable capture identity before dispatching this cycle.
+    /// Stage attribution changes only for subsequent spans; already dispatched provider/background spans keep their captured labels.
     pub(crate) fn set_scope(&self, scope: &EvaluationScope) {
+        ai_agents_observability::context::update_observation_tags(std::collections::HashMap::from(
+            [(
+                "custom:task_stage".into(),
+                scope
+                    .stage
+                    .as_deref()
+                    .map(super::events::safe_text)
+                    .unwrap_or(Value::Null)
+                    .to_string(),
+            )],
+        ));
         *self.scope.write() = Some(scope.clone());
     }
 
@@ -1262,12 +1274,32 @@ pub(crate) async fn scope_execution<F: std::future::Future>(
     }
     let todos = execution.task_todos();
     let run_id = execution.run_id.clone();
+    let snapshot = execution.acknowledged_snapshot();
+    let profile = snapshot
+        .payload
+        .get("profile")
+        .map(super::events::safe_value)
+        .unwrap_or(Value::Null)
+        .to_string();
+    let stage = snapshot
+        .payload
+        .get("stage")
+        .map(super::events::safe_value)
+        .unwrap_or(Value::Null)
+        .to_string();
     let scoped = ai_agents_llm::scope_invocation_admission(
         execution.clone(),
         RUN_EXECUTION.scope(
             execution,
             ai_agents_observability::with_updated_observation_context(
-                |context| context.with_tag("task_run", run_id),
+                |mut context| {
+                    context.agent_id = snapshot.key.agent_id;
+                    context
+                        .with_tag("task_run", run_id.clone())
+                        .with_tag("custom:task_run", run_id)
+                        .with_tag("custom:task_profile", profile)
+                        .with_tag("custom:task_stage", stage)
+                },
                 future,
             ),
         ),

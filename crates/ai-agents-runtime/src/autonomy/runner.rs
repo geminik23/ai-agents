@@ -34,7 +34,7 @@ mod host_runtime;
 mod hosting;
 pub use hosting::{
     CancellationDisposition, CancellationOutcome, MAX_TASK_DISPLAY_BYTES, TaskHostDetails,
-    TaskHostInteraction, TaskHostPrompt, TaskRunDisplay,
+    TaskHostInteraction, TaskHostPrompt, TaskRunDisplay, TaskRunInspection,
 };
 #[path = "live_controller.rs"]
 mod live_controller;
@@ -745,7 +745,9 @@ impl AutonomyRunner {
 
     /// Publishes only the bound run after public-result preparation; other explicit executions cannot overwrite its delivery slot.
     /// Foreground hosts may expose pending prompts only after this boundary, never from an intermediate pause checkpoint.
+    /// Blocking and streaming observers receive the same final facts after persistence preparation and ownership handoff.
     fn publish_automatic(&self, result: &TaskRunResult) {
+        super::events::observe_result(&self.agent, result);
         if let Some(session) = crate::autonomy::host_session::current_session() {
             session.publish(&result.run.key.run_id, result.run.revision);
         }
@@ -1657,8 +1659,10 @@ impl AutonomyRunner {
         let mut todo = None;
         // Known pre-execution setup errors release the reservation; drop during an ambiguous write still requires recovery.
         let setup = Box::pin(async {
+            // Only an exact lexical SDK handle or the actual configured controller can join the host catalogue before work starts.
             if let Some(session) = crate::autonomy::host_session::current_session()
-                && let Some(runner) = self.agent.automatic_task_runner()
+                && let Some(runner) = super::host_session::scoped_runner(self)
+                    .or_else(|| self.agent.automatic_task_runner())
                 && std::ptr::eq(self, Arc::as_ptr(&runner))
             {
                 session.register(runner, key.clone())?;

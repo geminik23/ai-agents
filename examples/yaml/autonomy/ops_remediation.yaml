@@ -1,0 +1,27 @@
+name: OperationsTask
+version: "1.0.0"
+description: "Required remediation, verification and review with truthful escalation"
+
+# Rust installs health/incident adapters; the fixture host has no network, shell or production-service access.
+# Flow: remediate -> verify health or actual escalation -> required review -> completion.
+system_prompt: Attempt the authorized remediation; if health cannot recover, create an escalation record and explain the remaining outage.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [domain]
+autonomy:
+  enabled: true
+  execution: {strategy: lifecycle}
+  max_turns: 8
+  max_llm_calls: 20
+  lifecycle: [{id: remediate}, {id: verify}, {id: review}]
+  validation:
+    checks:
+      - id: health
+        adapter: host.records
+        required: false
+        config: {domain: health}
+      - id: records
+        adapter: host.records
+        required: false
+        config: {domain: operations}
+  completion: {any: [{validator_passed: health}, {validator_passed: records}]}
+# A failed health check plus a real escalation can be an intended success; it must not skip the review stage.

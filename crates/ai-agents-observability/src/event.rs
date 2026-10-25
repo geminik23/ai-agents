@@ -50,6 +50,10 @@ pub struct ObservationEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventType {
+    /// Controller lifecycle fact, separate from LLM/tool invocation counts and execution authority.
+    TaskLifecycle {
+        kind: String,
+    },
     LlmCall {
         provider: String,
         model: String,

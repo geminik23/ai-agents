@@ -44,7 +44,15 @@ impl TaskHostRun {
     }
 }
 
-tokio::task_local! { static SESSION: TaskHostSession; }
+tokio::task_local! { static SESSION: TaskHostSession; static SUPPLIED_RUNNER: Arc<AutonomyRunner>; }
+
+// A lexical SDK handle must be the exact executing controller, never a registry or serialized identity match.
+pub(crate) fn scoped_runner(actual: &AutonomyRunner) -> Option<Arc<AutonomyRunner>> {
+    SUPPLIED_RUNNER
+        .try_with(Clone::clone)
+        .ok()
+        .filter(|runner| std::ptr::eq(actual, Arc::as_ptr(runner)))
+}
 
 impl TaskHostSession {
     /// Declares whether the foreground host can service responses; availability can only be withdrawn for this operation.
@@ -59,6 +67,12 @@ impl TaskHostSession {
     /// Polls work under this live catalogue without starting, detaching or adopting any task.
     pub async fn scope<F: Future>(&self, work: F) -> F::Output {
         SESSION.scope(self.clone(), work).await
+    }
+
+    /// Scopes an actual supplied SDK runner so its newly admitted runs join this host's cancellation and cleanup catalogue.
+    /// The runtime still checks pointer identity and registers only after its real entry; this does not adopt checkpoints or grant execution.
+    pub async fn scope_runner<F: Future>(&self, runner: Arc<AutonomyRunner>, work: F) -> F::Output {
+        self.scope(SUPPLIED_RUNNER.scope(runner, work)).await
     }
 
     /// Reports confirmed endpoint loss, not silence, and never fabricates approval or cancellation acknowledgement.
@@ -85,6 +99,40 @@ impl TaskHostSession {
                 .captured_task_owner()
                 .is_some_and(|owner| owner.run_id == run.key.run_id)
         })
+    }
+
+    /// Attaches an actual SDK operation result, including an explicitly reconstructed runner, to this foreground host.
+    /// A checkpoint or ID is insufficient: revision, key and local retained pause readiness are checked without executing or granting work.
+    pub async fn observe_result(
+        &self,
+        runner: Arc<AutonomyRunner>,
+        result: &super::TaskRunResult,
+    ) -> Result<()> {
+        let run = &result.run;
+        let actual = runner
+            .task_inspection(&run.key.run_id, run.revision)
+            .await?;
+        if actual.run.key != run.key
+            || actual.run.status != run.status
+            || (!run.status.is_terminal()
+                && (run.status != super::TaskRunStatus::Paused || !actual.locally_retained))
+        {
+            return Err(super::TaskRunStorageError::NotResumable.into());
+        }
+        if run.status == super::TaskRunStatus::Paused {
+            runner
+                .task_interaction(&run.key.run_id, run.revision)
+                .await?;
+        }
+        if let Some(existing) = self.0.tasks.lock().get(&run.key.run_id)
+            && (existing.key != run.key || !Arc::ptr_eq(&existing.runner, &runner))
+        {
+            return Err(super::TaskRunStorageError::Conflict.into());
+        }
+        self.register(runner, run.key.clone())?;
+        self.admitted(&run.key.run_id);
+        self.publish(&run.key.run_id, run.revision);
+        Ok(())
     }
 
     /// Wakes for admission or acknowledged automatic publication; callers still read the exact current scoped snapshot.

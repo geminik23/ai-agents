@@ -34,6 +34,24 @@ cargo run -p ai-agents-cli -- eval \
 
 Most suites declare their own `agent:` path, so `--agent` is optional unless you intentionally want to override it.
 
+## Development task suites
+
+`mocked/autonomy/` exercises typed task operations, automatic state/skill entry, retained decisions, shared composition, domain evidence and isolated real file effects. The current foundation is development-only, not the published 1.1.1 contract or full task-evaluation acceptance.
+
+```sh
+sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+```
+
+The helper recognizes only the fixed `# Eval host: task-domain-evals` marker for the repository-owned Rust host example. Those suites need actual named Rust adapters and, for the capped file-artifact profile, an explicit host ceiling; they are not ordinary CLI-only agents. The binary uses the same `EvalRunner` and no provider keys. Run one host-required suite directly from the repository root:
+
+```sh
+cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- examples/eval/mocked/autonomy/research_mocked.yaml target/eval/research
+```
+
+Other autonomy suites use the standard CLI. `fixtures.files` initializes bounded relative files in the attempt workspace without overwriting existing effects; exact generated tokens can also appear in typed agent and tool-fixture values. Profiles requiring domain adapters cannot be made executable merely by loading their IDs. Mocked providers do not mock command/network/tool effects: keep their fixtures and workspace policy intact.
+
+Development reports use schema 2 and separate scenario success from acknowledged task status. Task observations are bounded and redacted; exact evidence remains assertion-only. Suite observability aggregates observed event prefixes, and task metrics do not double-count cumulative resume snapshots. Unacknowledged cleanup retains files and prevents automatic retries, so do not treat every error as proof that an attempt directory can be removed. Full fields, actions, migration and limitations are in `website/content/docs/evaluation.md`.
+
 ## Attempt-local fixtures
 
 Every scenario attempt receives an opaque temporary workspace. Generated values are available in runtime context as `eval.workspace` and, when enabled, `mock_server.base_url`.
@@ -51,7 +69,7 @@ fixtures:
 
 Interpolation is JSON-safe and leaves unrelated template expressions unchanged. Referencing `mock_server.base_url` without enabling the mock server is a configuration error.
 
-Parent storage and `spawner.shared_storage` file, SQLite, or Redis backends are isolated per attempt. The runner removes its temporary attempt workspace after completion, failure, or cancellation. When a source agent has an existing path policy, `fixtures.workspace_policy` can narrowly add the attempt workspace to named policies without disabling other restrictions:
+Parent storage and `spawner.shared_storage` file, SQLite, or Redis backends are isolated per attempt. The runner removes its temporary attempt workspace after acknowledged cleanup; uncertain task cleanup retains it for host inspection rather than promising safe removal. When a source agent has an existing path policy, `fixtures.workspace_policy` can narrowly add the attempt workspace to named policies without disabling other restrictions:
 
 ```yaml
 fixtures:

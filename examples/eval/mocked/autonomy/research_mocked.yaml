@@ -1,0 +1,35 @@
+# Eval host: task-domain-evals
+# The Rust host supplies actual attempt-local records and versioned domain adapters; no provider, socket or file tools run.
+name: Research Task Evidence
+agent: ../../../yaml/autonomy/research_task.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm:
+    mode: mock
+    responses_by_alias:
+      main:
+        - '{"tool":"domain","arguments":{"op":"source","value":"A"}}'
+        - '{"sources":["A"]}'
+        - '{"tool":"domain","arguments":{"op":"source","value":"A"}}'
+        - '{"sources":["A"]}'
+        - '{"tool":"domain","arguments":{"op":"source","value":"B"}}'
+        - '{"sources":["A","B"]}'
+      judge: ['{"overall_score":0.9}']
+scenarios:
+  - id: distinct-sources-not-repeated-requests
+    tags: [autonomy, research, mock, fixture]
+    steps:
+      - !task
+        operation: {action: run, objective: Compare two distinct sources., profile: research}
+        assert:
+          all:
+            - response_contains: '"sources":["A","B"]'
+            - task:
+                status: completed
+                counters: {path: turns, eq: 3}
+                checks: [{id: records, outcome: pass}, {id: quality, outcome: pass}]
+                event_result_parity: true
+                events_include: [validation_completed, completion_gate_checked, progress_observed]
+            - tool_called: {id: domain, count: 3, executed: true, success: true}
+            - tool_not_called: file_write
+            - tool_not_called: todo

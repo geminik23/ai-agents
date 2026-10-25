@@ -8,6 +8,46 @@ use std::sync::{Arc, atomic::Ordering};
 
 const TASK: &str = "name: HostControls\nsystem_prompt: Helpful\nautonomy:\n  enabled: true\n  max_turns: 4\n  max_llm_calls: 4\n  completion: {response_contains: done}\n  premature_finish: {action: ask_user, on_unavailable: stop}\n";
 
+// Exact inspection keeps sensitive observations host-local and rejects stale revisions without consuming the pending request.
+#[tokio::test]
+async fn task_inspection_is_revision_bound_read_only_and_content_free_in_debug() {
+    let provider = RecordingProvider::new(&["draft", "done"]);
+    let agent = agent(provider.clone());
+    let result = agent
+        .run_task("PRIVATE_INSPECTION_OBJECTIVE", None)
+        .await
+        .unwrap();
+    let runner = agent.task_runner().unwrap();
+    let inspection = runner
+        .task_inspection(&result.run.key.run_id, result.run.revision)
+        .await
+        .unwrap();
+    assert_eq!(inspection.run.revision, result.run.revision);
+    assert_eq!(inspection.run.objective, "PRIVATE_INSPECTION_OBJECTIVE");
+    assert!(inspection.scope.is_some());
+    assert!(!format!("{inspection:?}").contains("PRIVATE_INSPECTION_OBJECTIVE"));
+    assert!(
+        runner
+            .task_inspection(&result.run.key.run_id, result.run.revision - 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        runner
+            .task_display(&result.run.key.run_id)
+            .await
+            .unwrap()
+            .summary
+            .revision,
+        result.run.revision
+    );
+    runner
+        .cancel_paused(&result.run.key.run_id, result.run.revision)
+        .await
+        .unwrap();
+}
+
 // Each fixture uses actual controller/checkpoint boundaries and an independent offline provider queue.
 fn agent(provider: Arc<RecordingProvider>) -> RuntimeAgent {
     AgentBuilder::from_yaml(TASK)

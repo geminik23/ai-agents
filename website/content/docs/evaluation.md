@@ -28,6 +28,94 @@ agent.yaml
 
 ---
 
+## Development task evaluation foundation
+
+The development checkout supports typed task operations through the same configured runtime/controller used by explicit tasks and automatic state/skill entry. This is not part of the published 1.1.1 contract, and complete task-evaluation acceptance and documentation closure remain unfinished. Task evaluation is not a second executor and does not decide completion from response wording or UI strings.
+
+Run the current no-key task suites from the repository root:
+
+```sh
+sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+```
+
+The helper uses the normal CLI for stock integrations. A fixed `# Eval host: task-domain-evals` marker selects the repository's Rust host example for suites that require named domain validators, progress adapters or explicit host ceilings. That binary calls the same `EvalRunner::from_file(...).with_host(...)`; the marker cannot select an arbitrary program or grant tool authority. For example:
+
+```sh
+cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- examples/eval/mocked/autonomy/research_mocked.yaml target/eval/research
+```
+
+### Typed steps and exact continuation
+
+A task step uses the existing advanced-step YAML tag, `!task`. Ordinary `turns` still enter through normal chat; with `stream: true`, automatic root state/skill tasks also retain their bounded task events and exact acknowledged result. For an explicit task, the step shape is:
+
+```yaml
+steps:
+  - !task
+    operation: {action: run, objective: Prepare a verified report.}
+    assert:
+      task: {status: paused, pending_kind: user_question}
+  - !task
+    operation: {action: resume, response: {kind: answer, value: Continue the report.}}
+    assert:
+      task: {status: completed, same_run: true}
+```
+
+This is a fragment, not an agent or a complete suite. The selected agent must have a compatible enabled task profile and a question policy for the first expectation to hold. See the full `skill_scoped_mocked.yaml`, `support_mocked.yaml` and `hitl_pause_mocked.yaml` suites in `examples/eval/mocked/autonomy/` for their actual fixtures and source agents.
+
+| Operation | Required data and behavior |
+|---|---|
+| `run` | `objective`, optional named `profile`; starts a new explicit task |
+| `skill` | `objective`, `skill`, optional `profile`; executes an actually installed skill |
+| `resume` | Typed `response`; targets the last exact acknowledged run/revision/request, not a latest-state lookup |
+| `cancel`, `stop` | Retire the last known-safe paused task; `stop` also requires `reason` |
+| `objective` | `objective` and `reason`; preserves consumed work and requires separate explicit continuation |
+| `limits` | A complete runtime `TaskRunLimits` object plus `reason`; not a YAML profile patch or counter refill |
+| `inspect` | Reads the supplied/last acknowledged result without invoking work or replaying events |
+| `restoration_review` | Explicit `decision`; answers the fresh reconstruction review, not the original pending question/approval |
+
+A step also accepts positive `timeout_ms` and `expect_error` as a substring or a list of alternatives. Its `assert` tree is required and nonempty. Existing tool, response and runtime assertions remain available. A rejected operation cannot silently rebind its response to a newer request.
+
+Resume response `kind` is `continue`, `answer` with JSON `value`, `approval` with an `ApprovalResult` `decision`, `question_timeout`, or `external` with `event_id`, optional `target_revision` and JSON `payload`. An `ask_user` answer uses that tool's `QuestionResponse` shape; a controller/clarification answer uses the runtime's corresponding JSON value. The runtime validates the actual pending kind, choices, original deadlines, current policy and implementation binding. A `continue` response is not approval or an answer to an unrelated question.
+
+### Task assertions and evidence scope
+
+| `assert.task` field | Meaning |
+|---|---|
+| `status` | Exact acknowledged `running`, `paused`, `completed`, `incomplete`, `limit_reached`, `failed`, `cancelled` or `recovery_required` fact |
+| `pending_kind`, `stop_reason` | Typed pending category or exact host stop reason |
+| `same_run` | Whether the preceding acknowledged result has the same complete run key; unavailable on the first ordinary task result |
+| `counters` | Existing path matcher applied to cumulative authoritative task counters |
+| `progress` | Existing path matcher applied to stored progress checkpoint data, not a new completion permit |
+| `checks` | List of `{id, outcome}` predicates over the latest eligible capture in the acknowledged controller scope; outcomes are `pass`, `fail`, `unknown` |
+| `events_include` | Required categories from this operation's complete, bounded task-event capture |
+| `event_result_parity` | Whether the captured final task event agrees with the acknowledged result's run/revision/status |
+
+Missing task inspection, unknown check IDs, unavailable validation scope, and incomplete/uncollected event evidence are errors where those assertions need them. They cannot turn into successful negative evidence through `not`; `any` can use a genuinely passing alternative but cannot convert unavailable-only branches into a false fact. Sibling clauses are conjunctive even when an `any` branch succeeds.
+
+A scenario can pass while its expected task outcome is `failed`, `incomplete` or `paused`. Scenario success means the contract was verified, not that business work completed. A successful tool record alone is not task completion. Denied/rejected attempts may have a factual record with `executed: false`; assert its exact unfiltered count and non-execution rather than asserting the record is absent.
+
+Task tool assertions use the coordinating acknowledged ledger, including actual child records. Only the new suffix belongs to the current operation: resumed or inspected completed prefixes are not counted as fresh execution. Event delivery is bounded at 4,096 records per operation; saturation is explicit, not silent evidence loss. Inspection and non-streaming automatic turns provide no task-event capture, so they cannot prove event absence or parity.
+
+### Fixtures, cleanup and host integration
+
+`fixtures.files` maps relative slash-separated paths to UTF-8 text inside a fresh attempt workspace. It permits at most 256 files and 8 MiB of configured content, rejects absolute/parent/drive paths, and never overwrites an existing effect. Files survive resets that preserve storage; explicit persistence deletion recreates the configured initial files. Mutation suites use actual isolated writes only when explicitly declared, while command/network/approval effects still need separate fixtures.
+
+Only exact generated tokens `{{ eval.workspace }}` and `{{ mock_server.base_url }}` are substituted in typed agent values and tool-fixture values. LLM fixtures retain JSON-aware substitution; unrelated templates and map keys are unchanged. These are eval fixture tokens, not a new general agent templating feature. A mock-server token requires the enabled fixture server. `fixtures.workspace_policy` only narrows additions to existing named policies; it does not disable fail-closed checks.
+
+Timeouts keep polling actual admitted task work while requesting cancellation through the foreground session. The original operation and its events drain together; cancellation-request failure does not by itself drop that future. A separate bounded five-second drain/cleanup window does not prove physical termination. Cleanup uncertainty is sticky: it retains attempt files and prevents retry/reset until acknowledged cleanup, even if no local owner is currently visible. Previously completed operation evidence survives an interrupted attempt. Ordinary task completion still waits for required owned work; eval flushes background work before collecting assertion evidence.
+
+Rust `EvalHost::configure` installs domain tools/adapters before construction freezes them. Implementations must preserve declared budgets, caller-owned instrumentation and actual managed bindings, and must not hide provider work or detach effects. Pure `validate` callbacks must not construct providers. Optional asynchronous `prepare` can supply an actual prepared SDK runner/result to a fresh, explicitly configured host; it does not install default production reconstruction or certify clock continuity. Its result is revision-checked, and reconstruction review remains a separate typed step. The controlled SQLite producer/consumer regression exercises this explicit SDK boundary, not general OS restart support.
+
+The sequential step foundation supports ordinary root state/skill entry and task-owned coordinating composition. It does not yet certify every independently hosted child-question interleaving, strategy/fault combination or production restart environment. Mocked LLMs alone do not isolate tools or storage, and eval host code remains trusted integration code, not an OS sandbox.
+
+### Development report and Rust migration
+
+Development reports now use `schema_version: 2`. Per-operation `task` contains a bounded redacted display, category-only event list and up to 64 validation summaries with hashed check IDs, outcome and observed identity. Exact inspection, prompts, checkpoint/native data and validator metrics stay assertion-only; task path details also hide dynamic map keys. Markdown/JUnit task observations are separate from scenario status. Truncation is explicit and never cuts the exact runtime result.
+
+Suite observability now aggregates de-duplicated retained post-cursor events across observed turns/attempts, rather than returning only the last report. It is measured observed data, not proof of complete billing or execution authority; dropped/conflicting observations remain explicit. `observed_task_*` metrics use the latest observed revision per distinct run and do not sum cumulative resume snapshots twice or imply later cleanup state.
+
+Affected Rust literals include `Assertion.task`, `TurnEvidence.task`, `TurnResult.task`, `TurnObservabilityEvidence.events`, and `FixturesConfig.files`; use constructors/defaults where available. `ScenarioStep` adds `Task`, `ToolExecutionSource` adds `Task`, and observation `EventType` adds `TaskLifecycle`; update exhaustive matches. Task/controller records no longer silently use the `llm` source label. Existing JSONL compatibility rows remain chat-only: explicit `task` or `steps` fields now reject instead of being ignored, while unrelated legacy compatibility fields remain tolerated. YAML remains strict. See [task inspection and eval hosts](@/docs/rust-api.md#task-evaluation-inspection-development-only).
+
 ## Hierarchical alias fixtures (1.1)
 
 Version 1.1 supports hierarchical auxiliary routing. Assign fixture responses independently with `fixtures.llm.responses_by_alias` for each named alias. `evaluation.response` selects response judges and `evaluation.facts` selects semantic fact judges; an explicit response assertion alias still wins. This does not activate the otherwise unused `JudgeConfig.llm` as a global selector.
@@ -1086,7 +1174,7 @@ response metadata is omitted from JSON and JSONL
 
 Set `settings.redact_outputs: false` only for trusted local debugging.
 
-Machine-readable output includes `schema_version: 1`.
+The development checkout emits machine-readable `schema_version: 2`; published 1.1.1 reports use schema 1. See the development migration notes above before changing report consumers.
 
 ---
 

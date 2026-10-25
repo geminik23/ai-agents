@@ -184,6 +184,26 @@ impl TaskRunDisplay {
     }
 }
 
+/// Exact assertion-time observations from one acknowledged revision, not a fresh completion permit or a recovery cursor.
+/// This trusted-host type is deliberately not serializable; consumers must export a separate redacted projection.
+#[derive(Clone)]
+pub struct TaskRunInspection {
+    pub run: TaskRun,
+    pub scope: Option<EvaluationScope>,
+    pub evidence: EvaluationEvidence,
+    pub locally_retained: bool,
+}
+
+impl std::fmt::Debug for TaskRunInspection {
+    // Domain keys, metrics and responses are assertion-only data, including in error diagnostics.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskRunInspection")
+            .field("revision", &self.run.revision)
+            .field("status", &self.run.status)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Bounded human-readable facts for an authenticated local UI, never an export or execution permit.
 /// Lines are informational and must not be parsed back into controls; exact checkpoints and results remain unchanged.
 #[derive(Clone)]
@@ -361,6 +381,43 @@ impl AutonomyRunner {
                 .is_some_and(|o| o.run_id == run_id),
             restoration_review_required,
         )
+    }
+
+    /// Reads exact typed evaluation observations at the caller's acknowledged revision without claiming or invoking work.
+    /// Scope and evidence are historical facts; missing observations remain absent and callers cannot infer current external freshness.
+    pub async fn task_inspection(&self, run_id: &str, revision: u64) -> Result<TaskRunInspection> {
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        if snapshot.revision != revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let controller = payload
+            .adapters
+            .iter()
+            .find(|a| a.id == "runtime.controller");
+        let scope = controller
+            .map(|a| serde_json::from_value(a.state["scope"].clone()))
+            .transpose()?;
+        let evidence = controller
+            .map(|a| serde_json::from_value::<EvaluationEvidence>(a.state["evidence"].clone()))
+            .transpose()?
+            .unwrap_or_default()
+            .normalized()?;
+        let locally_retained = self
+            .agent
+            .captured_task_owner()
+            .is_some_and(|o| o.run_id == run_id);
+        Ok(TaskRunInspection {
+            run: TaskRun::from_checkpoint(&snapshot, &self.config_identity)?,
+            scope,
+            evidence,
+            locally_retained,
+        })
     }
 
     /// Reads allowlisted local presentation facts without exposing executable adapters, native history or owner tokens.

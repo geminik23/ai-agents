@@ -51,6 +51,15 @@ struct Journal {
 type Cut = Vec<(Arc<ObservabilityManager>, ObservabilityCursor)>;
 
 impl TaskTelemetry {
+    /// Uses the coordinating collector once for lifecycle facts; child registration must not duplicate root events.
+    pub(crate) fn primary(&self) -> Option<Arc<ObservabilityManager>> {
+        self.sources
+            .lock()
+            .first()
+            .map(|source| source.manager.clone())
+            .filter(|manager| manager.config().enabled)
+    }
+
     /// Permanently records an unobserved interval, including legacy images without a numeric journal.
     pub(crate) fn mark_missing(&self) {
         self.missing

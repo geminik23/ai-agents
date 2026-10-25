@@ -1,0 +1,15 @@
+name: State Task Post Exit Evidence
+agent: ../../../yaml/autonomy/state_task.yaml
+settings: {timeout_per_turn_ms: 10000, retries: 0}
+fixtures:
+  llm: {mode: mock, responses: [Candidate response., This must not execute.]}
+scenarios:
+  - id: scoped-exit-uses-eligible-gate-not-destination-work
+    turns:
+      - input: Complete the active work.
+        stream: true
+        assert:
+          all:
+            - task: {status: completed, counters: {path: llm_attempts, eq: 1}, event_result_parity: true}
+            - state: resolved
+            - response_not_contains: This must not execute.

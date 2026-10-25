@@ -595,10 +595,10 @@ pub use autonomy::{
     EvaluationScope, GateOutcome, HostControlAction, MAX_TASK_DISPLAY_BYTES, ProgressAdapter,
     RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload, TaskEventCursor, TaskHostDetails,
     TaskHostInteraction, TaskHostPrompt, TaskHostRun, TaskHostScope, TaskHostSession, TaskRun,
-    TaskRunDisplay, TaskRunEvent, TaskRunEventKind, TaskRunKey, TaskRunMutation, TaskRunResult,
-    TaskRunSnapshot, TaskRunStatus, TaskRunStorageError, TaskRunStore, TaskRunStream,
-    TaskRuntimeCheckpoint, TaskStreamConfig, TaskStreamOperation, TaskValidationJournal,
-    ValidationDriverState,
+    TaskRunDisplay, TaskRunEvent, TaskRunEventKind, TaskRunInspection, TaskRunKey, TaskRunMutation,
+    TaskRunResult, TaskRunSnapshot, TaskRunStatus, TaskRunStorageError, TaskRunStore,
+    TaskRunStream, TaskRuntimeCheckpoint, TaskStreamConfig, TaskStreamOperation,
+    TaskValidationJournal, ValidationDriverState,
 };
 pub use error::{AgentError, Result};
 pub use memory::{

@@ -11,7 +11,7 @@ use ai_agents_runtime::{Agent, AgentBuilder, AgentStreamEvent, RuntimeAgent, Str
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use serde_json::{Value, json};
-use tokio::time::{Duration, Instant as TokioInstant, timeout, timeout_at};
+use tokio::time::{Duration, Instant as TokioInstant, timeout_at};
 
 use crate::assertion::{
     Assertion, AssertionEvalContext, AssertionOutcome, AssertionResultDetail, evaluate_assertion,
@@ -105,6 +105,11 @@ impl RecordingApprovalLog {
 
 #[async_trait]
 impl AgentHooks for EvalRecordHooks {
+    // Recording is caller-owned in-memory work with no hidden provider calls or detached effects.
+    fn task_providers(&self) -> Option<Vec<Arc<dyn ai_agents_core::LLMProvider>>> {
+        Some(Vec::new())
+    }
+
     async fn on_llm_start(&self, messages: &[ai_agents_core::ChatMessage]) {
         self.llm_log.push_messages(messages);
     }
@@ -166,6 +171,7 @@ pub struct EvalRunner {
     suite: EvalSuite,
     /// Runtime options applied to the suite.
     options: EvalRunnerOptions,
+    host: Option<Arc<dyn crate::task::EvalHost>>,
 }
 
 // Bundles attempt-local construction state so resets rebuild with the same isolation, logging, approval, and budget inputs.
@@ -181,8 +187,34 @@ struct BuildAgentParams<'a> {
 }
 
 // Bundles the agent, scenario, turn, and attempt-local evidence logs used to produce one turn result.
+// State outlives the timed future so interrupted attempts retain completed evidence and actual participant custody.
+struct AttemptState {
+    session: ai_agents_runtime::autonomy::TaskHostSession,
+    deadline: Option<TokioInstant>,
+    partial: Mutex<Vec<TurnResult>>,
+    initializing: Arc<std::sync::atomic::AtomicBool>,
+    cleanup_uncertain: Arc<std::sync::atomic::AtomicBool>,
+}
+impl AttemptState {
+    fn push(&self, turns: &mut Vec<TurnResult>, result: TurnResult) {
+        turns.push(result);
+        *self
+            .partial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = turns.clone();
+    }
+    fn partial(&self) -> Vec<TurnResult> {
+        self.partial
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
 struct RunTurnParams<'a> {
     agent: &'a RuntimeAgent,
+    tasks: &'a mut crate::task::TaskContext,
+    task: Option<&'a crate::task::TaskStep>,
     scenario: &'a Scenario,
     turn: &'a Turn,
     index: usize,
@@ -277,7 +309,14 @@ impl EvalRunner {
             suite_path: path,
             suite,
             options,
+            host: None,
         })
+    }
+
+    /// Installs caller-owned domain adapters before construction without replacing eval fixtures or execution ownership.
+    pub fn with_host(mut self, host: Arc<dyn crate::task::EvalHost>) -> Self {
+        self.host = Some(host);
+        self
     }
 
     pub fn validate_file(path: impl AsRef<Path>, agent_override: Option<PathBuf>) -> Result<()> {
@@ -292,7 +331,7 @@ impl EvalRunner {
         let agent_path = if let Some(agent) = agent_override {
             agent
         } else {
-            let agent = suite.agent.ok_or_else(|| {
+            let agent = suite.agent.clone().ok_or_else(|| {
                 EvalError::Config("agent path is required in suite or CLI".into())
             })?;
             if agent.is_absolute() {
@@ -315,7 +354,8 @@ impl EvalRunner {
                 agent_path.display(),
                 error
             ))
-        })
+        })?;
+        suite.validate_agent(&spec)
     }
 
     pub async fn run(&self) -> Result<EvalResult> {
@@ -351,7 +391,7 @@ impl EvalRunner {
         let observability = final_observability_report(&results);
 
         Ok(EvalResult {
-            schema_version: 1,
+            schema_version: 2,
             suite: self.suite.name.clone(),
             agent: agent_path.display().to_string(),
             total,
@@ -384,7 +424,12 @@ impl EvalRunner {
                     }
                 }
                 Err(error) => {
-                    results.push(error_result(scenario, error, FailureCategory::RuntimeError));
+                    results.push(error_result(
+                        scenario,
+                        error,
+                        FailureCategory::RuntimeError,
+                        self.suite.settings.redact_outputs,
+                    ));
                     if self.suite.settings.fail_fast {
                         break;
                     }
@@ -405,7 +450,12 @@ impl EvalRunner {
             .map(|(idx, scenario)| async move {
                 let result = self.run_scenario(agent_path, base_dir, scenario).await;
                 let result = result.unwrap_or_else(|error| {
-                    error_result(scenario, error, FailureCategory::RuntimeError)
+                    error_result(
+                        scenario,
+                        error,
+                        FailureCategory::RuntimeError,
+                        self.suite.settings.redact_outputs,
+                    )
                 });
                 (idx, result)
             })
@@ -505,19 +555,52 @@ impl EvalRunner {
         };
 
         for attempt_idx in 0..max_attempt {
-            let attempt_future =
-                self.run_attempt(agent_path, base_dir, scenario, attempt_idx, budget.clone());
-            let attempt = if let Some(timeout_ms) = self.suite.settings.timeout_per_scenario_ms {
-                match timeout(Duration::from_millis(timeout_ms), attempt_future).await {
-                    Ok(result) => result,
-                    Err(_) => Err(EvalError::Runtime(format!(
-                        "scenario '{}' attempt {} timed out after {}ms",
-                        scenario.id, attempt_idx, timeout_ms
-                    ))),
+            let state = AttemptState {
+                session: ai_agents_runtime::autonomy::TaskHostSession::new(true),
+                deadline: self
+                    .suite
+                    .settings
+                    .timeout_per_scenario_ms
+                    .map(|ms| TokioInstant::now() + Duration::from_millis(ms)),
+                partial: Default::default(),
+                initializing: Default::default(),
+                cleanup_uncertain: Default::default(),
+            };
+            let attempt_future = self.run_attempt(
+                agent_path,
+                base_dir,
+                scenario,
+                attempt_idx,
+                budget.clone(),
+                &state,
+            );
+            let attempt = if let Some(deadline) = state.deadline {
+                match crate::task::drive(&state.session, attempt_future, deadline).await {
+                    Ok((Ok(mut result), deadline_error)) => {
+                        if let Some(reason) = deadline_error {
+                            result.status = ScenarioStatus::Error {
+                                message: redact_text(
+                                    &reason,
+                                    self.suite.settings.redact_outputs,
+                                    0,
+                                )
+                                .value,
+                            };
+                        }
+                        Ok(result)
+                    }
+                    Ok((Err(error), _)) | Err(error) => Err(error),
                 }
             } else {
                 attempt_future.await
             };
+            let protected = state.session.has_protected_work()
+                || state
+                    .cleanup_uncertain
+                    .load(std::sync::atomic::Ordering::Acquire)
+                || state
+                    .initializing
+                    .load(std::sync::atomic::Ordering::Acquire);
             match attempt {
                 Ok(attempt_result) => {
                     final_status = attempt_result.status.clone();
@@ -536,18 +619,29 @@ impl EvalRunner {
                         failure_category_for_attempt(&attempt_result)
                     });
                     attempts.push(attempt_result);
+                    if protected {
+                        break;
+                    }
                 }
                 Err(error) => {
                     final_status = ScenarioStatus::Error {
-                        message: error.to_string(),
+                        message: redact_text(
+                            &error.to_string(),
+                            self.suite.settings.redact_outputs,
+                            0,
+                        )
+                        .value,
                     };
                     category = Some(FailureCategory::RuntimeError);
                     attempts.push(AttemptResult {
                         attempt: attempt_idx,
-                        turns: Vec::new(),
+                        turns: state.partial(),
                         status: final_status.clone(),
                         duration_ms: 0,
                     });
+                    if protected {
+                        break;
+                    }
                 }
             }
             if budget
@@ -583,11 +677,13 @@ impl EvalRunner {
         scenario: &Scenario,
         attempt: u32,
         budget: Option<ScenarioBudgetTracker>,
+        state: &AttemptState,
     ) -> Result<AttemptResult> {
         let start = Instant::now();
         let _env_guard = EnvGuard::apply(&scenario.env)?;
         let mock_server = start_mock_server(self.suite.fixtures.mock_server.as_ref()).await?;
         let attempt_context = AttemptWorkspace::create(mock_server.as_ref())?;
+        attempt_context.materialize_files(&self.suite.fixtures)?;
         let tool_log = RecordingToolLog::new();
         let approval_log = RecordingApprovalLog::default();
         let llm_log = RecordingLlmLog::default();
@@ -597,8 +693,8 @@ impl EvalRunner {
             .approvals
             .as_ref()
             .map(build_approval_handler);
-        let mut agent = self
-            .build_agent(BuildAgentParams {
+        let mut agent = Arc::new(
+            self.build_agent(BuildAgentParams {
                 agent_path,
                 base_dir,
                 attempt_context: &attempt_context,
@@ -608,16 +704,42 @@ impl EvalRunner {
                 approval_handler: approval_handler.clone(),
                 budget: budget.clone(),
             })
-            .await?;
+            .await?,
+        );
         apply_base_context(&agent, &self.suite, base_dir, scenario, &attempt_context)?;
         let mut turns = Vec::new();
         let mut status = ScenarioStatus::Passed;
+        let mut tasks = crate::task::TaskContext::with_session(state.session.clone());
+        let workspace_hold = attempt_context.hold_for_tasks();
+        tasks.workspace_hold = Some(workspace_hold.clone());
+        tasks.deadline = state.deadline;
+        tasks.initializing = Some(state.initializing.clone());
+        tasks.cleanup_uncertain = Some(state.cleanup_uncertain.clone());
+        if let Some(host) = &self.host {
+            state
+                .initializing
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some((runner, result)) = host.prepare(agent.clone(), &attempt_context).await? {
+                tasks
+                    .session
+                    .observe_result(runner.clone(), &result)
+                    .await?;
+                agent = runner.runtime().clone();
+                tasks.runner_override = Some(runner);
+                tasks.last = Some(result);
+            }
+            state
+                .initializing
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
 
         if !scenario.turns.is_empty() {
             for (idx, turn) in scenario.turns.iter().enumerate() {
                 let turn_execution = self
                     .run_turn(RunTurnParams {
                         agent: &agent,
+                        tasks: &mut tasks,
+                        task: None,
                         scenario,
                         turn,
                         index: idx,
@@ -632,7 +754,7 @@ impl EvalRunner {
                     .iter()
                     .any(|result| !result.passed);
                 let runtime_error = turn_execution.unhandled_runtime_error;
-                turns.push(turn_execution.result);
+                state.push(&mut turns, turn_execution.result);
                 if let Some(message) = runtime_error {
                     status = ScenarioStatus::Error { message };
                     break;
@@ -663,6 +785,8 @@ impl EvalRunner {
                         let turn_execution = self
                             .run_turn(RunTurnParams {
                                 agent: &agent,
+                                tasks: &mut tasks,
+                                task: None,
                                 scenario,
                                 turn,
                                 index: idx,
@@ -677,7 +801,7 @@ impl EvalRunner {
                             .iter()
                             .any(|result| !result.passed);
                         let runtime_error = turn_execution.unhandled_runtime_error;
-                        turns.push(turn_execution.result);
+                        state.push(&mut turns, turn_execution.result);
                         if let Some(message) = runtime_error {
                             status = ScenarioStatus::Error { message };
                             break;
@@ -695,11 +819,56 @@ impl EvalRunner {
                         agent.save_session(session).await?;
                     }
                 }
+                ScenarioStep::Task(task) => {
+                    let turn = Turn {
+                        input: String::new(),
+                        actor: None,
+                        context: Value::Null,
+                        stream: None,
+                        timeout_ms: task.timeout_ms,
+                        assertions: Some(task.assertions.clone()),
+                    };
+                    let execution = self
+                        .run_turn(RunTurnParams {
+                            agent: &agent,
+                            tasks: &mut tasks,
+                            task: Some(task),
+                            scenario,
+                            turn: &turn,
+                            index: turns.len(),
+                            tool_log: &tool_log,
+                            approval_log: &approval_log,
+                            llm_log: &llm_log,
+                        })
+                        .await?;
+                    let failed = execution
+                        .result
+                        .assertion_results
+                        .iter()
+                        .any(|result| !result.passed);
+                    state.push(&mut turns, execution.result);
+                    if let Some(message) = execution.unhandled_runtime_error {
+                        status = ScenarioStatus::Error { message };
+                    } else if failed {
+                        status = ScenarioStatus::Failed {
+                            reason: "task assertion failed".into(),
+                        };
+                    }
+                }
                 ScenarioStep::ResetAgent(reset) => {
+                    tasks.cleanup().await?;
+                    let deadline = tasks.deadline;
+                    let session = tasks.session.clone();
+                    tasks = crate::task::TaskContext::with_session(session);
+                    tasks.deadline = deadline;
+                    tasks.cleanup_uncertain = Some(state.cleanup_uncertain.clone());
+                    tasks.workspace_hold = Some(workspace_hold.clone());
+                    workspace_hold.store(true, std::sync::atomic::Ordering::Release);
                     if let Some(options) = reset_options(reset) {
                         if options.delete_persistence || !options.preserve_storage {
                             let _ = std::fs::remove_dir_all(&attempt_context.workspace);
                             std::fs::create_dir_all(&attempt_context.workspace)?;
+                            attempt_context.materialize_files(&self.suite.fixtures)?;
                         }
                         let preserved_actor = options
                             .preserve_actor_id
@@ -710,8 +879,8 @@ impl EvalRunner {
                         {
                             agent.reset().await?;
                         } else {
-                            agent = self
-                                .build_agent(BuildAgentParams {
+                            agent = Arc::new(
+                                self.build_agent(BuildAgentParams {
                                     agent_path,
                                     base_dir,
                                     attempt_context: &attempt_context,
@@ -721,7 +890,8 @@ impl EvalRunner {
                                     approval_handler: approval_handler.clone(),
                                     budget: budget.clone(),
                                 })
-                                .await?;
+                                .await?,
+                            );
                         }
                         if options.preserve_host_context {
                             apply_base_context(
@@ -761,6 +931,14 @@ impl EvalRunner {
             }
         }
 
+        match tasks.cleanup().await {
+            Ok(()) => workspace_hold.store(false, std::sync::atomic::Ordering::Release),
+            Err(_) => status = ScenarioStatus::Error {
+                message:
+                    "task cleanup unacknowledged; attempt workspace retained; no automatic retry"
+                        .into(),
+            },
+        }
         Ok(AttemptResult {
             attempt,
             turns,
@@ -790,7 +968,8 @@ impl EvalRunner {
             budget,
         } = params;
         let content = std::fs::read_to_string(agent_path)?;
-        let mut spec = AgentSpec::from_yaml_strict(&content)?;
+        let parsed = AgentSpec::from_yaml_strict(&content)?;
+        let mut spec = attempt_context.interpolate_config(&parsed)?;
         apply_eval_llm_settings(&mut spec, &self.suite.settings);
         isolate_spec_storage(&mut spec, attempt_context);
         apply_workspace_policy(
@@ -800,6 +979,7 @@ impl EvalRunner {
         )?;
         spec.validate()
             .map_err(|error| EvalError::Config(error.to_string()))?;
+        self.suite.validate_agent(&spec)?;
         let llm_fixture = attempt_context.interpolate_llm_fixture(&self.suite.fixtures.llm)?;
         let provider_configs = budget_provider_configs(&spec);
         let (mut llm_registry, _judge_llm) = build_llm_registry(&spec, &llm_fixture, base_dir)?;
@@ -816,20 +996,33 @@ impl EvalRunner {
                     budget.wrap(provider, config)
                 });
         }
+        // Tool fixture values are typed JSON; LLM content keeps its dedicated JSON-aware interpolation path.
+        let mut tool_fixtures = self.suite.fixtures.clone();
+        tool_fixtures.llm = Default::default();
+        let tool_fixtures = attempt_context.interpolate_config(&tool_fixtures)?;
         let tool_registry = crate::fixtures::build_tool_registry_for_routing(
-            &self.suite.fixtures,
+            &tool_fixtures,
             tool_log.clone(),
             spec.llm.router_roles().is_some(),
         )?;
         let agent_base_dir = agent_path.parent().unwrap_or_else(|| Path::new("."));
-        let mut builder = AgentBuilder::from_spec_with_base_dir(spec, agent_base_dir)
+        if let Some(host) = &self.host {
+            host.validate(&spec)?;
+        }
+        let builder = AgentBuilder::from_spec_with_base_dir(spec, agent_base_dir)
             .llm_registry(llm_registry)
             .tools(tool_registry)
             .hooks(Arc::new(EvalRecordHooks {
                 tool_log,
                 approval_log,
                 llm_log,
-            }))
+            }));
+        let builder = if let Some(host) = &self.host {
+            host.configure(builder, attempt_context)?
+        } else {
+            builder
+        };
+        let mut builder = builder
             .auto_configure_features()
             .map_err(|error| EvalError::Config(error.to_string()))?
             .auto_configure_mcp()
@@ -858,7 +1051,9 @@ impl EvalRunner {
             .await
             .map_err(|error| EvalError::Config(error.to_string()))?;
         let agent = builder
-            .build()
+            .task_interaction_delivery(true)
+            .build_task_host()
+            .await
             .map_err(|error| EvalError::Config(error.to_string()))?;
         agent.init_storage().await?;
         Ok(agent)
@@ -927,6 +1122,8 @@ impl EvalRunner {
     async fn run_turn(&self, params: RunTurnParams<'_>) -> Result<TurnExecution> {
         let RunTurnParams {
             agent,
+            tasks,
+            task,
             scenario,
             turn,
             index,
@@ -950,18 +1147,65 @@ impl EvalRunner {
         let timeout_ms = turn
             .timeout_ms
             .unwrap_or(self.suite.settings.timeout_per_turn_ms);
-        let mut operation = if turn.stream.unwrap_or(false) {
-            collect_stream_response(agent, &turn.input, timeout_ms).await
+        let timeout_ms = tasks.remaining(timeout_ms);
+        if let Some(hold) = &tasks.workspace_hold {
+            hold.store(true, std::sync::atomic::Ordering::Release);
+        }
+        tasks.events.clear();
+        tasks.events_complete = true;
+        let mut task_result = None;
+        let mut operation = if timeout_ms == 0 {
+            TurnOperation::error("scenario deadline reached before task admission".into())
+        } else if let Some(step) = task {
+            match tasks.operate(agent, step, timeout_ms).await {
+                Ok((result, runtime_error)) => {
+                    let response = result.final_response.clone();
+                    task_result = Some(result);
+                    TurnOperation {
+                        task_events: Vec::new(),
+                        events_complete: true,
+                        response_content: response
+                            .as_ref()
+                            .map_or_else(String::new, |r| r.content.clone()),
+                        response_metadata: response.as_ref().and_then(|r| r.metadata.clone()),
+                        response_present: response.is_some(),
+                        runtime_error,
+                    }
+                }
+                Err(error) => TurnOperation::error(error.to_string()),
+            }
         } else {
-            match timeout(Duration::from_millis(timeout_ms), agent.chat(&turn.input)).await {
-                Ok(Ok(response)) => TurnOperation {
-                    response_content: response.content,
-                    response_metadata: response.metadata,
-                    response_present: true,
-                    runtime_error: None,
-                },
-                Ok(Err(error)) => TurnOperation::error(error.to_string()),
-                Err(_) => TurnOperation::error(format!("turn timed out after {}ms", timeout_ms)),
+            let work = async {
+                if turn.stream.unwrap_or(false) {
+                    collect_stream_response(agent, &turn.input, timeout_ms).await
+                } else {
+                    match agent.chat(&turn.input).await {
+                        Ok(response) => TurnOperation {
+                            task_events: Vec::new(),
+                            events_complete: false,
+                            response_content: response.content,
+                            response_metadata: response.metadata,
+                            response_present: true,
+                            runtime_error: None,
+                        },
+                        Err(error) => TurnOperation::error(error.to_string()),
+                    }
+                }
+            };
+            match crate::task::drive(
+                &tasks.session,
+                work,
+                TokioInstant::now() + Duration::from_millis(timeout_ms),
+            )
+            .await
+            {
+                Ok((mut operation, deadline_error)) => {
+                    if let Some(reason) = deadline_error {
+                        operation.runtime_error.get_or_insert(reason);
+                    }
+                    operation
+                }
+                Err(error) => TurnOperation::error(error.to_string()),
             }
         };
         if let Err(error) = agent.flush_background_tasks().await
@@ -978,9 +1222,47 @@ impl EvalRunner {
             before_relationship,
             observability_cursor,
         );
+        for event in std::mem::take(&mut operation.task_events) {
+            tasks.record(event);
+        }
+        tasks.events_complete &= operation.events_complete;
+        if task_result.is_none()
+            && let Some(result) = agent.automatic_task_result()
+        {
+            let matches = operation
+                .response_metadata
+                .as_ref()
+                .and_then(|m| m.get("task_run"))
+                .is_some_and(|m| {
+                    m.get("run_id").and_then(Value::as_str) == Some(result.run.key.run_id.as_str())
+                        && m.get("revision").and_then(Value::as_u64) == Some(result.run.revision)
+                });
+            if matches {
+                task_result = Some(result);
+            }
+        }
+        let mut task_report = None;
+        if let Some(result) = task_result {
+            // The coordinating ledger includes actual child tools, even when their local hooks are not the parent's eval hook.
+            // Only the new acknowledged suffix belongs to this operation; completed prefixes must not be counted again on resume/inspection.
+            let prefix = tasks
+                .last
+                .as_ref()
+                .filter(|previous| previous.run.key == result.run.key)
+                .map_or(0, |previous| previous.run.evidence.tool_calls.len());
+            let operation_tools = RecordingToolLog::new();
+            for record in result.run.evidence.tool_calls.iter().skip(prefix) {
+                operation_tools.push_executor_record(&record.record);
+            }
+            evidence.tool_executions = operation_tools.records_since(0);
+            let (observations, report) = tasks.capture(agent, result).await?;
+            evidence.task = Some(observations);
+            task_report = Some(report);
+        }
         evidence.approvals = approval_log.records_since(approval_start);
         evidence.llm_requests = llm_log.records_since(llm_start);
         let judge = self.build_judge(agent);
+        let mut assertion_error = None;
         let mut assertion_results = if let Some(assertion) = &turn.assertions {
             match evaluate_assertion(
                 assertion,
@@ -996,7 +1278,16 @@ impl EvalRunner {
             .await
             {
                 AssertionOutcome::Passed(details) | AssertionOutcome::Failed(details) => details,
-                AssertionOutcome::Error(message) => return Err(EvalError::Assertion(message)),
+                AssertionOutcome::Error(message) => {
+                    assertion_error = Some(message);
+                    vec![AssertionResultDetail {
+                        assertion: "evidence_unavailable".into(),
+                        passed: false,
+                        actual: Value::Null,
+                        expected: json!("available evidence"),
+                        message: None,
+                    }]
+                }
             }
         } else {
             Vec::new()
@@ -1016,7 +1307,9 @@ impl EvalRunner {
             });
         }
 
-        let expected_error = turn_expected_error(turn);
+        let expected_error = task
+            .and_then(|step| step.expect_error.clone())
+            .or_else(|| turn_expected_error(turn));
         let unhandled_runtime_error = match (&expected_error, &operation.runtime_error) {
             (Some(expected), Some(error)) if expected.matches(error) => {
                 assertion_results.push(AssertionResultDetail {
@@ -1065,7 +1358,8 @@ impl EvalRunner {
             .runtime_error
             .as_deref()
             .map(|error| redact_text(error, self.suite.settings.redact_outputs, 0));
-        let unhandled_runtime_error = unhandled_runtime_error
+        let unhandled_runtime_error = assertion_error
+            .or(unhandled_runtime_error)
             .map(|error| redact_text(&error, self.suite.settings.redact_outputs, 0).value);
         Ok(TurnExecution {
             result: TurnResult {
@@ -1090,6 +1384,7 @@ impl EvalRunner {
                         .response_metadata
                         .and_then(|metadata| serde_json::to_value(metadata).ok())
                 },
+                task: task_report,
                 evidence,
                 assertion_results,
                 latency_ms,
@@ -1110,6 +1405,8 @@ struct TurnExecution {
 }
 
 struct TurnOperation {
+    task_events: Vec<ai_agents_runtime::autonomy::TaskRunEvent>,
+    events_complete: bool,
     response_content: String,
     response_metadata: Option<HashMap<String, Value>>,
     response_present: bool,
@@ -1119,6 +1416,8 @@ struct TurnOperation {
 impl TurnOperation {
     fn error(message: String) -> Self {
         Self {
+            task_events: Vec::new(),
+            events_complete: true,
             response_content: String::new(),
             response_metadata: None,
             response_present: false,
@@ -1132,36 +1431,62 @@ async fn collect_stream_response(
     input: &str,
     timeout_ms: u64,
 ) -> TurnOperation {
-    let deadline = TokioInstant::now() + Duration::from_millis(timeout_ms);
-    let stream = match timeout_at(deadline, agent.chat_stream_events(input)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(error)) => return TurnOperation::error(error.to_string()),
-        Err(_) => return TurnOperation::error(format!("turn timed out after {}ms", timeout_ms)),
+    let stream = match agent.chat_stream_events(input).await {
+        Ok(stream) => stream,
+        Err(error) => return TurnOperation::error(error.to_string()),
     };
-    consume_stream_response(stream, deadline, timeout_ms).await
+    consume_stream_response_inner(stream, None, timeout_ms).await
 }
 
 // Uses Final as the successful result and treats the first Error as terminal; expected HITL rejection is delivered as Final.
+#[cfg(test)]
 async fn consume_stream_response<S>(
-    mut stream: S,
+    stream: S,
     deadline: TokioInstant,
     timeout_ms: u64,
 ) -> TurnOperation
 where
     S: futures::Stream<Item = AgentStreamEvent> + Unpin,
 {
+    consume_stream_response_inner(stream, Some(deadline), timeout_ms).await
+}
+
+async fn consume_stream_response_inner<S>(
+    mut stream: S,
+    deadline: Option<TokioInstant>,
+    timeout_ms: u64,
+) -> TurnOperation
+where
+    S: futures::Stream<Item = AgentStreamEvent> + Unpin,
+{
+    let mut task_events = Vec::new();
+    let mut events_complete = true;
     let mut partial_content = String::new();
     let mut partial_content_seen = false;
     let mut runtime_error = None;
     let mut final_response = None;
     loop {
-        match timeout_at(deadline, stream.next()).await {
+        let event = if let Some(deadline) = deadline {
+            timeout_at(deadline, stream.next()).await
+        } else {
+            Ok(stream.next().await)
+        };
+        match event {
+            Ok(Some(AgentStreamEvent::Task(event))) => {
+                if task_events.len() < 4096 {
+                    task_events.push(event);
+                } else {
+                    events_complete = false;
+                }
+            }
             Ok(Some(AgentStreamEvent::Chunk(StreamChunk::Content { text }))) => {
                 partial_content_seen = true;
                 partial_content.push_str(&text);
             }
             Ok(Some(AgentStreamEvent::Chunk(StreamChunk::Error { message }))) => {
                 return TurnOperation {
+                    task_events,
+                    events_complete,
                     response_content: partial_content,
                     response_metadata: None,
                     response_present: partial_content_seen,
@@ -1186,6 +1511,8 @@ where
 
     if let Some(response) = final_response {
         return TurnOperation {
+            task_events,
+            events_complete,
             response_content: response.content,
             response_metadata: response.metadata,
             response_present: true,
@@ -1196,6 +1523,8 @@ where
         runtime_error = Some("stream ended before Final".to_string());
     }
     TurnOperation {
+        task_events,
+        events_complete,
         response_content: partial_content,
         response_metadata: None,
         response_present: partial_content_seen,
@@ -1352,8 +1681,18 @@ fn reset_options(config: &ResetStepConfig) -> Option<crate::reset::ResetOptions>
 
 fn redact_assertion_details(details: &mut [crate::assertion::AssertionResultDetail]) {
     for detail in details {
-        detail.actual = redact_value(std::mem::take(&mut detail.actual), true, 0);
-        detail.expected = redact_value(std::mem::take(&mut detail.expected), true, 0);
+        let actual = std::mem::take(&mut detail.actual);
+        let expected = std::mem::take(&mut detail.expected);
+        // Task paths may contain domain IDs as map keys; recursive value-only redaction cannot safely export those subtrees.
+        if detail.assertion.starts_with("task.")
+            && (actual.is_object() || actual.is_array() || expected.is_object())
+        {
+            detail.actual = json!({"redacted":true});
+            detail.expected = json!({"redacted":true});
+        } else {
+            detail.actual = redact_value(actual, true, 0);
+            detail.expected = redact_value(expected, true, 0);
+        }
     }
 }
 
@@ -1361,6 +1700,7 @@ fn error_result(
     scenario: &Scenario,
     error: EvalError,
     category: FailureCategory,
+    redact: bool,
 ) -> ScenarioResult {
     ScenarioResult {
         id: scenario.id.clone(),
@@ -1368,7 +1708,7 @@ fn error_result(
         tags: scenario.tags.clone(),
         language: scenario.language.clone(),
         status: ScenarioStatus::Error {
-            message: error.to_string(),
+            message: redact_text(&error.to_string(), redact, 0).value,
         },
         failure_category: Some(category),
         flaky: false,
@@ -1394,17 +1734,37 @@ fn failure_category_for_attempt(attempt: &AttemptResult) -> FailureCategory {
 fn final_observability_report(
     results: &[ScenarioResult],
 ) -> Option<ai_agents_observability::ObservabilityReport> {
-    results
+    let observations: Vec<_> = results
         .iter()
-        .rev()
-        .flat_map(|scenario| scenario.attempts.iter().rev())
-        .flat_map(|attempt| attempt.turns.iter().rev())
-        .find_map(|turn| {
-            turn.evidence
-                .observability
-                .as_ref()
-                .and_then(|obs| obs.report.clone())
-        })
+        .flat_map(|scenario| &scenario.attempts)
+        .flat_map(|attempt| &attempt.turns)
+        .filter_map(|turn| turn.evidence.observability.as_ref())
+        .collect();
+    if observations.is_empty() {
+        return None;
+    }
+    let mut events = std::collections::BTreeMap::new();
+    let mut dropped = 0;
+    for observation in observations {
+        dropped += observation
+            .report
+            .as_ref()
+            .map_or(0, |report| report.dropped_events);
+        for event in &observation.events {
+            if let Some(old) = events.get(&event.span_id) {
+                if serde_json::to_value(old).ok() != serde_json::to_value(event).ok() {
+                    dropped += 1;
+                }
+            } else {
+                events.insert(event.span_id.clone(), event.clone());
+            }
+        }
+    }
+    Some(ai_agents_observability::report::generate_report(
+        &events.into_values().collect::<Vec<_>>(),
+        Vec::new(),
+        dropped,
+    ))
 }
 
 fn apply_eval_llm_settings(spec: &mut AgentSpec, settings: &crate::suite::EvalSettings) {
@@ -2269,7 +2629,8 @@ llm:
         let path = workspace.workspace.join("agent.yaml");
         let runner = EvalRunner {
             suite_path: workspace.workspace.join("suite.yaml"),
-            suite: parse_eval_suite_yaml("name: construction\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\nscenarios:\n  - id: check\n    turns:\n      - input: hello\n").unwrap(),
+            host: None,
+                        suite: parse_eval_suite_yaml("name: construction\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\nscenarios:\n  - id: check\n    turns:\n      - input: hello\n").unwrap(),
             options: EvalRunnerOptions::default(),
         };
         let llm_log = RecordingLlmLog::default();
@@ -2309,7 +2670,8 @@ llm:
         let workspace_path = workspace.workspace.clone();
         let runner = EvalRunner {
             suite_path: workspace.workspace.join("suite.yaml"),
-            suite: parse_eval_suite_yaml("name: pending-build\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\n    responses: [ok]\nscenarios:\n  - id: check\n    turns:\n      - input: hello\n").unwrap(),
+            host: None,
+                        suite: parse_eval_suite_yaml("name: pending-build\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\n    responses: [ok]\nscenarios:\n  - id: check\n    turns:\n      - input: hello\n").unwrap(),
             options: EvalRunnerOptions::default(),
         };
         let llm_log = RecordingLlmLog::default();
@@ -2352,7 +2714,8 @@ llm:
         let agent_path = source.workspace.join("agent.yaml");
         let runner = EvalRunner {
             suite_path: source.workspace.join("suite.yaml"),
-            suite: parse_eval_suite_yaml("name: drop\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\n    responses: [ok]\n    delays_by_alias: {default: 60000}\nscenarios:\n  - id: pending\n    turns:\n      - input: hello\n").unwrap(),
+            host: None,
+                        suite: parse_eval_suite_yaml("name: drop\nagent: agent.yaml\nfixtures:\n  llm:\n    mode: mock\n    responses: [ok]\n    delays_by_alias: {default: 60000}\nscenarios:\n  - id: pending\n    turns:\n      - input: hello\n").unwrap(),
             options: EvalRunnerOptions::default(),
         };
         let workspace = AttemptWorkspace::create(None).unwrap();
@@ -2397,6 +2760,7 @@ llm:
         write_test_agent(&source.workspace);
         let runner = EvalRunner {
             suite_path: source.workspace.join("suite.yaml"),
+            host: None,
             suite: parse_eval_suite_yaml(
                 r#"
 name: parallel-reset

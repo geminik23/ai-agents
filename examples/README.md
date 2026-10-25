@@ -2,7 +2,7 @@
 
 Examples are organized by usage style:
 
-- `yaml/` - YAML-first examples run with `ai-agents-cli`
+- `yaml/` - YAML-first declarations; stock examples run with `ai-agents-cli`, while domain autonomy examples document their required Rust host
 - `rust/` - Rust examples for embedding, extension, and custom integrations
 
 Browse by goal: [YAML agents](#yaml-examples), [Rust integration](#rust-examples), or [evaluation suites](#evaluation-examples).
@@ -52,7 +52,7 @@ Use `eval/mocked/**/*.yaml` for default no-key checks. Do not glob all of `eval/
 
 ### Mocked no-key suites
 
-Mocked suites cover every runnable YAML example category: basic, context, disambiguation, error-recovery, HITL, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
+Mocked suites cover every runnable YAML example category: autonomy, basic, context, disambiguation, error-recovery, HITL, memory, observability, orchestration, persona, process, reasoning, relationships, runtime-optimization, session, skills, spawner, state-machine, and tools. Each suite uses a mock LLM provider, requires no API keys, and runs deterministically. Suites verify structural runtime evidence such as tool calls, state transitions, context paths, orchestration metadata, observability counts, relationship scores, fact extraction, disambiguation status, and persona secret gating.
 
 Run all mocked suites with the convenience helper:
 
@@ -579,6 +579,36 @@ cargo run -p ai-agents-cli -- run examples/yaml/orchestration/support_handoff.ya
 cargo run -p ai-agents-cli -- run examples/yaml/orchestration/team_coordinator.yaml
 ```
 
+### `yaml/autonomy/`
+
+Development-only task profiles use the existing controller, not a coding-specific execution loop. The no-key suites provide their actual fixtures; normal application hosts must supply authorized providers/tools/domain bindings and any requested resource ceilings. These examples do not complete the whole task product or install default production restart hosting.
+
+| File | Description |
+|------|-------------|
+| `research_task.yaml` | Named profile with actual source deduplication/citation evidence, semantic quality checks and custom progress; Rust domain host required |
+| `support_resolution.yaml` | Automatic state-owned ticket resolution with an exact retained question; Rust domain host required |
+| `artifact_generation.yaml` | Actual isolated file creation, repair and managed content validation with an explicit one-path host ceiling; Rust domain host required |
+| `report_records.yaml` | Non-filesystem artifact reference plus a separate report-content predicate; Rust domain host required |
+| `code_fix.yaml` | Actual isolated discovery/read/edit with fixture-backed command and diagnostics checks; no real shell execution in its mocked suite |
+| `ops_remediation.yaml` | Required remediation/verification/review stages and actual escalation evidence; Rust domain host required |
+| `world_state.yaml` | Host revision-bound world predicate, not response claims; Rust domain host required |
+| `tool_free_analysis.yaml` | Iterative analysis with semantic judge feedback and one shared call allowance; no tools or todos |
+| `skill_task.yaml` | Automatic selected-skill entry with one-time scripted preparation and retained continuation |
+| `state_task.yaml` | State-scope exit with an explicit post-exit gate, without unrelated destination work |
+| `approval_task.yaml` | Exact task approval/rejection; its mocked suite replaces approved HTTP output and opens no socket |
+| `composed_research.yaml` | Concurrent child findings, one coordinating question, no completed-prefix replay and an exact shared four-call cap |
+| `agents/source_a.yaml` | Ordinary research participant A; inherits the coordinating owner in the composed profile, not a separate task host |
+| `agents/source_b.yaml` | Ordinary research participant B; inherits the coordinating owner in the composed profile, not a separate task host |
+
+From the repository root:
+
+```sh
+sh examples/eval/mocked/run_mocked_evals.sh --category autonomy
+cargo run --manifest-path examples/Cargo.toml -p example-custom-llm --bin task-domain-evals -- examples/eval/mocked/autonomy/research_mocked.yaml target/eval/research
+```
+
+The helper's fixed host marker selects that Rust application only where adapters/ceilings are required; it still uses the same `EvalRunner`. Top-level autonomy defaults/profile loading does not turn every ordinary input into a task. Explicit invocations start task profiles, while the state/skill examples declare automatic scoped entry. `{{ eval.workspace }}` in file/command profiles is a generated eval token: replace it with the application's authorized path outside the eval harness. Keep attempt-local file fixtures and command/HTTP/approval fixtures intact. Compile/build-only validation does not prove live model quality or production restart support.
+
 ## Rust Examples
 
 Rust examples are for embedding and extension scenarios.
@@ -700,6 +730,7 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
 | `task-events` | Development-only offline task lifecycle events, retained question and explicit resume; no API key or tools |
 | `automatic-tasks` | Development-only YAML state/skill automatic task entry, safe events and explicit host resume through the same controller; offline with no tools or API key |
+| `task-domain-evals` | Explicit Rust validator/progress/tool integration for the same development EvalRunner; isolated business state and default-redacted reports, no provider keys |
 
 Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` - no custom Rust code needed.
 

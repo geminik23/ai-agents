@@ -1,0 +1,8 @@
+name: SourceB
+version: "1.0.0"
+description: "A second admitted research participant"
+
+# Both children share the coordinating task ledger but retain their own runtime and pending request identities.
+system_prompt: Give an independent concise source finding; ask the host if an explicit decision is needed.
+llm: {provider: openai, model: gpt-5.4-mini}
+tools: [ask_user]

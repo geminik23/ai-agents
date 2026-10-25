@@ -153,6 +153,8 @@ The declarative scope includes the normalized agent declaration and loaded skill
 
 The default CLI has no production reconstruction host or portable restart-clock binding. Explicit durable requests are rejected before task execution; `task resume` in a new process returns a clear unsupported-capability error before provider construction. SQLite existence and session `/save`/`/load` do not make a task restartable. Use retained in-process controls, or the explicitly prepared [Rust restoration APIs](@/docs/rust-api.md#automatic-state-and-skill-tasks-development-only) with an actual host binding. Arbitrary in-flight stack restoration and automatic abandoned-owner takeover remain unsupported.
 
+The development `eval` command also accepts typed `!task` steps and task assertions through the configured controller. Stock integrations use this CLI directly; domain suites with named Rust adapters use the fixed host route documented by the mocked helper. Development report schema 2, migration, timeout/cleanup behavior and current limitations are described in [task evaluation](@/docs/evaluation.md#development-task-evaluation-foundation). This foundation does not install default production task reconstruction or complete the full task-evaluation contract.
+
 ## Eval Options
 
 | Flag | Description |

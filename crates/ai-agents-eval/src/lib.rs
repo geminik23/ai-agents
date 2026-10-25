@@ -8,10 +8,19 @@ pub mod fixtures;
 pub mod judge;
 pub mod metrics;
 pub mod output;
+#[cfg(all(test, feature = "sqlite"))]
+mod prepared_tests;
 pub mod redaction;
 pub mod reset;
 pub mod runner;
 pub mod suite;
+pub mod task;
+#[cfg(test)]
+mod task_tests;
+pub use task::{
+    EvalHost, TaskAction, TaskAssertion, TaskCheckAssertion, TaskEvidence, TaskReply, TaskReport,
+    TaskStep,
+};
 
 pub use assertion::{AssertionOutcome, AssertionResultDetail, evaluate_assertion};
 pub use evidence::{DisambiguationStatus, ToolExecutionRecord, ToolExecutionSource, TurnEvidence};
