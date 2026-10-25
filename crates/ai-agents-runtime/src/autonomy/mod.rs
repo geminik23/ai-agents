@@ -8,6 +8,8 @@ mod authority;
 pub(crate) mod automatic;
 #[cfg(test)]
 mod automatic_tests;
+#[cfg(test)]
+mod hosting_tests;
 pub use automatic::AutomaticTaskOptions;
 mod boundary;
 pub(crate) mod composition;
@@ -56,11 +58,12 @@ pub(crate) use execution::{
 pub(crate) use memory::TaskMemory;
 pub use runner::TaskRestoreParticipant;
 pub use runner::{
-    AutonomyRunner, TaskReconstructionCheckpoint, TaskRecoveryCheckpoint, TaskRecoveryDecision,
-    TaskRecoveryDisposition, TaskRecoveryHost, TaskRestorationReview, TaskRestoreBinding,
-    TaskRestoreComposition, TaskRestoreEntry, TaskRestoreGenerations, TaskRestoreGraph,
-    TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest,
-    TaskRestoreResponse, TaskRestoreTarget, TaskStartupRequest,
+    AutonomyRunner, CancellationDisposition, CancellationOutcome, MAX_TASK_DISPLAY_BYTES,
+    TaskHostInteraction, TaskHostPrompt, TaskReconstructionCheckpoint, TaskRecoveryCheckpoint,
+    TaskRecoveryDecision, TaskRecoveryDisposition, TaskRecoveryHost, TaskRestorationReview,
+    TaskRestoreBinding, TaskRestoreComposition, TaskRestoreEntry, TaskRestoreGenerations,
+    TaskRestoreGraph, TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry,
+    TaskRestoreRequest, TaskRestoreResponse, TaskRestoreTarget, TaskRunDisplay, TaskStartupRequest,
 };
 mod builtins;
 #[cfg(test)]

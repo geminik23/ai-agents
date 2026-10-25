@@ -278,20 +278,34 @@ impl RunExecution {
 
     /// Serializes a retained-owner cancellation request with admission and signals only after the CAS is acknowledged.
     pub(crate) async fn request_cancel(&self) -> Result<TaskRunSummary> {
+        self.request_cancel_at_revision(None).await
+    }
+
+    /// Checks an optional host revision under the same serial boundary as cancellation admission and validates the exact write receipt.
+    /// Ambiguous writes retain recovery protection; a cancellation flag or signal alone never acknowledges cleanup.
+    pub(crate) async fn request_cancel_at_revision(
+        &self,
+        expected: Option<u64>,
+    ) -> Result<TaskRunSummary> {
         let _serial = self.serial.lock().await;
         let snapshot = self.load_owned_locked(&_serial).await?;
+        if expected.is_some_and(|revision| revision != snapshot.revision) {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
         if snapshot.cancel_requested {
+            self.cancellation.store(true, Ordering::Release);
             return Ok(snapshot.summary());
         }
+        let mutation = TaskRunMutation::RequestCancel {
+            expected_revision: snapshot.revision,
+        };
         let saved = self
             .store
-            .mutate(
-                &self.run_id,
-                &TaskRunMutation::RequestCancel {
-                    expected_revision: snapshot.revision,
-                },
-            )
-            .await?;
+            .mutate(&self.run_id, &mutation)
+            .await
+            .inspect_err(|_| self.storage_failure())?;
+        super::store::verify_checkpoint_receipt(&snapshot, &mutation, &saved)
+            .inspect_err(|_| self.storage_failure())?;
         self.revision.store(saved.revision, Ordering::Release);
         self.acknowledge_snapshot(&saved);
         self.cancellation.store(true, Ordering::Release);

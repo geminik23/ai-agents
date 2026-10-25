@@ -106,6 +106,138 @@ impl RuntimeAgent {
             .and_then(|host| host.runner.lock().clone())
     }
 
+    /// Resolves the configured runner for explicit and automatic work without starting a task or cloning runtime state.
+    /// An actor change creates a new scoped runner only when the original owner permits access; retained work cannot migrate actors.
+    pub fn task_runner(&self) -> Result<Arc<AutonomyRunner>> {
+        if let Some(runner) = self.automatic_task_runner()
+            && runner.actor_scope == self.effective_actor_id()
+        {
+            return Ok(runner);
+        }
+        let _mutations = self.autonomy_mutations.try_write().map_err(|_| {
+            AgentError::Config("task host construction conflicts with a live host operation".into())
+        })?;
+        self.configured_task_runner()
+    }
+
+    // Construction runs under the caller's mutation boundary; automatic promotion already holds that boundary and its root gate.
+    fn configured_task_runner(&self) -> Result<Arc<AutonomyRunner>> {
+        let host = self.automatic_host().ok_or_else(|| {
+            AgentError::Config(
+                "task hosting is not configured; supply autonomy settings and task options".into(),
+            )
+        })?;
+        let mut slot = host.runner.lock();
+        let actor = self.effective_actor_id();
+        if let Some(runner) = slot.as_ref()
+            && runner.actor_scope == actor
+        {
+            return Ok(runner.clone());
+        }
+        self.check_autonomy_access()?;
+        let identity = host
+            .options
+            .config_identity
+            .clone()
+            .unwrap_or(format!("automatic:{}", self.task_restore_configuration()?));
+        let store = match &host.options.store {
+            Some(store) => store.clone(),
+            None => Arc::new(crate::autonomy::ScopedTaskRunStore::new(
+                host.storage.clone(),
+                self.info.id.clone(),
+                actor,
+                identity.clone(),
+            )?),
+        };
+        let mut runner = AutonomyRunner::try_new(
+            self.shared_task_handle(),
+            host.config.clone(),
+            host.options.ceilings.clone(),
+            store,
+            identity,
+        )?;
+        if let Some(restore) = &host.options.restore_host {
+            runner = runner.with_restore_host(restore.clone());
+        }
+        let runner = Arc::new(runner);
+        *slot = Some(runner.clone());
+        Ok(runner)
+    }
+
+    /// Executes an explicit objective through the same configured runner used by automatic scoped entry.
+    /// Profile resolution, live ownership, admission and acknowledged pause preparation remain controller responsibilities.
+    pub async fn run_task(&self, objective: &str, profile: Option<&str>) -> Result<TaskRunResult> {
+        self.task_runner()?.run(objective, profile).await
+    }
+
+    /// Resumes only the exact acknowledged revision on the retained runner; the trusted host authenticates the response caller.
+    /// Turn-local actor context may have ended, so control must retain the admitted store scope rather than reconstruct it from session defaults.
+    pub async fn resume_task(
+        &self,
+        run_id: &str,
+        revision: u64,
+        input: crate::autonomy::TaskResumeInput,
+    ) -> Result<TaskRunResult> {
+        let runner = self
+            .automatic_task_runner()
+            .ok_or(crate::autonomy::TaskRunStorageError::NotResumable)?;
+        runner.resume(run_id, revision, input).await
+    }
+
+    /// Cancels the exact retained task revision and distinguishes a request receipt from acknowledged cleanup.
+    /// Running hosts must keep polling their original foreground operation; this method never detaches or fabricates terminal events.
+    pub async fn cancel_task(
+        &self,
+        run_id: &str,
+        revision: u64,
+    ) -> Result<crate::autonomy::CancellationOutcome> {
+        self.retained_task_runner()?
+            .cancel_task(run_id, revision)
+            .await
+    }
+
+    /// Reads a bounded default-redacted snapshot in the retained run's original scope without constructing or executing work.
+    /// This is an acknowledged display observation, not a current completion permit or caller authentication.
+    pub async fn task_display(&self, run_id: &str) -> Result<crate::autonomy::TaskRunDisplay> {
+        self.retained_task_runner()?.task_display(run_id).await
+    }
+
+    /// Returns exact typed prompt data only to a trusted host; diagnostics and display snapshots omit its sensitive content.
+    /// Request and revision must be returned unchanged, and any later policy/binding checks still run at execution admission.
+    pub async fn task_interaction(
+        &self,
+        run_id: &str,
+        revision: u64,
+    ) -> Result<Option<crate::autonomy::TaskHostInteraction>> {
+        self.retained_task_runner()?
+            .task_interaction(run_id, revision)
+            .await
+    }
+
+    /// Applies a typed operation through the configured controller, including controls which must not execute another model turn.
+    /// Only new execution resolves infrastructure; control keeps the original retained actor/store and acknowledged result publication.
+    pub async fn task_operation(&self, operation: TaskStreamOperation) -> Result<TaskRunResult> {
+        let runner = if matches!(
+            &operation,
+            TaskStreamOperation::Run { .. } | TaskStreamOperation::Skill { .. }
+        ) {
+            self.task_runner()?
+        } else {
+            self.retained_task_runner()?
+        };
+        let mut stream = runner.stream_operation(operation, Default::default())?;
+        while stream.next_event().await.is_some() {}
+        stream
+            .take_result()
+            .ok_or(crate::autonomy::TaskRunStorageError::NotResumable)?
+    }
+
+    // A control lookup must not re-scope a paused actor or silently construct a replacement for a missing live continuation.
+    fn retained_task_runner(&self) -> Result<Arc<AutonomyRunner>> {
+        self.automatic_task_runner()
+            .ok_or(crate::autonomy::TaskRunStorageError::NotResumable.into())
+    }
+
     /// Returns exact trusted-host data for the most recently published automatic operation, not a safe export DTO.
     pub fn automatic_task_result(&self) -> Option<TaskRunResult> {
         self.automatic_host()
@@ -355,30 +487,7 @@ impl RuntimeAgent {
             .autonomy_mutations
             .try_write()
             .map_err(|_| AgentError::Other("runtime has an active host operation".into()))?;
-        let identity = host
-            .options
-            .config_identity
-            .clone()
-            .unwrap_or(format!("automatic:{}", self.task_restore_configuration()?));
-        let store = match &host.options.store {
-            Some(store) => store.clone(),
-            None => Arc::new(crate::autonomy::ScopedTaskRunStore::new(
-                host.storage.clone(),
-                self.info.id.clone(),
-                self.effective_actor_id(),
-                identity.clone(),
-            )?),
-        };
-        let mut runner = AutonomyRunner::try_new(
-            self.shared_task_handle(),
-            host.config.clone(),
-            host.options.ceilings.clone(),
-            store,
-            identity,
-        )?;
-        if let Some(restore) = &host.options.restore_host {
-            runner = runner.with_restore_host(restore.clone());
-        }
+        let runner = self.configured_task_runner()?;
         let owner = crate::autonomy::RunOwner::new(
             uuid::Uuid::new_v4().to_string(),
             self.root_turn_gate.clone(),
@@ -400,7 +509,7 @@ impl RuntimeAgent {
             }),
             ..Default::default()
         });
-        *host.runner.lock() = Some(Arc::new(runner.with_automatic_outcome(outcome.clone())));
+        runner.bind_automatic_outcome(outcome.clone());
         *host.outcome.lock() = outcome.clone();
         *slot.lock() = Some(Box::new(AutomaticEntry {
             owner,

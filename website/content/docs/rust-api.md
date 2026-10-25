@@ -606,13 +606,34 @@ A configured literal objective is combined with accepted user input. An `objecti
 | API | Contract |
 |---|---|
 | `AgentBuilder::autonomy(config)` | Programmatic defaults for the same raw profile/override types as YAML |
-| `AgentBuilder::automatic_task_options(options)` | Trusted ceilings, optional scoped store/configuration identity and optional reconstruction host |
+| `AgentBuilder::automatic_task_options(options)` | Explicit hosting opt-in with trusted ceilings, optional scoped store/configuration identity and optional reconstruction host; it does not enable a disabled profile |
 | `RuntimeAgent::automatic_task_result()` | Last published exact `TaskRunResult`; trusted-host data, not a display export or proof of current state after an ambiguous error |
-| `RuntimeAgent::automatic_task_runner()` | The actual retained controller, not a newly constructed substitute |
+| `RuntimeAgent::automatic_task_runner()` | The already created retained controller, or `None` before first lookup/entry |
+| `RuntimeAgent::task_runner()` | Lazily resolves the shared configured controller without starting work; successive operations retain it within the same actor scope |
+| `RuntimeAgent::run_task(objective, profile)` | Explicit execution using that configured controller and the selected enabled profile |
+| `RuntimeAgent::resume_task(run_id, revision, input)` | Explicit typed response on the same controller, retaining exact revision and original authority |
+| `RuntimeAgent::cancel_task(run_id, revision)` | `CancellationOutcome` distinguishes `requested`, `acknowledged` cleanup, and `already_terminal` metadata |
+| `RuntimeAgent::task_operation(operation)` | Applies explicit typed run/skill/resume/stop/objective/limit and other supported controls through the same controller |
+| `RuntimeAgent::task_display(run_id)` | `TaskRunDisplay` is a bounded, default-redacted snapshot of acknowledged facts, not a completion proof or recovery payload |
+| `RuntimeAgent::task_interaction(run_id, revision)` | Exact `TaskHostInteraction` with typed prompt data for an authenticated host; not a display/export DTO |
 | `RuntimeAgent::automatic_task_operation(operation)` | Existing explicit resume/stop/cancel/objective/limit/delivery-control operations on that controller |
 | `AutonomyRunner::task_store()` | The actual scoped store for trusted inspection and reviewed recovery; namespace scoping does not authenticate an external caller |
 
+Calling `task_runner()` does not invoke a provider or start a task. Automatic state/skill entry uses that same configured runner, and acknowledged results remain bound to their exact run even if a later run is admitted before an earlier caller receives its result. After a settled actor change, a new scoped runner is selected instead of exposing the previous actor's task store. `resume_task` keeps the admitted runner and store even after a turn-local `chat_as_actor` context has ended; the trusted host must authenticate the responding caller. Full CLI/TUI task hosting and a production CLI reconstruction-clock binding remain unfinished; these convenience APIs do not change that boundary.
+
 Default hosting retains volatile in-memory checkpoints for the lifetime of the runtime/retained runner. It does not require SQLite for normal completion or same-process pause/resume. Durable or restart-prepared policies require an explicit compatible store and `TaskRestoreHost` in `AutomaticTaskOptions`; the supplied configuration identity must match the store. Existing explicit startup selection remains explicit, including for `resume_on_start`. A reconstruction resumes the task's typed safe continuation, not an arbitrary ordinary composing call stack.
+
+### Host inspection and cancellation (development only)
+
+`AutonomyRunner` exposes the same `cancel_task`, `task_display` and `task_interaction` operations. For a different process that only has an authorized scoped store, `CancellationOutcome::request(store, run_id, revision)` records a monotonic cancellation request without constructing providers, restoring ownership or executing pending work. Repeated requests at the current revision do not reset usage or consume a response. A stale revision is rejected; an ambiguous write or mismatching receipt is an error, not a successful request to retry blindly.
+
+`CancellationDisposition::Acknowledged` is returned only after retained safe-pause cleanup has completed. Running operations return `Requested` and their original foreground future must keep polling until settlement; non-preemptible or uncertain work can remain `RecoveryRequired`. `AlreadyTerminal` reports stored terminal status, not rollback or global quiescence. `locally_retained: Some(true/false)` is a local custody observation; store-only requests return `None` because another process's live ownership is unknown. It must not be converted into cleanup success.
+
+`TaskRunDisplay` preserves safe listing metadata plus redacted objective/profile/stage/reasons, stored counters/limits/clocks, bounded todo/progress and available artifact observations. Namespace identifiers have the same visibility as scoped storage listings; the host still authenticates access. `last_gate` and its cycle/objective revision are historical observations, not current eligible completion proof. Missing artifact observations remain unavailable, and `restoration_review_required: None` means no local retained review establishes that fact. Local custody can remain protected even when the store has released its owner token. Serialized display output is limited to `MAX_TASK_DISPLAY_BYTES` (16 KiB); oversized views fail explicitly without changing the task. A snapshot is not a durable event log or a UI-generated clock.
+
+`TaskHostInteraction` preserves the coordinating run/request/revision even when the displayed prompt comes from a nested child. `TaskHostPrompt` distinguishes approval, question, Continue, capacity, stage/plan review, external condition and validation observation. A stage review's `next_stage: None` with `finishes_lifecycle: true` still requires approval and does not establish task completion. Exact approval context and question/default text can be sensitive: the prompt/interaction types intentionally have no serde serialization and their `Debug` output omits content. Select only the fields needed by an authorized local UI; never log them or export recovery adapters. A view can become stale immediately and cannot be submitted as execution authority. Restoration review, when advertised, remains separate from the original pending answer.
+
+These host APIs do not install production CLI reconstruction, certify an OS clock, promise reboot/cross-host portability, or implement CLI/TUI task commands. Original restore bindings, resource/clock limits, current authorization and conservative uncertain-effect protection are unchanged.
 
 A host authenticates control callers and presents exact pending data through its authorized UI. Do not infer permission from an event, parse a model answer as host control, or call a new `chat()` to answer a reserved task. For example, after the application has obtained an answer to the advertised question:
 

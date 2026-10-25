@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Configured task hosting: development Rust convenience APIs share explicit and automatic task runners within an actor scope, with revision-bound resume and retained per-run delivery
+- Task host inspection and cancellation: development Rust hosts read bounded redacted snapshots and typed pending prompts, distinguish cancellation requests from acknowledged cleanup, and preserve controller delivery and final-stage review
 - Automatic task entry: development-only YAML state and selected-skill tasks share the existing controller, retained host decisions, bounded lifecycle events and acknowledged completion without replaying prepared work
 - Task event streams: development-only Rust hosts observe bounded, default-redacted task execution, retained decisions and acknowledged outcomes with explicit foreground close and recovery-safe drop
 - Task artifact validation: development profiles collect authorized file metadata or explicit host artifact projections with exact validation-proof freshness

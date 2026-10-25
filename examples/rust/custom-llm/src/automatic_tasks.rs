@@ -6,7 +6,7 @@ use ai_agents::autonomy::{TaskResumeInput, TaskRunEventKind, TaskRunStatus};
 use ai_agents::llm::{
     ChatMessage, FinishReason, LLMChunk, LLMConfig, LLMError, LLMFeature, LLMProvider, LLMResponse,
 };
-use ai_agents::{AgentBuilder, AgentStreamEvent, Result};
+use ai_agents::{AgentBuilder, AgentStreamEvent, Result, TaskHostPrompt};
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::{
@@ -133,18 +133,21 @@ async fn main() -> Result<()> {
             .automatic_task_result()
             .expect("acknowledged operation result");
         assert_eq!(paused.run.status, TaskRunStatus::Paused);
-        // Exact question details are trusted-host data for an authorized UI, not a display-event export.
-        let pending = paused
-            .run
-            .pending
-            .as_ref()
-            .expect("retained controller question");
+        // Safe snapshots can be exported; exact typed questions stay inside the authenticated host's UI boundary.
+        let display = agent.task_display(&paused.run.key.run_id).await?;
+        assert_eq!(display.summary.revision, paused.run.revision);
+        println!("{}", serde_json::to_string(&display)?);
+        let interaction = agent
+            .task_interaction(&paused.run.key.run_id, display.summary.revision)
+            .await?
+            .expect("retained typed controller question");
+        assert!(matches!(interaction.prompt, TaskHostPrompt::Question(_)));
         let runner = agent.automatic_task_runner().expect("same live controller");
         let mut resumed = runner.resume_stream(
             &paused.run.key.run_id,
             paused.run.revision,
             TaskResumeInput::UserAnswer {
-                request_id: pending.id.clone(),
+                request_id: interaction.request_id,
                 answer: serde_json::json!("continue the report"),
             },
         )?;

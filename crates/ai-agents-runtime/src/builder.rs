@@ -128,6 +128,7 @@ pub struct AgentBuilder {
     autonomy_extensions: Option<Arc<crate::autonomy::FrozenAutonomyExtensions>>,
     automatic_config: Option<ai_agents_core::autonomy::AutonomyConfig>,
     automatic_options: crate::autonomy::AutomaticTaskOptions,
+    task_hosting_requested: bool,
 }
 
 impl AgentBuilder {
@@ -136,6 +137,7 @@ impl AgentBuilder {
             autonomy_extensions: None,
             automatic_config: None,
             automatic_options: Default::default(),
+            task_hosting_requested: false,
             reasoning: None,
             reflection: None,
             spec: None,
@@ -189,12 +191,14 @@ impl AgentBuilder {
         self
     }
 
-    /// Installs trusted ceilings, optional scoped storage and reconstruction for automatic entry without granting tools.
+    /// Requests shared explicit and automatic task hosting with trusted ceilings, scoped storage and reconstruction bindings.
+    /// Disabled profiles stay disabled; installing infrastructure never grants tools or starts execution.
     pub fn automatic_task_options(
         mut self,
         options: crate::autonomy::AutomaticTaskOptions,
     ) -> Self {
         self.automatic_options = options;
+        self.task_hosting_requested = true;
         self
     }
 
@@ -210,6 +214,7 @@ impl AgentBuilder {
             autonomy_extensions: None,
             automatic_config: None,
             automatic_options: Default::default(),
+            task_hosting_requested: false,
             llm: None,
             llm_registry: None,
             memory: None,
@@ -1292,8 +1297,8 @@ impl AgentBuilder {
             .or_else(|| self.spec.as_ref().and_then(|spec| spec.states.as_ref()));
         crate::autonomy::validate_agent_config(config, states, &[])?;
         crate::autonomy::validate_loaded_skills(config, &self.skills)?;
-        let install_automatic =
-            crate::autonomy::has_enabled_declaration(config, states, &self.skills);
+        let install_automatic = self.task_hosting_requested
+            || crate::autonomy::has_enabled_declaration(config, states, &self.skills);
 
         let mut llm_registry = self.llm_registry.unwrap_or_default();
 

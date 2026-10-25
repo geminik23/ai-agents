@@ -12,6 +12,9 @@ pub use restoration::{
     TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest,
     TaskRestoreResponse, TaskRestoreTarget,
 };
+#[cfg(test)]
+#[path = "hosting_delivery_tests.rs"]
+mod hosting_delivery_tests;
 #[path = "persistence.rs"]
 mod persistence;
 #[path = "recovery.rs"]
@@ -27,6 +30,12 @@ pub use recovery::{
 mod controller_runtime;
 #[path = "host_runtime.rs"]
 mod host_runtime;
+#[path = "hosting.rs"]
+mod hosting;
+pub use hosting::{
+    CancellationDisposition, CancellationOutcome, MAX_TASK_DISPLAY_BYTES, TaskHostInteraction,
+    TaskHostPrompt, TaskRunDisplay,
+};
 #[path = "live_controller.rs"]
 mod live_controller;
 #[path = "paused_control.rs"]
@@ -47,7 +56,9 @@ pub struct AutonomyRunner {
     resume_gate: tokio::sync::Mutex<()>,
     interaction_delivery: bool,
     restore_host: Option<Arc<dyn TaskRestoreHost>>,
-    automatic_outcome: Option<Arc<super::automatic::AutomaticOutcome>>,
+    automatic_outcomes:
+        parking_lot::Mutex<BTreeMap<String, std::sync::Weak<super::automatic::AutomaticOutcome>>>,
+    pub(crate) actor_scope: Option<String>,
 }
 
 struct PausedTask {
@@ -697,6 +708,7 @@ impl AutonomyRunner {
         }
         super::config::validate_runner_config(&config)?;
         agent.preflight_standalone_autonomy()?;
+        let actor_scope = agent.effective_actor_id();
         Ok(Self {
             agent,
             config,
@@ -708,22 +720,32 @@ impl AutonomyRunner {
             resume_gate: Default::default(),
             interaction_delivery: true,
             restore_host: None,
-            automatic_outcome: None,
+            automatic_outcomes: Default::default(),
+            actor_scope,
         })
     }
 
-    /// Binds acknowledged public results to one automatic run, independently of the host API used to resume or cancel it.
-    pub(crate) fn with_automatic_outcome(
-        mut self,
-        outcome: Arc<super::automatic::AutomaticOutcome>,
-    ) -> Self {
-        self.automatic_outcome = Some(outcome);
-        self
+    /// Binds delivery to the newly admitted automatic run without replacing the configured runner or its scoped store.
+    /// Prior live delivery slots survive later admissions because an owner can release before its public result reaches its parent.
+    pub(crate) fn bind_automatic_outcome(&self, outcome: Arc<super::automatic::AutomaticOutcome>) {
+        if let Some(key) = &outcome.key {
+            let mut outcomes = self.automatic_outcomes.lock();
+            outcomes.retain(|_, slot| slot.strong_count() > 0);
+            outcomes.insert(key.run_id.clone(), Arc::downgrade(&outcome));
+        }
+    }
+
+    // Live callers own delivery slots; this lookup neither retains completed callers nor transfers one run's result to another.
+    fn automatic_outcome(&self, run_id: &str) -> Option<Arc<super::automatic::AutomaticOutcome>> {
+        self.automatic_outcomes
+            .lock()
+            .get(run_id)
+            .and_then(std::sync::Weak::upgrade)
     }
 
     /// Publishes only the bound run after public-result preparation; other explicit executions cannot overwrite its delivery slot.
     fn publish_automatic(&self, result: &TaskRunResult) {
-        if let Some(outcome) = &self.automatic_outcome {
+        if let Some(outcome) = self.automatic_outcome(&result.run.key.run_id) {
             outcome.publish(result);
         }
     }
@@ -733,33 +755,33 @@ impl AutonomyRunner {
         &self,
         run_id: &str,
     ) -> Option<super::automatic::AutomaticDeliveryGuard> {
-        let outcome = self
-            .automatic_outcome
-            .as_ref()
-            .filter(|outcome| outcome.key.as_ref().is_some_and(|key| key.run_id == run_id))?;
+        let outcome = self.automatic_outcome(run_id)?;
         let active = self.active.lock();
         let execution = active
             .as_ref()
             .filter(|execution| execution.run_id == run_id)?;
         Some(super::automatic::AutomaticDeliveryGuard {
             owner: Arc::downgrade(&execution.owner),
-            outcome: Arc::downgrade(outcome),
+            outcome: Arc::downgrade(&outcome),
         })
     }
 
     /// Invalid responses preserve a safe pause; only an actually abandoned or storage-uncertain bound execution fails ordinary delivery.
     fn automatic_operation_result(&self, result: Result<TaskRunResult>) -> Result<TaskRunResult> {
-        if result.is_err()
-            && let Some(outcome) = &self.automatic_outcome
-            && self.active.lock().as_ref().is_some_and(|execution| {
-                outcome
-                    .key
-                    .as_ref()
-                    .is_some_and(|key| key.run_id == execution.run_id)
-                    && (execution.owner.is_abandoned() || execution.has_storage_failure())
-            })
-        {
-            outcome.failure();
+        if result.is_err() {
+            let failed_run = self
+                .active
+                .lock()
+                .as_ref()
+                .filter(|execution| {
+                    execution.owner.is_abandoned() || execution.has_storage_failure()
+                })
+                .map(|execution| execution.run_id.clone());
+            if let Some(run_id) = failed_run
+                && let Some(outcome) = self.automatic_outcome(&run_id)
+            {
+                outcome.failure();
+            }
         }
         result
     }
@@ -930,6 +952,7 @@ impl AutonomyRunner {
     }
 
     /// Awaits cleanup of a known-safe same-process pause; request receipt alone never releases runtime protection.
+    /// Every successful branch publishes only after cleanup acknowledgement, including controller waits consumed by ordinary composing parents.
     pub async fn cancel_paused(
         &self,
         run_id: &str,
@@ -937,7 +960,8 @@ impl AutonomyRunner {
     ) -> Result<TaskRunResult> {
         let _delivery = self.automatic_delivery_guard(run_id);
         let result = Box::pin(self.cancel_paused_inner(run_id, expected_revision)).await;
-        self.automatic_operation_result(result)
+        let result = self.automatic_operation_result(result)?;
+        self.acknowledged_automatic_result(result)
     }
 
     /// Performs the existing conditional cleanup; the public boundary separately reports uncertain delivery to a composing host.

@@ -1340,7 +1340,8 @@ impl RuntimeAgent {
     }
 
     // An admitted task retains one actor/storage scope even if context resolution updates session defaults.
-    fn effective_actor_id(&self) -> Option<String> {
+    // Configured runners capture this resolved scope so later host lookups cannot reuse another actor's store.
+    pub(crate) fn effective_actor_id(&self) -> Option<String> {
         if let Some(input) = crate::autonomy::current_turn_input(&self.root_turn_gate) {
             return input.owner.actor_id.clone();
         }

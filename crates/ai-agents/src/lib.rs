@@ -590,13 +590,14 @@ pub use agent::{
 };
 pub use autonomy::{
     AutomaticTaskOptions, AutonomyConfig, AutonomyExtensions, AutonomyHostCeilings, AutonomyMode,
-    AutonomyOverride, AutonomyProfile, AutonomyScope, AutonomyValidator, CompletionGate,
-    CompletionGateEvaluator, EffectiveAutonomyProfile, EvaluationScope, GateOutcome,
-    HostControlAction, ProgressAdapter, RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload,
-    TaskEventCursor, TaskRun, TaskRunEvent, TaskRunEventKind, TaskRunKey, TaskRunMutation,
-    TaskRunResult, TaskRunSnapshot, TaskRunStatus, TaskRunStorageError, TaskRunStore,
-    TaskRunStream, TaskRuntimeCheckpoint, TaskStreamConfig, TaskStreamOperation,
-    TaskValidationJournal, ValidationDriverState,
+    AutonomyOverride, AutonomyProfile, AutonomyScope, AutonomyValidator, CancellationDisposition,
+    CancellationOutcome, CompletionGate, CompletionGateEvaluator, EffectiveAutonomyProfile,
+    EvaluationScope, GateOutcome, HostControlAction, MAX_TASK_DISPLAY_BYTES, ProgressAdapter,
+    RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload, TaskEventCursor,
+    TaskHostInteraction, TaskHostPrompt, TaskRun, TaskRunDisplay, TaskRunEvent, TaskRunEventKind,
+    TaskRunKey, TaskRunMutation, TaskRunResult, TaskRunSnapshot, TaskRunStatus,
+    TaskRunStorageError, TaskRunStore, TaskRunStream, TaskRuntimeCheckpoint, TaskStreamConfig,
+    TaskStreamOperation, TaskValidationJournal, ValidationDriverState,
 };
 pub use error::{AgentError, Result};
 pub use memory::{

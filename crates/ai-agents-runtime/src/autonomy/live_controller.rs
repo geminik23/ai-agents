@@ -19,6 +19,7 @@ impl AutonomyRunner {
     }
 
     /// Consumes an already minted owner after the ordinary root releases its gate; the same controller owns all later work.
+    /// Pre-execution failure retires only this exact owner, even when an older released execution has not yet cleared the shared active slot.
     pub(crate) async fn run_automatic(
         &self,
         entry: Box<super::super::automatic::AutomaticEntry>,
@@ -28,7 +29,13 @@ impl AutonomyRunner {
         let input = entry.binding.prepared.content.clone();
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let result = Box::pin(self.run_entry(&input, None, skill, Some(entry))).await;
-        if result.is_err() && self.active.lock().is_none() {
+        if result.is_err()
+            && self
+                .active
+                .lock()
+                .as_ref()
+                .is_none_or(|execution| !Arc::ptr_eq(&execution.owner, &owner))
+        {
             self.agent.release_autonomy_run(&owner).await?;
             cleanup.finish();
         } else if result.is_ok() {

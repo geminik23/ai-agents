@@ -29,6 +29,22 @@ fn development_automatic_task_hosting_surface_compiles() {
             })
     }
     fn control(agent: &RuntimeAgent) {
+        let _configured: ai_agents::Result<Arc<ai_agents::autonomy::AutonomyRunner>> =
+            agent.task_runner();
+        let _explicit = agent.run_task("objective", Some("research"));
+        let _resume = agent.resume_task(
+            "retained",
+            1,
+            ai_agents::autonomy::TaskResumeInput::Continue,
+        );
+        let _cancel = agent.cancel_task("retained", 1);
+        let _display = agent.task_display("retained");
+        let _prompt = agent.task_interaction("retained", 1);
+        let _typed_operation = agent.task_operation(ai_agents::TaskStreamOperation::Stop {
+            run_id: "retained".into(),
+            revision: 1,
+            reason: "host stop".into(),
+        });
         let _exact: Option<ai_agents::TaskRunResult> = agent.automatic_task_result();
         let _runner: Option<Arc<ai_agents::autonomy::AutonomyRunner>> =
             agent.automatic_task_runner();
@@ -38,13 +54,23 @@ fn development_automatic_task_hosting_surface_compiles() {
             input: ai_agents::autonomy::TaskResumeInput::Continue,
         });
     }
+    fn display_types(view: ai_agents::TaskRunDisplay, outcome: ai_agents::CancellationOutcome) {
+        let _ = (
+            view.summary,
+            outcome.disposition,
+            ai_agents::MAX_TASK_DISPLAY_BYTES,
+        );
+    }
+    fn prompt_type(prompt: ai_agents::TaskHostPrompt, interaction: ai_agents::TaskHostInteraction) {
+        let _ = (prompt, interaction.revision);
+    }
     fn task_event(event: AgentStreamEvent) -> Option<ai_agents::TaskRunEvent> {
         match event {
             AgentStreamEvent::Task(event) => Some(event),
             _ => None,
         }
     }
-    let _surface = (configure, control, task_event);
+    let _surface = (configure, control, display_types, prompt_type, task_event);
 }
 
 #[test]
