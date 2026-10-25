@@ -964,7 +964,8 @@ impl AutonomyRunner {
         self.acknowledged_automatic_result(result)
     }
 
-    /// Performs the existing conditional cleanup; the public boundary separately reports uncertain delivery to a composing host.
+    /// Performs conditional typed cleanup; only unavailable-host retirement may accept its exact cancellation-only successor before admission.
+    /// The public boundary separately reports uncertain delivery to a composing host; arbitrary revision changes still reject.
     async fn cancel_paused_inner(
         &self,
         run_id: &str,
@@ -976,7 +977,12 @@ impl AutonomyRunner {
             .load(run_id)
             .await?
             .ok_or(TaskRunStorageError::NotFound)?;
-        if snapshot.revision != expected_revision || snapshot.status != TaskRunStatus::Paused {
+        if snapshot.status != TaskRunStatus::Paused {
+            return Err(TaskRunStorageError::NotResumable.into());
+        }
+        let cancellation_only = snapshot.cancel_requested
+            && paused_control::accept_retirement_cancellation(&snapshot, expected_revision)?;
+        if snapshot.revision != expected_revision && !cancellation_only {
             return Err(TaskRunStorageError::NotResumable.into());
         }
         let mut payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;

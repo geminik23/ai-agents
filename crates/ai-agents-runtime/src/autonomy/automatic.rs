@@ -22,6 +22,8 @@ pub struct AutomaticTaskOptions {
 pub(crate) struct AutomaticTaskHost {
     pub(crate) config: AutonomyConfig,
     pub(crate) options: AutomaticTaskOptions,
+    pub(crate) interaction_delivery: bool,
+    // Prepared session backends can be shared, but task adapters retain independent actor/configuration validation.
     pub(crate) storage: Arc<dyn ai_agents_core::AgentStorage>,
     pub(crate) runner: parking_lot::Mutex<Option<Arc<AutonomyRunner>>>,
     pub(crate) outcome: parking_lot::Mutex<Arc<AutomaticOutcome>>,

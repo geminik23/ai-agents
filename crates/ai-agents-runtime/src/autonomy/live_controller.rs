@@ -45,6 +45,7 @@ impl AutonomyRunner {
     }
 
     /// Manual resume is a delivery endpoint by default; hosts can explicitly declare that no usable endpoint is exposed.
+    /// Unserviceable volatile pauses follow controller policy or acknowledged typed cleanup, never implicit approval or abandoned ownership.
     pub fn with_interaction_delivery(mut self, available: bool) -> Self {
         self.interaction_delivery = available;
         self

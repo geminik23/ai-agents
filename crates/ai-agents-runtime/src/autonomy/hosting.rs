@@ -76,6 +76,7 @@ impl CancellationOutcome {
 pub struct TaskRunDisplay {
     pub summary: TaskRunSummary,
     /// Local runtime custody is separate from the stored owner token and is not global quiescence evidence.
+    /// Store-only reads have no attached runtime and report false without certifying the remote owner's cleanup.
     pub locally_retained: bool,
     pub objective: Value,
     pub profile: Option<Value>,
@@ -94,6 +95,93 @@ pub struct TaskRunDisplay {
     pub artifacts: Option<Value>,
     /// None means there is no local retained review from which to establish this fact.
     pub restoration_review_required: Option<bool>,
+}
+
+impl TaskRunDisplay {
+    /// Reads a safe snapshot using only an authorized scoped store, without constructing providers, claiming owners or consuming responses.
+    /// False local retention means this store-only view has no attached runtime; remote custody and nonterminal restoration review remain unknown.
+    pub async fn read(store: &dyn TaskRunStore, run_id: &str) -> Result<Self> {
+        let snapshot = store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        // The store owns agent/actor/configuration admission; the shared projector additionally requires structurally valid checkpoint data.
+        payload.validate(&snapshot, &payload.config_identity)?;
+        let review = snapshot.status.is_terminal().then_some(false);
+        Self::project(&snapshot, &payload, false, review)
+    }
+
+    // Both local and store-only observation use the same bounded redaction; only a retained controller may supply local custody/review facts.
+    fn project(
+        snapshot: &TaskRunSnapshot,
+        payload: &TaskCheckpointPayload,
+        locally_retained: bool,
+        restoration_review_required: Option<bool>,
+    ) -> Result<Self> {
+        let latest = payload
+            .evidence
+            .records
+            .iter()
+            .rev()
+            .find(|r| r.origin == "controller");
+        let last_gate = latest
+            .and_then(|r| r.data.get("gate"))
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?;
+        // Historical controller evidence is display data, not an executable cursor or a fresh completion permit.
+        let evidence: Option<EvaluationEvidence> = payload
+            .adapters
+            .iter()
+            .find(|adapter| adapter.id == "runtime.controller")
+            .and_then(|adapter| adapter.state.get("evidence"))
+            .map(|value| serde_json::from_value(value.clone()))
+            .transpose()?;
+        let artifacts = evidence
+            .as_ref()
+            .filter(|state| !state.artifacts.is_empty())
+            .map(|state| {
+                let observations: Vec<_> = state
+                    .artifacts
+                    .iter()
+                    .map(|a| json!({"path":a.value.path,"exists":a.value.exists}))
+                    .collect();
+                safe_value(&json!(observations))
+            });
+        let view = Self {
+            summary: snapshot.summary(),
+            locally_retained,
+            objective: safe_text(&payload.objective),
+            profile: payload.profile.as_deref().map(safe_text),
+            stage: payload.stage.as_deref().map(safe_text),
+            pause_reason: payload.pause_reason.as_deref().map(safe_text),
+            stop_reason: payload.stop_reason.as_deref().map(safe_text),
+            pending_kind: payload.pending.as_ref().map(|p| p.kind),
+            counters: payload.counters.clone(),
+            limits: payload.limits.clone(),
+            clocks: payload.clocks.clone(),
+            todos: safe_value(&serde_json::to_value(
+                payload.todos.as_ref().map(|t| &t.items),
+            )?),
+            progress: safe_value(
+                &json!({"observations":payload.progress.observation_sequence,
+                "cycles_without_progress":payload.progress.cycles_without_progress,"replans":payload.progress.replans,
+                "high_water_marks":payload.progress.high_water_marks}),
+            ),
+            last_gate,
+            last_gate_cycle: latest.and_then(|r| r.data["scope"]["cycle"].as_u64()),
+            last_gate_objective_revision: latest
+                .and_then(|r| r.data["scope"]["objective_revision"].as_u64()),
+            artifacts,
+            restoration_review_required,
+        };
+        if serde_json::to_vec(&view)?.len() > MAX_TASK_DISPLAY_BYTES {
+            return Err(AgentError::Config(
+                "task display exceeds the bounded snapshot limit".into(),
+            ));
+        }
+        Ok(view)
+    }
 }
 
 /// Exact allowlisted prompt data for an authenticated host, deliberately not serializable or content-bearing Debug output.
@@ -234,36 +322,7 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotFound)?;
         let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
         payload.validate(&snapshot, &self.config_identity)?;
-        let latest = payload
-            .evidence
-            .records
-            .iter()
-            .rev()
-            .find(|r| r.origin == "controller");
-        let last_gate = latest
-            .and_then(|r| r.data.get("gate"))
-            .map(|v| serde_json::from_value(v.clone()))
-            .transpose()?;
-        // Display reads historical controller evidence, not the executable validation cursor which can be retired after cleanup.
-        // A missing observation stays unavailable and never becomes an empty successful artifact check.
-        let evidence: Option<EvaluationEvidence> = payload
-            .adapters
-            .iter()
-            .find(|adapter| adapter.id == "runtime.controller")
-            .and_then(|adapter| adapter.state.get("evidence"))
-            .map(|value| serde_json::from_value(value.clone()))
-            .transpose()?;
-        let artifacts = evidence
-            .as_ref()
-            .filter(|state| !state.artifacts.is_empty())
-            .map(|state| {
-                let observations: Vec<_> = state
-                    .artifacts
-                    .iter()
-                    .map(|a| json!({"path":a.value.path,"exists":a.value.exists}))
-                    .collect();
-                safe_value(&json!(observations))
-            });
+
         // Inspection also supports terminal or recovery data, where no executable paused cursor may exist.
         let restoration_review_required = if snapshot.status.is_terminal() {
             Some(false)
@@ -275,42 +334,14 @@ impl AutonomyRunner {
                     .is_some_and(|review| !review.view.approved)
             })
         };
-        let view = TaskRunDisplay {
-            summary: snapshot.summary(),
-            locally_retained: self
-                .agent
+        TaskRunDisplay::project(
+            &snapshot,
+            &payload,
+            self.agent
                 .captured_task_owner()
                 .is_some_and(|o| o.run_id == run_id),
-            objective: safe_text(&payload.objective),
-            profile: payload.profile.as_deref().map(safe_text),
-            stage: payload.stage.as_deref().map(safe_text),
-            pause_reason: payload.pause_reason.as_deref().map(safe_text),
-            stop_reason: payload.stop_reason.as_deref().map(safe_text),
-            pending_kind: payload.pending.as_ref().map(|p| p.kind),
-            counters: payload.counters.clone(),
-            limits: payload.limits.clone(),
-            clocks: payload.clocks.clone(),
-            todos: safe_value(&serde_json::to_value(
-                payload.todos.as_ref().map(|t| &t.items),
-            )?),
-            progress: safe_value(
-                &json!({"observations":payload.progress.observation_sequence,
-                "cycles_without_progress":payload.progress.cycles_without_progress,"replans":payload.progress.replans,
-                "high_water_marks":payload.progress.high_water_marks}),
-            ),
-            last_gate,
-            last_gate_cycle: latest.and_then(|r| r.data["scope"]["cycle"].as_u64()),
-            last_gate_objective_revision: latest
-                .and_then(|r| r.data["scope"]["objective_revision"].as_u64()),
-            artifacts,
             restoration_review_required,
-        };
-        if serde_json::to_vec(&view)?.len() > MAX_TASK_DISPLAY_BYTES {
-            return Err(AgentError::Config(
-                "task display exceeds the bounded snapshot limit".into(),
-            ));
-        }
-        Ok(view)
+        )
     }
 
     /// Projects only a validated pending prompt for the exact requested revision; it grants no response or restoration authority.

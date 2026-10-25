@@ -45,8 +45,9 @@ impl AutonomyRunner {
         Ok(())
     }
 
-    // A returned persisted pause is a complete prepared restart point, not just a DTO that happens to have pending IDs.
-    // Preparation failure returns an error and retains its actual claim phase rather than reporting a durable pause or retrying.
+    // A returned persisted pause is a prepared reconstruction point, not process-exit durability inferred from a DTO or store capability.
+    // Volatile pauses require a real host endpoint; otherwise typed cleanup retires pending work before the public result is published.
+    // Preparation or cleanup failure retains actual custody rather than reporting successful exit or retrying effects.
     pub(super) async fn persist_returned_pause(
         &self,
         result: TaskRunResult,
@@ -65,6 +66,9 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotResumable)?;
         let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload.clone())?;
         if !enabled(&payload.settings) {
+            if !self.interaction_delivery {
+                return Box::pin(self.retire_unavailable_pause(&saved)).await;
+            }
             self.publish_automatic(&result);
             return Ok(result);
         }

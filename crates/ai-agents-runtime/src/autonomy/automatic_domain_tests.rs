@@ -3,7 +3,7 @@
 use super::*;
 use crate::Agent;
 
-// Only declaration scope changes; the actual host tool, revision source and pure validator remain the production integration fixtures.
+// Actual domain tools and revision-bound validators enter through the configured hosting preparation shared by explicit and automatic tasks.
 async fn automatic_domain_agent(
     domain: &str,
     skill: bool,
@@ -51,7 +51,8 @@ async fn automatic_domain_agent(
             config_identity: Some("automatic-domain.v1".into()),
             ..Default::default()
         })
-        .build()
+        .build_task_host()
+        .await
         .unwrap()
 }
 

@@ -20,18 +20,20 @@ impl Drop for PromotionCleanup {
 }
 
 impl RuntimeAgent {
-    /// Installs automatic entry only after all providers, states, loaded skills and host adapters have their final bindings.
-    pub(crate) fn install_automatic_tasks(
-        mut self,
-        config: AutonomyConfig,
-        options: AutomaticTaskOptions,
-    ) -> Result<Self> {
+    /// Validates final component and declaration bindings without provider calls, storage construction or task admission.
+    /// None defers only the configured store check to explicit preparation; an installed restore host is still required for persistent automatic entry.
+    pub(crate) fn preflight_task_hosting(
+        &self,
+        config: &AutonomyConfig,
+        options: &AutomaticTaskOptions,
+        reconstruction: Option<bool>,
+    ) -> Result<()> {
         self.preflight_standalone_autonomy()?;
         let validate = |scope,
                         settings: &ai_agents_core::autonomy::AutonomyOverride|
          -> Result<()> {
             let profile = crate::autonomy::resolve_profile(
-                &config,
+                config,
                 scope,
                 None,
                 Some(settings),
@@ -41,17 +43,13 @@ impl RuntimeAgent {
             )?;
             if profile.enabled {
                 self.preflight_priced_autonomy(profile.max_cost_usd.is_some())?;
-                self.autonomy_extensions.bind_for_agent(&self, &profile)?;
+                self.autonomy_extensions.bind_for_agent(self, &profile)?;
                 if profile
                     .settings
                     .persistence
                     .as_ref()
                     .is_some_and(|p| p.enabled != Some(false))
-                    && (options.restore_host.is_none()
-                        || options
-                            .store
-                            .as_ref()
-                            .is_none_or(|store| !store.supports_reconstruction()))
+                    && (options.restore_host.is_none() || reconstruction == Some(false))
                 {
                     return Err(AgentError::Config("automatic task persistence requires an explicit reconstruction store and restore host".into()));
                 }
@@ -81,10 +79,55 @@ impl RuntimeAgent {
                 validate(AutonomyScope::Skill, settings)?;
             }
         }
+        Ok(())
+    }
+
+    /// Prepares only a selected task-capable session backend; snapshot-only configurations do not trigger hidden service connections.
+    /// The unpublished runtime retains the same backend for session and task work, while every runner still receives its own fixed actor scope.
+    pub(crate) async fn prepare_task_storage(
+        &self,
+    ) -> Result<Option<Arc<dyn ai_agents_core::AgentStorage>>> {
+        let injected = self.storage.read().clone();
+        if let Some(storage) = injected {
+            return Ok(storage
+                .supports(ai_agents_core::StorageCapability::TaskRuns)
+                .then_some(storage));
+        }
+        if !matches!(self.storage_config, crate::spec::StorageConfig::Sqlite(_)) {
+            return Ok(None);
+        }
+        self.init_storage().await?;
+        let storage = self.storage.read().clone();
+        match storage {
+            Some(storage) if storage.supports(ai_agents_core::StorageCapability::TaskRuns) => {
+                Ok(Some(storage))
+            }
+            _ => Err(AgentError::UnsupportedStorageCapability(
+                ai_agents_core::StorageCapability::TaskRuns,
+            )),
+        }
+    }
+
+    /// Publishes one configured service only after final capability checks and optional explicit storage preparation.
+    /// Reconstruction capability is not process-exit durability, and installing this service never starts a task or consumes a saved decision.
+    pub(crate) fn install_automatic_tasks(
+        mut self,
+        config: AutonomyConfig,
+        options: AutomaticTaskOptions,
+        storage: Option<Arc<dyn ai_agents_core::AgentStorage>>,
+        interaction_delivery: bool,
+    ) -> Result<Self> {
+        let reconstruction = options.store.as_ref().map_or_else(
+            || storage.is_some(),
+            |store| store.supports_reconstruction(),
+        );
+        self.preflight_task_hosting(&config, &options, Some(reconstruction))?;
         let host = Arc::new(AutomaticTaskHost {
             config,
             options,
-            storage: Arc::new(ai_agents_storage::InMemoryTaskStorage::default()),
+            interaction_delivery,
+            storage: storage
+                .unwrap_or_else(|| Arc::new(ai_agents_storage::InMemoryTaskStorage::default())),
             runner: Default::default(),
             outcome: Default::default(),
         });
@@ -155,7 +198,8 @@ impl RuntimeAgent {
             host.options.ceilings.clone(),
             store,
             identity,
-        )?;
+        )?
+        .with_interaction_delivery(host.interaction_delivery);
         if let Some(restore) = &host.options.restore_host {
             runner = runner.with_restore_host(restore.clone());
         }

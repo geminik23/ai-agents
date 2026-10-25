@@ -106,11 +106,13 @@ async fn main() -> Result<()> {
             router: true,
             calls: AtomicUsize::new(0),
         });
-        // The same builder used for ordinary YAML installs retained volatile hosting only for enabled declarations.
+        // Explicit host preparation uses the ordinary builder and keeps no-storage tasks volatile; it does not install restart authority.
         let agent = AgentBuilder::from_yaml(yaml)?
             .llm(main.clone())
             .llm_alias("router", router.clone())
-            .build()?;
+            .task_interaction_delivery(true)
+            .build_task_host()
+            .await?;
         let mut initial = agent.chat_stream_events("Prepare the report").await?;
         let mut saw_pause = false;
         while let Some(event) = initial.next().await {
@@ -143,6 +145,12 @@ async fn main() -> Result<()> {
             .expect("retained typed controller question");
         assert!(matches!(interaction.prompt, TaskHostPrompt::Question(_)));
         let runner = agent.automatic_task_runner().expect("same live controller");
+        // Store-only inspection shares the safe projection but cannot attest the retained runtime's local custody.
+        let stored =
+            ai_agents::TaskRunDisplay::read(runner.task_store().as_ref(), &paused.run.key.run_id)
+                .await?;
+        assert_eq!(stored.summary.revision, display.summary.revision);
+        assert!(!stored.locally_retained);
         let mut resumed = runner.resume_stream(
             &paused.run.key.run_id,
             paused.run.revision,

@@ -28,6 +28,12 @@ fn development_automatic_task_hosting_surface_compiles() {
                 restore_host: None,
             })
     }
+    async fn prepare(builder: ai_agents::AgentBuilder) -> ai_agents::Result<RuntimeAgent> {
+        builder
+            .task_interaction_delivery(false)
+            .build_task_host()
+            .await
+    }
     fn control(agent: &RuntimeAgent) {
         let _configured: ai_agents::Result<Arc<ai_agents::autonomy::AutonomyRunner>> =
             agent.task_runner();
@@ -54,6 +60,10 @@ fn development_automatic_task_hosting_surface_compiles() {
             input: ai_agents::autonomy::TaskResumeInput::Continue,
         });
     }
+    fn store_only(store: &dyn ai_agents::TaskRunStore) {
+        let _display = ai_agents::TaskRunDisplay::read(store, "retained");
+        let _cancel = ai_agents::CancellationOutcome::request(store, "retained", 1);
+    }
     fn display_types(view: ai_agents::TaskRunDisplay, outcome: ai_agents::CancellationOutcome) {
         let _ = (
             view.summary,
@@ -70,7 +80,15 @@ fn development_automatic_task_hosting_surface_compiles() {
             _ => None,
         }
     }
-    let _surface = (configure, control, display_types, prompt_type, task_event);
+    let _surface = (
+        configure,
+        prepare,
+        control,
+        store_only,
+        display_types,
+        prompt_type,
+        task_event,
+    );
 }
 
 #[test]

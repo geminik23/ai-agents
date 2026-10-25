@@ -607,6 +607,8 @@ A configured literal objective is combined with accepted user input. An `objecti
 |---|---|
 | `AgentBuilder::autonomy(config)` | Programmatic defaults for the same raw profile/override types as YAML |
 | `AgentBuilder::automatic_task_options(options)` | Explicit hosting opt-in with trusted ceilings, optional scoped store/configuration identity and optional reconstruction host; it does not enable a disabled profile |
+| `AgentBuilder::build_task_host().await` | Explicitly prepares task hosting from the same finalized builder, sharing an injected task-capable session backend or opening configured SQLite; no task or startup continuation is executed |
+| `AgentBuilder::task_interaction_delivery(available)` | Hosting opt-in declaring a usable controller-response endpoint; defaults to true, including manual Rust resume, and false follows existing unavailable policies |
 | `RuntimeAgent::automatic_task_result()` | Last published exact `TaskRunResult`; trusted-host data, not a display export or proof of current state after an ambiguous error |
 | `RuntimeAgent::automatic_task_runner()` | The already created retained controller, or `None` before first lookup/entry |
 | `RuntimeAgent::task_runner()` | Lazily resolves the shared configured controller without starting work; successive operations retain it within the same actor scope |
@@ -615,6 +617,7 @@ A configured literal objective is combined with accepted user input. An `objecti
 | `RuntimeAgent::cancel_task(run_id, revision)` | `CancellationOutcome` distinguishes `requested`, `acknowledged` cleanup, and `already_terminal` metadata |
 | `RuntimeAgent::task_operation(operation)` | Applies explicit typed run/skill/resume/stop/objective/limit and other supported controls through the same controller |
 | `RuntimeAgent::task_display(run_id)` | `TaskRunDisplay` is a bounded, default-redacted snapshot of acknowledged facts, not a completion proof or recovery payload |
+| `TaskRunDisplay::read(store, run_id).await` | Uses the same safe projection through an authorized scoped store without constructing a runtime/provider, claiming ownership or consuming a pending response |
 | `RuntimeAgent::task_interaction(run_id, revision)` | Exact `TaskHostInteraction` with typed prompt data for an authenticated host; not a display/export DTO |
 | `RuntimeAgent::automatic_task_operation(operation)` | Existing explicit resume/stop/cancel/objective/limit/delivery-control operations on that controller |
 | `AutonomyRunner::task_store()` | The actual scoped store for trusted inspection and reviewed recovery; namespace scoping does not authenticate an external caller |
@@ -623,11 +626,43 @@ Calling `task_runner()` does not invoke a provider or start a task. Automatic st
 
 Default hosting retains volatile in-memory checkpoints for the lifetime of the runtime/retained runner. It does not require SQLite for normal completion or same-process pause/resume. Durable or restart-prepared policies require an explicit compatible store and `TaskRestoreHost` in `AutomaticTaskOptions`; the supplied configuration identity must match the store. Existing explicit startup selection remains explicit, including for `resume_on_start`. A reconstruction resumes the task's typed safe continuation, not an arbitrary ordinary composing call stack.
 
+### Explicit hosting preparation (development only)
+
+`build_task_host().await` uses the same component construction as `build()`, validates actual automatic-declaration bindings before opening storage, and publishes the hosting service only after preparation succeeds. It does not call `auto_configure_llms`, connect MCP, auto-spawn children, call a model/tool, claim a checkpoint or select a startup candidate. Any earlier builder auto-configuration remains an explicit preparation step; this method is not a pure reconstruction staging implementation.
+
+Storage selection preserves existing precedence:
+
+1. An explicit `AutomaticTaskOptions::store` remains the fixed scoped task store; preparation does not open session storage just to replace it.
+2. Otherwise an injected session storage handle is used for tasks only when it advertises `StorageCapability::TaskRuns`.
+3. Otherwise configured SQLite is initialized through the runtime's existing storage path and the same handle backs task journals and session storage. The runtime `sqlite` feature is required; existing storage path resolution is unchanged.
+4. No storage or a snapshot-only File/Redis/Noop backend leaves task hosting volatile. Preparation does not eagerly open these snapshot-only backends or infer TaskRuns support from them. Their ordinary session initialization and any enabled session-storage requirements still apply at execution.
+
+A new actor-scoped adapter is selected after a settled actor change. An explicit scoped task store is not automatically rebound to another actor. The unchanged synchronous `build()` retains its previous volatile-task behavior unless an explicit task store was supplied. The new asynchronous preparation path is opt-in and does not enable a disabled task profile or change ordinary CLI construction.
+
+For an already configured builder whose caller owns the runtime lifetime and can deliver typed responses:
+
+```rust
+use ai_agents::{AgentBuilder, Result, RuntimeAgent};
+
+async fn prepare_host(builder: AgentBuilder) -> Result<RuntimeAgent> {
+    builder
+        .task_interaction_delivery(true)
+        .build_task_host()
+        .await
+}
+```
+
+Set `task_interaction_delivery(false)` only when no usable task-response endpoint is exposed. This passes the same setting as `AutonomyRunner::with_interaction_delivery` to configured explicit and automatic tasks. Controller stop/fail policies remain effective; other unserviceable volatile pauses, including tool questions and required reviews, are retired through existing typed cleanup and acknowledged as `Incomplete` with `capability_unavailable`, without invoking pending work or approving it. Rejected/lost/dropped cleanup acknowledgements retain custody. A verified cancellation-only successor takes precedence at cleanup admission; only a store-certified no-write claim refusal permits that narrow reread, never arbitrary-revision or ambiguous-error retry. Ordinary HITL and confirmed delivery-loss operations remain distinct, and silence is not loss. Explicitly prepared reconstruction still requires its installed host/store and does not infer process-exit durability.
+
+SQLite task journals are not prepared restart acknowledgements. Persistence still requires an explicitly installed compatible `TaskRestoreHost`, actual implementation/native-history bindings, trusted time continuity, the existing capture/reconstruction acknowledgements and separate restoration review. Backend capability, a configuration digest or this builder method supplies none of those authorities. Production YAML reconstruction and platform clock acceptance remain unfinished; do not exit a one-shot host advertising a durable pause merely because preparation opened SQLite. No package, checkpoint-envelope, dependency or MSRV version changes are introduced.
+
 ### Host inspection and cancellation (development only)
 
 `AutonomyRunner` exposes the same `cancel_task`, `task_display` and `task_interaction` operations. For a different process that only has an authorized scoped store, `CancellationOutcome::request(store, run_id, revision)` records a monotonic cancellation request without constructing providers, restoring ownership or executing pending work. Repeated requests at the current revision do not reset usage or consume a response. A stale revision is rejected; an ambiguous write or mismatching receipt is an error, not a successful request to retry blindly.
 
 `CancellationDisposition::Acknowledged` is returned only after retained safe-pause cleanup has completed. Running operations return `Requested` and their original foreground future must keep polling until settlement; non-preemptible or uncertain work can remain `RecoveryRequired`. `AlreadyTerminal` reports stored terminal status, not rollback or global quiescence. `locally_retained: Some(true/false)` is a local custody observation; store-only requests return `None` because another process's live ownership is unknown. It must not be converted into cleanup success.
+
+`TaskRunDisplay::read(store, run_id)` requires an already authorized scoped `TaskRunStore`; it does not build providers, connect MCP, perform startup selection or claim a task. Repeated inspection leaves the revision and pending response unchanged. Store-only `locally_retained: false` means no runtime is attached to that view, not that a remote owner released protection; nonterminal `restoration_review_required` stays `None`. The same redaction and 16 KiB bound apply to local and store-only projections.
 
 `TaskRunDisplay` preserves safe listing metadata plus redacted objective/profile/stage/reasons, stored counters/limits/clocks, bounded todo/progress and available artifact observations. Namespace identifiers have the same visibility as scoped storage listings; the host still authenticates access. `last_gate` and its cycle/objective revision are historical observations, not current eligible completion proof. Missing artifact observations remain unavailable, and `restoration_review_required: None` means no local retained review establishes that fact. Local custody can remain protected even when the store has released its owner token. Serialized display output is limited to `MAX_TASK_DISPLAY_BYTES` (16 KiB); oversized views fail explicitly without changing the task. A snapshot is not a durable event log or a UI-generated clock.
 

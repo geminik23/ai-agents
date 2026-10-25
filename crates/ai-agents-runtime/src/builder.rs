@@ -86,6 +86,13 @@ fn wrap_registry_with_observability(
     })
 }
 
+// This unpublished configuration accompanies the finalized runtime so storage preparation cannot duplicate component construction.
+struct PreparedTaskHosting {
+    config: ai_agents_core::autonomy::AutonomyConfig,
+    options: crate::autonomy::AutomaticTaskOptions,
+    interaction_delivery: bool,
+}
+
 pub struct AgentBuilder {
     spec: Option<AgentSpec>,
     llm: Option<Arc<dyn LLMProvider>>,
@@ -129,6 +136,7 @@ pub struct AgentBuilder {
     automatic_config: Option<ai_agents_core::autonomy::AutonomyConfig>,
     automatic_options: crate::autonomy::AutomaticTaskOptions,
     task_hosting_requested: bool,
+    task_interaction_delivery: bool,
 }
 
 impl AgentBuilder {
@@ -138,6 +146,7 @@ impl AgentBuilder {
             automatic_config: None,
             automatic_options: Default::default(),
             task_hosting_requested: false,
+            task_interaction_delivery: true,
             reasoning: None,
             reflection: None,
             spec: None,
@@ -202,6 +211,15 @@ impl AgentBuilder {
         self
     }
 
+    /// Declares whether the host exposes a usable task-response endpoint, including explicit manual resume.
+    /// False selects unavailable policies and acknowledged cleanup of unserviceable volatile pauses; silence is not delivery loss.
+    /// Ordinary HITL is unchanged, and persistent reconstruction still requires explicitly installed host capabilities.
+    pub fn task_interaction_delivery(mut self, available: bool) -> Self {
+        self.task_interaction_delivery = available;
+        self.task_hosting_requested = true;
+        self
+    }
+
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
@@ -215,6 +233,7 @@ impl AgentBuilder {
             automatic_config: None,
             automatic_options: Default::default(),
             task_hosting_requested: false,
+            task_interaction_delivery: true,
             llm: None,
             llm_registry: None,
             memory: None,
@@ -1230,7 +1249,42 @@ impl AgentBuilder {
 
     /// Finalizes one consistent hierarchy and installs shared automatic hosting only after enabled declarations pass actual capability preflight.
     /// Default-off agents retain ordinary construction and invocation behavior.
-    pub fn build(mut self) -> Result<RuntimeAgent> {
+    pub fn build(self) -> Result<RuntimeAgent> {
+        let (agent, hosting) = self.build_prepared()?;
+        match hosting {
+            Some(hosting) => agent.install_automatic_tasks(
+                hosting.config,
+                hosting.options,
+                None,
+                hosting.interaction_delivery,
+            ),
+            None => Ok(agent),
+        }
+    }
+
+    /// Builds the same runtime after validating final components, then explicitly prepares configured task-capable storage.
+    /// This may open the configured SQLite backend but never constructs a restore host, invokes semantic work or promises process restart.
+    /// Explicit task stores take precedence; session-only backends retain volatile task hosting without being opened here.
+    pub async fn build_task_host(mut self) -> Result<RuntimeAgent> {
+        self.task_hosting_requested = true;
+        let (agent, hosting) = self.build_prepared()?;
+        let hosting = hosting.expect("task hosting was explicitly requested");
+        agent.preflight_task_hosting(&hosting.config, &hosting.options, None)?;
+        let storage = if hosting.options.store.is_some() {
+            None
+        } else {
+            agent.prepare_task_storage().await?
+        };
+        agent.install_automatic_tasks(
+            hosting.config,
+            hosting.options,
+            storage,
+            hosting.interaction_delivery,
+        )
+    }
+
+    // Both public construction paths consume this exact finalized runtime; asynchronous preparation never replays builder effects.
+    fn build_prepared(mut self) -> Result<(RuntimeAgent, Option<PreparedTaskHosting>)> {
         self.prepare_routing(false)?;
         let resource_locks = self.shared_resource_locks();
         // Capture actor memory and facts configs before partial moves of spec consume fields.
@@ -1803,10 +1857,12 @@ impl AgentBuilder {
             agent = agent.with_facts_config(actor_memory_config, facts_config);
         }
 
-        if install_automatic {
-            agent = agent.install_automatic_tasks(automatic_config, self.automatic_options)?;
-        }
-        Ok(agent)
+        let hosting = install_automatic.then_some(PreparedTaskHosting {
+            config: automatic_config,
+            options: self.automatic_options,
+            interaction_delivery: self.task_interaction_delivery,
+        });
+        Ok((agent, hosting))
     }
 }
 

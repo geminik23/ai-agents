@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Added
-- Configured task hosting: development Rust convenience APIs share explicit and automatic task runners within an actor scope, with revision-bound resume and retained per-run delivery
+- Configured task hosting: development Rust hosts prepare configured task-capable storage, inspect safe snapshots with storage alone, and share explicit and automatic runners with truthful response availability and cleanup
 - Task host inspection and cancellation: development Rust hosts read bounded redacted snapshots and typed pending prompts, distinguish cancellation requests from acknowledged cleanup, and preserve controller delivery and final-stage review
 - Automatic task entry: development-only YAML state and selected-skill tasks share the existing controller, retained host decisions, bounded lifecycle events and acknowledged completion without replaying prepared work
 - Task event streams: development-only Rust hosts observe bounded, default-redacted task execution, retained decisions and acknowledged outcomes with explicit foreground close and recovery-safe drop
@@ -51,6 +51,7 @@
 - Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
 
 ### Fixed
+- Task host pause lifetimes: retire unserviceable volatile questions and reviews through acknowledged cleanup, preserve cancellation precedence and retain protection after failed or lost receipts
 - Task reconstruction bounds: reject predictable intermediate-journal size failures before claiming a usable pause and compare registry membership independently of listing order
 - Task pause acknowledgements: verify exact batch and composed checkpoint receipts before transferring revision, numeric-observation cursors or safe-pause ownership
 - Task effect boundaries: recheck cancellation and clocks after final host proof, preserve acknowledged effects while rejecting late task credit, and retain ordinary timeout recovery and resumed-message history cleanup

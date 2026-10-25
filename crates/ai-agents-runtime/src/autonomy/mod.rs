@@ -9,6 +9,10 @@ pub(crate) mod automatic;
 #[cfg(test)]
 mod automatic_tests;
 #[cfg(test)]
+mod hosting_completion_tests;
+#[cfg(test)]
+mod hosting_preparation_tests;
+#[cfg(test)]
 mod hosting_tests;
 pub use automatic::AutomaticTaskOptions;
 mod boundary;

@@ -9,6 +9,13 @@ pub(super) struct HostStop {
     kind: &'static str,
     status: TaskRunStatus,
     request_id: Option<String>,
+    cancellation: Option<Arc<RetirementCancellation>>,
+}
+
+// A single unavailable cleanup can yield to exactly one cancellation-only successor, never to a later resume or host edit.
+struct RetirementCancellation {
+    predecessor: TaskRunSnapshot,
+    accepted: std::sync::atomic::AtomicBool,
 }
 
 tokio::task_local! { static HOST_STOP: HostStop; }
@@ -20,10 +27,64 @@ async fn scope_stop<F: Future>(control: HostStop, future: F) -> F::Output {
 
 /// Cancellation helpers retain their original semantics unless the host explicitly owns a stop operation.
 pub(super) fn stop_reason() -> Option<HostStop> {
-    HOST_STOP.try_with(Clone::clone).ok()
+    HOST_STOP.try_with(Clone::clone).ok().filter(|control| {
+        control.cancellation.as_ref().is_none_or(|cancellation| {
+            !cancellation
+                .accepted
+                .load(std::sync::atomic::Ordering::Acquire)
+        })
+    })
+}
+
+// This live cleanup witness accepts only a fully verified RequestCancel successor; it cannot authorize replay or adopt an unrelated revision.
+pub(super) fn accept_retirement_cancellation(
+    snapshot: &TaskRunSnapshot,
+    expected_revision: u64,
+) -> ai_agents_core::Result<bool> {
+    let Some(control) = HOST_STOP.try_with(Clone::clone).ok() else {
+        return Ok(false);
+    };
+    let Some(cancellation) = control.cancellation else {
+        return Ok(false);
+    };
+    if cancellation.predecessor.revision != expected_revision || !snapshot.cancel_requested {
+        return Ok(false);
+    }
+    super::super::store::verify_checkpoint_receipt(
+        &cancellation.predecessor,
+        &TaskRunMutation::RequestCancel { expected_revision },
+        snapshot,
+    )?;
+    cancellation
+        .accepted
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(true)
 }
 
 impl AutonomyRunner {
+    /// Retires an acknowledged volatile pause when the configured host exposes no usable response endpoint.
+    /// Existing typed cancellation cleans pending histories without invoking them; failed or lost ACK retains the original custody protection.
+    pub(super) async fn retire_unavailable_pause(
+        &self,
+        acknowledged: &TaskRunSnapshot,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        let run_id = &acknowledged.key.run_id;
+        scope_stop(
+            HostStop {
+                reason: "host has no task response endpoint for a volatile pause".into(),
+                kind: "capability_unavailable",
+                status: TaskRunStatus::Incomplete,
+                request_id: None,
+                cancellation: Some(Arc::new(RetirementCancellation {
+                    predecessor: acknowledged.clone(),
+                    accepted: std::sync::atomic::AtomicBool::new(false),
+                })),
+            },
+            self.cancel_paused(run_id, acknowledged.revision),
+        )
+        .await
+    }
+
     /// Stops a known-safe retained pause without invoking its pending operation; the host authenticates its caller.
     /// A conditional claim excludes competing responses, and protection is released only after terminal acknowledgement.
     pub async fn stop_paused(
@@ -43,6 +104,7 @@ impl AutonomyRunner {
                 kind: "stop",
                 status: TaskRunStatus::Incomplete,
                 request_id: None,
+                cancellation: None,
             },
             self.cancel_paused(run_id, expected_revision),
         )
@@ -97,6 +159,7 @@ impl AutonomyRunner {
                 kind: "external_unavailable",
                 status,
                 request_id: Some(request_id.into()),
+                cancellation: None,
             },
             self.cancel_paused(run_id, expected_revision),
         )
@@ -147,6 +210,7 @@ impl AutonomyRunner {
                         TaskRunStatus::Incomplete
                     },
                     request_id: Some(request_id.into()),
+                    cancellation: None,
                 },
                 self.cancel_paused(run_id, expected_revision),
             )
@@ -187,6 +251,7 @@ impl AutonomyRunner {
                             TaskRunStatus::Incomplete
                         },
                         request_id: Some(request_id.into()),
+                        cancellation: None,
                     },
                     self.cancel_paused(run_id, expected_revision),
                 )
@@ -209,6 +274,7 @@ impl AutonomyRunner {
                     TaskRunStatus::Incomplete
                 },
                 request_id: Some(request_id.into()),
+                cancellation: None,
             },
             self.cancel_paused(run_id, expected_revision),
         )
@@ -414,7 +480,38 @@ impl AutonomyRunner {
                 expected_revision: snapshot.revision,
             }
         };
-        let saved = self.store.mutate(&snapshot.key.run_id, &mutation).await?;
+        let saved = if let TaskRunMutation::Claim {
+            expected_revision,
+            owner_token,
+        } = &mutation
+            && stop_reason().is_some_and(|control| control.cancellation.is_some())
+        {
+            // Only a certified no-write claim refusal permits a cancellation-only re-read; custom transport errors remain ambiguous.
+            match self
+                .store
+                .claim_paused(
+                    &snapshot.key.run_id,
+                    *expected_revision,
+                    owner_token.clone(),
+                )
+                .await?
+            {
+                Some(saved) => saved,
+                None => {
+                    let current = self
+                        .store
+                        .load(&snapshot.key.run_id)
+                        .await?
+                        .ok_or(TaskRunStorageError::NotFound)?;
+                    if accept_retirement_cancellation(&current, *expected_revision)? {
+                        return Ok(current);
+                    }
+                    return Err(TaskRunStorageError::Conflict.into());
+                }
+            }
+        } else {
+            self.store.mutate(&snapshot.key.run_id, &mutation).await?
+        };
         super::super::store::verify_checkpoint_receipt(&snapshot, &mutation, &saved)?;
         Ok(saved)
     }
@@ -427,10 +524,10 @@ impl AutonomyRunner {
     ) -> ai_agents_core::Result<TaskRunSnapshot> {
         let mutation = if let Some(control) = stop_reason() {
             payload.stop_reason = Some(
-                if control.kind == "stop" {
-                    "user_stopped"
-                } else {
-                    "external_unavailable"
+                match control.kind {
+                    "stop" => "user_stopped",
+                    "capability_unavailable" => "capability_unavailable",
+                    _ => "external_unavailable",
                 }
                 .into(),
             );
