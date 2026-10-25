@@ -64,6 +64,29 @@ fn development_automatic_task_hosting_surface_compiles() {
         let _display = ai_agents::TaskRunDisplay::read(store, "retained");
         let _cancel = ai_agents::CancellationOutcome::request(store, "retained", 1);
     }
+    async fn foreground_scope(
+        spec: &AgentSpec,
+        builder: ai_agents::AgentBuilder,
+    ) -> ai_agents::Result<()> {
+        let scope = ai_agents::TaskHostScope::from_spec(spec, std::path::Path::new("."), None)?;
+        let _options = scope.task_options();
+        let inspection_scope = scope.clone();
+        let _store = inspection_scope.open_store();
+        let agent = builder.task_host_scope(scope)?.build_task_host().await?;
+        let session = ai_agents::TaskHostSession::new(true);
+        let _result = session.scope(agent.run_task("objective", None));
+        let _changed = session.changed();
+        for run in session.runs() {
+            let _: ai_agents::TaskRunKey = run.key.clone();
+            let _admitted = run.execution_admitted();
+            let _running_cancel = run.runner.request_running_cancel("run");
+            let _revision = run.published_revision();
+            let _cleanup = run.runner.input_unavailable_paused("run", 1);
+        }
+        let _protected = session.has_protected_work();
+        session.close_input();
+        Ok(())
+    }
     fn display_types(view: ai_agents::TaskRunDisplay, outcome: ai_agents::CancellationOutcome) {
         let _ = (
             view.summary,
@@ -83,6 +106,7 @@ fn development_automatic_task_hosting_surface_compiles() {
     let _surface = (
         configure,
         prepare,
+        foreground_scope,
         control,
         store_only,
         display_types,

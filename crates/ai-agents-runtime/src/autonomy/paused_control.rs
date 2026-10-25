@@ -68,12 +68,27 @@ impl AutonomyRunner {
         &self,
         acknowledged: &TaskRunSnapshot,
     ) -> ai_agents_core::Result<TaskRunResult> {
+        self.retire_input_snapshot(
+            acknowledged,
+            TaskRunStatus::Incomplete,
+            "capability_unavailable",
+        )
+        .await
+    }
+
+    // Policy selection never reloads the predecessor; the existing witness alone admits an exact cancellation-only successor.
+    async fn retire_input_snapshot(
+        &self,
+        acknowledged: &TaskRunSnapshot,
+        status: TaskRunStatus,
+        kind: &'static str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
         let run_id = &acknowledged.key.run_id;
         scope_stop(
             HostStop {
                 reason: "host has no task response endpoint for a volatile pause".into(),
-                kind: "capability_unavailable",
-                status: TaskRunStatus::Incomplete,
+                kind,
+                status,
                 request_id: None,
                 cancellation: Some(Arc::new(RetirementCancellation {
                     predecessor: acknowledged.clone(),
@@ -83,6 +98,109 @@ impl AutonomyRunner {
             self.cancel_paused(run_id, acknowledged.revision),
         )
         .await
+    }
+
+    /// Retires a known-safe pause after confirmed foreground input loss, preserving controller and external unavailable policies.
+    /// Exact revision admission and existing typed cleanup remain authoritative; this does not acknowledge a running operation or uncertain effects.
+    pub async fn input_unavailable_paused(
+        &self,
+        run_id: &str,
+        revision: u64,
+    ) -> ai_agents_core::Result<TaskRunResult> {
+        let snapshot = self
+            .active
+            .lock()
+            .as_ref()
+            .filter(|execution| execution.run_id == run_id)
+            .map(|execution| execution.acknowledged_snapshot())
+            .ok_or(TaskRunStorageError::NotResumable)?;
+        if snapshot.revision != revision {
+            return Err(TaskRunStorageError::Conflict.into());
+        }
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let controller = controller_checkpoint(&payload)?;
+        use super::super::controller::ControllerProposal;
+        let fallback = match controller
+            .as_ref()
+            .and_then(|state| state.review.as_ref())
+            .map(|review| &review.proposal)
+        {
+            Some(
+                ControllerProposal::Capacity { .. }
+                | ControllerProposal::Question { limit: Some(_), .. },
+            ) => {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+                    == Some(InteractionUnavailableAction::Fail)
+            }
+            Some(ControllerProposal::Question { reason, .. }) if reason == "no_progress" => {
+                payload
+                    .settings
+                    .progress
+                    .as_ref()
+                    .and_then(|p| p.stagnation.as_ref())
+                    .and_then(|p| p.on_unavailable)
+                    == Some(StagnationAction::Fail)
+            }
+            Some(ControllerProposal::Question { .. }) => {
+                payload
+                    .settings
+                    .premature_finish
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+                    == Some(InteractionUnavailableAction::Fail)
+            }
+            _ if controller.is_none()
+                && payload
+                    .pending
+                    .as_ref()
+                    .is_some_and(|p| matches!(p.kind, TaskPendingKind::Limit)) =>
+            {
+                payload
+                    .settings
+                    .on_limit
+                    .as_ref()
+                    .and_then(|policy| policy.on_unavailable)
+                    == Some(InteractionUnavailableAction::Fail)
+            }
+            _ => false,
+        };
+        if let Some(wait) = controller
+            .as_ref()
+            .and_then(|state| state.driver.as_ref())
+            .and_then(|driver| driver.wait.as_ref())
+        {
+            if self.agent.autonomy_extensions().condition(&wait.binding.id) != Some(&wait.binding) {
+                return Err(TaskRunStorageError::NotResumable.into());
+            }
+            let failed = matches!(
+                self.agent
+                    .autonomy_extensions()
+                    .condition_unavailable_policy(&wait.binding.id),
+                ExternalUnavailablePolicy::Fail
+            );
+            return self
+                .retire_input_snapshot(
+                    &snapshot,
+                    if failed {
+                        TaskRunStatus::Failed
+                    } else {
+                        TaskRunStatus::Incomplete
+                    },
+                    "external_unavailable",
+                )
+                .await;
+        }
+        if fallback {
+            self.retire_input_snapshot(&snapshot, TaskRunStatus::Failed, "controller_unavailable")
+                .await
+        } else {
+            self.retire_unavailable_pause(&snapshot).await
+        }
     }
 
     /// Stops a known-safe retained pause without invoking its pending operation; the host authenticates its caller.

@@ -55,6 +55,9 @@ impl AutomaticOutcome {
             .store(false, std::sync::atomic::Ordering::Release);
         drop(current);
         self.changed.notify_waiters();
+        if let Some(session) = super::host_session::current_session() {
+            session.notify();
+        }
     }
 
     /// Ambiguous execution failure wakes ordinary callers without replacing a protected task with a fabricated terminal status.
@@ -70,6 +73,9 @@ impl AutomaticOutcome {
             .store(true, std::sync::atomic::Ordering::Release);
         drop(current);
         self.changed.notify_waiters();
+        if let Some(session) = super::host_session::current_session() {
+            session.notify();
+        }
     }
 }
 

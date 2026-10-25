@@ -5,6 +5,12 @@ mod ad_maintenance_fault_tests;
 #[cfg(test)]
 mod admission_tests;
 mod authority;
+mod host_scope;
+pub(crate) mod host_session;
+#[cfg(test)]
+mod host_session_tests;
+pub use host_scope::TaskHostScope;
+pub use host_session::{TaskHostRun, TaskHostSession};
 pub(crate) mod automatic;
 #[cfg(test)]
 mod automatic_tests;

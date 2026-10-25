@@ -1262,6 +1262,27 @@ impl AgentBuilder {
         }
     }
 
+    /// Binds an authorized declarative namespace to the definitions actually prepared by this builder, without constructing providers or starting work.
+    /// Definitions are loaded once and retained for final construction; this is not opaque implementation binding, caller authentication or restart authority.
+    pub fn task_host_scope(mut self, scope: crate::autonomy::TaskHostScope) -> Result<Self> {
+        if !self.skills_prepared {
+            if let Some(spec) = &self.spec {
+                let mut loader = self.skill_loader.take().unwrap_or_default();
+                if let Some(dir) = &self.yaml_dir {
+                    loader.set_base_dir(dir);
+                }
+                self.skills.extend(loader.load_refs(&spec.skills)?);
+            }
+            self.skills_prepared = true;
+        }
+        let spec = self.spec.as_ref().ok_or_else(|| {
+            AgentError::Config("declarative task scope requires an agent spec".into())
+        })?;
+        self.automatic_options.config_identity = Some(scope.validate_prepared(spec, &self.skills)?);
+        self.task_hosting_requested = true;
+        Ok(self)
+    }
+
     /// Builds the same runtime after validating final components, then explicitly prepares configured task-capable storage.
     /// This may open the configured SQLite backend but never constructs a restore host, invokes semantic work or promises process restart.
     /// Explicit task stores take precedence; session-only backends retain volatile task hosting without being opened here.

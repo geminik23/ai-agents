@@ -597,6 +597,7 @@ impl AutonomyRunner {
 
     /// Consumes only the frozen host decision and then reenters its controller, preserving original clocks and counted work.
     /// Capacity-driver bounds and logical custody are rechecked after claim/consumption acknowledgements, not reset by the host response.
+    /// Host question UIs may return the standard structured free-text response; only an explicit usable answer is normalized to controller guidance.
     pub(super) async fn resume_host_boundary(
         &self,
         snapshot: TaskRunSnapshot,
@@ -678,6 +679,22 @@ impl AutonomyRunner {
                     return Err(AgentError::HITLTimeout);
                 }
                 bounded_value(&value, 65_536)?;
+                let value = if value.is_object() {
+                    let response: ai_agents_tools::QuestionResponse =
+                        serde_json::from_value(value)?;
+                    if !response.answered
+                        || response.timed_out
+                        || response.unavailable
+                        || !response.selected.is_empty()
+                    {
+                        return Err(AgentError::Config(
+                            "controller guidance requires an explicit free-text answer".into(),
+                        ));
+                    }
+                    serde_json::Value::String(response.other_text.unwrap_or_default())
+                } else {
+                    value
+                };
                 if value.as_str().is_none_or(|text| text.trim().is_empty()) {
                     return Err(AgentError::Config("controller question requires a nonempty text answer; host controls use their explicit APIs".into()));
                 }

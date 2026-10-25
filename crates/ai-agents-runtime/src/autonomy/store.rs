@@ -245,6 +245,22 @@ impl ScopedTaskRunStore {
         })
     }
 
+    /// Lists only structurally valid rows matching this exact configuration as well as agent and actor scope.
+    /// Candidate inspection never claims or reconstructs work, and corrupted data remains an error rather than disappearing silently.
+    pub async fn list_compatible(&self) -> Result<Vec<TaskRunSummary>> {
+        let mut rows = Vec::new();
+        for summary in self.list().await? {
+            if let Some(snapshot) = self.inspect_candidate(&summary.key.run_id).await? {
+                let payload: TaskCheckpointPayload =
+                    serde_json::from_value(snapshot.payload.clone())?;
+                if payload.config_identity == self.config_identity {
+                    rows.push(snapshot.summary());
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// Retains a volatile store for same-process pause; it is not restart-resumable.
     pub fn in_memory(
         agent_id: String,

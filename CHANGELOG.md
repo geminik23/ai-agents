@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task CLI: development task commands and plain REPL share configured runners, retained human decisions, scoped provider-free journal management, bounded output and acknowledged foreground shutdown; default production restart remains unavailable
+- Foreground task hosts: development integrations track actual participating controllers through existing composition boundaries, expose prompts only after public acknowledgement and preserve protection after uncertain effects
 - Configured task hosting: development Rust hosts prepare configured task-capable storage, inspect safe snapshots with storage alone, and share explicit and automatic runners with truthful response availability and cleanup
 - Task host inspection and cancellation: development Rust hosts read bounded redacted snapshots and typed pending prompts, distinguish cancellation requests from acknowledged cleanup, and preserve controller delivery and final-stage review
 - Automatic task entry: development-only YAML state and selected-skill tasks share the existing controller, retained host decisions, bounded lifecycle events and acknowledged completion without replaying prepared work
@@ -32,6 +34,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- CLI command compatibility: development command matches include the task family while ordinary run, validation and evaluation retain their distinct result contracts
 - Rust task hosting: development automatic tasks retain shared runtime state and explicit host access; finish fluent configuration before publishing retained controller handles
 - Task validation names: development check IDs reserve the runtime journal namespace and reject collisions before ownership or execution
 - Rust recovery compatibility: development task mutations add guarded reconciliation and cleanup-only claim/publication; custom stores opt into recovery and compatibility-aware candidate inspection
@@ -48,7 +51,7 @@
 - Rust task execution compatibility: tools gain an additive typed task-execution bridge, and exhaustive development effect-state matches must handle acknowledged suspended message invocations without refunding consumed attempts
 - Rust task continuation compatibility: development response and validation outcome matches add external signals and safe suspension, driver literals add parked observation data, and executors gain compatible asynchronous suspension acknowledgement; task stores gain default-unsupported paused limit control and host-control literals include original expiry bounds
 - Rust task compatibility: message literals include optional provenance, actor/context mutation APIs report ownership errors, and additive provider billing, tool footprint and task-todo methods declare capabilities; existing serialized messages remain readable
-- Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; enabled YAML task execution remains unavailable until full runner integration
+- Rust configuration compatibility: typed autonomy fields, validation driver bounds and objective-bound todo identities require affected struct literals to be updated; these development additions are not the published stable API
 
 ### Fixed
 - Task host pause lifetimes: retire unserviceable volatile questions and reviews through acknowledged cleanup, preserve cancellation precedence and retain protection after failed or lost receipts

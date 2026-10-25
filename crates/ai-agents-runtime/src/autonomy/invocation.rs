@@ -72,6 +72,7 @@ pub(crate) struct InvocationScope {
     evidence: Vec<Arc<dyn ai_agents_core::autonomy::TaskFinalAdmission>>,
     child_operation: Option<String>,
     child_required: Option<bool>,
+    host_session: Option<super::TaskHostSession>,
 }
 
 impl InvocationScope {
@@ -95,6 +96,7 @@ impl InvocationScope {
             evidence: ai_agents_llm::current_invocation_evidence(),
             child_operation: super::current_child_operation(),
             child_required: Some(super::child_required()),
+            host_session: super::host_session::current_session(),
         }
     }
 
@@ -105,7 +107,7 @@ impl InvocationScope {
         scope
     }
 
-    /// Nested restrictions intersect; child attribution and failure policy survive spawned callbacks without minting another operation.
+    /// Nested restrictions intersect; child attribution, host delivery and failure policy survive spawned callbacks without minting another operation.
     /// Inherited mutation tracking observes actual child/fallback hops rather than only the outer record.
     pub(crate) async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
         let future = Box::pin(future);
@@ -131,7 +133,10 @@ impl InvocationScope {
         };
         Box::pin(ai_agents_llm::scope_invocation_evidence(
             self.evidence,
-            scope_invocation_bounds(self.bounds, Box::pin(work)),
+            scope_invocation_bounds(
+                self.bounds,
+                Box::pin(super::host_session::scope_session(self.host_session, work)),
+            ),
         ))
         .await
     }

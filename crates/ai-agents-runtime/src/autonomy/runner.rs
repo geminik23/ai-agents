@@ -744,7 +744,11 @@ impl AutonomyRunner {
     }
 
     /// Publishes only the bound run after public-result preparation; other explicit executions cannot overwrite its delivery slot.
+    /// Foreground hosts may expose pending prompts only after this boundary, never from an intermediate pause checkpoint.
     fn publish_automatic(&self, result: &TaskRunResult) {
+        if let Some(session) = crate::autonomy::host_session::current_session() {
+            session.publish(&result.run.key.run_id, result.run.revision);
+        }
         if let Some(outcome) = self.automatic_outcome(&result.run.key.run_id) {
             outcome.publish(result);
         }
@@ -792,6 +796,13 @@ impl AutonomyRunner {
         Ok(result)
     }
 
+    // A foreground host may withdraw delivery after EOF; absence of such a scope preserves the original embedded contract.
+    pub(super) fn interaction_available(&self) -> bool {
+        self.interaction_delivery
+            && crate::autonomy::host_session::current_session()
+                .is_none_or(|session| session.interaction_available())
+    }
+
     /// Returns the actual scoped storage capability for trusted inspection and reviewed recovery after ambiguous operation errors.
     /// Namespace scoping is not caller authentication, and exact recovery payloads must not be exported as display events.
     pub fn task_store(&self) -> &Arc<dyn TaskRunStore> {
@@ -813,6 +824,30 @@ impl AutonomyRunner {
             .is_some_and(|current| Arc::ptr_eq(&current.owner, owner))
         {
             *active = None;
+        }
+    }
+
+    /// Requests cancellation on the actual running execution's serial boundary, without rebinding a stale display revision.
+    /// None means no running handle remains; the caller must still poll its original future, and no cleanup or success is implied.
+    /// An acknowledged pause/terminal winner is preserved, while errors against a still-running execution retain uncertainty and are never retried.
+    pub async fn request_running_cancel(&self, run_id: &str) -> Result<Option<TaskRunSummary>> {
+        let execution = self
+            .active
+            .lock()
+            .as_ref()
+            .filter(|execution| execution.run_id == run_id)
+            .cloned();
+        let Some(execution) = execution else {
+            return Ok(None);
+        };
+        if execution.acknowledged_snapshot().status != TaskRunStatus::Running {
+            return Ok(None);
+        }
+        match execution.request_cancel().await {
+            Err(_) if execution.acknowledged_snapshot().status != TaskRunStatus::Running => {
+                Ok(None)
+            }
+            result => result.map(Some),
         }
     }
 
@@ -1397,7 +1432,7 @@ impl AutonomyRunner {
                         "llm_capacity" | "tool_capacity" | "priced_capacity" | "write_capacity"
                     )
                 {
-                    if !self.interaction_delivery {
+                    if !self.interaction_available() {
                         let latest = execution.load_owned().await?;
                         let current: TaskCheckpointPayload =
                             serde_json::from_value(latest.payload)?;
@@ -1608,9 +1643,10 @@ impl AutonomyRunner {
             binding
         });
         owner.interaction_delivery.store(
-            self.interaction_delivery,
+            self.interaction_available(),
             std::sync::atomic::Ordering::Release,
         );
+        // The scoped host catalogue retains only this exact configured runner; registration inside setup remains covered by pre-execution cleanup.
         let mut cleanup = OwnedTurnCleanup::new(owner.clone());
         let started = std::time::Instant::now();
         let now = chrono::Utc::now();
@@ -1621,6 +1657,12 @@ impl AutonomyRunner {
         let mut todo = None;
         // Known pre-execution setup errors release the reservation; drop during an ambiguous write still requires recovery.
         let setup = Box::pin(async {
+            if let Some(session) = crate::autonomy::host_session::current_session()
+                && let Some(runner) = self.agent.automatic_task_runner()
+                && std::ptr::eq(self, Arc::as_ptr(&runner))
+            {
+                session.register(runner, key.clone())?;
+            }
             let mut payload = TaskCheckpointPayload::new(
                 objective.clone(),
                 self.config_identity.clone(),
@@ -1714,6 +1756,9 @@ impl AutonomyRunner {
             execution.install_todos(self.agent.todo_store(), todo.checkpoint()?.binding);
         }
         *self.active.lock() = Some(execution.clone());
+        if let Some(session) = crate::autonomy::host_session::current_session() {
+            session.admitted(&run_id);
+        }
         // Box the controller before layering task scopes so default-stack polling matches the ordinary runtime entry.
         let result = scope_execution(
             execution.clone(),
@@ -2512,7 +2557,7 @@ impl AutonomyRunner {
                             && payload.counters.turns < u64::from(payload.limits.max_turns)
                             && payload.counters.llm_attempts
                                 < u64::from(payload.limits.max_llm_calls),
-                        interaction_available: self.interaction_delivery,
+                        interaction_available: self.interaction_available(),
                     },
                 )?;
                 // Publish the consumed allowance and selected decision, not the advisory pre-turn values, into the result checkpoint.
