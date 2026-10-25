@@ -4,6 +4,8 @@ use ai_agents_core::{Result, Tool, ToolExecutionContext, ToolResult, ToolSafetyM
 use async_trait::async_trait;
 use std::collections::BTreeSet;
 
+#[path = "automatic_domain_tests.rs"]
+mod automatic_acceptance;
 #[path = "ev_domain_tests.rs"]
 mod event_acceptance;
 #[path = "rg_receipt_tests.rs"]

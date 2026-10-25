@@ -151,6 +151,25 @@ impl AutonomyRunner {
         objective: &str,
         reason: &str,
     ) -> Result<TaskRunResult> {
+        let _delivery = self.automatic_delivery_guard(run_id);
+        let result = Box::pin(self.modify_objective_paused_inner(
+            run_id,
+            expected_revision,
+            objective,
+            reason,
+        ))
+        .await;
+        self.automatic_operation_result(result)
+    }
+
+    /// Retires old-objective cursors under the same claim and original accounting before publishing a new pending revision.
+    async fn modify_objective_paused_inner(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        objective: &str,
+        reason: &str,
+    ) -> Result<TaskRunResult> {
         let _resume = self.resume_gate.lock().await;
         if !self.store.supports_objective_revision() {
             return Err(AgentError::Config(
@@ -572,6 +591,7 @@ impl AutonomyRunner {
         retained.controller = execution.controller.lock().clone();
         retained.approval_deadlines.clear();
         cleanup.finish();
+        self.publish_automatic(&result);
         Ok(result)
     }
 

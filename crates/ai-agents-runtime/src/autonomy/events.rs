@@ -461,6 +461,123 @@ impl AutonomyRunner {
         operation: TaskStreamOperation,
         config: TaskStreamConfig,
     ) -> Result<TaskRunStream<'_>> {
+        let host_control = !matches!(
+            &operation,
+            TaskStreamOperation::Run { .. }
+                | TaskStreamOperation::Skill { .. }
+                | TaskStreamOperation::Resume { .. }
+        );
+        self.stream_work(
+            async move {
+                match operation {
+                    TaskStreamOperation::Run { objective, profile } => {
+                        self.run(&objective, profile.as_deref()).await
+                    }
+                    TaskStreamOperation::Skill {
+                        objective,
+                        skill_id,
+                        profile,
+                    } => {
+                        self.run_skill(&objective, &skill_id, profile.as_deref())
+                            .await
+                    }
+                    TaskStreamOperation::Resume {
+                        run_id,
+                        revision,
+                        input,
+                    } => self.resume(&run_id, revision, input).await,
+                    TaskStreamOperation::Cancel { run_id, revision } => {
+                        self.cancel_paused(&run_id, revision).await
+                    }
+                    TaskStreamOperation::Stop {
+                        run_id,
+                        revision,
+                        reason,
+                    } => self.stop_paused(&run_id, revision, &reason).await,
+                    TaskStreamOperation::ModifyObjective {
+                        run_id,
+                        revision,
+                        objective,
+                        reason,
+                    } => {
+                        self.modify_objective_paused(&run_id, revision, &objective, &reason)
+                            .await
+                    }
+                    TaskStreamOperation::ReviseLimits {
+                        run_id,
+                        revision,
+                        limits,
+                        reason,
+                    } => {
+                        self.revise_limits_paused(&run_id, revision, limits, &reason)
+                            .await
+                    }
+                    TaskStreamOperation::ExternalUnavailable {
+                        run_id,
+                        revision,
+                        request_id,
+                        reason,
+                    } => {
+                        self.external_unavailable_paused(&run_id, revision, &request_id, &reason)
+                            .await
+                    }
+                    TaskStreamOperation::ControllerUnavailable {
+                        run_id,
+                        revision,
+                        request_id,
+                        reason,
+                    } => {
+                        self.controller_unavailable_paused(&run_id, revision, &request_id, &reason)
+                            .await
+                    }
+                    TaskStreamOperation::RestorationReview {
+                        run_id,
+                        revision,
+                        review_id,
+                        decision,
+                    } => {
+                        self.approve_restoration(&run_id, revision, &review_id, decision)
+                            .await
+                    }
+                }
+            },
+            config,
+            host_control,
+        )
+    }
+
+    /// An admitted ordinary root uses the same bounded delivery and terminal projection as explicit operations, not another producer.
+    pub(crate) fn stream_automatic(
+        &self,
+        entry: Box<super::automatic::AutomaticEntry>,
+    ) -> Result<TaskRunStream<'_>> {
+        let owner = entry.owner.clone();
+        let mut cleanup = super::OwnedTurnCleanup::new(owner.clone());
+        self.stream_work(
+            async move {
+                if let Some(sink) = current_sink() {
+                    sink.owner(&owner);
+                    *owner.events.write() = Some(sink);
+                }
+                let result = self.run_automatic(entry).await;
+                cleanup.finish();
+                result
+            },
+            Default::default(),
+            false,
+        )
+    }
+
+    /// Shared foreground delivery owns the actual operation future; backpressure, cleanup and final ACK ordering are identical for every entry.
+    fn stream_work<'a, F>(
+        &'a self,
+        work: F,
+        config: TaskStreamConfig,
+        host_control: bool,
+    ) -> Result<TaskRunStream<'a>>
+    where
+        F: Future<Output = Result<TaskRunResult>> + Send + 'a,
+    {
         if config.capacity == 0 || config.capacity > 1024 {
             return Err(AgentError::Config(
                 "task stream capacity must be 1..=1024".into(),
@@ -477,19 +594,7 @@ impl AutonomyRunner {
         });
         let context = sink.clone();
         let future = Box::pin(EVENTS.scope(sink.clone(), async move {
-            let host_control = !matches!(&operation, TaskStreamOperation::Run { .. } | TaskStreamOperation::Skill { .. } | TaskStreamOperation::Resume { .. });
-            let result = match operation {
-                TaskStreamOperation::Run { objective, profile } => self.run(&objective, profile.as_deref()).await,
-                TaskStreamOperation::Skill { objective, skill_id, profile } => self.run_skill(&objective, &skill_id, profile.as_deref()).await,
-                TaskStreamOperation::Resume { run_id, revision, input } => self.resume(&run_id, revision, input).await,
-                TaskStreamOperation::Cancel { run_id, revision } => self.cancel_paused(&run_id, revision).await,
-                TaskStreamOperation::Stop { run_id, revision, reason } => self.stop_paused(&run_id, revision, &reason).await,
-                TaskStreamOperation::ModifyObjective { run_id, revision, objective, reason } => self.modify_objective_paused(&run_id, revision, &objective, &reason).await,
-                TaskStreamOperation::ReviseLimits { run_id, revision, limits, reason } => self.revise_limits_paused(&run_id, revision, limits, &reason).await,
-                TaskStreamOperation::ExternalUnavailable { run_id, revision, request_id, reason } => self.external_unavailable_paused(&run_id, revision, &request_id, &reason).await,
-                TaskStreamOperation::ControllerUnavailable { run_id, revision, request_id, reason } => self.controller_unavailable_paused(&run_id, revision, &request_id, &reason).await,
-                TaskStreamOperation::RestorationReview { run_id, revision, review_id, decision } => self.approve_restoration(&run_id, revision, &review_id, decision).await,
-            };
+            let result = work.await;
             // Existing APIs have already transferred safe pause/terminal custody; display loss cannot reverse that transfer.
             context.active.store(false, std::sync::atomic::Ordering::Release);
             match &result {
@@ -537,7 +642,7 @@ impl crate::RuntimeAgent {
         operation: TaskStreamOperation,
         config: TaskStreamConfig,
     ) -> Result<TaskRunStream<'a>> {
-        if !std::ptr::eq(self, runner.runtime().as_ref()) {
+        if !self.same_runtime(runner.runtime().as_ref()) {
             return Err(AgentError::Config(
                 "task stream runner belongs to another runtime".into(),
             ));

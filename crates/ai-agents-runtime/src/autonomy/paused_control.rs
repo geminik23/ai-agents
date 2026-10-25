@@ -224,6 +224,21 @@ impl AutonomyRunner {
         limits: TaskRunLimits,
         reason: &str,
     ) -> ai_agents_core::Result<TaskRunResult> {
+        let _delivery = self.automatic_delivery_guard(run_id);
+        let result =
+            Box::pin(self.revise_limits_paused_inner(run_id, expected_revision, limits, reason))
+                .await;
+        self.automatic_operation_result(result)
+    }
+
+    /// Applies only authenticated numeric revision while preserving pending work and the original operation deadlines.
+    async fn revise_limits_paused_inner(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        limits: TaskRunLimits,
+        reason: &str,
+    ) -> ai_agents_core::Result<TaskRunResult> {
         let _resume = self.resume_gate.lock().await;
         if !self.store.supports_paused_limit_revision() {
             return Err(ai_agents_core::AgentError::Config(
@@ -354,7 +369,7 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotResumable)?
             .whole_expiry = revised_expiry;
         cleanup.finish();
-        Ok(TaskRunResult {
+        self.acknowledged_automatic_result(TaskRunResult {
             run,
             final_response: None,
         })

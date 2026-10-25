@@ -10,7 +10,7 @@ pub struct TaskStartupRequest {
     pub profile: Option<String>,
 }
 
-// Omission preserves existing explicit execution; a declared persistence section opts in unless explicitly disabled.
+// Omission preserves foreground execution without restart preparation; a declared persistence section opts in unless explicitly disabled.
 fn enabled(settings: &AutonomyProfile) -> bool {
     settings
         .persistence
@@ -19,7 +19,7 @@ fn enabled(settings: &AutonomyProfile) -> bool {
 }
 
 impl AutonomyRunner {
-    /// Installs the trusted constructor for automatic safe-pause preparation; ordinary chat and task entry remain explicit.
+    /// Installs the trusted constructor for safe-pause preparation without itself starting chat, a task or abandoned-owner takeover.
     pub fn with_restore_host(mut self, host: Arc<dyn TaskRestoreHost>) -> Self {
         self.restore_host = Some(host);
         self
@@ -52,6 +52,7 @@ impl AutonomyRunner {
         result: TaskRunResult,
     ) -> Result<TaskRunResult> {
         if result.run.status != TaskRunStatus::Paused {
+            self.publish_automatic(&result);
             return Ok(result);
         }
         // The admitted policy is already in the exact acknowledged execution; omitted/disabled persistence adds no failure-capable read.
@@ -64,14 +65,21 @@ impl AutonomyRunner {
             .ok_or(TaskRunStorageError::NotResumable)?;
         let payload: TaskCheckpointPayload = serde_json::from_value(saved.payload.clone())?;
         if !enabled(&payload.settings) {
+            self.publish_automatic(&result);
             return Ok(result);
         }
         let host = self
             .restore_host
             .as_ref()
             .ok_or(TaskRunStorageError::NotResumable)?;
-        Box::pin(self.checkpoint_for_restore(&saved.key.run_id, result.run.revision, host.as_ref()))
-            .await
+        let prepared = Box::pin(self.checkpoint_for_restore(
+            &saved.key.run_id,
+            result.run.revision,
+            host.as_ref(),
+        ))
+        .await?;
+        self.publish_automatic(&prepared);
+        Ok(prepared)
     }
 
     // Optional per-step snapshots are separate from mandatory effect/continuation journals, which are never disabled by policy.

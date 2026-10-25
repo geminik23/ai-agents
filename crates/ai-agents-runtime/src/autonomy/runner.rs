@@ -47,6 +47,7 @@ pub struct AutonomyRunner {
     resume_gate: tokio::sync::Mutex<()>,
     interaction_delivery: bool,
     restore_host: Option<Arc<dyn TaskRestoreHost>>,
+    automatic_outcome: Option<Arc<super::automatic::AutomaticOutcome>>,
 }
 
 struct PausedTask {
@@ -675,7 +676,7 @@ impl AutonomyRunner {
         self.agent.release_autonomy_run(&owner).await?;
         self.retire_owner(&owner);
         cleanup.finish();
-        Ok(TaskRunResult {
+        self.acknowledged_automatic_result(TaskRunResult {
             run: TaskRun::from_checkpoint(&acknowledged, &self.config_identity)?,
             final_response: None,
         })
@@ -707,7 +708,72 @@ impl AutonomyRunner {
             resume_gate: Default::default(),
             interaction_delivery: true,
             restore_host: None,
+            automatic_outcome: None,
         })
+    }
+
+    /// Binds acknowledged public results to one automatic run, independently of the host API used to resume or cancel it.
+    pub(crate) fn with_automatic_outcome(
+        mut self,
+        outcome: Arc<super::automatic::AutomaticOutcome>,
+    ) -> Self {
+        self.automatic_outcome = Some(outcome);
+        self
+    }
+
+    /// Publishes only the bound run after public-result preparation; other explicit executions cannot overwrite its delivery slot.
+    fn publish_automatic(&self, result: &TaskRunResult) {
+        if let Some(outcome) = &self.automatic_outcome {
+            outcome.publish(result);
+        }
+    }
+
+    /// Captures weak delivery custody for one exact operation so a dropped response future cannot strand its ordinary composing parent.
+    fn automatic_delivery_guard(
+        &self,
+        run_id: &str,
+    ) -> Option<super::automatic::AutomaticDeliveryGuard> {
+        let outcome = self
+            .automatic_outcome
+            .as_ref()
+            .filter(|outcome| outcome.key.as_ref().is_some_and(|key| key.run_id == run_id))?;
+        let active = self.active.lock();
+        let execution = active
+            .as_ref()
+            .filter(|execution| execution.run_id == run_id)?;
+        Some(super::automatic::AutomaticDeliveryGuard {
+            owner: Arc::downgrade(&execution.owner),
+            outcome: Arc::downgrade(outcome),
+        })
+    }
+
+    /// Invalid responses preserve a safe pause; only an actually abandoned or storage-uncertain bound execution fails ordinary delivery.
+    fn automatic_operation_result(&self, result: Result<TaskRunResult>) -> Result<TaskRunResult> {
+        if result.is_err()
+            && let Some(outcome) = &self.automatic_outcome
+            && self.active.lock().as_ref().is_some_and(|execution| {
+                outcome
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.run_id == execution.run_id)
+                    && (execution.owner.is_abandoned() || execution.has_storage_failure())
+            })
+        {
+            outcome.failure();
+        }
+        result
+    }
+
+    /// Returns a fully acknowledged control result after owner release, waking only that run's ordinary consumers.
+    fn acknowledged_automatic_result(&self, result: TaskRunResult) -> Result<TaskRunResult> {
+        self.publish_automatic(&result);
+        Ok(result)
+    }
+
+    /// Returns the actual scoped storage capability for trusted inspection and reviewed recovery after ambiguous operation errors.
+    /// Namespace scoping is not caller authentication, and exact recovery payloads must not be exported as display events.
+    pub fn task_store(&self) -> &Arc<dyn TaskRunStore> {
+        &self.store
     }
 
     /// Returns the actual root for host control/inspection, including roots created by explicit reconstruction.
@@ -869,6 +935,17 @@ impl AutonomyRunner {
         run_id: &str,
         expected_revision: u64,
     ) -> Result<TaskRunResult> {
+        let _delivery = self.automatic_delivery_guard(run_id);
+        let result = Box::pin(self.cancel_paused_inner(run_id, expected_revision)).await;
+        self.automatic_operation_result(result)
+    }
+
+    /// Performs the existing conditional cleanup; the public boundary separately reports uncertain delivery to a composing host.
+    async fn cancel_paused_inner(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+    ) -> Result<TaskRunResult> {
         let _resume = self.resume_gate.lock().await;
         let snapshot = self
             .store
@@ -932,7 +1009,7 @@ impl AutonomyRunner {
         self.agent.release_autonomy_run(&owner).await?;
         self.retire_owner(&owner);
         cleanup.finish();
-        Ok(TaskRunResult {
+        self.acknowledged_automatic_result(TaskRunResult {
             run: TaskRun::from_checkpoint(&acknowledged, &self.config_identity)?,
             final_response: None,
         })
@@ -980,8 +1057,13 @@ impl AutonomyRunner {
         expected_revision: u64,
         input: TaskResumeInput,
     ) -> Result<TaskRunResult> {
-        let result = Box::pin(self.resume_inner(run_id, expected_revision, input)).await?;
-        self.persist_returned_pause(result).await
+        let _delivery = self.automatic_delivery_guard(run_id);
+        let result = async {
+            let result = Box::pin(self.resume_inner(run_id, expected_revision, input)).await?;
+            self.persist_returned_pause(result).await
+        }
+        .await;
+        self.automatic_operation_result(result)
     }
 
     // The retained gate is released before optional restart preparation reacquires it; pending work remains owner-protected throughout.
@@ -1366,7 +1448,7 @@ impl AutonomyRunner {
     /// Revision sources are sampled state, not providers or execution permits, and are rechecked at continuation/publication boundaries.
     /// Opted-in persistence prepares the acknowledged safe pause before returning it; failed preparation never reports a durable restart point.
     pub async fn run(&self, objective: &str, selected: Option<&str>) -> Result<TaskRunResult> {
-        let result = Box::pin(self.run_entry(objective, selected, None)).await?;
+        let result = Box::pin(self.run_entry(objective, selected, None, None)).await?;
         self.persist_returned_pause(result).await
     }
 
@@ -1376,16 +1458,23 @@ impl AutonomyRunner {
         objective: &str,
         selected: Option<&str>,
         skill: Option<ai_agents_skills::SkillDefinition>,
+        automatic: Option<Box<super::automatic::AutomaticEntry>>,
     ) -> Result<TaskRunResult> {
+        let binding = automatic.as_ref().map(|entry| &entry.binding);
         let profile = resolve_profile(
             &self.config,
-            if skill.is_some() {
-                AutonomyScope::Skill
-            } else {
-                AutonomyScope::Task
-            },
+            binding.map_or(
+                if skill.is_some() {
+                    AutonomyScope::Skill
+                } else {
+                    AutonomyScope::Task
+                },
+                |binding| binding.scope(),
+            ),
             selected,
-            skill.as_ref().and_then(|skill| skill.autonomy.as_ref()),
+            binding
+                .map(|binding| &binding.settings)
+                .or_else(|| skill.as_ref().and_then(|skill| skill.autonomy.as_ref())),
             None,
             Some(objective),
             &self.host,
@@ -1397,16 +1486,20 @@ impl AutonomyRunner {
         }
         self.agent
             .preflight_priced_autonomy(profile.max_cost_usd.is_some())?;
-        let objective = if objective.trim().is_empty() {
-            profile.settings.objective.as_deref().unwrap_or(objective)
+        let objective = if let Some(binding) = binding {
+            self.agent
+                .render_automatic_objective(&profile.settings, binding)?
         } else {
-            objective
-        }
-        .to_string();
-        let objective = if let Some(template) = &profile.settings.objective_template {
-            self.agent.render_autonomy_objective(template, &objective)?
-        } else {
-            objective
+            let objective = if objective.trim().is_empty() {
+                profile.settings.objective.as_deref().unwrap_or(objective)
+            } else {
+                objective
+            };
+            if let Some(template) = &profile.settings.objective_template {
+                self.agent.render_autonomy_objective(template, objective)?
+            } else {
+                objective.to_string()
+            }
         };
         if objective.trim().is_empty() {
             return Err(AgentError::Config(
@@ -1435,7 +1528,12 @@ impl AutonomyRunner {
         }
         self.preflight_persistence(&profile.settings)?;
 
-        let lifecycle = LifecycleState::new(&profile.settings, skill.is_some())?;
+        let lifecycle = LifecycleState::new(
+            &profile.settings,
+            binding.map_or(skill.is_some(), |binding| {
+                binding.scope() == AutonomyScope::Skill
+            }),
+        )?;
         let mut preflight_scope = EvaluationScope {
             key: TaskRunKey {
                 agent_id: self.agent.info().id,
@@ -1452,9 +1550,33 @@ impl AutonomyRunner {
             validation_dependencies: BTreeMap::new(),
         };
         bound.capture_targets(&mut preflight_scope)?;
-        let run_id = uuid::Uuid::new_v4().to_string();
-        let owner = self.agent.reserve_autonomy_run(run_id.clone()).await?;
-        *owner.skill.write() = skill.clone();
+        let (owner, activation) = if let Some(entry) = automatic {
+            (entry.owner, Some(entry.binding))
+        } else {
+            (
+                self.agent
+                    .reserve_autonomy_run(uuid::Uuid::new_v4().to_string())
+                    .await?,
+                None,
+            )
+        };
+        let run_id = owner.run_id.clone();
+        *owner.skill.write() = if activation
+            .as_ref()
+            .is_some_and(|binding| binding.scope() != AutonomyScope::Skill)
+        {
+            None
+        } else {
+            skill.clone()
+        };
+        *owner.prepared.lock() = activation.clone().map(|mut binding| {
+            if binding.scope() == AutonomyScope::Skill
+                && profile.strategy != ExecutionStrategy::Skill
+            {
+                binding.skill = None;
+            }
+            binding
+        });
         owner.interaction_delivery.store(
             self.interaction_delivery,
             std::sync::atomic::Ordering::Release,
@@ -1475,6 +1597,15 @@ impl AutonomyRunner {
                 &profile,
                 TaskRuntimeCheckpoint::between_turns(self.agent.save_state().await?)?,
             );
+            if let Some(binding) = &activation {
+                payload.adapters.push(TaskAdapterCheckpoint {
+                    id: "runtime.activation".into(),
+                    adapter: "runtime.activation".into(),
+                    contract_version: 1,
+                    config: serde_json::to_value(binding)?,
+                    state: json!({}),
+                });
+            }
             if let Some(skill) = &skill {
                 payload.adapters.push(TaskAdapterCheckpoint {
                     id: "runtime.entry".into(),
@@ -1689,7 +1820,16 @@ impl AutonomyRunner {
             let executor = RuntimeObservationExecutor {
                 agent: self.agent.clone(),
                 profile: profile.profile.clone(),
-                scope_mode: "task".into(),
+                scope_mode: super::automatic::binding(&restored)?.map_or_else(
+                    || "task".to_string(),
+                    |binding| {
+                        if binding.scope() == AutonomyScope::State {
+                            "state".into()
+                        } else {
+                            "skill".into()
+                        }
+                    },
+                ),
                 run_revision: execution.revision.clone(),
                 validator: String::new(),
                 contract_version: 1,
@@ -1874,6 +2014,7 @@ impl AutonomyRunner {
                 "remaining_micro_usd":payload.limits.max_micro_usd.map(|limit| limit.saturating_sub(payload.counters.charged_micro_usd).saturating_sub(payload.reservations.iter().filter(|reservation| matches!(reservation.state, TaskEffectState::Reserved | TaskEffectState::Dispatched | TaskEffectState::Suspended | TaskEffectState::Uncertain)).map(|reservation| reservation.reserved_micro_usd.saturating_sub(reservation.charged_micro_usd)).sum::<u64>())),
                 "remaining_declared_write_paths":payload.limits.max_declared_write_paths.map(|limit| (limit as usize).saturating_sub(payload.declared_write_targets.len())),
                                 "failed_gates":payload.evidence.records.last().and_then(|record| record.data.get("completion")).cloned(),
+                "skill_results":super::automatic::skill_results(&payload),
                 "progress_instruction":profile.settings.progress.as_ref().and_then(|progress| progress.auto_create_todo_prompt.clone()).unwrap_or_else(|| "Before progress-gated work, maintain the run todo list and select exactly one active item when required.".into()),
                 "stage_instruction":profile.settings.lifecycle.as_ref().and_then(|stages| stages.get(lifecycle.current_stage)).and_then(|stage| stage.instruction.clone())});
                     execution
@@ -2336,7 +2477,7 @@ impl AutonomyRunner {
                         },
                         children_settled: !execution.participants.unsettled()
                             && payload.children.iter().all(|child| child.result.is_some()),
-                        scope_ended: false,
+                        scope_ended: self.agent.automatic_scope_ended(),
                         additional_work_capacity: execution.stop_reason().is_none()
                             && payload.counters.turns < u64::from(payload.limits.max_turns)
                             && payload.counters.llm_attempts

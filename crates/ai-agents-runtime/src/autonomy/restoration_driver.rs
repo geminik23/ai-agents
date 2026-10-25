@@ -17,15 +17,22 @@ pub(super) fn current_host_compatible(
             serde_json::from_value::<ai_agents_skills::SkillDefinition>(adapter.config.clone())
         })
         .transpose()?;
+    let activation = super::super::automatic::binding(payload)?;
     let profile = resolve_profile(
         &request.config,
-        if skill.is_some() {
-            AutonomyScope::Skill
-        } else {
-            AutonomyScope::Task
-        },
+        activation.as_ref().map_or(
+            if skill.is_some() {
+                AutonomyScope::Skill
+            } else {
+                AutonomyScope::Task
+            },
+            |binding| binding.scope(),
+        ),
         payload.profile.as_deref(),
-        skill.as_ref().and_then(|skill| skill.autonomy.as_ref()),
+        activation
+            .as_ref()
+            .map(|binding| &binding.settings)
+            .or_else(|| skill.as_ref().and_then(|skill| skill.autonomy.as_ref())),
         None,
         Some(&payload.objective),
         &request.ceilings,

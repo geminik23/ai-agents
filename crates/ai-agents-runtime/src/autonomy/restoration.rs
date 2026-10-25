@@ -485,7 +485,7 @@ impl TaskRestoreGraph {
                     if self
                         .runtimes
                         .get(&id)
-                        .is_some_and(|old| !Arc::ptr_eq(old, &entry.agent))
+                        .is_some_and(|old| !old.same_runtime(&entry.agent))
                     {
                         return Err(AgentError::Config(
                             "different runtime objects share a restore identity".into(),
@@ -678,7 +678,7 @@ async fn capture_manifest(
     if graph
         .runtimes
         .get(&runner.agent.info().id)
-        .is_none_or(|root| !Arc::ptr_eq(root, &runner.agent))
+        .is_none_or(|root| !root.same_runtime(&runner.agent))
     {
         return Err(AgentError::Config(
             "restore source graph does not contain the actual root".into(),
@@ -731,7 +731,7 @@ async fn capture_manifest(
     let mut nodes = BTreeMap::new();
     for (id, runtime) in &graph.runtimes {
         let actual_owner = runtime.captured_task_owner();
-        let expected = if Arc::ptr_eq(runtime, &runner.agent) {
+        let expected = if runtime.same_runtime(&runner.agent) {
             Some(&paused.owner)
         } else {
             actual_owner
@@ -741,7 +741,7 @@ async fn capture_manifest(
         if actual_owner.is_some() && expected.is_none() {
             return Err(TaskRunStorageError::Owned.into());
         }
-        let mut continuation = if Arc::ptr_eq(runtime, &runner.agent) {
+        let mut continuation = if runtime.same_runtime(&runner.agent) {
             payload.runtime.continuation.clone()
         } else {
             TaskContinuation::BetweenTurns
@@ -790,7 +790,7 @@ async fn capture_manifest(
                     })
                     .transpose()?,
                 participant_actor: expected
-                    .filter(|_| !Arc::ptr_eq(runtime, &runner.agent))
+                    .filter(|_| !runtime.same_runtime(&runner.agent))
                     .map(|owner| TaskRestoreParticipant {
                         actor_id: owner.actor_id.clone(),
                     }),

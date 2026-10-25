@@ -471,12 +471,12 @@ impl AgentRegistry {
         removed
     }
 
-    /// Send a message from one agent to another and return the response.
+    /// Sends one message and retains its ordinary call frame while a hosted automatic recipient is paused.
     pub async fn send(&self, from: &str, to: &str, message: &str) -> Result<AgentResponse> {
-        self.send_inner(from, to, message, None).await
+        crate::autonomy::automatic::scope_composing(self.send_inner(from, to, message, None)).await
     }
 
-    /// Send a message with structured actor context for actor-scoped memory.
+    /// Sends with actor context while preserving the same retained automatic-child delivery contract.
     pub async fn send_with_actor_context(
         &self,
         from: &str,
@@ -484,8 +484,13 @@ impl AgentRegistry {
         message: &str,
         actor_context: TurnActorContext,
     ) -> Result<AgentResponse> {
-        self.send_inner(from, to, message, Some(actor_context))
-            .await
+        crate::autonomy::automatic::scope_composing(self.send_inner(
+            from,
+            to,
+            message,
+            Some(actor_context),
+        ))
+        .await
     }
 
     /// Captures framework-owned parent and child bindings and the selected failure policy before the sender callback; resume never reissues delivery.
@@ -761,13 +766,14 @@ impl AgentRegistry {
                                     Ok(pin) => pin,
                                     Err(error) => return (id, Err(error)),
                                 };
-                                let run = async move {
+                                // The worker explicitly retains the ordinary composing role across spawn; this grants no task authority.
+                                let run = crate::autonomy::automatic::scope_composing(async move {
                                     if let Some(context) = context {
                                         agent.chat_with_actor_context(&msg, context).await
                                     } else {
                                         agent.chat(&msg).await
                                     }
-                                };
+                                });
                                 let result = if let Some(context) = observation_context {
                                     with_observation_context(context, run).await
                                 } else {

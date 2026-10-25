@@ -14,6 +14,40 @@ use ai_agents::tools::{
 use ai_agents::{NativeCallBinding, NativeProviderState, NativeProviderTarget};
 
 #[test]
+fn development_automatic_task_hosting_surface_compiles() {
+    fn configure(
+        config: ai_agents::AutonomyConfig,
+        store: Arc<dyn ai_agents::TaskRunStore>,
+    ) -> ai_agents::AgentBuilder {
+        ai_agents::AgentBuilder::new()
+            .autonomy(config)
+            .automatic_task_options(ai_agents::AutomaticTaskOptions {
+                ceilings: ai_agents::AutonomyHostCeilings::default(),
+                store: Some(store),
+                config_identity: Some("prepared-host.v1".into()),
+                restore_host: None,
+            })
+    }
+    fn control(agent: &RuntimeAgent) {
+        let _exact: Option<ai_agents::TaskRunResult> = agent.automatic_task_result();
+        let _runner: Option<Arc<ai_agents::autonomy::AutonomyRunner>> =
+            agent.automatic_task_runner();
+        let _operation = agent.automatic_task_operation(ai_agents::TaskStreamOperation::Resume {
+            run_id: "retained".into(),
+            revision: 1,
+            input: ai_agents::autonomy::TaskResumeInput::Continue,
+        });
+    }
+    fn task_event(event: AgentStreamEvent) -> Option<ai_agents::TaskRunEvent> {
+        match event {
+            AgentStreamEvent::Task(event) => Some(event),
+            _ => None,
+        }
+    }
+    let _surface = (configure, control, task_event);
+}
+
+#[test]
 fn development_standalone_and_provenance_migration_surface_compiles() {
     use ai_agents::autonomy::{AutonomyConfig, AutonomyHostCeilings, AutonomyRunner, TaskRunStore};
     fn build(
@@ -40,6 +74,7 @@ fn development_standalone_and_provenance_migration_surface_compiles() {
             },
             ai_agents::TaskStreamConfig { capacity: 1 },
         )?;
+        let _store: Arc<dyn TaskRunStore> = runner.task_store().clone();
         let _cancel = runner.request_cancel("retained-run");
         let _resume = runner.resume(
             "retained-run",

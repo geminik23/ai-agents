@@ -126,12 +126,16 @@ pub struct AgentBuilder {
     routing_frozen: Option<LLMRegistry>,
     routing_dirty: bool,
     autonomy_extensions: Option<Arc<crate::autonomy::FrozenAutonomyExtensions>>,
+    automatic_config: Option<ai_agents_core::autonomy::AutonomyConfig>,
+    automatic_options: crate::autonomy::AutomaticTaskOptions,
 }
 
 impl AgentBuilder {
     pub fn new() -> Self {
         Self {
             autonomy_extensions: None,
+            automatic_config: None,
+            automatic_options: Default::default(),
             reasoning: None,
             reflection: None,
             spec: None,
@@ -179,6 +183,21 @@ impl AgentBuilder {
         self
     }
 
+    /// Supplies programmatic defaults for the same state/skill declarations used by strict YAML loading.
+    pub fn autonomy(mut self, config: ai_agents_core::autonomy::AutonomyConfig) -> Self {
+        self.automatic_config = Some(config);
+        self
+    }
+
+    /// Installs trusted ceilings, optional scoped storage and reconstruction for automatic entry without granting tools.
+    pub fn automatic_task_options(
+        mut self,
+        options: crate::autonomy::AutomaticTaskOptions,
+    ) -> Self {
+        self.automatic_options = options;
+        self
+    }
+
     pub fn from_spec(spec: AgentSpec) -> Self {
         let system_prompt = spec.system_prompt.clone();
         let max_iterations = Some(spec.max_iterations);
@@ -189,6 +208,8 @@ impl AgentBuilder {
         Self {
             spec: Some(spec),
             autonomy_extensions: None,
+            automatic_config: None,
+            automatic_options: Default::default(),
             llm: None,
             llm_registry: None,
             memory: None,
@@ -1202,7 +1223,8 @@ impl AgentBuilder {
         Ok(self)
     }
 
-    /// Finalizes one consistent hierarchy and refuses enabled declarations until the complete task integration exists.
+    /// Finalizes one consistent hierarchy and installs shared automatic hosting only after enabled declarations pass actual capability preflight.
+    /// Default-off agents retain ordinary construction and invocation behavior.
     pub fn build(mut self) -> Result<RuntimeAgent> {
         self.prepare_routing(false)?;
         let resource_locks = self.shared_resource_locks();
@@ -1257,8 +1279,12 @@ impl AgentBuilder {
             self.skills.extend(loaded_skills);
         }
         // Validate the machine actually installed by the builder; it can replace spec.states.
-        let disabled = ai_agents_core::autonomy::AutonomyConfig::default();
-        let config = self.spec.as_ref().map_or(&disabled, |spec| &spec.autonomy);
+        let automatic_config = self
+            .automatic_config
+            .clone()
+            .or_else(|| self.spec.as_ref().map(|spec| spec.autonomy.clone()))
+            .unwrap_or_default();
+        let config = &automatic_config;
         let states = self
             .state_machine
             .as_ref()
@@ -1266,11 +1292,8 @@ impl AgentBuilder {
             .or_else(|| self.spec.as_ref().and_then(|spec| spec.states.as_ref()));
         crate::autonomy::validate_agent_config(config, states, &[])?;
         crate::autonomy::validate_loaded_skills(config, &self.skills)?;
-        if crate::autonomy::has_enabled_declaration(config, states, &self.skills) {
-            return Err(AgentError::Config(
-                "autonomy task execution is not available until the complete runner integration is installed".into(),
-            ));
-        }
+        let install_automatic =
+            crate::autonomy::has_enabled_declaration(config, states, &self.skills);
 
         let mut llm_registry = self.llm_registry.unwrap_or_default();
 
@@ -1775,6 +1798,9 @@ impl AgentBuilder {
             agent = agent.with_facts_config(actor_memory_config, facts_config);
         }
 
+        if install_automatic {
+            agent = agent.install_automatic_tasks(automatic_config, self.automatic_options)?;
+        }
         Ok(agent)
     }
 }

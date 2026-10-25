@@ -699,6 +699,7 @@ Custom LLM provider examples - from implementing `LLMProvider` from scratch to m
 | `openai-compatible` | HTTP adapter for any OpenAI-compatible server (LM Studio, Ollama, vLLM, LocalAI, TGI) |
 | `multi-provider` | Multi-provider routing with `MultiLLMRouter` - expensive model for users, cheap model for internal tasks |
 | `task-events` | Development-only offline task lifecycle events, retained question and explicit resume; no API key or tools |
+| `automatic-tasks` | Development-only YAML state/skill automatic task entry, safe events and explicit host resume through the same controller; offline with no tools or API key |
 
 Note: For a zero-code YAML alternative, see `yaml/basic/openai_compatible.yaml` which uses the built-in `provider: openai-compatible` with `base_url` - no custom Rust code needed.
 
@@ -712,6 +713,7 @@ cargo run --bin custom-provider
 
 # Development-only task API: offline, finite and no external effects
 cargo run --bin task-events
+cargo run --bin automatic-tasks
 
 # Requires a running OpenAI-compatible server
 LOCAL_LLM_BASE_URL=http://localhost:1234/v1 cargo run --bin openai-compatible

@@ -17,6 +17,8 @@ tokio::task_local! {
     static TOOL_FALLBACK_REQUEST: std::cell::RefCell<Option<(ToolExecutionRequest, ToolFallbackState)>>;
 }
 
+#[path = "autonomy/automatic_runtime.rs"]
+mod task_automatic;
 #[path = "autonomy/composition_runtime.rs"]
 mod task_composition;
 #[path = "autonomy/continuation_runtime.rs"]
@@ -748,7 +750,17 @@ impl RuntimeControlHandle {
     }
 }
 
+/// One runtime identity; internal controller handles share its state rather than cloning an agent or its history.
+/// Complete fluent construction before obtaining a task handle; published task state is never copied for reconfiguration.
 pub struct RuntimeAgent {
+    inner: Arc<RuntimeAgentState>,
+    automatic_host: Option<Arc<crate::autonomy::automatic::AutomaticTaskHost>>,
+}
+
+/// Private-field storage for the runtime's single live identity, exposed only as the target of field delegation.
+#[doc(hidden)]
+pub struct RuntimeAgentState {
+    automatic_host: RwLock<std::sync::Weak<crate::autonomy::automatic::AutomaticTaskHost>>,
     info: AgentInfo,
     llm_registry: Arc<LLMRegistry>,
     memory: Arc<dyn Memory>,
@@ -793,6 +805,8 @@ pub struct RuntimeAgent {
     /// Set by try_skill_route() when skill-level disambiguation triggers clarification.
     /// Read by run_loop() when clarification resolves to route directly to the skill.
     pending_skill_id: RwLock<Option<String>>,
+    // Ordinary skill clarification retains accepted processing context until selection can transfer into a task.
+    pending_automatic_input: RwLock<Option<crate::autonomy::automatic::PreparedSkillInput>>,
     current_plan: RwLock<Option<Plan>>,
     /// Tool IDs declared in the top-level `tools:` spec.
     declared_tool_ids: Option<Vec<String>>,
@@ -851,6 +865,23 @@ pub struct RuntimeAgent {
     /// Session mutations and direct host operations exclude run reservation without changing ordinary root reentry.
     autonomy_mutations: tokio::sync::RwLock<()>,
     autonomy_extensions: Arc<crate::autonomy::FrozenAutonomyExtensions>,
+}
+
+impl std::ops::Deref for RuntimeAgent {
+    type Target = RuntimeAgentState;
+
+    // All execution handles refer to the same locks, generations, memory and root gate.
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for RuntimeAgent {
+    // Fluent construction is exclusive; a retained task must never receive a silently detached configuration copy.
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::get_mut(&mut self.inner)
+            .expect("finish runtime configuration before publishing task handles")
+    }
 }
 
 impl std::fmt::Debug for RuntimeAgent {
@@ -1012,6 +1043,7 @@ impl RuntimeAgent {
     }
 
     /// Constructs auxiliary consumers fallibly while preserving legacy optional selection.
+    /// One shared live state owns execution identity; internal controller handles reuse its history, locks and generations rather than copying them.
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         info: AgentInfo,
@@ -1049,72 +1081,90 @@ impl RuntimeAgent {
             ContextManager::new(HashMap::new(), info.name.clone(), info.version.clone());
 
         Ok(Self {
-            info,
-            llm_registry,
-            memory,
-            tools,
-            skills,
-            skill_router,
-            skill_executor,
-            base_system_prompt: system_prompt,
-            max_iterations,
-            iteration_count: RwLock::new(0),
-            max_context_tokens: 128000,
-            memory_token_budget: None,
-            recovery_manager: RecoveryManager::default(),
-            tool_security: ToolSecurityEngine::default(),
-            process_processor: None,
-            message_filters: RwLock::new(HashMap::new()),
-            state_machine: None,
-            transition_evaluator: None,
-            context_manager: Arc::new(context_manager),
-            template_renderer: TemplateRenderer::new(),
-            tool_call_history: RwLock::new(Vec::new()),
-            parallel_tools: ParallelToolsConfig::default(),
-            streaming: StreamingConfig::default(),
-            hooks: Arc::new(NoopHooks),
-            hitl_engine: None,
-            approval_handler: Arc::new(RejectAllHandler::new()),
-            storage_config: StorageConfig::default(),
-            storage: RwLock::new(None),
-            storage_init: tokio::sync::Mutex::new(()),
-            reasoning_config: ReasoningConfig::default(),
-            reflection_config: ReflectionConfig::default(),
-            disambiguation_manager: None,
-            disambiguation_epoch: AtomicU64::new(0),
-            disambiguation_admission: tokio::sync::RwLock::new(()),
-            state_transition_reserved: AtomicBool::new(false),
-            persona_manager: None,
-            pending_skill_id: RwLock::new(None),
-            current_plan: RwLock::new(None),
-            declared_tool_ids: None,
-            context_initialized: AtomicBool::new(false),
-            spawner: None,
-            spawner_registry: None,
-            redispatch_depth: RwLock::new(0),
-            active_turn_context: RwLock::new(None),
-            root_user_message_committed: AtomicBool::new(false),
-            active_native_exchanges: RwLock::new(Vec::new()),
-            actor_id: RwLock::new(None),
-            fact_store: RwLock::new(None),
-            fact_extractor: RwLock::new(None),
-            actor_facts_cache: Arc::new(RwLock::new(HashMap::new())),
-            messages_since_extraction: Arc::new(RwLock::new(0)),
-            actor_memory_config: None,
-            facts_config: None,
-            session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
-            current_session_id: RwLock::new(None),
-            relationship_manager: None,
-            observability_manager: None,
-            runtime_config: RuntimeConfig::default(),
-            background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
-            resource_locks: new_tool_resource_locks(),
-            observation_mutations: Arc::new(AtomicU64::new(0)),
-            runtime_control: Arc::new(RuntimeControlState::default()),
-            root_turn_gate,
-            autonomy_owner: Arc::new(RwLock::new(None)),
-            autonomy_mutations: tokio::sync::RwLock::new(()),
-            autonomy_extensions: crate::autonomy::AutonomyExtensions::builtins().freeze(),
+            automatic_host: None,
+            inner: Arc::new(RuntimeAgentState {
+                automatic_host: RwLock::new(std::sync::Weak::new()),
+                info,
+                llm_registry,
+                memory,
+                tools,
+                skills,
+                skill_router,
+                skill_executor,
+                base_system_prompt: system_prompt,
+                max_iterations,
+                iteration_count: RwLock::new(0),
+                max_context_tokens: 128000,
+                memory_token_budget: None,
+                recovery_manager: RecoveryManager::default(),
+                tool_security: ToolSecurityEngine::default(),
+                process_processor: None,
+                message_filters: RwLock::new(HashMap::new()),
+                state_machine: None,
+                transition_evaluator: None,
+                context_manager: Arc::new(context_manager),
+                template_renderer: TemplateRenderer::new(),
+                tool_call_history: RwLock::new(Vec::new()),
+                parallel_tools: ParallelToolsConfig::default(),
+                streaming: StreamingConfig::default(),
+                hooks: Arc::new(NoopHooks),
+                hitl_engine: None,
+                approval_handler: Arc::new(RejectAllHandler::new()),
+                storage_config: StorageConfig::default(),
+                storage: RwLock::new(None),
+                storage_init: tokio::sync::Mutex::new(()),
+                reasoning_config: ReasoningConfig::default(),
+                reflection_config: ReflectionConfig::default(),
+                disambiguation_manager: None,
+                disambiguation_epoch: AtomicU64::new(0),
+                disambiguation_admission: tokio::sync::RwLock::new(()),
+                state_transition_reserved: AtomicBool::new(false),
+                persona_manager: None,
+                pending_skill_id: RwLock::new(None),
+                pending_automatic_input: Default::default(),
+                current_plan: RwLock::new(None),
+                declared_tool_ids: None,
+                context_initialized: AtomicBool::new(false),
+                spawner: None,
+                spawner_registry: None,
+                redispatch_depth: RwLock::new(0),
+                active_turn_context: RwLock::new(None),
+                root_user_message_committed: AtomicBool::new(false),
+                active_native_exchanges: RwLock::new(Vec::new()),
+                actor_id: RwLock::new(None),
+                fact_store: RwLock::new(None),
+                fact_extractor: RwLock::new(None),
+                actor_facts_cache: Arc::new(RwLock::new(HashMap::new())),
+                messages_since_extraction: Arc::new(RwLock::new(0)),
+                actor_memory_config: None,
+                facts_config: None,
+                session_metadata: RwLock::new(ai_agents_core::SessionMetadata::default()),
+                current_session_id: RwLock::new(None),
+                relationship_manager: None,
+                observability_manager: None,
+                runtime_config: RuntimeConfig::default(),
+                background_maintenance: Arc::new(BackgroundMaintenanceQueue::default()),
+                resource_locks: new_tool_resource_locks(),
+                observation_mutations: Arc::new(AtomicU64::new(0)),
+                runtime_control: Arc::new(RuntimeControlState::default()),
+                root_turn_gate,
+                autonomy_owner: Arc::new(RwLock::new(None)),
+                autonomy_mutations: tokio::sync::RwLock::new(()),
+                autonomy_extensions: crate::autonomy::AutonomyExtensions::builtins().freeze(),
+            }),
+        })
+    }
+
+    /// Compares the actual shared runtime identity, not the address of an internal controller handle.
+    pub(crate) fn same_runtime(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Borrows the live state into an owned controller handle without retaining its hosting service in a cycle.
+    pub(crate) fn shared_task_handle(&self) -> Arc<Self> {
+        Arc::new(Self {
+            inner: self.inner.clone(),
+            automatic_host: None,
         })
     }
 
@@ -1410,6 +1460,9 @@ impl RuntimeAgent {
                     execution.stop("required_child_failure");
                 }
                 return result;
+            }
+            if self.automatic_host().is_some() {
+                return Box::pin(self.automatic_chat(input, Some(actor_context))).await;
             }
             let RootTurnAdmission {
                 guard,
@@ -2021,8 +2074,11 @@ impl RuntimeAgent {
         let identities: RootTurnGateIdentityStack = identities.into();
         let mut cleanup = crate::autonomy::OwnedTurnCleanup::new(input.owner.clone());
         let objective = input.objective.clone();
+        let prepared = input.owner.prepared.lock().take();
         let work: Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> =
-            if let Some(skill) = skill {
+            if let Some(prepared) = prepared {
+                Box::pin(self.run_automatic_prepared(prepared))
+            } else if let Some(skill) = skill {
                 self.resume_capacity_skill(skill)
             } else if let Some(model) = model {
                 self.resume_capacity_model(model)
@@ -8279,6 +8335,8 @@ impl RuntimeAgent {
     async fn select_skill_candidate(&self, input: &str) -> Result<Option<SkillCandidate>> {
         if let Some(turn) = crate::autonomy::current_turn_input(&self.root_turn_gate)
             && turn.initial_work()
+            && crate::autonomy::current_execution()
+                .is_some_and(|execution| execution.needs_skill_segment())
             && let Some(skill) = turn.owner.skill.read().clone()
         {
             self.validate_autonomy_skill_binding(&skill)?;
@@ -8383,6 +8441,7 @@ impl RuntimeAgent {
                         "Skill requires clarification before execution"
                     );
                     *self.pending_skill_id.write() = Some(skill_id.clone());
+                    self.retain_automatic_skill_input(&skill_id, input);
                     let response = AgentResponse::new(&question.question).with_metadata(
                         "disambiguation",
                         serde_json::json!({
@@ -8415,7 +8474,7 @@ impl RuntimeAgent {
                         )
                         .await?;
                     drop(admission);
-                    let content = self.execute_skill(&skill, &enriched_input).await?;
+                    let content = self.execute_selected_skill(&skill, &enriched_input).await?;
                     return Ok(SkillRouteResult::Response { skill_id, content });
                 }
                 DisambiguationResult::ProceedWithBestGuess { enriched_input } => {
@@ -8427,7 +8486,7 @@ impl RuntimeAgent {
                         )
                         .await?;
                     drop(admission);
-                    let content = self.execute_skill(&skill, &enriched_input).await?;
+                    let content = self.execute_selected_skill(&skill, &enriched_input).await?;
                     return Ok(SkillRouteResult::Response { skill_id, content });
                 }
                 DisambiguationResult::GiveUp { reason } => {
@@ -8475,7 +8534,7 @@ impl RuntimeAgent {
             )
             .await?;
         drop(admission);
-        let content = self.execute_skill(&skill, input).await?;
+        let content = self.execute_selected_skill(&skill, input).await?;
         Ok(SkillRouteResult::Response { skill_id, content })
     }
 
@@ -8495,9 +8554,12 @@ impl RuntimeAgent {
 
     /// Installed skill routing selects once under the admitted turn; later controller work skips completed selection.
     async fn try_skill_route_inner(&self, input: &str) -> Result<SkillRouteResult> {
-        if crate::autonomy::current_turn_input(&self.root_turn_gate)
-            .is_some_and(|turn| !turn.initial_work())
-        {
+        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some_and(|turn| {
+            !turn.initial_work()
+                || (turn.owner.skill.read().is_some()
+                    && crate::autonomy::current_execution()
+                        .is_some_and(|execution| !execution.needs_skill_segment()))
+        }) {
             return Ok(SkillRouteResult::NoMatch);
         }
         if let Some(candidate) = self.select_skill_candidate(input).await? {
@@ -8603,7 +8665,7 @@ impl RuntimeAgent {
             .as_ref()
             .and_then(|r| r.get_skill(skill_id).cloned())
             .ok_or_else(|| AgentError::Skill(format!("Skill not found: {}", skill_id)))?;
-        self.execute_skill(&skill, input).await
+        self.execute_selected_skill(&skill, input).await
     }
 
     // Uses one explicit reflection configuration for both skill and ordinary response gating.
@@ -9338,11 +9400,14 @@ OVERALL: PASS/FAIL"#,
         {
             return Ok(None);
         }
-        if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some()
-            && let Some(crate::autonomy::location::TaskStateReturn::Prepared { data }) =
-                crate::autonomy::location::current_state_return()
+        if let Some(crate::autonomy::location::TaskStateReturn::Prepared { data }) =
+            crate::autonomy::location::current_state_return()
         {
-            return Box::pin(self.run_accepted_input(data)).await.map(Some);
+            // Automatic arrival consumes the original preparation before ordinary redispatch could repeat extraction.
+            self.promote_automatic_state(&data).await?;
+            if crate::autonomy::current_turn_input(&self.root_turn_gate).is_some() {
+                return Box::pin(self.run_accepted_input(data)).await.map(Some);
+            }
         }
         self.redispatch_current_state(processed_input)
             .await
@@ -12129,7 +12194,7 @@ Respond in JSON format:
     /// If fields are still missing, it returns the new clarification question and keeps pending_skill_id set.
     /// If all fields are present (Clear), it executes the skill and returns the response.
     /// Task invalidation keeps manager state protected rather than clearing a possibly replaced exchange.
-    async fn recheck_skill_disambiguation(
+    async fn recheck_skill_disambiguation_inner(
         &self,
         skill_id: &str,
         enriched_input: &str,
@@ -13201,8 +13266,8 @@ Respond in JSON format:
             return Ok(PostLoopResult::NoTransition(content));
         }
 
-        // Check if we should skip re-generation after this transition.
-        if !self.should_regenerate_after_transition() {
+        // An owned scope exit must be evaluated before any unrelated destination-state model work can manufacture completion.
+        if self.automatic_scope_ended() || !self.should_regenerate_after_transition() {
             self.memory
                 .add_message(ChatMessage::assistant(&content))
                 .await?;
@@ -13211,6 +13276,18 @@ Respond in JSON format:
                 content,
                 regenerated: false,
             });
+        }
+
+        // A regenerating destination handles this same input, so its declared task adopts the completed transition without replaying it.
+        if crate::autonomy::current_execution().is_none() {
+            let mut prepared = ProcessData::new(processed_input);
+            prepared.context = self
+                .active_turn_context
+                .read()
+                .as_ref()
+                .map(|context| context.input_context.clone())
+                .unwrap_or_default();
+            self.promote_automatic_state(&prepared).await?;
         }
 
         // Check if the new state needs full dispatch.
@@ -14465,7 +14542,14 @@ Respond in JSON format:
         input_data: ProcessData,
     ) -> Pin<Box<dyn Future<Output = Result<AgentResponse>> + Send + '_>> {
         Box::pin(async move {
+            self.promote_automatic_state(&input_data).await?;
             let processed_input = &input_data.content;
+            if self.automatic_scope_ended() {
+                let response = AgentResponse::new("");
+                self.commit_root_user_message(processed_input).await?;
+                self.finish_turn_if_root(&response).await?;
+                return Ok(response);
+            }
             // Controller continuation works from committed aggregate history, not by rerunning completed initial child flows.
             if !crate::autonomy::current_turn_input(&self.root_turn_gate)
                 .is_some_and(|turn| !turn.initial_work())
@@ -15029,7 +15113,10 @@ Respond in JSON format:
                     crate::optimization::StreamingOptimizationPolicy::Disabled
                 )
             {
-                match self.try_pre_response_transition(processed_input).await {
+                match crate::autonomy::location::scope_state_return(
+                    crate::autonomy::location::TaskStateReturn::Prepared { data: input_data.clone() },
+                    self.try_pre_response_transition(processed_input),
+                ).await {
                     Ok(Some(response)) => {
                         yield StreamChunk::content(&response.content);
                         record_runtime_stream_final(&terminal, response);
@@ -15069,6 +15156,11 @@ Respond in JSON format:
                         return;
                     }
                 }
+            }
+
+            if let Err(error) = self.promote_automatic_state(&input_data).await {
+                yield StreamChunk::error(error.to_string());
+                return;
             }
 
             // Handle orchestration states in streaming mode.
@@ -15572,6 +15664,7 @@ Respond in JSON format:
             ));
         }
         self.disambiguation_epoch.fetch_add(1, Ordering::SeqCst);
+        *self.pending_automatic_input.write() = None;
         *self.pending_skill_id.write() = None;
         if let Some(disambiguator) = self.disambiguation_manager.as_ref() {
             disambiguator.clear_pending().await;
@@ -15888,13 +15981,26 @@ Respond in JSON format:
         all_results
     }
 
-    /// Streams one serialized root turn and releases its owned gate guard at Done or when the stream is dropped.
+    /// Streams one serialized ordinary turn or automatic task operation through its actual ownership boundary.
     ///
-    /// The captured immutable identity stack is restored for every inner poll and export with an `Arc` clone, so nested hooks and orchestration calls detect same-runtime reentry without rebuilding ancestry. The inner stream is drained after Done before ownership is released.
+    /// Ordinary streams restore the immutable identity stack on every poll and drain the inner stream after Done before releasing their gate.
+    /// Automatic entry exchanges that gate for its live task reservation before controller work; Done ends the operation, not a paused task's ownership.
     pub async fn chat_stream<'a>(
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = StreamChunk> + Send + 'a>>> {
+        if self.automatic_host().is_some() {
+            let mut events = self.automatic_event_stream(input, None, true).await?;
+            return Ok(Box::pin(async_stream::stream! {
+                while let Some(event) = events.next().await {
+                    match event {
+                        AgentStreamEvent::Chunk(chunk) => yield chunk,
+                        AgentStreamEvent::Final(_) => { yield StreamChunk::Done {}; return; }
+                        AgentStreamEvent::Task(_) => {}
+                    }
+                }
+            }));
+        }
         let RootTurnAdmission {
             guard: root_turn_guard,
             identity_stack,
@@ -15962,13 +16068,17 @@ Respond in JSON format:
         Ok(stream)
     }
 
-    /// Streams one serialized root turn and releases its owned gate guard at the authoritative terminal event or on drop.
+    /// Streams one serialized root dispatch under ordinary ownership or a promoted controller's acknowledged operation custody.
     ///
-    /// The captured immutable identity stack is restored for every inner poll and export with an `Arc` clone. The event API shares and drains the legacy execution stream so cleanup, nested-call detection, cancellation, and side effects cannot diverge before the gate is released.
+    /// Ordinary event delivery shares and drains the legacy execution stream before gate release, preserving cleanup and nested-call detection.
+    /// Automatic delivery additionally projects bounded task events; dispatch Final carries truthful task status and does not imply completion of a paused objective.
     pub async fn chat_stream_events<'a>(
         &'a self,
         input: &'a str,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        if self.automatic_host().is_some() {
+            return self.automatic_event_stream(input, None, false).await;
+        }
         let RootTurnAdmission {
             guard,
             identity_stack,
@@ -16001,6 +16111,11 @@ Respond in JSON format:
         input: &'a str,
         actor_context: crate::TurnActorContext,
     ) -> Result<Pin<Box<dyn Stream<Item = AgentStreamEvent> + Send + 'a>>> {
+        if self.automatic_host().is_some() {
+            return self
+                .automatic_event_stream(input, Some(actor_context), false)
+                .await;
+        }
         let RootTurnAdmission {
             guard,
             identity_stack,
@@ -16175,6 +16290,9 @@ impl Agent for RuntimeAgent {
                 execution.stop("required_child_failure");
             }
             return result;
+        }
+        if self.automatic_host().is_some() {
+            return Box::pin(self.automatic_chat(input, None)).await;
         }
         let RootTurnAdmission {
             guard,
@@ -16456,6 +16574,7 @@ mod tests {
     }
 
     /// Collects one event stream into (content chunks joined, all chunks, Final).
+    // These ordinary parity fixtures reject task activation instead of silently discarding a new lifecycle event.
     async fn collect_stream_events(
         agent: &RuntimeAgent,
         input: &str,
@@ -16473,6 +16592,7 @@ mod tests {
                     }
                     chunks.push(chunk);
                 }
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
                 AgentStreamEvent::Final(response) => final_response = Some(response),
             }
         }
@@ -16905,6 +17025,7 @@ mod tests {
     }
 
     #[tokio::test]
+    // Ordinary confirmation must terminate its own dispatch without accidentally activating task work.
     async fn streaming_state_confirmation_ends_the_turn_before_redispatch() {
         let (agent, observed) = state_disambiguation_agent(
             vec![
@@ -16942,6 +17063,7 @@ mod tests {
                     panic!("unexpected stream error: {message}")
                 }
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
         let confirmation = confirmation.expect("confirmation must finalize");
@@ -20624,6 +20746,7 @@ states:
     }
 
     #[tokio::test]
+    // A default-off event stream retains its ordinary single-Final protocol with no task lifecycle output.
     async fn stream_events_emit_one_authoritative_final_without_legacy_done() {
         let agent = AgentBuilder::new()
             .system_prompt("You are a test assistant.")
@@ -20644,6 +20767,7 @@ states:
                 }
                 AgentStreamEvent::Final(response) => final_responses.push(response),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -20660,6 +20784,7 @@ states:
     }
 
     #[tokio::test]
+    // Ordinary provisional output cannot replace the processed authoritative response or activate a task.
     async fn stream_final_content_includes_output_processing_after_provisional_chunks() {
         let yaml = r#"
 name: ProcessedStreamAgent
@@ -20693,6 +20818,7 @@ streaming:
                 }
                 AgentStreamEvent::Final(response) => final_content = Some(response.content),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -20704,6 +20830,7 @@ streaming:
     }
 
     #[tokio::test]
+    // Ordinary tool progress stays distinct from an opt-in task lifecycle while preserving final call evidence.
     async fn stream_events_preserve_tool_progress_and_final_tool_calls() {
         let agent = AgentBuilder::new()
             .system_prompt("Use the echo tool once, then answer.")
@@ -20737,6 +20864,7 @@ streaming:
                 }
                 AgentStreamEvent::Final(response) => final_response = Some(response),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -23845,6 +23973,7 @@ hitl:
     }
 
     #[tokio::test]
+    // A denied ordinary operation keeps its established event finalization without claiming task execution.
     async fn tool_hitl_rejection_preserves_legacy_error_but_finalizes_event_stream() {
         let mock = mock_with_response(r#"{"tool":"echo","arguments":{"message":"hello"}}"#);
         let yaml = r#"
@@ -23876,6 +24005,7 @@ hitl:
                 AgentStreamEvent::Chunk(StreamChunk::Error { .. }) => error_seen = true,
                 AgentStreamEvent::Final(response) => final_response = Some(response),
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
 
@@ -27979,6 +28109,7 @@ observability:
             .unwrap()
     }
 
+    // Actor parity fixtures consume only ordinary authoritative output; a task event would change the tested contract.
     async fn collect_actor_stream_final(
         agent: &RuntimeAgent,
         input: &str,
@@ -27997,6 +28128,7 @@ observability:
                     panic!("unexpected stream error: {message}")
                 }
                 AgentStreamEvent::Chunk(_) => {}
+                AgentStreamEvent::Task(_) => panic!("ordinary fixture unexpectedly entered a task"),
             }
         }
         final_response.expect("Final")

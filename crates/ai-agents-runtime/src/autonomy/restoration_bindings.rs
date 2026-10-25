@@ -336,6 +336,12 @@ impl Rebinding<'_> {
                     self.group(&mut group)?;
                     adapter.state = serde_json::to_value(group)?;
                 }
+                "runtime.activation" if payload.counters.turns == 0 => {
+                    let mut binding: Box<crate::autonomy::automatic::AutomaticBinding> =
+                        serde_json::from_value(adapter.config.clone())?;
+                    self.state(&root, &mut binding.state_generation)?;
+                    adapter.config = serde_json::to_value(binding)?;
+                }
                 // Skill/action journal adapters remain audit history; executable locations are rebound through their actual batch/controller.
                 "runtime.skill" | "runtime.actions" => {}
                 "runtime.validation"

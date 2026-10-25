@@ -14,8 +14,27 @@ impl AutonomyRunner {
         selected: Option<&str>,
     ) -> Result<TaskRunResult> {
         let skill = self.agent.admit_autonomy_skill(skill_id)?;
-        let result = Box::pin(self.run_entry(objective, selected, Some(skill))).await?;
+        let result = Box::pin(self.run_entry(objective, selected, Some(skill), None)).await?;
         self.persist_returned_pause(result).await
+    }
+
+    /// Consumes an already minted owner after the ordinary root releases its gate; the same controller owns all later work.
+    pub(crate) async fn run_automatic(
+        &self,
+        entry: Box<super::super::automatic::AutomaticEntry>,
+    ) -> Result<TaskRunResult> {
+        let owner = entry.owner.clone();
+        let skill = entry.binding.skill.clone();
+        let input = entry.binding.prepared.content.clone();
+        let mut cleanup = OwnedTurnCleanup::new(owner.clone());
+        let result = Box::pin(self.run_entry(&input, None, skill, Some(entry))).await;
+        if result.is_err() && self.active.lock().is_none() {
+            self.agent.release_autonomy_run(&owner).await?;
+            cleanup.finish();
+        } else if result.is_ok() {
+            cleanup.finish();
+        }
+        self.persist_returned_pause(result?).await
     }
 
     /// Manual resume is a delivery endpoint by default; hosts can explicitly declare that no usable endpoint is exposed.
@@ -29,6 +48,23 @@ impl AutonomyRunner {
         &self,
         payload: &TaskCheckpointPayload,
     ) -> Result<EffectiveAutonomyProfile> {
+        if let Some(binding) = super::super::automatic::binding(payload)? {
+            self.agent.validate_automatic_binding(&binding)?;
+            let profile = resolve_profile(
+                &self.config,
+                binding.scope(),
+                payload.profile.as_deref(),
+                Some(&binding.settings),
+                None,
+                Some(&payload.objective),
+                &self.host,
+            )?;
+            self.agent.restore_automatic_scope(&binding, profile.mode)?;
+            if payload.counters.turns == 0 {
+                *self.agent.autonomy_owner_for_prepared()?.prepared.lock() = Some(binding);
+            }
+            return Ok(profile);
+        }
         let entry = payload
             .adapters
             .iter()

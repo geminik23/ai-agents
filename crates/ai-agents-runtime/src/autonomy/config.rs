@@ -706,18 +706,18 @@ fn validate_config_scopes(
     Ok(())
 }
 
-// Reject only actually enabled default or scoped paths, not dormant named profiles.
+// Install hosting only for actually enabled default or scoped paths; dormant named profiles do not change ordinary behavior.
 pub(crate) fn has_enabled_declaration(
     config: &AutonomyConfig,
     states: Option<&StateConfig>,
     skills: &[SkillDefinition],
 ) -> bool {
-    // Only a resolved enabled scope needs the interim build guard.
+    // Presence-preserving resolution decides whether this declaration needs hosted task admission.
     fn enabled(config: &AutonomyConfig, scoped: Option<&AutonomyOverride>) -> bool {
         resolve_raw(config, None, scoped, None)
             .is_ok_and(|profile| profile.enabled.unwrap_or(false))
     }
-    // Scan the installed machine so programmatic states cannot bypass the interim guard.
+    // Scan the actual installed machine so programmatic state replacement receives the same hosting contract as YAML.
     fn state(
         config: &AutonomyConfig,
         definitions: &std::collections::HashMap<String, StateDefinition>,
@@ -1183,9 +1183,9 @@ states:
         );
     }
 
-    // Inactive profiles must not block chat, while installed state overrides cannot bypass refusal.
+    // Dormant profiles do not install task execution; actual programmatic state declarations receive the same hosted entry as YAML.
     #[test]
-    fn inactive_named_profile_does_not_change_chat_and_programmatic_state_is_guarded() {
+    fn inactive_profiles_and_programmatic_states_build_without_starting_work() {
         use crate::AgentBuilder;
         use ai_agents_llm::mock::MockLLMProvider;
         use std::sync::Arc;
@@ -1208,9 +1208,7 @@ states:
             .llm(Arc::new(MockLLMProvider::new("test")))
             .state_machine(machine)
             .build();
-        assert!(
-            matches!(result, Err(AgentError::Config(message)) if message.contains("runner integration is installed"))
-        );
+        assert!(result.unwrap().automatic_task_runner().is_none());
     }
 
     // Merge fallback policy before checking ask-user safety and reject future-stage proof.
@@ -1279,9 +1277,9 @@ states:
         }
     }
 
-    // Enabled declarations must not masquerade as working autonomy before controller installation.
+    // Enabled defaults configure the controller and enabled skill declarations install automatic entry without eager execution.
     #[test]
-    fn enabled_yaml_and_rust_skill_builds_fail_instead_of_silently_chatting() {
+    fn enabled_yaml_and_rust_skill_builds_install_lazy_hosting() {
         use crate::AgentBuilder;
         use ai_agents_llm::mock::MockLLMProvider;
         use std::sync::Arc;
@@ -1289,26 +1287,20 @@ states:
         let enabled = spec_with_autonomy(
             "name: Agent\nsystem_prompt: You are helpful.\nautonomy: {enabled: true, completion: {state: done}}\n",
         );
-        let error = match AgentBuilder::from_spec(enabled)
+        let configured = AgentBuilder::from_spec(enabled)
             .llm(Arc::new(MockLLMProvider::new("test")))
             .build()
-        {
-            Ok(_) => panic!("enabled autonomy cannot silently use chat"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("runner integration is installed"));
+            .unwrap();
+        assert!(configured.automatic_task_runner().is_none());
 
         let skill: SkillDefinition = serde_yaml::from_str("id: work\ndescription: Work\ntrigger: Work\nsteps: []\nautonomy: {enabled: true, mode: skill_until_complete, completion: {state: done}}\n").unwrap();
-        let error = match AgentBuilder::new()
+        let configured = AgentBuilder::new()
             .system_prompt("Helpful")
             .llm(Arc::new(MockLLMProvider::new("test")))
             .skill(skill)
             .build()
-        {
-            Ok(_) => panic!("programmatic skill autonomy cannot silently use chat"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("runner integration is installed"));
+            .unwrap();
+        assert!(configured.automatic_task_runner().is_none());
 
         let disabled = spec_with_autonomy(
             "name: Agent\nsystem_prompt: Helpful.\nautonomy: {enabled: false, completion: {state: done}}\n",
@@ -1345,9 +1337,7 @@ states:
             .unwrap()
             .llm(Arc::new(MockLLMProvider::new("test")))
             .build();
-        assert!(
-            matches!(result, Err(AgentError::Config(message)) if message.contains("runner integration is installed"))
-        );
+        assert!(result.unwrap().automatic_task_runner().is_none());
         std::fs::write(
             &path,
             "id: work\ndescription: Work\ntrigger: Work\nsteps: []\nautonomy: {enabeld: true}\n",

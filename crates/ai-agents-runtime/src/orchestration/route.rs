@@ -26,11 +26,15 @@ pub async fn route(
         AgentError::Other(format!("Routed agent not found in registry: {selected}"))
     })?;
     let _target_pin = registry.capture_task_target(&selected, &agent)?;
-    let response = if let Some(context) = current_turn_actor_context() {
-        agent.chat_with_actor_context(input, context).await?
-    } else {
-        agent.chat(input).await?
-    };
+    // Retain this selected route while a hosted automatic child awaits its explicit host response.
+    let response = crate::autonomy::automatic::scope_composing(async {
+        if let Some(context) = current_turn_actor_context() {
+            agent.chat_with_actor_context(input, context).await
+        } else {
+            agent.chat(input).await
+        }
+    })
+    .await?;
     info!(agent = %selected, "Route completed");
     Ok(RouteResult {
         response,

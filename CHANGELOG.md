@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- Automatic task entry: development-only YAML state and selected-skill tasks share the existing controller, retained host decisions, bounded lifecycle events and acknowledged completion without replaying prepared work
 - Task event streams: development-only Rust hosts observe bounded, default-redacted task execution, retained decisions and acknowledged outcomes with explicit foreground close and recovery-safe drop
 - Task artifact validation: development profiles collect authorized file metadata or explicit host artifact projections with exact validation-proof freshness
 - Task numeric telemetry: development completion gates consume acknowledged run-scoped observations across pause and reconstruction; missing, lossy and unmeasured metrics remain unknown
@@ -20,7 +21,7 @@
 - Task evidence: development-only frozen host revision sources bind validation and external waits to actual targets; explicit delivery-loss reports follow stop/fail policy without polling or replay
 - Task host controls: development-only retained objective changes retire safe pending work, preserve audit/usage and canonical todos, and require explicit revision-bound continuation
 - Task supervision: development-only lifecycle advancement/fix rewinds, controller replans and initial/reflection executable-plan adoption retain exact approval/rejection positions without proposal regeneration
-- Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy and enabled YAML execution remain unavailable
+- Standalone task execution: development-only foreground Rust invocation with runtime reservation, managed-attempt journaling, persisted message provenance and deadline-aware finalization; full autonomy hosting remains unfinished
 - Task resource admission: development-only declared-priced reservations, logical write targets, shared child execution and todo authority, objective templates and initial skill continuation without replay; full participant and restart integration remains unfinished
 - Task interaction continuation: development-only clarification/confirmation, transition approval and rejection, script/actions/fallback and model-tool composition retain exact progress; shared targets defer new histories, explicit host stop closes safe pauses and host limit revision preserves pending work, while full task-surface acceptance remains unfinished
 - Task broadcast continuation: development-only `AgentRegistry::broadcast_task` retains recipient operations and ordered results under a live tool-message permit; ordinary broadcast and calls without a permit remain blocking
@@ -29,6 +30,7 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- Rust task hosting: development automatic tasks retain shared runtime state and explicit host access; finish fluent configuration before publishing retained controller handles
 - Task validation names: development check IDs reserve the runtime journal namespace and reject collisions before ownership or execution
 - Rust recovery compatibility: development task mutations add guarded reconciliation and cleanup-only claim/publication; custom stores opt into recovery and compatibility-aware candidate inspection
 - Rust session metadata: the setter now returns an ownership-aware result, and ordinary session rebinding and actor deletion reject reserved task runtimes

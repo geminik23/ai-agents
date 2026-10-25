@@ -31,3 +31,7 @@ path = "src/multi_provider.rs"
 [[bin]]
 name = "task-events"
 path = "src/task_events.rs"
+
+[[bin]]
+name = "automatic-tasks"
+path = "src/automatic_tasks.rs"

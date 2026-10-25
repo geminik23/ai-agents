@@ -600,6 +600,11 @@ impl RunExecution {
         Ok(())
     }
 
+    /// Scope identity does not force scripted work when the explicitly selected execution strategy is model-led or lifecycle-led.
+    pub(crate) fn needs_skill_segment(&self) -> bool {
+        self.lifecycle.read().1.needs_skill_segment()
+    }
+
     /// Returns the acknowledged live lifecycle after a nested skill completes, without replacing controller stage ownership.
     pub(crate) fn skill_segment_completed(&self) -> bool {
         self.lifecycle.read().1.skill_segment_completed

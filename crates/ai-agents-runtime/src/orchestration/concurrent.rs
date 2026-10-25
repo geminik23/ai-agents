@@ -249,11 +249,14 @@ async fn concurrent_dispatch(
                                         )
                                     })?;
                                 }
-                                composition::run_composition_child(
-                                    scope,
-                                    slot,
-                                    response_custody,
-                                    run,
+                                // Spawned tasks do not inherit task locals; retain ordinary hosted-child delivery explicitly.
+                                crate::autonomy::automatic::scope_composing(
+                                    composition::run_composition_child(
+                                        scope,
+                                        slot,
+                                        response_custody,
+                                        run,
+                                    ),
                                 )
                                 .await
                             };

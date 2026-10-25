@@ -19,6 +19,10 @@ pub(crate) struct RunOwner {
     pub(crate) observed_branches: parking_lot::Mutex<std::collections::BTreeSet<String>>,
     // Only explicit admission installs this actual definition; serialized entry data cannot mint a skill scope.
     pub(crate) skill: parking_lot::RwLock<Option<ai_agents_skills::SkillDefinition>>,
+    // The original declaring subtree survives transitions; current state alone cannot reconstruct entry ownership.
+    pub(crate) state_scope: parking_lot::RwLock<Option<String>>,
+    // Initial prepared work is consumed once after root-gate handoff, never by public redispatch.
+    pub(crate) prepared: parking_lot::Mutex<Option<Box<super::automatic::AutomaticBinding>>>,
     // Actual reviewed implementations and request clocks remain owned across same-process pauses, not reconstructed from checkpoint labels.
     pub(crate) responses: parking_lot::Mutex<
         std::collections::BTreeMap<String, Arc<super::response::RetainedResponse>>,
@@ -52,6 +56,8 @@ impl RunOwner {
             telemetry: Default::default(),
             observed_branches: Default::default(),
             skill: parking_lot::RwLock::new(None),
+            state_scope: Default::default(),
+            prepared: Default::default(),
             responses: Default::default(),
             skill_finishing: Default::default(),
             interaction_delivery: AtomicBool::new(true),

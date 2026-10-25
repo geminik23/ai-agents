@@ -5,6 +5,10 @@ mod ad_maintenance_fault_tests;
 #[cfg(test)]
 mod admission_tests;
 mod authority;
+pub(crate) mod automatic;
+#[cfg(test)]
+mod automatic_tests;
+pub use automatic::AutomaticTaskOptions;
 mod boundary;
 pub(crate) mod composition;
 mod execution;

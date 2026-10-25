@@ -622,8 +622,9 @@ pub(crate) fn enter_composition_dispatch() -> bool {
 }
 
 /// Cursor authority is disabled for nested public orchestration without dropping inherited accounting or barrier custody.
+/// Ordinary compositions retain their caller frame while a hosted automatic child is paused, without acquiring task authority.
 pub(crate) async fn scope_dispatch_authority<F: Future>(authorized: bool, future: F) -> F::Output {
-    COMPOSITION_DISPATCH.scope(authorized, future).await
+    super::automatic::scope_composing(COMPOSITION_DISPATCH.scope(authorized, future)).await
 }
 
 /// Child admission and barrier closure share one lock; closure never aborts already admitted turns or their settlement.
