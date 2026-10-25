@@ -13,6 +13,130 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+#[cfg(unix)]
+fn run_tui_pty(agent: &std::path::Path, initial: &str, expected: &str, answer: &str, mode: &str) {
+    let out = Command::new("python3")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tui_pty.py"))
+        .args([
+            env!("CARGO_BIN_EXE_ai-agents-cli"),
+            agent.to_str().unwrap(),
+            initial,
+            expected,
+            answer,
+            mode,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "PTY failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_pty_retained_question_and_terminal_restoration() {
+    let fixture = Fixture::new(&["draft", "done"]);
+    let agent = fixture.agent(&format!(
+        "{TASK}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n"
+    ));
+    run_tui_pty(
+        &agent,
+        "/task run 보고서 작성",
+        "Agent: done",
+        "continue",
+        "complete",
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_pty_quit_from_a_volatile_pause_settles_without_replay() {
+    let fixture = Fixture::new(&["draft", "must not execute"]);
+    let agent = fixture.agent(&format!(
+        "{TASK}  premature_finish: {{action: ask_user, on_unavailable: stop}}\n"
+    ));
+    run_tui_pty(&agent, "/task run Research", "", "", "cancel");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_pty_ordinary_parent_services_independent_children_before_final() {
+    let first = Fixture::new(&["draft", "done-first"]);
+    let second = Fixture::new(&["draft", "done-second"]);
+    let root = Fixture::new(&[]);
+    let extra = "tools: []\nstates:\n  initial: work\n  states:\n    work:\n      autonomy:\n        enabled: true\n        max_turns: 3\n        max_llm_calls: 3\n        completion: {response_contains: done}\n        premature_finish: {action: ask_user, on_unavailable: stop}\n";
+    let a = first.agent(extra);
+    let b = second.agent(extra);
+    let parent=root.agent(&format!("tools: []\nspawner:\n  shared_llms: false\n  auto_spawn:\n    - {{id: first, agent: '{}' }}\n    - {{id: second, agent: '{}' }}\nstates:\n  initial: collect\n  states:\n    collect:\n      concurrent:\n        agents: [first, second]\n        aggregation: {{strategy: all}}\n",a.display(),b.display()));
+    run_tui_pty(
+        &parent,
+        "research",
+        "done-first|done-second",
+        "continue",
+        "complete",
+    );
+    assert_eq!(first.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(second.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(root.calls.load(Ordering::SeqCst), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_pty_report_requires_an_actual_isolated_file_effect() {
+    let fixture = Fixture::new(&[]);
+    let path = fixture.dir.join("report.txt");
+    let call = json!({"tool":"file_write","arguments":{"path":path,"content":"validated report"}})
+        .to_string();
+    let provider = Fixture::new(&[&call, "done"]);
+    let config=TASK.replace("tools: []","tools: [file_write]").replace("completion: {response_contains: done}","completion: {all: [{response_contains: done}, {tool_called: {id: file_write, count: 1, executed: true, success: true}}]}");
+    let agent=provider.agent(&format!("{config}  hitl: {{on_approval_required: pause_run}}\nhitl: {{default_timeout_seconds: 60, on_timeout: reject}}\ntool_security:\n  enabled: true\n  fail_closed: true\n  tools:\n    file_write:\n      write_paths: ['{}']\n      overwrite_existing: false\n",fixture.dir.display()));
+    run_tui_pty(&agent, "/task run report", "Agent: done", "yes", "complete");
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "validated report");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(unix)]
+#[test]
+fn tui_pty_task_owned_child_questions_preserve_completed_prefixes() {
+    let reply =
+        r#"{"tool":"ask_user","arguments":{"question":"Confirm source","options":["yes"]}}"#;
+    let first = Fixture::new(&[reply, "done-first"]);
+    let second = Fixture::new(&[reply, "done-second"]);
+    let root = Fixture::new(&[]);
+    let a = first.agent("tools: [ask_user]");
+    let b = second.agent("tools: [ask_user]");
+    std::fs::write(
+        &a,
+        std::fs::read_to_string(&a)
+            .unwrap()
+            .replace("name: Fixture", "name: FirstWorker"),
+    )
+    .unwrap();
+    std::fs::write(
+        &b,
+        std::fs::read_to_string(&b)
+            .unwrap()
+            .replace("name: Fixture", "name: SecondWorker"),
+    )
+    .unwrap();
+    let task = TASK.replace("tools: []", "tools: [ask_user]");
+    let parent=root.agent(&format!("{task}  hitl: {{on_user_question: pause_run}}\nspawner:\n  shared_llms: false\n  allowed_tools: [ask_user]\n  auto_spawn:\n    - {{id: first, agent: '{}' }}\n    - {{id: second, agent: '{}' }}\nstates:\n  initial: collect\n  states:\n    collect:\n      concurrent:\n        agents: [first, second]\n        aggregation: {{strategy: all}}\n",a.display(),b.display()));
+    run_tui_pty(
+        &parent,
+        "/task run research",
+        "done-first|done-second",
+        "yes",
+        "complete",
+    );
+    assert_eq!(first.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(second.calls.load(Ordering::SeqCst), 2);
+    assert_eq!(root.calls.load(Ordering::SeqCst), 0);
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
     dir: PathBuf,

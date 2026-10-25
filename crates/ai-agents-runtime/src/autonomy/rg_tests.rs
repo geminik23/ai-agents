@@ -363,6 +363,26 @@ async fn rg_report_operations_world_and_code_require_actual_host_state() {
             );
             assert_eq!(state.effects.load(Ordering::SeqCst), 1);
             assert!(state.observed.lock().len() >= 2);
+            let details = runner
+                .task_host_details(&done.run.key.run_id)
+                .await
+                .unwrap();
+            assert_eq!(details.revision, done.run.revision);
+            assert!(
+                details
+                    .lines
+                    .iter()
+                    .any(|line| line.starts_with("Validation "))
+            );
+            if domain == "report" {
+                assert!(
+                    details
+                        .lines
+                        .iter()
+                        .any(|line| line.contains("report://current")
+                            && line.contains("exists: true"))
+                );
+            }
             if domain == "operations" {
                 assert_eq!(done.run.counters.turns, 3);
                 assert_eq!(provider.calls.load(Ordering::SeqCst), 4);

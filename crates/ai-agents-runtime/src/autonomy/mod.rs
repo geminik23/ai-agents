@@ -69,11 +69,12 @@ pub(crate) use memory::TaskMemory;
 pub use runner::TaskRestoreParticipant;
 pub use runner::{
     AutonomyRunner, CancellationDisposition, CancellationOutcome, MAX_TASK_DISPLAY_BYTES,
-    TaskHostInteraction, TaskHostPrompt, TaskReconstructionCheckpoint, TaskRecoveryCheckpoint,
-    TaskRecoveryDecision, TaskRecoveryDisposition, TaskRecoveryHost, TaskRestorationReview,
-    TaskRestoreBinding, TaskRestoreComposition, TaskRestoreEntry, TaskRestoreGenerations,
-    TaskRestoreGraph, TaskRestoreHost, TaskRestoreManifest, TaskRestoreNode, TaskRestoreRegistry,
-    TaskRestoreRequest, TaskRestoreResponse, TaskRestoreTarget, TaskRunDisplay, TaskStartupRequest,
+    TaskHostDetails, TaskHostInteraction, TaskHostPrompt, TaskReconstructionCheckpoint,
+    TaskRecoveryCheckpoint, TaskRecoveryDecision, TaskRecoveryDisposition, TaskRecoveryHost,
+    TaskRestorationReview, TaskRestoreBinding, TaskRestoreComposition, TaskRestoreEntry,
+    TaskRestoreGenerations, TaskRestoreGraph, TaskRestoreHost, TaskRestoreManifest,
+    TaskRestoreNode, TaskRestoreRegistry, TaskRestoreRequest, TaskRestoreResponse,
+    TaskRestoreTarget, TaskRunDisplay, TaskStartupRequest,
 };
 mod builtins;
 #[cfg(test)]

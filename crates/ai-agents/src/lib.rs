@@ -593,7 +593,7 @@ pub use autonomy::{
     AutonomyOverride, AutonomyProfile, AutonomyScope, AutonomyValidator, CancellationDisposition,
     CancellationOutcome, CompletionGate, CompletionGateEvaluator, EffectiveAutonomyProfile,
     EvaluationScope, GateOutcome, HostControlAction, MAX_TASK_DISPLAY_BYTES, ProgressAdapter,
-    RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload, TaskEventCursor,
+    RunTodoAdapter, ScopedTaskRunStore, TaskCheckpointPayload, TaskEventCursor, TaskHostDetails,
     TaskHostInteraction, TaskHostPrompt, TaskHostRun, TaskHostScope, TaskHostSession, TaskRun,
     TaskRunDisplay, TaskRunEvent, TaskRunEventKind, TaskRunKey, TaskRunMutation, TaskRunResult,
     TaskRunSnapshot, TaskRunStatus, TaskRunStorageError, TaskRunStore, TaskRunStream,

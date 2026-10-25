@@ -21,12 +21,32 @@ use tokio::sync::{mpsc, oneshot};
 
 const INPUT_BYTES: usize = 65_536;
 
-enum Input {
+pub(crate) enum Input {
+    UiLine { generation: u64, line: String },
+    Reply { id: u64, line: String },
     Line(String),
     Eof,
     Error,
 }
-enum Output {
+pub(crate) enum Output {
+    Prompt {
+        id: u64,
+        text: String,
+        question: Option<QuestionRequest>,
+    },
+    PromptClosed(u64),
+    View {
+        display: Box<TaskRunDisplay>,
+        details: Option<ai_agents::TaskHostDetails>,
+    },
+    Result {
+        generation: u64,
+        result: Box<SessionResult>,
+    },
+    Rejected {
+        generation: u64,
+        message: String,
+    },
     Text(String),
     Diagnostic(String),
     Flush(oneshot::Sender<()>),
@@ -41,8 +61,19 @@ enum Callback {
 pub(crate) struct InputBridge {
     tx: mpsc::Sender<Callback>,
     show_context: Arc<std::sync::atomic::AtomicBool>,
+    auto_approval: Arc<std::sync::atomic::AtomicU8>,
 }
 impl InputBridge {
+    pub(crate) fn set_auto_approval(&self, decision: Option<bool>) {
+        self.auto_approval.store(
+            match decision {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            },
+            std::sync::atomic::Ordering::Release,
+        );
+    }
     pub(crate) fn set_show_context(&self, available: bool) {
         self.show_context
             .store(available, std::sync::atomic::Ordering::Release);
@@ -51,6 +82,14 @@ impl InputBridge {
 #[async_trait]
 impl ApprovalHandler for InputBridge {
     async fn request_approval(&self, request: ApprovalRequest) -> ApprovalResult {
+        match self
+            .auto_approval
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            1 => return ApprovalResult::approved(),
+            2 => return ApprovalResult::rejected(None),
+            _ => {}
+        }
         let (tx, rx) = oneshot::channel();
         if self.tx.send(Callback::Approval(request, tx)).await.is_err() {
             return ApprovalResult::rejected(None);
@@ -105,6 +144,13 @@ pub(crate) struct SessionResult {
     pub results: BTreeMap<String, TaskRunResult>,
     pub quit: bool,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    Open,
+    Closed,
+    Shutdown,
+}
+
 struct TaskPrompt {
     run: TaskHostRun,
     interaction: TaskHostInteraction,
@@ -114,6 +160,7 @@ enum Prompt {
     Callback(Callback),
 }
 struct View {
+    details: Option<ai_agents::TaskHostDetails>,
     run: TaskHostRun,
     display: TaskRunDisplay,
     interaction: Option<TaskHostInteraction>,
@@ -124,6 +171,10 @@ type InputResponse = std::result::Result<Option<(String, Control)>, (Box<Prompt>
 /// Owns only terminal input/output and polling, not task state, execution ordering, admission or cleanup semantics.
 pub(crate) struct FrontendSession {
     input: mpsc::Receiver<Input>,
+    ui: bool,
+    ui_generation: u64,
+    endpoint: Option<tokio::sync::watch::Receiver<Endpoint>>,
+    prompt_sequence: u64,
     queued: VecDeque<String>,
     callbacks: mpsc::Receiver<Callback>,
     bridge: Arc<InputBridge>,
@@ -183,6 +234,13 @@ impl FrontendSession {
                         }
                         continue;
                     }
+                    Output::Result { .. }
+                    | Output::Rejected { .. }
+                    | Output::Prompt { .. }
+                    | Output::PromptClosed(_)
+                    | Output::View { .. } => {
+                        continue;
+                    }
                     Output::Flush(ack) => {
                         let _ = ack.send(());
                         continue;
@@ -202,11 +260,16 @@ impl FrontendSession {
         let (callback_tx, callbacks) = mpsc::channel(32);
         Self {
             input,
+            ui: false,
+            ui_generation: 0,
+            endpoint: None,
+            prompt_sequence: 0,
             queued: VecDeque::new(),
             callbacks,
             bridge: Arc::new(InputBridge {
                 tx: callback_tx,
                 show_context: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                auto_approval: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             }),
             eof: !input_available,
             json,
@@ -215,6 +278,105 @@ impl FrontendSession {
             suppressed_output: false,
             interrupt: Box::pin(tokio::signal::ctrl_c()),
         }
+    }
+
+    /// Creates bounded in-process transport without a stdin reader or terminal-writing worker.
+    pub(crate) fn embedded() -> (Self, mpsc::Sender<Input>, mpsc::Receiver<Output>) {
+        let (tx, input) = mpsc::channel(16);
+        let (output, events) = mpsc::channel(32);
+        let (_, output_failed) = mpsc::channel(1);
+        let (callback_tx, callbacks) = mpsc::channel(32);
+        (
+            Self {
+                input,
+                ui: true,
+                ui_generation: 0,
+                endpoint: None,
+                prompt_sequence: 0,
+                queued: VecDeque::new(),
+                callbacks,
+                bridge: Arc::new(InputBridge {
+                    tx: callback_tx,
+                    show_context: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                    auto_approval: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+                }),
+                eof: false,
+                json: false,
+                output,
+                output_failed,
+                suppressed_output: false,
+                interrupt: Box::pin(tokio::signal::ctrl_c()),
+            },
+            tx,
+            events,
+        )
+    }
+
+    fn prompt_output(&mut self, prompt: &Prompt) -> Output {
+        if !self.ui {
+            return diagnostic(
+                match prompt {
+                    Prompt::Task(p) => render_task_prompt(p),
+                    Prompt::Callback(c) => render_callback(
+                        c,
+                        self.bridge
+                            .show_context
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    ),
+                },
+                self.json,
+            );
+        }
+        self.prompt_sequence = self.prompt_sequence.wrapping_add(1);
+        let (text, question) = match prompt {
+            Prompt::Task(p) => (
+                render_task_prompt(p),
+                match &p.interaction.prompt {
+                    TaskHostPrompt::Question(q)
+                        if p.interaction
+                            .restoration_review
+                            .as_ref()
+                            .is_none_or(|r| r.approved) =>
+                    {
+                        Some(q.clone())
+                    }
+                    _ => None,
+                },
+            ),
+            Prompt::Callback(c) => (
+                render_callback(
+                    c,
+                    self.bridge
+                        .show_context
+                        .load(std::sync::atomic::Ordering::Acquire),
+                ),
+                match c {
+                    Callback::Question(q, _) => Some(q.clone()),
+                    _ => None,
+                },
+            ),
+        };
+        Output::Prompt {
+            id: self.prompt_sequence,
+            text,
+            question,
+        }
+    }
+
+    pub(crate) fn send_ui(&self, output: Output) -> BoxFuture<'static, Result<()>> {
+        let tx = self.output.clone();
+        Box::pin(async move {
+            tx.send(output)
+                .await
+                .map_err(|_| anyhow::anyhow!("UI output closed; cleanup is not implied"))
+        })
+    }
+
+    pub(crate) fn set_endpoint(&mut self, endpoint: tokio::sync::watch::Receiver<Endpoint>) {
+        self.endpoint = Some(endpoint);
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.ui_generation
     }
 
     pub(crate) fn output_suppressed(&self) -> bool {
@@ -229,11 +391,14 @@ impl FrontendSession {
         self.bridge.clone()
     }
 
-    pub(crate) async fn write(&self, text: impl Into<String>) -> Result<()> {
-        self.output
-            .send(Output::Text(text.into()))
-            .await
-            .map_err(|_| anyhow::anyhow!("output unavailable; task cleanup is not implied"))
+    pub(crate) fn write(&self, text: impl Into<String>) -> BoxFuture<'static, Result<()>> {
+        let tx = self.output.clone();
+        let text = text.into();
+        Box::pin(async move {
+            tx.send(Output::Text(text))
+                .await
+                .map_err(|_| anyhow::anyhow!("output unavailable; task cleanup is not implied"))
+        })
     }
 
     pub(crate) async fn finish(&self) -> Result<()> {
@@ -252,12 +417,26 @@ impl FrontendSession {
         if self.eof {
             return Ok(None);
         }
+        let mut endpoint = self.endpoint.clone();
+        if endpoint
+            .as_ref()
+            .is_some_and(|rx| *rx.borrow() != Endpoint::Open)
+        {
+            self.eof = true;
+            return Ok(None);
+        }
         let input = tokio::select! {
+            _=async {endpoint.as_mut().unwrap().changed().await}, if endpoint.is_some()=>{self.eof=true;None},
             input=self.input.recv()=>input,
             _=&mut self.interrupt=>{self.eof=true;None},
         };
         match input {
+            Some(Input::UiLine { generation, line }) => {
+                self.ui_generation = generation;
+                Ok(Some(line))
+            }
             Some(Input::Line(line)) => Ok(Some(line)),
+            Some(Input::Reply { .. }) => Ok(Some(String::new())),
             Some(Input::Error) => {
                 self.eof = true;
                 bail!("stdin failed or input exceeds 64 KiB");
@@ -319,6 +498,10 @@ impl FrontendSession {
         let mut events_open = true;
         let mut operation_error = None;
         let mut input_closed = false;
+        let output = self.output.clone();
+        let mut endpoint = self.endpoint.clone();
+        let mut visible_prompt = None;
+        let mut sent_views = BTreeMap::new();
         loop {
             // Once shutdown begins, display backpressure must not hold execution or control futures hostage.
             // The read-only output worker may remain blocked, but it owns no runtime work and final delivery is explicitly suppressed.
@@ -343,10 +526,26 @@ impl FrontendSession {
             }
             if dirty && refresh.is_none() {
                 let session = host.clone();
-                refresh = Some(Box::pin(async move { inspect(&session).await }));
+                let ui = self.ui;
+                refresh = Some(Box::pin(async move { inspect(&session, ui).await }));
                 dirty = false;
             }
             if refresh.is_none() && !dirty {
+                if let Some(Prompt::Task(prompt)) = &presented
+                    && views.iter().any(|v| {
+                        v.run.key.run_id == prompt.run.key.run_id
+                            && v.display.summary.revision != prompt.interaction.revision
+                    })
+                {
+                    presented = None;
+                }
+                if self.ui
+                    && presented.is_none()
+                    && pending_output.is_none()
+                    && let Some(id) = visible_prompt.take()
+                {
+                    pending_output = Some(Output::PromptClosed(id));
+                }
                 for view in &mut views {
                     let id = view.run.key.run_id.clone();
                     if busy.contains(&id) || failed_runs.contains(&id) {
@@ -410,8 +609,23 @@ impl FrontendSession {
                         run: view.run.clone(),
                         interaction: view.interaction.take().unwrap(),
                     };
-                    pending_output = Some(diagnostic(render_task_prompt(&prompt), self.json));
-                    presented = Some(Prompt::Task(Box::new(prompt)));
+                    let prompt = Prompt::Task(Box::new(prompt));
+                    pending_output = Some(self.prompt_output(&prompt));
+                    visible_prompt = Some(self.prompt_sequence);
+                    presented = Some(prompt);
+                }
+                if self.ui
+                    && pending_output.is_none()
+                    && !stopping
+                    && let Some(view) = views.iter().find(|v| {
+                        sent_views.get(&v.run.key.run_id) != Some(&v.display.summary.revision)
+                    })
+                {
+                    sent_views.insert(view.run.key.run_id.clone(), view.display.summary.revision);
+                    pending_output = Some(Output::View {
+                        display: Box::new(view.display.clone()),
+                        details: view.details.clone(),
+                    });
                 }
                 // RecoveryRequired ends this foreground operation but deliberately retains protected runtime custody.
                 let all_settled = views.iter().all(|view| {
@@ -464,6 +678,13 @@ impl FrontendSession {
                 continue;
             }
             tokio::select! {
+                changed=async {endpoint.as_mut().unwrap().changed().await}, if endpoint.is_some() => {
+                    if changed.is_err() {endpoint=None;} else {
+                        let state=*endpoint.as_ref().unwrap().borrow();
+                        if state!=Endpoint::Open {self.eof=true;host.close_input();if let Some(Prompt::Callback(callback))=presented.take(){reject_callback(callback);}dirty=true;}
+                        if state==Endpoint::Shutdown {stopping=true;quit=true;self.suppressed_output=true;}
+                    }
+                }
                 result=&mut work, if !work_finished => {
                     work_finished=true;
                     match result {
@@ -497,23 +718,44 @@ impl FrontendSession {
                 callback=self.callbacks.recv(), if presented.is_none() && pending_output.is_none() => {
                     if let Some(callback)=callback {
                         if stopping || !host.interaction_available() { reject_callback(callback); }
-                        else { pending_output=Some(diagnostic(render_callback(&callback,self.bridge.show_context.load(std::sync::atomic::Ordering::Acquire)),self.json)); presented=Some(Prompt::Callback(callback)); }
+                        else { let prompt=Prompt::Callback(callback); pending_output=Some(self.prompt_output(&prompt));visible_prompt=Some(self.prompt_sequence);presented=Some(prompt); }
                     }
                 }
                 event=events.recv(), if events_open && pending_output.is_none() => {
                     match event { Some(text)=>{if !stopping {pending_output=Some(Output::Text(text));}}, None=>events_open=false }
                 }
-                permit=self.output.reserve(), if pending_output.is_some() && !output_lost && !stopping => {
+                permit=output.reserve(), if pending_output.is_some() && !output_lost && !stopping => {
                     match permit {
                         Ok(permit)=>{ permit.send(pending_output.take().unwrap()); }
                         Err(_)=>{output_lost=true;self.suppressed_output=true;pending_output=None;stopping=true;host.close_input();}
                     }
                 }
-                failed=self.output_failed.recv(), if !output_lost => {
+                failed=self.output_failed.recv(), if !output_lost && !self.ui => {
                     if failed.is_some() {output_lost=true;self.suppressed_output=true;pending_output=None;stopping=true;host.close_input();}
                 }
                 input=self.input.recv(), if !self.eof && self.queued.len()<16 => {
                     match input {
+                        Some(Input::UiLine { generation, line }) => {
+                            if generation != self.ui_generation {pending_output=Some(Output::Diagnostic("stale operation input was not submitted\n".into()));}
+                            else if line.starts_with("/task ") {
+                                match command(&line,&host,updates_tx.clone(),self.json) {
+                                    Ok((id,control))=>{busy.insert(id);controls.push(control);},
+                                    Err(error)=>pending_output=Some(Output::Diagnostic(format!("[control rejected] {error}\n"))),
+                                }
+                            } else {pending_output=Some(Output::Diagnostic("Work is retained; answer its exact prompt instead of starting another message\n".into()));}
+                        }
+                        Some(Input::Reply { id, line }) => {
+
+                            if visible_prompt != Some(id) || presented.is_none() {
+                                pending_output=Some(Output::Diagnostic("[input error] stale or closed prompt\n".into()));
+                            } else {
+                                match respond(presented.take().unwrap(), &line, host.clone(), updates_tx.clone(), self.json) {
+                                    Ok(Some((id, control))) => {busy.insert(id); controls.push(control);dirty=true;},
+                                    Ok(None) => {dirty=true;},
+                                    Err((prompt,error)) => {presented=Some(*prompt);pending_output=Some(Output::Diagnostic(format!("[input error] {error}\n")));}
+                                }
+                            }
+                        }
                         Some(Input::Line(line)) if (line=="/quit" || line=="/exit") && !host.runs().is_empty() => {stopping=true;quit=true;self.suppressed_output=true;host.close_input(); if let Some(Prompt::Callback(callback))=presented.take(){reject_callback(callback);} dirty=true;}
                         Some(Input::Line(line)) if line.starts_with("/task ") && presented.is_none() => {
                             match command(&line, &host,updates_tx.clone(),self.json) {
@@ -521,6 +763,7 @@ impl FrontendSession {
                                 Err(error)=>pending_output=Some(diagnostic(format!("[control rejected] {error}\n"),self.json)),
                             }
                         }
+                        Some(Input::Line(_)) if self.ui => {pending_output=Some(Output::Diagnostic("Use the displayed prompt identity for TUI responses\n".into()));}
                         Some(Input::Line(line))=>self.queued.push_back(line),
                         _=>{ self.eof=true; if self.queued.is_empty(){host.close_input(); if let Some(Prompt::Callback(callback))=presented.take(){reject_callback(callback);} dirty=true;} }
                     }
@@ -528,7 +771,7 @@ impl FrontendSession {
                 signal=&mut self.interrupt => {
                     self.interrupt=Box::pin(tokio::signal::ctrl_c());
                     if signal.is_ok() {
-                        if stopping {eprintln!("Forced exit: cleanup is unconfirmed; inspect task ownership before recovery."); std::process::exit(1);}
+                        if stopping {if self.ui {bail!("forced exit: cleanup is unconfirmed; inspect task ownership before recovery");} eprintln!("Forced exit: cleanup is unconfirmed; inspect task ownership before recovery."); std::process::exit(1);}
                         stopping=true;quit=true;self.suppressed_output=true;host.close_input(); if let Some(Prompt::Callback(callback))=presented.take(){reject_callback(callback);} dirty=true;
                     } else {
                         self.interrupt=Box::pin(std::future::pending());
@@ -558,7 +801,7 @@ impl FrontendSession {
     }
 }
 
-async fn inspect(session: &TaskHostSession) -> Result<Vec<View>> {
+async fn inspect(session: &TaskHostSession, ui: bool) -> Result<Vec<View>> {
     let mut views = vec![];
     for run in session.runs() {
         // Admission can publish its handle before initial storage setup; no missing row is treated as execution success.
@@ -589,7 +832,13 @@ async fn inspect(session: &TaskHostSession) -> Result<Vec<View>> {
         } else {
             None
         };
+        let details = if ui {
+            Some(run.runner.task_host_details(&run.key.run_id).await?)
+        } else {
+            None
+        };
         views.push(View {
+            details,
             run,
             display,
             interaction,
@@ -644,41 +893,26 @@ fn render_task_prompt(prompt: &TaskPrompt) -> String {
             "Validation observation: enter yes / no, or an exact JSON answer".into()
         }
     };
+    let description = if let Some(review) = &i.restoration_review
+        && !review.approved
+    {
+        format!(
+            "Restoration review {}: explicitly enter yes / no; this decision does not answer the original pending request",
+            review.id
+        )
+    } else {
+        description
+    };
     // Exact prompts are deliberately a local interaction surface, never copied into JSON event/export output.
     format!(
         "\n[task {} revision {} request {}]\n{description}\nReply > ",
         i.key.run_id, i.revision, i.request_id
     )
 }
-// Only operation-review fields are shown locally; diagnostics and JSON task exports never receive this exact prompt context.
+// HITL or the authenticated host has already selected these review fields; a frontend must not replace that contract with domain-specific key filters.
+// Exact local review is separate from diagnostics and safe exports, and never includes the recovery checkpoint itself.
 fn approval_context(context: &Value) -> String {
-    let selected = context
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .filter(|(key, _)| {
-                    matches!(
-                        key.as_str(),
-                        "tool"
-                            | "tool_name"
-                            | "arguments"
-                            | "args"
-                            | "path"
-                            | "command"
-                            | "operation"
-                            | "summary"
-                            | "description"
-                            | "diff"
-                            | "from"
-                            | "to"
-                            | "plan"
-                    )
-                })
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<serde_json::Map<_, _>>()
-        })
-        .unwrap_or_default();
-    let text = serde_json::to_string_pretty(&selected).unwrap_or_default();
+    let text = serde_json::to_string_pretty(context).unwrap_or_default();
     if text.chars().count() > 16_384 {
         format!(
             "{}\n[review display truncated; stop if the operation cannot be verified]",
@@ -925,9 +1159,12 @@ fn response_operation(prompt: &TaskPrompt, line: &str) -> Result<TaskStreamOpera
     if let Some(review) = &i.restoration_review {
         // A fresh restoration review is a distinct decision and cannot also consume the original pending answer.
         if !review.approved {
-            bail!(
-                "explicit restoration review is required through its bound host API before answering"
-            );
+            return Ok(TaskStreamOperation::RestorationReview {
+                run_id: i.key.run_id.clone(),
+                revision: i.revision,
+                review_id: review.id.clone(),
+                decision: approval(line)?,
+            });
         }
     }
     Ok(match &i.prompt {
@@ -1281,6 +1518,41 @@ pub(crate) async fn chat_work(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn configured_auto_approval_uses_the_bridge_without_terminal_io() {
+        let (io, _input, mut output) = FrontendSession::embedded();
+        for allowed in [true, false] {
+            io.bridge.set_auto_approval(Some(allowed));
+            let request = ApprovalRequest::new(
+                ai_agents::hitl::ApprovalTrigger::tool("echo", json!({})),
+                "Review",
+            );
+            assert_eq!(
+                io.bridge.request_approval(request).await.is_approved(),
+                allowed
+            );
+            assert!(output.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn configured_approval_review_fields_are_preserved_without_domain_key_filters() {
+        let context = json!({"method":"POST","url":"https://fixture.invalid/approve","amount":42,"recipient":"team","custom_domain_field":"review me"});
+        let review = approval_context(&context);
+        for name in [
+            "method",
+            "url",
+            "amount",
+            "recipient",
+            "custom_domain_field",
+        ] {
+            assert!(
+                review.contains(name),
+                "configured review field lost: {name}"
+            );
+        }
+    }
+
     struct DoneProvider;
     #[async_trait]
     impl ai_agents::llm::LLMProvider for DoneProvider {
@@ -1335,11 +1607,16 @@ mod tests {
         let (_failure_guard, output_failed) = mpsc::channel(1);
         let mut io = FrontendSession {
             input,
+            ui: false,
+            ui_generation: 0,
+            endpoint: None,
+            prompt_sequence: 0,
             queued: VecDeque::new(),
             callbacks,
             bridge: Arc::new(InputBridge {
                 tx: callback_tx,
                 show_context: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                auto_approval: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             }),
             eof: false,
             json: true,

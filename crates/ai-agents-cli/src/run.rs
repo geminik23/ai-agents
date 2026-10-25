@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use crate::approval::CliApprovalHandler;
 use crate::cli::{Cli, Command as CliCommand, RunArgs};
 use crate::metadata::{CliOverrides, ResolvedCliMetadata};
-use crate::question::CliQuestionHandler;
+
 use crate::repl::{CliRepl, CliReplConfig, PromptStyle, ReplMode};
 
 #[derive(Debug, Clone)]
@@ -120,36 +120,24 @@ pub async fn run_agent(options: RunOptions) -> Result<()> {
             .await;
     }
 
-    let agent = build_agent_from_spec(&options.agent_path, spec.clone()).await?;
-    agent.set_command_runner(Arc::new(ProcessCommandRunner));
-    if !is_tui && std::io::stdin().is_terminal() {
-        agent.set_question_handler(Some(CliQuestionHandler::new()));
-    }
-
-    // Initialize storage before entering either frontend so configuration failures remain visible.
-    agent
-        .init_storage()
-        .await
-        .context("failed to initialize agent storage")?;
-
-    // Inject context from --context and --context-file
-    inject_context(&agent, &options)?;
-
+    let (io, input, output) = crate::session::FrontendSession::embedded();
+    let namespace = ai_agents::TaskHostScope::from_spec(
+        &spec,
+        options.agent_path.parent().unwrap_or(Path::new(".")),
+        options.actor.clone(),
+    )?;
+    let agent = build_frontend_agent(
+        &options.agent_path,
+        spec.clone(),
+        io.bridge(),
+        Some(namespace),
+    )
+    .await?;
+    prepare_frontend(&agent, &options).await?;
     let config = resolve_cli_config(&spec, &metadata);
-
-    // Dispatch: plain REPL for piped/--plain, TUI for interactive TTY.
-    if !is_tui {
-        CliRepl::new(agent)
-            .with_config(config)
-            .run()
-            .await
-            .context("failed to run interactive session")
-    } else {
-        let theme_name = metadata.theme.clone();
-        crate::tui::run_tui(agent, config, theme_name)
-            .await
-            .context("failed to run TUI session")
-    }
+    crate::tui::run_prepared(agent, config, metadata.theme.clone(), io, input, output)
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to run TUI session: {error:#}"))
 }
 
 /// Parse "key=value" where key supports dotted paths and value is auto-typed.
@@ -288,11 +276,14 @@ async fn configured_builder(
                     .unwrap_or(true),
             );
         }
-        let ordinary_prompt = hitl_meta
-            .as_ref()
-            .and_then(|meta| meta.style.as_ref())
-            .is_none_or(|style| matches!(style, ai_agents::spec::CliHitlStyle::Prompt));
-        builder = if let Some(bridge) = bridge.filter(|_| ordinary_prompt) {
+        builder = if let Some(bridge) = bridge {
+            bridge.set_auto_approval(
+                match hitl_meta.as_ref().and_then(|meta| meta.style.as_ref()) {
+                    Some(ai_agents::spec::CliHitlStyle::AutoApprove) => Some(true),
+                    Some(ai_agents::spec::CliHitlStyle::AutoReject) => Some(false),
+                    _ => None,
+                },
+            );
             builder.approval_handler(bridge)
         } else {
             builder.approval_handler(CliApprovalHandler::from_metadata(hitl_meta.as_ref()))

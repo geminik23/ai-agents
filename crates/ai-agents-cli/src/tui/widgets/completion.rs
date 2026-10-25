@@ -16,6 +16,38 @@ pub struct SlashCommand {
 /// All available slash commands shown in the completion popup.
 pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
+        name: "/task run",
+        description: "Start a task: [--profile ID] OBJECTIVE",
+    },
+    SlashCommand {
+        name: "/task list",
+        description: "Actual foreground task participants",
+    },
+    SlashCommand {
+        name: "/task show",
+        description: "Safe task snapshot: RUN",
+    },
+    SlashCommand {
+        name: "/task cancel",
+        description: "Request cancellation: RUN REV",
+    },
+    SlashCommand {
+        name: "/task resume",
+        description: "Exact response: RUN REV REQUEST ANSWER",
+    },
+    SlashCommand {
+        name: "/task stop",
+        description: "Stop a retained task: RUN REV [REASON]",
+    },
+    SlashCommand {
+        name: "/task objective",
+        description: "Revise objective: RUN REV TEXT",
+    },
+    SlashCommand {
+        name: "/task limits",
+        description: "Revise limits: RUN REV JSON",
+    },
+    SlashCommand {
         name: "/help",
         description: "Commands and key bindings",
     },

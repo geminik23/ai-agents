@@ -3,6 +3,8 @@
 ## Unreleased
 
 ### Added
+- Task TUI: development terminal sessions share task hosting and exact human decisions with the plain frontend, show bounded task evidence and retain original work through acknowledged shutdown
+- Local task details: authenticated development hosts can read bounded human-readable observations without exporting recovery data or treating historical checks as current completion proof
 - Task CLI: development task commands and plain REPL share configured runners, retained human decisions, scoped provider-free journal management, bounded output and acknowledged foreground shutdown; default production restart remains unavailable
 - Foreground task hosts: development integrations track actual participating controllers through existing composition boundaries, expose prompts only after public acknowledgement and preserve protection after uncertain effects
 - Configured task hosting: development Rust hosts prepare configured task-capable storage, inspect safe snapshots with storage alone, and share explicit and automatic runners with truthful response availability and cleanup
@@ -34,6 +36,8 @@
 - Task validation: development-only tri-state checks, tool/fallback/child observation continuation and external signals preserve post-turn controller progress; fixed host permits and single logical journal charges survive re-pause, while full task acceptance remains unfinished
 
 ### Changed
+- TUI integration compatibility: low-level question, log and app constructors use bounded senders; modal literals include review scrolling and constructors remain the preferred interface
+- Approval review: configured and host-selected context fields remain visible without tool-specific field filters, while automatic approval styles use the foreground bridge without raw terminal output
 - CLI command compatibility: development command matches include the task family while ordinary run, validation and evaluation retain their distinct result contracts
 - Rust task hosting: development automatic tasks retain shared runtime state and explicit host access; finish fluent configuration before publishing retained controller handles
 - Task validation names: development check IDs reserve the runtime journal namespace and reject collisions before ownership or execution

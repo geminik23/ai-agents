@@ -18,6 +18,86 @@ fn agent(provider: Arc<RecordingProvider>) -> RuntimeAgent {
 }
 
 #[tokio::test]
+// Local detail projection preserves readable facts without exporting recovery data or consuming a decision.
+async fn host_details_are_bounded_local_only_and_leave_authority_unchanged() {
+    let provider = RecordingProvider::new(&["draft", "done"]);
+    let agent = agent(provider.clone());
+    let paused = agent
+        .run_task(&"PRIVATE_OBJECTIVE_한글".repeat(2000), None)
+        .await
+        .unwrap();
+    let runner = agent.task_runner().unwrap();
+    let details = runner
+        .task_host_details(&paused.run.key.run_id)
+        .await
+        .unwrap();
+    assert_eq!(details.revision, paused.run.revision);
+    assert!(details.truncated);
+    assert!(details.lines.iter().map(String::len).sum::<usize>() <= MAX_TASK_DISPLAY_BYTES);
+    assert!(details.lines.iter().all(|line| line.len() <= 2048));
+    assert!(
+        details
+            .lines
+            .iter()
+            .any(|line| line.contains("PRIVATE_OBJECTIVE"))
+    );
+    assert!(!format!("{details:?}").contains("PRIVATE_OBJECTIVE"));
+    for forbidden in [
+        "owner_token",
+        "runtime.controller",
+        "reviewed_action",
+        "native_history",
+        "fingerprints",
+    ] {
+        assert!(!details.lines.iter().any(|line| line.contains(forbidden)));
+    }
+    assert_eq!(
+        runner
+            .task_display(&paused.run.key.run_id)
+            .await
+            .unwrap()
+            .summary
+            .revision,
+        paused.run.revision
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+// A tool-free task remains valid without todos or file artifacts, and observation labels do not claim fresh eligibility.
+async fn host_details_tool_free_progress_remains_informational() {
+    let provider = RecordingProvider::new(&["draft"]);
+    let agent = agent(provider.clone());
+    let paused = agent.run_task("Research", None).await.unwrap();
+    let runner = agent.task_runner().unwrap();
+    let details = runner
+        .task_host_details(&paused.run.key.run_id)
+        .await
+        .unwrap();
+    assert!(
+        details
+            .lines
+            .iter()
+            .any(|line| line == "Todos: not configured")
+    );
+    assert!(details.lines.iter().any(|line| line.contains("historical")));
+    assert!(
+        !details
+            .lines
+            .iter()
+            .any(|line| line.starts_with("Artifact reference:"))
+    );
+    runner
+        .cancel_paused(&paused.run.key.run_id, paused.run.revision)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 // Reads do not consume an exchange, and exact sensitive prompt data never appears in display serialization or diagnostic formatting.
 async fn host_controls_display_and_typed_question_preserve_pending_without_raw_exports() {
     let provider = RecordingProvider::new(&["DRAFT_SECRET", "done"]);

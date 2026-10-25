@@ -33,8 +33,8 @@ mod host_runtime;
 #[path = "hosting.rs"]
 mod hosting;
 pub use hosting::{
-    CancellationDisposition, CancellationOutcome, MAX_TASK_DISPLAY_BYTES, TaskHostInteraction,
-    TaskHostPrompt, TaskRunDisplay,
+    CancellationDisposition, CancellationOutcome, MAX_TASK_DISPLAY_BYTES, TaskHostDetails,
+    TaskHostInteraction, TaskHostPrompt, TaskRunDisplay,
 };
 #[path = "live_controller.rs"]
 mod live_controller;

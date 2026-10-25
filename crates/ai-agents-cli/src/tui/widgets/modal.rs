@@ -101,6 +101,7 @@ impl QuestionModalState {
 }
 
 pub struct ModalState {
+    pub review_scroll: u16,
     pub title: String,
     pub message: String,
     pub context_lines: Vec<(String, String)>,
@@ -113,6 +114,7 @@ impl ModalState {
     /// Create an approval modal.
     pub fn approval(message: &str, context: Vec<(String, String)>) -> Self {
         Self {
+            review_scroll: 0,
             title: "APPROVAL REQUIRED".to_string(),
             message: message.to_string(),
             context_lines: context,
@@ -125,6 +127,7 @@ impl ModalState {
     /// Create a confirmation modal.
     pub fn confirm(title: &str, message: &str) -> Self {
         Self {
+            review_scroll: 0,
             title: title.to_string(),
             message: message.to_string(),
             context_lines: Vec::new(),
@@ -146,6 +149,7 @@ impl ModalState {
             QuestionModalState::new(message, options, multi_select, allow_other, default_label);
         let buttons = question_state.actions.clone();
         Self {
+            review_scroll: 0,
             title: "QUESTION".to_string(),
             message: message.to_string(),
             context_lines: Vec::new(),
@@ -158,17 +162,17 @@ impl ModalState {
 
 pub fn render_modal(area: Rect, buf: &mut Buffer, state: &ModalState, theme: &Theme) {
     // Center the modal
-    let width = (area.width * 60 / 100).clamp(30, 60);
-    let content_lines = if state.question.is_some() {
-        4 + state
-            .question
-            .as_ref()
-            .map(|q| q.options.len() as u16 + 4)
-            .unwrap_or(6)
-    } else {
-        6 + state.context_lines.len() as u16
-    };
-    let height = content_lines.min(area.height - 4).max(8);
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    let width = (area.width.saturating_mul(60) / 100)
+        .clamp(4, 60)
+        .min(area.width);
+    let content_lines = area.height.saturating_sub(2);
+    let height = content_lines
+        .min(area.height.saturating_sub(2))
+        .max(4)
+        .min(area.height);
     let x = area.x + (area.width.saturating_sub(width)) / 2;
     let y = area.y + (area.height.saturating_sub(height)) / 2;
     let modal_area = Rect::new(x, y, width, height);
@@ -186,10 +190,13 @@ pub fn render_modal(area: Rect, buf: &mut Buffer, state: &ModalState, theme: &Th
 
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        format!("  {}", state.message),
-        theme.value_style,
-    )));
+    lines.push(Line::from("PgUp/PgDn review | Esc hides | Ctrl+P reopens"));
+    for line in state.message.lines() {
+        lines.push(Line::from(Span::styled(
+            format!("  {line}"),
+            theme.value_style,
+        )));
+    }
 
     if let Some(q) = &state.question {
         if !q.options.is_empty() {
@@ -284,6 +291,8 @@ pub fn render_modal(area: Rect, buf: &mut Buffer, state: &ModalState, theme: &Th
         lines.push(Line::from(button_spans));
     }
 
-    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((state.review_scroll, 0));
     paragraph.render(inner, buf);
 }

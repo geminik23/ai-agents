@@ -184,6 +184,25 @@ impl TaskRunDisplay {
     }
 }
 
+/// Bounded human-readable facts for an authenticated local UI, never an export or execution permit.
+/// Lines are informational and must not be parsed back into controls; exact checkpoints and results remain unchanged.
+#[derive(Clone)]
+pub struct TaskHostDetails {
+    pub revision: u64,
+    pub lines: Vec<String>,
+    pub truncated: bool,
+}
+
+impl std::fmt::Debug for TaskHostDetails {
+    // Local labels may contain sensitive objectives or domain identifiers, so diagnostics expose only revision and bounds.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskHostDetails")
+            .field("revision", &self.revision)
+            .field("truncated", &self.truncated)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Exact allowlisted prompt data for an authenticated host, deliberately not serializable or content-bearing Debug output.
 /// Approval context and question defaults may be sensitive; they must not be logged or substituted for fresh controller admission.
 pub enum TaskHostPrompt {
@@ -342,6 +361,139 @@ impl AutonomyRunner {
                 .is_some_and(|o| o.run_id == run_id),
             restoration_review_required,
         )
+    }
+
+    /// Reads allowlisted local presentation facts without exposing executable adapters, native history or owner tokens.
+    /// Validation and progress are historical observations, not fresh gate eligibility; truncation affects presentation only.
+    pub async fn task_host_details(&self, run_id: &str) -> Result<TaskHostDetails> {
+        let snapshot = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or(TaskRunStorageError::NotFound)?;
+        let payload: TaskCheckpointPayload = serde_json::from_value(snapshot.payload.clone())?;
+        payload.validate(&snapshot, &self.config_identity)?;
+        let mut lines = vec![
+            format!("Objective: {}", payload.objective),
+            format!(
+                "Profile: {}",
+                payload.profile.as_deref().unwrap_or("default")
+            ),
+            format!("Stage: {}", payload.stage.as_deref().unwrap_or("none")),
+            format!(
+                "Progress observations: {}; stagnant cycles: {}; replans: {}",
+                payload.progress.observation_sequence,
+                payload.progress.cycles_without_progress,
+                payload.progress.replans
+            ),
+        ];
+        if let Some(todos) = &payload.todos {
+            lines.extend(
+                todos
+                    .items
+                    .iter()
+                    .map(|item| format!("Todo {:?}: {}", item.status, item.content)),
+            );
+        } else {
+            lines.push("Todos: not configured".into());
+        }
+        let evidence: Option<EvaluationEvidence> = payload
+            .adapters
+            .iter()
+            .find(|a| a.id == "runtime.controller")
+            .and_then(|a| a.state.get("evidence"))
+            .map(|v| serde_json::from_value(v.clone()))
+            .transpose()?;
+        if let Some(evidence) = evidence {
+            for result in evidence.validations.iter().rev().take(32) {
+                lines.push(format!(
+                    "Validation {}: {:?} (observed cycle {}, objective revision {}; historical)",
+                    result.check_id,
+                    result.outcome,
+                    result.identity.cycle,
+                    result.identity.objective_revision
+                ));
+            }
+            for check in &evidence.required_checks {
+                if !evidence.validations.iter().any(|r| &r.check_id == check) {
+                    lines.push(format!("Validation {check}: Unknown (not observed)"));
+                }
+            }
+            for artifact in evidence.artifacts.iter().rev().take(32) {
+                lines.push(format!(
+                    "Artifact reference: {}; exists: {} (observed cycle {}; historical)",
+                    artifact.value.path, artifact.value.exists, artifact.identity.cycle
+                ));
+            }
+        }
+        // Domain keys are local presentation only; no raw adapter state or executable cursor crosses this boundary.
+        if let Ok(state) =
+            serde_json::from_value::<ProgressState>(payload.progress.high_water_marks.clone())
+        {
+            lines.push(format!(
+                "Progress delta: {:?} (historical observation {:?})",
+                state.last_delta, state.last_cycle
+            ));
+        }
+        if let Some(values) = payload
+            .progress
+            .high_water_marks
+            .get("signals")
+            .and_then(Value::as_object)
+        {
+            for (name, value) in values.iter().take(32) {
+                lines.push(format!(
+                    "Progress {name}: high={}; previous={} (historical)",
+                    value.get("high").unwrap_or(&Value::Null),
+                    value.get("previous").unwrap_or(&Value::Null)
+                ));
+            }
+        }
+        for record in payload
+            .evidence
+            .records
+            .iter()
+            .rev()
+            .filter(|r| r.origin == "controller")
+            .take(16)
+        {
+            lines.push(format!(
+                "Decision at cycle {}: progress={}; intervention={} (historical)",
+                record.sequence,
+                record.data.get("progress").unwrap_or(&Value::Null),
+                record
+                    .data
+                    .get("decision")
+                    .and_then(|d| d.get("action"))
+                    .unwrap_or(&Value::Null)
+            ));
+        }
+        let mut remaining = MAX_TASK_DISPLAY_BYTES;
+        let mut truncated = lines.len() > 128;
+        lines = lines
+            .into_iter()
+            .take(128)
+            .filter_map(|line| {
+                if remaining == 0 {
+                    truncated = true;
+                    return None;
+                }
+                let end = line
+                    .char_indices()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .take_while(|end| *end <= remaining.min(2048))
+                    .last()
+                    .unwrap_or(0);
+                truncated |= end < line.len();
+                remaining -= end;
+                Some(line[..end].to_owned())
+            })
+            .collect();
+        Ok(TaskHostDetails {
+            revision: snapshot.revision,
+            lines,
+            truncated,
+        })
     }
 
     /// Projects only a validated pending prompt for the exact requested revision; it grants no response or restoration authority.

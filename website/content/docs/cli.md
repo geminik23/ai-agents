@@ -112,7 +112,7 @@ cargo run -p ai-agents-cli -- run agent.yaml --plain
 cargo run -p ai-agents-cli -- run agent.yaml --plain --stream
 ```
 
-Task-aware TUI interaction is not implemented yet; use `--plain` for these task workflows. Task lifecycle streaming is distinct from provider token streaming, and a dispatch `Final` with a paused task is not task completion.
+The development TUI also services these workflows through the same foreground driver; use `--plain` for line-oriented interaction. See [development task TUI](@/docs/cli.md#development-task-tui) for the terminal controls. Task lifecycle streaming is distinct from provider token streaming, and a dispatch `Final` with a paused task is not task completion.
 
 | REPL command | Meaning |
 | --- | --- |
@@ -361,6 +361,22 @@ Once inside the REPL, these slash commands are available (unless `--no-builtins`
 When running on an interactive terminal, the CLI launches a ratatui-based TUI with an alternate-screen interface.
 Use `--plain` to skip the TUI and use the traditional line REPL instead.
 
+### Development task TUI
+
+This section describes the development checkout, not the published 1.1.1 CLI. The TUI uses the same checked YAML/base-directory, actor scope, configured runtime/runner/store and controller as the plain REPL. `/task run [--profile ID] OBJECTIVE` starts explicit work; ordinary input can enter enabled state/selected-skill tasks without enabling provider token streaming. Omitted or disabled autonomy preserves ordinary chat.
+
+`F10` toggles the task view: run/revision/status, readable objective/profile/stage, optional canonical todos, historical tri-state validation, domain progress/stagnation/replan observations, file or non-file artifact references, cumulative usage and stored active-time/original-expiry facts. `Ctrl+Up/Down` selects an observed run, and `Ctrl+PageUp/PageDown` scrolls its details. These are observations, not fresh completion proofs or UI-enforced clocks. Missing measurements remain unavailable, not zero or Pass. Authoritative final answers return to chat; hiding the task view does not cancel execution.
+
+Pending decisions use the exact displayed task run/revision/request, or a distinct ordinary callback identity. Questions support declared choices, multiple selection and free text. Other typed decisions present their bound instructions for approval/rejection or argument changes, Continue, capacity revisions, stage/plan review, external signals, observations and installed-host restoration review. Use `PageUp/PageDown` to scroll long review text. `Esc` or the modal Cancel action hides a task decision without answering; `Ctrl+P` restores its draft. Select Use default explicitly when desired. A restoration review is separate from the original pending answer. Configured ordinary approval styles remain effective; they do not auto-approve required task reviews or override automatic policy denial.
+
+The same `/task resume/cancel/stop/objective/limits` exact-target syntax remains available after hiding a modal. `/task list` and `/task show RUN` inspect observed session runs while idle, and actual foreground participants during work; the standalone CLI provides store-only journal management. New chat/run input does not replace retained work. Invalid or stale decisions are rejected without rebinding to a newer request, and actor/session mutations cannot replace a retained task.
+
+The first `Ctrl+C` or `/quit` requests foreground shutdown and keeps polling the original operations. A second explicit quit forces exit with cleanup unconfirmed. Input loss closes ordinary callbacks and follows the task's existing unavailable policy. Cancellation requested, cleanup acknowledged, stored terminal metadata and protected recovery are distinct. Completion may win a cancellation race. Terminal restoration also runs on setup/draw/error paths, but never proves rollback or task cleanup.
+
+Input and ordinary callback queues are bounded (16 and 32); display/control delivery uses bounded queues of 32. Tick/resize are coalesced by the event loop and log hints may be dropped under pressure. Chat history is display-only (up to 256 entries and 32 KiB content), previews and local task details are bounded, and truncation never changes the exact retained result or checkpoint. Local objectives, question/default text and host-selected review context are trusted UI data, not safe log/export payloads. JSON task snapshots retain default redaction. Slow or closed display delivery must not block shutdown settlement.
+
+Session save/load does not reconstruct tasks. Default production new-process restart remains unsupported; an embedding Rust host must explicitly supply the existing prepared reconstruction contract. Low-level Rust TUI integrations now pass bounded `tokio::sync::mpsc::Sender` values to app/question/log constructors; modal constructors initialize review scrolling, while direct modal literals must include `review_scroll`.
+
 ### Layout
 
 The TUI has four zones:
@@ -393,12 +409,15 @@ Press the same key again to close a panel. Press `Esc` to close all panels.
 | Key             | Action |
 | --------------- | ------ |
 | `Enter`         | Send message |
-| `Ctrl+C`        | Quit |
+| `Ctrl+C`        | Request shutdown and await settlement; a second quit forces exit with cleanup unconfirmed |
 | `Ctrl+L`        | Clear chat display |
 | `Ctrl+S`        | Quick save session |
 | `PageUp/Down`   | Scroll chat history |
-| `Esc`           | Close completion/panels, resolve a question modal with its default, or hide current streaming display |
+| `Esc`           | Close completion/panels or hide a task decision/display without approval or cancellation |
 | `F1` - `F9`     | Toggle side panels |
+| `F10`           | Toggle task evidence/todo/validation/artifact view |
+| `Ctrl+P`        | Reopen the exact pending decision and draft |
+| `PageUp/Down` in modal | Scroll local review text |
 | `Ctrl+T`        | Cycle color theme |
 | `/`             | Start a slash command (opens completion popup) |
 

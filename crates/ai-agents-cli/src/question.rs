@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use ai_agents::tools::{QuestionHandler, QuestionRequest, QuestionResponse};
 use async_trait::async_trait;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::oneshot;
 
 use crate::tui::event::{AppMessage, PendingQuestion};
@@ -36,12 +36,12 @@ impl QuestionHandler for CliQuestionHandler {
 /// TUI question handler that sends modal requests to the app event loop.
 #[derive(Clone)]
 pub struct TuiQuestionHandler {
-    tx: UnboundedSender<AppMessage>,
+    tx: Sender<AppMessage>,
 }
 
 impl TuiQuestionHandler {
     /// Create a TUI handler backed by the app message channel.
-    pub fn new(tx: UnboundedSender<AppMessage>) -> Arc<Self> {
+    pub fn new(tx: Sender<AppMessage>) -> Arc<Self> {
         Arc::new(Self { tx })
     }
 }
@@ -56,6 +56,7 @@ impl QuestionHandler for TuiQuestionHandler {
                 request,
                 respond_to,
             }))
+            .await
             .is_err()
         {
             return QuestionResponse {

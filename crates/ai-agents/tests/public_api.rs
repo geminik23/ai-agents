@@ -82,6 +82,8 @@ fn development_automatic_task_hosting_surface_compiles() {
             let _running_cancel = run.runner.request_running_cancel("run");
             let _revision = run.published_revision();
             let _cleanup = run.runner.input_unavailable_paused("run", 1);
+            let _local_details = run.runner.task_host_details("run");
+            let _typed: Option<ai_agents::TaskHostDetails> = None;
         }
         let _protected = session.has_protected_work();
         session.close_input();
